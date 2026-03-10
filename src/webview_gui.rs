@@ -11,6 +11,40 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
+/// Temporarily suppress stderr (e.g. WebKit/JSC prints harmless warnings on init).
+/// Returns a guard that restores stderr when dropped.
+#[cfg(unix)]
+struct StderrSuppress {
+    saved_fd: i32,
+}
+
+#[cfg(unix)]
+impl StderrSuppress {
+    fn new() -> Self {
+        unsafe {
+            let saved = libc::dup(2);
+            let devnull = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY);
+            if devnull >= 0 {
+                libc::dup2(devnull, 2);
+                libc::close(devnull);
+            }
+            Self { saved_fd: saved }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StderrSuppress {
+    fn drop(&mut self) {
+        if self.saved_fd >= 0 {
+            unsafe {
+                libc::dup2(self.saved_fd, 2);
+                libc::close(self.saved_fd);
+            }
+        }
+    }
+}
+
 /// Custom events sent from IPC handler to event loop
 #[derive(Debug)]
 enum WvEvent {
@@ -20,6 +54,8 @@ enum WvEvent {
     Quit,
     /// Show an update status message in the WebView
     UpdateStatus(String),
+    /// Hot reload: exec a new binary (remote GUI only)
+    Reload,
 }
 
 use crate::theme::{ThemeColors, ThemeFile};
@@ -67,7 +103,7 @@ fn load_gui_theme_name() -> String {
 }
 
 /// Load the user's GUI theme CSS vars for initial HTML rendering.
-/// Reads gui_theme name from ~/.clay.dat and theme colors from ~/clay.theme.dat.
+/// Reads gui_theme name from ~/.clay.dat and theme colors from ~/.clay.theme.dat.
 fn load_user_theme_css() -> String {
     let home = crate::get_home_dir();
     let gui_theme_name = load_gui_theme_name();
@@ -76,7 +112,7 @@ fn load_user_theme_css() -> String {
         return ThemeColors::dark_default().to_css_vars();
     }
 
-    // Load theme colors from ~/clay.theme.dat
+    // Load theme colors from ~/.clay.theme.dat
     let theme_path = format!("{}/{}", home, crate::clay_filename("clay.theme.dat"));
     let theme_file = ThemeFile::load(std::path::Path::new(&theme_path));
     theme_file.get(&gui_theme_name).to_css_vars()
@@ -183,7 +219,11 @@ pub fn run_master_webgui() -> io::Result<()> {
     result
 }
 
-/// Remote mode: open WebView window connected to a remote Clay instance
+/// Remote mode: open WebView window connected to a remote Clay instance.
+///
+/// First tries direct ws:// connection (WebKit handles plain WebSocket fine).
+/// If the remote server only accepts wss://, falls back to a local WS proxy
+/// that handles TLS with self-signed cert support (WebKit rejects self-signed certs).
 pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
     // Check for display server availability (Linux only)
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -197,7 +237,7 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
         }
     }
 
-    // Strip ws:// or wss:// prefix if provided, remember the protocol
+    // Strip protocol prefix if provided
     let (addr_stripped, explicit_protocol) = if let Some(rest) = addr.strip_prefix("wss://") {
         (rest, Some("wss"))
     } else if let Some(rest) = addr.strip_prefix("ws://") {
@@ -216,18 +256,188 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
         (addr_stripped.to_string(), 9000)
     };
 
-    // Default to wss:// for security (the JS client will fall back to ws:// if it fails)
-    let protocol = explicit_protocol.unwrap_or("wss").to_string();
-
-    let params = WebViewParams {
-        ws_host: host,
-        ws_port: port,
-        ws_protocol: protocol,
-        auto_password: None,
-        theme_css: load_user_theme_css(),
+    // Determine if we can connect directly via ws:// or need a proxy for wss://
+    let use_proxy = if explicit_protocol == Some("ws") {
+        // User explicitly requested ws://, connect directly
+        false
+    } else if explicit_protocol == Some("wss") {
+        // User explicitly requested wss://, need proxy for self-signed cert support
+        true
+    } else {
+        // Auto-detect: try ws:// first with a quick WebSocket handshake probe
+        !probe_ws_connection(&host, port)
     };
 
-    create_webview_window("Clay", &params)
+    if use_proxy {
+        // WSS mode: start local proxy that handles TLS with self-signed cert support
+        let runtime = tokio::runtime::Runtime::new()?;
+        let _guard = runtime.enter();
+
+        let local_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let local_port = local_listener.local_addr()?.port();
+        local_listener.set_nonblocking(true)?;
+        let tokio_listener = tokio::net::TcpListener::from_std(local_listener)?;
+
+        let remote_wss = format!("wss://{}:{}", host, port);
+        let remote_ws = format!("ws://{}:{}", host, port);
+
+        runtime.handle().spawn(async move {
+            loop {
+                let Ok((local_stream, _)) = tokio_listener.accept().await else { continue };
+                let wss = remote_wss.clone();
+                let ws = remote_ws.clone();
+                tokio::spawn(async move {
+                    let _ = ws_proxy_bridge(local_stream, &wss, &ws).await;
+                });
+            }
+        });
+
+        let params = WebViewParams {
+            ws_host: "127.0.0.1".to_string(),
+            ws_port: local_port,
+            ws_protocol: "ws".to_string(),
+            auto_password: None,
+            theme_css: load_user_theme_css(),
+        };
+
+        let result = create_webview_window("Clay", &params);
+        runtime.shutdown_background();
+        result
+    } else {
+        // Direct ws:// connection — no proxy needed
+        let params = WebViewParams {
+            ws_host: host,
+            ws_port: port,
+            ws_protocol: "ws".to_string(),
+            auto_password: None,
+            theme_css: load_user_theme_css(),
+        };
+
+        create_webview_window("Clay", &params)
+    }
+}
+
+/// Quick probe to check if a ws:// WebSocket connection can be established.
+/// Attempts a TCP connect + HTTP upgrade handshake with a short timeout.
+fn probe_ws_connection(host: &str, port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let addr = format!("{}:{}", host, port);
+    let stream = match TcpStream::connect_timeout(
+        &addr.parse().unwrap_or_else(|_| {
+            // Fallback: resolve via ToSocketAddrs
+            use std::net::ToSocketAddrs;
+            addr.to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.next())
+                .unwrap_or_else(|| ([127, 0, 0, 1], port).into())
+        }),
+        Duration::from_secs(3),
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+
+    // Send a minimal WebSocket upgrade request
+    let request = format!(
+        "GET / HTTP/1.1\r\n\
+         Host: {}:{}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n",
+        host, port
+    );
+
+    let mut stream = stream;
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    // Read response — look for "101 Switching Protocols" (ws://) vs TLS alert or error
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let response = String::from_utf8_lossy(&buf[..n]);
+            response.contains("101")
+        }
+        _ => false,
+    }
+}
+
+/// Bridge a local WebSocket connection to a remote WebSocket server.
+/// Tries WSS first (with self-signed cert support), falls back to WS.
+/// Forwards messages bidirectionally until either side disconnects.
+async fn ws_proxy_bridge(
+    local_stream: tokio::net::TcpStream,
+    wss_url: &str,
+    ws_url: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use futures::{SinkExt, StreamExt};
+
+    // Accept local WebSocket from WebView
+    let local_ws = tokio_tungstenite::accept_async(local_stream).await?;
+    let (mut local_sink, mut local_source) = local_ws.split();
+
+    // Try WSS first with self-signed cert support, fall back to WS
+    let remote_ws = {
+        #[cfg(feature = "rustls-backend")]
+        {
+            let tls_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(
+                    crate::danger::NoCertificateVerification::new()
+                ))
+                .with_no_client_auth();
+            let connector = tokio_tungstenite::Connector::Rustls(
+                std::sync::Arc::new(tls_config)
+            );
+            match tokio_tungstenite::connect_async_tls_with_config(
+                wss_url, None, false, Some(connector),
+            ).await {
+                Ok((ws, _)) => ws,
+                Err(_) => {
+                    // WSS failed, try plain WS
+                    tokio_tungstenite::connect_async(ws_url).await?.0
+                }
+            }
+        }
+        #[cfg(not(feature = "rustls-backend"))]
+        {
+            // Without rustls, try plain connect (handles both ws:// and wss://)
+            match tokio_tungstenite::connect_async(wss_url).await {
+                Ok((ws, _)) => ws,
+                Err(_) => tokio_tungstenite::connect_async(ws_url).await?.0,
+            }
+        }
+    };
+    let (mut remote_sink, mut remote_source) = remote_ws.split();
+
+    // Forward messages in both directions
+    let local_to_remote = async {
+        while let Some(Ok(msg)) = local_source.next().await {
+            if msg.is_close() { break; }
+            if remote_sink.send(msg).await.is_err() { break; }
+        }
+    };
+
+    let remote_to_local = async {
+        while let Some(Ok(msg)) = remote_source.next().await {
+            if msg.is_close() { break; }
+            if local_sink.send(msg).await.is_err() { break; }
+        }
+    };
+
+    tokio::select! {
+        _ = local_to_remote => {},
+        _ = remote_to_local => {},
+    }
+
+    Ok(())
 }
 
 /// Build HTML content with WS params injected into template placeholders,
@@ -426,6 +636,11 @@ document.addEventListener('DOMContentLoaded', function() {
 /// Uses custom protocol (clay://) instead of with_html() because with_html() loads
 /// content with a null origin, which blocks WebSocket connections on WebKit2GTK.
 fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> {
+    // Suppress WebKit/JSC stderr noise during init (harmless "Overriding existing handler
+    // for signal 10" message when Clay's SIGUSR1 handler conflicts with JSC's GC signal)
+    #[cfg(unix)]
+    let _stderr_guard = StderrSuppress::new();
+
     let event_loop = EventLoopBuilder::<WvEvent>::with_user_event().build();
     let proxy: EventLoopProxy<WvEvent> = event_loop.create_proxy();
 
@@ -481,7 +696,9 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
         .with_url("clay://localhost/index.html")
         .with_clipboard(true)
         .with_devtools(cfg!(debug_assertions))
-        .with_ipc_handler(move |req| {
+        .with_ipc_handler({
+            let is_master = params.auto_password.is_some();
+            move |req| {
             let body = req.body();
             if body == "quit" {
                 let _ = proxy.send_event(WvEvent::Quit);
@@ -510,12 +727,23 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
                         }
                     }
                 });
+            } else if body == "reload" {
+                // Hot reload: master mode sends SIGUSR1 to self (triggers exec_reload
+                // in the headless app), remote mode sends WvEvent to exec a new binary.
+                if is_master {
+                    // Master mode: signal the headless app to reload
+                    #[cfg(all(unix, not(target_os = "android")))]
+                    unsafe { libc::kill(libc::getpid(), libc::SIGUSR1); }
+                } else {
+                    // Remote mode: restart the GUI binary
+                    let _ = proxy.send_event(WvEvent::Reload);
+                }
             } else if let Some(rest) = body.strip_prefix("opacity:") {
                 if let Ok(opacity) = rest.parse::<f64>() {
                     let _ = proxy.send_event(WvEvent::SetOpacity(opacity));
                 }
             }
-        })
+        }})
         // Open external links in the system browser instead of navigating the WebView.
         // Links use target="_blank", which triggers new_window_req_handler.
         .with_new_window_req_handler(|url| {
@@ -576,6 +804,9 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
     let _webview = builder.build(&window)
         .map_err(|e| io::Error::other(format!("Failed to create WebView: {}", e)))?;
 
+    #[cfg(unix)]
+    drop(_stderr_guard);
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -621,6 +852,38 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
                 // Show update status in WebView via JS
                 let escaped = msg.replace('\\', "\\\\").replace('\'', "\\'");
                 let _ = _webview.evaluate_script(&format!("window.showUpdateStatus('{}')", escaped));
+            }
+            Event::UserEvent(WvEvent::Reload) => {
+                // Remote GUI reload: exec a new binary (no state to save — state lives on server)
+                #[cfg(all(unix, not(target_os = "android")))]
+                {
+                    if let Ok((exe_path, _)) = crate::get_executable_path() {
+                        let args: Vec<String> = std::env::args().collect();
+                        let c_exe = std::ffi::CString::new(exe_path.to_string_lossy().as_bytes()).unwrap();
+                        let c_args: Vec<std::ffi::CString> = args.iter()
+                            .map(|a| std::ffi::CString::new(a.as_bytes()).unwrap())
+                            .collect();
+                        let c_arg_ptrs: Vec<*const libc::c_char> = c_args.iter()
+                            .map(|a| a.as_ptr())
+                            .chain(std::iter::once(std::ptr::null()))
+                            .collect();
+                        unsafe { libc::execv(c_exe.as_ptr(), c_arg_ptrs.as_ptr()); }
+                        // If exec fails, show error in WebView
+                        let _ = _webview.evaluate_script(
+                            "window.showUpdateStatus('Reload failed: exec error')"
+                        );
+                    } else {
+                        let _ = _webview.evaluate_script(
+                            "window.showUpdateStatus('Reload failed: cannot find binary')"
+                        );
+                    }
+                }
+                #[cfg(not(all(unix, not(target_os = "android"))))]
+                {
+                    let _ = _webview.evaluate_script(
+                        "window.showUpdateStatus('Reload not supported on this platform')"
+                    );
+                }
             }
             _ => {}
         }

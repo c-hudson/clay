@@ -59,6 +59,15 @@ pub fn create_delete_action_dialog(action_name: &str) -> PopupDefinition {
     )
 }
 
+/// Create an allow list wildcard warning dialog
+pub fn create_allow_list_warning_dialog() -> PopupDefinition {
+    create_confirm_dialog(
+        "allow_list_warning",
+        "Warning",
+        "Allow list contains '*' which permits all hosts to connect with a password. Continue?",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

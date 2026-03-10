@@ -422,7 +422,7 @@ body {
 }
 
 #prompt {
-    color: var(--theme-prompt, var(--accent-color));
+    color: var(--text-color);
     white-space: pre;
 }
 
@@ -526,7 +526,7 @@ body.device-phone #nav-bar {
     display: flex;
     height: 40px;
 }
-body.device-phone #input { font-size: 16px; }
+body.device-phone #input { font-size: inherit; }
 body.device-phone #status-bar { height: 26px; gap: 8px; padding: 0 10px; }
 /* Hide menu and font slider from phone status bar */
 body.device-phone .status-menu-btn { display: none; }
@@ -2111,7 +2111,6 @@ body.device-phone #output-container { padding: 6px 10px; }
 @media (max-width: 600px) {
     #input {
         min-height: 3.2em;
-        font-size: 16px;
     }
 
     #input-container {

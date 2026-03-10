@@ -1151,15 +1151,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     if !app.settings.websocket_allow_list.is_empty() {
         writeln!(file, "websocket_allow_list={}", app.settings.websocket_allow_list)?;
     }
-    // Get whitelisted_host from running server, or from settings
-    let whitelisted_host = if let Some(ref server) = app.ws_server {
-        server.get_whitelisted_host()
-    } else {
-        app.settings.websocket_whitelisted_host.clone()
-    };
-    if let Some(ref host) = whitelisted_host {
-        writeln!(file, "websocket_whitelisted_host={}", host)?;
-    }
+    // whitelisted_host is runtime-only state, not persisted across reloads
     if !app.settings.websocket_cert_file.is_empty() {
         writeln!(file, "websocket_cert_file={}", app.settings.websocket_cert_file)?;
     }
@@ -1386,17 +1378,17 @@ pub fn unescape_string(s: &str) -> String {
 }
 
 pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
-    debug_log(true, "LOAD_STATE: Starting load_reload_state");
+    debug_log(is_debug_enabled(), "LOAD_STATE: Starting load_reload_state");
     let path = get_reload_state_path();
     if !path.exists() {
-        debug_log(true, "LOAD_STATE: No state file found");
+        debug_log(is_debug_enabled(), "LOAD_STATE: No state file found");
         return Ok(false);
     }
 
-    debug_log(true, &format!("LOAD_STATE: Reading state file: {:?}", path));
+    debug_log(is_debug_enabled(), &format!("LOAD_STATE: Reading state file: {:?}", path));
     let content = std::fs::read_to_string(&path)?;
     let lines: Vec<&str> = content.lines().collect();
-    debug_log(true, &format!("LOAD_STATE: State file has {} lines", lines.len()));
+    debug_log(is_debug_enabled(), &format!("LOAD_STATE: State file has {} lines", lines.len()));
 
     // Parse the reload state
     let mut current_section = String::new();
@@ -1728,7 +1720,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         app.settings.websocket_allow_list = value.to_string();
                     }
                     "websocket_whitelisted_host" => {
-                        app.settings.websocket_whitelisted_host = Some(value.to_string());
+                        // Legacy: ignored, whitelisted_host is now runtime-only state
                     }
                     "websocket_cert_file" => {
                         app.settings.websocket_cert_file = value.to_string();

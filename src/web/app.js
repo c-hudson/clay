@@ -1421,7 +1421,8 @@
                 if (window.AUTO_PASSWORD) break;
                 // Try auth key first (if not multiuser mode - keys are single-user only)
                 if (!msg.multiuser_mode && authKey && tryAuthWithKey()) {
-                    // Key auth attempt sent, wait for response
+                    // Key auth attempt sent, cancel any deferred password auth
+                    deferredAutoLoginPassword = null;
                     break;
                 }
                 // Handle deferred auto-login (Android saved password without username)
@@ -1824,11 +1825,9 @@
 
                         let appendedLineCount = 0;
                         rawLines.forEach(line => {
-                            // Strip ANSI codes to check if line has actual content
-                            // Some MUDs send trailing ANSI reset codes after newlines
-                            const strippedLine = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
-                            // Skip lines that are empty or whitespace-only after stripping ANSI
-                            if (!strippedLine || strippedLine.trim().length === 0) {
+                            // Skip lines that are ONLY ANSI codes with no visible content
+                            // (e.g., trailing reset codes after newlines), but keep blank lines
+                            if (line.length > 0 && line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0) {
                                 return;
                             }
                             // Filter out keep-alive idler message lines
@@ -2801,6 +2800,15 @@
             return;
         }
 
+        // Intercept /reload in remote WebView mode — restart the local GUI binary
+        // (master WebView passes through to server which handles exec_reload with state)
+        if (window.WEBVIEW_MODE && !window.AUTO_PASSWORD &&
+            (cmdTrimmed === '/reload' || cmdTrimmed.startsWith('/reload '))) {
+            elements.input.value = '';
+            window.ipc.postMessage('reload');
+            return;
+        }
+
         const sent = send({
             type: 'SendCommand',
             world_index: currentWorldIndex,
@@ -3134,6 +3142,15 @@
                     window.ipc.postMessage('quit');
                 } else {
                     window.close();
+                }
+                break;
+
+            case '/reload':
+                // Hot reload
+                if (window.ipc && window.ipc.postMessage) {
+                    window.ipc.postMessage('reload');
+                } else {
+                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/reload' });
                 }
                 break;
 
@@ -4657,6 +4674,7 @@
 
     // Show/hide connection error modal
     function showConnectionErrorModal() {
+        elements.connectionErrorText.textContent = 'Unable to connect to the server.';
         elements.connectionErrorModal.className = 'modal visible';
         elements.connectionErrorModal.style.display = 'flex';
         forceRepaint(elements.connectionErrorModal);
@@ -6181,6 +6199,13 @@
             case 'filter':
                 openFilterPopup();
                 break;
+            case 'reload':
+                if (window.ipc && window.ipc.postMessage) {
+                    window.ipc.postMessage('reload');
+                } else {
+                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/reload' });
+                }
+                break;
             case 'resync':
                 // On Android, call native reload method if available
                 if (typeof Android !== 'undefined' && Android.reloadPage) {
@@ -7392,6 +7417,14 @@
                     elements.input.selectionStart = elements.input.selectionEnd = pos;
                 }
             // Note: Ctrl+W handled by window capture-phase listener in init()
+            } else if (e.key === 'r' && e.ctrlKey) {
+                // Ctrl+R: Hot reload
+                e.preventDefault();
+                if (window.ipc && window.ipc.postMessage) {
+                    window.ipc.postMessage('reload');
+                } else {
+                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/reload' });
+                }
             } else if (e.key === 'l' && e.ctrlKey) {
                 // Ctrl+L: Redraw screen — filter out client-generated output, keep only MUD server data
                 e.preventDefault();

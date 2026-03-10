@@ -64,7 +64,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 // ============================================================================
 
 /// Log a remote connection event to clay.remote.log
-fn log_remote_event(event_type: &str, ip: &str, details: &str) {
+pub fn log_remote_event(event_type: &str, ip: &str, details: &str) {
     use std::io::Write;
     let timestamp = crate::util::local_time_now();
     let time_str = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -268,12 +268,13 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     if is_websocket_upgrade(&request) {
         if let Some(ws_state) = ws_state {
             let client_id = ws_state.next_client_id();
+            let pw_hash = ws_state.password_hash.read().unwrap().clone();
             let prefixed = PrefixedStream::new(buf[..n].to_vec(), stream);
             let _ = crate::websocket::handle_ws_client(
                 prefixed,
                 client_id,
                 ws_state.clients.clone(),
-                ws_state.password_hash.clone(),
+                pw_hash,
                 ws_state.allow_list.clone(),
                 ws_state.whitelisted_host.clone(),
                 client_addr,
@@ -315,7 +316,7 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 pub struct WsConnectionState {
     pub clients: Arc<RwLock<HashMap<u64, crate::websocket::WsClientInfo>>>,
     pub next_client_id: Arc<std::sync::Mutex<u64>>,
-    pub password_hash: String,
+    pub password_hash: Arc<std::sync::RwLock<String>>,
     pub allow_list: Arc<std::sync::RwLock<Vec<String>>>,
     pub whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
     pub event_tx: tokio::sync::mpsc::Sender<crate::AppEvent>,

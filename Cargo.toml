@@ -54,8 +54,8 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 libc = "0.2"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-# Audio playback for ANSI music (optional, requires ALSA dev libraries on Linux)
-rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
+# Audio playback (optional, requires ALSA dev libraries on Linux)
+rodio = { version = "0.17", optional = true, default-features = false, features = ["wav", "mp3", "vorbis", "flac"] }
 # WebView GUI (native WebView window using system browser engine)
 wry = { version = "0.48", optional = true }
 tao = { version = "0.34", optional = true }
@@ -64,15 +64,15 @@ gdk = { version = "0.18", optional = true }
 gtk = { version = "0.18", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Audio playback for ANSI music (uses CoreAudio on macOS automatically)
-rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
+# Audio playback (uses CoreAudio on macOS automatically)
+rodio = { version = "0.17", optional = true, default-features = false, features = ["wav", "mp3", "vorbis", "flac"] }
 # WebView GUI (native WebView window using system browser engine)
 wry = { version = "0.48", optional = true }
 tao = { version = "0.34", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# Audio playback for ANSI music (uses WASAPI on Windows automatically)
-rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
+# Audio playback (uses WASAPI on Windows automatically)
+rodio = { version = "0.17", optional = true, default-features = false, features = ["wav", "mp3", "vorbis", "flac"] }
 # WebView GUI (native WebView window using system browser engine)
 wry = { version = "0.48", optional = true }
 tao = { version = "0.34", optional = true }
@@ -84,7 +84,8 @@ winres = "0.1"
 default = ["rustls-backend"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
-webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk", "rodio"]
+native-audio = ["rodio"]
+webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk", "native-audio"]
 
 [[bin]]
 name = "clay-test-server"

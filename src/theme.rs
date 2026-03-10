@@ -1,5 +1,5 @@
 // Theme system for Clay MUD client
-// Loads theme colors from ~/clay.theme.dat and provides them to all renderers
+// Loads theme colors from ~/.clay.theme.dat and provides them to all renderers
 
 use std::collections::HashMap;
 use std::fs;
@@ -88,7 +88,7 @@ pub struct ThemeColors {
 }
 
 impl ThemeColors {
-    /// Default dark theme - imported from ~/clay.theme.dat
+    /// Default dark theme - imported from ~/.clay.theme.dat
     pub fn dark_default() -> Self {
         Self {
             // Background hierarchy

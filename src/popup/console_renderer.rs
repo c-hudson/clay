@@ -27,9 +27,6 @@ pub fn render_popup(f: &mut Frame, state: &mut PopupState, theme: &Theme) {
     // Calculate popup dimensions
     let (popup_area, inner_area) = calculate_popup_area(area, layout, state);
 
-    // Store rendered area for crossterm clipping
-    state.rendered_area = Some(popup_area);
-
     // Update actual_content_height for scroll calculations
     // Inner area height minus space for buttons (if any)
     let button_space = if state.definition.buttons.is_empty() { 0 } else { 2 };

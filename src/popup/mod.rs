@@ -716,8 +716,6 @@ pub struct PopupState {
     pub highlight: Option<PopupHighlight>,
     /// Content areas for mouse-to-line mapping (populated during console rendering)
     pub content_areas: Vec<ContentArea>,
-    /// Last rendered popup area (set during console rendering, used for crossterm clipping)
-    pub rendered_area: Option<ratatui::layout::Rect>,
 }
 
 /// Mouse text highlight state for popup content
@@ -777,7 +775,6 @@ impl PopupState {
             hit_areas: Vec::new(),
             highlight: None,
             content_areas: Vec::new(),
-            rendered_area: None,
         }
     }
 

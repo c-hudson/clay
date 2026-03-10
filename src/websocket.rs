@@ -468,7 +468,7 @@ pub struct GlobalSettingsMsg {
     pub shift_arrow_up_down_mode: String,
     #[serde(default)]
     pub new_line_indicator: bool,
-    /// Theme colors from ~/clay.theme.dat (serialized as hex strings)
+    /// Theme colors from ~/.clay.theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
 }
@@ -534,7 +534,7 @@ pub struct UserCredential {
 pub struct WebSocketServer {
     pub clients: Arc<RwLock<HashMap<u64, WsClientInfo>>>,
     pub next_client_id: Arc<std::sync::Mutex<u64>>,
-    pub password_hash: String,
+    pub password_hash: Arc<std::sync::RwLock<String>>,
     pub running: Arc<RwLock<bool>>,
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub port: u16,
@@ -568,7 +568,7 @@ impl WebSocketServer {
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(std::sync::Mutex::new(1)),
-            password_hash,
+            password_hash: Arc::new(std::sync::RwLock::new(password_hash)),
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: None,
             port,
@@ -707,11 +707,6 @@ impl WebSocketServer {
                 client.received_initial_state = true;
             }
         });
-    }
-
-    /// Get the current whitelisted host (for saving state)
-    pub fn get_whitelisted_host(&self) -> Option<String> {
-        self.whitelisted_host.read().unwrap().clone()
     }
 
     /// Set the client type for a connected client
@@ -899,7 +894,22 @@ impl WebSocketServer {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        // Clear whitelisted host if it's no longer in the new allow list
+        {
+            let mut whitelist = self.whitelisted_host.write().unwrap();
+            if let Some(ref host) = *whitelist {
+                let still_valid = allow_list_vec.iter().any(|entry| entry == "*" || entry == host);
+                if !still_valid {
+                    *whitelist = None;
+                }
+            }
+        }
         *self.allow_list.write().unwrap() = allow_list_vec;
+    }
+
+    /// Update the password hash on the running server (takes effect for new connections)
+    pub fn update_password(&self, password: &str) {
+        *self.password_hash.write().unwrap() = hash_password(password);
     }
 
     pub fn stop(&mut self) {
@@ -930,8 +940,15 @@ pub fn is_ip_in_allow_list(ip: &str, allow_list: &[String]) -> bool {
     let normalized_ip = if ip == "127.0.0.1" || ip == "::1" { "localhost" } else { ip };
 
     for pattern in allow_list {
+        let trimmed = pattern.trim();
+
+        // Bare "*" matches all hosts
+        if trimmed == "*" {
+            return true;
+        }
+
         // Normalize pattern for localhost comparison
-        let normalized_pattern = if pattern == "127.0.0.1" || pattern == "::1" { "localhost" } else { pattern.as_str() };
+        let normalized_pattern = if trimmed == "127.0.0.1" || trimmed == "::1" { "localhost" } else { trimmed };
 
         if let Some(prefix) = normalized_pattern.strip_suffix('*') {
             // Reject overly broad wildcards (must have at least 4 chars before * and contain a dot)
@@ -947,6 +964,11 @@ pub fn is_ip_in_allow_list(ip: &str, allow_list: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Check if any entry in a CSV allow list string contains a bare "*" wildcard.
+pub fn allow_list_has_wildcard(allow_list: &str) -> bool {
+    allow_list.split(',').any(|s| s.trim() == "*")
 }
 
 /// Start the WebSocket server
@@ -1000,7 +1022,7 @@ pub async fn start_websocket_server(
                             };
 
                             let clients = Arc::clone(&clients);
-                            let password_hash = password_hash.clone();
+                            let password_hash = password_hash.read().unwrap().clone();
                             let allow_list = allow_list.clone();
                             let whitelisted_host = whitelisted_host.clone();
                             let event_tx = event_tx.clone();
@@ -1076,9 +1098,9 @@ pub async fn start_websocket_server(
                                             }
                                         }
                                         Err(e) => {
-                                            // TLS handshake failed - send to output area
-                                            let msg = format!("WSS TLS handshake failed from {}: {}", client_addr, e);
-                                            let _ = event_tx.send(AppEvent::SystemMessage(msg)).await;
+                                            // TLS handshake failed - log to remote log
+                                            crate::http::log_remote_event("WSS-TLS-ERROR",
+                                                &client_addr.ip().to_string(), &format!("{}", e));
                                         }
                                     }
                                 } else if let Err(_e) = handle_ws_client(
@@ -1143,22 +1165,20 @@ where
         whitelist_guard.as_ref().map(|h| h == &client_ip).unwrap_or(false)
     };
 
-    // Check allow list - reject if not in allow list and not whitelisted
-    let (allow_list_empty, in_allow_list) = {
-        let allow_list_guard = allow_list.read().unwrap();
-        let empty = allow_list_guard.is_empty();
-        let in_list = is_ip_in_allow_list(&client_ip, &allow_list_guard);
-        (empty, in_list)
-    };
+    // Localhost always allowed for password auth (embedded GUI connects via 127.0.0.1)
+    let is_localhost = client_ip == "127.0.0.1" || client_ip == "::1";
 
-    // Reject connection if:
-    // - Allow list is non-empty AND IP is not in list AND not whitelisted
-    // (Empty allow list = allow everyone, they still need password to authenticate)
-    if !allow_list_empty && !in_allow_list && !is_whitelisted {
-        let msg = format!("WS connection rejected from {} (not in allow list)", client_addr);
-        let _ = event_tx.send(AppEvent::SystemMessage(msg)).await;
-        return Ok(());
-    }
+    // Check allow list for non-auth-key connections.
+    // Auth key validation happens later (after WS handshake) and always bypasses allow list.
+    // Here we just check if the IP is eligible for password-based auth.
+    let in_allow_list = is_localhost || {
+        let allow_list_guard = allow_list.read().unwrap();
+        is_ip_in_allow_list(&client_ip, &allow_list_guard)
+    };
+    let allow_list_empty = !is_localhost && {
+        let allow_list_guard = allow_list.read().unwrap();
+        allow_list_guard.is_empty()
+    };
 
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
@@ -1194,6 +1214,10 @@ where
             viewport_height: 24,  // Default, updated by UpdateViewState
         });
     }
+
+    // Log connection
+    crate::http::log_remote_event("WS-CONNECT", &client_ip,
+        &format!("whitelisted={}", is_whitelisted));
 
     // Notify app of new connection
     let _ = event_tx.send(AppEvent::WsClientConnected(client_id)).await;
@@ -1231,6 +1255,11 @@ where
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match &ws_msg {
                         WsMessage::AuthRequest { username, password_hash: client_hash, auth_key, request_key, challenge_response: uses_challenge, .. } => {
+                            let has_key = auth_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
+                            let has_pw = !client_hash.is_empty();
+                            crate::http::log_remote_event("WS-AUTH", &client_ip,
+                                &format!("has_key={}, has_password={}, challenge={}", has_key, has_pw, uses_challenge));
+
                             // Try auth_key first (device key authentication)
                             // auth_key validation must happen in the app since keys are stored there
                             // So we forward to app and let it respond (include challenge for verification)
@@ -1241,7 +1270,34 @@ where
                                 continue;
                             }
 
-                            // Fall back to password-based authentication
+                            // Password-based auth: check allow list first.
+                            // - Empty allow list: reject (only auth keys accepted)
+                            // - Non-empty allow list: IP must be in list or whitelisted
+                            if allow_list_empty {
+                                crate::http::log_remote_event("WS-REJECT", &client_ip,
+                                    "allow list empty, auth key required");
+                                let _ = tx.send(WsMessage::AuthResponse {
+                                    success: false,
+                                    error: Some("Password auth not available. Use an auth key.".to_string()),
+                                    username: None,
+                                    multiuser_mode,
+                                });
+                                continue;
+                            }
+                            if !in_allow_list && !is_whitelisted {
+                                crate::http::log_remote_event("WS-REJECT", &client_ip,
+                                    "not in allow list");
+                                ban_list.record_violation(&client_ip, "WebSocket: not in allow list");
+                                let _ = tx.send(WsMessage::AuthResponse {
+                                    success: false,
+                                    error: Some("Not authorized from this address".to_string()),
+                                    username: None,
+                                    multiuser_mode,
+                                });
+                                continue;
+                            }
+
+                            // Password-based authentication
                             // If challenge_response is true, client sent SHA256(SHA256(password) + challenge)
                             // We compare by computing SHA256(stored_hash + challenge) on our side
                             let (auth_success, auth_error, auth_username) = if multiuser_mode {

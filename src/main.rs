@@ -13,6 +13,7 @@ pub mod http;
 pub mod persistence;
 pub mod daemon;
 pub mod theme;
+pub mod audio;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
 #[cfg(test)]
@@ -27,7 +28,16 @@ const BUILD_DATE: &str = env!("BUILD_DATE");
 
 // Custom config file path (set via --conf=<path> argument)
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 static CUSTOM_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Global debug flag — set from settings, checked by debug_log and file writes
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Check if debug logging is enabled
+pub fn is_debug_enabled() -> bool {
+    DEBUG_ENABLED.load(Ordering::Relaxed)
+}
 
 /// Set a custom config file path (call early in main before loading settings)
 pub fn set_custom_config_path(path: PathBuf) {
@@ -89,7 +99,7 @@ use std::os::unix::io::{FromRawFd, RawFd};
 #[cfg(all(unix, not(target_os = "android")))]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
@@ -942,22 +952,6 @@ fn generate_test_music_notes() -> Vec<crate::ansi_music::MusicNote> {
     ]
 }
 
-/// Detect available system media player for console audio playback
-fn detect_media_player() -> Option<String> {
-    for cmd in &["mpv", "ffplay"] {
-        if std::process::Command::new("which")
-            .arg(cmd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(cmd.to_string());
-        }
-    }
-    None
-}
 
 pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
     use socket2::SockRef;
@@ -1753,13 +1747,13 @@ fn setup_crash_handler() {
 
         // Log crash to debug file (always log crashes regardless of debug setting)
         let panic_msg = format!("CRASH: {}", panic_info);
-        debug_log(true, &panic_msg);
+        debug_log(is_debug_enabled(), &panic_msg);
 
         // Also log backtrace if available
         let backtrace = std::backtrace::Backtrace::capture();
         let bt_str = format!("{}", backtrace);
         if !bt_str.is_empty() && !bt_str.contains("disabled") {
-            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
         }
 
         // Print the panic info using the default handler
@@ -2276,7 +2270,7 @@ impl World {
             // Use projected line count (current + this line's visual lines) for pause trigger
             let triggers_pause = !goes_to_pending
                 && settings.more_mode_enabled
-                && (self.lines_since_pause + visual_lines) >= max_lines;
+                && (self.lines_since_pause + visual_lines) > max_lines;
 
             // Pre-wrap oversized lines: call wrap_ansi_line once and store each visual
             // line as a separate OutputLine. This caches the wrap result so the renderer
@@ -2376,7 +2370,7 @@ impl World {
                 // Calculate how many visual lines can still fit on screen
                 let remaining = max_lines.saturating_sub(self.lines_since_pause);
 
-                if !is_partial && visual_lines > 1 && remaining < visual_lines {
+                if !is_partial && visual_lines > 1 && remaining > 0 && remaining < visual_lines {
                     // Split the wrapped line: fit what we can on screen, rest goes to pending
                     let wrapped = wrap_ansi_line(line, output_width as usize);
                     let take_count = remaining.min(wrapped.len());
@@ -2681,7 +2675,7 @@ pub struct App {
     pub user_connections: std::collections::HashMap<(usize, String), UserConnection>,
     /// TinyFugue scripting engine
     pub tf_engine: tf::TfEngine,
-    /// Loaded theme colors from ~/clay.theme.dat
+    /// Loaded theme colors from ~/.clay.theme.dat
     pub theme_file: theme::ThemeFile,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
@@ -2699,20 +2693,20 @@ pub struct App {
     pub gui_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Master GUI mode: callback to wake the GUI for immediate repaint
     pub gui_repaint: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-    /// Console media player command ("mpv", "ffplay", or None)
-    pub media_player_cmd: Option<String>,
+    /// Audio backend for console playback (native rodio or external mpv/ffplay)
+    pub audio_backend: audio::AudioBackend,
     /// Directory for cached media files
     pub media_cache_dir: PathBuf,
-    /// Running media processes keyed by identifier (for Stop) - value is (world_idx, child)
-    pub media_processes: std::collections::HashMap<String, (usize, std::process::Child)>,
+    /// Running media playback handles keyed by identifier (for Stop) - value is (world_idx, handle)
+    pub media_processes: std::collections::HashMap<String, (usize, audio::PlayHandle)>,
     /// Current music process key (only one music track at a time) - (world_idx, key)
     pub media_music_key: Option<(usize, String)>,
-    /// Event channel sender for async media process delivery
+    /// Event channel sender for async media events
     pub event_tx: Option<mpsc::Sender<AppEvent>>,
-    /// Currently playing ANSI music process (console playback via mpv/ffplay)
-    /// Tracked so we can kill it before starting a new sequence
-    pub ansi_music_child: Option<std::process::Child>,
-    /// Counter for unique ANSI music WAV filenames (avoids overwriting while player reads)
+    /// Currently playing ANSI music handle
+    /// Tracked so we can stop it before starting a new sequence
+    pub ansi_music_handle: Option<audio::PlayHandle>,
+    /// Counter for unique ANSI music WAV filenames (external player only)
     pub ansi_music_counter: u32,
     /// Test-only: log of all messages passed to ws_broadcast() and ws_broadcast_to_world()
     #[cfg(test)]
@@ -2728,6 +2722,8 @@ enum WsAsyncAction {
     Connect { world_index: usize, prev_index: usize, broadcast: bool },
     /// Need to run /disconnect for world_index. prev_index is the world to restore after.
     Disconnect { world_index: usize, prev_index: usize },
+    /// Need to trigger hot reload (exec_reload).
+    Reload,
 }
 
 impl App {
@@ -2784,7 +2780,7 @@ impl App {
             backfill_next: None,
             gui_tx: None, // Set when running in master GUI mode (--gui)
             gui_repaint: None,
-            media_player_cmd: detect_media_player(),
+            audio_backend: audio::init_audio(),
             media_cache_dir: {
                 let home = get_home_dir();
                 PathBuf::from(home).join(clay_filename("clay")).join("media")
@@ -2792,7 +2788,7 @@ impl App {
             media_processes: std::collections::HashMap::new(),
             media_music_key: None,
             event_tx: None,
-            ansi_music_child: None,
+            ansi_music_handle: None,
             ansi_music_counter: 0,
             #[cfg(test)]
             ws_broadcast_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2861,6 +2857,7 @@ impl App {
         self.settings.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
         self.show_tags = settings.show_tags;
         self.settings.debug_enabled = settings.debug_enabled;
+        DEBUG_ENABLED.store(settings.debug_enabled, Ordering::Relaxed);
         self.settings.ansi_music_enabled = settings.ansi_music_enabled;
         self.settings.theme = Theme::from_name(&settings.console_theme);
         self.settings.gui_theme = Theme::from_name(&settings.gui_theme);
@@ -3404,14 +3401,16 @@ impl App {
                     // Dedup: skip ServerData that has already been received (e.g., after resync)
                     if msg_seq > 0 && msg_seq <= world.max_received_seq {
                         // Log duplicate to debug file
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("clay.output.debug")
-                        {
-                            let _ = writeln!(f, "DUPLICATE [console] in '{}': line_seq={}, max_seq={}, text={:?}",
-                                world.name, msg_seq, world.max_received_seq,
-                                data.chars().take(200).collect::<String>());
+                        if is_debug_enabled() {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).append(true)
+                                .open("clay.output.debug")
+                            {
+                                let _ = writeln!(f, "DUPLICATE [console] in '{}': line_seq={}, max_seq={}, text={:?}",
+                                    world.name, msg_seq, world.max_received_seq,
+                                    data.chars().take(200).collect::<String>());
+                            }
                         }
                         // Report back to server
                         if let Some(ref tx) = self.ws_client_tx {
@@ -4282,86 +4281,45 @@ impl App {
                                 self.worlds[world_idx].active_media.insert(key.to_string(), json_data.to_string());
                             }
 
-                            // Only spawn audio processes when play_audio is true and a player is available
-                            #[allow(clippy::collapsible_if)]
-                            if play_audio {
-                                if let Some(ref player_cmd) = self.media_player_cmd {
-                                    // For music type: stop previous music (unless continue)
-                                    if media_type == "music" {
-                                        if cont {
-                                            if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
-                                                return;
-                                            }
-                                        }
-                                        if let Some((_, prev_key)) = self.media_music_key.take() {
-                                            if let Some((_, mut child)) = self.media_processes.remove(&prev_key) {
-                                                let _ = child.kill();
-                                            }
+                            // Only play audio when play_audio is true and backend is available
+                            if play_audio && !matches!(self.audio_backend, audio::AudioBackend::None) {
+                                // For music type: stop previous music (unless continue)
+                                if media_type == "music" {
+                                    if cont {
+                                        if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
+                                            return;
                                         }
                                     }
-
-                                    let _ = std::fs::create_dir_all(&self.media_cache_dir);
-                                    let safe_name = full_url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
-                                    let cache_path = self.media_cache_dir.join(&safe_name);
-                                    let player = player_cmd.clone();
-                                    let key_owned = key.to_string();
-                                    let cache_path_str = cache_path.to_string_lossy().to_string();
-                                    let vol = volume;
-                                    let loop_count = loops;
-                                    let is_music = media_type == "music";
-                                    let event_tx = self.event_tx.clone();
-
-                                    std::thread::spawn(move || {
-                                        if !cache_path.exists() {
-                                            let output = std::process::Command::new("curl")
-                                                .args(["-sL", "-o", &cache_path_str, &full_url])
-                                                .output();
-                                            if output.is_err() || !cache_path.exists() {
-                                                return;
-                                            }
+                                    if let Some((_, prev_key)) = self.media_music_key.take() {
+                                        if let Some((_, mut handle)) = self.media_processes.remove(&prev_key) {
+                                            handle.kill();
                                         }
-                                        let mut cmd = std::process::Command::new(&player);
-                                        match player.as_str() {
-                                            "mpv" => {
-                                                cmd.args(["--no-video", "--no-terminal"]);
-                                                cmd.arg(format!("--volume={}", vol));
-                                                if loop_count == -1 {
-                                                    cmd.arg("--loop=inf");
-                                                } else if loop_count > 1 {
-                                                    cmd.arg(format!("--loop={}", loop_count));
-                                                }
-                                            }
-                                            "ffplay" => {
-                                                cmd.args(["-nodisp", "-autoexit"]);
-                                                cmd.arg("-volume").arg(format!("{}", vol));
-                                                if loop_count == -1 || loop_count > 1 {
-                                                    cmd.arg("-loop").arg(
-                                                        if loop_count == -1 { "0".to_string() }
-                                                        else { loop_count.to_string() }
-                                                    );
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                        cmd.arg(&cache_path_str);
-                                        cmd.stdout(std::process::Stdio::null());
-                                        cmd.stderr(std::process::Stdio::null());
-                                        if let Ok(child) = cmd.spawn() {
-                                            if let Some(tx) = event_tx {
-                                                let _ = tx.blocking_send(AppEvent::MediaProcessReady(
-                                                    world_idx, key_owned, child, is_music,
-                                                ));
-                                            }
-                                        }
-                                    });
+                                    }
                                 }
+
+                                let cache_dir = self.media_cache_dir.clone();
+                                let key_owned = key.to_string();
+                                let vol = volume;
+                                let loop_count = loops;
+                                let is_music = media_type == "music";
+                                let event_tx = self.event_tx.clone();
+
+                                std::thread::spawn(move || {
+                                    if let Some(cache_path) = audio::download_to_cache(&full_url, &cache_dir) {
+                                        if let Some(tx) = event_tx {
+                                            let _ = tx.blocking_send(AppEvent::MediaFileReady(
+                                                world_idx, key_owned, cache_path, vol, loop_count, is_music,
+                                            ));
+                                        }
+                                    }
+                                });
                             }
                         }
                         "Stop" => {
-                            // Always update tracking state and kill processes
+                            // Always update tracking state and stop playback
                             if !key.is_empty() {
-                                if let Some((_, mut child)) = self.media_processes.remove(key) {
-                                    let _ = child.kill();
+                                if let Some((_, mut handle)) = self.media_processes.remove(key) {
+                                    handle.kill();
                                 }
                                 self.worlds[world_idx].active_media.remove(key);
                                 if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
@@ -4370,8 +4328,8 @@ impl App {
                             } else if media_type == "music" {
                                 if let Some((_, mk)) = self.media_music_key.take() {
                                     self.worlds[world_idx].active_media.remove(&mk);
-                                    if let Some((_, mut child)) = self.media_processes.remove(&mk) {
-                                        let _ = child.kill();
+                                    if let Some((_, mut handle)) = self.media_processes.remove(&mk) {
+                                        handle.kill();
                                     }
                                 }
                             }
@@ -4385,15 +4343,9 @@ impl App {
                             } else {
                                 return;
                             };
-                            let _ = std::fs::create_dir_all(&self.media_cache_dir);
-                            let safe_name = full_url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
-                            let cache_path_str = self.media_cache_dir.join(&safe_name).to_string_lossy().to_string();
+                            let cache_dir = self.media_cache_dir.clone();
                             std::thread::spawn(move || {
-                                let _ = std::process::Command::new("curl")
-                                    .args(["-sL", "-o", &cache_path_str, &full_url])
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .status();
+                                let _ = audio::download_to_cache(&full_url, &cache_dir);
                             });
                         }
                         _ => {}
@@ -4406,14 +4358,14 @@ impl App {
 
     /// Stop all media processes for a specific world
     fn stop_world_media(&mut self, world_idx: usize) {
-        // Kill media processes belonging to this world
+        // Stop media playback belonging to this world
         let keys_to_remove: Vec<String> = self.media_processes.iter()
             .filter(|(_, (idx, _))| *idx == world_idx)
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys_to_remove {
-            if let Some((_, mut child)) = self.media_processes.remove(&key) {
-                let _ = child.kill();
+            if let Some((_, mut handle)) = self.media_processes.remove(&key) {
+                handle.kill();
             }
         }
         // Clear music key if it belongs to this world
@@ -4446,42 +4398,24 @@ impl App {
         }
     }
 
-    /// Play ANSI music notes on the console via mpv/ffplay.
-    /// Kills any currently playing ANSI music first to prevent overlapping playback.
-    /// Uses unique filenames to avoid overwriting a WAV file while the player reads it.
+    /// Play ANSI music notes on the console.
+    /// Stops any currently playing ANSI music first to prevent overlapping playback.
     fn play_ansi_music_console(&mut self, notes: &[crate::ansi_music::MusicNote]) {
-        let player_cmd = match self.media_player_cmd {
-            Some(ref cmd) => cmd.clone(),
-            None => return,
-        };
-
-        // Kill any currently playing ANSI music process
-        if let Some(mut child) = self.ansi_music_child.take() {
-            let _ = child.kill();
-            let _ = child.wait(); // Reap to avoid zombie
+        // Stop any currently playing ANSI music
+        if let Some(mut handle) = self.ansi_music_handle.take() {
+            handle.stop();
         }
 
         let wav_data = generate_wav_from_notes(notes);
-        let _ = std::fs::create_dir_all(&self.media_cache_dir);
-
-        // Use a unique filename so we don't overwrite a file the previous player
-        // might still be reading (even after kill, there can be a brief delay)
         self.ansi_music_counter = self.ansi_music_counter.wrapping_add(1);
-        let wav_path = self.media_cache_dir.join(format!("ansi_music_{}.wav", self.ansi_music_counter % 4));
 
-        if std::fs::write(&wav_path, &wav_data).is_ok() {
-            let wav_path_str = wav_path.to_string_lossy().to_string();
-            let mut cmd = std::process::Command::new(&player_cmd);
-            match player_cmd.as_str() {
-                "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
-                "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
-                _ => { cmd.arg(&wav_path_str); }
-            }
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
-            if let Ok(child) = cmd.spawn() {
-                self.ansi_music_child = Some(child);
-            }
+        if let Some(handle) = audio::play_wav_memory(
+            &self.audio_backend,
+            wav_data,
+            &self.media_cache_dir,
+            self.ansi_music_counter,
+        ) {
+            self.ansi_music_handle = Some(handle);
         }
     }
 
@@ -4513,8 +4447,7 @@ impl App {
                     }
                 }
                 // Log if we didn't send to anyone (for debugging)
-                if sent_count == 0 && !clients_guard.is_empty() {
-                    // Clients connected but none authenticated
+                if is_debug_enabled() && sent_count == 0 && !clients_guard.is_empty() {
                     use std::io::Write;
                     if let Ok(mut f) = std::fs::OpenOptions::new()
                         .create(true).append(true)
@@ -5302,8 +5235,14 @@ impl App {
     /// Handle WsAuthKeyValidation event.
     fn handle_ws_auth_key_validation(&mut self, client_id: u64, msg: WsMessage, client_ip: &str, challenge: &str) {
         if let WsMessage::AuthRequest { auth_key: Some(key), current_world, challenge_response: uses_challenge, .. } = msg {
+            let keys_before = self.settings.websocket_auth_keys.len();
             // Prune expired keys
             self.settings.websocket_auth_keys.retain(|ak| !ak.is_expired());
+            let keys_after = self.settings.websocket_auth_keys.len();
+            let expired = keys_before - keys_after;
+
+            crate::http::log_remote_event("WS-KEY", client_ip,
+                &format!("challenge={}, stored_keys={}, expired={}", uses_challenge, keys_after, expired));
 
             // If challenge_response, client sent SHA256(auth_key + challenge)
             // We compute SHA256(stored_key + challenge) for each stored key and compare
@@ -5316,6 +5255,7 @@ impl App {
                 self.settings.websocket_auth_keys.iter().any(|ak| ak.key == key)
             };
             if is_valid {
+                crate::http::log_remote_event("WS-KEY-OK", client_ip, "accepted");
                 self.ws_set_client_authenticated(client_id, true);
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: true,
@@ -5335,6 +5275,8 @@ impl App {
                     dimensions: None,
                 });
             } else {
+                crate::http::log_remote_event("WS-KEY-REJECT", client_ip,
+                    &format!("key not found in {} stored keys", keys_after));
                 self.ban_list.record_violation(client_ip, "WebSocket: failed auth key");
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: false,
@@ -5975,17 +5917,8 @@ impl App {
                 // Bounce back to client — /update should run locally on the client's machine
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
             }
-            // Commands that should be blocked from remote
             Command::Reload => {
-                self.ws_broadcast(WsMessage::ServerData {
-                    world_index,
-                    data: "This command is not available from remote interfaces.".to_string(),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                });
+                return WsAsyncAction::Reload;
             }
             // UI popup commands - send back to client for local handling
             Command::Help | Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
@@ -6639,6 +6572,7 @@ impl App {
                 self.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
                 self.show_tags = show_tags;
                 self.settings.debug_enabled = debug_enabled;
+                DEBUG_ENABLED.store(debug_enabled, Ordering::Relaxed);
                 self.settings.ansi_music_enabled = ansi_music_enabled;
                 // Console theme affects the TUI on the server
                 self.settings.theme = Theme::from_name(&console_theme);
@@ -6901,7 +6835,7 @@ impl App {
             }
             WsMessage::SaveThemeFile => {
                 let content = self.theme_file.generate_file_content();
-                let path = std::path::Path::new(&get_home_dir()).join("clay.theme.dat");
+                let path = std::path::Path::new(&get_home_dir()).join(clay_filename("clay.theme.dat"));
                 match std::fs::write(&path, &content) {
                     Ok(_) => {
                         self.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: true, error: None });
@@ -6947,27 +6881,31 @@ impl App {
                 self.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
             }
             WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-                let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("clay.output.debug")
-                {
-                    let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                        source, world_name, expected_seq_gt, actual_seq,
-                        line_text.chars().take(80).collect::<String>());
+                if is_debug_enabled() {
+                    let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true).append(true)
+                        .open("clay.output.debug")
+                    {
+                        let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                            source, world_name, expected_seq_gt, actual_seq,
+                            line_text.chars().take(80).collect::<String>());
+                    }
                 }
             }
             WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
-                let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("clay.output.debug")
-                {
-                    let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                        source, world_name, line_seq, max_seq,
+                if is_debug_enabled() {
+                    let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true).append(true)
+                        .open("clay.output.debug")
+                    {
+                        let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                            source, world_name, line_seq, max_seq,
                         line_text.chars().take(200).collect::<String>());
+                    }
                 }
             }
             WsMessage::ClientTypeDeclaration { client_type } => {
@@ -7804,8 +7742,8 @@ pub enum AppEvent {
     MsdpNegotiated(String),                   // world_name
     GmcpReceived(String, String, String),     // world_name, package, json_data
     MsdpReceived(String, String, String),     // world_name, variable, value_json
-    // Media process ready from background download/spawn thread
-    MediaProcessReady(usize, String, std::process::Child, bool),  // world_idx, key, child, is_music
+    // Media file downloaded and ready to play
+    MediaFileReady(usize, String, std::path::PathBuf, i64, i64, bool),  // world_idx, key, path, volume, loops, is_music
     // API lookup result (dict/urban/translate) from spawned task
     ApiLookupResult(u64, usize, Result<String, String>),  // client_id, world_index, Ok(input_text) or Err(error)
     // Result from background update check/download
@@ -7913,11 +7851,18 @@ fn debug_log(debug_enabled: bool, message: &str) {
     }
 }
 
-/// Load theme file from ~/clay.theme.dat into app.theme_file
+/// Load theme file from ~/.clay.theme.dat into app.theme_file
 /// If the file doesn't exist, generates a default one and loads defaults
 fn load_theme_file(app: &mut App) {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let theme_path = std::path::Path::new(&home).join("clay.theme.dat");
+    let theme_path = std::path::Path::new(&home).join(clay_filename("clay.theme.dat"));
+    // Migrate old ~/clay.theme.dat → ~/.clay.theme.dat
+    if !theme_path.exists() {
+        let old_path = std::path::Path::new(&home).join("clay.theme.dat");
+        if old_path.exists() {
+            let _ = std::fs::rename(&old_path, &theme_path);
+        }
+    }
     if !theme_path.exists() {
         // Generate default theme file
         let content = theme::ThemeFile::generate_default_file();
@@ -8303,7 +8248,7 @@ fn strip_deleted_suffix(path_str: &str) -> String {
 /// We strip that suffix to get the path to the new binary.
 /// Returns (path, debug_info) for better error messages.
 #[cfg(all(unix, not(target_os = "android")))]
-fn get_executable_path() -> io::Result<(PathBuf, String)> {
+pub fn get_executable_path() -> io::Result<(PathBuf, String)> {
     let proc_exe = PathBuf::from("/proc/self/exe");
     let link_target = std::fs::read_link(&proc_exe)?;
     let target_str = link_target.to_string_lossy().to_string();
@@ -8505,13 +8450,13 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
 }
 
 #[cfg(all(unix, not(target_os = "android")))]
-fn exec_reload(app: &App) -> io::Result<()> {
-    debug_log(true, "RELOAD: Starting exec_reload");
+pub fn exec_reload(app: &App) -> io::Result<()> {
+    debug_log(is_debug_enabled(), "RELOAD: Starting exec_reload");
 
     // Save the current state
-    debug_log(true, "RELOAD: Saving state...");
+    debug_log(is_debug_enabled(), "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
-    debug_log(true, "RELOAD: State saved successfully");
+    debug_log(is_debug_enabled(), "RELOAD: State saved successfully");
 
     // Collect socket fds that need to survive exec (plain TCP only)
     // TLS proxy connections reconnect via Unix socket path after reload
@@ -8525,11 +8470,11 @@ fn exec_reload(app: &App) -> io::Result<()> {
             // If clear_cloexec fails, the FD is stale - just skip it
         }
     }
-    debug_log(true, &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));
+    debug_log(is_debug_enabled(), &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));
 
     // Get the executable path with debug info
     let (exe, debug_info) = get_executable_path()?;
-    debug_log(true, &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
+    debug_log(is_debug_enabled(), &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
 
     // Verify the executable exists
     if !exe.exists() {
@@ -8547,7 +8492,7 @@ fn exec_reload(app: &App) -> io::Result<()> {
         .join(",");
     std::env::set_var(RELOAD_FDS_ENV, &fds_str);
 
-    debug_log(true, &format!("RELOAD: About to exec with fds={}", fds_str));
+    debug_log(is_debug_enabled(), &format!("RELOAD: About to exec with fds={}", fds_str));
 
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
@@ -8839,8 +8784,8 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             let any_popup_visible = app.has_new_popup() || app.confirm_dialog.visible;
 
             // When transitioning to popup: terminal.clear() resets ratatui's buffers
-            // On popup transition: clear ratatui buffers for full popup coverage.
-            // Crossterm restores output AFTER ratatui, skipping popup rows.
+            // so the diff writes ALL popup cells (full coverage, no bleed-through).
+            // Ratatui handles both output and popup rendering when popup is visible.
             if any_popup_visible && !app.popup_was_visible {
                 terminal.clear()?;
             }
@@ -9226,6 +9171,10 @@ fn handle_remote_client_key(
                             app.open_actions_list_popup();
                         }
                     }
+                } else if data.contains_key("web_save_remote") {
+                    // Allow list wildcard warning confirmed — apply settings
+                    let settings = web_settings_from_custom_data(&data);
+                    apply_remote_web_settings(app, &settings, &ws_tx);
                 }
             }
             NewPopupAction::ConfirmCancelled(data) => {
@@ -9309,51 +9258,22 @@ fn handle_remote_client_key(
                 });
             }
             NewPopupAction::WebSaved(settings) => {
-                // Update local web settings
-                app.settings.web_secure = settings.web_secure;
-                app.settings.http_enabled = settings.http_enabled;
-                app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
-                app.settings.websocket_allow_list = settings.ws_allow_list.clone();
-                app.settings.websocket_cert_file = settings.ws_cert_file.clone();
-                app.settings.websocket_key_file = settings.ws_key_file.clone();
-                // Password update handled separately if changed
-
-                // Send UpdateGlobalSettings to daemon
-                let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
-                    more_mode_enabled: app.settings.more_mode_enabled,
-                    spell_check_enabled: app.settings.spell_check_enabled,
-                    temp_convert_enabled: app.settings.temp_convert_enabled,
-                    world_switch_mode: app.settings.world_switch_mode.name().to_string(),
-                    show_tags: app.show_tags,
-                    debug_enabled: app.settings.debug_enabled,
-                    ansi_music_enabled: app.settings.ansi_music_enabled,
-                    console_theme: app.settings.theme.name().to_string(),
-                    gui_theme: app.settings.gui_theme.name().to_string(),
-                    gui_transparency: app.settings.gui_transparency,
-                    color_offset_percent: app.settings.color_offset_percent,
-                    input_height: app.input_height,
-                    font_name: app.settings.font_name.clone(),
-                    font_size: app.settings.font_size,
-                    web_font_size_phone: app.settings.web_font_size_phone,
-                    web_font_size_tablet: app.settings.web_font_size_tablet,
-                    web_font_size_desktop: app.settings.web_font_size_desktop,
-                    web_font_weight: app.settings.web_font_weight,
-                    ws_allow_list: app.settings.websocket_allow_list.clone(),
-                    web_secure: app.settings.web_secure,
-                    http_enabled: app.settings.http_enabled,
-                    http_port: app.settings.http_port,
-                    ws_enabled: false,  // Legacy
-                    ws_port: 0,         // Legacy
-                    ws_cert_file: app.settings.websocket_cert_file.clone(),
-                    ws_key_file: app.settings.websocket_key_file.clone(),
-                    tls_proxy_enabled: app.settings.tls_proxy_enabled,
-                    dictionary_path: app.settings.dictionary_path.clone(),
-                    mouse_enabled: app.settings.mouse_enabled,
-                    zwj_enabled: app.settings.zwj_enabled,
-                    arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
-                    shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
-                    new_line_indicator: app.settings.new_line_indicator,
-                });
+                // Check for wildcard '*' in allow list — warn user
+                if crate::websocket::allow_list_has_wildcard(&settings.ws_allow_list) {
+                    use popup::definitions::confirm::create_allow_list_warning_dialog;
+                    let mut def = create_allow_list_warning_dialog();
+                    def.custom_data.insert("web_save_remote".to_string(), "1".to_string());
+                    def.custom_data.insert("web_secure".to_string(), settings.web_secure.to_string());
+                    def.custom_data.insert("http_enabled".to_string(), settings.http_enabled.to_string());
+                    def.custom_data.insert("http_port".to_string(), settings.http_port);
+                    def.custom_data.insert("ws_password".to_string(), settings.ws_password);
+                    def.custom_data.insert("ws_allow_list".to_string(), settings.ws_allow_list);
+                    def.custom_data.insert("ws_cert_file".to_string(), settings.ws_cert_file);
+                    def.custom_data.insert("ws_key_file".to_string(), settings.ws_key_file);
+                    app.popup_manager.open(def);
+                } else {
+                    apply_remote_web_settings(app, &settings, &ws_tx);
+                }
             }
             NewPopupAction::ConnectionsClose => {
                 // Connections popup closed - no action needed
@@ -10237,6 +10157,102 @@ struct WebSettings {
     ws_key_file: String,
 }
 
+/// Apply web settings to app and save to disk
+fn apply_web_settings(app: &mut App, settings: &WebSettings) {
+    let port_changed = app.settings.http_port != settings.http_port.parse().unwrap_or(9000);
+    let secure_changed = app.settings.web_secure != settings.web_secure;
+    let http_changed = app.settings.http_enabled != settings.http_enabled;
+    let cert_changed = app.settings.websocket_cert_file != settings.ws_cert_file
+        || app.settings.websocket_key_file != settings.ws_key_file;
+
+    app.settings.web_secure = settings.web_secure;
+    app.settings.http_enabled = settings.http_enabled;
+    app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
+    app.settings.websocket_password = settings.ws_password.clone();
+    app.settings.websocket_allow_list = settings.ws_allow_list.clone();
+    app.settings.websocket_cert_file = settings.ws_cert_file.clone();
+    app.settings.websocket_key_file = settings.ws_key_file.clone();
+
+    // Update the running server's allow list and password immediately (no reload needed)
+    if let Some(ref server) = app.ws_server {
+        server.update_allow_list(&settings.ws_allow_list);
+        if !settings.ws_password.is_empty() {
+            server.update_password(&settings.ws_password);
+        }
+    }
+
+    let _ = persistence::save_settings(app);
+
+    if port_changed || secure_changed || http_changed || cert_changed {
+        app.add_output("Web settings saved. Use /reload to apply server changes.");
+    } else {
+        app.add_output("Web settings saved.");
+    }
+}
+
+/// Extract WebSettings from a confirm dialog's custom_data
+fn web_settings_from_custom_data(data: &std::collections::HashMap<String, String>) -> WebSettings {
+    WebSettings {
+        web_secure: data.get("web_secure").map(|v| v == "true").unwrap_or(false),
+        http_enabled: data.get("http_enabled").map(|v| v == "true").unwrap_or(false),
+        http_port: data.get("http_port").cloned().unwrap_or_else(|| "9000".to_string()),
+        ws_password: data.get("ws_password").cloned().unwrap_or_default(),
+        ws_allow_list: data.get("ws_allow_list").cloned().unwrap_or_default(),
+        ws_cert_file: data.get("ws_cert_file").cloned().unwrap_or_default(),
+        ws_key_file: data.get("ws_key_file").cloned().unwrap_or_default(),
+    }
+}
+
+/// Apply web settings from a remote console client (sends UpdateGlobalSettings to daemon)
+fn apply_remote_web_settings(
+    app: &mut App,
+    settings: &WebSettings,
+    ws_tx: &tokio::sync::mpsc::UnboundedSender<crate::websocket::WsMessage>,
+) {
+    app.settings.web_secure = settings.web_secure;
+    app.settings.http_enabled = settings.http_enabled;
+    app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
+    app.settings.websocket_allow_list = settings.ws_allow_list.clone();
+    app.settings.websocket_cert_file = settings.ws_cert_file.clone();
+    app.settings.websocket_key_file = settings.ws_key_file.clone();
+
+    let _ = ws_tx.send(crate::websocket::WsMessage::UpdateGlobalSettings {
+        more_mode_enabled: app.settings.more_mode_enabled,
+        spell_check_enabled: app.settings.spell_check_enabled,
+        temp_convert_enabled: app.settings.temp_convert_enabled,
+        world_switch_mode: app.settings.world_switch_mode.name().to_string(),
+        show_tags: app.show_tags,
+        debug_enabled: app.settings.debug_enabled,
+        ansi_music_enabled: app.settings.ansi_music_enabled,
+        console_theme: app.settings.theme.name().to_string(),
+        gui_theme: app.settings.gui_theme.name().to_string(),
+        gui_transparency: app.settings.gui_transparency,
+        color_offset_percent: app.settings.color_offset_percent,
+        input_height: app.input_height,
+        font_name: app.settings.font_name.clone(),
+        font_size: app.settings.font_size,
+        web_font_size_phone: app.settings.web_font_size_phone,
+        web_font_size_tablet: app.settings.web_font_size_tablet,
+        web_font_size_desktop: app.settings.web_font_size_desktop,
+        web_font_weight: app.settings.web_font_weight,
+        ws_allow_list: app.settings.websocket_allow_list.clone(),
+        web_secure: app.settings.web_secure,
+        http_enabled: app.settings.http_enabled,
+        http_port: app.settings.http_port,
+        ws_enabled: false,  // Legacy
+        ws_port: 0,         // Legacy
+        ws_cert_file: app.settings.websocket_cert_file.clone(),
+        ws_key_file: app.settings.websocket_key_file.clone(),
+        tls_proxy_enabled: app.settings.tls_proxy_enabled,
+        dictionary_path: app.settings.dictionary_path.clone(),
+        mouse_enabled: app.settings.mouse_enabled,
+        zwj_enabled: app.settings.zwj_enabled,
+        arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
+        shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
+        new_line_indicator: app.settings.new_line_indicator,
+    });
+}
+
 /// Settings from the world editor popup
 struct WorldEditorSettings {
     world_index: usize,  // Which world is being edited
@@ -10337,7 +10353,9 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
 
     let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
     let is_menu = popup_id == Some(popup::PopupId("menu"));
-    let is_confirm = popup_id.as_ref().map(|id| id.0.starts_with("delete_")).unwrap_or(false);
+    let is_confirm = app.popup_manager.current().map(|s| {
+        s.definition.buttons.iter().any(|b| b.id == popup::definitions::confirm::CONFIRM_BTN_YES)
+    }).unwrap_or(false);
     let is_world_selector = popup_id == Some(popup::PopupId("world_selector"));
     let is_setup = popup_id == Some(popup::PopupId("setup"));
     let is_web = popup_id == Some(popup::PopupId("web"));
@@ -11740,6 +11758,7 @@ fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+
     // =========================================================================
     // CLI argument parsing - single structured pass with validation
     // =========================================================================
@@ -11822,7 +11841,7 @@ async fn main() -> io::Result<()> {
     }
 
     // Log startup for debugging reload/crash issues
-    debug_log(true, &format!("STARTUP: {} (reload={}, crash={})", get_version_string(), is_reload_arg, is_crash_arg));
+    debug_log(is_debug_enabled(), &format!("STARTUP: {} (reload={}, crash={})", get_version_string(), is_reload_arg, is_crash_arg));
 
     // Validate mutual exclusivity
     if console_arg.is_some() && gui_arg.is_some() {
@@ -11935,7 +11954,7 @@ async fn main() -> io::Result<()> {
             // Restore terminal before printing
             let _ = disable_raw_mode();
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-            debug_log(true, "CRASH: SIGFPE (Floating Point Exception)");
+            debug_log(is_debug_enabled(), "CRASH: SIGFPE (Floating Point Exception)");
             eprintln!("\n\n=== SIGFPE (Floating Point Exception) detected! ===");
             eprintln!("This is typically caused by division by zero.");
             eprintln!("Please report this bug with the steps to reproduce.");
@@ -11944,7 +11963,7 @@ async fn main() -> io::Result<()> {
             eprintln!("\nBacktrace:");
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_str = format!("{}", bt);
-            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
             eprintln!("{}", bt);
 
             std::process::exit(136);  // 128 + 8 (SIGFPE)
@@ -11954,11 +11973,11 @@ async fn main() -> io::Result<()> {
         extern "C" fn sigsegv_handler(_: libc::c_int) {
             let _ = disable_raw_mode();
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-            debug_log(true, "CRASH: SIGSEGV (Segmentation Fault)");
+            debug_log(is_debug_enabled(), "CRASH: SIGSEGV (Segmentation Fault)");
             eprintln!("\n\n=== SIGSEGV (Segmentation Fault) detected! ===");
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_str = format!("{}", bt);
-            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
             eprintln!("{}", bt);
             std::process::exit(139);  // 128 + 11 (SIGSEGV)
         }
@@ -11967,11 +11986,11 @@ async fn main() -> io::Result<()> {
         extern "C" fn sigbus_handler(_: libc::c_int) {
             let _ = disable_raw_mode();
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-            debug_log(true, "CRASH: SIGBUS (Bus Error)");
+            debug_log(is_debug_enabled(), "CRASH: SIGBUS (Bus Error)");
             eprintln!("\n\n=== SIGBUS (Bus Error) detected! ===");
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_str = format!("{}", bt);
-            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
             eprintln!("{}", bt);
             std::process::exit(135);  // 128 + 7 (SIGBUS)
         }
@@ -11980,11 +11999,11 @@ async fn main() -> io::Result<()> {
         extern "C" fn sigabrt_handler(_: libc::c_int) {
             let _ = disable_raw_mode();
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-            debug_log(true, "CRASH: SIGABRT (Abort)");
+            debug_log(is_debug_enabled(), "CRASH: SIGABRT (Abort)");
             eprintln!("\n\n=== SIGABRT (Abort) detected! ===");
             let bt = std::backtrace::Backtrace::force_capture();
             let bt_str = format!("{}", bt);
-            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+            debug_log(is_debug_enabled(), &format!("BACKTRACE:\n{}", bt_str));
             eprintln!("{}", bt);
             std::process::exit(134);  // 128 + 6 (SIGABRT)
         }
@@ -12047,19 +12066,19 @@ pub async fn run_app_headless(
     let should_load_state = is_reload || is_crash;
 
     if should_load_state {
-        debug_log(true, "HEADLESS STARTUP: Loading reload state...");
+        debug_log(is_debug_enabled(), "HEADLESS STARTUP: Loading reload state...");
         match persistence::load_reload_state(&mut app) {
             Ok(true) => {
-                debug_log(true, "HEADLESS STARTUP: Reload state loaded successfully");
+                debug_log(is_debug_enabled(), "HEADLESS STARTUP: Reload state loaded successfully");
             }
             Ok(false) => {
-                debug_log(true, "HEADLESS STARTUP: No reload state found");
+                debug_log(is_debug_enabled(), "HEADLESS STARTUP: No reload state found");
                 if let Err(e) = persistence::load_settings(&mut app) {
                     eprintln!("Warning: Could not load settings: {}", e);
                 }
             }
             Err(e) => {
-                debug_log(true, &format!("HEADLESS STARTUP: Failed to load reload state: {}", e));
+                debug_log(is_debug_enabled(), &format!("HEADLESS STARTUP: Failed to load reload state: {}", e));
                 if let Err(e) = persistence::load_settings(&mut app) {
                     eprintln!("Warning: Could not load settings: {}", e);
                 }
@@ -12084,10 +12103,13 @@ pub async fn run_app_headless(
         }
     }
 
+    // Sync global debug flag from loaded settings
+    DEBUG_ENABLED.store(app.settings.debug_enabled, Ordering::Relaxed);
+
     // Pre-compile action regexes after loading settings or reload state
     compile_all_action_regexes(&mut app.settings.actions);
 
-    // Load theme file (~/clay.theme.dat)
+    // Load theme file (~/.clay.theme.dat)
     load_theme_file(&mut app);
 
     app.ensure_has_world();
@@ -12103,7 +12125,7 @@ pub async fn run_app_headless(
     // Reconstruct connections from saved fds if in reload/crash mode
     #[cfg(unix)]
     if should_load_state {
-        debug_log(true, "HEADLESS STARTUP: Reconstructing connections...");
+        debug_log(is_debug_enabled(), "HEADLESS STARTUP: Reconstructing connections...");
         // First pass: disconnect TLS worlds without proxy
         let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
         for (world_idx, world) in app.worlds.iter().enumerate() {
@@ -12258,7 +12280,7 @@ pub async fn run_app_headless(
                                 });
                             }
                             Err(e) => {
-                                debug_log(true, &format!("HEADLESS: Failed to reconnect proxy for {}: {}", app.worlds[world_idx].name, e));
+                                debug_log(is_debug_enabled(), &format!("HEADLESS: Failed to reconnect proxy for {}: {}", app.worlds[world_idx].name, e));
                                 app.worlds[world_idx].clear_connection_state(false, false);
                             }
                         }
@@ -12271,8 +12293,14 @@ pub async fn run_app_headless(
         for world in &mut app.worlds {
             if world.connected && world.command_tx.is_none() {
                 world.connected = false;
+                world.socket_fd = None;
                 world.pending_lines.clear();
                 world.paused = false;
+                let seq = world.next_seq;
+                world.next_seq += 1;
+                world.output_lines.push(OutputLine::new(
+                    "Connection was not restored during reload. Use /worlds to reconnect.".to_string(), seq
+                ));
             }
         }
     }
@@ -12432,13 +12460,13 @@ pub async fn run_app_headless(
                     let _ = app.tf_engine.execute(single_cmd);
                 } else {
                     // Plain text can't be run at startup in headless mode
-                    debug_log(true, &format!("[Startup] Skipped command (headless): {}", single_cmd));
+                    debug_log(is_debug_enabled(), &format!("[Startup] Skipped command (headless): {}", single_cmd));
                 }
             }
         }
     }
 
-    debug_log(true, "HEADLESS: Entering main event loop");
+    debug_log(is_debug_enabled(), "HEADLESS: Entering main event loop");
 
     // Main event loop
     loop {
@@ -12559,7 +12587,7 @@ pub async fn run_app_headless(
                     AppEvent::Sigusr1Received => {
                         #[cfg(all(unix, not(target_os = "android")))]
                         {
-                            debug_log(true, "HEADLESS: Received SIGUSR1, triggering reload");
+                            debug_log(is_debug_enabled(), "HEADLESS: Received SIGUSR1, triggering reload");
                             app.ws_broadcast(WsMessage::ServerReloading);
                             exec_reload(&app)?;
                             return Ok(());
@@ -12593,11 +12621,13 @@ pub async fn run_app_headless(
                             app.handle_msdp_received(world_idx, variable, value_json);
                         }
                     }
-                    AppEvent::MediaProcessReady(world_idx, key, child, is_music) => {
-                        if is_music {
-                            app.media_music_key = Some((world_idx, key.clone()));
+                    AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
+                        if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
+                            if is_music {
+                                app.media_music_key = Some((world_idx, key.clone()));
+                            }
+                            app.media_processes.insert(key, (world_idx, handle));
                         }
-                        app.media_processes.insert(key, (world_idx, child));
                     }
                     AppEvent::ApiLookupResult(client_id, world_index, result) => {
                         match result {
@@ -12980,21 +13010,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     if should_load_state {
         // Load the reload state
-        debug_log(true, "STARTUP: Loading reload state...");
+        debug_log(is_debug_enabled(), "STARTUP: Loading reload state...");
         match persistence::load_reload_state(&mut app) {
             Ok(true) => {
-                debug_log(true, "STARTUP: Reload state loaded successfully");
+                debug_log(is_debug_enabled(), "STARTUP: Reload state loaded successfully");
                 // Silent on success - only show errors
             }
             Ok(false) => {
-                debug_log(true, "STARTUP: No reload state found");
+                debug_log(is_debug_enabled(), "STARTUP: No reload state found");
                 startup_messages.push("Warning: No reload state found, starting fresh.".to_string());
                 if let Err(e) = persistence::load_settings(&mut app) {
                     startup_messages.push(format!("Warning: Could not load settings: {}", e));
                 }
             }
             Err(e) => {
-                debug_log(true, &format!("STARTUP: Failed to load reload state: {}", e));
+                debug_log(is_debug_enabled(), &format!("STARTUP: Failed to load reload state: {}", e));
                 startup_messages.push(format!("Warning: Failed to load reload state: {}", e));
                 if let Err(e) = persistence::load_settings(&mut app) {
                     startup_messages.push(format!("Warning: Could not load settings: {}", e));
@@ -13021,16 +13051,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
+    // Sync global debug flag from loaded settings
+    DEBUG_ENABLED.store(app.settings.debug_enabled, Ordering::Relaxed);
+
     // Pre-compile action regexes after loading settings or reload state
     compile_all_action_regexes(&mut app.settings.actions);
 
-    // Load theme file (~/clay.theme.dat)
+    // Load theme file (~/.clay.theme.dat)
     load_theme_file(&mut app);
 
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
-    debug_log(true, "STARTUP: Ensuring has world...");
+    debug_log(is_debug_enabled(), "STARTUP: Ensuring has world...");
     app.ensure_has_world();
-    debug_log(true, &format!("STARTUP: Have {} worlds", app.worlds.len()));
+    debug_log(is_debug_enabled(), &format!("STARTUP: Have {} worlds", app.worlds.len()));
 
     // Re-create spell checker with custom dictionary path if configured
     if !app.settings.dictionary_path.is_empty() {
@@ -13042,12 +13075,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // pending_lines cleared in the cleanup pass below (line ~17205).
 
     // Now display any startup messages
-    debug_log(true, "STARTUP: Displaying startup messages...");
+    debug_log(is_debug_enabled(), "STARTUP: Displaying startup messages...");
     for msg in startup_messages {
         app.add_output(&msg);
     }
 
-    debug_log(true, "STARTUP: Creating event channel...");
+    debug_log(is_debug_enabled(), "STARTUP: Creating event channel...");
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
     app.event_tx = Some(event_tx.clone());
 
@@ -13055,7 +13088,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // FD reconstruction is Unix-only (reload/crash recovery requires exec() which is Unix-only)
     #[cfg(unix)]
     if should_load_state {
-        debug_log(true, "STARTUP: Reconstructing connections...");
+        debug_log(is_debug_enabled(), "STARTUP: Reconstructing connections...");
         // First pass: identify TLS worlds WITHOUT proxy that need to be disconnected
         // TLS worlds WITH proxy will be reconnected via Unix socket
         let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
@@ -13523,7 +13556,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        debug_log(true, "STARTUP: Connection cleanup done, sending keepalives...");
+        debug_log(is_debug_enabled(), "STARTUP: Connection cleanup done, sending keepalives...");
 
         // Send immediate keepalive for all reconnected worlds since we don't know how long they were idle
         for world in &mut app.worlds {
@@ -13572,7 +13605,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
-    debug_log(true, "STARTUP: Keepalives sent, starting servers...");
+    debug_log(is_debug_enabled(), "STARTUP: Keepalives sent, starting servers...");
 
     // Create WebSocket server state (for client management, no standalone listener)
     let ws_state = if !app.settings.websocket_password.is_empty() {
@@ -13776,7 +13809,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
-    debug_log(true, "STARTUP: Entering main event loop");
+    debug_log(is_debug_enabled(), "STARTUP: Entering main event loop");
 
     // Counter for debugging first few loop iterations
     let mut loop_count: u64 = 0;
@@ -13785,7 +13818,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         loop_count += 1;
         // Log first 5 iterations to debug early crashes
         if loop_count <= 5 {
-            debug_log(true, &format!("LOOP: iteration {}", loop_count));
+            debug_log(is_debug_enabled(), &format!("LOOP: iteration {}", loop_count));
         }
 
         // Track whether this iteration changed visible state requiring a redraw
@@ -14331,7 +14364,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::Sigusr1Received => {
                         // SIGUSR1 received - trigger hot reload (only on non-Android)
-                        debug_log(true, "LOOP: Received SIGUSR1 via event channel");
+                        debug_log(is_debug_enabled(), "LOOP: Received SIGUSR1 via event channel");
                         app.add_output("Received SIGUSR1, performing hot reload...");
                         if handle_command("/reload", &mut app, event_tx.clone()).await {
                             return Ok(());
@@ -14525,6 +14558,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                                 app.current_world_index = prev_index;
                             }
+                            WsAsyncAction::Reload => {
+                                #[cfg(all(unix, not(target_os = "android")))]
+                                {
+                                    debug_log(is_debug_enabled(), "HEADLESS: WS client requested reload");
+                                    app.ws_broadcast(WsMessage::ServerReloading);
+                                    exec_reload(&app)?;
+                                    return Ok(());
+                                }
+                            }
                             WsAsyncAction::Done => {}
                         }
                     }
@@ -14536,11 +14578,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                         }
                     }
-                    AppEvent::MediaProcessReady(world_idx, key, child, is_music) => {
-                        if is_music {
-                            app.media_music_key = Some((world_idx, key.clone()));
+                    AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
+                        if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
+                            if is_music {
+                                app.media_music_key = Some((world_idx, key.clone()));
+                            }
+                            app.media_processes.insert(key, (world_idx, handle));
                         }
-                        app.media_processes.insert(key, (world_idx, child));
                     }
                     AppEvent::ApiLookupResult(client_id, world_index, result) => {
                         match result {
@@ -15189,6 +15233,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             app.current_world_index = prev_index;
                         }
+                        WsAsyncAction::Reload => {
+                            debug_log(is_debug_enabled(), "CONSOLE: WS client requested reload");
+                            app.add_output("Received reload request, performing hot reload...");
+                            if handle_command("/reload", &mut app, event_tx.clone()).await {
+                                return Ok(());
+                            }
+                        }
                         WsAsyncAction::Done => {}
                     }
                 }
@@ -15205,11 +15256,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                     }
                 }
-                AppEvent::MediaProcessReady(world_idx, key, child, is_music) => {
-                    if is_music {
-                        app.media_music_key = Some((world_idx, key.clone()));
+                AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
+                    if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
+                        if is_music {
+                            app.media_music_key = Some((world_idx, key.clone()));
+                        }
+                        app.media_processes.insert(key, (world_idx, handle));
                     }
-                    app.media_processes.insert(key, (world_idx, child));
                 }
                 AppEvent::ApiLookupResult(client_id, world_index, result) => {
                     match result {
@@ -15251,7 +15304,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
             // When transitioning to popup: terminal.clear() resets ratatui's buffers so
             // the diff will write ALL popup cells (full coverage, no bleed-through).
-            // Crossterm output is restored AFTER ratatui draws, clipped to avoid the popup.
+            // Ratatui handles both output and popup rendering when popup is visible.
             if any_popup_visible && !app.popup_was_visible {
                 terminal.clear()?;
             }
@@ -15288,7 +15341,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
             // Render output area with crossterm only when needed (optimization)
             // Also redraw when popup visibility changes (including popup open/close)
-            // When a popup is visible, crossterm renders output but skips popup rows
+            // When popup is visible, render_output_crossterm is a no-op (ratatui handles it)
             if app.needs_output_redraw || popup_visibility_changed {
                 render_output_crossterm(&app);
                 app.needs_output_redraw = false;
@@ -15750,6 +15803,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.open_actions_list_popup();
                         }
                     }
+                } else if data.contains_key("web_save") {
+                    // Allow list wildcard warning confirmed — apply settings
+                    let settings = web_settings_from_custom_data(&data);
+                    apply_web_settings(app, &settings);
                 }
             }
             NewPopupAction::ConfirmCancelled(data) => {
@@ -15841,6 +15898,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     WorldSwitchMode::Alphabetical
                 };
                 app.settings.debug_enabled = settings.debug;
+                DEBUG_ENABLED.store(settings.debug, Ordering::Relaxed);
                 // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 app.input_height = settings.input_height as u16;
                 app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
@@ -15865,18 +15923,23 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 let _ = persistence::save_settings(app);
             }
             NewPopupAction::WebSaved(settings) => {
-                // Apply saved web settings
-                app.settings.web_secure = settings.web_secure;
-                app.settings.http_enabled = settings.http_enabled;
-                app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
-                app.settings.websocket_password = settings.ws_password;
-                app.settings.websocket_allow_list = settings.ws_allow_list;
-                app.settings.websocket_cert_file = settings.ws_cert_file;
-                app.settings.websocket_key_file = settings.ws_key_file;
-                // Save settings to disk
-                let _ = persistence::save_settings(app);
-                // Note: Server start/stop requires reload to take effect
-                app.add_output("Web settings saved. Use /reload to apply server changes.");
+                // Check for wildcard '*' in allow list — warn user
+                if crate::websocket::allow_list_has_wildcard(&settings.ws_allow_list) {
+                    use popup::definitions::confirm::create_allow_list_warning_dialog;
+                    let mut def = create_allow_list_warning_dialog();
+                    // Store settings in custom_data for retrieval on confirm
+                    def.custom_data.insert("web_save".to_string(), "1".to_string());
+                    def.custom_data.insert("web_secure".to_string(), settings.web_secure.to_string());
+                    def.custom_data.insert("http_enabled".to_string(), settings.http_enabled.to_string());
+                    def.custom_data.insert("http_port".to_string(), settings.http_port);
+                    def.custom_data.insert("ws_password".to_string(), settings.ws_password);
+                    def.custom_data.insert("ws_allow_list".to_string(), settings.ws_allow_list);
+                    def.custom_data.insert("ws_cert_file".to_string(), settings.ws_cert_file);
+                    def.custom_data.insert("ws_key_file".to_string(), settings.ws_key_file);
+                    app.popup_manager.open(def);
+                } else {
+                    apply_web_settings(app, &settings);
+                }
             }
             NewPopupAction::ConnectionsClose => {
                 // Nothing to do, popup is already closed
@@ -19760,23 +19823,10 @@ fn render_output_crossterm(app: &App) {
         return;
     }
 
-    // Get popup area for row clipping (skip rows overlapping the popup)
-    let popup_rect = if app.has_new_popup() {
-        app.popup_manager.current().and_then(|s| s.rendered_area)
-    } else if app.confirm_dialog.visible {
-        // Confirm dialog is small and centered - approximate its area
-        let w = app.output_width;
-        let h = app.output_height + app.input_height + 1;
-        let pw = 40u16.min(w.saturating_sub(4));
-        let ph = 5u16;
-        Some(ratatui::layout::Rect::new(
-            w.saturating_sub(pw) / 2,
-            h.saturating_sub(ph) / 2,
-            pw, ph,
-        ))
-    } else {
-        None
-    };
+    // Skip if any overlay popup is visible - ratatui handles output rendering behind popups
+    if app.has_new_popup() || app.confirm_dialog.visible {
+        return;
+    }
 
     let mut stdout = std::io::stdout();
 
@@ -20002,7 +20052,7 @@ fn render_output_crossterm(app: &App) {
     }
 
     // Debug: verify output line sequence order (only check visible range, log mismatches)
-    if !world.output_lines.is_empty() {
+    if is_debug_enabled() && !world.output_lines.is_empty() {
         let check_start = first_line_idx;
         let check_end = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
         let mut last_seq: Option<u64> = None;
@@ -20068,13 +20118,6 @@ fn render_output_crossterm(app: &App) {
     for (row_idx, (wrapped, highlight_f8, hl_color, marked_new)) in lines_to_show.iter().enumerate() {
         let row_y = row_idx as u16;
 
-        // Skip rows that overlap with the popup area (ratatui already rendered those)
-        if let Some(ref pr) = popup_rect {
-            if row_y >= pr.y && row_y < pr.y + pr.height {
-                continue;
-            }
-        }
-
         let _ = stdout.queue(cursor::MoveTo(0, row_y));
 
         // New line indicator: green triangle prefix for unseen/pending lines
@@ -20114,12 +20157,6 @@ fn render_output_crossterm(app: &App) {
 
     for row_idx in lines_to_show.len()..visible_height {
         let row_y = row_idx as u16;
-        // Skip rows that overlap with the popup area
-        if let Some(ref pr) = popup_rect {
-            if row_y >= pr.y && row_y < pr.y + pr.height {
-                continue;
-            }
-        }
         let _ = stdout.queue(cursor::MoveTo(0, row_y));
         let _ = stdout.queue(Print("\x1b[K"));
     }
@@ -20194,6 +20231,178 @@ fn render_output_crossterm(app: &App) {
     let _ = stdout.flush();
 }
 
+/// Write an ANSI-colored string directly to a ratatui buffer at (x, y).
+/// Parses ANSI SGR escape sequences and sets cell styles accordingly.
+/// This bypasses ansi_to_tui and Paragraph for reliable color reproduction.
+fn ansi_string_to_buffer(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, s: &str, max_width: u16) {
+    use ratatui::style::{Color, Modifier, Style};
+
+    let mut col = 0u16;
+    let mut style = Style::default();
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if col >= max_width {
+            break;
+        }
+
+        if c == '\x1b' {
+            // Parse escape sequence
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                let mut params = String::new();
+                // Collect parameter bytes
+                while let Some(&pc) = chars.peek() {
+                    if pc.is_ascii_digit() || pc == ';' {
+                        params.push(pc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Get the final byte
+                if let Some(final_byte) = chars.next() {
+                    if final_byte == 'm' {
+                        // SGR sequence - parse parameters
+                        let nums: Vec<u32> = params.split(';')
+                            .filter(|s| !s.is_empty())
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if nums.is_empty() {
+                            // \x1b[m = reset
+                            style = Style::default();
+                        } else {
+                            let mut i = 0;
+                            while i < nums.len() {
+                                match nums[i] {
+                                    0 => style = Style::default(),
+                                    1 => style = style.add_modifier(Modifier::BOLD),
+                                    2 => style = style.add_modifier(Modifier::DIM),
+                                    3 => style = style.add_modifier(Modifier::ITALIC),
+                                    4 => style = style.add_modifier(Modifier::UNDERLINED),
+                                    5 | 6 => style = style.add_modifier(Modifier::SLOW_BLINK),
+                                    7 => style = style.add_modifier(Modifier::REVERSED),
+                                    8 => style = style.add_modifier(Modifier::HIDDEN),
+                                    9 => style = style.add_modifier(Modifier::CROSSED_OUT),
+                                    22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+                                    23 => style = style.remove_modifier(Modifier::ITALIC),
+                                    24 => style = style.remove_modifier(Modifier::UNDERLINED),
+                                    25 => style = style.remove_modifier(Modifier::SLOW_BLINK),
+                                    27 => style = style.remove_modifier(Modifier::REVERSED),
+                                    28 => style = style.remove_modifier(Modifier::HIDDEN),
+                                    29 => style = style.remove_modifier(Modifier::CROSSED_OUT),
+                                    30 => style = style.fg(Color::Black),
+                                    31 => style = style.fg(Color::Red),
+                                    32 => style = style.fg(Color::Green),
+                                    33 => style = style.fg(Color::Yellow),
+                                    34 => style = style.fg(Color::Blue),
+                                    35 => style = style.fg(Color::Magenta),
+                                    36 => style = style.fg(Color::Cyan),
+                                    37 => style = style.fg(Color::White),
+                                    38 => {
+                                        // Extended foreground color
+                                        if i + 1 < nums.len() && nums[i + 1] == 5 && i + 2 < nums.len() {
+                                            style = style.fg(Color::Indexed(nums[i + 2] as u8));
+                                            i += 2;
+                                        } else if i + 1 < nums.len() && nums[i + 1] == 2 && i + 4 < nums.len() {
+                                            style = style.fg(Color::Rgb(
+                                                nums[i + 2] as u8,
+                                                nums[i + 3] as u8,
+                                                nums[i + 4] as u8,
+                                            ));
+                                            i += 4;
+                                        }
+                                    }
+                                    39 => style = style.fg(Color::Reset),
+                                    40 => style = style.bg(Color::Black),
+                                    41 => style = style.bg(Color::Red),
+                                    42 => style = style.bg(Color::Green),
+                                    43 => style = style.bg(Color::Yellow),
+                                    44 => style = style.bg(Color::Blue),
+                                    45 => style = style.bg(Color::Magenta),
+                                    46 => style = style.bg(Color::Cyan),
+                                    47 => style = style.bg(Color::White),
+                                    48 => {
+                                        // Extended background color
+                                        if i + 1 < nums.len() && nums[i + 1] == 5 && i + 2 < nums.len() {
+                                            style = style.bg(Color::Indexed(nums[i + 2] as u8));
+                                            i += 2;
+                                        } else if i + 1 < nums.len() && nums[i + 1] == 2 && i + 4 < nums.len() {
+                                            style = style.bg(Color::Rgb(
+                                                nums[i + 2] as u8,
+                                                nums[i + 3] as u8,
+                                                nums[i + 4] as u8,
+                                            ));
+                                            i += 4;
+                                        }
+                                    }
+                                    49 => style = style.bg(Color::Reset),
+                                    90 => style = style.fg(Color::DarkGray),
+                                    91 => style = style.fg(Color::LightRed),
+                                    92 => style = style.fg(Color::LightGreen),
+                                    93 => style = style.fg(Color::LightYellow),
+                                    94 => style = style.fg(Color::LightBlue),
+                                    95 => style = style.fg(Color::LightMagenta),
+                                    96 => style = style.fg(Color::LightCyan),
+                                    97 => style = style.fg(Color::White),
+                                    100 => style = style.bg(Color::DarkGray),
+                                    101 => style = style.bg(Color::LightRed),
+                                    102 => style = style.bg(Color::LightGreen),
+                                    103 => style = style.bg(Color::LightYellow),
+                                    104 => style = style.bg(Color::LightBlue),
+                                    105 => style = style.bg(Color::LightMagenta),
+                                    106 => style = style.bg(Color::LightCyan),
+                                    107 => style = style.bg(Color::White),
+                                    _ => {}
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    // Non-SGR CSI sequences (e.g., cursor movement) are ignored
+                }
+            } else if chars.peek() == Some(&']') {
+                // OSC sequence - skip until BEL or ST
+                chars.next(); // consume ']'
+                while let Some(oc) = chars.next() {
+                    if oc == '\x07' {
+                        break;
+                    }
+                    if oc == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Other escape sequences are ignored
+            continue;
+        }
+
+        // Regular character - write to buffer
+        let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if char_width == 0 && c != ' ' {
+            // Zero-width character (ZWJ, combining marks, etc.) - skip
+            continue;
+        }
+
+        let cell_x = x + col;
+        if cell_x < x + max_width {
+            let cell = buf.get_mut(cell_x, y);
+            cell.set_char(c);
+            cell.set_style(style);
+            col += char_width as u16;
+            // For wide characters, mark the next cell as continuation
+            if char_width == 2 && col <= max_width {
+                let next_cell = buf.get_mut(x + col - 1, y);
+                next_cell.set_char(' ');
+                next_cell.set_style(style);
+            }
+        } else {
+            break;
+        }
+    }
+}
+
 fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     let world = app.current_world();
     let visible_height = area.height as usize;
@@ -20211,30 +20420,24 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     // Check if any overlay popup is visible (setup, help, world selector, etc.)
     let has_overlay_popup = app.confirm_dialog.visible || app.has_new_popup();
 
-    // If an overlay popup is visible (but not the editor), skip output rendering entirely.
-    // The crossterm-rendered output already on screen stays visible behind the popup,
-    // and the popup renderer clears/fills only its own area. This preserves the colored
-    // MUD output that ratatui's ANSI handling can't reproduce well.
-    if has_overlay_popup && !app.editor.visible {
-        return;
-    }
-
     // If no overlay popup and no editor, raw crossterm will handle output rendering
-    // (it provides better ANSI color handling)
+    // (it provides better ANSI color handling than ratatui's ansi_to_tui conversion)
     // Clear the area so ratatui doesn't show stale content - crossterm will fill it in
-    if !app.editor.visible {
+    if !has_overlay_popup && !app.editor.visible {
         f.render_widget(ratatui::widgets::Clear, area);
         return;
     }
 
-    // Editor is visible - render output with ratatui (crossterm is skipped)
-    // First, fill the entire output area with background to cover any crossterm remnants
-    let theme = app.settings.theme;
-    let background = ratatui::widgets::Block::default().style(Style::default().bg(theme.bg()));
-    f.render_widget(background, area);
+    // Overlay popup or editor is visible - render output with ratatui
+    // (crossterm is skipped when popups are shown to avoid bleed-through)
+    // Write directly to the ratatui buffer, bypassing Paragraph widget,
+    // with manual ANSI parsing for proper color reproduction.
 
-    // Build visual lines by working backwards from scroll_offset, wrapping each line
-    let mut lines: Vec<Line<'_>> = Vec::new();
+    // Fill the entire output area with background first
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    // Build visual lines (wrapped ANSI strings) by working backwards from scroll_offset
+    let mut wrapped_lines: Vec<String> = Vec::new();
 
     if !world.output_lines.is_empty() {
         let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
@@ -20247,8 +20450,8 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
             let expanded = match process_output_line(line, app.show_tags, app.settings.temp_convert_enabled, app.settings.zwj_enabled, &cached_now) {
                 Some(text) if text.is_empty() => {
-                    lines.insert(0, Line::from(""));
-                    if lines.len() >= visible_height {
+                    wrapped_lines.insert(0, String::new());
+                    if wrapped_lines.len() >= visible_height {
                         break;
                     }
                     continue;
@@ -20260,32 +20463,31 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
             // Wrap the line to fit the output area width
             let wrapped = wrap_ansi_line(&expanded, area_width);
 
-            // Convert each wrapped visual line to ratatui Line and insert at front
             for w in wrapped.into_iter().rev() {
-                let rline = match ansi_to_tui::IntoText::into_text(&w) {
-                    Ok(text) => {
-                        text.lines.into_iter().next().unwrap_or_else(|| Line::from(""))
-                    }
-                    Err(_) => Line::raw(w),
-                };
-                lines.insert(0, rline);
+                wrapped_lines.insert(0, w);
             }
 
-            if lines.len() >= visible_height {
+            if wrapped_lines.len() >= visible_height {
                 break;
             }
         }
     }
 
     // Trim to visible_height from the bottom (keep the most recent lines)
-    if lines.len() > visible_height {
-        let excess = lines.len() - visible_height;
-        lines.drain(0..excess);
+    if wrapped_lines.len() > visible_height {
+        let excess = wrapped_lines.len() - visible_height;
+        wrapped_lines.drain(0..excess);
     }
 
-    let output_text = Text::from(lines);
-    let output_paragraph = Paragraph::new(output_text).style(Style::default().bg(theme.bg()));
-    f.render_widget(output_paragraph, area);
+    // Write each line directly to the ratatui buffer with ANSI-parsed styles
+    let buf = f.buffer_mut();
+    for (row_idx, line) in wrapped_lines.iter().enumerate() {
+        if row_idx >= visible_height {
+            break;
+        }
+        let y = area.y + row_idx as u16;
+        ansi_string_to_buffer(buf, area.x, y, line, area.width);
+    }
 }
 
 /// Render the split-screen editor panel
@@ -20767,19 +20969,13 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                     }
                 }
                 Err(_) => {
-                    // Fallback to accent color if parsing fails
-                    lines.push(Line::from(Span::styled(
-                        prompt.to_string(),
-                        Style::default().fg(tc.fg_accent()),
-                    )));
+                    // Fallback: render as plain text without adding color
+                    lines.push(Line::from(Span::raw(prompt.to_string())));
                 }
             }
         } else {
-            // No ANSI codes, use accent color
-            lines.push(Line::from(Span::styled(
-                prompt.to_string(),
-                Style::default().fg(tc.fg_accent()),
-            )));
+            // No ANSI codes — render as-is without adding color
+            lines.push(Line::from(Span::raw(prompt.to_string())));
         }
     }
 
@@ -22095,7 +22291,7 @@ mod tests {
         let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(Vec::new()));
+            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
@@ -22173,7 +22369,7 @@ mod tests {
         let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(Vec::new()));
+            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
@@ -22236,7 +22432,7 @@ mod tests {
         let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(Vec::new()));
+            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
@@ -22310,7 +22506,7 @@ mod tests {
         let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(Vec::new()));
+            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
@@ -22348,7 +22544,7 @@ mod tests {
 
         // Server 2: test wrong password for valid user
         let allow_list2: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(Vec::new()));
+            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
         let whitelisted2: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let server_task2 = tokio::spawn(async move {
@@ -22552,7 +22748,7 @@ mod tests {
         let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(Vec::new()));
+            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
@@ -22624,6 +22820,22 @@ mod tests {
         // Localhost normalization
         assert!(is_ip_in_allow_list("127.0.0.1", &["localhost".to_string()]));
         assert!(is_ip_in_allow_list("::1", &["localhost".to_string()]));
+
+        // Bare "*" matches all hosts
+        assert!(is_ip_in_allow_list("10.0.0.1", &["*".to_string()]));
+        assert!(is_ip_in_allow_list("192.168.1.100", &["*".to_string()]));
+
+        // "*" in a multi-entry list
+        assert!(is_ip_in_allow_list("10.0.0.1", &["192.168.1.1".to_string(), "*".to_string()]));
+
+        // allow_list_has_wildcard
+        use crate::websocket::allow_list_has_wildcard;
+        assert!(allow_list_has_wildcard("*"));
+        assert!(allow_list_has_wildcard("192.168.1.1, *"));
+        assert!(allow_list_has_wildcard("*, 10.0.0.1"));
+        assert!(!allow_list_has_wildcard("192.168.1.*"));
+        assert!(!allow_list_has_wildcard(""));
+        assert!(!allow_list_has_wildcard("192.168.1.1"));
     }
 
     /// Test: ServerHello is sent before auth (regression: needed for client UI)
@@ -22643,7 +22855,7 @@ mod tests {
         let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
-            Arc::new(std::sync::RwLock::new(Vec::new()));
+            Arc::new(std::sync::RwLock::new(vec!["*".to_string()]));
         let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
             Arc::new(std::sync::RwLock::new(None));
         let ban_list = BanList::new();
@@ -24370,4 +24582,6 @@ mod tests {
         assert!(!is_newer_version("1.0", "1.0.1"));
         assert!(!is_newer_version("1.0", "1.0.0"));
     }
+
+
 }

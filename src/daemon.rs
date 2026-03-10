@@ -323,6 +323,14 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             }),
                         }
                     }
+                    AppEvent::Sigusr1Received => {
+                        #[cfg(all(unix, not(target_os = "android")))]
+                        {
+                            app.ws_broadcast(WsMessage::ServerReloading);
+                            crate::exec_reload(&app)?;
+                            return Ok(());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -914,17 +922,9 @@ pub async fn handle_daemon_ws_message(
                         }
                     }
                 }
-                // Commands that should be blocked from remote
                 Command::Reload => {
-                    app.ws_broadcast(WsMessage::ServerData {
-                        world_index,
-                        data: "This command is not available from remote interfaces.".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                    marked_new: false,
-                    });
+                    // Signal the event loop to perform reload
+                    let _ = event_tx.send(AppEvent::Sigusr1Received).await;
                 }
                 // Commands that execute locally on the client
                 Command::Quit | Command::Update { .. } => {
@@ -1404,27 +1404,31 @@ pub async fn handle_daemon_ws_message(
             }
         }
         WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("clay.output.debug")
-            {
-                let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                    source, world_name, expected_seq_gt, actual_seq,
-                    line_text.chars().take(80).collect::<String>());
+            if is_debug_enabled() {
+                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("clay.output.debug")
+                {
+                    let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                        source, world_name, expected_seq_gt, actual_seq,
+                        line_text.chars().take(80).collect::<String>());
+                }
             }
         }
         WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
-            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("clay.output.debug")
-            {
-                let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                    source, world_name, line_seq, max_seq,
-                    line_text.chars().take(200).collect::<String>());
+            if is_debug_enabled() {
+                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("clay.output.debug")
+                {
+                    let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                        source, world_name, line_seq, max_seq,
+                        line_text.chars().take(200).collect::<String>());
+                }
             }
         }
         WsMessage::ClientTypeDeclaration { client_type } => {
@@ -2868,27 +2872,31 @@ pub async fn handle_multiuser_ws_message(
             // Silently reject - users can't edit worlds in multiuser mode
         }
         WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("clay.output.debug")
-            {
-                let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                    source, world_name, expected_seq_gt, actual_seq,
-                    line_text.chars().take(80).collect::<String>());
+            if is_debug_enabled() {
+                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("clay.output.debug")
+                {
+                    let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                        source, world_name, expected_seq_gt, actual_seq,
+                        line_text.chars().take(80).collect::<String>());
+                }
             }
         }
         WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
-            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("clay.output.debug")
-            {
-                let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                    source, world_name, line_seq, max_seq,
-                    line_text.chars().take(200).collect::<String>());
+            if is_debug_enabled() {
+                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("clay.output.debug")
+                {
+                    let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                        source, world_name, line_seq, max_seq,
+                        line_text.chars().take(200).collect::<String>());
+                }
             }
         }
         WsMessage::ToggleWorldGmcp { world_index } => {
