@@ -18,6 +18,7 @@ use crate::http::log_ws_auth;
 
 /// Default function for serde to return true (for from_server field backwards compatibility)
 fn default_true() -> bool { true }
+fn is_false(v: &bool) -> bool { !v }
 
 /// WebSocket protocol messages for client-server communication
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -94,7 +95,7 @@ pub enum WsMessage {
     /// is_viewed: true if any interface (console/web/GUI) is viewing this world
     /// ts: timestamp in seconds since Unix epoch (when the line was received)
     /// from_server: true if data came from MUD server, false if client-generated
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default)] marked_new: bool },
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default)] marked_new: bool, #[serde(default, skip_serializing_if = "is_false")] flush: bool },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },

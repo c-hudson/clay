@@ -168,7 +168,7 @@ pub fn run_master_webgui() -> io::Result<()> {
 
     // Create bidirectional channels (required by run_app_headless API)
     let (app_to_gui_tx, _app_to_gui_rx) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
-    let (_gui_to_app_tx, gui_to_app_rx) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
+    let (gui_to_app_tx, gui_to_app_rx) = tokio::sync::mpsc::unbounded_channel::<crate::WsMessage>();
 
     // Spawn the headless App with WS override
     let ws_password = password.clone();
@@ -211,7 +211,7 @@ pub fn run_master_webgui() -> io::Result<()> {
         theme_css: load_user_theme_css(),
     };
 
-    let result = create_webview_window("Clay", &params);
+    let result = create_webview_window("Clay", &params, Some(gui_to_app_tx));
 
     // Shut down the tokio runtime when the window closes
     runtime.shutdown_background();
@@ -300,7 +300,7 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
             theme_css: load_user_theme_css(),
         };
 
-        let result = create_webview_window("Clay", &params);
+        let result = create_webview_window("Clay", &params, None);
         runtime.shutdown_background();
         result
     } else {
@@ -313,7 +313,7 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
             theme_css: load_user_theme_css(),
         };
 
-        create_webview_window("Clay", &params)
+        create_webview_window("Clay", &params, None)
     }
 }
 
@@ -635,9 +635,13 @@ document.addEventListener('DOMContentLoaded', function() {
 /// Create and run the WebView window with custom protocol to serve embedded web content.
 /// Uses custom protocol (clay://) instead of with_html() because with_html() loads
 /// content with a null origin, which blocks WebSocket connections on WebKit2GTK.
-fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> {
-    // Suppress WebKit/JSC stderr noise during init (harmless "Overriding existing handler
-    // for signal 10" message when Clay's SIGUSR1 handler conflicts with JSC's GC signal)
+fn create_webview_window(
+    title: &str,
+    params: &WebViewParams,
+    reload_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
+) -> io::Result<()> {
+    // Suppress WebKit/JSC stderr noise during init (WebKit/JSC overrides SIGUSR1 handler
+    // for GC signaling — this is why we use a channel for reload instead of SIGUSR1)
     #[cfg(unix)]
     let _stderr_guard = StderrSuppress::new();
 
@@ -698,6 +702,7 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
         .with_devtools(cfg!(debug_assertions))
         .with_ipc_handler({
             let is_master = params.auto_password.is_some();
+            let reload_tx = reload_tx.clone();
             move |req| {
             let body = req.body();
             if body == "quit" {
@@ -728,12 +733,19 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
                     }
                 });
             } else if body == "reload" {
-                // Hot reload: master mode sends SIGUSR1 to self (triggers exec_reload
-                // in the headless app), remote mode sends WvEvent to exec a new binary.
+                // Hot reload: master mode uses both atomic flag AND channel for reliability
+                // (can't use SIGUSR1 because WebKit/JSC overrides the signal handler),
+                // remote mode sends WvEvent to exec a new binary.
                 if is_master {
-                    // Master mode: signal the headless app to reload
-                    #[cfg(all(unix, not(target_os = "android")))]
-                    unsafe { libc::kill(libc::getpid(), libc::SIGUSR1); }
+                    // Set atomic flag (checked by headless event loop on 100ms timer)
+                    crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Also try channel as backup path
+                    if let Some(ref tx) = reload_tx {
+                        let _ = tx.send(crate::WsMessage::SendCommand {
+                            world_index: 0,
+                            command: "/reload".to_string(),
+                        });
+                    }
                 } else {
                     // Remote mode: restart the GUI binary
                     let _ = proxy.send_event(WvEvent::Reload);

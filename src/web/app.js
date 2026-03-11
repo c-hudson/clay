@@ -1773,6 +1773,22 @@
                     if (!worldOutputCache[msg.world_index]) {
                         worldOutputCache[msg.world_index] = [];
                     }
+                    // Flush flag: clear output buffer atomically before appending new lines
+                    // (e.g., splash screen cleared — combined with data to avoid race condition)
+                    if (msg.flush) {
+                        world.output_lines = [];
+                        world.pendingCount = 0;
+                        world.showing_splash = false;
+                        worldOutputCache[msg.world_index] = [];
+                        partialLines[msg.world_index] = '';
+                        if (msg.world_index === currentWorldIndex) {
+                            elements.output.innerHTML = '';
+                            scrollOffset = 0;
+                            linesSincePause = 0;
+                            paused = false;
+                            pendingLines = [];
+                        }
+                    }
                     if (msg.data) {
                         // Dedup: skip ServerData that has already been received (e.g., after resync)
                         if (msg.seq && msg.seq > 0 && world._max_seq && msg.seq <= world._max_seq) {
@@ -1816,6 +1832,12 @@
 
                         // Split by any line ending
                         const rawLines = data.split(/\r\n|\n|\r/);
+
+                        // Remove trailing empty string from split (data ending with \n
+                        // produces ["line", ""] — the empty string is not a real line)
+                        if (endsWithNewline && rawLines.length > 0 && rawLines[rawLines.length - 1] === '') {
+                            rawLines.pop();
+                        }
 
                         // If data doesn't end with newline, last element is a partial line
                         // (only for server data - client messages are always complete)
@@ -2411,7 +2433,7 @@
 
     // Handle incoming line with more-mode logic
     function handleIncomingLine(text, ts, worldIndex, lineIndex) {
-        if (!text) return;
+        if (text === undefined || text === null) return;
 
         const visibleLines = getVisibleLineCount();
         const threshold = Math.max(1, visibleLines - 2);
@@ -3659,7 +3681,7 @@
         function getThemeAnsiPalette() {
             const fallback = [
                 [0, 0, 0], [170, 0, 0], [68, 170, 68], [170, 85, 0],
-                [0, 57, 170], [170, 34, 170], [26, 146, 170], [170, 170, 170],
+                [0, 57, 170], [170, 34, 170], [26, 146, 170], [232, 228, 236],
                 [119, 119, 119], [255, 135, 135], [76, 230, 76], [222, 216, 44],
                 [41, 95, 204], [204, 88, 204], [76, 204, 230], [255, 255, 255]
             ];
@@ -3726,7 +3748,7 @@
                     if (colorNameToRgb[colorName]) return colorNameToRgb[colorName];
                 }
             }
-            return [230, 237, 243]; // Default text color
+            return [232, 228, 236]; // Default text color (matches theme fg)
         }
 
         function getBgRgb(classes, style) {
@@ -4610,7 +4632,7 @@
         // More/Hist badge
         const serverPending = world ? (world.pending_count || 0) : 0;
         const totalPending = pendingLines.length + serverPending;
-        if (!isAtBottom()) {
+        if (!isAtBottom() && !scrollRafPending) {
             const container = elements.outputContainer;
             const fontSize = currentFontSize || 14;
             const lineHeight = fontSize * 1.2;

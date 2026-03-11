@@ -170,6 +170,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                     from_server: false,
                                     seq: 0,
                                 marked_new: false,
+                                flush: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -181,6 +182,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                     from_server: false,
                                     seq: 0,
                                 marked_new: false,
+                                flush: false,
                                 });
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
@@ -320,6 +322,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
+                                flush: false,
                             }),
                         }
                     }
@@ -380,6 +383,7 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,
+                            flush: false,
                             });
                         } else {
                             let commands = split_action_commands(&action.command);
@@ -402,6 +406,7 @@ pub async fn handle_daemon_ws_message(
                                                 from_server: false,
                                                 seq: 0,
                                             marked_new: false,
+                                            flush: false,
                                             });
                                         }
                                         tf::TfCommandResult::Success(None) => {}
@@ -414,6 +419,7 @@ pub async fn handle_daemon_ws_message(
                                                 from_server: false,
                                                 seq: 0,
                                             marked_new: false,
+                                            flush: false,
                                             });
                                         }
                                         tf::TfCommandResult::SendToMud(text) => {
@@ -436,18 +442,18 @@ pub async fn handle_daemon_ws_message(
 
                                                 if !opts.quiet {
                                                     if let Some(h) = header {
-                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                                     }
                                                 }
                                                 if matches.is_empty() {
-                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                                 } else {
                                                     for m in matches {
-                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                                     }
                                                 }
                                                 if !opts.quiet {
-                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                                 }
                                             }
                                         }
@@ -478,6 +484,7 @@ pub async fn handle_daemon_ws_message(
                                     ts: current_timestamp_secs(), from_server: false,
                                     seq: 0,
                                 marked_new: false,
+                                flush: false,
                                 });
                             }
                             tf::TfCommandResult::Success(None) => {}
@@ -487,6 +494,7 @@ pub async fn handle_daemon_ws_message(
                                     ts: current_timestamp_secs(), from_server: false,
                                     seq: 0,
                                 marked_new: false,
+                                flush: false,
                                 });
                             }
                             tf::TfCommandResult::SendToMud(text) => {
@@ -508,18 +516,18 @@ pub async fn handle_daemon_ws_message(
                                     let ts = current_timestamp_secs();
                                     if !opts.quiet {
                                         if let Some(h) = header {
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                         }
                                     }
                                     if matches.is_empty() {
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                     } else {
                                         for m in matches {
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                         }
                                     }
                                     if !opts.quiet {
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                     }
                                 }
                             }
@@ -535,6 +543,7 @@ pub async fn handle_daemon_ws_message(
                                     from_server: false,
                                     seq: 0,
                                 marked_new: false,
+                                flush: false,
                                 });
                             }
                         }
@@ -574,6 +583,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 Command::UrbanUsage => {
@@ -585,6 +595,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 Command::TranslateUsage => {
@@ -596,6 +607,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 Command::HelpTopic { ref topic } => {
@@ -617,6 +629,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         });
                     }
                 }
@@ -629,6 +642,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -665,6 +679,7 @@ pub async fn handle_daemon_ws_message(
                                     from_server: false,
                                     seq: 0,
                                 marked_new: false,
+                                flush: false,
                                 });
                             }
                         } else {
@@ -676,6 +691,7 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,
+                            flush: false,
                             });
                         }
                     } else if world_index < app.worlds.len() {
@@ -709,6 +725,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                         marked_new: false,
+                        flush: false,
                         });
                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                     } else {
@@ -720,6 +737,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                         marked_new: false,
+                        flush: false,
                         });
                     }
                 }
@@ -740,6 +758,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                         marked_new: false,
+                        flush: false,
                         });
                     }
                 }
@@ -752,6 +771,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 Command::BanList => {
@@ -765,6 +785,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                         marked_new: false,
+                        flush: false,
                         });
                     } else {
                         let mut output = String::new();
@@ -787,6 +808,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                         marked_new: false,
+                        flush: false,
                         });
                     }
                     app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -802,6 +824,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                         marked_new: false,
+                        flush: false,
                         });
                         app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
                         app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
@@ -814,6 +837,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                         marked_new: false,
+                        flush: false,
                         });
                         app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                     }
@@ -838,6 +862,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 Command::Notify { message } => {
@@ -858,6 +883,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 Command::Dump => {
@@ -907,6 +933,7 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,
+                            flush: false,
                             });
                         }
                         Err(e) => {
@@ -918,12 +945,14 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,
+                            flush: false,
                             });
                         }
                     }
                 }
                 Command::Reload => {
                     // Signal the event loop to perform reload
+                    crate::debug_log(true, "DAEMON: Received /reload command, sending Sigusr1Received event");
                     let _ = event_tx.send(AppEvent::Sigusr1Received).await;
                 }
                 // Commands that execute locally on the client
@@ -944,6 +973,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 // AddWorld - add or update world definition
@@ -991,6 +1021,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
                 // Connect command - use daemon connection logic
@@ -1009,11 +1040,12 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,
+                            flush: false,
                             });
 
                             app.worlds[world_index].connection_id += 1;
                             let skip_login = app.worlds[world_index].skip_auto_login;
-                            if let Some(cmd_tx) = connect_daemon_world(
+                            if let Some((cmd_tx, socket_fd, is_tls)) = connect_daemon_world(
                                 world_index,
                                 world_name.clone(),
                                 &settings,
@@ -1025,6 +1057,9 @@ pub async fn handle_daemon_ws_message(
                                 app.worlds[world_index].command_tx = Some(cmd_tx);
                                 app.worlds[world_index].was_connected = true;
                                 app.worlds[world_index].skip_auto_login = false;
+                                #[cfg(unix)]
+                                { app.worlds[world_index].socket_fd = socket_fd; }
+                                app.worlds[world_index].is_tls = is_tls;
                                 let now = std::time::Instant::now();
                                 app.worlds[world_index].last_send_time = Some(now);
                                 app.worlds[world_index].last_receive_time = Some(now);
@@ -1039,6 +1074,7 @@ pub async fn handle_daemon_ws_message(
                                     from_server: false,
                                     seq: 0,
                                 marked_new: false,
+                                flush: false,
                                 });
                             }
                         } else {
@@ -1050,6 +1086,7 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,
+                            flush: false,
                             });
                         }
                     }
@@ -1079,11 +1116,12 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,
+                            flush: false,
                             });
 
                             app.worlds[idx].connection_id += 1;
                             let skip_login = app.worlds[idx].skip_auto_login;
-                            if let Some(cmd_tx) = connect_daemon_world(
+                            if let Some((cmd_tx, socket_fd, is_tls)) = connect_daemon_world(
                                 idx,
                                 world_name.clone(),
                                 &settings,
@@ -1095,6 +1133,9 @@ pub async fn handle_daemon_ws_message(
                                 app.worlds[idx].command_tx = Some(cmd_tx);
                                 app.worlds[idx].was_connected = true;
                                 app.worlds[idx].skip_auto_login = false;
+                                #[cfg(unix)]
+                                { app.worlds[idx].socket_fd = socket_fd; }
+                                app.worlds[idx].is_tls = is_tls;
                                 let now = std::time::Instant::now();
                                 app.worlds[idx].last_send_time = Some(now);
                                 app.worlds[idx].last_receive_time = Some(now);
@@ -1109,6 +1150,7 @@ pub async fn handle_daemon_ws_message(
                                     from_server: false,
                                     seq: 0,
                                 marked_new: false,
+                                flush: false,
                                 });
                             }
                         }
@@ -1121,6 +1163,7 @@ pub async fn handle_daemon_ws_message(
                             from_server: false,
                             seq: 0,
                         marked_new: false,
+                        flush: false,
                         });
                     }
                 }
@@ -1141,6 +1184,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                     return;
                 }
@@ -1154,12 +1198,13 @@ pub async fn handle_daemon_ws_message(
                     from_server: false,
                     seq: 0,
                 marked_new: false,
+                flush: false,
                 });
 
                 // Attempt connection
                 app.worlds[world_index].connection_id += 1;
                 let skip_login = app.worlds[world_index].skip_auto_login;
-                if let Some(cmd_tx) = connect_daemon_world(
+                if let Some((cmd_tx, socket_fd, is_tls)) = connect_daemon_world(
                     world_index,
                     world_name.clone(),
                     &settings,
@@ -1172,6 +1217,9 @@ pub async fn handle_daemon_ws_message(
                     app.worlds[world_index].command_tx = Some(cmd_tx);
                     app.worlds[world_index].was_connected = true;
                     app.worlds[world_index].skip_auto_login = false;
+                    #[cfg(unix)]
+                    { app.worlds[world_index].socket_fd = socket_fd; }
+                    app.worlds[world_index].is_tls = is_tls;
                     let now = std::time::Instant::now();
                     app.worlds[world_index].last_send_time = Some(now);
                     app.worlds[world_index].last_receive_time = Some(now);
@@ -1188,6 +1236,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     marked_new: false,
+                    flush: false,
                     });
                 }
             }
@@ -1363,6 +1412,7 @@ pub async fn handle_daemon_ws_message(
                             // arrived after reconnect, causing false duplicate detection.
                             seq: 0,
                             marked_new: has_marked_new,
+                            flush: false,
                         });
                     }
 
@@ -1394,6 +1444,7 @@ pub async fn handle_daemon_ws_message(
                         from_server: line.from_server,
                         seq: line.seq,
                         marked_new: false,
+                        flush: false,
                     });
                 }
                 app.worlds[world_index].output_lines.extend(kept);
@@ -1406,29 +1457,17 @@ pub async fn handle_daemon_ws_message(
         WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
             if is_debug_enabled() {
                 let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("clay.output.debug")
-                {
-                    let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                        source, world_name, expected_seq_gt, actual_seq,
-                        line_text.chars().take(80).collect::<String>());
-                }
+                output_debug_log(&format!("SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                    source, world_name, expected_seq_gt, actual_seq,
+                    line_text.chars().take(80).collect::<String>()));
             }
         }
         WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
             if is_debug_enabled() {
                 let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("clay.output.debug")
-                {
-                    let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                        source, world_name, line_seq, max_seq,
-                        line_text.chars().take(200).collect::<String>());
-                }
+                output_debug_log(&format!("DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                    source, world_name, line_seq, max_seq,
+                    line_text.chars().take(200).collect::<String>()));
             }
         }
         WsMessage::ClientTypeDeclaration { client_type } => {
@@ -1861,6 +1900,7 @@ keep_alive_type=Generic
                                         from_server: false,
                                         seq: 0,
                                     marked_new: false,
+                                    flush: false,
                                     });
                                 }
                             }
@@ -1874,6 +1914,7 @@ keep_alive_type=Generic
                                         from_server: false,
                                         seq: 0,
                                     marked_new: false,
+                                    flush: false,
                                     });
                                 }
                             }
@@ -1938,6 +1979,7 @@ keep_alive_type=Generic
                                         from_server: false,
                                         seq: 0,
                                         marked_new: false,
+                                        flush: false,
                                     }, Some(&requesting_username));
                                 }
                             // Create per-user connection
@@ -1973,6 +2015,7 @@ keep_alive_type=Generic
                                         from_server: false,
                                         seq: 0,
                                         marked_new: false,
+                                        flush: false,
                                     }, Some(&requesting_username));
                                 }
                             }
@@ -2005,6 +2048,7 @@ keep_alive_type=Generic
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
+                                    flush: false,
                                 }, Some(&username));
                             }
                         }
@@ -2299,7 +2343,7 @@ pub async fn connect_daemon_world(
     event_tx: mpsc::Sender<AppEvent>,
     connection_id: u64,
     skip_auto_login: bool,
-) -> Option<mpsc::Sender<WriteCommand>> {
+) -> Option<(mpsc::Sender<WriteCommand>, Option<i32>, bool)> {
     let host = &settings.hostname;
     let port = &settings.port;
     let use_ssl = settings.use_ssl;
@@ -2312,11 +2356,22 @@ pub async fn connect_daemon_world(
         Ok(tcp_stream) => {
             let _ = tcp_stream.set_nodelay(true);
 
+            // Store the socket fd for hot reload (before splitting, Unix only)
+            #[cfg(unix)]
+            let socket_fd = {
+                use std::os::unix::io::AsRawFd;
+                Some(tcp_stream.as_raw_fd())
+            };
+            #[cfg(not(unix))]
+            let socket_fd: Option<i32> = None;
+
             // Enable TCP keepalive to detect dead connections faster
             enable_tcp_keepalive(&tcp_stream);
 
             // Handle SSL if needed
+            let is_tls;
             let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
+                is_tls = true;
                 #[cfg(feature = "native-tls-backend")]
                 {
                     let connector = match native_tls::TlsConnector::builder()
@@ -2371,9 +2426,13 @@ pub async fn connect_daemon_world(
                     return None;
                 }
             } else {
+                is_tls = false;
                 let (r, w) = tcp_stream.into_split();
                 (StreamReader::Plain(r), StreamWriter::Plain(w))
             };
+
+            // For TLS, socket_fd should be None (can't preserve across reload)
+            let final_socket_fd = if is_tls { None } else { socket_fd };
 
             let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
 
@@ -2486,7 +2545,7 @@ pub async fn connect_daemon_world(
                 }
             });
 
-            Some(cmd_tx)
+            Some((cmd_tx, final_socket_fd, is_tls))
         }
         Err(_) => None,
     }
@@ -2874,29 +2933,17 @@ pub async fn handle_multiuser_ws_message(
         WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
             if is_debug_enabled() {
                 let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("clay.output.debug")
-                {
-                    let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                        source, world_name, expected_seq_gt, actual_seq,
-                        line_text.chars().take(80).collect::<String>());
-                }
+                output_debug_log(&format!("SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                    source, world_name, expected_seq_gt, actual_seq,
+                    line_text.chars().take(80).collect::<String>()));
             }
         }
         WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
             if is_debug_enabled() {
                 let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("clay.output.debug")
-                {
-                    let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                        source, world_name, line_seq, max_seq,
-                        line_text.chars().take(200).collect::<String>());
-                }
+                output_debug_log(&format!("DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                    source, world_name, line_seq, max_seq,
+                    line_text.chars().take(200).collect::<String>()));
             }
         }
         WsMessage::ToggleWorldGmcp { world_index } => {

@@ -1190,6 +1190,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "lines_since_pause={}", world.lines_since_pause)?;
         writeln!(file, "is_tls={}", world.is_tls)?;
         writeln!(file, "was_connected={}", world.was_connected)?;
+        writeln!(file, "showing_splash={}", world.showing_splash)?;
         writeln!(file, "telnet_mode={}", world.telnet_mode)?;
         if let Some(enc) = world.negotiated_encoding {
             writeln!(file, "negotiated_encoding={}", enc.iana_name())?;
@@ -1419,6 +1420,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         lines_since_pause: usize,
         is_tls: bool,
         was_connected: bool,
+        showing_splash: bool,
         telnet_mode: bool,
         negotiated_encoding: Option<Encoding>,
         uses_wont_echo_prompt: bool,
@@ -1524,6 +1526,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         lines_since_pause: 0,
                         is_tls: false,
                         was_connected: false,
+                        showing_splash: false,
                         telnet_mode: false,
                         negotiated_encoding: None,
                         uses_wont_echo_prompt: false,
@@ -1799,6 +1802,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "lines_since_pause" => tw.lines_since_pause = value.parse().unwrap_or(0),
                             "is_tls" => tw.is_tls = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
+                            "showing_splash" => tw.showing_splash = value == "true",
                             "telnet_mode" => tw.telnet_mode = value == "true",
                             "negotiated_encoding" => tw.negotiated_encoding = Encoding::from_iana_name(value),
                             "uses_wont_echo_prompt" => tw.uses_wont_echo_prompt = value == "true",
@@ -1906,6 +1910,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.lines_since_pause = tw.lines_since_pause;
         world.is_tls = tw.is_tls;
         world.was_connected = tw.was_connected;
+        world.showing_splash = tw.showing_splash;
         world.telnet_mode = tw.telnet_mode;
         world.negotiated_encoding = tw.negotiated_encoding;
         world.uses_wont_echo_prompt = tw.uses_wont_echo_prompt;

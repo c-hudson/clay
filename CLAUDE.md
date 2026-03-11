@@ -9,6 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Debug output interferes with the TUI and corrupts the terminal display. Instead:
 - Write debug logs to a file (e.g., `clay.debug.log`, `clay.tf.debug.log`)
 - Or display messages in the output area using `add_tf_output()` or similar methods
+- Use `debug_log(true, msg)` for always-on logging (e.g., reload diagnostics) or `debug_log(is_debug_enabled(), msg)` for user-toggled debug
+- Use `output_debug_log(msg)` for output/seq debugging (writes to `clay.output.debug`)
+- Both log files include a session header on first write per startup/reload
 
 ## Build Commands
 
@@ -387,6 +390,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - When more data arrives continuing a partial line, the existing line is updated in-place
 - Prevents duplicate lines when data is split across TCP reads
 - Correctly handles partials in both `output_lines` and `pending_lines` (when paused)
+- Partial lines are excluded from WebSocket broadcasts and `InitialState` to avoid duplicate/flickering content on remote clients; they are included in the next broadcast when completed
 
 ### Async Architecture
 
@@ -405,7 +409,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `src/spell.rs` - Spell checking with Levenshtein distance suggestions
 - `src/persistence.rs` - Settings save/load (`~/.clay.dat` INI format)
 - `src/util.rs` - Shared utility functions
-- `src/daemon.rs` - Daemon/background process management
+- `src/daemon.rs` - Daemon/background process management, headless connection logic (`connect_daemon_world` returns cmd_tx + socket_fd + is_tls for hot reload)
 - `src/ansi_music.rs` - ANSI music sequence parsing and playback
 
 **Networking:**
@@ -768,7 +772,7 @@ The client supports GMCP-based media playback using the Client.Media.* protocol 
 
 The `/reload` command performs a true hot code reload:
 
-1. Saves complete application state (output buffers, pending lines, scroll positions, per-world settings including auto login type, etc.)
+1. Saves complete application state (output buffers, pending lines, scroll positions, per-world settings including auto login type, showing_splash state, etc.)
 2. Clears FD_CLOEXEC on socket file descriptors so they survive exec
 3. Calls exec() to replace the current process with a fresh binary
 4. The new process detects reload mode and restores state including all output history
@@ -785,6 +789,7 @@ Works with updated binaries: On Linux, when the binary is rebuilt while running,
 - `/reload` command from within the client
 - `Ctrl+R` keyboard shortcut
 - Send SIGUSR1 signal: `kill -USR1 $(pgrep clay)`
+- WebView GUI: IPC "reload" message sets `GUI_RELOAD_REQUESTED` AtomicBool (can't use SIGUSR1 because WebKit/JSC overrides the signal handler)
 
 **Limitations:**
 - TLS/SSL connections: By default, TLS connections cannot be preserved (TLS state is in userspace) and will need manual reconnection after reload
@@ -844,6 +849,7 @@ The client includes an embedded WebSocket server that allows GUI and web clients
 - JSON over WebSocket
 - Message types: AuthRequest, AuthResponse, InitialState, ServerData, WorldConnected, WorldDisconnected, WorldSwitched, PromptUpdate, SendCommand, SwitchWorld, ConnectWorld, DisconnectWorld, MarkWorldSeen, UnseenCleared, Ping, Pong
 - Password is hashed with SHA-256 before transmission
+- `ServerData` includes a `flush` flag: when true, client clears its output buffer before appending new lines (used when splash screen is cleared by incoming server data, replacing the separate `WorldFlushed` message to avoid race conditions)
 
 **Cross-Interface Sync:**
 
@@ -1031,6 +1037,8 @@ cargo build --features webview-gui
 - ANSI music playback via rodio (included with webview-gui feature)
 - World switching is GUI-local (doesn't affect console)
 - Default mode on macOS and Windows (when webview-gui feature is compiled in)
+- Hot reload supported in master mode: triggers via `GUI_RELOAD_REQUESTED` AtomicBool (WebKit/JSC overrides SIGUSR1 for GC), exec's new binary with `--gui --reload`
+- Splash screen shows clay2.png image instead of text-based ASCII art; persisted across reload via `showing_splash` state
 
 ### Remote Console Client
 

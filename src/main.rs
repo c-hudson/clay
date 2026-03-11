@@ -34,6 +34,15 @@ static CUSTOM_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// Global debug flag — set from settings, checked by debug_log and file writes
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Tracks whether the startup header has been written to clay.debug.log
+static DEBUG_LOG_HEADER_WRITTEN: AtomicBool = AtomicBool::new(false);
+/// Tracks whether the startup header has been written to clay.output.debug
+static OUTPUT_DEBUG_HEADER_WRITTEN: AtomicBool = AtomicBool::new(false);
+/// Startup time stored as Unix timestamp (seconds since epoch)
+static STARTUP_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Flag set by IPC handler to request reload — checked by headless event loop
+pub static GUI_RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Check if debug logging is enabled
 pub fn is_debug_enabled() -> bool {
     DEBUG_ENABLED.load(Ordering::Relaxed)
@@ -3396,21 +3405,26 @@ impl App {
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, marked_new, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, marked_new, flush, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
+                    // Flush: clear output buffer before appending new lines
+                    // (e.g., splash screen cleared — combined with data to avoid race condition)
+                    if flush {
+                        world.output_lines.clear();
+                        world.pending_lines.clear();
+                        world.showing_splash = false;
+                        world.paused = false;
+                        world.lines_since_pause = 0;
+                        world.scroll_offset = 0;
+                        self.needs_output_redraw = true;
+                    }
                     // Dedup: skip ServerData that has already been received (e.g., after resync)
                     if msg_seq > 0 && msg_seq <= world.max_received_seq {
                         // Log duplicate to debug file
                         if is_debug_enabled() {
-                            use std::io::Write as _;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).append(true)
-                                .open("clay.output.debug")
-                            {
-                                let _ = writeln!(f, "DUPLICATE [console] in '{}': line_seq={}, max_seq={}, text={:?}",
-                                    world.name, msg_seq, world.max_received_seq,
-                                    data.chars().take(200).collect::<String>());
-                            }
+                            output_debug_log(&format!("DUPLICATE [console] in '{}': line_seq={}, max_seq={}, text={:?}",
+                                world.name, msg_seq, world.max_received_seq,
+                                data.chars().take(200).collect::<String>()));
                         }
                         // Report back to server
                         if let Some(ref tx) = self.ws_client_tx {
@@ -4182,6 +4196,7 @@ impl App {
             from_server: false,  // Client-generated message
             seq: 0,
             marked_new: false,
+            flush: false,
         });
 
         // Mark output for redraw since we added content
@@ -4231,6 +4246,7 @@ impl App {
             from_server: false,  // Client-generated message
             seq: 0,
             marked_new: false,
+            flush: false,
         });
 
         if world_idx == self.current_world_index {
@@ -4448,13 +4464,7 @@ impl App {
                 }
                 // Log if we didn't send to anyone (for debugging)
                 if is_debug_enabled() && sent_count == 0 && !clients_guard.is_empty() {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true)
-                        .open("clay.output.debug")
-                    {
-                        let _ = writeln!(f, "ws_broadcast: {} clients connected, 0 authenticated", clients_guard.len());
-                    }
+                    output_debug_log(&format!("ws_broadcast: {} clients connected, 0 authenticated", clients_guard.len()));
                 }
             } else {
                 // Lock contention - fall back to async broadcast
@@ -4803,23 +4813,51 @@ impl App {
             let output_before = self.worlds[world_idx].output_lines.len();
             let was_showing_splash = self.worlds[world_idx].showing_splash;
 
+            // Track partial line state before add_output:
+            // If there's a partial line in output_lines, we shouldn't have broadcast it yet
+            // (we exclude partials from broadcasts). When it's completed, we'll include it.
+            let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
+                && !self.worlds[world_idx].partial_in_pending;
+
             self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, console_width, true, true);
 
             // Check if splash was cleared (output_lines was reset)
             let splash_was_cleared = was_showing_splash && !self.worlds[world_idx].showing_splash;
 
+            // Check partial state after add_output
+            let has_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
+                && !self.worlds[world_idx].partial_in_pending;
+
             // Calculate what went where
             let pending_after = self.worlds[world_idx].pending_lines.len();
             let output_after = self.worlds[world_idx].output_lines.len();
 
-            // If splash was cleared, output_lines was reset, so we need to broadcast ALL output lines
-            // (not just the difference from before)
+            // Calculate broadcast boundaries, accounting for partial lines:
+            // - Partial lines are NOT broadcast (clients only get complete lines)
+            // - When a partial is completed (updated in-place), include it in the broadcast
+            // This fixes the bug where partial line updates were never sent to remote clients
             let (lines_to_output, skip_count) = if splash_was_cleared {
                 // Broadcast all output lines since buffer was cleared
                 (output_after, 0)
             } else {
-                // Normal case: broadcast only newly added lines
-                (output_after.saturating_sub(output_before), output_before)
+                let mut skip = output_before;
+                let mut count = output_after.saturating_sub(output_before);
+
+                // If we had a partial in output_lines before, it wasn't broadcast yet.
+                // Now that add_output may have completed it (or added new lines after it),
+                // include it in this broadcast by moving skip back one position.
+                if had_partial_in_output && skip > 0 {
+                    skip -= 1;
+                    count = output_after.saturating_sub(skip);
+                }
+
+                // If there's currently a partial line at the end of output_lines,
+                // exclude it from this broadcast (it'll be sent when completed)
+                if has_partial_in_output && count > 0 {
+                    count -= 1;
+                }
+
+                (count, skip)
             };
             let lines_to_pending = pending_after.saturating_sub(pending_before);
 
@@ -4846,11 +4884,6 @@ impl App {
                 self.needs_output_redraw = true;
             }
 
-            // If splash was cleared, tell clients to flush their buffers first
-            if splash_was_cleared {
-                self.ws_broadcast(WsMessage::WorldFlushed { world_index: world_idx });
-            }
-
             // For synchronized more-mode: only broadcast lines that went to output_lines
             // Lines that went to pending_lines will be broadcast when released
             // Only send to clients viewing this world (Phase 2 output routing)
@@ -4873,6 +4906,8 @@ impl App {
                 let ws_data = output_lines_to_broadcast.join("\n") + "\n";
 
                 // Route output only to clients viewing this world
+                // If splash was cleared, set flush flag so client clears buffer atomically
+                // before appending new lines (avoids race with separate WorldFlushed message)
                 self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                     world_index: world_idx,
                     data: ws_data,
@@ -4881,7 +4916,11 @@ impl App {
                     from_server: true,
                     seq: first_seq,
                     marked_new: !is_current,
+                    flush: splash_was_cleared,
                 });
+            } else if splash_was_cleared {
+                // Splash cleared but no output lines to send — still need to flush client buffers
+                self.ws_broadcast(WsMessage::WorldFlushed { world_index: world_idx });
             }
 
             // Broadcast pending count update if it changed (for synchronized more-mode indicator)
@@ -4972,6 +5011,7 @@ impl App {
             from_server: false,
             seq,
             marked_new: false,
+            flush: false,
         });
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
     }
@@ -5314,6 +5354,13 @@ impl App {
 
     /// Handle initial WsClientMessage (AuthRequest) after authentication.
     fn handle_ws_auth_initial_state(&mut self, client_id: u64, current_world: Option<usize>) {
+        // Debug: log showing_splash state for all worlds
+        for (idx, world) in self.worlds.iter().enumerate() {
+            debug_log(true, &format!(
+                "AUTH_INITIAL_STATE: World[{}] '{}' showing_splash={} output_lines={} connected={}",
+                idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
+            ));
+        }
         let initial_state = self.build_initial_state();
         self.ws_send_initial_state_and_mark(client_id, initial_state);
         let world_idx = current_world
@@ -5410,6 +5457,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         });
                     } else {
                         let commands = split_action_commands(&action.command);
@@ -5434,6 +5482,7 @@ impl App {
                                             from_server: false,
                                             seq: 0,
                                             marked_new: false,
+                                            flush: false,
                                         });
                                     }
                                     tf::TfCommandResult::Success(None) => {}
@@ -5446,6 +5495,7 @@ impl App {
                                             from_server: false,
                                             seq: 0,
                                             marked_new: false,
+                                            flush: false,
                                         });
                                     }
                                     tf::TfCommandResult::SendToMud(text) => {
@@ -5468,18 +5518,18 @@ impl App {
 
                                             if !opts.quiet {
                                                 if let Some(h) = header {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false });
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false });
                                                 }
                                             }
                                             if matches.is_empty() {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                             } else {
                                                 for m in matches {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false });
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false });
                                                 }
                                             }
                                             if !opts.quiet {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false, seq: 0, marked_new: false });
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false });
                                             }
                                         }
                                     }
@@ -5516,6 +5566,7 @@ impl App {
                                 ts: current_timestamp_secs(), from_server: false,
                                 seq: 0,
                                 marked_new: false,
+                                flush: false,
                             });
                         }
                         tf::TfCommandResult::Success(None) => {}
@@ -5525,6 +5576,7 @@ impl App {
                                 ts: current_timestamp_secs(), from_server: false,
                                 seq: 0,
                                 marked_new: false,
+                                flush: false,
                             });
                         }
                         tf::TfCommandResult::SendToMud(text) => {
@@ -5546,18 +5598,18 @@ impl App {
                                 let ts = current_timestamp_secs();
                                 if !opts.quiet {
                                     if let Some(h) = header {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                     }
                                 }
                                 if matches.is_empty() {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                 } else {
                                     for m in matches {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                     }
                                 }
                                 if !opts.quiet {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
                                 }
                             }
                         }
@@ -5576,6 +5628,7 @@ impl App {
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
+                                flush: false,
                             });
                         }
                     }
@@ -5611,6 +5664,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -5651,6 +5705,7 @@ impl App {
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
+                                flush: false,
                             });
                         }
                     } else {
@@ -5662,6 +5717,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         });
                     }
                 } else {
@@ -5691,6 +5747,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                     self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                 } else {
@@ -5702,6 +5759,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                 }
             }
@@ -5723,6 +5781,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                 }
             }
@@ -5736,6 +5795,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             Command::BanList => {
@@ -5750,6 +5810,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                 } else {
                     let mut output = String::new();
@@ -5772,6 +5833,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                 }
                 self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -5788,6 +5850,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                     // Broadcast updated ban list
                     self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
@@ -5801,6 +5864,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                     self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                 }
@@ -5821,6 +5885,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             Command::Notify { message } => {
@@ -5842,6 +5907,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             Command::Dump => {
@@ -5893,6 +5959,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         });
                     }
                     Err(e) => {
@@ -5904,6 +5971,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         });
                     }
                 }
@@ -5934,6 +6002,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             // AddWorld - add or update world definition
@@ -5981,6 +6050,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             // Connect command - needs async follow-up
@@ -5999,6 +6069,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         });
                     }
                 }
@@ -6035,6 +6106,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                 }
             }
@@ -6050,6 +6122,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             Command::UrbanUsage => {
@@ -6061,6 +6134,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             Command::TranslateUsage => {
@@ -6072,6 +6146,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
+                    flush: false,
                 });
             }
             Command::HelpTopic { ref topic } => {
@@ -6095,6 +6170,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
+                        flush: false,
                     });
                 }
             }
@@ -6126,6 +6202,7 @@ impl App {
                     self.ws_broadcast(WsMessage::ServerData {
                         world_index, data: format!("(no recall matches for '{}')", pattern_str),
                         is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+ flush: false,
                     });
                 }
             }
@@ -6184,6 +6261,7 @@ impl App {
                                 self.ws_broadcast(WsMessage::ServerData {
                                     world_index, data: "Not connected".to_string(),
                                     is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+ flush: false,
                                 });
                                 break;
                             }
@@ -6193,6 +6271,7 @@ impl App {
                         self.ws_broadcast(WsMessage::ServerData {
                             world_index, data: line,
                             is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+ flush: false,
                         });
                     }
                     tf::QuoteDisposition::Exec => {
@@ -6211,12 +6290,14 @@ impl App {
                                 self.ws_broadcast(WsMessage::ServerData {
                                     world_index, data: msg,
                                     is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+ flush: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
                                 self.ws_broadcast(WsMessage::ServerData {
                                     world_index, data: format!("Error: {}", err),
                                     is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+ flush: false,
                                 });
                             }
                             _ => {}
@@ -6284,6 +6365,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         });
                     } else {
                         // Save current world index, switch to target, connect, then restore
@@ -6495,6 +6577,7 @@ impl App {
                                 // arrived after reconnect, causing false duplicate detection.
                                 seq: 0,
                                 marked_new: has_marked_new,
+                                flush: false,
                             });
                         }
 
@@ -6883,29 +6966,17 @@ impl App {
             WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
                 if is_debug_enabled() {
                     let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true)
-                        .open("clay.output.debug")
-                    {
-                        let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                            source, world_name, expected_seq_gt, actual_seq,
-                            line_text.chars().take(80).collect::<String>());
-                    }
+                    output_debug_log(&format!("SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                        source, world_name, expected_seq_gt, actual_seq,
+                        line_text.chars().take(80).collect::<String>()));
                 }
             }
             WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
                 if is_debug_enabled() {
                     let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true)
-                        .open("clay.output.debug")
-                    {
-                        let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                            source, world_name, line_seq, max_seq,
-                        line_text.chars().take(200).collect::<String>());
-                    }
+                    output_debug_log(&format!("DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                        source, world_name, line_seq, max_seq,
+                        line_text.chars().take(200).collect::<String>()));
                 }
             }
             WsMessage::ClientTypeDeclaration { client_type } => {
@@ -7116,10 +7187,18 @@ impl App {
             // Create timestamped versions (add sparkle prefix for client-generated messages)
             // Only include output_lines - pending_lines stay on the server and are
             // released via PgDn/Tab, then broadcast to clients normally.
-            let total_lines = world.output_lines.len();
+            // Exclude trailing partial line (text without trailing newline, e.g., prompt).
+            // It will be included in the next broadcast when completed by subsequent data.
+            let has_trailing_partial = !world.partial_line.is_empty() && !world.partial_in_pending;
+            let total_lines = if has_trailing_partial {
+                world.output_lines.len().saturating_sub(1)
+            } else {
+                world.output_lines.len()
+            };
             let skip = total_lines.saturating_sub(MAX_INITIAL_LINES);
             let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
                 .skip(skip)
+                .take(total_lines - skip)
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
@@ -7694,6 +7773,7 @@ impl App {
                 // Use seq 0 to bypass client-side dedup check (see ReleasePending handler)
                 seq: 0,
                 marked_new: has_marked_new,
+                flush: false,
             });
         }
 
@@ -7824,6 +7904,21 @@ fn get_debug_log_path() -> PathBuf {
     PathBuf::from(home).join("clay.debug.log")
 }
 
+/// Write a session startup header to a debug log file.
+/// Called once per file per session (startup/reload).
+fn write_debug_header(file: &mut std::fs::File) {
+    use std::io::Write;
+    let startup_secs = STARTUP_TIME.load(Ordering::Relaxed);
+    let lt = local_time_from_epoch(startup_secs as i64);
+    let startup_ts = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        lt.year, lt.month, lt.day,
+        lt.hour, lt.minute, lt.second
+    );
+    let _ = writeln!(file, "");
+    let _ = writeln!(file, "=== {} — started {} ===", get_version_string(), startup_ts);
+}
+
 /// Write a debug message to clay.debug.log if debug is enabled
 fn debug_log(debug_enabled: bool, message: &str) {
     if !debug_enabled {
@@ -7837,6 +7932,10 @@ fn debug_log(debug_enabled: bool, message: &str) {
         .open(&path)
     {
         Ok(mut file) => {
+            // Write session header on first log entry
+            if !DEBUG_LOG_HEADER_WRITTEN.swap(true, Ordering::Relaxed) {
+                write_debug_header(&mut file);
+            }
             let lt = local_time_now();
             let timestamp = format!(
                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -7848,6 +7947,22 @@ fn debug_log(debug_enabled: bool, message: &str) {
         Err(e) => {
             eprintln!("Failed to open debug log {:?}: {}", path, e);
         }
+    }
+}
+
+/// Write a debug message to clay.output.debug (output/seq debugging)
+fn output_debug_log(message: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("clay.output.debug")
+    {
+        // Write session header on first log entry
+        if !OUTPUT_DEBUG_HEADER_WRITTEN.swap(true, Ordering::Relaxed) {
+            write_debug_header(&mut f);
+        }
+        let _ = writeln!(f, "{}", message);
     }
 }
 
@@ -8451,12 +8566,13 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
 
 #[cfg(all(unix, not(target_os = "android")))]
 pub fn exec_reload(app: &App) -> io::Result<()> {
-    debug_log(is_debug_enabled(), "RELOAD: Starting exec_reload");
+    // Always log reload (not gated by debug flag) so we can trace issues
+    debug_log(true, "RELOAD: Starting exec_reload");
 
     // Save the current state
-    debug_log(is_debug_enabled(), "RELOAD: Saving state...");
+    debug_log(true, "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
-    debug_log(is_debug_enabled(), "RELOAD: State saved successfully");
+    debug_log(true, "RELOAD: State saved successfully");
 
     // Collect socket fds that need to survive exec (plain TCP only)
     // TLS proxy connections reconnect via Unix socket path after reload
@@ -8470,11 +8586,11 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
             // If clear_cloexec fails, the FD is stale - just skip it
         }
     }
-    debug_log(is_debug_enabled(), &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));
+    debug_log(true, &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));
 
     // Get the executable path with debug info
     let (exe, debug_info) = get_executable_path()?;
-    debug_log(is_debug_enabled(), &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
+    debug_log(true, &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
 
     // Verify the executable exists
     if !exe.exists() {
@@ -8492,12 +8608,11 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
         .join(",");
     std::env::set_var(RELOAD_FDS_ENV, &fds_str);
 
-    debug_log(is_debug_enabled(), &format!("RELOAD: About to exec with fds={}", fds_str));
-
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
     let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload").collect();
     args.push("--reload".to_string());
+    debug_log(true, &format!("RELOAD: About to exec {} with args={:?} fds={}", exe.display(), args, fds_str));
     let err = std::process::Command::new(&exe)
         .args(&args)
         .exec();
@@ -11840,8 +11955,19 @@ async fn main() -> io::Result<()> {
         set_custom_config_path(PathBuf::from(path));
     }
 
-    // Log startup for debugging reload/crash issues
-    debug_log(is_debug_enabled(), &format!("STARTUP: {} (reload={}, crash={})", get_version_string(), is_reload_arg, is_crash_arg));
+    // Record startup time and reset debug log header flags for this session
+    STARTUP_TIME.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        Ordering::Relaxed,
+    );
+    DEBUG_LOG_HEADER_WRITTEN.store(false, Ordering::Relaxed);
+    OUTPUT_DEBUG_HEADER_WRITTEN.store(false, Ordering::Relaxed);
+
+    // Always log startup (not gated by debug flag) for reload/crash diagnostics
+    debug_log(true, &format!("STARTUP: {} (reload={}, crash={}, gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg));
 
     // Validate mutual exclusivity
     if console_arg.is_some() && gui_arg.is_some() {
@@ -12066,19 +12192,25 @@ pub async fn run_app_headless(
     let should_load_state = is_reload || is_crash;
 
     if should_load_state {
-        debug_log(is_debug_enabled(), "HEADLESS STARTUP: Loading reload state...");
+        debug_log(true, "HEADLESS STARTUP: Loading reload state...");
         match persistence::load_reload_state(&mut app) {
             Ok(true) => {
-                debug_log(is_debug_enabled(), "HEADLESS STARTUP: Reload state loaded successfully");
+                debug_log(true, "HEADLESS STARTUP: Reload state loaded successfully");
+                for (idx, world) in app.worlds.iter().enumerate() {
+                    debug_log(true, &format!(
+                        "HEADLESS RELOAD STATE: World[{}] '{}' showing_splash={} output_lines={} connected={}",
+                        idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
+                    ));
+                }
             }
             Ok(false) => {
-                debug_log(is_debug_enabled(), "HEADLESS STARTUP: No reload state found");
+                debug_log(true, "HEADLESS STARTUP: No reload state found");
                 if let Err(e) = persistence::load_settings(&mut app) {
                     eprintln!("Warning: Could not load settings: {}", e);
                 }
             }
             Err(e) => {
-                debug_log(is_debug_enabled(), &format!("HEADLESS STARTUP: Failed to load reload state: {}", e));
+                debug_log(true, &format!("HEADLESS STARTUP: Failed to load reload state: {}", e));
                 if let Err(e) = persistence::load_settings(&mut app) {
                     eprintln!("Warning: Could not load settings: {}", e);
                 }
@@ -12125,7 +12257,16 @@ pub async fn run_app_headless(
     // Reconstruct connections from saved fds if in reload/crash mode
     #[cfg(unix)]
     if should_load_state {
-        debug_log(is_debug_enabled(), "HEADLESS STARTUP: Reconstructing connections...");
+        // Log world state for debugging (always-on)
+        for (idx, world) in app.worlds.iter().enumerate() {
+            if world.connected || world.socket_fd.is_some() {
+                debug_log(true, &format!(
+                    "HEADLESS RELOAD: World[{}] '{}' connected={} is_tls={} socket_fd={:?} proxy_pid={:?}",
+                    idx, world.name, world.connected, world.is_tls, world.socket_fd, world.proxy_pid
+                ));
+            }
+        }
+        debug_log(true, "HEADLESS STARTUP: Reconstructing connections...");
         // First pass: disconnect TLS worlds without proxy
         let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
         for (world_idx, world) in app.worlds.iter().enumerate() {
@@ -12158,6 +12299,7 @@ pub async fn run_app_headless(
             let world = &app.worlds[world_idx];
             if world.connected && world.socket_fd.is_some() && !world.is_tls {
                 let fd = world.socket_fd.unwrap();
+                debug_log(true, &format!("HEADLESS RELOAD: Reconstructing plain TCP for '{}' fd={}", world.name, fd));
                 let tcp_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
                 tcp_stream.set_nonblocking(true)?;
                 let tcp_stream = TcpStream::from_std(tcp_stream)?;
@@ -12292,6 +12434,10 @@ pub async fn run_app_headless(
         // Cleanup: mark disconnected worlds that claim to be connected but have no command channel
         for world in &mut app.worlds {
             if world.connected && world.command_tx.is_none() {
+                debug_log(true, &format!(
+                    "HEADLESS RELOAD CLEANUP: World '{}' connected but no command_tx — marking disconnected (socket_fd={:?})",
+                    world.name, world.socket_fd
+                ));
                 world.connected = false;
                 world.socket_fd = None;
                 world.pending_lines.clear();
@@ -12422,6 +12568,10 @@ pub async fn run_app_headless(
     let pending_update_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(pending_update_sleep);
 
+    // GUI reload check — polls atomic flag set by IPC handler (100ms interval)
+    let mut gui_reload_check = tokio::time::interval(Duration::from_millis(100));
+    gui_reload_check.tick().await; // consume first immediate tick
+
     // SIGUSR1 handler for hot reload
     #[cfg(all(unix, not(target_os = "android")))]
     {
@@ -12466,7 +12616,7 @@ pub async fn run_app_headless(
         }
     }
 
-    debug_log(is_debug_enabled(), "HEADLESS: Entering main event loop");
+    debug_log(true, "HEADLESS: Entering main event loop");
 
     // Main event loop
     loop {
@@ -12582,12 +12732,20 @@ pub async fn run_app_headless(
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         });
                     }
                     AppEvent::Sigusr1Received => {
                         #[cfg(all(unix, not(target_os = "android")))]
                         {
-                            debug_log(is_debug_enabled(), "HEADLESS: Received SIGUSR1, triggering reload");
+                            // Always log reload trigger (not gated by debug flag)
+                            debug_log(true, "HEADLESS: Reload triggered, calling exec_reload");
+                            for (idx, world) in app.worlds.iter().enumerate() {
+                                debug_log(true, &format!(
+                                    "HEADLESS PRE-RELOAD: World[{}] '{}' showing_splash={} output_lines={} connected={}",
+                                    idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
+                                ));
+                            }
                             app.ws_broadcast(WsMessage::ServerReloading);
                             exec_reload(&app)?;
                             return Ok(());
@@ -12640,6 +12798,7 @@ pub async fn run_app_headless(
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
+                                flush: false,
                             }),
                         }
                     }
@@ -12888,6 +13047,7 @@ pub async fn run_app_headless(
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
+                                    flush: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -12903,6 +13063,7 @@ pub async fn run_app_headless(
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
+                                    flush: false,
                                 });
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
@@ -12936,6 +13097,25 @@ pub async fn run_app_headless(
                     process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
                 } else {
                     process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
+            }
+
+            // GUI reload check — polls atomic flag set by WebView IPC handler
+            _ = gui_reload_check.tick() => {
+                if GUI_RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
+                    #[cfg(all(unix, not(target_os = "android")))]
+                    {
+                        debug_log(true, "HEADLESS: GUI reload flag detected, calling exec_reload");
+                        for (idx, world) in app.worlds.iter().enumerate() {
+                            debug_log(true, &format!(
+                                "HEADLESS GUI-RELOAD: World[{}] '{}' showing_splash={} output_lines={} connected={}",
+                                idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
+                            ));
+                        }
+                        app.ws_broadcast(WsMessage::ServerReloading);
+                        exec_reload(&app)?;
+                        return Ok(());
+                    }
                 }
             }
 
@@ -14467,6 +14647,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         from_server: false,
                                         seq: 0,
                                         marked_new: false,
+                                        flush: false,
                                     });
                                 }
 
@@ -14597,6 +14778,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
+                                flush: false,
                             }),
                         }
                     }
@@ -14865,6 +15047,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
+                                    flush: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -14880,6 +15063,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
+                                    flush: false,
                                 });
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
@@ -15161,6 +15345,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
+                                flush: false,
                             });
                         }
 
@@ -15275,6 +15460,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             from_server: false,
                             seq: 0,
                             marked_new: false,
+                            flush: false,
                         }),
                     }
                 }
@@ -16522,6 +16708,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     // Use seq 0 to bypass client-side dedup check (see ReleasePending handler)
                     seq: 0,
                     marked_new: has_marked_new,
+                    flush: false,
                 });
             }
 
@@ -16620,6 +16807,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     from_server: line.from_server,
                     seq: line.seq,
                     marked_new: false,
+                    flush: false,
                 });
             }
             app.worlds[world_idx].output_lines.extend(kept);
@@ -16685,6 +16873,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     from_server: true,
                     seq: first_seq,
                     marked_new: false,
+                    flush: false,
                 });
                 if app.worlds[world_idx].pending_lines.is_empty() {
                     app.worlds[world_idx].paused = false;
@@ -20074,14 +20263,9 @@ fn render_output_crossterm(app: &App) {
                         });
                     } else {
                         // Local console: write to debug file
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("clay.output.debug")
-                        {
-                            let _ = writeln!(f, "SEQ MISMATCH in '{}': idx={}, expected seq>{}, got seq={}, text={:?}",
-                                world.name, idx, prev_seq, line.seq,
-                                line.text.chars().take(80).collect::<String>());
-                        }
+                        output_debug_log(&format!("SEQ MISMATCH in '{}': idx={}, expected seq>{}, got seq={}, text={:?}",
+                            world.name, idx, prev_seq, line.seq,
+                            line.text.chars().take(80).collect::<String>()));
                     }
                 }
             }

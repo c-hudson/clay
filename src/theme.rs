@@ -134,7 +134,7 @@ impl ThemeColors {
                 ThemeColor::new(0, 57, 170),      // 4: blue
                 ThemeColor::new(170, 34, 170),    // 5: magenta
                 ThemeColor::new(26, 146, 170),    // 6: cyan
-                ThemeColor::new(170, 170, 170),   // 7: white
+                ThemeColor::new(232, 228, 236),   // 7: white (matches fg for dark theme)
                 ThemeColor::new(119, 119, 119),   // 8: bright black
                 ThemeColor::new(255, 135, 135),   // 9: bright red
                 ThemeColor::new(76, 230, 76),     // 10: bright green
@@ -193,7 +193,7 @@ impl ThemeColors {
                 ThemeColor::new(0, 57, 170),      // 4: blue
                 ThemeColor::new(170, 34, 170),    // 5: magenta
                 ThemeColor::new(26, 146, 170),    // 6: cyan
-                ThemeColor::new(80, 80, 80),      // 7: white (dark gray for light bg)
+                ThemeColor::new(29, 29, 31),      // 7: white (matches fg for light theme)
                 ThemeColor::new(119, 119, 119),   // 8: bright black
                 ThemeColor::new(255, 135, 135),   // 9: bright red
                 ThemeColor::new(76, 230, 76),     // 10: bright green
