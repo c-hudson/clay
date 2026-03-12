@@ -165,10 +165,10 @@ Clay is a terminal-based MUD (Multi-User Dungeon) client built with ratatui/cros
 
 ### Key Structs
 
-- **App**: Central state - worlds list, current world index, input area, spell checker, settings, settings popup
+- **App**: Central state - worlds list, current world index, input area, spell checker, settings, settings popup, keybindings
 - **World**: Per-connection state - output buffer, scroll position, connection, unseen lines, pause state, world settings, log handle, prompt (from telnet GA)
 - **WorldSettings**: Per-world connection settings - hostname, port, user, password, use_ssl, log_file, encoding, auto_connect_type, keep_alive_type, keep_alive_cmd
-- **InputArea**: Input buffer with viewport scrolling, command history, cursor position
+- **InputArea**: Input buffer with viewport scrolling, command history, cursor position, kill ring (for ^Y yank)
 - **SpellChecker**: System dictionary-based spell checking with Levenshtein-distance suggestions (uses /usr/share/dict/words)
 - **Settings**: Global preferences (more_mode_enabled, spell_check_enabled, world_switch_mode, websocket_enabled, websocket_port, websocket_password, https_enabled, https_port)
 - **WebSocketServer**: Embedded WebSocket server for GUI/web clients
@@ -411,6 +411,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `src/util.rs` - Shared utility functions
 - `src/daemon.rs` - Daemon/background process management, headless connection logic (`connect_daemon_world` returns cmd_tx + socket_fd + is_tls for hot reload)
 - `src/ansi_music.rs` - ANSI music sequence parsing and playback
+- `src/keybindings.rs` - Configurable keyboard bindings with TF defaults, load/save `~/.clay.key.dat`
 
 **Networking:**
 - `src/websocket.rs` - WebSocket server, message types, client management
@@ -443,6 +444,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `src/web/style.css` - Web interface CSS styles (uses `var(--theme-*)` CSS variables)
 - `src/web/app.js` - Web interface JavaScript client
 - `src/web/theme-editor.html` - Standalone browser-based theme color editor with live preview
+- `src/web/keybind-editor.html` - Standalone browser-based keyboard bindings editor
 
 **Testing:**
 - `src/testharness.rs` - Test harness for integration tests
@@ -455,15 +457,38 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `websockets.readme` - WebSocket protocol documentation
 - `~/.clay.dat` - Settings file (created on first save)
 - `~/clay.theme.dat` - Theme file (INI format with `[theme:name]` sections, editable via theme editor)
+- `~/.clay.key.dat` - Keyboard bindings file (INI format, only non-default bindings saved, editable via keybind editor)
 - `/usr/share/dict/words` - System dictionary for spell checking (fallback: american-english, british-english)
 
-### Controls
+### Configurable Keybindings
+
+All non-character keys are configurable via `~/.clay.key.dat`. Defaults follow TinyFugue conventions. The keybinding system has two layers checked in order:
+1. TF `/bind` bindings (runtime, from `/bind` command)
+2. Action bindings (from `~/.clay.key.dat`, falling back to TF defaults)
+
+Keybindings are loaded at startup and on `/reload`. A browser-based keybind editor is available at `/keybind-editor` (same pattern as theme editor).
+
+**Key name format:** `^A` (Ctrl+A), `Esc-x` (Escape then x), `F1`-`F12`, `Up`, `Down`, `Left`, `Right`, `PageUp`, `PageDown`, `Home`, `End`, `Insert`, `Delete`, `Backspace`, `Tab`, `Enter`, `Escape`, `Shift-Up`, `Ctrl-Down`, `Alt-Up`, etc.
+
+**Action IDs:** Each binding maps a key name to an action ID string (e.g. `cursor_home`, `history_prev`, `world_next`). See `keybindings::ACTIONS` for the full list.
+
+**File format (`~/.clay.key.dat`):**
+```ini
+[bindings]
+Up = world_next
+Down = world_prev
+Ctrl-Up = UNBOUND
+```
+Only non-default bindings need to be saved. Use `UNBOUND` to remove a default binding. Files without a `[bindings]` section header are also accepted.
+
+### Controls (TF Defaults)
 
 **World Switching:**
-- `Up/Down` - Cycle through active worlds (connected OR with unseen output)
+- `Ctrl+Up/Down` - Cycle through active worlds (connected OR with unseen output)
+- `Shift+Up/Down` - Cycle through all worlds
+- `Escape` then `b` - Switch to previous world (same as `fg -<`)
+- `Escape` then `f` - Switch to next world (same as `fg ->`)
 - `Escape` then `w` - Switch to world with activity (priority: oldest pending → unseen output → previous world)
-- `Shift+Up/Down` - Cycle through all worlds that have ever been connected
-- Disconnected worlds without unseen lines are skipped from Up/Down cycling
 
 World switching behavior is controlled by the "World Switching" setting:
 
@@ -473,24 +498,33 @@ World switching behavior is controlled by the "World Switching" setting:
 This logic applies to all interfaces (console, web, GUI). Remote clients query the master instance for consistent world switching across all views.
 
 **Input Area:**
-- `Left/Right` or `Ctrl+B/Ctrl+F` - Move cursor
-- `Ctrl+Up/Down` - Move cursor up/down in multi-line input
-- `Alt+Up/Down` - Resize input area (1-15 lines)
-- `Ctrl+U` - Clear input
-- `Ctrl+W` - Delete word before cursor
+- `Left/Right` - Move cursor one character
+- `Ctrl+B/Ctrl+F` - Move cursor one word left/right (TF: wleft/wright)
+- `Up/Down` - Move cursor up/down in multi-line input (TF default)
+- `Ctrl+A` or `Home` - Jump to start of line
+- `Ctrl+E` or `End` - Jump to end of line
+- `Ctrl+U` - Clear line
+- `Ctrl+W` - Delete word backward (space-delimited)
+- `Ctrl+K` - Kill to end of line (pushes to kill ring)
+- `Ctrl+D` - Delete character forward
+- `Ctrl+Y` - Yank (paste from kill ring)
+- `Ctrl+T` - Transpose two characters before cursor
+- `Ctrl+V` - Insert next character literally (console only, not web)
 - `Ctrl+P/N` - Previous/Next command history
 - `Ctrl+Q` - Spell suggestions / cycle and replace
 - `Ctrl+G` - Terminal bell/beep
-- `Ctrl+T` - Transpose two characters before cursor
-- `Ctrl+V` - Insert next character literally (console only, not web)
-- `Ctrl+A` or `Home/End` - Jump to start/end (Ctrl+A = start only)
 - `Tab` - Command completion (when input starts with `/` or `#`); more-mode takes priority if paused
+- `Escape` then `c/l/u` - Capitalize / lowercase / uppercase word
+- `Escape` then `d` - Delete word forward (pushes to kill ring)
 - `Escape` then `Space` - Collapse multiple spaces around cursor to one
 - `Escape` then `-` - Jump to matching bracket (`()[]{}`)
 - `Escape` then `.` or `_` - Insert last word from previous history entry
 - `Escape` then `p` - Search history backward (entries starting with current input)
 - `Escape` then `n` - Search history forward (continues backward search)
-- `Escape` then `Backspace` - Delete word backward (punctuation-delimited)
+- `Escape` then `Backspace` - Delete word backward (punctuation-delimited, pushes to kill ring)
+- `Alt+Up/Down` - Resize input area (1-15 lines)
+
+**Kill Ring:** `Ctrl+K`, `Ctrl+U`, `Ctrl+W`, `Escape+d`, and `Escape+Backspace` push deleted text to the kill ring. `Ctrl+Y` pastes the most recent entry.
 
 **Output Scrollback:**
 - `PageUp` - Scroll back in history (enables more-pause)
@@ -499,9 +533,6 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 - `Escape` then `j` - Jump to end, release all pending lines
 - `Escape` then `J` (uppercase) - Selective flush: keep only highlighted pending lines, discard rest
 - `Escape` then `h` - Half-page scroll up or release half screenful of pending
-- `Alt+w` (or `Escape` then `w`) - Switch to world with activity (priority: oldest pending → unseen output → previous world)
-- `Escape` then `b` - Switch to previous world (same as `fg -<`)
-- `Escape` then `f` - Switch to next world (same as `fg ->`)
 - `F4` - Open filter popup to search output
 
 **General:**

@@ -30,6 +30,8 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **GMCP Media** - Server-driven sound effects and music via Client.Media protocol
 - **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands, startup actions
 - **TinyFugue Compatibility** - Full TF command support (`/def`, `/set`, `/if`, `/load`, etc.)
+- **Configurable Keybindings** - All keys configurable via `~/.clay.key.dat` with TF defaults, browser-based editor
+- **Kill Ring** - Emacs-style kill ring (Ctrl+K/U/W push, Ctrl+Y yanks)
 - **Themes** - Customizable color themes for GUI/web via `~/clay.theme.dat` with browser-based theme editor
 - **Notes Editor** - Per-world split-screen notes editor (`/edit`)
 - **Termux Support** - Runs on Android via Termux
@@ -46,6 +48,7 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 | Platform | Binary | Notes |
 |----------|--------|-------|
 | Linux x86_64 (static) | `clay-linux-x86_64-musl` | TUI only, works on any Linux |
+| Linux x86_64 (GUI) | `clay-linux-x86_64-gui` | TUI + WebView GUI + audio |
 | Linux ARM64 (Termux) | `clay-termux-aarch64` | TUI only, for Android/Termux |
 | Android | `clay-android.apk` | WebSocket client app |
 | macOS (Universal) | `clay-macos-universal` | GUI + audio, Intel & Apple Silicon |
@@ -175,11 +178,13 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 
 ## Controls
 
+All keybindings are configurable via `~/.clay.key.dat`. Defaults follow TinyFugue conventions. A browser-based keybind editor is available at `/keybind-editor`.
+
 **World Switching:**
 
 | Key | Action |
 |-----|--------|
-| `Up/Down` | Switch between active worlds |
+| `Ctrl+Up/Down` | Switch between active worlds |
 | `Shift+Up/Down` | Cycle through all worlds |
 | `Escape b` | Previous world |
 | `Escape f` | Next world |
@@ -189,18 +194,21 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 
 | Key | Action |
 |-----|--------|
-| `Left/Right` | Move cursor |
+| `Left/Right` | Move cursor one character |
+| `Ctrl+B/F` | Move cursor one word left/right |
+| `Up/Down` | Move cursor up/down (multi-line input) |
 | `Ctrl+A` / `Home` | Jump to start of line |
 | `Ctrl+E` / `End` | Jump to end of line |
-| `Ctrl+U` | Clear input |
+| `Ctrl+U` | Clear line |
 | `Ctrl+W` | Delete word backward |
 | `Ctrl+K` | Kill to end of line |
 | `Ctrl+D` | Delete character forward |
+| `Ctrl+Y` | Yank (paste from kill ring) |
 | `Ctrl+T` | Transpose two characters before cursor |
 | `Ctrl+V` | Insert next character literally (console only) |
-| `Ctrl+G` | Terminal bell |
 | `Ctrl+P/N` | Previous/next command history |
 | `Ctrl+Q` | Spell suggestions |
+| `Ctrl+G` | Terminal bell |
 | `Tab` | Command completion (when input starts with `/`) |
 | `Escape Space` | Collapse multiple spaces to one |
 | `Escape -` | Jump to matching bracket `()[]{}` |
@@ -211,6 +219,8 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 | `Escape c/l/u` | Capitalize / lowercase / uppercase word |
 | `Escape d` | Delete word forward |
 | `Alt+Up/Down` | Resize input area (1-15 lines) |
+
+**Kill Ring:** `Ctrl+K`, `Ctrl+U`, `Ctrl+W`, `Escape d`, and `Escape Backspace` push deleted text to the kill ring. `Ctrl+Y` pastes the most recent entry.
 
 **Output & Scrollback:**
 
@@ -289,6 +299,19 @@ Clay supports customizable color themes for the GUI and web interfaces:
 - Browser-based theme editor included for live color preview
 - Select themes in `/setup` (GUI Theme setting)
 - Console uses separate dark/light theme toggle
+
+## Keybindings
+
+All keyboard shortcuts are configurable via `~/.clay.key.dat` (INI format). Only non-default bindings need to be saved — defaults follow TinyFugue conventions.
+
+```ini
+[bindings]
+Up = world_next
+Down = world_prev
+Ctrl-Up = UNBOUND
+```
+
+Use `UNBOUND` to remove a default binding. A browser-based keybind editor is available at `/keybind-editor` when the HTTP server is enabled.
 
 ## Configuration
 
