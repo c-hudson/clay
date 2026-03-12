@@ -710,6 +710,8 @@ fn create_webview_window(
             } else if body == "update" || body == "update-force" {
                 let force = body == "update-force";
                 let proxy_clone = proxy.clone();
+                let is_master_clone = is_master;
+                let reload_tx_clone = reload_tx.clone();
                 std::thread::spawn(move || {
                     let rt = match tokio::runtime::Runtime::new() {
                         Ok(rt) => rt,
@@ -725,7 +727,24 @@ fn create_webview_window(
                         Ok(success) => {
                             // Install the update
                             let msg = install_update(&success.temp_path, &success.version);
+                            let is_success = msg.starts_with("Updated to");
                             let _ = proxy_clone.send_event(WvEvent::UpdateStatus(msg));
+                            // Auto-reload after successful update
+                            if is_success {
+                                // Brief delay so the status message is visible
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                if is_master_clone {
+                                    crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    if let Some(ref tx) = reload_tx_clone {
+                                        let _ = tx.send(crate::WsMessage::SendCommand {
+                                            world_index: 0,
+                                            command: "/reload".to_string(),
+                                        });
+                                    }
+                                } else {
+                                    let _ = proxy_clone.send_event(WvEvent::Reload);
+                                }
+                            }
                         }
                         Err(e) => {
                             let _ = proxy_clone.send_event(WvEvent::UpdateStatus(e));
@@ -866,7 +885,7 @@ fn create_webview_window(
                 let _ = _webview.evaluate_script(&format!("window.showUpdateStatus('{}')", escaped));
             }
             Event::UserEvent(WvEvent::Reload) => {
-                // Remote GUI reload: exec a new binary (no state to save — state lives on server)
+                // Remote GUI reload: restart the binary (no state to save — state lives on server)
                 #[cfg(all(unix, not(target_os = "android")))]
                 {
                     if let Ok((exe_path, _)) = crate::get_executable_path() {
@@ -890,7 +909,25 @@ fn create_webview_window(
                         );
                     }
                 }
-                #[cfg(not(all(unix, not(target_os = "android"))))]
+                #[cfg(windows)]
+                {
+                    if let Ok((exe_path, _)) = crate::get_executable_path() {
+                        let args: Vec<String> = std::env::args().collect();
+                        match std::process::Command::new(&exe_path).args(&args[1..]).spawn() {
+                            Ok(_) => std::process::exit(0),
+                            Err(_) => {
+                                let _ = _webview.evaluate_script(
+                                    "window.showUpdateStatus('Reload failed: spawn error')"
+                                );
+                            }
+                        }
+                    } else {
+                        let _ = _webview.evaluate_script(
+                            "window.showUpdateStatus('Reload failed: cannot find binary')"
+                        );
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     let _ = _webview.evaluate_script(
                         "window.showUpdateStatus('Reload not supported on this platform')"
@@ -942,7 +979,7 @@ fn install_update(temp_path: &std::path::Path, version: &str) -> String {
                             let _ = std::fs::remove_file(temp_path);
                             return format!("Failed to install update: {}", e3);
                         }
-                        return format!("Updated to Clay v{} — please restart.", version);
+                        return format!("Updated to Clay v{} — reloading...", version);
                     }
                 }
                 let _ = std::fs::remove_file(temp_path);
@@ -951,5 +988,5 @@ fn install_update(temp_path: &std::path::Path, version: &str) -> String {
         }
     }
 
-    format!("Updated to Clay v{} — please restart.", version)
+    format!("Updated to Clay v{} — reloading...", version)
 }

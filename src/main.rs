@@ -13,6 +13,7 @@ pub mod http;
 pub mod persistence;
 pub mod daemon;
 pub mod theme;
+pub mod keybindings;
 pub mod audio;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
@@ -95,7 +96,7 @@ pub use persistence::{
     load_reload_state,
     unescape_string,
 };
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(not(target_os = "android"))]
 pub use persistence::save_reload_state;
 pub use daemon::{
     run_daemon_server, run_multiuser_server,
@@ -105,11 +106,19 @@ pub use daemon::{
 use std::io::{self, stdout, Write as IoWrite};
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::FromRawSocket;
 #[cfg(all(unix, not(target_os = "android")))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, AtomicU32};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Platform-specific socket descriptor type for hot reload preservation
+#[cfg(unix)]
+type SocketFd = i32;  // same as RawFd
+#[cfg(not(unix))]
+type SocketFd = i64;
 
 use async_recursion::async_recursion;
 use bytes::BytesMut;
@@ -1215,6 +1224,8 @@ pub struct ClientViewState {
     pub world_index: usize,
     /// Number of visible output lines in the client's display
     pub visible_lines: usize,
+    /// Number of visible columns in the client's output area (0 = not reported)
+    pub visible_columns: usize,
     /// Client's output area dimensions (width, height) for NAWS
     pub dimensions: Option<(u16, u16)>,
 }
@@ -1643,10 +1654,10 @@ fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
     Command::Send { text, all_worlds, target_world, no_newline }
 }
 
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(not(target_os = "android"))]
 const RELOAD_FDS_ENV: &str = "CLAY_RELOAD_FDS";
 const CRASH_COUNT_ENV: &str = "CLAY_CRASH_COUNT";
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(not(target_os = "android"))]
 const MAX_CRASH_RESTARTS: u32 = 2;
 
 // Static pointer to App for crash recovery - set when app is running
@@ -1679,12 +1690,12 @@ fn set_app_ptr(app: *mut App) {
 }
 
 /// Get the global app pointer
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(not(target_os = "android"))]
 fn get_app_ptr() -> *mut App {
     APP_PTR.load(Ordering::SeqCst)
 }
 
-/// Attempt to restart after a crash (not available on Android or Windows)
+/// Attempt to restart after a crash (Unix version - uses exec)
 #[cfg(all(unix, not(target_os = "android")))]
 fn crash_restart() {
     // Read crash count directly from env var, not from atomic
@@ -1745,8 +1756,60 @@ fn crash_restart() {
     }
 }
 
-/// Set up the crash handler (panic hook) - not available on Android or Windows
-#[cfg(all(unix, not(target_os = "android")))]
+/// Attempt to restart after a crash (Windows version - uses spawn + exit)
+#[cfg(windows)]
+fn crash_restart() {
+    let crash_count = std::env::var(CRASH_COUNT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if crash_count >= MAX_CRASH_RESTARTS {
+        eprintln!("Maximum crash restarts ({}) reached, not restarting.", MAX_CRASH_RESTARTS);
+        return;
+    }
+
+    let app_ptr = get_app_ptr();
+    if !app_ptr.is_null() {
+        let app = unsafe { &*app_ptr };
+
+        if let Err(e) = persistence::save_reload_state(app) {
+            eprintln!("Failed to save state during crash: {}", e);
+        }
+
+        // Make socket handles inheritable so they survive into the child process
+        for world in &app.worlds {
+            if let Some(handle) = world.socket_fd {
+                let _ = make_inheritable(handle as u64);
+            }
+        }
+
+        let fds_str: String = app.worlds
+            .iter()
+            .filter_map(|w| w.socket_fd)
+            .map(|fd| fd.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        std::env::set_var(RELOAD_FDS_ENV, &fds_str);
+    }
+
+    let new_count = crash_count + 1;
+    std::env::set_var(CRASH_COUNT_ENV, new_count.to_string());
+
+    if let Ok((exe, _)) = get_executable_path() {
+        let mut args: Vec<String> = std::env::args()
+            .skip(1)
+            .filter(|a| a != "--reload" && a != "--crash")
+            .collect();
+        args.push("--crash".to_string());
+
+        if std::process::Command::new(&exe).args(&args).spawn().is_ok() {
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Set up the crash handler (panic hook)
+#[cfg(not(target_os = "android"))]
 fn setup_crash_handler() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -1921,9 +1984,9 @@ pub struct World {
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
     #[cfg(unix)]
-    socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only, Unix only)
+    socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only)
     #[cfg(not(unix))]
-    socket_fd: Option<i64>,      // Placeholder on non-Unix (never used)
+    socket_fd: Option<i64>,      // Socket handle on Windows, placeholder on other platforms
     #[cfg(unix)]
     proxy_socket_fd: Option<RawFd>, // Store Unix socket fd to TLS proxy for hot reload
     #[cfg(not(unix))]
@@ -1969,6 +2032,7 @@ pub struct World {
     pub gmcp_user_enabled: bool,     // True if user has enabled GMCP processing (F9 toggle)
     pub connection_id: u64,          // Incremented on each connection, used to ignore stale disconnect events
     pub max_received_seq: u64,       // Highest seq received from server (remote console dedup)
+    pub first_marked_new_index: Option<usize>, // Index of first marked_new line in output_lines (for fast clear)
 }
 
 impl World {
@@ -2040,6 +2104,7 @@ impl World {
             gmcp_user_enabled: false,
             connection_id: 0,
             max_received_seq: 0,
+            first_marked_new_index: None,
         }
     }
 
@@ -2184,6 +2249,7 @@ impl World {
             self.needs_redraw = true; // Signal terminal needs full redraw
             self.output_lines.clear();
             self.scroll_offset = 0;
+            self.first_marked_new_index = None;
         }
         let max_lines = (output_height as usize).saturating_sub(2);
 
@@ -2224,6 +2290,12 @@ impl World {
                     self.pending_lines.pop();
                 } else {
                     self.output_lines.pop();
+                    // Invalidate tracked index if we popped the last marked_new line
+                    if let Some(idx) = self.first_marked_new_index {
+                        if self.output_lines.len() <= idx {
+                            self.first_marked_new_index = None;
+                        }
+                    }
                 }
             } else {
                 // Update the partial line with combined content
@@ -2281,74 +2353,6 @@ impl World {
                 && settings.more_mode_enabled
                 && (self.lines_since_pause + visual_lines) > max_lines;
 
-            // Pre-wrap oversized lines: call wrap_ansi_line once and store each visual
-            // line as a separate OutputLine. This caches the wrap result so the renderer
-            // doesn't need to re-wrap, and allows more-mode to paginate per visual line.
-            let needs_split = !is_partial
-                && settings.more_mode_enabled
-                && max_lines > 0
-                && visual_lines > max_lines;
-
-            if needs_split {
-                let wrapped = wrap_ansi_line(line, output_width as usize);
-
-                if goes_to_pending {
-                    // All visual lines go to pending
-                    if self.pending_lines.is_empty() {
-                        self.pending_since = Some(std::time::Instant::now());
-                        if !is_current && self.first_unseen_at.is_none() {
-                            self.first_unseen_at = Some(std::time::Instant::now());
-                        }
-                    }
-                    for vl in &wrapped {
-                        let seq = self.next_seq; self.next_seq += 1;
-                        let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
-                                 else { OutputLine::new_client(vl.clone(), seq) };
-                        cl.marked_new = !is_current;
-                        self.pending_lines.push(cl);
-                    }
-                    if !is_current { self.unseen_lines += wrapped.len(); }
-                } else {
-                    // Fill remaining screen space, rest -> pending
-                    let remaining = max_lines.saturating_sub(self.lines_since_pause);
-                    let take_count = remaining.min(wrapped.len());
-                    for vl in wrapped.iter().take(take_count) {
-                        let seq = self.next_seq; self.next_seq += 1;
-                        let mut fl = if from_server { OutputLine::new(vl.clone(), seq) }
-                                 else { OutputLine::new_client(vl.clone(), seq) };
-                        fl.marked_new = !is_current;
-                        self.output_lines.push(fl);
-                        self.lines_since_pause += 1; // each pre-wrapped line is 1 visual line
-                    }
-                    if !is_current && take_count > 0 {
-                        if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
-                            self.first_unseen_at = Some(std::time::Instant::now());
-                        }
-                        self.unseen_lines += take_count;
-                    }
-                    if take_count > 0 {
-                        self.scroll_to_bottom();
-                    }
-                    self.paused = true;
-
-                    // Remaining visual lines -> pending
-                    if wrapped.len() > take_count {
-                        if self.pending_lines.is_empty() {
-                            self.pending_since = Some(std::time::Instant::now());
-                        }
-                        for vl in wrapped.iter().skip(take_count) {
-                            let seq = self.next_seq; self.next_seq += 1;
-                            let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
-                                     else { OutputLine::new_client(vl.clone(), seq) };
-                            cl.marked_new = !is_current;
-                            self.pending_lines.push(cl);
-                            if !is_current { self.unseen_lines += 1; }
-                        }
-                    }
-                }
-                continue;
-            }
-
             // Create OutputLine with appropriate from_server flag
             let seq = self.next_seq;
             self.next_seq += 1;
@@ -2376,67 +2380,30 @@ impl World {
                     self.partial_in_pending = true;
                 }
             } else if triggers_pause {
-                // Calculate how many visual lines can still fit on screen
-                let remaining = max_lines.saturating_sub(self.lines_since_pause);
-
-                if !is_partial && visual_lines > 1 && remaining > 0 && remaining < visual_lines {
-                    // Split the wrapped line: fit what we can on screen, rest goes to pending
-                    let wrapped = wrap_ansi_line(line, output_width as usize);
-                    let take_count = remaining.min(wrapped.len());
-
-                    for vl in wrapped.iter().take(take_count) {
-                        let seq = self.next_seq; self.next_seq += 1;
-                        let mut fl = if from_server { OutputLine::new(vl.clone(), seq) }
-                                 else { OutputLine::new_client(vl.clone(), seq) };
-                        fl.marked_new = !is_current;
-                        self.output_lines.push(fl);
-                        self.lines_since_pause += 1;
+                // Store the whole logical line — each renderer wraps at its own width
+                new_line.marked_new = !is_current;
+                if !is_current && self.first_marked_new_index.is_none() {
+                    self.first_marked_new_index = Some(self.output_lines.len());
+                }
+                self.output_lines.push(new_line);
+                self.lines_since_pause += visual_lines;
+                if !is_current {
+                    if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
+                        self.first_unseen_at = Some(std::time::Instant::now());
                     }
-                    if !is_current && take_count > 0 {
-                        if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
-                            self.first_unseen_at = Some(std::time::Instant::now());
-                        }
-                        self.unseen_lines += take_count;
-                    }
-                    if take_count > 0 {
-                        self.scroll_to_bottom();
-                    }
-                    self.paused = true;
-
-                    // Remaining visual lines go to pending
-                    if wrapped.len() > take_count {
-                        if self.pending_lines.is_empty() {
-                            self.pending_since = Some(std::time::Instant::now());
-                        }
-                        for vl in wrapped.iter().skip(take_count) {
-                            let seq = self.next_seq; self.next_seq += 1;
-                            let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
-                                     else { OutputLine::new_client(vl.clone(), seq) };
-                            cl.marked_new = !is_current;
-                            self.pending_lines.push(cl);
-                            if !is_current { self.unseen_lines += 1; }
-                        }
-                    }
-                } else {
-                    // Single visual line or fits in remaining space - add whole line
-                    new_line.marked_new = !is_current;
-                    self.output_lines.push(new_line);
-                    self.lines_since_pause += visual_lines;
-                    if !is_current {
-                        if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
-                            self.first_unseen_at = Some(std::time::Instant::now());
-                        }
-                        self.unseen_lines += 1;
-                    }
-                    self.scroll_to_bottom();
-                    self.paused = true;
-                    if is_partial {
-                        self.partial_line = line.to_string();
-                        self.partial_in_pending = false;
-                    }
+                    self.unseen_lines += 1;
+                }
+                self.scroll_to_bottom();
+                self.paused = true;
+                if is_partial {
+                    self.partial_line = line.to_string();
+                    self.partial_in_pending = false;
                 }
             } else {
                 new_line.marked_new = !is_current;
+                if !is_current && self.first_marked_new_index.is_none() {
+                    self.first_marked_new_index = Some(self.output_lines.len());
+                }
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -2457,6 +2424,12 @@ impl World {
             self.paused = false;
             // Release any pending lines immediately
             if !self.pending_lines.is_empty() {
+                if self.first_marked_new_index.is_none() {
+                    // Check if any pending line has marked_new before bulk append
+                    if self.pending_lines.iter().any(|l| l.marked_new) {
+                        self.first_marked_new_index = Some(self.output_lines.len());
+                    }
+                }
                 self.output_lines.append(&mut self.pending_lines);
             }
         }
@@ -2478,11 +2451,15 @@ impl World {
         // (via clear_new_line_indicators in switch_world).
     }
 
-    /// Clear new line indicator flags on all output lines.
+    /// Clear new line indicator flags on output lines.
     /// Called when switching away from a world or on Ctrl+L.
+    /// Only iterates from the first marked_new line to avoid O(n) scan of large buffers.
     pub fn clear_new_line_indicators(&mut self) {
-        for line in &mut self.output_lines {
-            line.marked_new = false;
+        if let Some(first) = self.first_marked_new_index {
+            for line in &mut self.output_lines[first..] {
+                line.marked_new = false;
+            }
+            self.first_marked_new_index = None;
         }
     }
 
@@ -2527,6 +2504,9 @@ impl World {
             .drain(..logical_count.min(self.pending_lines.len()))
             .collect();
         for line in to_release {
+            if line.marked_new && self.first_marked_new_index.is_none() {
+                self.first_marked_new_index = Some(self.output_lines.len());
+            }
             self.output_lines.push(line);
         }
         if self.pending_lines.is_empty() {
@@ -2547,7 +2527,9 @@ impl World {
     }
 
     pub fn release_all_pending(&mut self) {
-
+        if self.first_marked_new_index.is_none() && self.pending_lines.iter().any(|l| l.marked_new) {
+            self.first_marked_new_index = Some(self.output_lines.len());
+        }
         self.output_lines.append(&mut self.pending_lines);
         self.paused = false;
         self.lines_since_pause = 0;
@@ -2564,6 +2546,8 @@ impl World {
         self.output_lines.retain(|line| line.from_server);
         self.pending_lines.retain(|line| line.from_server);
         // Clear new line indicators (Ctrl+L clears them)
+        // Note: retain() invalidates first_marked_new_index, so reset and scan
+        self.first_marked_new_index = None;
         for line in &mut self.output_lines {
             line.marked_new = false;
         }
@@ -2686,6 +2670,8 @@ pub struct App {
     pub tf_engine: tf::TfEngine,
     /// Loaded theme colors from ~/.clay.theme.dat
     pub theme_file: theme::ThemeFile,
+    /// Configurable keyboard bindings (TF defaults + user customizations from ~/.clay.key.dat)
+    pub keybindings: keybindings::KeyBindings,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Remote client mode: pending /update request (Some(force_flag))
@@ -2781,6 +2767,7 @@ impl App {
             user_connections: std::collections::HashMap::new(),
             tf_engine: tf::TfEngine::new(),
             theme_file: theme::ThemeFile::with_defaults(),
+            keybindings: keybindings::KeyBindings::tf_defaults(),
             ws_client_tx: None, // Set when running as remote client (--console mode)
             pending_update: None,
             pending_reload: false,
@@ -2854,6 +2841,7 @@ impl App {
             shift_arrow_up_down_mode: self.settings.shift_arrow_up_down_mode.name().to_string(),
             new_line_indicator: self.settings.new_line_indicator,
             theme_colors_json: self.gui_theme_colors().to_json(),
+            keybindings_json: self.keybindings.to_json(),
         }
     }
 
@@ -2897,6 +2885,10 @@ impl App {
         self.settings.mouse_enabled = settings.mouse_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
         self.settings.new_line_indicator = settings.new_line_indicator;
+        // Sync keybindings from master
+        if !settings.keybindings_json.is_empty() {
+            self.keybindings = keybindings::KeyBindings::from_json(&settings.keybindings_json);
+        }
     }
 
     /// Ensure there's at least one world (creates initial world if needed)
@@ -3411,6 +3403,7 @@ impl App {
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
                     if flush {
                         world.output_lines.clear();
+                        world.first_marked_new_index = None;
                         world.pending_lines.clear();
                         world.showing_splash = false;
                         world.paused = false;
@@ -3451,6 +3444,9 @@ impl App {
                                 OutputLine::new_client(line.to_string(), seq)
                             };
                             output_line.marked_new = marked_new;
+                            if marked_new && world.first_marked_new_index.is_none() {
+                                world.first_marked_new_index = Some(world.output_lines.len());
+                            }
                             world.output_lines.push(output_line);
                             // Track max received seq from server
                             if msg_seq > 0 {
@@ -3551,6 +3547,7 @@ impl App {
                 // World's output buffer was cleared (e.g., splash screen replaced with MUD data)
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     world.output_lines.clear();
+                    world.first_marked_new_index = None;
                     world.pending_count = 0;
                     world.paused = false;
                     world.scroll_offset = 0;
@@ -4176,8 +4173,11 @@ impl App {
         let is_current = true;
         let settings = self.settings.clone();
         let output_height = self.output_height;
-        let output_width = self.output_width;
+        let console_width = self.output_width;
         let world_idx = self.current_world_index;
+        let output_width = self.min_viewer_width(world_idx)
+            .map(|w| console_width.min(w as u16))
+            .unwrap_or(console_width);
         // Ensure client-generated messages are complete lines (end with newline)
         let text_with_newline = if text.ends_with('\n') || text.is_empty() {
             text.to_string()
@@ -4208,7 +4208,11 @@ impl App {
         let is_current = true;
         let settings = self.settings.clone();
         let output_height = self.output_height;
-        let output_width = self.output_width;
+        let console_width = self.output_width;
+        let world_idx = self.current_world_index;
+        let output_width = self.min_viewer_width(world_idx)
+            .map(|w| console_width.min(w as u16))
+            .unwrap_or(console_width);
         let text_with_newline = if text.ends_with('\n') || text.is_empty() {
             text.to_string()
         } else {
@@ -4228,7 +4232,10 @@ impl App {
         let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
         let settings = self.settings.clone();
         let output_height = self.output_height;
-        let output_width = self.output_width;
+        let console_width = self.output_width;
+        let output_width = self.min_viewer_width(world_idx)
+            .map(|w| console_width.min(w as u16))
+            .unwrap_or(console_width);
         let text_with_newline = if text.ends_with('\n') || text.is_empty() {
             text.to_string()
         } else {
@@ -4626,6 +4633,16 @@ impl App {
         ws_min
     }
 
+    /// Get the minimum visible columns among WS clients viewing a world (for wrap width)
+    /// Returns None if no WS clients have reported their width
+    fn min_viewer_width(&self, world_index: usize) -> Option<usize> {
+        self.ws_client_worlds
+            .values()
+            .filter(|v| v.world_index == world_index && v.visible_columns > 0)
+            .map(|v| v.visible_columns)
+            .min()
+    }
+
     /// Process incoming server data - shared logic for both console and daemon modes
     /// Returns commands that need to be executed (for trigger processing)
     pub fn process_server_data(
@@ -4800,11 +4817,30 @@ impl App {
                 (true, None) => console_height,
                 (false, Some(ws)) => ws as u16,
                 (false, None) => {
-                    // Daemon mode with no viewers - use minimum across all clients
+                    // Daemon mode with no viewers (with visible_lines > 0) -
+                    // use minimum across all clients that have reported their size
                     self.ws_client_worlds.values()
                         .map(|s| s.visible_lines)
+                        .filter(|&v| v > 0)
                         .min()
                         .unwrap_or(24) as u16
+                }
+            };
+
+            // Calculate minimum visible columns among all viewers for wrap width
+            let ws_min_width = self.min_viewer_width(world_idx);
+            let output_width = match (console_viewing, ws_min_width) {
+                (true, Some(ws_w)) => console_width.min(ws_w as u16),
+                (true, None) => console_width,
+                (false, Some(ws_w)) => ws_w as u16,
+                (false, None) => {
+                    // Daemon mode with no viewers reporting width -
+                    // use minimum across all clients that have reported their width
+                    self.ws_client_worlds.values()
+                        .map(|s| s.visible_columns)
+                        .filter(|&v| v > 0)
+                        .min()
+                        .unwrap_or(200) as u16
                 }
             };
 
@@ -4819,7 +4855,7 @@ impl App {
             let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
                 && !self.worlds[world_idx].partial_in_pending;
 
-            self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, console_width, true, true);
+            self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
 
             // Check if splash was cleared (output_lines was reset)
             let splash_was_cleared = was_showing_splash && !self.worlds[world_idx].showing_splash;
@@ -4831,6 +4867,7 @@ impl App {
             // Calculate what went where
             let pending_after = self.worlds[world_idx].pending_lines.len();
             let output_after = self.worlds[world_idx].output_lines.len();
+
 
             // Calculate broadcast boundaries, accounting for partial lines:
             // - Partial lines are NOT broadcast (clients only get complete lines)
@@ -4993,6 +5030,7 @@ impl App {
         self.worlds[world_idx].next_seq += 1;
         let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
         self.worlds[world_idx].output_lines.push(disconnect_msg.clone());
+        self.worlds[world_idx].scroll_to_bottom();
 
         // If this is not the current world, increment unseen_lines for activity indicator
         if world_idx != self.current_world_index {
@@ -5000,6 +5038,11 @@ impl App {
                 self.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
             }
             self.worlds[world_idx].unseen_lines += 1;
+        }
+
+        // Mark output for redraw if this is the current world
+        if world_idx == self.current_world_index {
+            self.needs_output_redraw = true;
         }
 
         // Broadcast disconnect message to WebSocket clients viewing this world
@@ -5097,7 +5140,11 @@ impl App {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             self.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string(), seq));
+            self.worlds[world_idx].scroll_to_bottom();
             self.worlds[world_idx].prompt.clear();
+            if world_idx == self.current_world_index {
+                self.needs_output_redraw = true;
+            }
             return;
         }
 
@@ -5312,6 +5359,7 @@ impl App {
                 self.ws_client_worlds.insert(client_id, ClientViewState {
                     world_index: world_idx,
                     visible_lines: 0,
+                    visible_columns: 0,
                     dimensions: None,
                 });
             } else {
@@ -5354,12 +5402,22 @@ impl App {
 
     /// Handle initial WsClientMessage (AuthRequest) after authentication.
     fn handle_ws_auth_initial_state(&mut self, client_id: u64, current_world: Option<usize>) {
-        // Debug: log showing_splash state for all worlds
-        for (idx, world) in self.worlds.iter().enumerate() {
+        // Debug: log current world state for reload message diagnosis
+        let cw = self.current_world_index;
+        if cw < self.worlds.len() {
+            let world = &self.worlds[cw];
             debug_log(true, &format!(
-                "AUTH_INITIAL_STATE: World[{}] '{}' showing_splash={} output_lines={} connected={}",
-                idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
+                "AUTH_INITIAL_STATE: current_world={} '{}' showing_splash={} output_lines={} is_reload={}",
+                cw, world.name, world.showing_splash, world.output_lines.len(), self.is_reload
             ));
+            // Log last 3 lines of output to verify reload message is present
+            let start = world.output_lines.len().saturating_sub(3);
+            for (i, line) in world.output_lines[start..].iter().enumerate() {
+                debug_log(true, &format!(
+                    "AUTH_INITIAL_STATE: output_line[{}] from_server={} text='{}'",
+                    start + i, line.from_server, line.text.trim()
+                ));
+            }
         }
         let initial_state = self.build_initial_state();
         self.ws_send_initial_state_and_mark(client_id, initial_state);
@@ -5370,6 +5428,7 @@ impl App {
         self.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: world_idx,
             visible_lines: 0,
+            visible_columns: 0,
             dimensions: None,
         });
         // Broadcast activity count to new client
@@ -5377,8 +5436,7 @@ impl App {
     }
 
     /// Handle ConnectionSuccess event (used in headless and console modes).
-    fn handle_connection_success(&mut self, world_name: &str, cmd_tx: mpsc::Sender<WriteCommand>, socket_fd: Option<i32>, is_tls: bool) {
-        let _ = &socket_fd; // used on unix only
+    fn handle_connection_success(&mut self, world_name: &str, cmd_tx: mpsc::Sender<WriteCommand>, socket_fd: Option<SocketFd>, is_tls: bool) {
         if let Some(world_idx) = self.find_world_index(world_name) {
             self.worlds[world_idx].connected = true;
             self.worlds[world_idx].was_connected = true;
@@ -5390,7 +5448,7 @@ impl App {
             self.worlds[world_idx].last_nop_time = None;
             self.worlds[world_idx].is_initial_world = false;
             self.worlds[world_idx].command_tx = Some(cmd_tx.clone());
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             { self.worlds[world_idx].socket_fd = socket_fd; }
             self.worlds[world_idx].is_tls = is_tls;
 
@@ -5768,6 +5826,7 @@ impl App {
                 if world_index < self.worlds.len() {
                     let line_count = self.worlds[world_index].output_lines.len();
                     self.worlds[world_index].output_lines.clear();
+                    self.worlds[world_index].first_marked_new_index = None;
                     self.worlds[world_index].pending_lines.clear();
                     self.worlds[world_index].scroll_offset = 0;
                     self.worlds[world_index].lines_since_pause = 0;
@@ -6078,9 +6137,11 @@ impl App {
             Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                 if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                     // Switch only the requesting client's world, not the console
-                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                    let visible_lines = self.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, dimensions });
+                    let prev = self.ws_client_worlds.get(&client_id);
+                    let dimensions = prev.and_then(|s| s.dimensions);
+                    let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
+                    let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, visible_columns, dimensions });
                     self.ws_set_client_world(client_id, Some(idx));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                     // Also send ExecuteLocalCommand so web clients can switch their local view
@@ -6332,9 +6393,11 @@ impl App {
                     }
                     // Update client's viewing world to ensure they receive output
                     // (fixes race condition where client sends command before UpdateViewState)
-                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                    let visible_lines = self.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                    let prev = self.ws_client_worlds.get(&client_id);
+                    let dimensions = prev.and_then(|s| s.dimensions);
+                    let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
+                    let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions });
                     self.ws_set_client_world(client_id, Some(world_index));
                 }
 
@@ -6343,9 +6406,11 @@ impl App {
             WsMessage::SwitchWorld { world_index } => {
                 // Switch only the requesting client's world, not the console
                 if world_index < self.worlds.len() {
-                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                    let visible_lines = self.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                    let prev = self.ws_client_worlds.get(&client_id);
+                    let dimensions = prev.and_then(|s| s.dimensions);
+                    let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
+                    let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions });
                     self.ws_set_client_world(client_id, Some(world_index));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                     // Send active media for the new world
@@ -6473,12 +6538,11 @@ impl App {
                         }
                     }
                     // Track which world this client is viewing (sync cache)
-                    let visible_lines = self.ws_client_worlds
-                        .get(&client_id)
-                        .map(|v| v.visible_lines)
-                        .unwrap_or(0);
-                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                    let prev = self.ws_client_worlds.get(&client_id);
+                    let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
+                    let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
+                    let dimensions = prev.and_then(|s| s.dimensions);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions });
                     // Update client's world in WebSocket server (async state)
                     self.ws_set_client_world(client_id, Some(world_index));
 
@@ -6494,12 +6558,13 @@ impl App {
                     }
                 }
             }
-            WsMessage::UpdateViewState { world_index, visible_lines } => {
+            WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
                 // A remote client is reporting its view state (for more-mode threshold calculation)
                 if world_index < self.worlds.len() {
                     // Preserve existing dimensions when updating view state
                     let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                    let vc = visible_columns.unwrap_or_else(|| self.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions });
                     // Update client's world in WebSocket server so broadcast_to_world_viewers works
                     self.ws_set_client_world(client_id, Some(world_index));
                 }
@@ -6522,8 +6587,8 @@ impl App {
                     if pending_count > 0 {
                         // Get client's output width for visual line calculation
                         let client_width = self.ws_client_worlds.get(&client_id)
-                            .and_then(|s| s.dimensions)
-                            .map(|(w, _)| w as usize)
+                            .map(|s| s.visible_columns)
+                            .filter(|&w| w > 0)
                             .unwrap_or(self.output_width as usize);
 
                         // count == 0 means release all; otherwise treat count as visual budget
@@ -6928,6 +6993,48 @@ impl App {
                     }
                 }
             }
+            WsMessage::RequestKeybindEditorState => {
+                let bindings_json = self.keybindings.to_json();
+                let defaults_json = keybindings::KeyBindings::tf_defaults().to_json();
+                let actions_json = keybindings::KeyBindings::actions_json();
+                self.ws_send_to_client(client_id, WsMessage::KeybindEditorState {
+                    bindings_json,
+                    defaults_json,
+                    actions_json,
+                });
+            }
+            WsMessage::UpdateKeybindEditorBindings { bindings_json } => {
+                self.keybindings = keybindings::KeyBindings::from_json(&bindings_json);
+                // Broadcast to all clients so web/GUI clients update live
+                self.ws_broadcast(WsMessage::KeybindingsUpdated {
+                    bindings_json: self.keybindings.to_json(),
+                });
+            }
+            WsMessage::SaveKeybindFile => {
+                let path = std::path::Path::new(&get_home_dir()).join(clay_filename("clay.key.dat"));
+                match self.keybindings.save(&path) {
+                    Ok(_) => {
+                        self.ws_send_to_client(client_id, WsMessage::KeybindFileSaved { success: true, error: None });
+                    }
+                    Err(e) => {
+                        self.ws_send_to_client(client_id, WsMessage::KeybindFileSaved { success: false, error: Some(e.to_string()) });
+                    }
+                }
+            }
+            WsMessage::ResetKeybindDefaults => {
+                self.keybindings = keybindings::KeyBindings::tf_defaults();
+                let bindings_json = self.keybindings.to_json();
+                let defaults_json = keybindings::KeyBindings::tf_defaults().to_json();
+                let actions_json = keybindings::KeyBindings::actions_json();
+                self.ws_send_to_client(client_id, WsMessage::KeybindEditorState {
+                    bindings_json,
+                    defaults_json,
+                    actions_json,
+                });
+                self.ws_broadcast(WsMessage::KeybindingsUpdated {
+                    bindings_json: self.keybindings.to_json(),
+                });
+            }
             WsMessage::RequestConnectionsList => {
                 // Generate connections list using same format as master console
                 let current_idx = self.current_world_index;
@@ -6997,14 +7104,14 @@ impl App {
 
                 if let Some(idx) = new_index {
                     // Update client's view state (sync state)
-                    let visible_lines = self.ws_client_worlds.get(&client_id)
-                        .map(|s| s.visible_lines)
-                        .unwrap_or(24);
-                    let dimensions = self.ws_client_worlds.get(&client_id)
-                        .and_then(|s| s.dimensions);
+                    let prev = self.ws_client_worlds.get(&client_id);
+                    let visible_lines = prev.map(|s| s.visible_lines).unwrap_or(24);
+                    let visible_columns = prev.map(|s| s.visible_columns).unwrap_or(0);
+                    let dimensions = prev.and_then(|s| s.dimensions);
                     self.ws_client_worlds.insert(client_id, ClientViewState {
                         world_index: idx,
                         visible_lines,
+                        visible_columns,
                         dimensions,
                     });
                     // Update client's world in WebSocket server (async state)
@@ -7181,7 +7288,7 @@ impl App {
     fn build_initial_state(&self) -> WsMessage {
         // Send only the most recent lines in InitialState for fast initial load.
         // Clients backfill remaining history via RequestScrollback after rendering.
-        const MAX_INITIAL_LINES: usize = 75;
+        const MAX_INITIAL_LINES: usize = 100;
 
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
             // Create timestamped versions (add sparkle prefix for client-generated messages)
@@ -7195,7 +7302,22 @@ impl App {
             } else {
                 world.output_lines.len()
             };
-            let skip = total_lines.saturating_sub(MAX_INITIAL_LINES);
+            // Find skip index so that at least MAX_INITIAL_LINES *visible* (non-gagged) lines
+            // are included. Walk backwards counting visible lines.
+            let skip = {
+                let mut visible_count = 0;
+                let mut start = total_lines;
+                for i in (0..total_lines).rev() {
+                    start = i;
+                    if !world.output_lines[i].gagged {
+                        visible_count += 1;
+                        if visible_count >= MAX_INITIAL_LINES {
+                            break;
+                        }
+                    }
+                }
+                start
+            };
             let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
                 .skip(skip)
                 .take(total_lines - skip)
@@ -7799,7 +7921,7 @@ pub enum AppEvent {
     SystemMessage(String),       // message to display in current world's output
     Sigusr1Received,             // SIGUSR1 received - trigger hot reload (not available on Android)
     // Background connection events
-    ConnectionSuccess(String, mpsc::Sender<WriteCommand>, Option<i32>, bool),  // world_name, cmd_tx, socket_fd, is_tls
+    ConnectionSuccess(String, mpsc::Sender<WriteCommand>, Option<SocketFd>, bool),  // world_name, cmd_tx, socket_fd, is_tls
     ConnectionFailed(String, String),  // world_name, error_message
     // WebSocket events
     WsClientConnected(u64),                    // client_id
@@ -7986,10 +8108,9 @@ fn load_theme_file(app: &mut App) {
     app.theme_file = theme::ThemeFile::load(&theme_path);
 }
 
-// Hot reload helper - not available on Android/Termux
+// Hot reload helper - clear FD_CLOEXEC on Unix so fd survives exec
 #[cfg(all(unix, not(target_os = "android")))]
 fn clear_cloexec(fd: RawFd) -> io::Result<()> {
-    // Clear the FD_CLOEXEC flag so the fd survives exec
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFD);
         if flags == -1 {
@@ -7999,6 +8120,20 @@ fn clear_cloexec(fd: RawFd) -> io::Result<()> {
         if libc::fcntl(fd, libc::F_SETFD, new_flags) == -1 {
             return Err(io::Error::last_os_error());
         }
+    }
+    Ok(())
+}
+
+// Hot reload helper - make socket handle inheritable on Windows so it survives into child process
+#[cfg(windows)]
+fn make_inheritable(socket: u64) -> io::Result<()> {
+    const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+    extern "system" {
+        fn SetHandleInformation(hObject: isize, dwMask: u32, dwFlags: u32) -> i32;
+    }
+    let handle = socket as isize;
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -8377,6 +8512,15 @@ pub fn get_executable_path() -> io::Result<(PathBuf, String)> {
     Ok((PathBuf::from(clean_path), debug_info))
 }
 
+/// Get the executable path on Windows.
+/// Windows locks running executables, but spawn+exit handles this naturally.
+#[cfg(windows)]
+pub fn get_executable_path() -> io::Result<(PathBuf, String)> {
+    let exe = std::env::current_exe()?;
+    let debug_info = format!("path='{}', exists={}", exe.display(), exe.exists());
+    Ok((exe, debug_info))
+}
+
 /// Get the correct GitHub release asset name for this platform
 #[cfg(not(target_os = "android"))]
 fn get_platform_asset_name() -> &'static str {
@@ -8621,6 +8765,102 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
     Err(io::Error::other(format!("exec failed: {} (path: {})", err, exe.display())))
 }
 
+/// Hot reload on Windows: spawn new process and exit old one.
+/// Uses a named event to synchronize so the old process stays alive until
+/// the new one has taken over the console (prevents shell prompt flash).
+#[cfg(windows)]
+pub fn exec_reload(app: &App) -> io::Result<()> {
+    extern "system" {
+        fn CreateEventA(
+            lpEventAttributes: *const std::ffi::c_void,
+            bManualReset: i32,
+            bInitialState: i32,
+            lpName: *const u8,
+        ) -> isize;
+        fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
+        fn CloseHandle(hObject: isize) -> i32;
+    }
+
+    debug_log(true, "RELOAD: Starting exec_reload (Windows)");
+
+    debug_log(true, "RELOAD: Saving state...");
+    persistence::save_reload_state(app)?;
+    debug_log(true, "RELOAD: State saved successfully");
+
+    // Make socket handles inheritable so they survive into the child process
+    let mut handles_to_keep: Vec<i64> = Vec::new();
+    for world in &app.worlds {
+        if let Some(handle) = world.socket_fd {
+            if make_inheritable(handle as u64).is_ok() {
+                handles_to_keep.push(handle);
+            }
+        }
+    }
+    debug_log(true, &format!("RELOAD: Keeping {} handles", handles_to_keep.len()));
+
+    let (exe, debug_info) = get_executable_path()?;
+    debug_log(true, &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
+
+    if !exe.exists() {
+        return Err(io::Error::other(format!(
+            "Executable not found. Debug: {}",
+            debug_info
+        )));
+    }
+
+    // Pass handle list via environment
+    let fds_str: String = handles_to_keep
+        .iter()
+        .map(|h| h.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    std::env::set_var(RELOAD_FDS_ENV, &fds_str);
+
+    // Only create a sync event in console mode (not headless/GUI/daemon).
+    // In headless mode there's no console terminal to fight over, and waiting
+    // would block the old process from releasing the WebSocket port.
+    let is_headless = std::env::args().any(|a| a == "--gui" || a == "-D");
+    let sync_event = if !is_headless {
+        // Create a named event so the new process can signal when it has taken over the console.
+        // This prevents the parent shell (cmd.exe/PowerShell) from reclaiming the console
+        // in the gap between old process exit and new process raw mode entry.
+        let event_name = format!("ClayReloadSync-{}\0", std::process::id());
+        let handle = unsafe {
+            CreateEventA(std::ptr::null(), 1, 0, event_name.as_ptr())
+        };
+        if handle != 0 {
+            std::env::set_var("CLAY_RELOAD_SYNC_EVENT", &event_name[..event_name.len()-1]);
+        }
+        handle
+    } else {
+        0
+    };
+
+    // Spawn new process with --reload argument
+    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload").collect();
+    args.push("--reload".to_string());
+    debug_log(true, &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
+
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(_) => {
+            // Wait for the new process to signal it has taken over the console
+            if sync_event != 0 {
+                debug_log(true, "RELOAD: Waiting for new process to take over console...");
+                unsafe { WaitForSingleObject(sync_event, 5000); }
+                unsafe { CloseHandle(sync_event); }
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            if sync_event != 0 {
+                std::env::remove_var("CLAY_RELOAD_SYNC_EVENT");
+                unsafe { CloseHandle(sync_event); }
+            }
+            Err(io::Error::other(format!("Failed to spawn reload process: {} (path: {})", e, exe.display())))
+        }
+    }
+}
+
 /// Run as console client connecting to remote daemon (--console=host:port)
 /// Uses the same App struct and ui() function as the normal console interface
 async fn run_console_client(addr: &str) -> io::Result<()> {
@@ -8862,11 +9102,12 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                             client_type: websocket::RemoteClientType::RemoteConsole,
                         });
                         // Send initial view state for more-mode sync
-                        let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
                         let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
                         let _ = ws_tx.send(WsMessage::UpdateViewState {
                             world_index: current_world_index,
                             visible_lines,
+                            visible_columns: Some(width as usize),
                         });
                         break;
                     }
@@ -9072,12 +9313,13 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                             }
                             needs_redraw = true;
                         }
-                        Event::Resize(_, height) => {
+                        Event::Resize(width, height) => {
                             // Send updated view state for more-mode sync
                             let visible_lines = height.saturating_sub(4) as usize;
                             let _ = ws_tx.send(WsMessage::UpdateViewState {
                                 world_index: app.current_world_index,
                                 visible_lines,
+                                visible_columns: Some(width as usize),
                             });
                             needs_redraw = true;
                         }
@@ -9638,365 +9880,43 @@ fn handle_remote_client_key(
         return false;
     }
 
+    // Convert key event to canonical name, handling Esc+key sequences
+    let key_name = if recent_escape && matches!(key.code, Char(_) | Backspace) {
+        app.last_escape = None;
+        keybindings::escape_key_to_name(key.code, key.modifiers)
+    } else {
+        keybindings::key_event_to_name(key.code, key.modifiers)
+    };
+
     // Clear history search state on any non-search key
-    if !(key.code == Char('p') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape))
-        && !(key.code == Char('n') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape))
-        && key.code != Esc
-    {
-        app.input.search_prefix = None;
-        app.input.search_index = None;
+    if let Some(ref name) = key_name {
+        if name != "Esc-p" && name != "Esc-n" && name != "Escape" {
+            app.input.search_prefix = None;
+            app.input.search_index = None;
+        }
     }
 
-    // Handle Escape+j (Alt+j) to jump to end - release all pending
-    if key.code == Char('j') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
-        if app.current_world().paused && has_pending {
-            // Send release all (count=0 means release all)
-            // Server will broadcast PendingLinesUpdate to sync all clients
-            let _ = ws_tx.send(WsMessage::ReleasePending {
+    // Check TF /bind bindings first (runtime bindings from /bind command)
+    if let Some(ref name) = key_name {
+        let tf_name = canonical_to_tf_key_name(name);
+        if let Some(cmd) = app.tf_engine.keybindings.get(&tf_name).cloned() {
+            let _ = ws_tx.send(WsMessage::SendCommand {
                 world_index: app.current_world_index,
-                count: 0,
+                command: cmd,
             });
+            return false;
         }
-        // Also scroll to bottom
-        app.current_world_mut().scroll_to_bottom();
-        app.needs_output_redraw = true;
-        return false;
     }
 
-    // Handle Escape+w (Alt+w) to switch to world with oldest pending
-    if key.code == Char('w') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        // Request oldest pending world from server
-        let _ = ws_tx.send(WsMessage::CalculateOldestPending { current_index: app.current_world_index });
-        return false;
+    // Check configurable action bindings
+    if let Some(ref name) = key_name {
+        if let Some(action_id) = app.keybindings.get_action(name).map(|s| s.to_string()) {
+            return dispatch_remote_action(&action_id, app, ws_tx);
+        }
     }
 
-    // Handle Escape+c (Alt+c) to capitalize word
-    if key.code == Char('c') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.capitalize_word();
-        return false;
-    }
-
-    // Handle Escape+l (Alt+l) to lowercase word
-    if key.code == Char('l') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.lowercase_word();
-        return false;
-    }
-
-    // Handle Escape+u (Alt+u) to uppercase word
-    if key.code == Char('u') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.uppercase_word();
-        return false;
-    }
-
-    // Handle Escape+d (Alt+d) to delete word forward
-    if key.code == Char('d') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.delete_word_forward();
-        return false;
-    }
-
-    // Handle Escape+Space to collapse multiple spaces to one
-    if key.code == Char(' ') && recent_escape {
-        app.last_escape = None;
-        app.input.collapse_spaces();
-        return false;
-    }
-
-    // Handle Escape+- to goto matching bracket
-    if key.code == Char('-') && recent_escape {
-        app.last_escape = None;
-        app.input.goto_matching_bracket();
-        return false;
-    }
-
-    // Handle Escape+. / Escape+_ to insert last word of previous history
-    if (key.code == Char('.') || key.code == Char('_'))
-        && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape)
-    {
-        app.last_escape = None;
-        app.input.last_argument();
-        return false;
-    }
-
-    // Handle Escape+J (uppercase) for selective flush
-    if key.code == Char('J') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        let _ = ws_tx.send(WsMessage::SelectiveFlush {
-            world_index: app.current_world_index,
-        });
-        return false;
-    }
-
-    // Handle Escape+b to switch to previous world
-    if key.code == Char('b') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
-        return false;
-    }
-
-    // Handle Escape+f to switch to next world
-    if key.code == Char('f') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
-        return false;
-    }
-
-    // Handle Escape+h for half-page scroll/release
-    if key.code == Char('h') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        let half = (app.output_height as usize).saturating_sub(2) / 2;
-        let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
-        if app.current_world().paused && has_pending {
-            let release_count = half.max(1);
-            let _ = ws_tx.send(WsMessage::ReleasePending {
-                world_index: app.current_world_index,
-                count: release_count,
-            });
-        } else {
-            // Scroll up half page locally
-            let scroll_amount = half.max(1);
-            let current_offset = app.current_world().scroll_offset;
-            let new_offset = current_offset.saturating_sub(scroll_amount);
-            app.current_world_mut().scroll_offset = new_offset;
-            app.needs_output_redraw = true;
-        }
-        return false;
-    }
-
-    // Handle Escape+p for history search backward
-    if key.code == Char('p') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.history_search_backward();
-        return false;
-    }
-
-    // Handle Escape+n for history search forward
-    if key.code == Char('n') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.history_search_forward();
-        return false;
-    }
-
-    // Handle Escape+Backspace for delete word back (punctuation-delimited)
-    if key.code == Backspace && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.backward_kill_word_punctuation();
-        return false;
-    }
-
-    match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, Char('u')) => {
-            app.input.clear();
-        }
-        (KeyModifiers::CONTROL, Char('w')) => {
-            app.input.delete_word_before_cursor();
-        }
-        (KeyModifiers::CONTROL, Char('e')) => {
-            app.input.end();
-        }
-        (KeyModifiers::CONTROL, Char('k')) => {
-            app.input.kill_to_end();
-        }
-        (KeyModifiers::CONTROL, Char('d')) => {
-            app.input.delete_char_forward();
-        }
-        (KeyModifiers::CONTROL, Char('a')) | (_, Home) => {
-            app.input.home();
-        }
-        (_, End) => {
-            app.input.end();
-        }
-        (KeyModifiers::CONTROL, Char('p')) => {
-            app.input.history_prev();
-        }
-        (KeyModifiers::CONTROL, Char('n')) => {
-            app.input.history_next();
-        }
-        (KeyModifiers::CONTROL, Char('b')) | (_, Left) => {
-            app.input.move_cursor_left();
-        }
-        (KeyModifiers::CONTROL, Char('f')) | (_, Right) => {
-            app.input.move_cursor_right();
-        }
-        (KeyModifiers::CONTROL, Char('r')) => {
-            // Reload local remote client binary
-            app.pending_reload = true;
-        }
-        (KeyModifiers::CONTROL, Char('l')) => {
-            // Redraw screen - filter output to only show server data
-            app.current_world_mut().filter_to_server_output();
-            // Signal main loop to clear terminal and redraw everything
-            app.needs_terminal_clear = true;
-            app.needs_output_redraw = true;
-        }
-        // Terminal bell (Ctrl+G)
-        (KeyModifiers::CONTROL, Char('g')) => {
-            print!("\x07");
-        }
-        // Transpose characters (Ctrl+T)
-        (KeyModifiers::CONTROL, Char('t')) => {
-            app.input.transpose_chars();
-        }
-        // Literal next character (Ctrl+V)
-        (KeyModifiers::CONTROL, Char('v')) => {
-            app.literal_next = true;
-        }
-        (KeyModifiers::CONTROL, Up) => {
-            // Ctrl+Up - configurable behavior (same as Shift+Up)
-            match app.settings.shift_arrow_up_down_mode {
-                ArrowKeyMode::CycleWorlds => {
-                    let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
-                }
-                ArrowKeyMode::InputLine => {
-                    app.input.move_cursor_up();
-                }
-                ArrowKeyMode::CommandHistory => {
-                    app.input.history_prev();
-                }
-            }
-        }
-        (KeyModifiers::CONTROL, Down) => {
-            // Ctrl+Down - configurable behavior (same as Shift+Down)
-            match app.settings.shift_arrow_up_down_mode {
-                ArrowKeyMode::CycleWorlds => {
-                    let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
-                }
-                ArrowKeyMode::InputLine => {
-                    app.input.move_cursor_down();
-                }
-                ArrowKeyMode::CommandHistory => {
-                    app.input.history_next();
-                }
-            }
-        }
-        (KeyModifiers::ALT, Up) => {
-            // Resize input area smaller
-            if app.input_height > 1 {
-                app.input_height -= 1;
-            }
-        }
-        (KeyModifiers::ALT, Down) => {
-            // Resize input area larger
-            if app.input_height < 15 {
-                app.input_height += 1;
-            }
-        }
-        (KeyModifiers::SHIFT, Up) => {
-            // Shift+Up - configurable behavior
-            match app.settings.shift_arrow_up_down_mode {
-                ArrowKeyMode::CycleWorlds => {
-                    let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
-                }
-                ArrowKeyMode::InputLine => {
-                    app.input.move_cursor_up();
-                }
-                ArrowKeyMode::CommandHistory => {
-                    app.input.history_prev();
-                }
-            }
-        }
-        (KeyModifiers::SHIFT, Down) => {
-            // Shift+Down - configurable behavior
-            match app.settings.shift_arrow_up_down_mode {
-                ArrowKeyMode::CycleWorlds => {
-                    let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
-                }
-                ArrowKeyMode::InputLine => {
-                    app.input.move_cursor_down();
-                }
-                ArrowKeyMode::CommandHistory => {
-                    app.input.history_next();
-                }
-            }
-        }
-        (_, Up) => {
-            // Up - configurable behavior
-            match app.settings.arrow_up_down_mode {
-                ArrowKeyMode::CycleWorlds => {
-                    let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
-                }
-                ArrowKeyMode::InputLine => {
-                    app.input.move_cursor_up();
-                }
-                ArrowKeyMode::CommandHistory => {
-                    app.input.history_prev();
-                }
-            }
-        }
-        (_, Down) => {
-            // Down - configurable behavior
-            match app.settings.arrow_up_down_mode {
-                ArrowKeyMode::CycleWorlds => {
-                    let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
-                }
-                ArrowKeyMode::InputLine => {
-                    app.input.move_cursor_down();
-                }
-                ArrowKeyMode::CommandHistory => {
-                    app.input.history_next();
-                }
-            }
-        }
-        (_, PageUp) => {
-            // Scroll up (towards older content) = decrease scroll_offset
-            let scroll_amount = app.output_height.saturating_sub(2) as usize;
-            let current_offset = app.current_world().scroll_offset;
-            let new_offset = current_offset.saturating_sub(scroll_amount.max(1));
-            app.current_world_mut().scroll_offset = new_offset;
-
-            // If we're at or near the top, request more scrollback from server
-            if new_offset == 0 {
-                // Get the oldest sequence number we have
-                let before_seq = app.current_world().output_lines.first().map(|l| l.seq);
-                let _ = ws_tx.send(WsMessage::RequestScrollback {
-                    world_index: app.current_world_index,
-                    count: scroll_amount.max(1),
-                    before_seq,
-                });
-            }
-            app.needs_output_redraw = true;
-        }
-        (_, PageDown) => {
-            // Scroll down (towards newer content) = increase scroll_offset
-            let scroll_amount = app.output_height.saturating_sub(2) as usize;
-            let max_offset = app.current_world().output_lines.len().saturating_sub(1);
-            app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
-            app.needs_output_redraw = true;
-        }
-        (_, Tab) => {
-            // Release pending lines or scroll down
-            // Use pending_count for console mode (synced from daemon), pending_lines for daemon mode
-            let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
-            if app.current_world().paused && has_pending {
-                // Send release request - server will broadcast PendingLinesUpdate to sync all clients
-                let release_count = app.output_height.saturating_sub(2) as usize;
-                let _ = ws_tx.send(WsMessage::ReleasePending {
-                    world_index: app.current_world_index,
-                    count: release_count,
-                });
-            } else if !app.current_world().is_at_bottom() {
-                // Scroll down (towards newer content) = increase scroll_offset
-                let scroll_amount = app.output_height.saturating_sub(2) as usize;
-                let max_offset = app.current_world().output_lines.len().saturating_sub(1);
-                app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
-                app.needs_output_redraw = true;
-            }
-        }
-        (_, Backspace) => {
-            app.input.delete_char();
-            app.last_input_was_delete = true;
-        }
-        (_, Delete) => {
-            app.input.delete_char_forward();
-            app.last_input_was_delete = true;
-        }
-        (_, Enter) => {
+    // Enter key (always active, not bound via action system)
+    if key.code == Enter {
             let cmd = app.input.take_input();
             if cmd.is_empty() {
                 // Send empty command to server (some MUDs use this for "look")
@@ -10149,38 +10069,206 @@ fn handle_remote_client_key(
                 world.showing_splash = false;
                 world.needs_redraw = true;
                 world.output_lines.clear();
+                world.first_marked_new_index = None;
                 world.scroll_offset = 0;
                 app.needs_output_redraw = true;
             }
         }
-        (_, KeyCode::F(1)) => {
-            // Toggle help popup (using new unified popup system)
+    // Fall through to character input (unbound keys)
+    if let Char(c) = key.code {
+        if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            app.input.insert_char(c);
+            app.last_input_was_delete = false;
+            app.check_temp_conversion();
+        }
+    }
+    false
+}
+
+/// Dispatch a keybinding action for remote console client.
+/// Similar to dispatch_action() but sends WsMessages instead of direct App mutations for world ops.
+/// Returns true if quit was requested.
+fn dispatch_remote_action(
+    action: &str,
+    app: &mut App,
+    ws_tx: &mpsc::UnboundedSender<WsMessage>,
+) -> bool {
+    match action {
+        // Cursor Movement
+        "cursor_left" => { app.input.move_cursor_left(); }
+        "cursor_right" => { app.input.move_cursor_right(); }
+        "cursor_word_left" => { app.input.word_left(); }
+        "cursor_word_right" => { app.input.word_right(); }
+        "cursor_home" => { app.input.home(); }
+        "cursor_end" => { app.input.end(); }
+        "cursor_up" => { app.input.move_cursor_up(); }
+        "cursor_down" => { app.input.move_cursor_down(); }
+
+        // Editing
+        "delete_backward" => { app.input.delete_char(); app.last_input_was_delete = true; }
+        "delete_forward" => { app.input.delete_char_forward(); app.last_input_was_delete = true; }
+        "delete_word_backward" => { app.input.delete_word_before_cursor(); }
+        "delete_word_forward" => { app.input.delete_word_forward(); }
+        "delete_word_backward_punct" => { app.input.backward_kill_word_punctuation(); }
+        "kill_to_end" => { app.input.kill_to_end(); }
+        "clear_line" => { app.input.clear(); }
+        "transpose_chars" => { app.input.transpose_chars(); }
+        "literal_next" => { app.literal_next = true; }
+        "capitalize_word" => { app.input.capitalize_word(); }
+        "lowercase_word" => { app.input.lowercase_word(); }
+        "uppercase_word" => { app.input.uppercase_word(); }
+        "collapse_spaces" => { app.input.collapse_spaces(); }
+        "goto_matching_bracket" => { app.input.goto_matching_bracket(); }
+        "insert_last_arg" => { app.input.last_argument(); }
+        "yank" => { app.input.yank(); }
+
+        // History
+        "history_prev" => { app.input.history_prev(); }
+        "history_next" => { app.input.history_next(); }
+        "history_search_backward" => { app.input.history_search_backward(); }
+        "history_search_forward" => { app.input.history_search_forward(); }
+
+        // Scrollback
+        "scroll_page_up" => {
+            let scroll_amount = app.output_height.saturating_sub(2) as usize;
+            let current_offset = app.current_world().scroll_offset;
+            let new_offset = current_offset.saturating_sub(scroll_amount.max(1));
+            app.current_world_mut().scroll_offset = new_offset;
+            if new_offset == 0 {
+                let before_seq = app.current_world().output_lines.first().map(|l| l.seq);
+                let _ = ws_tx.send(WsMessage::RequestScrollback {
+                    world_index: app.current_world_index,
+                    count: scroll_amount.max(1),
+                    before_seq,
+                });
+            }
+            app.needs_output_redraw = true;
+        }
+        "scroll_page_down" => {
+            let scroll_amount = app.output_height.saturating_sub(2) as usize;
+            let max_offset = app.current_world().output_lines.len().saturating_sub(1);
+            app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
+            app.needs_output_redraw = true;
+        }
+        "scroll_half_page" => {
+            let half = (app.output_height as usize).saturating_sub(2) / 2;
+            let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
+            if app.current_world().paused && has_pending {
+                let _ = ws_tx.send(WsMessage::ReleasePending {
+                    world_index: app.current_world_index,
+                    count: half.max(1),
+                });
+            } else {
+                let scroll_amount = half.max(1);
+                let current_offset = app.current_world().scroll_offset;
+                let new_offset = current_offset.saturating_sub(scroll_amount);
+                app.current_world_mut().scroll_offset = new_offset;
+                app.needs_output_redraw = true;
+            }
+        }
+        "flush_output" => {
+            let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
+            if app.current_world().paused && has_pending {
+                let _ = ws_tx.send(WsMessage::ReleasePending {
+                    world_index: app.current_world_index,
+                    count: 0,
+                });
+            }
+            app.current_world_mut().scroll_to_bottom();
+            app.needs_output_redraw = true;
+        }
+        "selective_flush" => {
+            let _ = ws_tx.send(WsMessage::SelectiveFlush {
+                world_index: app.current_world_index,
+            });
+        }
+        "tab_key" => {
+            let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
+            if app.current_world().paused && has_pending {
+                let release_count = app.output_height.saturating_sub(2) as usize;
+                let _ = ws_tx.send(WsMessage::ReleasePending {
+                    world_index: app.current_world_index,
+                    count: release_count,
+                });
+            } else if !app.current_world().is_at_bottom() {
+                let scroll_amount = app.output_height.saturating_sub(2) as usize;
+                let max_offset = app.current_world().output_lines.len().saturating_sub(1);
+                app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
+                app.needs_output_redraw = true;
+            }
+        }
+
+        // World (remote: send WS messages to server for world calculations)
+        "world_next" => {
+            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+        }
+        "world_prev" => {
+            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+        }
+        "world_all_next" => {
+            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+        }
+        "world_all_prev" => {
+            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+        }
+        "world_activity" => {
+            let _ = ws_tx.send(WsMessage::CalculateOldestPending { current_index: app.current_world_index });
+        }
+        "world_previous" => {
+            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+        }
+        "world_forward" => {
+            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+        }
+
+        // System
+        "help" => {
             if app.has_new_popup() {
                 app.close_new_popup();
             } else {
                 app.open_help_popup_new();
             }
         }
-        (_, KeyCode::F(2)) => {
-            // Toggle show_tags
+        "redraw" => {
+            app.current_world_mut().filter_to_server_output();
+            app.needs_terminal_clear = true;
+            app.needs_output_redraw = true;
+        }
+        "reload" => {
+            app.pending_reload = true;
+        }
+        "quit" => {
+            if let Some(last_time) = app.last_ctrl_c {
+                if last_time.elapsed() < std::time::Duration::from_secs(15) {
+                    return true;
+                }
+            }
+            app.last_ctrl_c = Some(std::time::Instant::now());
+            app.add_output("Press again within 15 seconds to quit.");
+        }
+        "suspend" => { /* Not supported in remote console */ }
+        "bell" => { print!("\x07"); }
+        "spell_check" => {
+            // Spell check not easily supported in remote mode
+        }
+
+        // Clay Extensions
+        "toggle_tags" => {
             app.show_tags = !app.show_tags;
             app.needs_output_redraw = true;
         }
-        (_, KeyCode::F(4)) => {
-            // Toggle filter popup
+        "filter_popup" => {
             if app.filter_popup.visible {
                 app.filter_popup.visible = false;
             } else {
                 app.filter_popup.open();
             }
         }
-        (_, KeyCode::F(8)) => {
-            // Toggle action highlighting
+        "toggle_action_highlight" => {
             app.highlight_actions = !app.highlight_actions;
             app.needs_output_redraw = true;
         }
-        (_, KeyCode::F(9)) => {
-            // Toggle GMCP user processing for current world
+        "toggle_gmcp_media" => {
             let idx = app.current_world_index;
             app.worlds[idx].gmcp_user_enabled = !app.worlds[idx].gmcp_user_enabled;
             app.ws_broadcast(WsMessage::GmcpUserToggled {
@@ -10194,10 +10282,11 @@ fn handle_remote_client_key(
             }
             app.needs_output_redraw = true;
         }
-        (_, Char(c)) => {
-            app.input.insert_char(c);
-            app.last_input_was_delete = false;
-            app.check_temp_conversion();
+        "input_grow" => {
+            if app.input_height < 15 { app.input_height += 1; }
+        }
+        "input_shrink" => {
+            if app.input_height > 1 { app.input_height -= 1; }
         }
         _ => {}
     }
@@ -12136,8 +12225,8 @@ async fn main() -> io::Result<()> {
         libc::signal(libc::SIGABRT, sigabrt_handler as *const () as libc::sighandler_t);
     }
 
-    // Set up crash handler for automatic recovery (not available on Android or Windows)
-    #[cfg(all(unix, not(target_os = "android")))]
+    // Set up crash handler for automatic recovery (not available on Android)
+    #[cfg(not(target_os = "android"))]
     setup_crash_handler();
 
     enable_raw_mode()?;
@@ -12149,6 +12238,26 @@ async fn main() -> io::Result<()> {
         Clear(ClearType::All),
         cursor::MoveTo(0, 0)
     )?;
+
+    // On Windows reload: signal the old process that we've taken over the console.
+    // This lets the old process exit without the shell reclaiming the terminal.
+    #[cfg(windows)]
+    if let Ok(event_name) = std::env::var("CLAY_RELOAD_SYNC_EVENT") {
+        extern "system" {
+            fn OpenEventA(dwDesiredAccess: u32, bInheritHandle: i32, lpName: *const u8) -> isize;
+            fn SetEvent(hEvent: isize) -> i32;
+            fn CloseHandle(hObject: isize) -> i32;
+        }
+        const EVENT_MODIFY_STATE: u32 = 0x0002;
+        let name = format!("{}\0", event_name);
+        let handle = unsafe { OpenEventA(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if handle != 0 {
+            unsafe { SetEvent(handle); }
+            unsafe { CloseHandle(handle); }
+        }
+        std::env::remove_var("CLAY_RELOAD_SYNC_EVENT");
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -12244,6 +12353,13 @@ pub async fn run_app_headless(
     // Load theme file (~/.clay.theme.dat)
     load_theme_file(&mut app);
 
+    // Load keyboard bindings (~/.clay.key.dat)
+    {
+        let home = get_home_dir();
+        let key_path = std::path::Path::new(&home).join(clay_filename("clay.key.dat"));
+        app.keybindings = keybindings::KeyBindings::load(&key_path);
+    }
+
     app.ensure_has_world();
 
     // Re-create spell checker with custom dictionary path if configured
@@ -12255,7 +12371,7 @@ pub async fn run_app_headless(
     app.event_tx = Some(event_tx.clone());
 
     // Reconstruct connections from saved fds if in reload/crash mode
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if should_load_state {
         // Log world state for debugging (always-on)
         for (idx, world) in app.worlds.iter().enumerate() {
@@ -12300,7 +12416,10 @@ pub async fn run_app_headless(
             if world.connected && world.socket_fd.is_some() && !world.is_tls {
                 let fd = world.socket_fd.unwrap();
                 debug_log(true, &format!("HEADLESS RELOAD: Reconstructing plain TCP for '{}' fd={}", world.name, fd));
+                #[cfg(unix)]
                 let tcp_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+                #[cfg(windows)]
+                let tcp_stream = unsafe { std::net::TcpStream::from_raw_socket(fd as u64) };
                 tcp_stream.set_nonblocking(true)?;
                 let tcp_stream = TcpStream::from_std(tcp_stream)?;
                 let (r, w) = tcp_stream.into_split();
@@ -12449,6 +12568,15 @@ pub async fn run_app_headless(
                 ));
             }
         }
+
+        // Clear splash screen so the reload message is visible (splash hides output_lines)
+        app.current_world_mut().showing_splash = false;
+        let reload_msg = if is_crash {
+            "Crash recovery complete."
+        } else {
+            "Hot reload complete."
+        };
+        app.add_output(reload_msg);
     }
 
     // Apply WS override for webview-gui master mode (local-only server)
@@ -12629,8 +12757,10 @@ pub async fn run_app_headless(
                 match event {
                     AppEvent::ServerData(ref world_name, ref bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Use large width in daemon mode so text is not pre-wrapped —
+                            // GUI/web clients handle wrapping via CSS
                             let commands = app.process_server_data(
-                                world_idx, bytes, 24, 80, true,
+                                world_idx, bytes, 24, 1000, true,
                             );
                             // Activate prompt check if server data set wont_echo_time
                             if app.worlds[world_idx].wont_echo_time.is_some() {
@@ -12736,7 +12866,7 @@ pub async fn run_app_headless(
                         });
                     }
                     AppEvent::Sigusr1Received => {
-                        #[cfg(all(unix, not(target_os = "android")))]
+                        #[cfg(not(target_os = "android"))]
                         {
                             // Always log reload trigger (not gated by debug flag)
                             debug_log(true, "HEADLESS: Reload triggered, calling exec_reload");
@@ -13103,7 +13233,7 @@ pub async fn run_app_headless(
             // GUI reload check — polls atomic flag set by WebView IPC handler
             _ = gui_reload_check.tick() => {
                 if GUI_RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
-                    #[cfg(all(unix, not(target_os = "android")))]
+                    #[cfg(not(target_os = "android"))]
                     {
                         debug_log(true, "HEADLESS: GUI reload flag detected, calling exec_reload");
                         for (idx, world) in app.worlds.iter().enumerate() {
@@ -13240,6 +13370,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Load theme file (~/.clay.theme.dat)
     load_theme_file(&mut app);
 
+    // Load keyboard bindings (~/.clay.key.dat)
+    {
+        let home = get_home_dir();
+        let key_path = std::path::Path::new(&home).join(clay_filename("clay.key.dat"));
+        app.keybindings = keybindings::KeyBindings::load(&key_path);
+    }
+
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
     debug_log(is_debug_enabled(), "STARTUP: Ensuring has world...");
     app.ensure_has_world();
@@ -13265,8 +13402,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     app.event_tx = Some(event_tx.clone());
 
     // If in reload or crash recovery mode, reconstruct connections from saved fds
-    // FD reconstruction is Unix-only (reload/crash recovery requires exec() which is Unix-only)
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if should_load_state {
         debug_log(is_debug_enabled(), "STARTUP: Reconstructing connections...");
         // First pass: identify TLS worlds WITHOUT proxy that need to be disconnected
@@ -13306,8 +13442,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             if world.connected && world.socket_fd.is_some() && !world.is_tls {
                 let fd = world.socket_fd.unwrap();
 
-                // Reconstruct TcpStream from the raw fd
+                // Reconstruct TcpStream from the raw fd/handle
+                #[cfg(unix)]
                 let tcp_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+                #[cfg(windows)]
+                let tcp_stream = unsafe { std::net::TcpStream::from_raw_socket(fd as u64) };
                 tcp_stream.set_nonblocking(true)?;
                 let tcp_stream = TcpStream::from_std(tcp_stream)?;
 
@@ -13502,10 +13641,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        // Third pass: restore TLS proxy connections
+        // Third pass: restore TLS proxy connections (Unix only - TLS Proxy uses Unix sockets)
         // The proxy is designed to accept reconnections - when exec() happens, the old
         // client connection closes and the proxy waits for a new connection on its listener.
         // We reconnect via the Unix socket path rather than trying to preserve FDs.
+        #[cfg(all(unix, not(target_os = "android")))]
         for world_idx in 0..app.worlds.len() {
             let world = &app.worlds[world_idx];
             if world.connected && world.is_tls && world.proxy_pid.is_some() {
@@ -13783,6 +13923,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
             }
         }
+
+        // Clear splash screen so the reload message is visible (splash hides output_lines)
+        app.current_world_mut().showing_splash = false;
+        let reload_msg = if is_crash {
+            "Crash recovery complete."
+        } else {
+            "Hot reload complete."
+        };
+        app.add_output(reload_msg);
     }
 
     debug_log(is_debug_enabled(), "STARTUP: Keepalives sent, starting servers...");
@@ -14150,6 +14299,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 world.showing_splash = false;
                                 world.needs_redraw = true;
                                 world.output_lines.clear();
+                                world.first_marked_new_index = None;
                                 world.scroll_offset = 0;
                                 terminal.clear()?;
                                 terminal.resize(terminal.size()?)?;
@@ -14605,7 +14755,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Add non-gagged output normally
                                 let settings = app.settings.clone();
                                 let console_height = app.output_height;
-                                let output_width = app.output_width;
+                                let console_width = app.output_width;
 
                                 // Calculate minimum visible lines among all viewers for synchronized more-mode
                                 let console_viewing = world_idx == app.current_world_index;
@@ -14615,6 +14765,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     (true, None) => console_height,
                                     (false, Some(ws)) => ws as u16,
                                     (false, None) => console_height,
+                                };
+
+                                // Calculate minimum visible columns among all viewers for wrap width
+                                let ws_min_width = app.min_viewer_width(world_idx);
+                                let output_width = match (console_viewing, ws_min_width) {
+                                    (true, Some(ws_w)) => console_width.min(ws_w as u16),
+                                    (true, None) => console_width,
+                                    (false, Some(ws_w)) => ws_w as u16,
+                                    (false, None) => console_width,
                                 };
 
                                 // Track pending count before add_output for synchronized more-mode
@@ -14668,6 +14827,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                 // Broadcast activity count to keep all clients in sync
                                 app.broadcast_activity();
+                            }
+
+                            // Mark output for redraw if this is the current world
+                            if world_idx == app.current_world_index {
+                                app.needs_output_redraw = true;
                             }
 
                             // Execute any triggered commands
@@ -14740,7 +14904,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.current_world_index = prev_index;
                             }
                             WsAsyncAction::Reload => {
-                                #[cfg(all(unix, not(target_os = "android")))]
+                                #[cfg(not(target_os = "android"))]
                                 {
                                     debug_log(is_debug_enabled(), "HEADLESS: WS client requested reload");
                                     app.ws_broadcast(WsMessage::ServerReloading);
@@ -15334,7 +15498,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Add non-gagged output normally
                             let settings = app.settings.clone();
                             let output_height = app.output_height;
-                            let output_width = app.output_width;
+                            let console_width = app.output_width;
+                            let ws_min_width = app.min_viewer_width(world_idx);
+                            let console_viewing = world_idx == app.current_world_index;
+                            let output_width = match (console_viewing, ws_min_width) {
+                                (true, Some(ws_w)) => console_width.min(ws_w as u16),
+                                (true, None) => console_width,
+                                (false, Some(ws_w)) => ws_w as u16,
+                                (false, None) => console_width,
+                            };
                             app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
                             // Broadcast to WebSocket clients (only non-gagged)
                             app.ws_broadcast(WsMessage::ServerData {
@@ -15347,6 +15519,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 marked_new: false,
                                 flush: false,
                             });
+                        }
+
+                        // Mark output for redraw if this is the current world
+                        if world_idx == app.current_world_index {
+                            app.needs_output_redraw = true;
                         }
 
                         // Execute any triggered commands
@@ -16669,374 +16846,430 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
+    // Convert key event to canonical name, handling Esc+key sequences
+    let key_name = if recent_escape && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace) {
+        app.last_escape = None;
+        keybindings::escape_key_to_name(key.code, key.modifiers)
+    } else {
+        keybindings::key_event_to_name(key.code, key.modifiers)
+    };
+
     // Clear history search state on any non-search key
-    // (Esc+p and Esc+n will re-set these as needed)
-    if !(key.code == KeyCode::Char('p') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape))
-        && !(key.code == KeyCode::Char('n') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape))
-        && key.code != KeyCode::Esc
-    {
-        app.input.search_prefix = None;
-        app.input.search_index = None;
+    if let Some(ref name) = key_name {
+        if name != "Esc-p" && name != "Esc-n" && name != "Escape" {
+            app.input.search_prefix = None;
+            app.input.search_index = None;
+        }
     }
 
-    // Handle Escape+j (Alt+j) to jump to end - release all pending
-    if key.code == KeyCode::Char('j') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None; // Clear escape state
-        if app.current_world().paused {
-            let world_idx = app.current_world_index;
+    // Check TF /bind bindings first (runtime bindings from /bind command)
+    if let Some(ref name) = key_name {
+        // Map our canonical names to TF's key name format for lookup
+        let tf_name = canonical_to_tf_key_name(name);
+        if let Some(cmd) = app.tf_engine.keybindings.get(&tf_name).cloned() {
+            return KeyAction::SendCommand(cmd);
+        }
+    }
 
-            // Get text and marked_new flag of lines that will be released
-            let has_marked_new = app.worlds[world_idx].pending_lines.iter().any(|l| l.marked_new);
-            let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
-                .pending_lines
-                .iter()
-                .map(|line| line.text.replace('\r', ""))
-                .collect();
-            let released = lines_to_broadcast.len();
+    // Check configurable action bindings
+    if let Some(ref name) = key_name {
+        if let Some(action_id) = app.keybindings.get_action(name).map(|s| s.to_string()) {
+            return dispatch_action(&action_id, app);
+        }
+    }
 
-            app.current_world_mut().release_all_pending();
-
-            // Broadcast the released lines to clients viewing this world
-            if !lines_to_broadcast.is_empty() {
-                let ws_data = lines_to_broadcast.join("\n") + "\n";
-                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                    world_index: world_idx,
-                    data: ws_data,
-                    is_viewed: true,
-                    ts: current_timestamp_secs(),
-                    from_server: true,
-                    // Use seq 0 to bypass client-side dedup check (see ReleasePending handler)
-                    seq: 0,
-                    marked_new: has_marked_new,
-                    flush: false,
-                });
+    // Enter key (not bound by default via action system - always active)
+    if key.code == KeyCode::Enter {
+        let input = app.input.take_input();
+        if !input.is_empty() || app.current_world().connected {
+            app.current_world_mut().lines_since_pause = 0;
+            if app.current_world().pending_lines.is_empty() {
+                app.current_world_mut().paused = false;
             }
-
-            // Broadcast release event so other clients sync
-            app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
-            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
-            // Broadcast activity count since pending lines changed
-            app.broadcast_activity();
-            app.needs_output_redraw = true;
+            return KeyAction::SendCommand(input);
         }
         return KeyAction::None;
     }
 
-    // Handle Escape+w (Alt+w) to switch to world with oldest pending output
-    if key.code == KeyCode::Char('w') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None; // Clear escape state
-        app.switch_to_oldest_pending();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+c (Alt+c) to capitalize word
-    if key.code == KeyCode::Char('c') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.capitalize_word();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+l (Alt+l) to lowercase word
-    if key.code == KeyCode::Char('l') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.lowercase_word();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+u (Alt+u) to uppercase word
-    if key.code == KeyCode::Char('u') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.uppercase_word();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+d (Alt+d) to delete word forward
-    if key.code == KeyCode::Char('d') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.delete_word_forward();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+Space to collapse multiple spaces to one
-    if key.code == KeyCode::Char(' ') && recent_escape {
-        app.last_escape = None;
-        app.input.collapse_spaces();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+- to goto matching bracket
-    if key.code == KeyCode::Char('-') && recent_escape {
-        app.last_escape = None;
-        app.input.goto_matching_bracket();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+. / Escape+_ to insert last word of previous history
-    if (key.code == KeyCode::Char('.') || key.code == KeyCode::Char('_'))
-        && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape)
-    {
-        app.last_escape = None;
-        app.input.last_argument();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+J (uppercase) for selective flush - keep highlighted pending lines
-    if key.code == KeyCode::Char('J') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        if app.current_world().paused {
-            let world_idx = app.current_world_index;
-            // Keep lines with highlight_color, discard rest
-            let pending = std::mem::take(&mut app.worlds[world_idx].pending_lines);
-            let mut kept = Vec::new();
-            let mut discarded_count = 0usize;
-            for line in pending {
-                if line.highlight_color.is_some() {
-                    kept.push(line);
-                } else {
-                    discarded_count += 1;
-                }
+    // Fall through to character input (unbound keys)
+    if let KeyCode::Char(c) = key.code {
+        if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            if !c.is_alphabetic() && app.spell_state.showing_suggestions {
+                app.spell_state.reset();
             }
-            // Move kept lines to output
-            for line in &kept {
-                let ws_data = line.text.replace('\r', "") + "\n";
-                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                    world_index: world_idx,
-                    data: ws_data,
-                    is_viewed: true,
-                    ts: current_timestamp_secs(),
-                    from_server: line.from_server,
-                    seq: line.seq,
-                    marked_new: false,
-                    flush: false,
-                });
+            if !c.is_whitespace() && !matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}') {
+                app.skip_temp_conversion = None;
             }
-            app.worlds[world_idx].output_lines.extend(kept);
-            app.worlds[world_idx].paused = false;
-            app.worlds[world_idx].lines_since_pause = 0;
-            let _ = discarded_count; // suppress unused warning
-            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
-            app.broadcast_activity();
-            app.needs_output_redraw = true;
+            app.input.insert_char(c);
+            app.last_input_was_delete = false;
+            return KeyAction::None;
         }
-        return KeyAction::None;
     }
 
-    // Handle Escape+b to switch to previous world
-    if key.code == KeyCode::Char('b') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.prev_world();
-        return KeyAction::SwitchedWorld(app.current_world_index);
-    }
+    KeyAction::None
+}
 
-    // Handle Escape+f to switch to next world
-    if key.code == KeyCode::Char('f') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.next_world();
-        return KeyAction::SwitchedWorld(app.current_world_index);
+/// Convert our canonical key names to TF's parse_key_name format for /bind lookup.
+fn canonical_to_tf_key_name(name: &str) -> String {
+    // Our format -> TF format:
+    // "Esc-x" -> "Alt-X" (TF normalizes to Alt-)
+    if let Some(rest) = name.strip_prefix("Esc-") {
+        return format!("Alt-{}", rest.to_uppercase());
     }
+    // "Ctrl-Up" -> needs to stay as-is since TF doesn't have these
+    // "Shift-Up" -> same
+    // "^A" -> "^A" (same format)
+    // "F1" -> "F1" (same format)
+    // Special keys like "PageUp", "Home", etc. match TF format
+    name.to_string()
+}
 
-    // Handle Escape+h for half-page scroll/release
-    if key.code == KeyCode::Char('h') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        let half = (app.output_height as usize).saturating_sub(2) / 2;
-        if app.current_world().paused && !app.current_world().pending_lines.is_empty() {
-            // Release half a screenful of pending lines
-            let visual_budget = half.max(1);
-            let output_width = app.output_width as usize;
-            let world_idx = app.current_world_index;
-            let mut released = 0;
-            let mut visual_used = 0;
-            let pending_len = app.worlds[world_idx].pending_lines.len();
-            for i in 0..pending_len {
-                let line = &app.worlds[world_idx].pending_lines[i];
-                let line_visual = if output_width > 0 {
-                    (line.text.len() / output_width) + 1
-                } else {
-                    1
-                };
-                if visual_used + line_visual > visual_budget && released > 0 {
-                    break;
-                }
-                visual_used += line_visual;
-                released += 1;
+/// Dispatch a keybinding action ID to the corresponding behavior.
+fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
+    match action {
+        // Cursor Movement
+        "cursor_left" => {
+            app.input.move_cursor_left();
+            KeyAction::None
+        }
+        "cursor_right" => {
+            app.input.move_cursor_right();
+            KeyAction::None
+        }
+        "cursor_word_left" => {
+            app.input.word_left();
+            KeyAction::None
+        }
+        "cursor_word_right" => {
+            app.input.word_right();
+            KeyAction::None
+        }
+        "cursor_home" => {
+            app.input.home();
+            KeyAction::None
+        }
+        "cursor_end" => {
+            app.input.end();
+            KeyAction::None
+        }
+        "cursor_up" => {
+            app.input.move_cursor_up();
+            KeyAction::None
+        }
+        "cursor_down" => {
+            app.input.move_cursor_down();
+            KeyAction::None
+        }
+
+        // Editing
+        "delete_backward" => {
+            app.input.delete_char();
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+        "delete_forward" => {
+            app.input.delete_char_forward();
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+        "delete_word_backward" => {
+            app.input.delete_word_before_cursor();
+            app.spell_state.reset();
+            app.suggestion_message = None;
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+        "delete_word_forward" => {
+            app.input.delete_word_forward();
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+        "delete_word_backward_punct" => {
+            app.input.backward_kill_word_punctuation();
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+        "kill_to_end" => {
+            app.input.kill_to_end();
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+        "clear_line" => {
+            app.input.clear();
+            app.spell_state.reset();
+            app.suggestion_message = None;
+            KeyAction::None
+        }
+        "transpose_chars" => {
+            app.input.transpose_chars();
+            KeyAction::None
+        }
+        "literal_next" => {
+            app.literal_next = true;
+            KeyAction::None
+        }
+        "capitalize_word" => {
+            app.input.capitalize_word();
+            KeyAction::None
+        }
+        "lowercase_word" => {
+            app.input.lowercase_word();
+            KeyAction::None
+        }
+        "uppercase_word" => {
+            app.input.uppercase_word();
+            KeyAction::None
+        }
+        "collapse_spaces" => {
+            app.input.collapse_spaces();
+            KeyAction::None
+        }
+        "goto_matching_bracket" => {
+            app.input.goto_matching_bracket();
+            KeyAction::None
+        }
+        "insert_last_arg" => {
+            app.input.last_argument();
+            KeyAction::None
+        }
+        "yank" => {
+            app.input.yank();
+            KeyAction::None
+        }
+
+        // History
+        "history_prev" => {
+            app.input.history_prev();
+            app.spell_state.reset();
+            KeyAction::None
+        }
+        "history_next" => {
+            app.input.history_next();
+            app.spell_state.reset();
+            KeyAction::None
+        }
+        "history_search_backward" => {
+            app.input.history_search_backward();
+            KeyAction::None
+        }
+        "history_search_forward" => {
+            app.input.history_search_forward();
+            KeyAction::None
+        }
+
+        // Scrollback
+        "scroll_page_up" => {
+            app.scroll_output_up();
+            KeyAction::None
+        }
+        "scroll_page_down" => {
+            if app.current_world().is_at_bottom() && app.current_world().paused {
+                app.release_pending_screenful();
+            } else {
+                app.scroll_output_down();
             }
-            if released > 0 {
-                let lines: Vec<_> = app.worlds[world_idx].pending_lines.drain(..released).collect();
-                let first_seq = lines.first().map(|l| l.seq).unwrap_or(0);
-                let ws_data: String = lines.iter().map(|l| l.text.replace('\r', "")).collect::<Vec<_>>().join("\n") + "\n";
-                app.worlds[world_idx].output_lines.extend(lines);
-                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                    world_index: world_idx,
-                    data: ws_data,
-                    is_viewed: true,
-                    ts: current_timestamp_secs(),
-                    from_server: true,
-                    seq: first_seq,
-                    marked_new: false,
-                    flush: false,
-                });
-                if app.worlds[world_idx].pending_lines.is_empty() {
-                    app.worlds[world_idx].paused = false;
-                    app.worlds[world_idx].lines_since_pause = 0;
+            KeyAction::None
+        }
+        "scroll_half_page" => {
+            let half = (app.output_height as usize).saturating_sub(2) / 2;
+            if app.current_world().paused && !app.current_world().pending_lines.is_empty() {
+                let visual_budget = half.max(1);
+                let output_width = app.output_width as usize;
+                let world_idx = app.current_world_index;
+                let mut released = 0;
+                let mut visual_used = 0;
+                let pending_len = app.worlds[world_idx].pending_lines.len();
+                for i in 0..pending_len {
+                    let line = &app.worlds[world_idx].pending_lines[i];
+                    let line_visual = if output_width > 0 {
+                        (line.text.len() / output_width) + 1
+                    } else {
+                        1
+                    };
+                    if visual_used + line_visual > visual_budget && released > 0 {
+                        break;
+                    }
+                    visual_used += line_visual;
+                    released += 1;
                 }
-                let pending_count = app.worlds[world_idx].pending_lines.len();
-                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
+                if released > 0 {
+                    let lines: Vec<_> = app.worlds[world_idx].pending_lines.drain(..released).collect();
+                    let first_seq = lines.first().map(|l| l.seq).unwrap_or(0);
+                    let ws_data: String = lines.iter().map(|l| l.text.replace('\r', "")).collect::<Vec<_>>().join("\n") + "\n";
+                    app.worlds[world_idx].output_lines.extend(lines);
+                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                        world_index: world_idx,
+                        data: ws_data,
+                        is_viewed: true,
+                        ts: current_timestamp_secs(),
+                        from_server: true,
+                        seq: first_seq,
+                        marked_new: false,
+                        flush: false,
+                    });
+                    if app.worlds[world_idx].pending_lines.is_empty() {
+                        app.worlds[world_idx].paused = false;
+                        app.worlds[world_idx].lines_since_pause = 0;
+                    }
+                    let pending_count = app.worlds[world_idx].pending_lines.len();
+                    app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
+                    app.broadcast_activity();
+                }
+            } else {
+                app.scroll_output_up_by(half.max(1));
+            }
+            app.needs_output_redraw = true;
+            KeyAction::None
+        }
+        "flush_output" => {
+            if app.current_world().paused {
+                let world_idx = app.current_world_index;
+                let has_marked_new = app.worlds[world_idx].pending_lines.iter().any(|l| l.marked_new);
+                let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
+                    .pending_lines
+                    .iter()
+                    .map(|line| line.text.replace('\r', ""))
+                    .collect();
+                let released = lines_to_broadcast.len();
+                app.current_world_mut().release_all_pending();
+                if !lines_to_broadcast.is_empty() {
+                    let ws_data = lines_to_broadcast.join("\n") + "\n";
+                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                        world_index: world_idx,
+                        data: ws_data,
+                        is_viewed: true,
+                        ts: current_timestamp_secs(),
+                        from_server: true,
+                        seq: 0,
+                        marked_new: has_marked_new,
+                        flush: false,
+                    });
+                }
+                app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
+                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
                 app.broadcast_activity();
+                app.needs_output_redraw = true;
             }
-        } else {
-            // Scroll up half a page
-            app.scroll_output_up_by(half.max(1));
+            KeyAction::None
         }
-        app.needs_output_redraw = true;
-        return KeyAction::None;
-    }
-
-    // Handle Escape+p for history search backward
-    if key.code == KeyCode::Char('p') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.history_search_backward();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+n for history search forward
-    if key.code == KeyCode::Char('n') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.history_search_forward();
-        return KeyAction::None;
-    }
-
-    // Handle Escape+Backspace for delete word back (punctuation-delimited)
-    if key.code == KeyCode::Backspace && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
-        app.last_escape = None;
-        app.input.backward_kill_word_punctuation();
-        return KeyAction::None;
-    }
-
-    // Ctrl+Up/Down - configurable behavior (same as Shift+Up/Down)
-    if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
-        match app.settings.shift_arrow_up_down_mode {
-            ArrowKeyMode::CycleWorlds => {
-                app.prev_world();
-                return KeyAction::SwitchedWorld(app.current_world_index);
+        "selective_flush" => {
+            if app.current_world().paused {
+                let world_idx = app.current_world_index;
+                let pending = std::mem::take(&mut app.worlds[world_idx].pending_lines);
+                let mut kept = Vec::new();
+                for line in pending {
+                    if line.highlight_color.is_some() {
+                        kept.push(line);
+                    }
+                }
+                for line in &kept {
+                    let ws_data = line.text.replace('\r', "") + "\n";
+                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                        world_index: world_idx,
+                        data: ws_data,
+                        is_viewed: true,
+                        ts: current_timestamp_secs(),
+                        from_server: line.from_server,
+                        seq: line.seq,
+                        marked_new: false,
+                        flush: false,
+                    });
+                }
+                app.worlds[world_idx].output_lines.extend(kept);
+                app.worlds[world_idx].paused = false;
+                app.worlds[world_idx].lines_since_pause = 0;
+                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
+                app.broadcast_activity();
+                app.needs_output_redraw = true;
             }
-            ArrowKeyMode::InputLine => {
-                app.input.move_cursor_up();
-                return KeyAction::None;
-            }
-            ArrowKeyMode::CommandHistory => {
-                app.input.history_prev();
-                app.spell_state.reset();
-                return KeyAction::None;
-            }
+            KeyAction::None
         }
-    }
-    if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
-        match app.settings.shift_arrow_up_down_mode {
-            ArrowKeyMode::CycleWorlds => {
-                app.next_world();
-                return KeyAction::SwitchedWorld(app.current_world_index);
+        "tab_key" => {
+            // Tab in more-mode releases a screenful, otherwise no-op for now
+            // (Tab completion is handled earlier in the function)
+            if app.current_world().paused {
+                app.release_pending_screenful();
+            } else if !app.current_world().is_at_bottom() {
+                app.scroll_output_down();
             }
-            ArrowKeyMode::InputLine => {
-                app.input.move_cursor_down();
-                return KeyAction::None;
-            }
-            ArrowKeyMode::CommandHistory => {
-                app.input.history_next();
-                app.spell_state.reset();
-                return KeyAction::None;
-            }
+            KeyAction::None
         }
-    }
 
-    // Shift+Up/Down - configurable behavior
-    if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT) && !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
-        match app.settings.shift_arrow_up_down_mode {
-            ArrowKeyMode::CycleWorlds => {
-                app.prev_world();
-                return KeyAction::SwitchedWorld(app.current_world_index);
-            }
-            ArrowKeyMode::InputLine => {
-                app.input.move_cursor_up();
-                return KeyAction::None;
-            }
-            ArrowKeyMode::CommandHistory => {
-                app.input.history_prev();
-                app.spell_state.reset();
-                return KeyAction::None;
-            }
+        // World
+        "world_next" => {
+            app.next_world();
+            KeyAction::SwitchedWorld(app.current_world_index)
         }
-    }
-    if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT) && !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
-        match app.settings.shift_arrow_up_down_mode {
-            ArrowKeyMode::CycleWorlds => {
-                app.next_world();
-                return KeyAction::SwitchedWorld(app.current_world_index);
-            }
-            ArrowKeyMode::InputLine => {
-                app.input.move_cursor_down();
-                return KeyAction::None;
-            }
-            ArrowKeyMode::CommandHistory => {
-                app.input.history_next();
-                app.spell_state.reset();
-                return KeyAction::None;
-            }
+        "world_prev" => {
+            app.prev_world();
+            KeyAction::SwitchedWorld(app.current_world_index)
         }
-    }
+        "world_all_next" => {
+            app.next_world();
+            KeyAction::SwitchedWorld(app.current_world_index)
+        }
+        "world_all_prev" => {
+            app.prev_world();
+            KeyAction::SwitchedWorld(app.current_world_index)
+        }
+        "world_activity" => {
+            app.switch_to_oldest_pending();
+            KeyAction::None
+        }
+        "world_previous" => {
+            app.prev_world();
+            KeyAction::SwitchedWorld(app.current_world_index)
+        }
+        "world_forward" => {
+            app.next_world();
+            KeyAction::SwitchedWorld(app.current_world_index)
+        }
 
-    // Alt+Up/Down - resize input area
-    if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
-        app.increase_input_height();
-        return KeyAction::None;
-    }
-    if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::ALT) {
-        app.decrease_input_height();
-        return KeyAction::None;
-    }
-
-    match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-            // Check if we pressed Ctrl+C within the last 15 seconds
+        // System
+        "help" => {
+            app.open_help_popup_new();
+            KeyAction::None
+        }
+        "redraw" => KeyAction::Redraw,
+        "reload" => KeyAction::Reload,
+        "quit" => {
+            // Double-press Ctrl+C logic
             if let Some(last_time) = app.last_ctrl_c {
                 if last_time.elapsed() < Duration::from_secs(15) {
                     return KeyAction::Quit;
                 }
             }
-            // First Ctrl+C or timeout - show message and record time
             app.last_ctrl_c = Some(std::time::Instant::now());
-            app.add_output("Press Ctrl+C again within 15 seconds to exit, or use /quit");
+            app.add_output("Press again within 15 seconds to exit, or use /quit");
+            KeyAction::None
+        }
+        "suspend" => KeyAction::Suspend,
+        "bell" => {
+            print!("\x07");
+            KeyAction::None
+        }
+        "spell_check" => {
+            app.handle_spell_check();
             KeyAction::None
         }
 
-        // Ctrl+L to redraw screen
-        (KeyModifiers::CONTROL, KeyCode::Char('l')) => KeyAction::Redraw,
-
-        // Ctrl+R to reload
-        (KeyModifiers::CONTROL, KeyCode::Char('r')) => KeyAction::Reload,
-
-        // Ctrl+Z to suspend
-        (KeyModifiers::CONTROL, KeyCode::Char('z')) => KeyAction::Suspend,
-
-        // F1 to open help popup (using new unified popup system)
-        (_, KeyCode::F(1)) => {
-            app.open_help_popup_new();
-            KeyAction::None
-        }
-
-        // F2 to toggle tag display
-        (_, KeyCode::F(2)) => {
+        // Clay Extensions
+        "toggle_tags" => {
             app.show_tags = !app.show_tags;
-            KeyAction::Redraw // Force full screen redraw to apply change
+            KeyAction::Redraw
         }
-
-        // F8 to toggle action pattern highlighting
-        (_, KeyCode::F(8)) => {
+        "filter_popup" => {
+            app.filter_popup.open();
+            let output_lines = app.current_world().output_lines.clone();
+            app.filter_popup.update_filter(&output_lines);
+            app.needs_output_redraw = true;
+            KeyAction::None
+        }
+        "toggle_action_highlight" => {
             app.highlight_actions = !app.highlight_actions;
-            KeyAction::Redraw // Force full screen redraw to apply change
+            KeyAction::Redraw
         }
-
-        // F9 to toggle GMCP user processing for current world
-        (_, KeyCode::F(9)) => {
+        "toggle_gmcp_media" => {
             let idx = app.current_world_index;
             app.worlds[idx].gmcp_user_enabled = !app.worlds[idx].gmcp_user_enabled;
             app.ws_broadcast(WsMessage::GmcpUserToggled {
@@ -17051,200 +17284,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.needs_output_redraw = true;
             KeyAction::Redraw
         }
-
-        // F4 to open filter popup
-        (_, KeyCode::F(4)) => {
-            app.filter_popup.open();
-            let output_lines = app.current_world().output_lines.clone();
-            app.filter_popup.update_filter(&output_lines);
-            app.needs_output_redraw = true;
+        "input_grow" => {
+            app.increase_input_height();
             KeyAction::None
         }
-
-        // Up/Down without modifiers - configurable behavior
-        (KeyModifiers::NONE, KeyCode::Up) => {
-            match app.settings.arrow_up_down_mode {
-                ArrowKeyMode::CycleWorlds => {
-                    app.prev_world();
-                    KeyAction::SwitchedWorld(app.current_world_index)
-                }
-                ArrowKeyMode::InputLine => {
-                    app.input.move_cursor_up();
-                    KeyAction::None
-                }
-                ArrowKeyMode::CommandHistory => {
-                    app.input.history_prev();
-                    app.spell_state.reset();
-                    KeyAction::None
-                }
-            }
-        }
-        (KeyModifiers::NONE, KeyCode::Down) => {
-            match app.settings.arrow_up_down_mode {
-                ArrowKeyMode::CycleWorlds => {
-                    app.next_world();
-                    KeyAction::SwitchedWorld(app.current_world_index)
-                }
-                ArrowKeyMode::InputLine => {
-                    app.input.move_cursor_down();
-                    KeyAction::None
-                }
-                ArrowKeyMode::CommandHistory => {
-                    app.input.history_next();
-                    app.spell_state.reset();
-                    KeyAction::None
-                }
-            }
-        }
-
-        // Clear input
-        (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-            app.input.clear();
-            app.spell_state.reset();
-            app.suggestion_message = None;
-            KeyAction::None
-        }
-
-        // Delete word before cursor
-        (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
-            app.input.delete_word_before_cursor();
-            app.spell_state.reset();
-            app.suggestion_message = None;
-            app.last_input_was_delete = true;
-            KeyAction::None
-        }
-
-        // Go to end of line
-        (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
-            app.input.end();
-            KeyAction::None
-        }
-
-        // Kill to end of line
-        (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
-            app.input.kill_to_end();
-            app.last_input_was_delete = true;
-            KeyAction::None
-        }
-
-        // Delete character under cursor
-        (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
-            app.input.delete_char_forward();
-            app.last_input_was_delete = true;
-            KeyAction::None
-        }
-
-        // History navigation
-        (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
-            app.input.history_prev();
-            app.spell_state.reset();
-            KeyAction::None
-        }
-        (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
-            app.input.history_next();
-            app.spell_state.reset();
-            KeyAction::None
-        }
-
-        // Spell check
-        (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
-            app.handle_spell_check();
-            KeyAction::None
-        }
-
-        // Terminal bell (Ctrl+G)
-        (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
-            print!("\x07");
-            KeyAction::None
-        }
-
-        // Transpose characters (Ctrl+T)
-        (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
-            app.input.transpose_chars();
-            KeyAction::None
-        }
-
-        // Literal next character (Ctrl+V)
-        (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
-            app.literal_next = true;
-            KeyAction::None
-        }
-
-        // Submit - Reset lines_since_pause when sending a command
-        (_, KeyCode::Enter) => {
-            let input = app.input.take_input();
-            // Allow empty input to be sent if connected (some MUDs use empty lines)
-            if !input.is_empty() || app.current_world().connected {
-                // Always reset counter when user sends a command
-                // This matches daemon.rs behavior and prevents spurious pausing
-                app.current_world_mut().lines_since_pause = 0;
-                // Also clear paused flag if no pending lines
-                // This prevents staying paused after the triggering line when user sends a command
-                if app.current_world().pending_lines.is_empty() {
-                    app.current_world_mut().paused = false;
-                }
-                KeyAction::SendCommand(input)
-            } else {
-                KeyAction::None
-            }
-        }
-
-        // Editing
-        (_, KeyCode::Backspace) => {
-            app.input.delete_char();
-            app.last_input_was_delete = true;
-            KeyAction::None
-        }
-        (_, KeyCode::Delete) => {
-            app.input.delete_char_forward();
-            app.last_input_was_delete = true;
-            KeyAction::None
-        }
-
-        // Cursor movement
-        (_, KeyCode::Left) | (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
-            app.input.move_cursor_left();
-            KeyAction::None
-        }
-        (_, KeyCode::Right) | (KeyModifiers::CONTROL, KeyCode::Char('f')) => {
-            app.input.move_cursor_right();
-            KeyAction::None
-        }
-        (_, KeyCode::Home) | (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
-            app.input.home();
-            KeyAction::None
-        }
-        (_, KeyCode::End) => {
-            app.input.end();
-            KeyAction::None
-        }
-
-        // Output scrolling (history)
-        (_, KeyCode::PageUp) => {
-            app.scroll_output_up();
-            KeyAction::None
-        }
-        (_, KeyCode::PageDown) => {
-            if app.current_world().is_at_bottom() && app.current_world().paused {
-                // At bottom and paused - release one screenful (same as Tab)
-                app.release_pending_screenful();
-            } else {
-                app.scroll_output_down();
-            }
-            KeyAction::None
-        }
-
-        // Character input
-        (_, KeyCode::Char(c)) => {
-            if !c.is_alphabetic() && app.spell_state.showing_suggestions {
-                app.spell_state.reset();
-            }
-            // Clear skip_temp_conversion when typing non-separator (starting new word)
-            if !c.is_whitespace() && !matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}') {
-                app.skip_temp_conversion = None;
-            }
-            app.input.insert_char(c);
-            app.last_input_was_delete = false;
+        "input_shrink" => {
+            app.decrease_input_height();
             KeyAction::None
         }
 
@@ -18677,14 +18722,19 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             tokio::spawn(async move {
                 match TcpStream::connect(format!("{}:{}", connect_host, connect_port)).await {
                     Ok(tcp_stream) => {
-                        // Store the socket fd for hot reload (before splitting, Unix only)
+                        // Store the socket fd/handle for hot reload (before splitting)
                         #[cfg(unix)]
-                        let socket_fd = {
+                        let socket_fd: Option<SocketFd> = {
                             use std::os::unix::io::AsRawFd;
                             Some(tcp_stream.as_raw_fd())
                         };
-                        #[cfg(not(unix))]
-                        let socket_fd: Option<i32> = None;
+                        #[cfg(windows)]
+                        let socket_fd: Option<SocketFd> = {
+                            use std::os::windows::io::AsRawSocket;
+                            Some(tcp_stream.as_raw_socket() as i64)
+                        };
+                        #[cfg(not(any(unix, windows)))]
+                        let socket_fd: Option<SocketFd> = None;
 
                         // Enable TCP keepalive to detect dead connections faster
                         enable_tcp_keepalive(&tcp_stream);
@@ -18944,6 +18994,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::Flush => {
             let line_count = app.current_world().output_lines.len();
             app.current_world_mut().output_lines.clear();
+            app.current_world_mut().first_marked_new_index = None;
             app.current_world_mut().pending_lines.clear();
             app.current_world_mut().scroll_offset = 0;
             app.current_world_mut().lines_since_pause = 0;
@@ -19013,14 +19064,14 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::Reload => {
-            // Hot reload is not available on Android/Termux or Windows
-            #[cfg(any(target_os = "android", not(unix)))]
+            // Hot reload is not available on Android/Termux
+            #[cfg(target_os = "android")]
             {
                 app.add_output("Hot reload is not available on this platform.");
                 app.add_output("Restart the app manually to apply changes.");
             }
 
-            #[cfg(all(unix, not(target_os = "android")))]
+            #[cfg(not(target_os = "android"))]
             {
                 // First check if we can find the executable (handling " (deleted)" suffix)
                 let exe_path = match get_executable_path() {
@@ -23327,33 +23378,24 @@ mod tests {
     }
 
     #[test]
-    fn test_oversized_single_line_splits() {
-        // Test that a single oversized line gets pre-wrapped into individual visual lines
-        // stored as separate OutputLines, so more-mode can paginate with Tab.
+    fn test_oversized_single_line_no_presplit() {
+        // Test that a single oversized line is stored as one logical OutputLine.
+        // Each renderer wraps at its own width. More-mode still pauses correctly
+        // based on visual line count.
         let mut world = World::new("test");
         let settings = Settings { more_mode_enabled: true, ..Settings::default() };
 
         // Create a single very long line: 10000 chars at width 80, max_lines = 46
         // wrap_ansi_line produces ceil(10000/80) = 125 visual lines
-        // First 46 go to output_lines, remaining 79 go to pending_lines
+        // The whole line goes to output_lines as one logical entry, and pause triggers
         let long_line = "x".repeat(10000) + "\n";
         world.add_output(&long_line, true, &settings, 48, 80, false, true);
 
-        // Should be paused with first max_lines visual lines in output, rest in pending
+        // Should be paused - the line exceeds max_lines worth of visual lines
         assert!(world.paused, "Should be paused");
-        assert_eq!(world.output_lines.len(), 46, "First 46 visual lines in output");
-        assert_eq!(world.pending_lines.len(), 79, "Remaining 79 visual lines in pending");
-
-        // Each output line should be exactly 1 visual line (pre-wrapped)
-        for (i, ol) in world.output_lines.iter().enumerate() {
-            let vl = visual_line_count(&ol.text, 80);
-            assert_eq!(vl, 1, "Output line {} should be 1 visual line, got {}", i, vl);
-        }
-
-        // Tab should release one screenful at a time
-        let pending_before = world.pending_lines.len();
-        world.release_pending(46, 80);
-        assert!(world.pending_lines.len() < pending_before, "Tab should release pending lines");
+        // Stored as 1 logical line (no pre-wrapping)
+        assert_eq!(world.output_lines.len(), 1, "One logical line in output");
+        assert_eq!(world.pending_lines.len(), 0, "No pending lines (whole line went to output)");
     }
 
     #[test]

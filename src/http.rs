@@ -119,6 +119,9 @@ const WEB_APP_JS: &str = include_str!("web/app.js");
 /// Embedded theme editor HTML
 const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
 
+/// Embedded keybind editor HTML
+const WEB_KEYBIND_EDITOR_HTML: &str = include_str!("web/keybind-editor.html");
+
 /// Parse an HTTP request line and return the method and path
 fn parse_http_request(request: &str) -> Option<(&str, &str)> {
     let first_line = request.lines().next()?;
@@ -224,6 +227,13 @@ fn handle_http_routes(
         }
         "/theme-editor" => {
             let html = WEB_THEME_EDITOR_HTML
+                .replace("{{WS_HOST}}", &sanitized_host)
+                .replace("{{WS_PORT}}", "0")
+                .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+            RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
+        }
+        "/keybind-editor" => {
+            let html = WEB_KEYBIND_EDITOR_HTML
                 .replace("{{WS_HOST}}", &sanitized_host)
                 .replace("{{WS_PORT}}", "0")
                 .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });

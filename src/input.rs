@@ -36,6 +36,7 @@ pub struct InputArea {
     pub temp_input: String,
     pub search_prefix: Option<String>,  // Prefix being searched (set on first ^[p/^[n)
     pub search_index: Option<usize>,    // Position in history during search
+    pub kill_ring: Vec<String>,         // Killed text history (for ^Y yank)
 }
 
 impl InputArea {
@@ -52,6 +53,7 @@ impl InputArea {
             temp_input: String::new(),
             search_prefix: None,
             search_index: None,
+            kill_ring: Vec::new(),
         }
     }
 
@@ -153,6 +155,7 @@ impl InputArea {
             return;
         }
 
+        let old_pos = self.cursor_position;
         // Work with characters, not bytes
         let before_cursor: String = self.buffer[..self.cursor_position].to_string();
         let mut chars: Vec<char> = before_cursor.chars().collect();
@@ -171,11 +174,22 @@ impl InputArea {
         let new_before: String = chars.into_iter().collect();
         let after_cursor = &self.buffer[self.cursor_position..];
         self.cursor_position = new_before.len();
+
+        // Push killed text to kill ring
+        let killed = self.buffer[self.cursor_position..old_pos].to_string();
+        if !killed.is_empty() {
+            self.kill_ring.push(killed);
+        }
+
         self.buffer = new_before + after_cursor;
         self.adjust_viewport();
     }
 
     pub fn clear(&mut self) {
+        // Push to kill ring if there's content
+        if !self.buffer.is_empty() {
+            self.kill_ring.push(self.buffer.clone());
+        }
         self.buffer.clear();
         self.cursor_position = 0;
         self.viewport_start_line = 0;
@@ -242,6 +256,10 @@ impl InputArea {
 
     /// Delete from cursor position to end of line (Ctrl+K)
     pub fn kill_to_end(&mut self) {
+        let killed = self.buffer[self.cursor_position..].to_string();
+        if !killed.is_empty() {
+            self.kill_ring.push(killed);
+        }
         self.buffer.truncate(self.cursor_position);
     }
 
@@ -265,6 +283,11 @@ impl InputArea {
         // Calculate byte offset to delete
         let byte_offset: usize = after[..i].iter().map(|c| c.len_utf8()).sum();
         let end = self.cursor_position + byte_offset;
+        // Push killed text to kill ring
+        let killed = self.buffer[self.cursor_position..end].to_string();
+        if !killed.is_empty() {
+            self.kill_ring.push(killed);
+        }
         self.buffer.replace_range(self.cursor_position..end, "");
     }
 
@@ -622,6 +645,7 @@ impl InputArea {
         if self.cursor_position == 0 {
             return;
         }
+        let old_pos = self.cursor_position;
         let before_cursor: String = self.buffer[..self.cursor_position].to_string();
         let mut chars: Vec<char> = before_cursor.chars().collect();
 
@@ -648,7 +672,62 @@ impl InputArea {
         let new_before: String = chars.into_iter().collect();
         let after_cursor = &self.buffer[self.cursor_position..];
         self.cursor_position = new_before.len();
+
+        // Push killed text to kill ring
+        let killed = self.buffer[self.cursor_position..old_pos].to_string();
+        if !killed.is_empty() {
+            self.kill_ring.push(killed);
+        }
+
         self.buffer = new_before + after_cursor;
+        self.adjust_viewport();
+    }
+
+    /// Yank (paste) the most recent entry from the kill ring (Ctrl+Y).
+    pub fn yank(&mut self) {
+        if let Some(text) = self.kill_ring.last().cloned() {
+            self.buffer.insert_str(self.cursor_position, &text);
+            self.cursor_position += text.len();
+            self.adjust_viewport();
+        }
+    }
+
+    /// Move cursor backward one word (Esc+b / Ctrl+Left).
+    pub fn word_left(&mut self) {
+        if self.cursor_position == 0 {
+            return;
+        }
+        let before: Vec<char> = self.buffer[..self.cursor_position].chars().collect();
+        let mut i = before.len();
+        // Skip whitespace/non-word chars
+        while i > 0 && !before[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        // Skip word chars
+        while i > 0 && before[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        self.cursor_position = before[..i].iter().map(|c| c.len_utf8()).sum();
+        self.adjust_viewport();
+    }
+
+    /// Move cursor forward one word (Esc+f / Ctrl+Right).
+    pub fn word_right(&mut self) {
+        if self.cursor_position >= self.buffer.len() {
+            return;
+        }
+        let after: Vec<char> = self.buffer[self.cursor_position..].chars().collect();
+        let mut i = 0;
+        // Skip non-word chars
+        while i < after.len() && !after[i].is_alphanumeric() {
+            i += 1;
+        }
+        // Skip word chars
+        while i < after.len() && after[i].is_alphanumeric() {
+            i += 1;
+        }
+        let byte_offset: usize = after[..i].iter().map(|c| c.len_utf8()).sum();
+        self.cursor_position += byte_offset;
         self.adjust_viewport();
     }
 

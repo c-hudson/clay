@@ -156,7 +156,7 @@ pub enum WsMessage {
     SelectiveFlush { world_index: usize },
     MarkWorldSeen { world_index: usize },
     /// Update client's view state (world index and visible lines for more-mode calculation)
-    UpdateViewState { world_index: usize, visible_lines: usize },
+    UpdateViewState { world_index: usize, visible_lines: usize, #[serde(default)] visible_columns: Option<usize> },
     /// Update client's output dimensions (for NAWS - report smallest across all instances)
     UpdateDimensions { width: u16, height: u16 },
     RequestState,  // Request full state resync
@@ -328,6 +328,19 @@ pub enum WsMessage {
     ThemeFileSaved { success: bool, error: Option<String> },
     ThemeCssVarsUpdated { css_vars: String, colors_json: String },
 
+    // Keybind editor (client -> server)
+    RequestKeybindEditorState,
+    UpdateKeybindEditorBindings { bindings_json: String },
+    SaveKeybindFile,
+    ResetKeybindDefaults,
+
+    // Keybind editor (server -> client)
+    KeybindEditorState { bindings_json: String, defaults_json: String, actions_json: String },
+    KeybindFileSaved { success: bool, error: Option<String> },
+
+    // Keybindings update (server -> all clients)
+    KeybindingsUpdated { bindings_json: String },
+
     // Keepalive
     Ping,
     Pong,
@@ -472,6 +485,9 @@ pub struct GlobalSettingsMsg {
     /// Theme colors from ~/.clay.theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
+    /// Keyboard bindings (serialized as JSON object: key -> action)
+    #[serde(default)]
+    pub keybindings_json: String,
 }
 
 fn default_gui_transparency() -> f32 {

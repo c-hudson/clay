@@ -106,20 +106,49 @@ pub fn parse_key_name(name: &str) -> Result<String, String> {
     }
 
     let lower = name.to_lowercase();
-    if let Some(rest) = lower.strip_prefix("ctrl-").or_else(|| lower.strip_prefix("ctrl+")) {
-        if rest.len() == 1 {
-            let c = rest.chars().next().unwrap().to_ascii_uppercase();
-            if c.is_ascii_uppercase() {
-                return Ok(format!("^{}", c));
+
+    // Shift/Ctrl/Alt + special key combos: Shift-Up, Ctrl-Down, Alt-Left, etc.
+    for (prefix, canonical_prefix) in &[
+        ("shift-", "Shift-"), ("shift+", "Shift-"),
+        ("ctrl-", "Ctrl-"), ("ctrl+", "Ctrl-"),
+        ("alt-", "Alt-"), ("alt+", "Alt-"),
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            // Check if the rest is a special key (not a single letter for ctrl/alt)
+            let special = match rest {
+                "up" => Some("Up"), "down" => Some("Down"),
+                "left" => Some("Left"), "right" => Some("Right"),
+                "pageup" | "pgup" => Some("PageUp"), "pagedown" | "pgdn" => Some("PageDown"),
+                "home" => Some("Home"), "end" => Some("End"),
+                "insert" | "ins" => Some("Insert"), "delete" | "del" => Some("Delete"),
+                "tab" => Some("Tab"), "enter" | "return" => Some("Enter"),
+                "backspace" | "bs" => Some("Backspace"), "escape" | "esc" => Some("Escape"),
+                _ => None,
+            };
+            if let Some(special_name) = special {
+                return Ok(format!("{}{}", canonical_prefix, special_name));
             }
+            // For Ctrl + single letter, normalize to ^X
+            if *canonical_prefix == "Ctrl-" && rest.len() == 1 {
+                let c = rest.chars().next().unwrap().to_ascii_uppercase();
+                if c.is_ascii_uppercase() {
+                    return Ok(format!("^{}", c));
+                }
+            }
+            // For Alt + single letter or string, normalize to Alt-X
+            if *canonical_prefix == "Alt-" {
+                return Ok(format!("Alt-{}", rest.to_uppercase()));
+            }
+            // Shift + letter or unknown: pass through
+            if *canonical_prefix == "Shift-" {
+                return Ok(format!("Shift-{}", rest));
+            }
+            return Err(format!("Invalid key: {}", name));
         }
-        return Err(format!("Invalid control key: {}", name));
     }
 
-    // Alt/Meta keys: Alt-A, Meta-A, \eA
-    if let Some(rest) = lower.strip_prefix("alt-")
-        .or_else(|| lower.strip_prefix("alt+"))
-        .or_else(|| lower.strip_prefix("meta-"))
+    // Alt/Meta keys: Meta-A, \eA
+    if let Some(rest) = lower.strip_prefix("meta-")
         .or_else(|| lower.strip_prefix("meta+")) {
         return Ok(format!("Alt-{}", rest.to_uppercase()));
     }

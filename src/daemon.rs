@@ -227,7 +227,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 world_idx,
                                 &bytes,
                                 24, // Default console height for daemon mode
-                                80, // Default console width
+                                200, // Fallback width — actual width computed from connected clients
                                 true, // is_daemon_mode
                             );
 
@@ -745,6 +745,7 @@ pub async fn handle_daemon_ws_message(
                     if world_index < app.worlds.len() {
                         let line_count = app.worlds[world_index].output_lines.len();
                         app.worlds[world_index].output_lines.clear();
+                        app.worlds[world_index].first_marked_new_index = None;
                         app.worlds[world_index].pending_lines.clear();
                         app.worlds[world_index].scroll_offset = 0;
                         app.worlds[world_index].lines_since_pause = 0;
@@ -1057,8 +1058,7 @@ pub async fn handle_daemon_ws_message(
                                 app.worlds[world_index].command_tx = Some(cmd_tx);
                                 app.worlds[world_index].was_connected = true;
                                 app.worlds[world_index].skip_auto_login = false;
-                                #[cfg(unix)]
-                                { app.worlds[world_index].socket_fd = socket_fd; }
+                                app.worlds[world_index].socket_fd = socket_fd;
                                 app.worlds[world_index].is_tls = is_tls;
                                 let now = std::time::Instant::now();
                                 app.worlds[world_index].last_send_time = Some(now);
@@ -1133,8 +1133,7 @@ pub async fn handle_daemon_ws_message(
                                 app.worlds[idx].command_tx = Some(cmd_tx);
                                 app.worlds[idx].was_connected = true;
                                 app.worlds[idx].skip_auto_login = false;
-                                #[cfg(unix)]
-                                { app.worlds[idx].socket_fd = socket_fd; }
+                                app.worlds[idx].socket_fd = socket_fd;
                                 app.worlds[idx].is_tls = is_tls;
                                 let now = std::time::Instant::now();
                                 app.worlds[idx].last_send_time = Some(now);
@@ -1217,8 +1216,7 @@ pub async fn handle_daemon_ws_message(
                     app.worlds[world_index].command_tx = Some(cmd_tx);
                     app.worlds[world_index].was_connected = true;
                     app.worlds[world_index].skip_auto_login = false;
-                    #[cfg(unix)]
-                    { app.worlds[world_index].socket_fd = socket_fd; }
+                    app.worlds[world_index].socket_fd = socket_fd;
                     app.worlds[world_index].is_tls = is_tls;
                     let now = std::time::Instant::now();
                     app.worlds[world_index].last_send_time = Some(now);
@@ -1334,11 +1332,12 @@ pub async fn handle_daemon_ws_message(
         WsMessage::Ping => {
             app.ws_send_to_client(client_id, WsMessage::Pong);
         }
-        WsMessage::UpdateViewState { world_index, visible_lines } => {
+        WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
             // Track client's view state for more-mode threshold calculation
             if world_index < app.worlds.len() {
                 let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                let vc = visible_columns.unwrap_or_else(|| app.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
+                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions });
             }
         }
         WsMessage::MarkWorldSeen { world_index } => {
@@ -1357,8 +1356,8 @@ pub async fn handle_daemon_ws_message(
                 if pending_count > 0 {
                     // Get client's output width for visual line calculation
                     let client_width = app.ws_client_worlds.get(&client_id)
-                        .and_then(|s| s.dimensions)
-                        .map(|(w, _)| w as usize)
+                        .map(|s| s.visible_columns)
+                        .filter(|&w| w > 0)
                         .unwrap_or(app.output_width as usize);
 
                     // count == 0 means release all; otherwise treat count as visual budget
@@ -1491,14 +1490,14 @@ pub async fn handle_daemon_ws_message(
 
             if let Some(idx) = new_index {
                 // Update client's view state (sync state)
-                let visible_lines = app.ws_client_worlds.get(&client_id)
-                    .map(|s| s.visible_lines)
-                    .unwrap_or(24);
-                let dimensions = app.ws_client_worlds.get(&client_id)
-                    .and_then(|s| s.dimensions);
+                let prev = app.ws_client_worlds.get(&client_id);
+                let visible_lines = prev.map(|s| s.visible_lines).unwrap_or(24);
+                let visible_columns = prev.map(|s| s.visible_columns).unwrap_or(0);
+                let dimensions = prev.and_then(|s| s.dimensions);
                 app.ws_client_worlds.insert(client_id, ClientViewState {
                     world_index: idx,
                     visible_lines,
+                    visible_columns,
                     dimensions,
                 });
                 // Update client's world in WebSocket server (async state)
@@ -2343,7 +2342,7 @@ pub async fn connect_daemon_world(
     event_tx: mpsc::Sender<AppEvent>,
     connection_id: u64,
     skip_auto_login: bool,
-) -> Option<(mpsc::Sender<WriteCommand>, Option<i32>, bool)> {
+) -> Option<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool)> {
     let host = &settings.hostname;
     let port = &settings.port;
     let use_ssl = settings.use_ssl;
@@ -2356,14 +2355,19 @@ pub async fn connect_daemon_world(
         Ok(tcp_stream) => {
             let _ = tcp_stream.set_nodelay(true);
 
-            // Store the socket fd for hot reload (before splitting, Unix only)
+            // Store the socket fd for hot reload (before splitting)
             #[cfg(unix)]
-            let socket_fd = {
+            let socket_fd: Option<SocketFd> = {
                 use std::os::unix::io::AsRawFd;
                 Some(tcp_stream.as_raw_fd())
             };
-            #[cfg(not(unix))]
-            let socket_fd: Option<i32> = None;
+            #[cfg(windows)]
+            let socket_fd: Option<SocketFd> = {
+                use std::os::windows::io::AsRawSocket;
+                Some(tcp_stream.as_raw_socket() as i64)
+            };
+            #[cfg(not(any(unix, windows)))]
+            let socket_fd: Option<SocketFd> = None;
 
             // Enable TCP keepalive to detect dead connections faster
             enable_tcp_keepalive(&tcp_stream);

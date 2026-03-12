@@ -174,6 +174,7 @@
         setupShiftArrowSelect: document.getElementById('setup-shift-arrow-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
+        setupDebugToggle: document.getElementById('setup-debug-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
         setupHeightMinus: document.getElementById('setup-height-minus'),
@@ -271,6 +272,8 @@
     let worldSwitchMode = 'Unseen First';  // 'Unseen First' or 'Alphabetical'
     let arrowUpDownMode = 'cycle_worlds';  // 'cycle_worlds' or 'input_line'
     let shiftArrowUpDownMode = 'input_line'; // 'cycle_worlds' or 'input_line'
+    let keybindings = {};  // key name -> action ID, received from server
+    let killRing = [];     // killed text for yank (Ctrl+Y)
 
     // Actions state
     let actions = [];
@@ -330,6 +333,7 @@
     let setupShiftArrowUpDown = 'input_line';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
+    let setupDebug = false;
     let setupInputHeightValue = 1;
     let setupGuiTheme = 'dark';
     let setupTransparency = 1.0;
@@ -867,17 +871,9 @@
             if (e.key === 'w' && e.ctrlKey && !e.altKey && !e.metaKey) {
                 e.preventDefault();
                 e.stopPropagation();
-                // Perform word-delete if input is focused
+                // Perform word-delete if input is focused (uses kill ring)
                 if (document.activeElement === elements.input) {
-                    const input = elements.input;
-                    const pos = input.selectionStart;
-                    const text = input.value;
-                    // Find start of word before cursor
-                    let start = pos;
-                    while (start > 0 && text[start - 1] === ' ') start--;
-                    while (start > 0 && text[start - 1] !== ' ') start--;
-                    input.value = text.substring(0, start) + text.substring(pos);
-                    input.selectionStart = input.selectionEnd = start;
+                    deleteWordBackwardKill();
                 } else {
                     // Focus input if not already focused
                     elements.input.focus();
@@ -943,17 +939,27 @@
         return Math.floor(elements.outputContainer.clientHeight / lineHeight);
     }
 
+    // Get visible column count in output area (approximate from container width and font size)
+    function getVisibleColumnCount() {
+        const fontSize = currentFontSize || 14;
+        const charWidth = fontSize * 0.6; // monospace approximate
+        return Math.floor(elements.outputContainer.clientWidth / charWidth);
+    }
+
     // Send UpdateViewState to server for synchronized more-mode
     function sendViewStateIfChanged() {
         const visibleLines = getVisibleLineCount();
-        const newState = { worldIndex: currentWorldIndex, visibleLines };
+        const visibleColumns = getVisibleColumnCount();
+        const newState = { worldIndex: currentWorldIndex, visibleLines, visibleColumns };
         if (!lastSentViewState ||
             lastSentViewState.worldIndex !== newState.worldIndex ||
-            lastSentViewState.visibleLines !== newState.visibleLines) {
+            lastSentViewState.visibleLines !== newState.visibleLines ||
+            lastSentViewState.visibleColumns !== newState.visibleColumns) {
             send({
                 type: 'UpdateViewState',
                 world_index: currentWorldIndex,
-                visible_lines: visibleLines
+                visible_lines: visibleLines,
+                visible_columns: visibleColumns
             });
             lastSentViewState = newState;
         }
@@ -1723,6 +1729,9 @@
                     if (msg.settings.shift_arrow_up_down_mode !== undefined) {
                         shiftArrowUpDownMode = msg.settings.shift_arrow_up_down_mode;
                     }
+                    if (msg.settings.keybindings_json) {
+                        try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
+                    }
                 }
                 // Calculate activity count from world data (don't wait for ActivityUpdate message)
                 serverActivityCount = worlds.filter((w, i) =>
@@ -1783,7 +1792,6 @@
                         partialLines[msg.world_index] = '';
                         if (msg.world_index === currentWorldIndex) {
                             elements.output.innerHTML = '';
-                            scrollOffset = 0;
                             linesSincePause = 0;
                             paused = false;
                             pendingLines = [];
@@ -2006,7 +2014,6 @@
                     // If it's the current world, clear the display and reset more-mode state
                     if (msg.world_index === currentWorldIndex) {
                         elements.output.innerHTML = '';
-                        scrollOffset = 0;
                         // Reset more-mode state to prevent immediate pause on new data
                         linesSincePause = 0;
                         paused = false;
@@ -2183,6 +2190,15 @@
                     if (msg.settings.shift_arrow_up_down_mode !== undefined) {
                         shiftArrowUpDownMode = msg.settings.shift_arrow_up_down_mode;
                     }
+                    if (msg.settings.keybindings_json) {
+                        try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
+                    }
+                }
+                break;
+
+            case 'KeybindingsUpdated':
+                if (msg.bindings_json) {
+                    try { keybindings = JSON.parse(msg.bindings_json); } catch(e) {}
                 }
                 break;
 
@@ -2191,8 +2207,8 @@
                 if (wakePongTimeout) {
                     clearTimeout(wakePongTimeout);
                     wakePongTimeout = null;
-                    // Connection is alive, resync state
-                    ws.send(JSON.stringify({ type: 'RequestState' }));
+                    // Connection is alive - no resync needed, just update view state
+                    sendViewStateIfChanged();
                 }
                 break;
 
@@ -5126,6 +5142,7 @@
         setupShiftArrowUpDown = shiftArrowUpDownMode;
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
+        setupDebug = debugEnabled;
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
         setupColorOffset = colorOffsetPercent;
@@ -5169,6 +5186,11 @@
             elements.setupNewLineIndicatorToggle.classList.add('active');
         } else {
             elements.setupNewLineIndicatorToggle.classList.remove('active');
+        }
+        if (setupDebug) {
+            elements.setupDebugToggle.classList.add('active');
+        } else {
+            elements.setupDebugToggle.classList.remove('active');
         }
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
@@ -5250,6 +5272,7 @@
         shiftArrowUpDownMode = setupShiftArrowUpDown;
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
+        debugEnabled = setupDebug;
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
         applyTheme(guiTheme);
@@ -6172,6 +6195,411 @@
         return (Date.now() - lastEscapeTime) < 500;
     }
 
+    // Convert a JS KeyboardEvent to canonical key name (matching Rust format)
+    // Returns null if the key should not be looked up in bindings
+    function keyEventToName(e) {
+        const key = e.key;
+        // Handle Escape+key sequences (Esc pressed within 500ms)
+        if (!e.ctrlKey && !e.altKey && !e.metaKey && isRecentEscape() && key !== 'Escape') {
+            if (key === 'Backspace') return 'Esc-Backspace';
+            if (key === ' ') return 'Esc-Space';
+            if (key.length === 1) return 'Esc-' + key;  // preserves case: Esc-j vs Esc-J
+            return null;
+        }
+        // Ctrl+letter
+        if (e.ctrlKey && !e.altKey && !e.metaKey && key.length === 1) {
+            return '^' + key.toUpperCase();
+        }
+        // Alt+letter (native Alt key, not escape sequence)
+        if (e.altKey && !e.ctrlKey && !e.metaKey && key.length === 1) {
+            return 'Esc-' + key;  // preserves case
+        }
+        // Alt+Backspace
+        if (e.altKey && !e.ctrlKey && !e.metaKey && key === 'Backspace') {
+            return 'Esc-Backspace';
+        }
+        // F-keys
+        if (/^F(\d+)$/.test(key)) return key;
+        // Special keys with modifiers
+        const specialMap = {
+            'ArrowUp': 'Up', 'ArrowDown': 'Down', 'ArrowLeft': 'Left', 'ArrowRight': 'Right',
+            'PageUp': 'PageUp', 'PageDown': 'PageDown',
+            'Home': 'Home', 'End': 'End', 'Insert': 'Insert', 'Delete': 'Delete',
+            'Backspace': 'Backspace', 'Tab': 'Tab', 'Enter': 'Enter', 'Escape': 'Escape'
+        };
+        const mapped = specialMap[key];
+        if (mapped) {
+            if (e.shiftKey && !e.ctrlKey && !e.altKey) return 'Shift-' + mapped;
+            if (e.ctrlKey && !e.shiftKey && !e.altKey) return 'Ctrl-' + mapped;
+            if (e.altKey && !e.shiftKey && !e.ctrlKey) return 'Alt-' + mapped;
+            if (!e.shiftKey && !e.ctrlKey && !e.altKey) return mapped;
+        }
+        return null;
+    }
+
+    // Look up a key name in keybindings and return the action ID, or null
+    function lookupBinding(keyName) {
+        if (!keyName) return null;
+        const action = keybindings[keyName];
+        if (action && action !== 'UNBOUND') return action;
+        return null;
+    }
+
+    // Push text to the kill ring (for yank)
+    function pushKillRing(text) {
+        if (text) {
+            killRing.push(text);
+            if (killRing.length > 100) killRing.shift();
+        }
+    }
+
+    // Yank (paste) most recent kill ring entry at cursor
+    function killRingYank() {
+        if (killRing.length === 0) return;
+        const text = killRing[killRing.length - 1];
+        const input = elements.input;
+        const pos = input.selectionStart;
+        const val = input.value;
+        input.value = val.substring(0, pos) + text + val.substring(pos);
+        input.selectionStart = input.selectionEnd = pos + text.length;
+    }
+
+    // Delete word before cursor and push to kill ring
+    function deleteWordBackwardKill() {
+        const input = elements.input;
+        const pos = input.selectionStart;
+        const text = input.value;
+        let start = pos;
+        while (start > 0 && text[start - 1] === ' ') start--;
+        while (start > 0 && text[start - 1] !== ' ') start--;
+        const killed = text.substring(start, pos);
+        pushKillRing(killed);
+        input.value = text.substring(0, start) + text.substring(pos);
+        input.selectionStart = input.selectionEnd = start;
+    }
+
+    // Kill to end of line and push to kill ring
+    function killToEndKill() {
+        const input = elements.input;
+        const pos = input.selectionStart;
+        const killed = input.value.substring(pos);
+        pushKillRing(killed);
+        input.value = input.value.substring(0, pos);
+        input.selectionStart = input.selectionEnd = pos;
+    }
+
+    // Clear line and push to kill ring
+    function clearLineKill() {
+        const input = elements.input;
+        if (input.value) pushKillRing(input.value);
+        input.value = '';
+        historyIndex = -1;
+    }
+
+    // Delete word forward and push to kill ring
+    function deleteWordForwardKill() {
+        const input = elements.input;
+        const pos = input.selectionStart;
+        const text = input.value;
+        let end = pos;
+        while (end < text.length && text[end] === ' ') end++;
+        while (end < text.length && text[end] !== ' ') end++;
+        const killed = text.substring(pos, end);
+        pushKillRing(killed);
+        input.value = text.substring(0, pos) + text.substring(end);
+        input.selectionStart = input.selectionEnd = pos;
+    }
+
+    // Backward kill word (punctuation-delimited) and push to kill ring
+    function backwardKillWordPunctuationKill() {
+        const input = elements.input;
+        const pos = input.selectionStart;
+        const text = input.value;
+        let start = pos;
+        // Skip trailing spaces
+        while (start > 0 && text[start - 1] === ' ') start--;
+        // Skip until space or punctuation
+        const punct = /[^a-zA-Z0-9]/;
+        if (start > 0 && punct.test(text[start - 1])) {
+            start--;
+        } else {
+            while (start > 0 && !punct.test(text[start - 1]) && text[start - 1] !== ' ') start--;
+        }
+        const killed = text.substring(start, pos);
+        pushKillRing(killed);
+        input.value = text.substring(0, start) + text.substring(pos);
+        input.selectionStart = input.selectionEnd = start;
+    }
+
+    // Dispatch a keybinding action by ID. Returns true if handled.
+    function dispatchAction(actionId) {
+        switch (actionId) {
+            // Cursor
+            case 'cursor_left': {
+                const input = elements.input;
+                if (input.selectionStart > 0) {
+                    input.selectionStart = input.selectionEnd = input.selectionStart - 1;
+                }
+                return true;
+            }
+            case 'cursor_right': {
+                const input = elements.input;
+                if (input.selectionStart < input.value.length) {
+                    input.selectionStart = input.selectionEnd = input.selectionStart + 1;
+                }
+                return true;
+            }
+            case 'cursor_word_left': {
+                const input = elements.input;
+                let pos = input.selectionStart;
+                const text = input.value;
+                while (pos > 0 && text[pos - 1] === ' ') pos--;
+                while (pos > 0 && text[pos - 1] !== ' ') pos--;
+                input.selectionStart = input.selectionEnd = pos;
+                return true;
+            }
+            case 'cursor_word_right': {
+                const input = elements.input;
+                let pos = input.selectionStart;
+                const text = input.value;
+                while (pos < text.length && text[pos] !== ' ') pos++;
+                while (pos < text.length && text[pos] === ' ') pos++;
+                input.selectionStart = input.selectionEnd = pos;
+                return true;
+            }
+            case 'cursor_home': {
+                elements.input.selectionStart = elements.input.selectionEnd = 0;
+                return true;
+            }
+            case 'cursor_end': {
+                const len = elements.input.value.length;
+                elements.input.selectionStart = elements.input.selectionEnd = len;
+                return true;
+            }
+            case 'cursor_up':
+            case 'cursor_down':
+                // Multi-line cursor movement - let browser handle natively in textarea
+                return false;
+
+            // Editing
+            case 'delete_backward': {
+                // Let browser handle natively
+                return false;
+            }
+            case 'delete_forward': {
+                const input = elements.input;
+                const pos = input.selectionStart;
+                const text = input.value;
+                if (pos < text.length) {
+                    input.value = text.substring(0, pos) + text.substring(pos + 1);
+                    input.selectionStart = input.selectionEnd = pos;
+                }
+                return true;
+            }
+            case 'delete_word_backward':
+                deleteWordBackwardKill();
+                return true;
+            case 'delete_word_forward':
+                deleteWordForwardKill();
+                return true;
+            case 'delete_word_backward_punct':
+                backwardKillWordPunctuationKill();
+                return true;
+            case 'kill_to_end':
+                killToEndKill();
+                return true;
+            case 'clear_line':
+                clearLineKill();
+                return true;
+            case 'transpose_chars':
+                transposeChars();
+                return true;
+            case 'literal_next':
+                // Not meaningful in browser
+                return true;
+            case 'capitalize_word':
+                transformWordForward('capitalize');
+                return true;
+            case 'lowercase_word':
+                transformWordForward('lowercase');
+                return true;
+            case 'uppercase_word':
+                transformWordForward('uppercase');
+                return true;
+            case 'collapse_spaces':
+                collapseSpaces();
+                return true;
+            case 'goto_matching_bracket':
+                gotoMatchingBracket();
+                return true;
+            case 'insert_last_arg':
+                lastArgument();
+                return true;
+            case 'yank':
+                killRingYank();
+                return true;
+
+            // History
+            case 'history_prev':
+                historyPrev();
+                return true;
+            case 'history_next':
+                historyNext();
+                return true;
+            case 'history_search_backward':
+                historySearchBackward();
+                return true;
+            case 'history_search_forward':
+                historySearchForward();
+                return true;
+
+            // Scrollback
+            case 'scroll_page_up': {
+                const pgH = elements.outputContainer.clientHeight;
+                const pgLH = (currentFontSize || 14) * 1.2;
+                elements.outputContainer.scrollBy(0, -(pgH - pgLH));
+                return true;
+            }
+            case 'scroll_page_down': {
+                const pgH = elements.outputContainer.clientHeight;
+                const pgLH = (currentFontSize || 14) * 1.2;
+                elements.outputContainer.scrollBy(0, pgH - pgLH);
+                if (isAtBottom()) {
+                    const world = worlds[currentWorldIndex];
+                    const serverPending = world ? (world.pending_count || 0) : 0;
+                    if (pendingLines.length === 0 && serverPending === 0) {
+                        paused = false;
+                        linesSincePause = 0;
+                        updateStatusBar();
+                    } else {
+                        releaseScreenful();
+                    }
+                }
+                return true;
+            }
+            case 'scroll_half_page': {
+                const world = worlds[currentWorldIndex];
+                const serverPending = world ? (world.pending_count || 0) : 0;
+                if (pendingLines.length > 0 || serverPending > 0) {
+                    releaseScreenful();
+                } else {
+                    const halfPage = Math.floor(elements.outputContainer.clientHeight / 2);
+                    elements.outputContainer.scrollBy(0, -halfPage);
+                }
+                return true;
+            }
+            case 'flush_output':
+                releaseAll();
+                scrollToBottom();
+                return true;
+            case 'selective_flush':
+                selectiveFlush();
+                return true;
+            case 'tab_key': {
+                // Try command completion first
+                const inputValue = elements.input.value;
+                if (inputValue.startsWith('/')) {
+                    const completed = completeCommand(inputValue);
+                    if (completed !== null) {
+                        elements.input.value = completed;
+                        const spacePos = completed.indexOf(' ');
+                        const cursorPos = spacePos >= 0 ? spacePos : completed.length;
+                        elements.input.setSelectionRange(cursorPos, cursorPos);
+                        return true;
+                    }
+                }
+                const world = worlds[currentWorldIndex];
+                const serverPending = world ? (world.pending_count || 0) : 0;
+                if (pendingLines.length > 0 || serverPending > 0) {
+                    releaseScreenful();
+                } else {
+                    elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
+                }
+                return true;
+            }
+
+            // World
+            case 'world_next':
+                requestNextWorld();
+                return true;
+            case 'world_prev':
+                requestPrevWorld();
+                return true;
+            case 'world_all_next':
+                requestNextWorld();  // Uses same server-side logic
+                return true;
+            case 'world_all_prev':
+                requestPrevWorld();
+                return true;
+            case 'world_activity':
+                requestOldestPendingWorld();
+                return true;
+            case 'world_previous':
+                requestPrevWorld();
+                return true;
+            case 'world_forward':
+                requestNextWorld();
+                return true;
+
+            // System
+            case 'help':
+                if (helpPopupOpen) closeHelpPopup(); else openHelpPopup();
+                return true;
+            case 'redraw':
+                if (worlds[currentWorldIndex]) {
+                    worlds[currentWorldIndex].output_lines = worlds[currentWorldIndex].output_lines.filter(l => l.from_server !== false);
+                    worlds[currentWorldIndex].output_lines.forEach(l => { l.marked_new = false; });
+                    worldOutputCache[currentWorldIndex] = {};
+                }
+                renderOutput();
+                return true;
+            case 'reload':
+                if (window.ipc && window.ipc.postMessage) {
+                    window.ipc.postMessage('reload');
+                } else {
+                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/reload' });
+                }
+                return true;
+            case 'quit':
+                // No-op in web
+                return true;
+            case 'suspend':
+                // No-op in web
+                return true;
+            case 'bell':
+                // No-op in browser
+                return true;
+            case 'spell_check':
+                // No-op in web (no spell checker)
+                return true;
+
+            // Clay Extensions
+            case 'toggle_tags':
+                showTags = !showTags;
+                renderOutput();
+                return true;
+            case 'filter_popup':
+                if (filterPopupOpen) closeFilterPopup(); else openFilterPopup();
+                return true;
+            case 'toggle_action_highlight':
+                highlightActions = !highlightActions;
+                renderOutput();
+                return true;
+            case 'toggle_gmcp_media':
+                send({ type: 'ToggleWorldGmcp', world_index: currentWorldIndex });
+                return true;
+            case 'input_grow':
+                if (inputHeight < 15) setInputHeight(inputHeight + 1);
+                return true;
+            case 'input_shrink':
+                if (inputHeight > 1) setInputHeight(inputHeight - 1);
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
     // Toggle menu dropdown (unified - opens upward from button)
     function toggleMenu(anchorBtn) {
         menuOpen = !menuOpen;
@@ -6863,43 +7291,18 @@
                 return;
             }
 
-            // Handle F-keys and shortcuts globally (before popup checks which have early returns)
-            if (e.key === 'F1') {
-                // F1: Toggle help popup
-                e.preventDefault();
-                if (helpPopupOpen) {
-                    closeHelpPopup();
-                } else {
-                    openHelpPopup();
+            // Handle F-keys and shortcuts globally via keybinding system
+            // (before popup checks which have early returns)
+            {
+                const keyName = keyEventToName(e);
+                const action = lookupBinding(keyName);
+                if (action === 'help' || action === 'toggle_tags' || action === 'filter_popup' ||
+                    action === 'toggle_action_highlight' || action === 'toggle_gmcp_media') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    dispatchAction(action);
+                    return;
                 }
-                return;
-            } else if (e.key === 'F2') {
-                // F2: Toggle MUD tag display
-                e.preventDefault();
-                showTags = !showTags;
-                renderOutput();
-                return;
-            } else if (e.key === 'F8') {
-                // F8: Toggle action highlighting
-                e.preventDefault();
-                e.stopPropagation();
-                highlightActions = !highlightActions;
-                renderOutput();
-                return;
-            } else if (e.key === 'F9') {
-                // F9: Toggle GMCP user processing for current world
-                e.preventDefault();
-                send({ type: 'ToggleWorldGmcp', world_index: currentWorldIndex });
-                return;
-            } else if (e.key === 'F4') {
-                // F4: Toggle filter popup
-                e.preventDefault();
-                if (filterPopupOpen) {
-                    closeFilterPopup();
-                } else {
-                    openFilterPopup();
-                }
-                return;
             }
 
             // Handle help popup
@@ -7119,127 +7522,29 @@
                 return;
             }
 
-            // Handle navigation keys at document level
-            if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
-                e.preventDefault();
-                const world = worlds[currentWorldIndex];
-                const serverPending = world ? (world.pending_count || 0) : 0;
-                if (pendingLines.length > 0 || serverPending > 0) {
-                    // Release one screenful of pending lines
-                    releaseScreenful();
-                } else {
-                    // Scroll down one screenful (like more)
-                    elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
+            // Handle navigation keys at document level via keybinding system
+            {
+                const keyName = keyEventToName(e);
+                const action = lookupBinding(keyName);
+                if (action) {
+                    // Clear escape time for Esc+key sequences that matched
+                    if (isRecentEscape() && e.key !== 'Escape') lastEscapeTime = 0;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    dispatchAction(action);
+                    elements.input.focus();
+                    return;
                 }
-                elements.input.focus();
-            } else if (e.key === 'j' && (e.altKey || isRecentEscape())) {
-                // Alt+j or Escape+j: Jump to end, release all pending
-                lastEscapeTime = 0;
-                e.preventDefault();
-                releaseAll();
-                scrollToBottom();
-                elements.input.focus();
-            } else if (e.key === 'w' && (e.altKey || isRecentEscape())) {
-                // Alt+w or Escape+w: Switch to world with activity
-                lastEscapeTime = 0;
-                e.preventDefault();
-                requestOldestPendingWorld();
-                elements.input.focus();
-            } else if (e.key === 'b' && (e.altKey || isRecentEscape())) {
-                // Esc+b: Previous world
-                lastEscapeTime = 0;
-                e.preventDefault();
-                requestPrevWorld();
-                elements.input.focus();
-            } else if (e.key === 'f' && (e.altKey || isRecentEscape())) {
-                // Esc+f: Next world
-                lastEscapeTime = 0;
-                e.preventDefault();
-                requestNextWorld();
-                elements.input.focus();
-            } else if (e.key === 'h' && (e.altKey || isRecentEscape())) {
-                // Esc+h: Half-page scroll/release
-                lastEscapeTime = 0;
-                e.preventDefault();
-                const halfPage = Math.floor(elements.outputContainer.clientHeight / 2);
-                const world = worlds[currentWorldIndex];
-                const serverPending = world ? (world.pending_count || 0) : 0;
-                if (pendingLines.length > 0 || serverPending > 0) {
-                    releaseScreenful(); // Release half (approx)
-                } else {
-                    elements.outputContainer.scrollBy(0, -halfPage);
-                }
-                elements.input.focus();
-            } else if (e.key === 'J' && (e.altKey || isRecentEscape())) {
-                // Esc+Shift+J: Selective flush
-                lastEscapeTime = 0;
-                e.preventDefault();
-                selectiveFlush();
-                elements.input.focus();
-            } else if (e.key === 'PageUp') {
-                e.preventDefault();
-                elements.outputContainer.scrollBy(0, -elements.outputContainer.clientHeight);
-            } else if (e.key === 'PageDown') {
-                e.preventDefault();
-                elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
-                if (isAtBottom()) {
-                    const world = worlds[currentWorldIndex];
-                    const serverPending = world ? (world.pending_count || 0) : 0;
-                    if (pendingLines.length === 0 && serverPending === 0) {
-                        paused = false;
-                        linesSincePause = 0;
-                        updateStatusBar();
-                    } else {
-                        // Release one screenful when at bottom with pending (same as Tab)
-                        releaseScreenful();
-                    }
-                }
-            } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
-                // Up: configurable behavior (when not focused on input)
-                e.preventDefault();
-                if (arrowUpDownMode === 'cycle_worlds') {
-                    requestPrevWorld();
-                } else if (arrowUpDownMode === 'command_history') {
-                    historyPrev();
-                }
-                elements.input.focus();
-            } else if (e.key === 'ArrowDown' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
-                // Down: configurable behavior (when not focused on input)
-                e.preventDefault();
-                if (arrowUpDownMode === 'cycle_worlds') {
-                    requestNextWorld();
-                } else if (arrowUpDownMode === 'command_history') {
-                    historyNext();
-                }
-                elements.input.focus();
-            } else if (e.key === 'ArrowUp' && e.shiftKey && !e.ctrlKey && !e.altKey && document.activeElement !== elements.input) {
-                // Shift+Up: configurable behavior (when not focused on input)
-                e.preventDefault();
-                if (shiftArrowUpDownMode === 'cycle_worlds') {
-                    requestPrevWorld();
-                } else if (shiftArrowUpDownMode === 'command_history') {
-                    historyPrev();
-                }
-                elements.input.focus();
-            } else if (e.key === 'ArrowDown' && e.shiftKey && !e.ctrlKey && !e.altKey && document.activeElement !== elements.input) {
-                // Shift+Down: configurable behavior (when not focused on input)
-                e.preventDefault();
-                if (shiftArrowUpDownMode === 'cycle_worlds') {
-                    requestNextWorld();
-                } else if (shiftArrowUpDownMode === 'command_history') {
-                    historyNext();
-                }
-                elements.input.focus();
-            } else if (e.key === 'Escape' && filterPopupOpen) {
-                // Escape: Close filter popup if open
+            }
+
+            // Escape handling: close popups or track for sequences
+            if (e.key === 'Escape' && filterPopupOpen) {
                 e.preventDefault();
                 closeFilterPopup();
             } else if (e.key === 'Escape' && deviceModeModalOpen) {
-                // Escape: Close device mode modal if open
                 e.preventDefault();
                 hideDeviceModeModal();
             } else if (e.key === 'Escape') {
-                // Track bare Escape for Escape+key sequences
                 lastEscapeTime = Date.now();
             }
         };
@@ -7247,242 +7552,36 @@
         // Keyboard controls (console-style) - input-specific
         elements.input.addEventListener('keydown', function(e) {
             // Clear history search state on non-search keys
-            if (e.key !== 'Escape' && !((e.key === 'p' || e.key === 'n') && (e.altKey || isRecentEscape()))) {
+            const keyName = keyEventToName(e);
+            const action = lookupBinding(keyName);
+            if (e.key !== 'Escape' && action !== 'history_search_backward' && action !== 'history_search_forward') {
                 clearHistorySearch();
             }
+
+            // Enter is always handled directly (not configurable)
             if (e.key === 'Enter') {
-                // Send command (also releases all pending) - both Enter and Shift+Enter
                 e.preventDefault();
-                e.stopPropagation();  // Prevent document-level handler from catching this
+                e.stopPropagation();
                 sendCommand();
-            } else if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
-                e.preventDefault(); // Always prevent default tab behavior
-                // Try command completion first if input starts with /
-                const inputValue = elements.input.value;
-                if (inputValue.startsWith('/')) {
-                    const completed = completeCommand(inputValue);
-                    if (completed !== null) {
-                        elements.input.value = completed;
-                        // Move cursor to end of command part
-                        const spacePos = completed.indexOf(' ');
-                        const cursorPos = spacePos >= 0 ? spacePos : completed.length;
-                        elements.input.setSelectionRange(cursorPos, cursorPos);
-                        return;
-                    }
-                }
-                // Tab: Release one screenful of pending lines, or scroll down
-                const tabWorld = worlds[currentWorldIndex];
-                const tabServerPending = tabWorld ? (tabWorld.pending_count || 0) : 0;
-                if (pendingLines.length > 0 || tabServerPending > 0) {
-                    releaseScreenful();
-                } else {
-                    // Scroll down one screenful (like more)
-                    elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
-                }
-            } else if (e.key === 'j' && (e.altKey || isRecentEscape())) {
-                // Alt+j or Escape+j: Jump to end, release all pending
-                lastEscapeTime = 0;
+                return;
+            }
+
+            // Binding-based dispatch
+            if (action) {
+                // For delete_backward (Backspace), let the browser handle it natively
+                if (action === 'delete_backward') return;
+                // Clear escape time for Esc+key sequences that matched
+                if (isRecentEscape() && e.key !== 'Escape') lastEscapeTime = 0;
                 e.preventDefault();
-                releaseAll();
-                scrollToBottom();
-            } else if (e.key === 'w' && (e.altKey || isRecentEscape())) {
-                // Alt+w or Escape+w: Switch to world with activity
-                lastEscapeTime = 0;
-                e.preventDefault();
-                requestOldestPendingWorld();
-            } else if (e.key === 'c' && (e.altKey || isRecentEscape())) {
-                // Alt+c or Escape+c: Capitalize word forward
-                lastEscapeTime = 0;
-                e.preventDefault();
-                transformWordForward('capitalize');
-            } else if (e.key === 'l' && (e.altKey || isRecentEscape())) {
-                // Alt+l or Escape+l: Lowercase word forward
-                lastEscapeTime = 0;
-                e.preventDefault();
-                transformWordForward('lowercase');
-            } else if (e.key === 'u' && (e.altKey || isRecentEscape())) {
-                // Alt+u or Escape+u: Uppercase word forward
-                lastEscapeTime = 0;
-                e.preventDefault();
-                transformWordForward('uppercase');
-            } else if (e.key === 'd' && (e.altKey || isRecentEscape())) {
-                // Alt+d or Escape+d: Delete word forward
-                lastEscapeTime = 0;
-                e.preventDefault();
-                deleteWordForward();
-            } else if (e.key === ' ' && isRecentEscape()) {
-                // Esc+Space: Collapse spaces
-                lastEscapeTime = 0;
-                e.preventDefault();
-                collapseSpaces();
-            } else if (e.key === '-' && isRecentEscape()) {
-                // Esc+-: Goto matching bracket
-                lastEscapeTime = 0;
-                e.preventDefault();
-                gotoMatchingBracket();
-            } else if ((e.key === '.' || e.key === '_') && (e.altKey || isRecentEscape())) {
-                // Esc+. / Esc+_: Insert last argument from previous history
-                lastEscapeTime = 0;
-                e.preventDefault();
-                lastArgument();
-            } else if (e.key === 'p' && (e.altKey || isRecentEscape())) {
-                // Esc+p: History search backward
-                lastEscapeTime = 0;
-                e.preventDefault();
-                historySearchBackward();
-                return; // Don't clear search state
-            } else if (e.key === 'n' && (e.altKey || isRecentEscape())) {
-                // Esc+n: History search forward
-                lastEscapeTime = 0;
-                e.preventDefault();
-                historySearchForward();
-                return; // Don't clear search state
-            } else if (e.key === 'Backspace' && (e.altKey || isRecentEscape())) {
-                // Esc+Backspace: Delete word back (punctuation-delimited)
-                lastEscapeTime = 0;
-                e.preventDefault();
-                backwardKillWordPunctuation();
-            } else if (e.key === 'g' && e.ctrlKey) {
-                // Ctrl+G: Bell (no-op in browser)
-                e.preventDefault();
-            } else if (e.key === 't' && e.ctrlKey) {
-                // Ctrl+T: Transpose chars
-                e.preventDefault();
-                transposeChars();
-            } else if (e.key === 'ArrowUp' && e.altKey) {
-                // Alt+Up: Increase input height
-                e.preventDefault();
-                if (inputHeight < 15) {
-                    setInputHeight(inputHeight + 1);
-                }
-            } else if (e.key === 'ArrowDown' && e.altKey) {
-                // Alt+Down: Decrease input height
-                e.preventDefault();
-                if (inputHeight > 1) {
-                    setInputHeight(inputHeight - 1);
-                }
-            } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey) {
-                // Up: configurable behavior
-                if (arrowUpDownMode === 'cycle_worlds') {
-                    e.preventDefault();
-                    requestPrevWorld();
-                } else if (arrowUpDownMode === 'command_history') {
-                    e.preventDefault();
-                    historyPrev();
-                }
-                // else: let browser handle cursor movement in multi-line input
-            } else if (e.key === 'ArrowDown' && !e.ctrlKey && !e.shiftKey && !e.altKey) {
-                // Down: configurable behavior
-                if (arrowUpDownMode === 'cycle_worlds') {
-                    e.preventDefault();
-                    requestNextWorld();
-                } else if (arrowUpDownMode === 'command_history') {
-                    e.preventDefault();
-                    historyNext();
-                }
-                // else: let browser handle cursor movement in multi-line input
-            } else if (e.key === 'ArrowUp' && e.shiftKey && !e.ctrlKey && !e.altKey) {
-                // Shift+Up: configurable behavior
-                if (shiftArrowUpDownMode === 'cycle_worlds') {
-                    e.preventDefault();
-                    requestPrevWorld();
-                } else if (shiftArrowUpDownMode === 'command_history') {
-                    e.preventDefault();
-                    historyPrev();
-                }
-                // else: let browser handle cursor movement
-            } else if (e.key === 'ArrowDown' && e.shiftKey && !e.ctrlKey && !e.altKey) {
-                // Shift+Down: configurable behavior
-                if (shiftArrowUpDownMode === 'cycle_worlds') {
-                    e.preventDefault();
-                    requestNextWorld();
-                } else if (shiftArrowUpDownMode === 'command_history') {
-                    e.preventDefault();
-                    historyNext();
-                }
-                // else: let browser handle cursor movement
-            } else if (e.key === 'p' && e.ctrlKey) {
-                // Ctrl+P: Previous command in history
-                e.preventDefault();
-                historyPrev();
-            } else if (e.key === 'n' && e.ctrlKey) {
-                // Ctrl+N: Next command in history
-                e.preventDefault();
-                historyNext();
-            } else if (e.key === 'u' && e.ctrlKey) {
-                // Ctrl+U: Clear input
-                e.preventDefault();
-                elements.input.value = '';
-                historyIndex = -1;
-            } else if (e.key === 'a' && e.ctrlKey) {
-                // Ctrl+A: Move cursor to beginning of line
-                e.preventDefault();
-                elements.input.selectionStart = elements.input.selectionEnd = 0;
-            } else if (e.key === 'e' && e.ctrlKey) {
-                // Ctrl+E: Move cursor to end of line
-                e.preventDefault();
-                const len = elements.input.value.length;
-                elements.input.selectionStart = elements.input.selectionEnd = len;
-            } else if (e.key === 'k' && e.ctrlKey) {
-                // Ctrl+K: Kill to end of line
-                e.preventDefault();
-                const pos = elements.input.selectionStart;
-                elements.input.value = elements.input.value.substring(0, pos);
-                elements.input.selectionStart = elements.input.selectionEnd = pos;
-            } else if (e.key === 'd' && e.ctrlKey) {
-                // Ctrl+D: Delete character under cursor
-                e.preventDefault();
-                const pos = elements.input.selectionStart;
-                const text = elements.input.value;
-                if (pos < text.length) {
-                    elements.input.value = text.substring(0, pos) + text.substring(pos + 1);
-                    elements.input.selectionStart = elements.input.selectionEnd = pos;
-                }
-            // Note: Ctrl+W handled by window capture-phase listener in init()
-            } else if (e.key === 'r' && e.ctrlKey) {
-                // Ctrl+R: Hot reload
-                e.preventDefault();
-                if (window.ipc && window.ipc.postMessage) {
-                    window.ipc.postMessage('reload');
-                } else {
-                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/reload' });
-                }
-            } else if (e.key === 'l' && e.ctrlKey) {
-                // Ctrl+L: Redraw screen — filter out client-generated output, keep only MUD server data
-                e.preventDefault();
-                if (worlds[currentWorldIndex]) {
-                    worlds[currentWorldIndex].output_lines = worlds[currentWorldIndex].output_lines.filter(l => l.from_server !== false);
-                    // Clear new line indicators
-                    worlds[currentWorldIndex].output_lines.forEach(l => { l.marked_new = false; });
-                    worldOutputCache[currentWorldIndex] = {};
-                }
-                renderOutput();
-            } else if (e.key === 'PageUp') {
-                // PageUp: Scroll output up (triggers pause via scroll handler)
-                e.preventDefault();
-                elements.outputContainer.scrollBy(0, -elements.outputContainer.clientHeight);
-            } else if (e.key === 'PageDown') {
-                // PageDown: Scroll output down
-                e.preventDefault();
-                elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
-                // If at bottom now, unpause or release pending (same as Tab)
-                if (isAtBottom()) {
-                    const world = worlds[currentWorldIndex];
-                    const serverPending = world ? (world.pending_count || 0) : 0;
-                    if (pendingLines.length === 0 && serverPending === 0) {
-                        paused = false;
-                        linesSincePause = 0;
-                        updateStatusBar();
-                    } else {
-                        // Release one screenful when at bottom with pending (same as Tab)
-                        releaseScreenful();
-                    }
-                }
-            } else if (e.key === 'Escape') {
-                // Track bare Escape for Escape+key sequences
+                e.stopPropagation();
+                dispatchAction(action);
+                return;
+            }
+
+            // Track bare Escape for Escape+key sequences
+            if (e.key === 'Escape') {
                 lastEscapeTime = Date.now();
             }
-            // Note: F2, F3, F4 are handled at document level (before this handler)
         });
 
         // Reset command completion state when input changes (typing, not Tab)
@@ -7671,6 +7770,10 @@
         };
         elements.setupNewLineIndicatorToggle.onclick = function() {
             setupNewLineIndicator = !setupNewLineIndicator;
+            updateSetupPopupUI();
+        };
+        elements.setupDebugToggle.onclick = function() {
+            setupDebug = !setupDebug;
             updateSetupPopupUI();
         };
         elements.setupWorldSwitchSelect.onchange = function() {

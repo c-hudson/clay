@@ -1,0 +1,1095 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clay Keybind Editor</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --editor-bg: #0e1220;
+  --editor-bg2: #141828;
+  --editor-bg3: #1a1f33;
+  --editor-bg4: #222840;
+  --editor-fg: #d0ccd6;
+  --editor-fg2: #908a9a;
+  --editor-accent: #d4845a;
+  --editor-border: #2a2f44;
+  --editor-hover: #2a3050;
+  --editor-selected: #33395a;
+  --editor-success: #7ecf8b;
+  --editor-error: #e87070;
+  --editor-warning: #e8c46a;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 13px;
+}
+
+/* Auth overlay */
+.auth-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--editor-bg);
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.auth-overlay.hidden { display: none; }
+
+.auth-box {
+  background: var(--editor-bg3);
+  border: 1px solid var(--editor-accent);
+  border-radius: 6px;
+  padding: 24px 32px;
+  min-width: 300px;
+  text-align: center;
+}
+
+.auth-box h2 {
+  color: var(--editor-accent);
+  font-size: 16px;
+  margin-bottom: 16px;
+}
+
+.auth-box input[type="password"] {
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  width: 100%;
+  border-radius: 3px;
+  margin-bottom: 12px;
+}
+
+.auth-box input[type="password"]:focus { outline: 1px solid var(--editor-accent); }
+
+.auth-error {
+  color: var(--editor-error);
+  font-size: 12px;
+  margin-bottom: 8px;
+  min-height: 16px;
+}
+
+.auth-status {
+  color: var(--editor-fg2);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+/* Toolbar */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--editor-bg2);
+  border-bottom: 1px solid var(--editor-border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.toolbar-title {
+  font-weight: bold;
+  font-size: 14px;
+  color: var(--editor-accent);
+  margin-right: 12px;
+  white-space: nowrap;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-left: 1px solid var(--editor-border);
+}
+
+.toolbar-group:first-child { border-left: none; padding-left: 0; }
+
+button {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+button:hover { background: var(--editor-hover); }
+button:active { background: var(--editor-selected); }
+
+button.primary {
+  background: #3a4a30;
+  border-color: #4a6a38;
+}
+button.primary:hover { background: #4a5a40; }
+
+button.danger {
+  background: #4a2020;
+  border-color: #6a3030;
+}
+button.danger:hover { background: #5a3030; }
+
+.unsaved-dot {
+  display: none;
+  width: 8px;
+  height: 8px;
+  background: var(--editor-warning);
+  border-radius: 50%;
+  margin-left: 4px;
+  flex-shrink: 0;
+}
+
+.unsaved-dot.visible { display: inline-block; }
+
+.save-status {
+  color: var(--editor-success);
+  font-size: 11px;
+  margin-left: 8px;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+.save-status.visible { opacity: 1; }
+
+/* Main layout */
+.main-layout {
+  display: flex;
+  height: calc(100% - 37px);
+}
+
+/* Left panel: action list */
+.action-list-panel {
+  width: 360px;
+  min-width: 280px;
+  border-right: 1px solid var(--editor-border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.action-list-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.action-list-scroll::-webkit-scrollbar { width: 6px; }
+.action-list-scroll::-webkit-scrollbar-track { background: var(--editor-bg); }
+.action-list-scroll::-webkit-scrollbar-thumb { background: var(--editor-border); border-radius: 3px; }
+
+.action-group { margin-bottom: 2px; }
+
+.action-group-header {
+  display: flex;
+  align-items: center;
+  padding: 5px 10px;
+  background: var(--editor-bg2);
+  cursor: pointer;
+  user-select: none;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  border-bottom: 1px solid var(--editor-border);
+}
+
+.action-group-header:hover { background: var(--editor-bg3); }
+
+.action-group-arrow {
+  font-size: 10px;
+  width: 14px;
+  color: var(--editor-fg2);
+  transition: transform 0.15s;
+}
+
+.action-group-arrow.collapsed { transform: rotate(-90deg); }
+
+.action-group-title {
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--editor-fg2);
+}
+
+.action-group-items { }
+.action-group-items.collapsed { display: none; }
+
+.action-item {
+  display: flex;
+  align-items: center;
+  padding: 4px 10px 4px 24px;
+  cursor: pointer;
+  gap: 8px;
+  border-left: 3px solid transparent;
+  justify-content: space-between;
+}
+
+.action-item:hover { background: var(--editor-hover); }
+.action-item.selected {
+  background: var(--editor-selected);
+  border-left-color: var(--editor-accent);
+}
+
+.action-item-name {
+  font-size: 12px;
+  color: var(--editor-fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.action-item-keys {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.key-badge {
+  display: inline-block;
+  background: var(--editor-bg4);
+  color: var(--editor-accent);
+  border: 1px solid var(--editor-border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-family: inherit;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+
+.key-badge.modified {
+  border-color: var(--editor-warning);
+  color: var(--editor-warning);
+}
+
+.key-badge.unbound {
+  border-color: transparent;
+  color: var(--editor-fg2);
+  background: transparent;
+  font-style: italic;
+}
+
+/* Right panel */
+.right-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.right-panel-content {
+  padding: 20px 24px;
+  overflow-y: auto;
+}
+
+.right-panel-content::-webkit-scrollbar { width: 6px; }
+.right-panel-content::-webkit-scrollbar-track { background: var(--editor-bg); }
+.right-panel-content::-webkit-scrollbar-thumb { background: var(--editor-border); border-radius: 3px; }
+
+.no-selection {
+  color: var(--editor-fg2);
+  font-style: italic;
+  text-align: center;
+  margin-top: 40px;
+}
+
+.detail-action-name {
+  font-size: 18px;
+  font-weight: bold;
+  color: var(--editor-fg);
+  margin-bottom: 4px;
+}
+
+.detail-action-id {
+  font-size: 11px;
+  color: var(--editor-fg2);
+  margin-bottom: 16px;
+}
+
+.detail-section {
+  margin-bottom: 20px;
+}
+
+.detail-label {
+  font-size: 11px;
+  color: var(--editor-fg2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+.detail-keys-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.detail-key-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detail-key-badge {
+  display: inline-block;
+  background: var(--editor-bg4);
+  color: var(--editor-accent);
+  border: 1px solid var(--editor-border);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  min-width: 60px;
+  text-align: center;
+}
+
+.detail-key-badge.modified {
+  border-color: var(--editor-warning);
+  color: var(--editor-warning);
+}
+
+.detail-key-badge.default-key {
+  border-color: var(--editor-fg2);
+  opacity: 0.6;
+}
+
+.detail-key-remove {
+  background: none;
+  border: none;
+  color: var(--editor-fg2);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+.detail-key-remove:hover { color: var(--editor-error); background: rgba(232,112,112,0.1); }
+
+.detail-key-default-label {
+  font-size: 10px;
+  color: var(--editor-fg2);
+  font-style: italic;
+}
+
+/* Key capture */
+.capture-area {
+  position: relative;
+}
+
+.capture-btn {
+  background: var(--editor-bg3);
+  color: var(--editor-fg2);
+  border: 2px dashed var(--editor-border);
+  border-radius: 6px;
+  padding: 12px 20px;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  width: 100%;
+  text-align: center;
+  transition: all 0.2s;
+}
+
+.capture-btn:hover {
+  border-color: var(--editor-accent);
+  color: var(--editor-fg);
+  background: var(--editor-hover);
+}
+
+.capture-btn.active {
+  border-color: var(--editor-accent);
+  border-style: solid;
+  color: var(--editor-accent);
+  background: rgba(212,132,90,0.08);
+  animation: capture-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes capture-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(212,132,90,0.2); }
+  50% { box-shadow: 0 0 0 6px rgba(212,132,90,0); }
+}
+
+.conflict-warning {
+  background: rgba(232,196,106,0.08);
+  border: 1px solid rgba(232,196,106,0.3);
+  border-radius: 4px;
+  padding: 8px 12px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--editor-warning);
+  display: none;
+}
+
+.conflict-warning.visible { display: block; }
+
+.conflict-action-name {
+  font-weight: bold;
+  color: var(--editor-fg);
+}
+
+.detail-buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+</style>
+</head>
+<body>
+
+<!-- Auth overlay -->
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-box">
+    <h2>Clay Keybind Editor</h2>
+    <div class="auth-error" id="authError"></div>
+    <input type="password" id="authPassword" placeholder="Server password" autocomplete="off">
+    <div class="auth-status" id="authStatus">Connecting...</div>
+  </div>
+</div>
+
+<!-- Main editor (hidden until auth) -->
+<div id="editorMain" style="display:none; flex-direction:column; height:100%;">
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <div class="toolbar-group">
+      <span class="toolbar-title">Clay Keybind Editor</span>
+      <span class="unsaved-dot" id="unsavedDot"></span>
+    </div>
+    <div class="toolbar-group">
+      <button class="primary" onclick="doSave()">Save</button>
+      <button onclick="doCancel()">Cancel</button>
+      <button class="danger" onclick="doResetDefaults()">Reset Defaults</button>
+      <span class="save-status" id="saveStatus"></span>
+    </div>
+  </div>
+
+  <!-- Main layout -->
+  <div class="main-layout">
+    <!-- Left: action list -->
+    <div class="action-list-panel">
+      <div class="action-list-scroll" id="actionList"></div>
+    </div>
+
+    <!-- Right: detail editor -->
+    <div class="right-panel">
+      <div class="right-panel-content" id="detailPanel">
+        <div class="no-selection">Select an action to edit its keybinding</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// State
+let ws = null;
+let bindings = {};       // current: key -> action_id
+let defaults = {};       // TF defaults: key -> action_id
+let actions = [];         // [{id, name, category}]
+let savedSnapshot = '';   // JSON.stringify of bindings at last save
+let selectedAction = null;
+let capturing = false;
+let lastEscapeTime = 0;
+let pendingCapture = null; // {key, conflictAction} awaiting confirmation
+let saveStatusTimeout = null;
+
+// WebSocket connection
+function connect() {
+  const wsHost = '{{WS_HOST}}' || window.location.hostname;
+  const wsPort = '{{WS_PORT}}' === '0' ? window.location.port : '{{WS_PORT}}';
+  const wsProto = '{{WS_PROTOCOL}}' || (window.location.protocol === 'https:' ? 'wss' : 'ws');
+  const url = wsProto + '://' + wsHost + ':' + wsPort;
+
+  document.getElementById('authStatus').textContent = 'Connecting...';
+
+  ws = new WebSocket(url);
+
+  ws.onopen = function() {
+    document.getElementById('authStatus').textContent = 'Enter password';
+    document.getElementById('authPassword').focus();
+  };
+
+  ws.onmessage = function(event) {
+    try {
+      const msg = JSON.parse(event.data);
+      handleWsMessage(msg);
+    } catch (e) { /* ignore */ }
+  };
+
+  ws.onclose = function() {
+    document.getElementById('authStatus').textContent = 'Disconnected. Refresh to reconnect.';
+  };
+
+  ws.onerror = function() {
+    document.getElementById('authStatus').textContent = 'Connection failed.';
+  };
+}
+
+function handleWsMessage(msg) {
+  switch (msg.type) {
+    case 'ServerHello':
+      break;
+
+    case 'AuthResponse':
+      if (msg.success) {
+        document.getElementById('authOverlay').classList.add('hidden');
+        document.getElementById('editorMain').style.display = 'flex';
+        wsSend({ type: 'RequestKeybindEditorState' });
+      } else {
+        document.getElementById('authError').textContent = msg.error || 'Authentication failed';
+      }
+      break;
+
+    case 'KeybindEditorState':
+      if (msg.bindings_json) bindings = JSON.parse(msg.bindings_json);
+      if (msg.defaults_json) defaults = JSON.parse(msg.defaults_json);
+      if (msg.actions_json) actions = JSON.parse(msg.actions_json);
+      savedSnapshot = JSON.stringify(bindings);
+      rebuildAll();
+      break;
+
+    case 'KeybindFileSaved':
+      if (msg.success) {
+        savedSnapshot = JSON.stringify(bindings);
+        updateUnsaved();
+        showSaveStatus('Saved');
+      } else {
+        showSaveStatus('Error: ' + (msg.error || 'unknown'));
+      }
+      break;
+
+    case 'KeybindingsUpdated':
+      if (msg.bindings_json) {
+        bindings = JSON.parse(msg.bindings_json);
+        rebuildAll();
+      }
+      break;
+
+    case 'Pong':
+      break;
+  }
+}
+
+function wsSend(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+// Auth
+async function doAuth() {
+  const password = document.getElementById('authPassword').value;
+  if (!password) return;
+  document.getElementById('authError').textContent = '';
+
+  try {
+    const hash = await hashPassword(password);
+    wsSend({ type: 'AuthRequest', password_hash: hash });
+  } catch (e) {
+    const hash = sha256Fallback(password);
+    wsSend({ type: 'AuthRequest', password_hash: hash });
+  }
+}
+
+async function hashPassword(password) {
+  if (window.crypto && window.crypto.subtle) {
+    try {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(password);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) {
+      return sha256Fallback(password);
+    }
+  }
+  return sha256Fallback(password);
+}
+
+function sha256Fallback(message) {
+  const utf8 = unescape(encodeURIComponent(message));
+  const bytes = [];
+  for (let i = 0; i < utf8.length; i++) bytes.push(utf8.charCodeAt(i));
+  const K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+  let H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  const l = bytes.length;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  const bitLen = l * 8;
+  for (let i = 56; i >= 0; i -= 8) bytes.push((bitLen / Math.pow(2, i)) & 0xff);
+  for (let off = 0; off < bytes.length; off += 64) {
+    const W = new Array(64);
+    for (let i = 0; i < 16; i++) W[i] = (bytes[off + i * 4] << 24) | (bytes[off + i * 4 + 1] << 16) | (bytes[off + i * 4 + 2] << 8) | bytes[off + i * 4 + 3];
+    for (let i = 16; i < 64; i++) {
+      const s0 = (ror(W[i-15], 7) ^ ror(W[i-15], 18) ^ (W[i-15] >>> 3)) >>> 0;
+      const s1 = (ror(W[i-2], 17) ^ ror(W[i-2], 19) ^ (W[i-2] >>> 10)) >>> 0;
+      W[i] = (W[i-16] + s0 + W[i-7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) >>> 0;
+      const ch = ((e & f) ^ (~e & g)) >>> 0;
+      const t1 = (h + S1 + ch + K[i] + W[i]) >>> 0;
+      const S0 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) >>> 0;
+      const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H = H.map((v, i) => (v + [a, b, c, d, e, f, g, h][i]) >>> 0);
+  }
+  return H.map(v => v.toString(16).padStart(8, '0')).join('');
+  function ror(n, b) { return ((n >>> b) | (n << (32 - b))) >>> 0; }
+}
+
+// Key name conversion (matches Rust canonical format)
+function keyEventToName(e) {
+  const key = e.key;
+  const code = e.code;
+
+  // Modifier-only keys
+  if (['Control', 'Alt', 'Shift', 'Meta'].includes(key)) return null;
+
+  // Ctrl+letter
+  if (e.ctrlKey && !e.altKey && key.length === 1) {
+    return '^' + key.toUpperCase();
+  }
+
+  // Alt+letter (also handles Esc+letter via escape tracking)
+  if (e.altKey && !e.ctrlKey && key.length === 1) {
+    return 'Esc-' + key;
+  }
+
+  // Function keys
+  if (key.startsWith('F') && key.length >= 2) {
+    const n = parseInt(key.slice(1));
+    if (n >= 1 && n <= 12) return 'F' + n;
+  }
+
+  // Arrow keys with modifiers
+  const arrowMap = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right' };
+  if (arrowMap[key]) {
+    const arrow = arrowMap[key];
+    if (e.shiftKey && !e.ctrlKey && !e.altKey) return 'Shift-' + arrow;
+    if (e.ctrlKey && !e.shiftKey && !e.altKey) return 'Ctrl-' + arrow;
+    if (e.altKey && !e.ctrlKey && !e.shiftKey) return 'Alt-' + arrow;
+    return arrow;
+  }
+
+  // Special keys
+  const specialMap = {
+    PageUp: 'PageUp', PageDown: 'PageDown',
+    Home: 'Home', End: 'End',
+    Insert: 'Insert', Delete: 'Delete',
+    Backspace: e.altKey ? 'Esc-Backspace' : 'Backspace',
+    Tab: 'Tab', Enter: 'Enter', Escape: 'Escape',
+    ' ': e.ctrlKey ? '^Space' : (e.altKey ? 'Esc-Space' : null),
+  };
+  if (specialMap[key] !== undefined) return specialMap[key];
+
+  // Ctrl+special
+  if (e.ctrlKey) {
+    if (key === 'a' || key === 'A') return '^A';
+    // Generic ctrl+letter
+    if (key.length === 1 && key.match(/[a-zA-Z]/)) return '^' + key.toUpperCase();
+  }
+
+  return null;
+}
+
+// Escape sequence tracking for terminals
+function handleEscapeSequence(e) {
+  const now = Date.now();
+  if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    lastEscapeTime = now;
+    return null; // Don't capture bare Escape yet
+  }
+
+  // Check if this follows a recent Escape
+  if (now - lastEscapeTime < 500 && lastEscapeTime > 0) {
+    lastEscapeTime = 0;
+    if (e.key.length === 1 && !e.ctrlKey && !e.altKey) {
+      if (e.key === ' ') return 'Esc-Space';
+      if (e.key === '-') return 'Esc--';
+      if (e.key === '.') return 'Esc-.';
+      if (e.key === '_') return 'Esc-_';
+      return 'Esc-' + e.key;
+    }
+    if (e.key === 'Backspace') return 'Esc-Backspace';
+  }
+
+  return keyEventToName(e);
+}
+
+// Get all keys bound to an action
+function keysForAction(actionId) {
+  const keys = [];
+  for (const [key, aid] of Object.entries(bindings)) {
+    if (aid === actionId) keys.push(key);
+  }
+  return keys.sort();
+}
+
+// Get default keys for an action
+function defaultKeysForAction(actionId) {
+  const keys = [];
+  for (const [key, aid] of Object.entries(defaults)) {
+    if (aid === actionId) keys.push(key);
+  }
+  return keys.sort();
+}
+
+// Find which action a key is bound to
+function actionForKey(keyName) {
+  return bindings[keyName] || null;
+}
+
+// Check if a binding differs from default
+function isModified(keyName) {
+  return defaults[keyName] !== bindings[keyName];
+}
+
+// Rebuild everything
+function rebuildAll() {
+  rebuildActionList();
+  rebuildDetail();
+  updateUnsaved();
+}
+
+// Rebuild left panel
+function rebuildActionList() {
+  const container = document.getElementById('actionList');
+  container.innerHTML = '';
+
+  const categories = {};
+  for (const action of actions) {
+    if (!categories[action.category]) categories[action.category] = [];
+    categories[action.category].push(action);
+  }
+
+  const order = ['Cursor', 'Editing', 'History', 'Scrollback', 'World', 'System', 'Clay'];
+  for (const cat of order) {
+    if (!categories[cat]) continue;
+    const group = document.createElement('div');
+    group.className = 'action-group';
+
+    const header = document.createElement('div');
+    header.className = 'action-group-header';
+    header.innerHTML = '<span class="action-group-arrow">&#9660;</span><span class="action-group-title">' + cat + '</span>';
+
+    const items = document.createElement('div');
+    items.className = 'action-group-items';
+
+    header.onclick = function() {
+      items.classList.toggle('collapsed');
+      header.querySelector('.action-group-arrow').classList.toggle('collapsed');
+    };
+
+    for (const action of categories[cat]) {
+      const item = document.createElement('div');
+      item.className = 'action-item' + (selectedAction === action.id ? ' selected' : '');
+      item.dataset.actionId = action.id;
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'action-item-name';
+      nameSpan.textContent = action.name;
+
+      const keysDiv = document.createElement('span');
+      keysDiv.className = 'action-item-keys';
+
+      const keys = keysForAction(action.id);
+      if (keys.length === 0) {
+        const badge = document.createElement('span');
+        badge.className = 'key-badge unbound';
+        badge.textContent = 'unbound';
+        keysDiv.appendChild(badge);
+      } else {
+        for (const k of keys) {
+          const badge = document.createElement('span');
+          badge.className = 'key-badge' + (isModified(k) ? ' modified' : '');
+          badge.textContent = k;
+          keysDiv.appendChild(badge);
+        }
+      }
+
+      item.appendChild(nameSpan);
+      item.appendChild(keysDiv);
+      item.onclick = function() {
+        selectedAction = action.id;
+        capturing = false;
+        pendingCapture = null;
+        rebuildAll();
+      };
+
+      items.appendChild(item);
+    }
+
+    group.appendChild(header);
+    group.appendChild(items);
+    container.appendChild(group);
+  }
+}
+
+// Rebuild right detail panel
+function rebuildDetail() {
+  const panel = document.getElementById('detailPanel');
+  if (!selectedAction) {
+    panel.innerHTML = '<div class="no-selection">Select an action to edit its keybinding</div>';
+    return;
+  }
+
+  const action = actions.find(a => a.id === selectedAction);
+  if (!action) return;
+
+  const keys = keysForAction(selectedAction);
+  const defKeys = defaultKeysForAction(selectedAction);
+
+  let html = '';
+  html += '<div class="detail-action-name">' + esc(action.name) + '</div>';
+  html += '<div class="detail-action-id">' + esc(action.id) + ' &middot; ' + esc(action.category) + '</div>';
+
+  // Current bindings
+  html += '<div class="detail-section">';
+  html += '<div class="detail-label">Current Bindings</div>';
+  html += '<div class="detail-keys-list">';
+  if (keys.length === 0) {
+    html += '<div style="color:var(--editor-fg2);font-style:italic;font-size:12px;">No keys bound</div>';
+  } else {
+    for (const k of keys) {
+      const isDef = defKeys.includes(k);
+      const isMod = isModified(k);
+      html += '<div class="detail-key-row">';
+      html += '<span class="detail-key-badge' + (isMod ? ' modified' : '') + '">' + esc(k) + '</span>';
+      if (isDef) html += '<span class="detail-key-default-label">default</span>';
+      html += '<button class="detail-key-remove" onclick="removeBinding(\'' + escAttr(k) + '\')" title="Remove binding">&times;</button>';
+      html += '</div>';
+    }
+  }
+  html += '</div>';
+
+  // Default bindings info
+  if (defKeys.length > 0) {
+    const diff = defKeys.filter(k => !keys.includes(k));
+    if (diff.length > 0) {
+      html += '<div style="font-size:11px;color:var(--editor-fg2);margin-bottom:12px;">Default: ' + diff.map(k => '<span class="key-badge" style="opacity:0.5">' + esc(k) + '</span>').join(' ') + ' (removed)</div>';
+    }
+  }
+  html += '</div>';
+
+  // Capture area
+  html += '<div class="detail-section">';
+  html += '<div class="detail-label">Add Binding</div>';
+  html += '<div class="capture-area">';
+  html += '<button class="capture-btn' + (capturing ? ' active' : '') + '" id="captureBtn" onclick="toggleCapture()">';
+  html += capturing ? 'Press a key combination...' : 'Click to capture key';
+  html += '</button>';
+  html += '<div class="conflict-warning" id="conflictWarning"></div>';
+  html += '</div>';
+  html += '</div>';
+
+  // Action buttons
+  html += '<div class="detail-buttons">';
+  html += '<button onclick="resetActionToDefault()">Reset to Default</button>';
+  html += '<button onclick="clearAllBindings()">Clear All Bindings</button>';
+  html += '</div>';
+
+  panel.innerHTML = html;
+}
+
+function esc(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function escAttr(s) {
+  return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+// Binding operations
+function removeBinding(keyName) {
+  if (bindings[keyName]) {
+    delete bindings[keyName];
+    sendBindingsUpdate();
+    rebuildAll();
+  }
+}
+
+function resetActionToDefault() {
+  if (!selectedAction) return;
+  // Remove all current bindings for this action
+  for (const key of Object.keys(bindings)) {
+    if (bindings[key] === selectedAction) delete bindings[key];
+  }
+  // Restore default bindings for this action
+  for (const [key, aid] of Object.entries(defaults)) {
+    if (aid === selectedAction) {
+      bindings[key] = aid;
+    }
+  }
+  sendBindingsUpdate();
+  rebuildAll();
+}
+
+function clearAllBindings() {
+  if (!selectedAction) return;
+  for (const key of Object.keys(bindings)) {
+    if (bindings[key] === selectedAction) delete bindings[key];
+  }
+  sendBindingsUpdate();
+  rebuildAll();
+}
+
+function toggleCapture() {
+  capturing = !capturing;
+  pendingCapture = null;
+  rebuildDetail();
+  if (capturing) {
+    // Focus the button for key capture
+    setTimeout(() => {
+      const btn = document.getElementById('captureBtn');
+      if (btn) btn.focus();
+    }, 10);
+  }
+}
+
+function applyCapture(keyName) {
+  if (!selectedAction) return;
+
+  // Check for conflict
+  const existing = actionForKey(keyName);
+  if (existing && existing !== selectedAction) {
+    // Show conflict warning
+    const conflictAction = actions.find(a => a.id === existing);
+    const warning = document.getElementById('conflictWarning');
+    if (warning) {
+      warning.className = 'conflict-warning visible';
+      warning.innerHTML = '<strong>' + esc(keyName) + '</strong> is currently bound to <span class="conflict-action-name">' + esc(conflictAction ? conflictAction.name : existing) + '</span>. <button onclick="confirmReassign(\'' + escAttr(keyName) + '\')" style="margin-left:8px;">Reassign</button> <button onclick="cancelCapture()">Cancel</button>';
+      pendingCapture = { key: keyName };
+      return;
+    }
+  }
+
+  // No conflict - apply directly
+  bindings[keyName] = selectedAction;
+  capturing = false;
+  pendingCapture = null;
+  sendBindingsUpdate();
+  rebuildAll();
+}
+
+function confirmReassign(keyName) {
+  if (!selectedAction) return;
+  bindings[keyName] = selectedAction;
+  capturing = false;
+  pendingCapture = null;
+  sendBindingsUpdate();
+  rebuildAll();
+}
+
+function cancelCapture() {
+  pendingCapture = null;
+  const warning = document.getElementById('conflictWarning');
+  if (warning) warning.className = 'conflict-warning';
+}
+
+function sendBindingsUpdate() {
+  wsSend({ type: 'UpdateKeybindEditorBindings', bindings_json: JSON.stringify(bindings) });
+  updateUnsaved();
+}
+
+// Unsaved tracking
+function updateUnsaved() {
+  const isUnsaved = JSON.stringify(bindings) !== savedSnapshot;
+  document.getElementById('unsavedDot').className = 'unsaved-dot' + (isUnsaved ? ' visible' : '');
+}
+
+function showSaveStatus(text) {
+  const el = document.getElementById('saveStatus');
+  el.textContent = text;
+  el.classList.add('visible');
+  if (saveStatusTimeout) clearTimeout(saveStatusTimeout);
+  saveStatusTimeout = setTimeout(() => el.classList.remove('visible'), 2000);
+}
+
+// Toolbar actions
+function doSave() {
+  wsSend({ type: 'SaveKeybindFile' });
+}
+
+function doCancel() {
+  bindings = JSON.parse(savedSnapshot);
+  sendBindingsUpdate();
+  rebuildAll();
+  showSaveStatus('Reverted');
+}
+
+function doResetDefaults() {
+  if (!confirm('Reset all keybindings to TinyFugue defaults?')) return;
+  wsSend({ type: 'ResetKeybindDefaults' });
+}
+
+// Global key handler for capture mode
+document.addEventListener('keydown', function(e) {
+  // Auth password entry
+  if (!document.getElementById('authOverlay').classList.contains('hidden')) {
+    if (e.key === 'Enter') doAuth();
+    return;
+  }
+
+  // Capture mode
+  if (capturing && selectedAction) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const name = handleEscapeSequence(e);
+    if (name) {
+      applyCapture(name);
+    }
+    return;
+  }
+});
+
+// Beforeunload warning
+window.addEventListener('beforeunload', function(e) {
+  if (JSON.stringify(bindings) !== savedSnapshot) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// Keepalive
+setInterval(function() {
+  wsSend({ type: 'Ping' });
+}, 30000);
+
+// Init
+connect();
+</script>
+</body>
+</html>

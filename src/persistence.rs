@@ -1116,7 +1116,7 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(not(target_os = "android"))]
 pub fn save_reload_state(app: &App) -> io::Result<()> {
     let path = get_reload_state_path();
     let mut file = std::fs::File::create(&path)?;
