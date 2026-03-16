@@ -119,6 +119,18 @@ html, body {
 
 .toolbar-group:first-child { border-left: none; padding-left: 0; }
 
+.back-btn {
+  background: none;
+  border: 1px solid var(--editor-border);
+  color: var(--editor-fg2);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  margin-right: 4px;
+}
+.back-btn:hover { color: var(--editor-accent); border-color: var(--editor-accent); }
+
 button {
   background: var(--editor-bg3);
   color: var(--editor-fg);
@@ -471,6 +483,7 @@ button.danger:hover { background: #5a3030; }
 <div id="editorMain" style="display:none; flex-direction:column; height:100%;">
   <!-- Toolbar -->
   <div class="toolbar">
+    <button class="back-btn" id="backBtn" style="display:none" onclick="window.close()">&larr; Back</button>
     <div class="toolbar-group">
       <span class="toolbar-title">Clay Keybind Editor</span>
       <span class="unsaved-dot" id="unsavedDot"></span>
@@ -1089,6 +1102,7 @@ setInterval(function() {
 }, 30000);
 
 // Init
+if (window.opener) document.getElementById('backBtn').style.display = '';
 connect();
 </script>
 </body>

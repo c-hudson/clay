@@ -1574,6 +1574,29 @@ impl PopupState {
         }
     }
 
+    /// Scroll the first scrollable content field up (regardless of selection)
+    pub fn scroll_content_up(&mut self, amount: usize) {
+        for field in &mut self.definition.fields {
+            if let FieldKind::ScrollableContent { ref mut scroll_offset, .. } = field.kind {
+                *scroll_offset = scroll_offset.saturating_sub(amount);
+                return;
+            }
+        }
+    }
+
+    /// Scroll the first scrollable content field down (regardless of selection)
+    pub fn scroll_content_down(&mut self, amount: usize) {
+        let actual_height = self.actual_content_height;
+        for field in &mut self.definition.fields {
+            if let FieldKind::ScrollableContent { ref lines, ref mut scroll_offset, ref visible_height } = field.kind {
+                let effective_height = actual_height.unwrap_or(*visible_height);
+                let max_scroll = lines.len().saturating_sub(effective_height);
+                *scroll_offset = (*scroll_offset + amount).min(max_scroll);
+                return;
+            }
+        }
+    }
+
     /// Scroll to the beginning of the selected scrollable field
     pub fn scroll_to_top(&mut self) {
         if let Some(field) = self.selected_field_mut() {

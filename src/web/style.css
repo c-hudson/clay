@@ -2059,10 +2059,62 @@ body.device-phone #output-container { padding: 6px 10px; }
 .help-content {
     max-height: 60vh;
     overflow-y: auto;
-    white-space: pre;
+    white-space: normal;
     line-height: 1.4;
     padding: 4px 0;
     color: var(--text-color);
+}
+
+.help-table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+}
+
+.help-table td {
+    padding: 1px 4px;
+    vertical-align: top;
+}
+
+.help-section-heading {
+    font-weight: bold;
+    color: var(--theme-separator-text, #fff);
+    padding-top: 4px !important;
+    white-space: nowrap;
+}
+
+.help-note {
+    font-weight: normal;
+    color: var(--theme-separator-dim, #666);
+    font-size: 0.9em;
+}
+
+.help-sub-heading {
+    color: var(--theme-prompt, #0cc);
+    padding-left: 8px !important;
+    padding-top: 2px !important;
+}
+
+.help-left {
+    white-space: nowrap;
+    padding-left: 16px !important;
+    color: var(--theme-separator-text, #ddd);
+    width: 1%;
+}
+
+.help-right {
+    text-align: left;
+    color: var(--theme-separator-dim, #999);
+    padding-left: 24px !important;
+}
+
+.help-content a {
+    color: var(--theme-prompt, #0cc);
+    text-decoration: underline;
+}
+
+.help-content a:hover {
+    color: #fff;
 }
 
 /* Slider (kept for compatibility) */

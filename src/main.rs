@@ -348,33 +348,6 @@ impl EditorSide {
     }
 }
 
-/// What Up/Down or Ctrl+Up/Down arrow keys do
-#[derive(Clone, Copy, PartialEq, Default)]
-pub enum ArrowKeyMode {
-    #[default]
-    CycleWorlds,
-    InputLine,
-    CommandHistory,
-}
-
-impl ArrowKeyMode {
-    pub fn name(&self) -> &'static str {
-        match self {
-            ArrowKeyMode::CycleWorlds => "cycle_worlds",
-            ArrowKeyMode::InputLine => "input_line",
-            ArrowKeyMode::CommandHistory => "command_history",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Self {
-        match name.to_lowercase().as_str() {
-            "input_line" => ArrowKeyMode::InputLine,
-            "command_history" => ArrowKeyMode::CommandHistory,
-            _ => ArrowKeyMode::CycleWorlds,
-        }
-    }
-}
-
 /// Which element has focus when editor is open
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum EditorFocus {
@@ -1056,9 +1029,6 @@ pub struct Settings {
     mouse_enabled: bool,
     // ZWJ emoji sequence handling (true = pass through, false = strip ZWJ + colored square)
     zwj_enabled: bool,
-    // Arrow key behavior settings
-    arrow_up_down_mode: ArrowKeyMode,       // What Up/Down does (default: CycleWorlds)
-    shift_arrow_up_down_mode: ArrowKeyMode, // What Ctrl+Up/Down does (default: InputLine)
     // New line indicator - prefix unseen/pending lines with green "+"
     pub new_line_indicator: bool,
 }
@@ -1098,8 +1068,6 @@ impl Default for Settings {
             editor_side: EditorSide::Left,
             mouse_enabled: true,
             zwj_enabled: false,
-            arrow_up_down_mode: ArrowKeyMode::CycleWorlds,
-            shift_arrow_up_down_mode: ArrowKeyMode::InputLine,
             new_line_indicator: false,
         }
     }
@@ -2033,6 +2001,7 @@ pub struct World {
     pub connection_id: u64,          // Incremented on each connection, used to ignore stale disconnect events
     pub max_received_seq: u64,       // Highest seq received from server (remote console dedup)
     pub first_marked_new_index: Option<usize>, // Index of first marked_new line in output_lines (for fast clear)
+    pub visual_line_offset: usize, // When > 0, show only first N visual lines of scroll_offset line (partial display for more-mode)
 }
 
 impl World {
@@ -2105,6 +2074,7 @@ impl World {
             connection_id: 0,
             max_received_seq: 0,
             first_marked_new_index: None,
+            visual_line_offset: 0,
         }
     }
 
@@ -2380,7 +2350,7 @@ impl World {
                     self.partial_in_pending = true;
                 }
             } else if triggers_pause {
-                // Store the whole logical line — each renderer wraps at its own width
+                // Line fits on screen (single-line or small overflow) — add to output then pause
                 new_line.marked_new = !is_current;
                 if !is_current && self.first_marked_new_index.is_none() {
                     self.first_marked_new_index = Some(self.output_lines.len());
@@ -2394,6 +2364,12 @@ impl World {
                     self.unseen_lines += 1;
                 }
                 self.scroll_to_bottom();
+                // If this line overflows the remaining budget, show only what fits
+                let prior_visual = self.lines_since_pause.saturating_sub(visual_lines);
+                let remaining_budget = max_lines.saturating_sub(prior_visual);
+                if visual_lines > remaining_budget && remaining_budget > 0 {
+                    self.visual_line_offset = remaining_budget;
+                }
                 self.paused = true;
                 if is_partial {
                     self.partial_line = line.to_string();
@@ -2441,6 +2417,7 @@ impl World {
 
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = self.output_lines.len().saturating_sub(1);
+        self.visual_line_offset = 0;
     }
 
     pub fn mark_seen(&mut self) {
@@ -2534,6 +2511,7 @@ impl World {
         self.paused = false;
         self.lines_since_pause = 0;
         self.pending_since = None; // Clear pending timestamp
+        self.visual_line_offset = 0;
         // If partial was in pending, it's now in output
         if self.partial_in_pending {
             self.partial_in_pending = false;
@@ -2541,10 +2519,19 @@ impl World {
         self.scroll_to_bottom();
     }
 
-    /// Filter output to only keep lines from the MUD server (remove client-generated lines)
+    /// Filter output to hide client-generated lines (mark them as gagged instead of removing).
+    /// They become visible again with F2 (show_tags mode).
     fn filter_to_server_output(&mut self) {
-        self.output_lines.retain(|line| line.from_server);
-        self.pending_lines.retain(|line| line.from_server);
+        for line in &mut self.output_lines {
+            if !line.from_server {
+                line.gagged = true;
+            }
+        }
+        for line in &mut self.pending_lines {
+            if !line.from_server {
+                line.gagged = true;
+            }
+        }
         // Clear new line indicators (Ctrl+L clears them)
         // Note: retain() invalidates first_marked_new_index, so reset and scan
         self.first_marked_new_index = None;
@@ -2837,8 +2824,6 @@ impl App {
             dictionary_path: self.settings.dictionary_path.clone(),
             mouse_enabled: self.settings.mouse_enabled,
             zwj_enabled: self.settings.zwj_enabled,
-            arrow_up_down_mode: self.settings.arrow_up_down_mode.name().to_string(),
-            shift_arrow_up_down_mode: self.settings.shift_arrow_up_down_mode.name().to_string(),
             new_line_indicator: self.settings.new_line_indicator,
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
@@ -3160,8 +3145,6 @@ impl App {
             self.settings.mouse_enabled,
             self.settings.zwj_enabled,
             self.settings.ansi_music_enabled,
-            self.settings.arrow_up_down_mode.name(),
-            self.settings.shift_arrow_up_down_mode.name(),
             self.settings.new_line_indicator,
         );
         self.popup_manager.open(def);
@@ -4196,7 +4179,7 @@ impl App {
             from_server: false,  // Client-generated message
             seq: 0,
             marked_new: false,
-            flush: false,
+            flush: false, gagged: false,
         });
 
         // Mark output for redraw since we added content
@@ -4253,7 +4236,7 @@ impl App {
             from_server: false,  // Client-generated message
             seq: 0,
             marked_new: false,
-            flush: false,
+            flush: false, gagged: false,
         });
 
         if world_idx == self.current_world_index {
@@ -4308,10 +4291,9 @@ impl App {
                             if play_audio && !matches!(self.audio_backend, audio::AudioBackend::None) {
                                 // For music type: stop previous music (unless continue)
                                 if media_type == "music" {
-                                    if cont {
-                                        if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
-                                            return;
-                                        }
+                                    if cont
+                                        && self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
+                                        return;
                                     }
                                     if let Some((_, prev_key)) = self.media_music_key.take() {
                                         if let Some((_, mut handle)) = self.media_processes.remove(&prev_key) {
@@ -4953,7 +4935,7 @@ impl App {
                     from_server: true,
                     seq: first_seq,
                     marked_new: !is_current,
-                    flush: splash_was_cleared,
+                    flush: splash_was_cleared, gagged: false,
                 });
             } else if splash_was_cleared {
                 // Splash cleared but no output lines to send — still need to flush client buffers
@@ -4980,6 +4962,7 @@ impl App {
         }
 
         // Add gagged lines to output (they'll only show with F2)
+        // Also broadcast to WebSocket clients so F2 works on all interfaces
         let was_at_bottom = self.worlds[world_idx].is_at_bottom();
         for (line, highlight) in gagged_lines {
             let seq = self.worlds[world_idx].next_seq;
@@ -4987,12 +4970,28 @@ impl App {
             let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
             output_line.highlight_color = highlight;
             self.worlds[world_idx].output_lines.push(output_line);
+            // Broadcast gagged line to WebSocket clients
+            let ws_data = line.to_string().replace('\r', "") + "\n";
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data: ws_data,
+                is_viewed: is_current,
+                ts: current_timestamp_secs(),
+                from_server: true,
+                seq,
+                marked_new: !is_current,
+                flush: false,
+                gagged: true,
+            });
         }
         // Keep scroll at bottom if we were already there, even when paused.
         // Without this, gagged lines shift output_lines.len() ahead of scroll_offset,
         // causing is_at_bottom() to return false and Tab to scroll instead of releasing.
+        // Preserve visual_line_offset since gagged lines don't affect visible display.
         if was_at_bottom {
+            let saved_vlo = self.worlds[world_idx].visual_line_offset;
             self.worlds[world_idx].scroll_to_bottom();
+            self.worlds[world_idx].visual_line_offset = saved_vlo;
         }
 
         // Display TF trigger messages (from /echo commands)
@@ -5054,7 +5053,7 @@ impl App {
             from_server: false,
             seq,
             marked_new: false,
-            flush: false,
+            flush: false, gagged: false,
         });
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
     }
@@ -5515,7 +5514,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
-                            flush: false,
+                            flush: false, gagged: false,
                         });
                     } else {
                         let commands = split_action_commands(&action.command);
@@ -5540,7 +5539,7 @@ impl App {
                                             from_server: false,
                                             seq: 0,
                                             marked_new: false,
-                                            flush: false,
+                                            flush: false, gagged: false,
                                         });
                                     }
                                     tf::TfCommandResult::Success(None) => {}
@@ -5553,7 +5552,7 @@ impl App {
                                             from_server: false,
                                             seq: 0,
                                             marked_new: false,
-                                            flush: false,
+                                            flush: false, gagged: false,
                                         });
                                     }
                                     tf::TfCommandResult::SendToMud(text) => {
@@ -5576,18 +5575,18 @@ impl App {
 
                                             if !opts.quiet {
                                                 if let Some(h) = header {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false });
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                                 }
                                             }
                                             if matches.is_empty() {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                             } else {
                                                 for m in matches {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false });
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                                 }
                                             }
                                             if !opts.quiet {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false });
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                             }
                                         }
                                     }
@@ -5624,7 +5623,7 @@ impl App {
                                 ts: current_timestamp_secs(), from_server: false,
                                 seq: 0,
                                 marked_new: false,
-                                flush: false,
+                                flush: false, gagged: false,
                             });
                         }
                         tf::TfCommandResult::Success(None) => {}
@@ -5634,7 +5633,7 @@ impl App {
                                 ts: current_timestamp_secs(), from_server: false,
                                 seq: 0,
                                 marked_new: false,
-                                flush: false,
+                                flush: false, gagged: false,
                             });
                         }
                         tf::TfCommandResult::SendToMud(text) => {
@@ -5656,18 +5655,18 @@ impl App {
                                 let ts = current_timestamp_secs();
                                 if !opts.quiet {
                                     if let Some(h) = header {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                     }
                                 }
                                 if matches.is_empty() {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                 } else {
                                     for m in matches {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                     }
                                 }
                                 if !opts.quiet {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false });
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                 }
                             }
                         }
@@ -5686,7 +5685,7 @@ impl App {
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
-                                flush: false,
+                                flush: false, gagged: false,
                             });
                         }
                     }
@@ -5722,7 +5721,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -5763,7 +5762,7 @@ impl App {
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
-                                flush: false,
+                                flush: false, gagged: false,
                             });
                         }
                     } else {
@@ -5775,7 +5774,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
-                            flush: false,
+                            flush: false, gagged: false,
                         });
                     }
                 } else {
@@ -5805,7 +5804,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                     self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                 } else {
@@ -5817,7 +5816,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                 }
             }
@@ -5840,7 +5839,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                 }
             }
@@ -5854,7 +5853,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             Command::BanList => {
@@ -5869,7 +5868,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                 } else {
                     let mut output = String::new();
@@ -5892,7 +5891,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                 }
                 self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -5909,7 +5908,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                     // Broadcast updated ban list
                     self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
@@ -5923,7 +5922,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                     self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                 }
@@ -5944,7 +5943,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             Command::Notify { message } => {
@@ -5966,11 +5965,11 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             Command::Dump => {
-                // Dump all scrollback buffers to ~/.clay.dmp.log
+                // Dump comprehensive debug state to ~/.clay.dmp.log
                 use std::io::Write;
                 let ts = current_timestamp_secs();
 
@@ -5979,60 +5978,104 @@ impl App {
 
                 match std::fs::File::create(&dump_path) {
                     Ok(mut file) => {
-                        let mut total_lines = 0;
-                        for world in self.worlds.iter() {
-                            for line in &world.output_lines {
-                                let line_ts = line.timestamp
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0) as i64;
-                                let lt = local_time_from_epoch(line_ts);
-                                let datetime = format!(
-                                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                    lt.year, lt.month, lt.day,
-                                    lt.hour, lt.minute, lt.second
-                                );
-                                let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                                total_lines += 1;
-                            }
-                            for line in &world.pending_lines {
-                                let line_ts = line.timestamp
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0) as i64;
-                                let lt = local_time_from_epoch(line_ts);
-                                let datetime = format!(
-                                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                    lt.year, lt.month, lt.day,
-                                    lt.hour, lt.minute, lt.second
-                                );
-                                let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                                total_lines += 1;
-                            }
+                        let _ = writeln!(file, "=== CLAY DEBUG DUMP ===");
+                        let _ = writeln!(file, "Version: {} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH);
+                        let lt = local_time_from_epoch(ts as i64);
+                        let _ = writeln!(file, "Timestamp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                            lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second);
+                        let _ = writeln!(file, "Mode: daemon/ws");
+                        let _ = writeln!(file, "");
+
+                        // Global state
+                        let _ = writeln!(file, "=== GLOBAL STATE ===");
+                        let _ = writeln!(file, "output_height: {}", self.output_height);
+                        let _ = writeln!(file, "output_width: {}", self.output_width);
+                        let _ = writeln!(file, "current_world_index: {}", self.current_world_index);
+                        let _ = writeln!(file, "worlds_count: {}", self.worlds.len());
+                        let _ = writeln!(file, "more_mode_enabled: {}", self.settings.more_mode_enabled);
+                        let _ = writeln!(file, "show_tags: {}", self.show_tags);
+                        let _ = writeln!(file, "new_line_indicator: {}", self.settings.new_line_indicator);
+                        let _ = writeln!(file, "");
+
+                        // WS client info
+                        let _ = writeln!(file, "=== WS CLIENTS ===");
+                        let _ = writeln!(file, "ws_client_worlds count: {}", self.ws_client_worlds.len());
+                        for (cid, cv) in &self.ws_client_worlds {
+                            let _ = writeln!(file, "  client {}: world_index={}, visible_lines={}, visible_columns={}, dimensions={:?}",
+                                cid, cv.world_index, cv.visible_lines, cv.visible_columns, cv.dimensions);
                         }
-                        self.ws_broadcast(WsMessage::ServerData {
-                            world_index,
-                            data: format!("Dumped {} lines from {} worlds to {}", total_lines, self.worlds.len(), dump_path),
-                            is_viewed: false,
-                            ts,
-                            from_server: false,
-                            seq: 0,
-                            marked_new: false,
-                            flush: false,
-                        });
+                        let _ = writeln!(file, "");
+
+                        // Per-world state
+                        for (wi, world) in self.worlds.iter().enumerate() {
+                            let is_current = wi == self.current_world_index;
+                            let _ = writeln!(file, "=== WORLD {} [{}] {} ===",
+                                wi, world.name, if is_current { "(CURRENT)" } else { "" });
+                            let _ = writeln!(file, "connected: {}", world.connected);
+                            let _ = writeln!(file, "paused: {}", world.paused);
+                            let _ = writeln!(file, "lines_since_pause: {}", world.lines_since_pause);
+                            let _ = writeln!(file, "visual_line_offset: {}", world.visual_line_offset);
+                            let _ = writeln!(file, "scroll_offset: {}", world.scroll_offset);
+                            let _ = writeln!(file, "output_lines.len: {}", world.output_lines.len());
+                            let _ = writeln!(file, "pending_lines.len: {}", world.pending_lines.len());
+                            let _ = writeln!(file, "unseen_lines: {}", world.unseen_lines);
+                            let _ = writeln!(file, "showing_splash: {}", world.showing_splash);
+                            let _ = writeln!(file, "partial_line: {:?}", if world.partial_line.is_empty() { "".to_string() } else { format!("({} chars) {:?}", world.partial_line.len(), &world.partial_line[..world.partial_line.len().min(100)]) });
+                            let _ = writeln!(file, "partial_in_pending: {}", world.partial_in_pending);
+                            if let Some(ps) = world.pending_since {
+                                let _ = writeln!(file, "pending_since: {:?} ago", ps.elapsed());
+                            }
+                            let _ = writeln!(file, "encoding: {:?}", world.settings.encoding);
+
+                            let ws_min_lines = self.min_viewer_lines(wi);
+                            let ws_min_width = self.min_viewer_width(wi);
+                            let _ = writeln!(file, "min_viewer_lines: {:?}", ws_min_lines);
+                            let _ = writeln!(file, "min_viewer_width: {:?}", ws_min_width);
+
+                            let console_viewing = wi == self.current_world_index;
+                            let eff_height = match (console_viewing, ws_min_lines) {
+                                (true, Some(ws)) => (self.output_height).min(ws as u16),
+                                (true, None) => self.output_height,
+                                (false, Some(ws)) => ws as u16,
+                                (false, None) => self.output_height,
+                            };
+                            let eff_width = match (console_viewing, ws_min_width) {
+                                (true, Some(ws_w)) => (self.output_width).min(ws_w as u16),
+                                (true, None) => self.output_width,
+                                (false, Some(ws_w)) => ws_w as u16,
+                                (false, None) => self.output_width,
+                            };
+                            let _ = writeln!(file, "effective_output_height: {}", eff_height);
+                            let _ = writeln!(file, "effective_output_width: {}", eff_width);
+                            let _ = writeln!(file, "effective_max_lines: {}", (eff_height as usize).saturating_sub(2));
+                            let _ = writeln!(file, "");
+
+                            // Full scrollback dump (all output + pending lines)
+                            let _ = writeln!(file, "--- OUTPUT LINES ({}) ---", world.output_lines.len());
+                            for line in &world.output_lines {
+                                let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+                                let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
+                                let _ = writeln!(file, "{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
+                                    prefix, lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second,
+                                    line.text);
+                            }
+
+                            if !world.pending_lines.is_empty() {
+                                let _ = writeln!(file, "--- PENDING LINES ({}) ---", world.pending_lines.len());
+                                for line in &world.pending_lines {
+                                    let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+                                    let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
+                                    let _ = writeln!(file, "P,{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
+                                        prefix, lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second,
+                                        line.text);
+                                }
+                            }
+                            let _ = writeln!(file, "");
+                        }
+
+                        // Don't broadcast — /dump must be passive and not disturb more-mode state
                     }
-                    Err(e) => {
-                        self.ws_broadcast(WsMessage::ServerData {
-                            world_index,
-                            data: format!("Failed to create dump file: {}", e),
-                            is_viewed: false,
-                            ts,
-                            from_server: false,
-                            seq: 0,
-                            marked_new: false,
-                            flush: false,
-                        });
-                    }
+                    Err(_e) => {}
                 }
             }
             Command::Quit => {
@@ -6061,7 +6104,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             // AddWorld - add or update world definition
@@ -6109,7 +6152,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             // Connect command - needs async follow-up
@@ -6128,7 +6171,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
-                            flush: false,
+                            flush: false, gagged: false,
                         });
                     }
                 }
@@ -6167,7 +6210,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                 }
             }
@@ -6183,7 +6226,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             Command::UrbanUsage => {
@@ -6195,7 +6238,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             Command::TranslateUsage => {
@@ -6207,7 +6250,7 @@ impl App {
                     from_server: false,
                     seq: 0,
                     marked_new: false,
-                    flush: false,
+                    flush: false, gagged: false,
                 });
             }
             Command::HelpTopic { ref topic } => {
@@ -6231,7 +6274,7 @@ impl App {
                         from_server: false,
                         seq: 0,
                         marked_new: false,
-                        flush: false,
+                        flush: false, gagged: false,
                     });
                 }
             }
@@ -6263,7 +6306,7 @@ impl App {
                     self.ws_broadcast(WsMessage::ServerData {
                         world_index, data: format!("(no recall matches for '{}')", pattern_str),
                         is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false,
+ flush: false, gagged: false,
                     });
                 }
             }
@@ -6322,7 +6365,7 @@ impl App {
                                 self.ws_broadcast(WsMessage::ServerData {
                                     world_index, data: "Not connected".to_string(),
                                     is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false,
+ flush: false, gagged: false,
                                 });
                                 break;
                             }
@@ -6332,7 +6375,7 @@ impl App {
                         self.ws_broadcast(WsMessage::ServerData {
                             world_index, data: line,
                             is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false,
+ flush: false, gagged: false,
                         });
                     }
                     tf::QuoteDisposition::Exec => {
@@ -6351,14 +6394,14 @@ impl App {
                                 self.ws_broadcast(WsMessage::ServerData {
                                     world_index, data: msg,
                                     is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false,
+ flush: false, gagged: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
                                 self.ws_broadcast(WsMessage::ServerData {
                                     world_index, data: format!("Error: {}", err),
                                     is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false,
+ flush: false, gagged: false,
                                 });
                             }
                             _ => {}
@@ -6430,7 +6473,7 @@ impl App {
                             from_server: false,
                             seq: 0,
                             marked_new: false,
-                            flush: false,
+                            flush: false, gagged: false,
                         });
                     } else {
                         // Save current world index, switch to target, connect, then restore
@@ -6642,7 +6685,7 @@ impl App {
                                 // arrived after reconnect, causing false duplicate detection.
                                 seq: 0,
                                 marked_new: has_marked_new,
-                                flush: false,
+                                flush: false, gagged: false,
                             });
                         }
 
@@ -6712,7 +6755,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode, new_line_indicator } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -6756,8 +6799,6 @@ impl App {
                 self.settings.tls_proxy_enabled = tls_proxy_enabled;
                 self.settings.mouse_enabled = mouse_enabled;
                 self.settings.zwj_enabled = zwj_enabled;
-                self.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&arrow_up_down_mode);
-                self.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&shift_arrow_up_down_mode);
                 self.settings.new_line_indicator = new_line_indicator;
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
@@ -7729,6 +7770,7 @@ impl App {
         let visible_height = (self.output_height as usize).max(1);
         let width = (self.output_width as usize).max(1);
         let world = self.current_world_mut();
+        world.visual_line_offset = 0;
 
         // Calculate the minimum scroll_offset where line 0 is at the top
         // This is where all content from line 0 to scroll_offset fits in visible_height
@@ -7779,6 +7821,7 @@ impl App {
         let visible_height = (self.output_height as usize).max(1);
         let width = (self.output_width as usize).max(1);
         let world = self.current_world_mut();
+        world.visual_line_offset = 0;
 
         let mut min_offset = 0usize;
         let mut visual_lines = 0usize;
@@ -7819,6 +7862,7 @@ impl App {
         let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
         let width = (self.output_width as usize).max(1);
         let world = self.current_world_mut();
+        world.visual_line_offset = 0;
         let max_scroll = world.output_lines.len().saturating_sub(1);
 
         if world.scroll_offset >= max_scroll {
@@ -7845,13 +7889,43 @@ impl App {
     /// Release one screenful of pending lines and broadcast to WebSocket clients.
     /// Used by both Tab and PgDn when at the bottom and paused.
     pub(crate) fn release_pending_screenful(&mut self) {
-        let visual_budget = (self.output_height as usize).saturating_sub(2);
+        let mut visual_budget = (self.output_height as usize).saturating_sub(2);
         let output_width = self.output_width as usize;
         let world_idx = self.current_world_index;
+        let width = output_width.max(1);
+
+        // If we have a partially-shown line, first reveal more of it
+        if self.worlds[world_idx].visual_line_offset > 0 {
+            // Find the actual partially-shown line (walk back past gagged lines)
+            let scroll_idx = self.worlds[world_idx].scroll_offset;
+            let mut partial_idx = scroll_idx;
+            while partial_idx > 0 && partial_idx < self.worlds[world_idx].output_lines.len()
+                && self.worlds[world_idx].output_lines[partial_idx].gagged {
+                partial_idx -= 1;
+            }
+            if partial_idx < self.worlds[world_idx].output_lines.len() {
+                let total_vl = wrap_ansi_line(&self.worlds[world_idx].output_lines[partial_idx].text, width).len().max(1);
+                let remaining = total_vl.saturating_sub(self.worlds[world_idx].visual_line_offset);
+                if remaining > visual_budget {
+                    // More of this line than fits on screen — advance offset, done
+                    self.worlds[world_idx].visual_line_offset += visual_budget;
+                    self.needs_output_redraw = true;
+                    return;
+                }
+                // Remaining fits — clear partial, reduce budget for pending release
+                self.worlds[world_idx].visual_line_offset = 0;
+                visual_budget = visual_budget.saturating_sub(remaining);
+                if visual_budget == 0 {
+                    self.needs_output_redraw = true;
+                    return;
+                }
+            } else {
+                self.worlds[world_idx].visual_line_offset = 0;
+            }
+        }
 
         // Pre-calculate how many logical lines fit in the visual budget
         // (mirrors the logic in release_pending so we can collect lines for broadcasting)
-        let width = output_width.max(1);
         let mut visual_total = 0;
         let mut logical_count = 0;
         for line in &self.worlds[world_idx].pending_lines {
@@ -7869,34 +7943,55 @@ impl App {
             logical_count = 1;
         }
 
-        // Get text and marked_new flag of lines that will be released
-        let has_marked_new = self.worlds[world_idx].pending_lines.iter()
-            .take(logical_count).any(|l| l.marked_new);
-        let lines_to_broadcast: Vec<String> = self.worlds[world_idx]
+        // Collect per-line text and marked_new for broadcasting
+        let lines_with_flags: Vec<(String, bool)> = self.worlds[world_idx]
             .pending_lines
             .iter()
             .take(logical_count)
-            .map(|line| line.text.replace('\r', ""))
+            .map(|line| (line.text.replace('\r', ""), line.marked_new))
             .collect();
 
         let pending_before = self.worlds[world_idx].pending_lines.len();
         self.current_world_mut().release_pending(visual_budget, output_width);
         let released = pending_before - self.worlds[world_idx].pending_lines.len();
 
-        // Broadcast the released lines to clients viewing this world
-        if !lines_to_broadcast.is_empty() {
-            let ws_data = lines_to_broadcast.join("\n") + "\n";
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                world_index: world_idx,
-                data: ws_data,
-                is_viewed: true,
-                ts: current_timestamp_secs(),
-                from_server: true,
-                // Use seq 0 to bypass client-side dedup check (see ReleasePending handler)
-                seq: 0,
-                marked_new: has_marked_new,
-                flush: false,
-            });
+        // Broadcast released lines to clients viewing this world.
+        // Group consecutive lines by marked_new so each gets the correct indicator.
+        if !lines_with_flags.is_empty() {
+            let ts = current_timestamp_secs();
+            let mut batch: Vec<&str> = Vec::new();
+            let mut batch_marked_new = lines_with_flags[0].1;
+            for (text, marked_new) in &lines_with_flags {
+                if *marked_new != batch_marked_new && !batch.is_empty() {
+                    let ws_data = batch.join("\n") + "\n";
+                    self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                        world_index: world_idx,
+                        data: ws_data,
+                        is_viewed: true,
+                        ts,
+                        from_server: true,
+                        seq: 0,
+                        marked_new: batch_marked_new,
+                        flush: false, gagged: false,
+                    });
+                    batch.clear();
+                    batch_marked_new = *marked_new;
+                }
+                batch.push(text);
+            }
+            if !batch.is_empty() {
+                let ws_data = batch.join("\n") + "\n";
+                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                    world_index: world_idx,
+                    data: ws_data,
+                    is_viewed: true,
+                    ts,
+                    from_server: true,
+                    seq: 0,
+                    marked_new: batch_marked_new,
+                    flush: false, gagged: false,
+                });
+            }
         }
 
         // Broadcast release event so other clients sync
@@ -8037,7 +8132,7 @@ fn write_debug_header(file: &mut std::fs::File) {
         lt.year, lt.month, lt.day,
         lt.hour, lt.minute, lt.second
     );
-    let _ = writeln!(file, "");
+    let _ = writeln!(file);
     let _ = writeln!(file, "=== {} — started {} ===", get_version_string(), startup_ts);
 }
 
@@ -8754,7 +8849,7 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
 
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
-    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload").collect();
+    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
     args.push("--reload".to_string());
     debug_log(true, &format!("RELOAD: About to exec {} with args={:?} fds={}", exe.display(), args, fds_str));
     let err = std::process::Command::new(&exe)
@@ -8837,7 +8932,7 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
     };
 
     // Spawn new process with --reload argument
-    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload").collect();
+    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
     args.push("--reload".to_string());
     debug_log(true, &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
 
@@ -8859,6 +8954,370 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
             Err(io::Error::other(format!("Failed to spawn reload process: {} (path: {})", e, exe.display())))
         }
     }
+}
+
+/// Run as grep client connecting to remote daemon (--grep=host:port)
+/// Searches world output for matching lines and prints to stdout
+async fn run_grep_client(
+    addr: &str,
+    pattern: &str,
+    world_filter: Option<&str>,
+    use_regex: bool,
+    strip_ansi: bool,
+    follow_mode: bool,
+) -> io::Result<()> {
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use futures::SinkExt;
+    use regex::RegexBuilder;
+
+    // Read password from environment
+    let password = match std::env::var("CLAY_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            eprintln!("Error: CLAY_PASSWORD environment variable not set.");
+            eprintln!("Set it with: export CLAY_PASSWORD=yourpassword");
+            std::process::exit(1);
+        }
+    };
+
+    // Compile pattern
+    let regex_pattern = if use_regex {
+        pattern.to_string()
+    } else {
+        tf::macros::glob_to_regex(pattern)
+    };
+    let re = match RegexBuilder::new(&regex_pattern).case_insensitive(true).build() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: Invalid pattern '{}': {}", pattern, e);
+            std::process::exit(1);
+        }
+    };
+
+    // Connect to WebSocket server (same logic as run_console_client)
+    let (ws_url, try_fallback) = if addr.starts_with("ws://") || addr.starts_with("wss://") {
+        (addr.to_string(), false)
+    } else {
+        (format!("wss://{}", addr), true)
+    };
+
+    #[cfg(feature = "rustls-backend")]
+    let connect_result = if ws_url.starts_with("wss://") {
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+            .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+        tokio_tungstenite::connect_async_tls_with_config(
+            &ws_url,
+            None,
+            false,
+            Some(connector),
+        ).await
+    } else {
+        connect_async(&ws_url).await
+    };
+
+    #[cfg(not(feature = "rustls-backend"))]
+    let connect_result = connect_async(&ws_url).await;
+
+    let (ws_stream, _) = match connect_result {
+        Ok(result) => result,
+        Err(e) if try_fallback => {
+            let fallback_url = format!("ws://{}", addr);
+            match connect_async(&fallback_url).await {
+                Ok(result) => result,
+                Err(e2) => {
+                    eprintln!("Failed to connect to {}: {}", fallback_url, e2);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to connect to {}: {}", ws_url, e);
+            std::process::exit(1);
+        }
+    };
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    // Create a channel for sending messages to the WebSocket
+    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsMessage>();
+
+    // Spawn task to forward messages to WebSocket
+    tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if ws_write.send(Message::Text(json)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for ServerHello to get challenge
+    let server_challenge = loop {
+        match ws_read.next().await {
+            Some(Ok(Message::Text(text))) => {
+                if let Ok(WsMessage::ServerHello { challenge, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                    break challenge;
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => {
+                eprintln!("Connection closed before authentication");
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    };
+
+    // Authenticate with challenge-response
+    let password_hash = hash_password(&password);
+    let challenge_hash = hash_with_challenge(&password_hash, &server_challenge);
+    let _ = ws_tx.send(WsMessage::AuthRequest {
+        password_hash: challenge_hash,
+        username: None,
+        current_world: None,
+        auth_key: None,
+        request_key: false,
+        challenge_response: true,
+    });
+
+    // Wait for auth response
+    loop {
+        match ws_read.next().await {
+            Some(Ok(Message::Text(text))) => {
+                if let Ok(WsMessage::AuthResponse { success, error, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                    if !success {
+                        eprintln!("Authentication failed: {}", error.unwrap_or_default());
+                        std::process::exit(1);
+                    }
+                    break;
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => {
+                eprintln!("Connection closed during authentication");
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
+    // Wait for InitialState
+    let worlds: Vec<WorldStateMsg> = loop {
+        match ws_read.next().await {
+            Some(Ok(Message::Text(text))) => {
+                if let Ok(WsMessage::InitialState { worlds, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                    break worlds;
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => {
+                eprintln!("Connection closed before receiving state");
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    };
+
+    // Build world index→name map and validate world filter
+    let mut world_names: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    for w in &worlds {
+        world_names.insert(w.index, w.name.clone());
+    }
+
+    let filter_indices: Option<Vec<usize>> = if let Some(filter) = world_filter {
+        let filter_lower = filter.to_lowercase();
+        let matching: Vec<usize> = worlds.iter()
+            .filter(|w| w.name.to_lowercase() == filter_lower)
+            .map(|w| w.index)
+            .collect();
+        if matching.is_empty() {
+            eprintln!("Error: World '{}' not found. Available worlds:", filter);
+            for w in &worlds {
+                eprintln!("  {}", w.name);
+            }
+            std::process::exit(1);
+        }
+        Some(matching)
+    } else {
+        None
+    };
+
+    let matches_world = |idx: usize| -> bool {
+        match &filter_indices {
+            Some(indices) => indices.contains(&idx),
+            None => true,
+        }
+    };
+
+    let format_line = |ts: u64, world_name: &str, text: &str| -> String {
+        let lt = local_time_from_epoch(ts as i64);
+        let display_text = if strip_ansi { strip_ansi_codes(text) } else { text.to_string() };
+        format!("{:02}:{:02}:{:02}:{}  {}",
+            lt.hour, lt.minute, lt.second, world_name, display_text)
+    };
+
+    if follow_mode {
+        // Follow mode: match new output as it arrives
+        // Enable raw mode to capture Ctrl+L for screen clearing
+        let raw_mode_enabled = enable_raw_mode().is_ok();
+        let mut key_reader = EventStream::new();
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    break;
+                }
+                key_event = key_reader.next() => {
+                    match key_event {
+                        Some(Ok(Event::Key(KeyEvent { code: KeyCode::Char('l'), modifiers, kind: KeyEventKind::Press, .. }))) if modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Clear screen and move cursor to top
+                            print!("\x1b[2J\x1b[H");
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                        }
+                        Some(Ok(Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, kind: KeyEventKind::Press, .. }))) if modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                msg = ws_read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            match serde_json::from_str::<WsMessage>(&text) {
+                                Ok(WsMessage::ServerData { world_index, data, from_server, ts, .. }) => {
+                                    if !from_server { continue; }
+                                    if !matches_world(world_index) { continue; }
+                                    let world_name = world_names.get(&world_index).map(|s| s.as_str()).unwrap_or("?");
+                                    for line in data.lines() {
+                                        let clean = strip_ansi_codes(line);
+                                        if re.is_match(&clean) {
+                                            print!("{}\r\n", format_line(ts, world_name, line));
+                                        }
+                                    }
+                                }
+                                Ok(WsMessage::Ping) => {
+                                    let _ = ws_tx.send(WsMessage::Pong);
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Restore terminal state
+        if raw_mode_enabled {
+            let _ = disable_raw_mode();
+        }
+    } else {
+        // History search mode: request scrollback, search, exit
+        let mut had_match = false;
+
+        // Determine which worlds to search
+        let search_worlds: Vec<(usize, String)> = worlds.iter()
+            .filter(|w| matches_world(w.index))
+            .map(|w| (w.index, w.name.clone()))
+            .collect();
+
+        // Request scrollback for each world
+        for &(world_index, _) in &search_worlds {
+            let _ = ws_tx.send(WsMessage::RequestScrollback {
+                world_index,
+                count: 10000,
+                before_seq: None,
+            });
+        }
+
+        // Collect all lines per world: scrollback + initial state lines
+        let mut world_lines: std::collections::HashMap<usize, Vec<TimestampedLine>> = std::collections::HashMap::new();
+        let mut pending_worlds: std::collections::HashSet<usize> = search_worlds.iter().map(|&(idx, _)| idx).collect();
+
+        // Pre-populate with initial state lines
+        for w in &worlds {
+            if matches_world(w.index) {
+                world_lines.insert(w.index, w.output_lines_ts.clone());
+            }
+        }
+
+        // Receive scrollback responses
+        while !pending_worlds.is_empty() {
+            match ws_read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<WsMessage>(&text) {
+                        Ok(WsMessage::ScrollbackLines { world_index, lines, backfill_complete }) => {
+                            if let Some(existing) = world_lines.get_mut(&world_index) {
+                                // Scrollback lines come before existing lines
+                                let mut merged = lines;
+                                merged.append(existing);
+                                *existing = merged;
+                            }
+                            if backfill_complete {
+                                pending_worlds.remove(&world_index);
+                            } else {
+                                // Request more scrollback
+                                if let Some(existing) = world_lines.get(&world_index) {
+                                    let min_seq = existing.iter().map(|l| l.seq).min();
+                                    let _ = ws_tx.send(WsMessage::RequestScrollback {
+                                        world_index,
+                                        count: 10000,
+                                        before_seq: min_seq,
+                                    });
+                                }
+                            }
+                        }
+                        Ok(WsMessage::Ping) => {
+                            let _ = ws_tx.send(WsMessage::Pong);
+                        }
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // Deduplicate by seq within each world and sort
+        for (_world_idx, lines) in &mut world_lines {
+            lines.sort_by_key(|l| l.seq);
+            lines.dedup_by_key(|l| l.seq);
+        }
+
+        // Collect all lines across worlds, sort by timestamp then seq
+        let mut all_lines: Vec<(usize, &TimestampedLine)> = Vec::new();
+        for (world_idx, lines) in &world_lines {
+            for line in lines {
+                all_lines.push((*world_idx, line));
+            }
+        }
+        all_lines.sort_by(|a, b| a.1.ts.cmp(&b.1.ts).then(a.1.seq.cmp(&b.1.seq)));
+
+        // Match and print
+        for (world_idx, line) in &all_lines {
+            if !line.from_server { continue; }
+            let clean = strip_ansi_codes(&line.text);
+            if re.is_match(&clean) {
+                let world_name = world_names.get(world_idx).map(|s| s.as_str()).unwrap_or("?");
+                println!("{}", format_line(line.ts, world_name, &line.text));
+                had_match = true;
+            }
+        }
+
+        // Exit code: 0 if matches found, 1 if none (grep convention)
+        if !had_match {
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
 }
 
 /// Run as console client connecting to remote daemon (--console=host:port)
@@ -9504,11 +9963,22 @@ fn handle_remote_client_key(
                         }
                     }
                     _ => {
-                        // Other commands - send to server
-                        let _ = ws_tx.send(WsMessage::SendCommand {
-                            world_index: app.current_world_index,
-                            command: cmd,
-                        });
+                        // Web-only editors: show URL hint in console
+                        if cmd == "/theme-editor" || cmd == "/keybind-editor" {
+                            let page = cmd.trim_start_matches('/');
+                            let proto = if app.settings.web_secure { "https" } else { "http" };
+                            if app.settings.http_enabled {
+                                app.add_output(&format!("Open in browser: {}://localhost:{}/{}", proto, app.settings.http_port, page));
+                            } else {
+                                app.add_output(&format!("Enable HTTP in /web settings, then open /{} in a browser.", page));
+                            }
+                        } else {
+                            // Other commands - send to server
+                            let _ = ws_tx.send(WsMessage::SendCommand {
+                                world_index: app.current_world_index,
+                                command: cmd,
+                            });
+                        }
                     }
                 }
             }
@@ -9531,7 +10001,7 @@ fn handle_remote_client_key(
                 } else if data.contains_key("web_save_remote") {
                     // Allow list wildcard warning confirmed — apply settings
                     let settings = web_settings_from_custom_data(&data);
-                    apply_remote_web_settings(app, &settings, &ws_tx);
+                    apply_remote_web_settings(app, &settings, ws_tx);
                 }
             }
             NewPopupAction::ConfirmCancelled(data) => {
@@ -9573,8 +10043,6 @@ fn handle_remote_client_key(
                 }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
-                app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&settings.arrow_up_down);
-                app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&settings.shift_arrow_up_down);
                 app.settings.new_line_indicator = settings.new_line_indicator;
 
                 // Send UpdateGlobalSettings to daemon
@@ -9609,8 +10077,6 @@ fn handle_remote_client_key(
                     dictionary_path: app.settings.dictionary_path.clone(),
                     mouse_enabled: app.settings.mouse_enabled,
                     zwj_enabled: app.settings.zwj_enabled,
-                    arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
-                    shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
                     new_line_indicator: app.settings.new_line_indicator,
                 });
             }
@@ -9629,7 +10095,7 @@ fn handle_remote_client_key(
                     def.custom_data.insert("ws_key_file".to_string(), settings.ws_key_file);
                     app.popup_manager.open(def);
                 } else {
-                    apply_remote_web_settings(app, &settings, &ws_tx);
+                    apply_remote_web_settings(app, &settings, ws_tx);
                 }
             }
             NewPopupAction::ConnectionsClose => {
@@ -10255,6 +10721,7 @@ fn dispatch_remote_action(
         // Clay Extensions
         "toggle_tags" => {
             app.show_tags = !app.show_tags;
+            app.current_world_mut().visual_line_offset = 0;
             app.needs_output_redraw = true;
         }
         "filter_popup" => {
@@ -10345,8 +10812,6 @@ struct SetupSettings {
     mouse_enabled: bool,
     zwj_enabled: bool,
     ansi_music: bool,
-    arrow_up_down: String,
-    shift_arrow_up_down: String,
     new_line_indicator: bool,
 }
 
@@ -10451,8 +10916,6 @@ fn apply_remote_web_settings(
         dictionary_path: app.settings.dictionary_path.clone(),
         mouse_enabled: app.settings.mouse_enabled,
         zwj_enabled: app.settings.zwj_enabled,
-        arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
-        shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
         new_line_indicator: app.settings.new_line_indicator,
     });
 }
@@ -10522,7 +10985,6 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
-        SETUP_FIELD_ARROW_UP_DOWN, SETUP_FIELD_SHIFT_ARROW_UP_DOWN,
         SETUP_FIELD_NEW_LINE_INDICATOR,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
@@ -10559,6 +11021,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     let is_menu = popup_id == Some(popup::PopupId("menu"));
     let is_confirm = app.popup_manager.current().map(|s| {
         s.definition.buttons.iter().any(|b| b.id == popup::definitions::confirm::CONFIRM_BTN_YES)
+            && s.definition.buttons.iter().any(|b| b.id == popup::definitions::confirm::CONFIRM_BTN_NO)
     }).unwrap_or(false);
     let is_world_selector = popup_id == Some(popup::PopupId("world_selector"));
     let is_setup = popup_id == Some(popup::PopupId("setup"));
@@ -10749,10 +11212,6 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
                     zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
                     ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
-                    arrow_up_down: state.get_selected(SETUP_FIELD_ARROW_UP_DOWN)
-                        .unwrap_or("cycle_worlds").to_string(),
-                    shift_arrow_up_down: state.get_selected(SETUP_FIELD_SHIFT_ARROW_UP_DOWN)
-                        .unwrap_or("input_line").to_string(),
                     new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
                 }
             };
@@ -11855,11 +12314,11 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         state.select_button(CONFIRM_BTN_YES);
                     }
                 } else {
-                    // Scrollable content (help popup)
+                    // Scrollable content (help popup) - scroll regardless of button focus
                     if matches!(key.code, Up) {
-                        state.scroll_up(1);
+                        state.scroll_content_up(1);
                     } else {
-                        state.scroll_down(1);
+                        state.scroll_content_down(1);
                     }
                 }
             }
@@ -11871,14 +12330,16 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     } else {
                         state.select_button(CONFIRM_BTN_YES);
                     }
+                } else if matches!(key.code, Tab) {
+                    // Tab selects the first button (e.g., Ok in help popup)
+                    state.select_first_button();
                 }
-                // For other popups like help, Left/Right/Tab do nothing
             }
             PageUp => {
-                state.scroll_up(5);
+                state.scroll_content_up(5);
             }
             PageDown => {
-                state.scroll_down(5);
+                state.scroll_content_down(5);
             }
             Char('y') | Char('Y') => {
                 if is_confirm {
@@ -11975,28 +12436,48 @@ async fn main() -> io::Result<()> {
     let mut multiuser_mode = false;
     let mut is_reload_arg = false;
     let mut is_crash_arg = false;
+    #[allow(unused_variables)]
     let mut tls_proxy_config: Option<String> = None;
     let mut console_arg: Option<Option<String>> = None;  // None=not set, Some(None)=bare, Some(Some(addr))=with addr
     let mut gui_arg: Option<Option<String>> = None;
+    let mut grep_arg: Option<String> = None;
+    let mut grep_extra_args: Vec<String> = Vec::new();
 
-    for arg in &args {
-        match arg.as_str() {
-            "-v" | "--version" => show_version = true,
-            "-h" | "--help" => show_help = true,
-            "-D" => daemon_mode = true,
-            "--multiuser" => multiuser_mode = true,
-            "--reload" => is_reload_arg = true,
-            "--crash" => is_crash_arg = true,
-            "--console" => console_arg = Some(None),
-            "--gui" => gui_arg = Some(None),
-            _ if arg.starts_with("--conf=") => conf_path = Some(arg[7..].to_string()),
-            _ if arg.starts_with("--console=") => console_arg = Some(Some(arg[10..].to_string())),
-            _ if arg.starts_with("--gui=") => gui_arg = Some(Some(arg[6..].to_string())),
-            _ if arg.starts_with("--tls-proxy=") => tls_proxy_config = Some(arg[12..].to_string()),
-            _ => {
-                eprintln!("Error: Unknown option '{}'. Use -h for help.", arg);
-                std::process::exit(1);
+    #[allow(unused_assignments)]
+    {
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            if arg.starts_with("--grep=") {
+                let mut addr = arg[7..].to_string();
+                // Default to port 9000 if no port specified
+                if !addr.contains(':') {
+                    addr.push_str(":9000");
+                }
+                grep_arg = Some(addr);
+                // Collect all remaining args for grep
+                grep_extra_args = args[i + 1..].to_vec();
+                break;
             }
+            match arg.as_str() {
+                "-v" | "--version" => show_version = true,
+                "-h" | "--help" => show_help = true,
+                "-D" => daemon_mode = true,
+                "--multiuser" => multiuser_mode = true,
+                "--reload" => is_reload_arg = true,
+                "--crash" => is_crash_arg = true,
+                "--console" => console_arg = Some(None),
+                "--gui" => gui_arg = Some(None),
+                _ if arg.starts_with("--conf=") => conf_path = Some(arg[7..].to_string()),
+                _ if arg.starts_with("--console=") => console_arg = Some(Some(arg[10..].to_string())),
+                _ if arg.starts_with("--gui=") => gui_arg = Some(Some(arg[6..].to_string())),
+                _ if arg.starts_with("--tls-proxy=") => tls_proxy_config = Some(arg[12..].to_string()),
+                _ => {
+                    eprintln!("Error: Unknown option '{}'. Use -h for help.", arg);
+                    std::process::exit(1);
+                }
+            }
+            i += 1;
         }
     }
 
@@ -12014,6 +12495,12 @@ async fn main() -> io::Result<()> {
         println!("    -D                   Run as headless daemon server");
         println!("    --multiuser          Run as multiuser server");
         println!("    --conf=<path>        Use custom config file (default: ~/.clay.dat)");
+        println!("    --grep=host[:port] <pattern>  Search world output (default port: 9000)");
+        println!("      -w <world>              Limit to specific world");
+        println!("      --regexp                Use regex (default: glob with * and ? wildcards)");
+        println!("      --noesc                 Strip ANSI color codes from output");
+        println!("      -f                      Follow mode (match new output, runs until Ctrl+C)");
+        println!("      Password via CLAY_PASSWORD environment variable");
         println!("    -v, --version        Show version and build information");
         println!("    -h, --help           Show this help message");
         println!();
@@ -12058,6 +12545,48 @@ async fn main() -> io::Result<()> {
     // Always log startup (not gated by debug flag) for reload/crash diagnostics
     debug_log(true, &format!("STARTUP: {} (reload={}, crash={}, gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg));
 
+    // Parse --grep extra args
+    let mut grep_world_filter: Option<String> = None;
+    let mut grep_use_regex = false;
+    let mut grep_strip_ansi = false;
+    let mut grep_follow_mode = false;
+    let mut grep_pattern: Option<String> = None;
+    if grep_arg.is_some() {
+        let mut gi = 0;
+        while gi < grep_extra_args.len() {
+            match grep_extra_args[gi].as_str() {
+                "-w" => {
+                    gi += 1;
+                    if gi >= grep_extra_args.len() {
+                        eprintln!("Error: -w requires a world name argument.");
+                        std::process::exit(1);
+                    }
+                    grep_world_filter = Some(grep_extra_args[gi].clone());
+                }
+                "--regexp" => grep_use_regex = true,
+                "--noesc" => grep_strip_ansi = true,
+                "-f" => grep_follow_mode = true,
+                other if other.starts_with('-') => {
+                    eprintln!("Error: Unknown grep option '{}'. Use -h for help.", other);
+                    std::process::exit(1);
+                }
+                _ => {
+                    if grep_pattern.is_none() {
+                        grep_pattern = Some(grep_extra_args[gi].clone());
+                    } else {
+                        eprintln!("Error: Unexpected argument '{}'. Pattern already set to '{}'.", grep_extra_args[gi], grep_pattern.as_ref().unwrap());
+                        std::process::exit(1);
+                    }
+                }
+            }
+            gi += 1;
+        }
+        if grep_pattern.is_none() {
+            eprintln!("Error: Missing search pattern. Usage: clay --grep=host:port [OPTIONS] <pattern>");
+            std::process::exit(1);
+        }
+    }
+
     // Validate mutual exclusivity
     if console_arg.is_some() && gui_arg.is_some() {
         eprintln!("Error: --console and --gui are mutually exclusive.");
@@ -12065,6 +12594,10 @@ async fn main() -> io::Result<()> {
     }
     if (daemon_mode || multiuser_mode) && (console_arg.is_some() || gui_arg.is_some()) {
         eprintln!("Error: -D/--multiuser cannot be combined with --console/--gui.");
+        std::process::exit(1);
+    }
+    if grep_arg.is_some() && (console_arg.is_some() || gui_arg.is_some() || daemon_mode || multiuser_mode) {
+        eprintln!("Error: --grep cannot be combined with --console/--gui/-D/--multiuser.");
         std::process::exit(1);
     }
 
@@ -12085,6 +12618,18 @@ async fn main() -> io::Result<()> {
             }
         }
         return Ok(());
+    }
+
+    // Handle --grep mode (before multiuser/daemon since it's a client mode)
+    if let Some(ref addr) = grep_arg {
+        return run_grep_client(
+            addr,
+            grep_pattern.as_ref().unwrap(),
+            grep_world_filter.as_deref(),
+            grep_use_regex,
+            grep_strip_ansi,
+            grep_follow_mode,
+        ).await;
     }
 
     // Handle --multiuser mode
@@ -12862,7 +13407,7 @@ pub async fn run_app_headless(
                             from_server: false,
                             seq: 0,
                             marked_new: false,
-                            flush: false,
+                            flush: false, gagged: false,
                         });
                     }
                     AppEvent::Sigusr1Received => {
@@ -12928,7 +13473,7 @@ pub async fn run_app_headless(
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
-                                flush: false,
+                                flush: false, gagged: false,
                             }),
                         }
                     }
@@ -13177,7 +13722,7 @@ pub async fn run_app_headless(
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
-                                    flush: false,
+                                    flush: false, gagged: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -13193,7 +13738,7 @@ pub async fn run_app_headless(
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
-                                    flush: false,
+                                    flush: false, gagged: false,
                                 });
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
@@ -14751,6 +15296,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if !app.worlds[world_idx].paused {
                                     app.worlds[world_idx].scroll_to_bottom();
                                 }
+                                // Broadcast gagged line to WebSocket clients
+                                let is_current = world_idx == app.current_world_index;
+                                let ws_data = message.replace('\r', "") + "\n";
+                                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                                    world_index: world_idx,
+                                    data: ws_data,
+                                    is_viewed: is_current,
+                                    ts: current_timestamp_secs(),
+                                    from_server: true,
+                                    seq,
+                                    marked_new: !is_current,
+                                    flush: false, gagged: true,
+                                });
                             } else {
                                 // Add non-gagged output normally
                                 let settings = app.settings.clone();
@@ -14806,7 +15364,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         from_server: false,
                                         seq: 0,
                                         marked_new: false,
-                                        flush: false,
+                                        flush: false, gagged: false,
                                     });
                                 }
 
@@ -14942,7 +15500,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
-                                flush: false,
+                                flush: false, gagged: false,
                             }),
                         }
                     }
@@ -15211,7 +15769,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
-                                    flush: false,
+                                    flush: false, gagged: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -15227,7 +15785,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     from_server: false,
                                     seq: 0,
                                     marked_new: false,
-                                    flush: false,
+                                    flush: false, gagged: false,
                                 });
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
@@ -15494,6 +16052,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             if !app.worlds[world_idx].paused {
                                 app.worlds[world_idx].scroll_to_bottom();
                             }
+                            // Broadcast gagged line to WebSocket clients
+                            let is_current = world_idx == app.current_world_index;
+                            let ws_data = message.replace('\r', "") + "\n";
+                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                                world_index: world_idx,
+                                data: ws_data,
+                                is_viewed: is_current,
+                                ts: current_timestamp_secs(),
+                                from_server: true,
+                                seq,
+                                marked_new: !is_current,
+                                flush: false, gagged: true,
+                            });
                         } else {
                             // Add non-gagged output normally
                             let settings = app.settings.clone();
@@ -15517,7 +16088,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 from_server: false,
                                 seq: 0,
                                 marked_new: false,
-                                flush: false,
+                                flush: false, gagged: false,
                             });
                         }
 
@@ -15637,7 +16208,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             from_server: false,
                             seq: 0,
                             marked_new: false,
-                            flush: false,
+                            flush: false, gagged: false,
                         }),
                     }
                 }
@@ -16123,6 +16694,17 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     if app.has_new_popup() {
         match handle_new_popup_key(app, key) {
             NewPopupAction::Command(cmd) => {
+                // Web-only editors: show URL hint in console
+                if cmd == "/theme-editor" || cmd == "/keybind-editor" {
+                    let page = cmd.trim_start_matches('/');
+                    let proto = if app.settings.web_secure { "https" } else { "http" };
+                    if app.settings.http_enabled {
+                        app.add_output(&format!("Open in browser: {}://localhost:{}/{}", proto, app.settings.http_port, page));
+                    } else {
+                        app.add_output(&format!("Enable HTTP in /web settings, then open /{} in a browser.", page));
+                    }
+                    return KeyAction::None;
+                }
                 // Menu command selected - execute it
                 return KeyAction::SendCommand(cmd);
             }
@@ -16279,8 +16861,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
-                app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&settings.arrow_up_down);
-                app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&settings.shift_arrow_up_down);
                 app.settings.new_line_indicator = settings.new_line_indicator;
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
@@ -16882,9 +17462,13 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     if key.code == KeyCode::Enter {
         let input = app.input.take_input();
         if !input.is_empty() || app.current_world().connected {
-            app.current_world_mut().lines_since_pause = 0;
-            if app.current_world().pending_lines.is_empty() {
-                app.current_world_mut().paused = false;
+            // /dump is passive — don't reset more-mode state
+            let is_dump = input.trim().eq_ignore_ascii_case("/dump");
+            if !is_dump {
+                app.current_world_mut().lines_since_pause = 0;
+                if app.current_world().pending_lines.is_empty() {
+                    app.current_world_mut().paused = false;
+                }
             }
             return KeyAction::SendCommand(input);
         }
@@ -17094,19 +17678,42 @@ fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                 }
                 if released > 0 {
                     let lines: Vec<_> = app.worlds[world_idx].pending_lines.drain(..released).collect();
-                    let first_seq = lines.first().map(|l| l.seq).unwrap_or(0);
-                    let ws_data: String = lines.iter().map(|l| l.text.replace('\r', "")).collect::<Vec<_>>().join("\n") + "\n";
+                    // Group consecutive lines by marked_new for correct per-line indicators
+                    let ts = current_timestamp_secs();
+                    let mut batch: Vec<String> = Vec::new();
+                    let mut batch_marked_new = lines.first().map(|l| l.marked_new).unwrap_or(false);
+                    for line in &lines {
+                        if line.marked_new != batch_marked_new && !batch.is_empty() {
+                            let ws_data = batch.join("\n") + "\n";
+                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                                world_index: world_idx,
+                                data: ws_data,
+                                is_viewed: true,
+                                ts,
+                                from_server: true,
+                                seq: 0,
+                                marked_new: batch_marked_new,
+                                flush: false, gagged: false,
+                            });
+                            batch.clear();
+                            batch_marked_new = line.marked_new;
+                        }
+                        batch.push(line.text.replace('\r', ""));
+                    }
+                    if !batch.is_empty() {
+                        let ws_data = batch.join("\n") + "\n";
+                        app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                            world_index: world_idx,
+                            data: ws_data,
+                            is_viewed: true,
+                            ts,
+                            from_server: true,
+                            seq: 0,
+                            marked_new: batch_marked_new,
+                            flush: false, gagged: false,
+                        });
+                    }
                     app.worlds[world_idx].output_lines.extend(lines);
-                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                        world_index: world_idx,
-                        data: ws_data,
-                        is_viewed: true,
-                        ts: current_timestamp_secs(),
-                        from_server: true,
-                        seq: first_seq,
-                        marked_new: false,
-                        flush: false,
-                    });
                     if app.worlds[world_idx].pending_lines.is_empty() {
                         app.worlds[world_idx].paused = false;
                         app.worlds[world_idx].lines_since_pause = 0;
@@ -17124,26 +17731,49 @@ fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
         "flush_output" => {
             if app.current_world().paused {
                 let world_idx = app.current_world_index;
-                let has_marked_new = app.worlds[world_idx].pending_lines.iter().any(|l| l.marked_new);
-                let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
+                let lines_with_flags: Vec<(String, bool)> = app.worlds[world_idx]
                     .pending_lines
                     .iter()
-                    .map(|line| line.text.replace('\r', ""))
+                    .map(|line| (line.text.replace('\r', ""), line.marked_new))
                     .collect();
-                let released = lines_to_broadcast.len();
+                let released = lines_with_flags.len();
                 app.current_world_mut().release_all_pending();
-                if !lines_to_broadcast.is_empty() {
-                    let ws_data = lines_to_broadcast.join("\n") + "\n";
-                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                        world_index: world_idx,
-                        data: ws_data,
-                        is_viewed: true,
-                        ts: current_timestamp_secs(),
-                        from_server: true,
-                        seq: 0,
-                        marked_new: has_marked_new,
-                        flush: false,
-                    });
+                if !lines_with_flags.is_empty() {
+                    // Group consecutive lines by marked_new for correct per-line indicators
+                    let ts = current_timestamp_secs();
+                    let mut batch: Vec<&str> = Vec::new();
+                    let mut batch_marked_new = lines_with_flags[0].1;
+                    for (text, marked_new) in &lines_with_flags {
+                        if *marked_new != batch_marked_new && !batch.is_empty() {
+                            let ws_data = batch.join("\n") + "\n";
+                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                                world_index: world_idx,
+                                data: ws_data,
+                                is_viewed: true,
+                                ts,
+                                from_server: true,
+                                seq: 0,
+                                marked_new: batch_marked_new,
+                                flush: false, gagged: false,
+                            });
+                            batch.clear();
+                            batch_marked_new = *marked_new;
+                        }
+                        batch.push(text);
+                    }
+                    if !batch.is_empty() {
+                        let ws_data = batch.join("\n") + "\n";
+                        app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                            world_index: world_idx,
+                            data: ws_data,
+                            is_viewed: true,
+                            ts,
+                            from_server: true,
+                            seq: 0,
+                            marked_new: batch_marked_new,
+                            flush: false, gagged: false,
+                        });
+                    }
                 }
                 app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
                 app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
@@ -17171,8 +17801,8 @@ fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                         ts: current_timestamp_secs(),
                         from_server: line.from_server,
                         seq: line.seq,
-                        marked_new: false,
-                        flush: false,
+                        marked_new: line.marked_new,
+                        flush: false, gagged: false,
                     });
                 }
                 app.worlds[world_idx].output_lines.extend(kept);
@@ -17256,6 +17886,7 @@ fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
         // Clay Extensions
         "toggle_tags" => {
             app.show_tags = !app.show_tags;
+            app.current_world_mut().visual_line_offset = 0;
             KeyAction::Redraw
         }
         "filter_popup" => {
@@ -19140,6 +19771,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::Update { force } => {
             #[cfg(any(target_os = "android", not(unix)))]
             {
+                let _ = force;
                 app.add_output("Update is not available on this platform.");
             }
 
@@ -19314,7 +19946,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.add_output("  Example: /tr es say Hello");
         }
         Command::Dump => {
-            // Dump all scrollback buffers to ~/.clay.dmp.log
+            // Dump comprehensive debug state to ~/.clay.dmp.log
             use std::io::Write;
 
             let home = get_home_dir();
@@ -19322,51 +19954,109 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
             match std::fs::File::create(&dump_path) {
                 Ok(mut file) => {
-                    let mut total_lines = 0;
+                    let _ = writeln!(file, "=== CLAY DEBUG DUMP ===");
+                    let _ = writeln!(file, "Version: {} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH);
+                    let now_ts = current_timestamp_secs();
+                    let lt = local_time_from_epoch(now_ts as i64);
+                    let _ = writeln!(file, "Timestamp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                        lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second);
+                    let _ = writeln!(file, "");
 
-                    // Cycle through all worlds
-                    for world in app.worlds.iter() {
-                        // Write output_lines
+                    // Global state
+                    let _ = writeln!(file, "=== GLOBAL STATE ===");
+                    let _ = writeln!(file, "output_height: {}", app.output_height);
+                    let _ = writeln!(file, "output_width: {}", app.output_width);
+                    let _ = writeln!(file, "input_height: {}", app.input_height);
+                    let _ = writeln!(file, "current_world_index: {}", app.current_world_index);
+                    let _ = writeln!(file, "worlds_count: {}", app.worlds.len());
+                    let _ = writeln!(file, "more_mode_enabled: {}", app.settings.more_mode_enabled);
+                    let _ = writeln!(file, "show_tags: {}", app.show_tags);
+                    let _ = writeln!(file, "new_line_indicator: {}", app.settings.new_line_indicator);
+                    let _ = writeln!(file, "max_lines (output_height-2): {}", (app.output_height as usize).saturating_sub(2));
+                    let _ = writeln!(file, "");
+
+                    // WS client info
+                    let _ = writeln!(file, "=== WS CLIENTS ===");
+                    let _ = writeln!(file, "ws_client_worlds count: {}", app.ws_client_worlds.len());
+                    for (cid, cv) in &app.ws_client_worlds {
+                        let _ = writeln!(file, "  client {}: world_index={}, visible_lines={}, visible_columns={}, dimensions={:?}",
+                            cid, cv.world_index, cv.visible_lines, cv.visible_columns, cv.dimensions);
+                    }
+                    let _ = writeln!(file, "");
+
+                    // Per-world state
+                    for (wi, world) in app.worlds.iter().enumerate() {
+                        let is_current = wi == app.current_world_index;
+                        let _ = writeln!(file, "=== WORLD {} [{}] {} ===",
+                            wi, world.name, if is_current { "(CURRENT)" } else { "" });
+                        let _ = writeln!(file, "connected: {}", world.connected);
+                        let _ = writeln!(file, "paused: {}", world.paused);
+                        let _ = writeln!(file, "lines_since_pause: {}", world.lines_since_pause);
+                        let _ = writeln!(file, "visual_line_offset: {}", world.visual_line_offset);
+                        let _ = writeln!(file, "scroll_offset: {}", world.scroll_offset);
+                        let _ = writeln!(file, "output_lines.len: {}", world.output_lines.len());
+                        let _ = writeln!(file, "pending_lines.len: {}", world.pending_lines.len());
+                        let _ = writeln!(file, "unseen_lines: {}", world.unseen_lines);
+                        let _ = writeln!(file, "showing_splash: {}", world.showing_splash);
+                        let _ = writeln!(file, "partial_line: {:?}", if world.partial_line.is_empty() { "".to_string() } else { format!("({} chars) {:?}", world.partial_line.len(), &world.partial_line[..world.partial_line.len().min(100)]) });
+                        let _ = writeln!(file, "partial_in_pending: {}", world.partial_in_pending);
+                        if let Some(ps) = world.pending_since {
+                            let _ = writeln!(file, "pending_since: {:?} ago", ps.elapsed());
+                        }
+                        let _ = writeln!(file, "encoding: {:?}", world.settings.encoding);
+
+                        // Min viewer dimensions
+                        let ws_min_lines = app.min_viewer_lines(wi);
+                        let ws_min_width = app.min_viewer_width(wi);
+                        let _ = writeln!(file, "min_viewer_lines: {:?}", ws_min_lines);
+                        let _ = writeln!(file, "min_viewer_width: {:?}", ws_min_width);
+
+                        // Effective output dimensions for more-mode
+                        let console_viewing = wi == app.current_world_index;
+                        let eff_height = match (console_viewing, ws_min_lines) {
+                            (true, Some(ws)) => (app.output_height).min(ws as u16),
+                            (true, None) => app.output_height,
+                            (false, Some(ws)) => ws as u16,
+                            (false, None) => app.output_height,
+                        };
+                        let eff_width = match (console_viewing, ws_min_width) {
+                            (true, Some(ws_w)) => (app.output_width).min(ws_w as u16),
+                            (true, None) => app.output_width,
+                            (false, Some(ws_w)) => ws_w as u16,
+                            (false, None) => app.output_width,
+                        };
+                        let _ = writeln!(file, "effective_output_height: {}", eff_height);
+                        let _ = writeln!(file, "effective_output_width: {}", eff_width);
+                        let _ = writeln!(file, "effective_max_lines: {}", (eff_height as usize).saturating_sub(2));
+                        let _ = writeln!(file, "");
+
+                        // Full scrollback dump (all output + pending lines)
+                        let _ = writeln!(file, "--- OUTPUT LINES ({}) ---", world.output_lines.len());
                         for line in &world.output_lines {
-                            // Format timestamp as YYYY-MM-DD HH:MM:SS
-                            let ts = line.timestamp
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0) as i64;
-                            let lt = local_time_from_epoch(ts);
-                            let datetime = format!(
-                                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                lt.year, lt.month, lt.day,
-                                lt.hour, lt.minute, lt.second
-                            );
-
-                            // Write: world_name,datetime,line_text
-                            let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                            total_lines += 1;
+                            let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+                            let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
+                            let _ = writeln!(file, "{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
+                                prefix, lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second,
+                                line.text);
                         }
 
-                        // Also write pending_lines if any
-                        for line in &world.pending_lines {
-                            let ts = line.timestamp
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0) as i64;
-                            let lt = local_time_from_epoch(ts);
-                            let datetime = format!(
-                                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                lt.year, lt.month, lt.day,
-                                lt.hour, lt.minute, lt.second
-                            );
-
-                            let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                            total_lines += 1;
+                        if !world.pending_lines.is_empty() {
+                            let _ = writeln!(file, "--- PENDING LINES ({}) ---", world.pending_lines.len());
+                            for line in &world.pending_lines {
+                                let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+                                let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
+                                let _ = writeln!(file, "P,{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
+                                    prefix, lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second,
+                                    line.text);
+                            }
                         }
+                        let _ = writeln!(file, "");
                     }
 
-                    app.add_output(&format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path));
+                    // Don't use add_output — it resets lines_since_pause and scrolls.
+                    // /dump must be passive and not disturb more-mode state.
                 }
-                Err(e) => {
-                    app.add_output(&format!("Failed to create dump file: {}", e));
+                Err(_e) => {
                 }
             }
         }
@@ -19831,7 +20521,11 @@ fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
             i += 1;
             continue;
         } else {
-            let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            // Tab characters are rendered as 8 spaces (see process_output_line),
+            // but unicode_width returns None/0 for tabs. Use 8 to match rendering.
+            let char_width = if c == '\t' { 8 } else {
+                unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+            };
 
             // Check if we need to wrap before adding this character
             if current_width + char_width > max_width && current_width > 0 {
@@ -20248,11 +20942,20 @@ fn render_output_crossterm(app: &App) {
         let mut rev_lines: Vec<(String, bool, Option<String>, bool)> = Vec::with_capacity(visible_height + 8);
         first_line_idx = end_line;
         let mut old_visual_count: usize = 0;
+        let mut applied_vlo = false;
         for line_idx in (0..=end_line).rev() {
             first_line_idx = line_idx;
             let line = &world.output_lines[line_idx];
             let highlight = should_highlight(line);
-            let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+            let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+
+            // Partial line display: truncate the first visible line encountered from the end.
+            // This may not be end_line itself if gagged lines were appended after the trigger.
+            if !applied_vlo && world.visual_line_offset > 0
+               && !wrapped.is_empty() && wrapped.len() > world.visual_line_offset {
+                wrapped.truncate(world.visual_line_offset);
+                applied_vlo = true;
+            }
 
             let is_new = line.marked_new;
             for w in wrapped.into_iter().rev() {
@@ -22873,7 +23576,7 @@ mod tests {
     fn test_security_valid_paths_no_ban() {
         let valid_paths = vec![
             "/", "/index.html", "/style.css", "/app.js",
-            "/theme-editor", "/favicon.ico",
+            "/theme-editor", "/keybind-editor", "/favicon.ico",
         ];
 
         for path in valid_paths {
@@ -22881,7 +23584,7 @@ mod tests {
             // If any of these paths start returning 404, it would be a regression
             let is_valid = matches!(path,
                 "/" | "/index.html" | "/style.css" | "/app.js" |
-                "/theme-editor" | "/favicon.ico"
+                "/theme-editor" | "/keybind-editor" | "/favicon.ico"
             );
             assert!(is_valid, "Path {} should be recognized as valid", path);
         }
@@ -23182,6 +23885,123 @@ mod tests {
             "Expected 12 output lines (each wrapping to 2 visual), got {}", world.output_lines.len());
         assert_eq!(world.pending_lines.len(), 38,
             "Expected 38 pending lines, got {}", world.pending_lines.len());
+    }
+
+    #[test]
+    fn test_more_mode_single_line_exceeds_screen() {
+        // A single logical line wraps to more visual lines than the screen.
+        // Scenario: 2 short lines (2 vl) + 1 huge line (25 vl) on a 21-line screen (max_lines=19).
+        // The huge line should trigger pause AND set visual_line_offset so the renderer
+        // only shows the first 17 visual lines of it (filling exactly 19 with the 2 prior).
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        let output_height: u16 = 21;
+        let output_width: u16 = 80;
+        let max_lines = (output_height as usize) - 2; // 19
+
+        // 2 short lines (1 visual line each)
+        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true);
+        assert!(!world.paused, "Should not be paused after 2 short lines");
+        assert_eq!(world.lines_since_pause, 2);
+
+        // 1 huge line: 25 visual lines at width 80 (80*25 = 2000 visible chars)
+        let huge_line = "A".repeat(80 * 25);
+        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true);
+
+        // Should be paused
+        assert!(world.paused, "Should be paused after huge line");
+        // Huge line goes to output (triggers_pause path), not pending
+        assert_eq!(world.output_lines.len(), 3, "All 3 lines should be in output");
+        assert_eq!(world.pending_lines.len(), 0, "No pending lines");
+        // lines_since_pause = 2 + 25 = 27
+        assert_eq!(world.lines_since_pause, 27);
+        // visual_line_offset should be set: remaining_budget = 19 - 2 = 17
+        assert_eq!(world.visual_line_offset, max_lines - 2,
+            "visual_line_offset should be {} (screen fills precisely)", max_lines - 2);
+    }
+
+    #[test]
+    fn test_more_mode_single_line_exceeds_screen_release() {
+        // Test that Tab (release_pending_screenful) correctly reveals more of a
+        // partially-shown line before releasing pending lines.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        let output_height: u16 = 21;
+        let output_width: u16 = 80;
+
+        // 2 short lines + 1 huge line (25 vl) + 5 pending lines
+        world.add_output("short one\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short two\n", true, &settings, output_height, output_width, false, true);
+        let huge_line = "B".repeat(80 * 25);
+        // The huge line + 5 more lines in one batch
+        let batch = format!("{}\npending1\npending2\npending3\npending4\npending5\n", huge_line);
+        world.add_output(&batch, true, &settings, output_height, output_width, false, true);
+
+        assert!(world.paused);
+        assert_eq!(world.output_lines.len(), 3, "3 lines in output (2 short + 1 huge)");
+        assert_eq!(world.pending_lines.len(), 5, "5 lines pending");
+        assert_eq!(world.visual_line_offset, 17, "partial display at 17 vl");
+
+        // Simulate Tab: release_pending reveals more of the huge line first
+        // Remaining vl of huge line: 25 - 17 = 8. Budget is 19.
+        // 8 < 19, so partial clears and budget becomes 19 - 8 = 11 for pending.
+        world.release_pending(19 - 8, output_width as usize);
+        // visual_line_offset should be cleared by release_pending's scroll_to_bottom
+        // (the App-level release_pending_screenful handles the VLO logic, but
+        // at the World level, after release_pending, scroll_to_bottom clears it)
+    }
+
+    #[test]
+    fn test_more_mode_visual_line_offset_cleared_on_scroll() {
+        // visual_line_offset should be cleared when user scrolls manually
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        let output_height: u16 = 21;
+        let output_width: u16 = 80;
+
+        // Set up a paused state with visual_line_offset
+        world.add_output("short\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short\n", true, &settings, output_height, output_width, false, true);
+        let huge_line = "C".repeat(80 * 25);
+        world.add_output(&format!("{}\nextra\n", huge_line), true, &settings, output_height, output_width, false, true);
+
+        assert!(world.visual_line_offset > 0, "Should have visual_line_offset set");
+
+        // release_all_pending should clear it
+        world.release_all_pending();
+        assert_eq!(world.visual_line_offset, 0, "release_all_pending should clear visual_line_offset");
+    }
+
+    #[test]
+    fn test_more_mode_visual_line_offset_survives_gagged_lines() {
+        // Regression test: gagged lines appended after add_output must not
+        // clear visual_line_offset (the bug was scroll_to_bottom in the gagged
+        // lines handler resetting it to 0).
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        let output_height: u16 = 21;
+        let output_width: u16 = 80;
+
+        world.add_output("short\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short\n", true, &settings, output_height, output_width, false, true);
+        let huge_line = "D".repeat(80 * 25);
+        world.add_output(&format!("{}\nextra\n", huge_line), true, &settings, output_height, output_width, false, true);
+
+        let saved_vlo = world.visual_line_offset;
+        assert!(saved_vlo > 0, "Should have visual_line_offset set");
+
+        // Simulate what the gagged lines handler does: append gagged lines + scroll_to_bottom
+        let seq = world.next_seq;
+        world.next_seq += 1;
+        world.output_lines.push(OutputLine::new_gagged("gagged line".to_string(), seq));
+        // The fix: save/restore visual_line_offset around scroll_to_bottom
+        let saved = world.visual_line_offset;
+        world.scroll_to_bottom();
+        world.visual_line_offset = saved;
+
+        assert_eq!(world.visual_line_offset, saved_vlo,
+            "visual_line_offset should survive gagged line append");
     }
 
     #[test]

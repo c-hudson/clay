@@ -36,6 +36,8 @@
         authUsernameRow: document.getElementById('auth-username-row'),
         authUsername: document.getElementById('auth-username'),
         authPassword: document.getElementById('auth-password'),
+        authKeyRow: document.getElementById('auth-key-row'),
+        authKeyInput: document.getElementById('auth-key'),
         authError: document.getElementById('auth-error'),
         authSubmit: document.getElementById('auth-submit'),
         // Connection error modal
@@ -170,8 +172,6 @@
         // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
-        setupArrowUpDownSelect: document.getElementById('setup-arrow-updown-select'),
-        setupShiftArrowSelect: document.getElementById('setup-shift-arrow-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupDebugToggle: document.getElementById('setup-debug-toggle'),
@@ -270,8 +270,6 @@
 
     // Settings
     let worldSwitchMode = 'Unseen First';  // 'Unseen First' or 'Alphabetical'
-    let arrowUpDownMode = 'cycle_worlds';  // 'cycle_worlds' or 'input_line'
-    let shiftArrowUpDownMode = 'input_line'; // 'cycle_worlds' or 'input_line'
     let keybindings = {};  // key name -> action ID, received from server
     let killRing = [];     // killed text for yank (Ctrl+Y)
 
@@ -329,8 +327,6 @@
     let setupColorOffset = 0;
     let setupAnsiMusic = true;
     let setupZwj = false;
-    let setupArrowUpDown = 'cycle_worlds';
-    let setupShiftArrowUpDown = 'input_line';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
     let setupDebug = false;
@@ -382,7 +378,9 @@
         { label: 'Font', command: '/font' },
         { label: 'Actions', command: '/actions' },
         { label: 'World Selector', command: '/worlds' },
-        { label: 'Connected Worlds', command: '/connections' }
+        { label: 'Connected Worlds', command: '/connections' },
+        { label: 'Theme Editor', command: '/theme-editor' },
+        { label: 'Keybind Editor', command: '/keybind-editor' }
     ];
 
     // Current theme values (synced from server)
@@ -900,34 +898,29 @@
         setInterval(updateTime, 1000);
     }
 
-    // Load auth key from storage (Android or localStorage)
+    // Load auth key from storage (Android only)
     function loadAuthKey() {
         if (window.Android && window.Android.getAuthKey) {
             authKey = window.Android.getAuthKey();
-        } else if (typeof localStorage !== 'undefined') {
-            authKey = localStorage.getItem('clay_auth_key');
         }
         debugLog('loadAuthKey: ' + (authKey ? 'found key' : 'no key'));
     }
 
-    // Save auth key to storage
+    // Save auth key to storage (Android only)
     function saveAuthKey(key) {
+        if (!window.Android) return;
         authKey = key;
-        if (window.Android && window.Android.saveAuthKey) {
+        if (window.Android.saveAuthKey) {
             window.Android.saveAuthKey(key);
-        } else if (typeof localStorage !== 'undefined') {
-            localStorage.setItem('clay_auth_key', key);
         }
         debugLog('saveAuthKey: saved key');
     }
 
-    // Clear auth key from storage
+    // Clear auth key from storage (Android only)
     function clearAuthKey() {
         authKey = null;
         if (window.Android && window.Android.clearAuthKey) {
             window.Android.clearAuthKey();
-        } else if (typeof localStorage !== 'undefined') {
-            localStorage.removeItem('clay_auth_key');
         }
         debugLog('clearAuthKey: cleared');
     }
@@ -1059,6 +1052,18 @@
                         }
                     }, 1000);
                 }
+            } else if (authKey) {
+                // Have auth key but no saved password - wait for ServerHello to try key auth
+                // Don't show auth modal yet; it will be shown if key auth fails
+                debugLog('onopen: no password but have auth key, waiting for ServerHello');
+                // Safety timeout: if ServerHello doesn't arrive within 3s, show auth modal
+                setTimeout(function() {
+                    if (!authenticated && !authKeyPending) {
+                        debugLog('ServerHello timeout, showing auth modal');
+                        showAuthModal(true);
+                        elements.authPassword.focus();
+                    }
+                }, 3000);
             } else {
                 showAuthModal(true);
                 // Pre-fill username if saved (for multiuser mode)
@@ -1318,6 +1323,17 @@
                             }
                         }, 1000);
                     }
+                } else if (authKey) {
+                    // Have auth key but no saved password - wait for ServerHello to try key auth
+                    debugLog('ws.onopen: no password but have auth key, waiting for ServerHello');
+                    // Safety timeout: if ServerHello doesn't arrive within 3s, show auth modal
+                    setTimeout(function() {
+                        if (!authenticated && !authKeyPending) {
+                            debugLog('ServerHello timeout, showing auth modal');
+                            showAuthModal(true);
+                            elements.authPassword.focus();
+                        }
+                    }, 3000);
                 } else {
                     showAuthModal(true);
                     // Pre-fill username if saved (for multiuser mode)
@@ -1483,13 +1499,13 @@
                         window.Android.startBackgroundService();
                     }
                 } else {
-                    // If this was a key-based auth failure, clear key and show password prompt
+                    // If this was a key-based auth failure, show password prompt with key visible
                     if (authKeyPending) {
-                        debugLog('Key-based auth failed, clearing key and showing password prompt');
+                        debugLog('Key-based auth failed, showing password prompt with failed key');
                         authKeyPending = false;
-                        clearAuthKey();
-                        // Show password modal - don't show error for key failure
+                        // Don't clear the key - show it in the UI so user can see it failed
                         showAuthModal(true);
+                        elements.authError.textContent = 'Auth key rejected - enter password';
                         elements.authPassword.focus();
                         break;
                     }
@@ -1723,12 +1739,6 @@
                         webFontWeight = msg.settings.web_font_weight;
                         applyFontWeight(webFontWeight);
                     }
-                    if (msg.settings.arrow_up_down_mode !== undefined) {
-                        arrowUpDownMode = msg.settings.arrow_up_down_mode;
-                    }
-                    if (msg.settings.shift_arrow_up_down_mode !== undefined) {
-                        shiftArrowUpDownMode = msg.settings.shift_arrow_up_down_mode;
-                    }
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
@@ -1867,7 +1877,7 @@
                             const lineIndex = world.output_lines.length;
                             const hasRealSeq = msg.seq !== undefined && msg.seq > 0;
                             const lineSeq = hasRealSeq ? msg.seq + appendedLineCount : lineIndex;
-                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, marked_new: msg.marked_new || false });
+                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, marked_new: msg.marked_new || false, gagged: msg.gagged || false });
                             appendedLineCount++;
                             // Verify sequence order (only for messages with real server-assigned seq)
                             if (lineIndex > 0 && msg.seq !== undefined && msg.seq > 0) {
@@ -1886,12 +1896,17 @@
                                 }
                             }
                             if (msg.world_index === currentWorldIndex) {
-                                // Released pending lines (seq=0, from_server=true) bypass local
-                                // more-mode to avoid flickering the More indicator
-                                if (!hasRealSeq && isFromServer) {
-                                    appendNewLine(line, lineTs, msg.world_index, lineIndex);
+                                const lineMarkedNew = msg.marked_new || false;
+                                // Gagged lines are stored but not rendered (only visible with F2)
+                                // They bypass more-mode entirely
+                                if (msg.gagged) {
+                                    // Don't render or count for more-mode
+                                } else if (!hasRealSeq && isFromServer) {
+                                    // Released pending lines (seq=0, from_server=true) bypass local
+                                    // more-mode to avoid flickering the More indicator
+                                    appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew);
                                 } else {
-                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex);
+                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew);
                                 }
                             }
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
@@ -2184,12 +2199,6 @@
                         webFontWeight = msg.settings.web_font_weight;
                         applyFontWeight(webFontWeight);
                     }
-                    if (msg.settings.arrow_up_down_mode !== undefined) {
-                        arrowUpDownMode = msg.settings.arrow_up_down_mode;
-                    }
-                    if (msg.settings.shift_arrow_up_down_mode !== undefined) {
-                        shiftArrowUpDownMode = msg.settings.shift_arrow_up_down_mode;
-                    }
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
@@ -2448,7 +2457,7 @@
     }
 
     // Handle incoming line with more-mode logic
-    function handleIncomingLine(text, ts, worldIndex, lineIndex) {
+    function handleIncomingLine(text, ts, worldIndex, lineIndex, markedNew) {
         if (text === undefined || text === null) return;
 
         const visibleLines = getVisibleLineCount();
@@ -2456,19 +2465,19 @@
 
         if (paused) {
             // Already paused, queue the line info
-            pendingLines.push({ text, ts, worldIndex, lineIndex });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false });
             updateStatusBar();
         } else if (moreModeEnabled && linesSincePause >= threshold) {
             // Trigger pause
             paused = true;
-            pendingLines.push({ text, ts, worldIndex, lineIndex });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false });
             // Scroll to bottom to show what we have so far
             scrollToBottom();
             updateStatusBar();
         } else {
             // Normal display - append the line
             linesSincePause++;
-            appendNewLine(text, ts, worldIndex, lineIndex);
+            appendNewLine(text, ts, worldIndex, lineIndex, markedNew);
         }
     }
 
@@ -2525,7 +2534,7 @@
         const released = pendingLines.splice(0, toRelease);
 
         released.forEach(item => {
-            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex);
+            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew);
         });
 
         if (pendingLines.length === 0) {
@@ -2653,6 +2662,23 @@
         // Trim password to remove any trailing spaces from Android keyboard
         const rawPassword = passwordOverride || elements.authPassword.value;
         const password = String(rawPassword || '').trim();
+
+        // Check if user edited the auth key field
+        if (elements.authKeyInput && window.Android) {
+            const editedKey = elements.authKeyInput.value.trim();
+            if (editedKey && editedKey !== authKey) {
+                // User changed the auth key - save it
+                saveAuthKey(editedKey);
+            }
+            // If no password but we have an auth key, try key-based auth
+            if (!password && authKey) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    tryAuthWithKey();
+                }
+                return;
+            }
+        }
+
         if (!password) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -3184,11 +3210,11 @@
                 break;
 
             case '/reload':
-                // Hot reload
+                // Hot reload — local only, never restart the remote server
                 if (window.ipc && window.ipc.postMessage) {
                     window.ipc.postMessage('reload');
                 } else {
-                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/reload' });
+                    window.location.reload();
                 }
                 break;
 
@@ -3272,104 +3298,124 @@
     }
 
     // Help popup functions (/help)
-    const helpLines = [
-        'Commands:',
-        '',
-        '  Connection:',
-        '  /connect [host port [ssl]] Connect to server',
-        '  /disconnect (or /dc)       Disconnect from server',
-        '  /worlds                    Open world selector',
-        '  /worlds <name>             Connect to or create world',
-        '  /worlds -e [name]          Edit world settings',
-        '  /worlds -l <name>          Connect without auto-login',
-        '  /connections (or /l)       List connected worlds',
-        '  /addworld <name> [host] [port] [-s]',
-        '                             Add or update world (-s=SSL)',
-        '  /keepalive                 Show keepalive settings',
-        '',
-        '  Communication:',
-        '  /send [-W] [-w<world>] [-n] <text>',
-        '                             Send text to world(s)',
-        '                             -W=all worlds, -n=no newline',
-        '  /notify <message>          Send notification to mobile',
-        '',
-        '  Lookup & Translation:',
-        '  /dict <prefix> <word>      Look up word definition',
-        '  /urban <prefix> <word>     Look up Urban Dictionary',
-        '  /translate <lang> <prefix> <text>',
-        '                             Translate text (or /tr)',
-        '                             <lang> = code (es) or name (spanish)',
-        '',
-        '  Actions & Triggers:',
-        '  /actions [world]           Open actions editor',
-        '  /gag <pattern>             Gag lines matching pattern',
-        '  /<action_name> [args]      Execute named action',
-        '',
-        '  Settings:',
-        '  /setup                     Open global settings',
-        '  /web                       Open web/WebSocket settings',
-        '  /tag                       Toggle MUD tag display (F2)',
-        '',
-        '  Display:',
-        '  /menu                      Open menu popup',
-        '  /flush                     Clear output buffer',
-        '  /dump                      Dump scrollback to file',
-        '  /edit [file]               Open split-screen editor',
-        '',
-        '  System:',
-        '  /help                      Show this help',
-        '  /help tf                   Show TF commands help',
-        '  /version                   Show version info',
-        '  /reload                    Hot reload binary',
-        '  /testmusic                 Test ANSI music playback',
-        '  /quit                      Exit client',
-        '',
-        '  Security:',
-        '  /ban                       Show banned hosts',
-        '  /unban <host>              Remove host from ban list',
-        '',
-        'TF Commands:',
-        '  For TinyFugue compatibility commands (triggers, macros,',
-        '  variables, control flow), use:  /help tf  or  /tfhelp',
-        '',
-        'World Switching:',
-        '  Up/Down                    Switch between active worlds',
-        '  Ctrl+Up/Down               Switch between all worlds',
-        '  Alt+W                      Switch to world with activity',
-        '',
-        'Input:',
-        '  Left/Right, Ctrl+B/F       Move cursor',
-        '  Ctrl+Up/Down               Move cursor up/down lines',
-        '  Alt+Up/Down                Resize input area',
-        '  Ctrl+U                     Clear input',
-        '  Ctrl+W                     Delete word before cursor',
-        '  Ctrl+K                     Delete to end of line',
-        '  Ctrl+D                     Delete character under cursor',
-        '  Ctrl+A/Home                Jump to start of line',
-        '  Ctrl+E/End                 Jump to end of line',
-        '  Esc+D                      Delete word forward',
-        '  Esc+C                      Capitalize word forward',
-        '  Esc+L                      Lowercase word forward',
-        '  Esc+U                      Uppercase word forward',
-        '  Ctrl+P/N                   Command history',
-        '  Ctrl+Q                     Spell suggestions',
-        '  Tab                        Command completion',
-        '',
-        'Output:',
-        '  PageUp/PageDown            Scroll output',
-        '  Tab                        Release one screenful (paused)',
-        '  Alt+J                      Jump to end, release all',
-        '',
-        'Display:',
-        '  F1                         Show this help',
-        '  F2                         Toggle MUD tag display',
-        '  F4                         Filter output',
-        '  F8                         Highlight action matches',
+    // Help content as structured sections: [heading, [left, right], ...]
+    // Empty right = continuation line; null right = section heading
+    const helpSections = [
+        { heading: 'Commands', note: '(/help &lt;command&gt; for details)', rows: [
+            { heading: 'Connection' },
+            { l: '/worlds', r: 'Open world selector' },
+            { l: '/worlds &lt;name&gt;', r: 'Connect to or create world' },
+            { l: '/worlds -e [name]', r: 'Edit world settings' },
+            { l: '/worlds -l &lt;name&gt;', r: 'Connect without auto-login' },
+            { l: '/disconnect (or /dc)', r: 'Disconnect from server' },
+            { l: '/connections (or /l)', r: 'List connected worlds' },
+            { heading: 'Communication' },
+            { l: '/send [-W] [-w&lt;world&gt;] [-n] &lt;text&gt;', r: 'Send text to world(s)' },
+            { l: '', r: '-W=all worlds, -n=no newline' },
+            { l: '/notify &lt;message&gt;', r: 'Send notification to mobile' },
+            { heading: 'Lookup &amp; Translation' },
+            { l: '/dict &lt;prefix&gt; &lt;word&gt;', r: 'Look up word definition' },
+            { l: '/urban &lt;prefix&gt; &lt;word&gt;', r: 'Look up Urban Dictionary' },
+            { l: '/translate &lt;lang&gt; &lt;prefix&gt; &lt;text&gt;', r: 'Translate text (or /tr)' },
+            { heading: 'Actions &amp; Triggers' },
+            { l: '/actions [world]', r: 'Open actions editor' },
+            { l: '/gag &lt;pattern&gt;', r: 'Gag lines matching pattern' },
+            { l: '/&lt;action_name&gt; [args]', r: 'Execute named action' },
+            { heading: 'Settings' },
+            { l: '/setup', r: 'Open global settings' },
+            { l: '/web', r: 'Open web/WebSocket settings' },
+            { l: '/tag', r: 'Toggle MUD tag display (F2)' },
+            { heading: 'Display' },
+            { l: '/menu', r: 'Open menu popup' },
+            { l: '/flush', r: 'Clear output buffer' },
+            { l: '/dump', r: 'Dump scrollback to file' },
+            { l: '/edit [file]', r: 'Open split-screen editor' },
+            { heading: 'System' },
+            { l: '/help [topic]', r: 'Show help (topic = command)' },
+            { l: '/version', r: 'Show version info' },
+            { l: '/reload', r: 'Hot reload binary' },
+            { l: '/testmusic', r: 'Test ANSI music playback' },
+            { l: '/quit', r: 'Exit client' },
+            { heading: 'Security' },
+            { l: '/ban', r: 'Show banned hosts' },
+            { l: '/unban &lt;host&gt;', r: 'Remove host from ban list' },
+        ]},
+        { heading: 'TF Commands', rows: [
+            { l: 'For TinyFugue commands (triggers, macros,', r: '' },
+            { l: 'variables, control flow): /help tf or /tfhelp', r: '' },
+        ]},
+        { heading: 'World Switching', rows: [
+            { l: 'Up/Down', r: 'Switch between active worlds' },
+            { l: 'Ctrl+Up/Down', r: 'Switch between all worlds' },
+            { l: 'Alt+W', r: 'Switch to world with activity' },
+        ]},
+        { heading: 'Input', rows: [
+            { l: 'Left/Right, Ctrl+B/F', r: 'Move cursor' },
+            { l: 'Ctrl+Up/Down', r: 'Move cursor up/down lines' },
+            { l: 'Alt+Up/Down', r: 'Resize input area' },
+            { l: 'Ctrl+U', r: 'Clear input' },
+            { l: 'Ctrl+W', r: 'Delete word before cursor' },
+            { l: 'Ctrl+K', r: 'Delete to end of line' },
+            { l: 'Ctrl+D', r: 'Delete character under cursor' },
+            { l: 'Ctrl+A/Home', r: 'Jump to start of line' },
+            { l: 'Ctrl+E/End', r: 'Jump to end of line' },
+            { l: 'Esc+D', r: 'Delete word forward' },
+            { l: 'Esc+C / Esc+L / Esc+U', r: 'Capitalize / Lower / Upper' },
+            { l: 'Ctrl+P/N', r: 'Command history' },
+            { l: 'Ctrl+Q', r: 'Spell suggestions' },
+            { l: 'Tab', r: 'Command completion' },
+        ]},
+        { heading: 'Output', rows: [
+            { l: 'PageUp/PageDown', r: 'Scroll output' },
+            { l: 'Tab', r: 'Release one screenful (paused)' },
+            { l: 'Alt+J', r: 'Jump to end, release all' },
+            { l: 'Esc+H', r: 'Half-page scroll/release' },
+        ]},
+        { heading: 'Display', rows: [
+            { l: 'F1', r: 'Show this help' },
+            { l: 'F2', r: 'Toggle MUD tag display' },
+            { l: 'F4', r: 'Filter output' },
+            { l: 'F8', r: 'Highlight action matches' },
+            { l: 'F9', r: 'Toggle GMCP media audio' },
+        ]},
     ];
+
+    function getBaseUrl() {
+        const proto = window.location.protocol; // 'http:' or 'https:'
+        const host = window.location.hostname;
+        const port = window.location.port;
+        // Use origin if port matches default, otherwise include port
+        if (port && port !== '80' && port !== '443') {
+            return proto + '//' + host + ':' + port;
+        }
+        return proto + '//' + host;
+    }
 
     function openHelpPopup() {
         helpPopupOpen = true;
-        elements.helpContent.textContent = helpLines.join('\n');
+        const baseUrl = getBaseUrl();
+        let html = '<table class="help-table">';
+        for (const section of helpSections) {
+            html += '<tr><td colspan="2" class="help-section-heading">' + section.heading;
+            if (section.note) html += ' <span class="help-note">' + section.note + '</span>';
+            html += '</td></tr>';
+            for (const row of section.rows) {
+                if (row.heading) {
+                    html += '<tr><td colspan="2" class="help-sub-heading">' + row.heading + '</td></tr>';
+                } else {
+                    html += '<tr><td class="help-left">' + row.l + '</td><td class="help-right">' + row.r + '</td></tr>';
+                }
+            }
+            html += '<tr><td colspan="2">&nbsp;</td></tr>';
+        }
+        // Editor links
+        html += '<tr><td colspan="2" class="help-section-heading">Editors</td></tr>';
+        html += '<tr><td class="help-left"><a href="' + baseUrl + '/theme-editor" target="_blank">Theme Editor</a></td>';
+        html += '<td class="help-right">Customize GUI/web colors</td></tr>';
+        html += '<tr><td class="help-left"><a href="' + baseUrl + '/keybind-editor" target="_blank">Keybind Editor</a></td>';
+        html += '<td class="help-right">Configure keyboard bindings</td></tr>';
+        html += '</table>';
+        elements.helpContent.innerHTML = html;
         elements.helpModal.classList.add('visible');
     }
 
@@ -3407,6 +3453,10 @@
     function selectMenuItem() {
         const cmd = menuItems[menuSelectedIndex].command;
         closeMenuPopup();
+        if (cmd === '/theme-editor' || cmd === '/keybind-editor') {
+            window.open(cmd.substring(1), '_blank');
+            return;
+        }
         elements.input.value = cmd;
         sendCommand();
     }
@@ -3651,7 +3701,7 @@
     }
 
     // Append a new line to current world's output (already visible)
-    function appendNewLine(text, ts, worldIndex, lineIndex) {
+    function appendNewLine(text, ts, worldIndex, lineIndex, markedNew) {
         // Strip newlines/carriage returns
         const cleanText = String(text).replace(/[\r\n]+/g, '');
 
@@ -3662,7 +3712,8 @@
         const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
         // Skip Discord emoji conversion when showTags is enabled so users can see original text
         const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
-        const html = tsPrefix + (showTags ? processed : convertDiscordEmojis(processed));
+        const newLinePrefix = (newLineIndicator && markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
+        const html = tsPrefix + newLinePrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
         // Append to output with a <br> prefix (if not first line)
         const prefix = elements.output.childNodes.length > 0 ? '<br>' : '';
@@ -4753,6 +4804,15 @@
             if (elements.authUsername) {
                 elements.authUsername.value = '';
             }
+            // Show auth key field on Android so user can see/edit it
+            if (elements.authKeyRow && elements.authKeyInput) {
+                if (window.Android) {
+                    elements.authKeyRow.style.display = '';
+                    elements.authKeyInput.value = authKey || '';
+                } else {
+                    elements.authKeyRow.style.display = 'none';
+                }
+            }
         } else {
             // Restore UI elements when hiding auth modal
             setupToolbars(deviceMode);
@@ -4784,6 +4844,16 @@
         document.querySelectorAll('.menu-clay-server').forEach(el => {
             el.style.display = isAndroid ? '' : 'none';
         });
+        // Show Reload menu item only in WebView GUI mode (not pure web)
+        document.querySelectorAll('.menu-reload').forEach(el => {
+            el.style.display = window.WEBVIEW_MODE ? '' : 'none';
+        });
+        // Hide Resync for master WebView GUI (it IS the master, resync is meaningless)
+        if (window.WEBVIEW_MODE && window.AUTO_PASSWORD) {
+            document.querySelectorAll('.menu-resync').forEach(el => {
+                el.style.display = 'none';
+            });
+        }
     }
 
     // Update UI based on multiuser mode
@@ -5138,8 +5208,6 @@
         // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
-        setupArrowUpDown = arrowUpDownMode;
-        setupShiftArrowUpDown = shiftArrowUpDownMode;
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupDebug = debugEnabled;
@@ -5195,11 +5263,6 @@
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
         updateCustomDropdown(elements.setupWorldSwitchSelect);
-        // Arrow key mode dropdowns
-        elements.setupArrowUpDownSelect.value = setupArrowUpDown;
-        updateCustomDropdown(elements.setupArrowUpDownSelect);
-        elements.setupShiftArrowSelect.value = setupShiftArrowUpDown;
-        updateCustomDropdown(elements.setupShiftArrowSelect);
         // Input height stepper
         elements.setupInputHeightValue.textContent = setupInputHeightValue;
         // Color offset stepper
@@ -5246,8 +5309,6 @@
             ws_key_file: wsKeyFile,
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
-            arrow_up_down_mode: arrowUpDownMode,
-            shift_arrow_up_down_mode: shiftArrowUpDownMode,
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
@@ -5268,8 +5329,6 @@
         // Note: show tags removed from setup - controlled by F2 or /tag command
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
-        arrowUpDownMode = setupArrowUpDown;
-        shiftArrowUpDownMode = setupShiftArrowUpDown;
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         debugEnabled = setupDebug;
@@ -6554,10 +6613,11 @@
                 renderOutput();
                 return true;
             case 'reload':
+                // Local only — never restart the remote server
                 if (window.ipc && window.ipc.postMessage) {
                     window.ipc.postMessage('reload');
                 } else {
-                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/reload' });
+                    window.location.reload();
                 }
                 return true;
             case 'quit':
@@ -6622,6 +6682,9 @@
     function handleMenuItem(action) {
         closeMenu();
         switch (action) {
+            case 'help':
+                openHelpPopup();
+                break;
             case 'worlds':
                 outputWorldsList();
                 focusInputWithKeyboard();
@@ -6641,6 +6704,12 @@
             case 'font':
                 openFontPopup();
                 break;
+            case 'theme-editor':
+                window.open('/theme-editor', '_blank');
+                break;
+            case 'keybind-editor':
+                window.open('/keybind-editor', '_blank');
+                break;
             case 'toggle-tags':
                 showTags = !showTags;
                 renderOutput();
@@ -6650,10 +6719,11 @@
                 openFilterPopup();
                 break;
             case 'reload':
+                // Local only — never restart the remote server
                 if (window.ipc && window.ipc.postMessage) {
                     window.ipc.postMessage('reload');
                 } else {
-                    send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/reload' });
+                    window.location.reload();
                 }
                 break;
             case 'resync':
@@ -6678,16 +6748,10 @@
                 }
                 break;
             case 'clay-server':
-                // Disconnect from WebSocket and go to server settings (Android app)
-                if (ws) {
-                    ws.close();
-                    ws = null;
-                }
-                // Call Android interface if available (running in Android WebView)
+                // Open server settings (Android app) - don't close WebSocket
                 if (typeof Android !== 'undefined' && Android.openServerSettings) {
                     Android.openServerSettings();
                 } else {
-                    // Fallback for browser: show a message
                     appendClientLine('Clay Server settings only available in Android app.');
                 }
                 break;
@@ -7523,7 +7587,9 @@
             }
 
             // Handle navigation keys at document level via keybinding system
-            {
+            // (skip when input is focused — the input-specific handler takes care of it)
+            if (document.activeElement !== elements.input &&
+                document.activeElement !== elements.filterInput) {
                 const keyName = keyEventToName(e);
                 const action = lookupBinding(keyName);
                 if (action) {
@@ -7568,13 +7634,13 @@
 
             // Binding-based dispatch
             if (action) {
-                // For delete_backward (Backspace), let the browser handle it natively
-                if (action === 'delete_backward') return;
                 // Clear escape time for Esc+key sequences that matched
                 if (isRecentEscape() && e.key !== 'Escape') lastEscapeTime = 0;
-                e.preventDefault();
-                e.stopPropagation();
-                dispatchAction(action);
+                const handled = dispatchAction(action);
+                if (handled) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
                 return;
             }
 
@@ -7598,6 +7664,14 @@
                 authenticate();
             }
         };
+        // Auth key field Enter handler
+        if (elements.authKeyInput) {
+            elements.authKeyInput.onkeydown = function(e) {
+                if (e.key === 'Enter') {
+                    authenticate();
+                }
+            };
+        }
 
         // Connection error modal buttons
         elements.connectionRetryBtn.onclick = function() {
@@ -7778,12 +7852,6 @@
         };
         elements.setupWorldSwitchSelect.onchange = function() {
             setupWorldSwitchMode = this.value;
-        };
-        elements.setupArrowUpDownSelect.onchange = function() {
-            setupArrowUpDown = this.value;
-        };
-        elements.setupShiftArrowSelect.onchange = function() {
-            setupShiftArrowUpDown = this.value;
         };
         elements.setupHeightMinus.onclick = function() {
             if (setupInputHeightValue > 1) {

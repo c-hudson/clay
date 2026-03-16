@@ -486,8 +486,6 @@ Only non-default bindings need to be saved. Use `UNBOUND` to remove a default bi
 **World Switching:**
 - `Ctrl+Up/Down` - Cycle through active worlds (connected OR with unseen output)
 - `Shift+Up/Down` - Cycle through all worlds
-- `Escape` then `b` - Switch to previous world (same as `fg -<`)
-- `Escape` then `f` - Switch to next world (same as `fg ->`)
 - `Escape` then `w` - Switch to world with activity (priority: oldest pending → unseen output → previous world)
 
 World switching behavior is controlled by the "World Switching" setting:
@@ -498,8 +496,8 @@ World switching behavior is controlled by the "World Switching" setting:
 This logic applies to all interfaces (console, web, GUI). Remote clients query the master instance for consistent world switching across all views.
 
 **Input Area:**
-- `Left/Right` - Move cursor one character
-- `Ctrl+B/Ctrl+F` - Move cursor one word left/right (TF: wleft/wright)
+- `Left/Right` or `Ctrl+B/Ctrl+F` - Move cursor one character
+- `Escape` then `b/f` - Move cursor one word left/right (TF: wleft/wright)
 - `Up/Down` - Move cursor up/down in multi-line input (TF default)
 - `Ctrl+A` or `Home` - Jump to start of line
 - `Ctrl+E` or `End` - Jump to end of line
@@ -986,8 +984,8 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `Escape+j` - Jump to end, release all pending
 - `Escape+J` - Selective flush (keep highlighted pending, discard rest)
 - `Escape+w` or `Alt+w` - Switch to world with activity (oldest pending/unseen)
-- `Escape+b` - Switch to previous world
-- `Escape+f` - Switch to next world
+- `Escape+b` - Move cursor one word left
+- `Escape+f` - Move cursor one word right
 - `Escape+h` - Half-page scroll/release
 - `Ctrl+P/N` - Command history navigation
 - `Ctrl+U` - Clear input
@@ -1109,6 +1107,45 @@ A terminal-based client mode that connects to a running Clay's WebSocket server,
 # No special features required - works with standard musl build
 cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
 ```
+
+### Grep Client
+
+A command-line mode that searches world output via WebSocket, similar to `grep`. Can search scrollback history or follow live output.
+
+**Running:**
+```bash
+# Search scrollback history for a pattern (glob wildcards by default)
+CLAY_PASSWORD=pass ./clay --grep=hostname:port '*tells you*'
+
+# Follow mode: match new output as it arrives (like tail -f | grep)
+CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*tells you*'
+
+# Use regex, filter to a specific world, strip ANSI
+CLAY_PASSWORD=pass ./clay --grep=hostname:port --regexp -w MyWorld --noesc 'combat.*hit'
+```
+
+**Options:**
+- `-w <world>` - Limit search to a specific world (by name)
+- `--regexp` - Use regex instead of glob patterns (default: glob with `*` and `?`)
+- `--noesc` - Strip ANSI color codes from output
+- `-f` - Follow mode: match new output as it arrives, runs until Ctrl+C
+
+**Authentication:**
+- Password is read from the `CLAY_PASSWORD` environment variable
+
+**Output Format:**
+- Each matching line is printed as: `HH:MM:SS:WorldName  line_text`
+- Lines are sorted by timestamp across all worlds
+
+**History Mode (default):**
+- Requests full scrollback from the server
+- Searches all lines, prints matches, exits
+- Exit code: 0 if matches found, 1 if none (grep convention)
+
+**Follow Mode (`-f`):**
+- Matches new output as it arrives in real-time
+- `Ctrl+C` - Exit
+- `Ctrl+L` - Clear screen (hide previously seen output)
 
 ### GUI Keyboard Shortcuts
 

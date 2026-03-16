@@ -119,6 +119,18 @@ html, body {
 
 .toolbar-group:first-child { border-left: none; padding-left: 0; }
 
+.back-btn {
+  background: none;
+  border: 1px solid var(--editor-border);
+  color: var(--editor-fg2);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  margin-right: 4px;
+}
+.back-btn:hover { color: var(--editor-accent); border-color: var(--editor-accent); }
+
 .toolbar-label {
   color: var(--editor-fg2);
   font-size: 11px;
@@ -834,6 +846,7 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
 <!-- Main editor (hidden until auth) -->
 <div id="editorMain" style="display:none;height:100%;flex-direction:column">
 <div class="toolbar">
+  <button class="back-btn" id="backBtn" style="display:none" onclick="window.close()">&larr; Back</button>
   <span class="toolbar-title">Clay Theme Editor</span>
   <div class="unsaved-dot" id="unsavedDot" title="Unsaved changes"></div>
   <span class="save-status" id="saveStatus"></span>
@@ -1055,10 +1068,12 @@ let updateDebounceTimer = null;
 function initConnection() {
   const host = window.WS_HOST || window.location.hostname;
   const protocol = window.WS_PROTOCOL || 'ws';
-  const port = window.WS_PORT || 9003;
+  // WS_PORT=0 means WS shares the HTTP port (unified server)
+  const port = (window.WS_PORT && window.WS_PORT !== 0)
+    ? window.WS_PORT : (window.location.port || (protocol === 'wss' ? '443' : '80'));
 
   // Check if we have WS config (remote mode) or standalone
-  if (!window.WS_HOST && !window.WS_PORT) {
+  if (!window.WS_HOST && window.WS_PORT === undefined) {
     // Standalone mode - show file ops, hide remote ops
     isRemoteMode = false;
     document.getElementById('authOverlay').classList.add('hidden');
@@ -2071,6 +2086,7 @@ window.WS_HOST = '{{WS_HOST}}';
 window.WS_PORT = {{WS_PORT}};
 window.WS_PROTOCOL = '{{WS_PROTOCOL}}';
 
+if (window.opener) document.getElementById('backBtn').style.display = '';
 initPickerEvents();
 initConnection();
 </script>

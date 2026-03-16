@@ -79,15 +79,11 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void openServerSettings() {
             runOnUiThread(() -> {
-                // Clear saved host/port to force settings screen to show
-                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-                SharedPreferences.Editor editor = prefs.edit();
-                editor.remove(KEY_SERVER_HOST);
-                editor.remove(KEY_SERVER_PORT);
-                editor.apply();
-
-                // Open settings activity
-                openSettings("Change Clay server connection");
+                // Open settings activity with fromMenu flag (don't clear host/port)
+                Intent intent = new Intent(MainActivity.this, SettingsActivity.class);
+                intent.putExtra("errorMessage", "Change Clay server connection");
+                intent.putExtra("fromMenu", true);
+                startActivity(intent);
             });
         }
 

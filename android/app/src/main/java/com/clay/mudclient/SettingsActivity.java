@@ -23,6 +23,7 @@ public class SettingsActivity extends AppCompatActivity {
     private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
     private static final String KEY_LOCAL_NETMASK = "localNetmask";
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
+    private static final String KEY_AUTH_KEY = "authKey";
 
     private EditText serverHostInput;
     private EditText serverPortInput;
@@ -35,6 +36,9 @@ public class SettingsActivity extends AppCompatActivity {
     private EditText serverPasswordInput;
     private TextView connectionStatus;
     private Button saveButton;
+    private Button cancelButton;
+    private TextView authKeyValue;
+    private boolean fromMenu;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -52,17 +56,22 @@ public class SettingsActivity extends AppCompatActivity {
         serverPasswordInput = findViewById(R.id.serverPassword);
         connectionStatus = findViewById(R.id.connectionStatus);
         saveButton = findViewById(R.id.saveButton);
+        cancelButton = findViewById(R.id.cancelButton);
+        authKeyValue = findViewById(R.id.authKeyValue);
+
+        fromMenu = getIntent().getBooleanExtra("fromMenu", false);
 
         // Load saved settings
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String savedHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
-        int savedPort = prefs.getInt(KEY_SERVER_PORT, 9000);
+        int savedPort = prefs.getInt(KEY_SERVER_PORT, 0);
         boolean savedSecure = prefs.getBoolean(KEY_USE_SECURE, false);
         boolean savedAdvanced = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
         String savedNetmask = prefs.getString(KEY_LOCAL_NETMASK, "");
         String savedRemoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
         String savedUsername = prefs.getString(KEY_SAVED_USERNAME, "");
         String savedPassword = prefs.getString(KEY_SAVED_PASSWORD, "");
+        String authKey = prefs.getString(KEY_AUTH_KEY, "");
 
         serverHostInput.setText(savedHost);
         serverPortInput.setText(savedPort > 0 ? String.valueOf(savedPort) : "");
@@ -73,6 +82,15 @@ public class SettingsActivity extends AppCompatActivity {
         remoteHostnameInput.setText(savedRemoteHost);
         serverUsernameInput.setText(savedUsername);
         serverPasswordInput.setText(savedPassword);
+
+        // Display auth key
+        if (authKey != null && !authKey.isEmpty()) {
+            authKeyValue.setText(authKey);
+        } else {
+            authKeyValue.setText("none");
+            authKeyValue.setTextColor(0xFF484F58);  // dimmer color for "none"
+            authKeyValue.setTypeface(null, android.graphics.Typeface.ITALIC);
+        }
 
         // Toggle advanced section visibility
         advancedCheckbox.setOnCheckedChangeListener((buttonView, isChecked) -> {
@@ -92,14 +110,20 @@ public class SettingsActivity extends AppCompatActivity {
             updatePortHint();
         });
 
+        // Show cancel button only when opened from menu
+        if (fromMenu) {
+            cancelButton.setVisibility(View.VISIBLE);
+            cancelButton.setOnClickListener(v -> finish());
+        }
+
         saveButton.setOnClickListener(v -> saveAndConnect());
     }
 
     private void updatePortHint() {
         if (secureSwitch.isChecked()) {
-            serverPortInput.setHint("port (default: 9001 for HTTPS)");
+            serverPortInput.setHint("9001");
         } else {
-            serverPortInput.setHint("port (default: 9000 for HTTP)");
+            serverPortInput.setHint("9000");
         }
     }
 
@@ -161,7 +185,13 @@ public class SettingsActivity extends AppCompatActivity {
 
     @Override
     public void onBackPressed() {
-        // Check if we have valid settings before allowing back
+        if (fromMenu) {
+            // Opened from menu - back just returns to Clay
+            finish();
+            return;
+        }
+
+        // Initial setup - check if we have valid settings before allowing back
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, null);
         int port = prefs.getInt(KEY_SERVER_PORT, 0);

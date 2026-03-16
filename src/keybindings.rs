@@ -82,7 +82,7 @@ pub const ACTIONS: &[ActionInfo] = &[
 
     // Clay Extensions
     ActionInfo { id: "toggle_tags", name: "Toggle Tags (F2)", category: "Clay" },
-    ActionInfo { id: "filter_popup", name: "Filter Popup (F4)", category: "Clay" },
+    ActionInfo { id: "filter_popup", name: "Find (F4)", category: "Clay" },
     ActionInfo { id: "toggle_action_highlight", name: "Toggle Highlights (F8)", category: "Clay" },
     ActionInfo { id: "toggle_gmcp_media", name: "Toggle GMCP Media (F9)", category: "Clay" },
     ActionInfo { id: "input_grow", name: "Grow Input Area", category: "Clay" },
@@ -100,17 +100,17 @@ impl KeyBindings {
     pub fn tf_defaults() -> Self {
         let mut b = HashMap::new();
 
-        // Cursor Movement
+        // Cursor Movement (TF defaults: ^B/^F = char, Esc-b/Esc-f = word)
         b.insert("^A".into(), "cursor_home".into());
-        b.insert("^B".into(), "cursor_word_left".into());
+        b.insert("^B".into(), "cursor_left".into());
         b.insert("^E".into(), "cursor_end".into());
-        b.insert("^F".into(), "cursor_word_right".into());
+        b.insert("^F".into(), "cursor_right".into());
         b.insert("Left".into(), "cursor_left".into());
         b.insert("Right".into(), "cursor_right".into());
         b.insert("Home".into(), "cursor_home".into());
         b.insert("End".into(), "cursor_end".into());
-        b.insert("Esc-b".into(), "world_previous".into());
-        b.insert("Esc-f".into(), "world_forward".into());
+        b.insert("Esc-b".into(), "cursor_word_left".into());
+        b.insert("Esc-f".into(), "cursor_word_right".into());
 
         // Editing
         b.insert("Backspace".into(), "delete_backward".into());
@@ -299,13 +299,14 @@ impl KeyBindings {
     /// Save to INI file. Only saves bindings that differ from TF defaults.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let defaults = Self::tf_defaults();
-        let mut lines = Vec::new();
-        lines.push("# Clay Keyboard Bindings".to_string());
-        lines.push("# Format: key = action".to_string());
-        lines.push("# Only modified bindings are saved (defaults are built-in)".to_string());
-        lines.push("# Use UNBOUND to remove a default binding".to_string());
-        lines.push(String::new());
-        lines.push("[bindings]".to_string());
+        let mut lines = vec![
+            "# Clay Keyboard Bindings".to_string(),
+            "# Format: key = action".to_string(),
+            "# Only modified bindings are saved (defaults are built-in)".to_string(),
+            "# Use UNBOUND to remove a default binding".to_string(),
+            String::new(),
+            "[bindings]".to_string(),
+        ];
 
         // Find bindings that differ from defaults
         let mut entries: Vec<(&String, &String)> = self.bindings.iter()
@@ -492,7 +493,10 @@ mod tests {
         let kb = KeyBindings::tf_defaults();
         assert_eq!(kb.get_action("^A"), Some("cursor_home"));
         assert_eq!(kb.get_action("Up"), Some("cursor_up"));
-        assert_eq!(kb.get_action("Esc-b"), Some("world_previous"));
+        assert_eq!(kb.get_action("^B"), Some("cursor_left"));
+        assert_eq!(kb.get_action("^F"), Some("cursor_right"));
+        assert_eq!(kb.get_action("Esc-b"), Some("cursor_word_left"));
+        assert_eq!(kb.get_action("Esc-f"), Some("cursor_word_right"));
         assert_eq!(kb.get_action("^Y"), Some("yank"));
         assert_eq!(kb.get_action("F1"), Some("help"));
     }

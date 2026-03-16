@@ -22,8 +22,6 @@ pub const SETUP_FIELD_EDITOR_SIDE: FieldId = FieldId(11);
 pub const SETUP_FIELD_MOUSE: FieldId = FieldId(12);
 pub const SETUP_FIELD_ZWJ: FieldId = FieldId(13);
 pub const SETUP_FIELD_ANSI_MUSIC: FieldId = FieldId(14);
-pub const SETUP_FIELD_ARROW_UP_DOWN: FieldId = FieldId(15);
-pub const SETUP_FIELD_SHIFT_ARROW_UP_DOWN: FieldId = FieldId(16);
 pub const SETUP_FIELD_NEW_LINE_INDICATOR: FieldId = FieldId(17);
 
 // Button IDs
@@ -54,15 +52,6 @@ pub fn editor_side_options() -> Vec<SelectOption> {
     ]
 }
 
-/// Arrow key mode options
-pub fn arrow_key_options() -> Vec<SelectOption> {
-    vec![
-        SelectOption::new("cycle_worlds", "Cycle Worlds"),
-        SelectOption::new("input_line", "Input Up/Down"),
-        SelectOption::new("command_history", "Command History"),
-    ]
-}
-
 /// Create the setup popup definition with current values
 #[allow(clippy::too_many_arguments)]
 pub fn create_setup_popup(
@@ -79,23 +68,11 @@ pub fn create_setup_popup(
     mouse_enabled: bool,
     zwj_enabled: bool,
     ansi_music: bool,
-    arrow_up_down: &str,
-    shift_arrow_up_down: &str,
     new_line_indicator: bool,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
     let editor_side_idx = if editor_side == "right" { 1 } else { 0 };
-    let arrow_up_down_idx = match arrow_up_down {
-        "input_line" => 1,
-        "command_history" => 2,
-        _ => 0,
-    };
-    let shift_arrow_up_down_idx = match shift_arrow_up_down {
-        "input_line" => 1,
-        "command_history" => 2,
-        _ => 0,
-    };
 
     PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -140,7 +117,7 @@ pub fn create_setup_popup(
         ))
         .with_field(Field::new(
             SETUP_FIELD_DICTIONARY,
-            "Dictionary",
+            "Dictionary Path",
             FieldKind::text(dictionary_path),
         ))
         .with_field(Field::new(
@@ -162,16 +139,6 @@ pub fn create_setup_popup(
             SETUP_FIELD_ANSI_MUSIC,
             "ANSI Music",
             FieldKind::toggle(ansi_music),
-        ))
-        .with_field(Field::new(
-            SETUP_FIELD_ARROW_UP_DOWN,
-            "Up/Down Arrow",
-            FieldKind::select(arrow_key_options(), arrow_up_down_idx),
-        ))
-        .with_field(Field::new(
-            SETUP_FIELD_SHIFT_ARROW_UP_DOWN,
-            "Ctrl+Up/Down",
-            FieldKind::select(arrow_key_options(), shift_arrow_up_down_idx),
         ))
         .with_field(Field::new(
             SETUP_FIELD_NEW_LINE_INDICATOR,
@@ -203,13 +170,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            "cycle_worlds", "input_line", false,
+            false,
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 16);
+        assert_eq!(state.definition.fields.len(), 14);
         assert_eq!(state.definition.buttons.len(), 2);
     }
 
@@ -218,7 +185,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            "input_line", "cycle_worlds", false,
+            false,
         );
         let state = PopupState::new(def);
 

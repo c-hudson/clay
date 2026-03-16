@@ -68,19 +68,22 @@
 
         <!-- Menu dropdown (unified, opens upward from status/nav bar) -->
         <div id="menu-dropdown" class="menu-dropdown">
+            <div class="menu-item" data-action="help">Help<span class="shortcut">F1</span></div>
             <div class="menu-item" data-action="world-selector">World Selector<span class="shortcut">/worlds</span></div>
             <div class="menu-item" data-action="actions">Actions<span class="shortcut">/actions</span></div>
             <div class="menu-sep"></div>
             <div class="menu-item" data-action="setup">Setup<span class="shortcut">/setup</span></div>
             <div class="menu-item" data-action="web">Web Settings<span class="shortcut">/web</span></div>
             <div class="menu-item" data-action="font">Font<span class="shortcut">/font</span></div>
+            <div class="menu-item" data-action="theme-editor">Theme Editor</div>
+            <div class="menu-item" data-action="keybind-editor">Keybind Editor</div>
             <div class="menu-sep"></div>
             <div class="menu-item" data-action="toggle-tags">Toggle Tags<span class="shortcut">F2</span></div>
-            <div class="menu-item" data-action="filter">Filter<span class="shortcut">F4</span></div>
+            <div class="menu-item" data-action="filter">Find<span class="shortcut">F4</span></div>
             <div class="menu-sep"></div>
             <div class="menu-item menu-change-password" data-action="change-password" style="display: none;">Change Password</div>
-            <div class="menu-item" data-action="reload">Reload<span class="shortcut">Ctrl+R</span></div>
-            <div class="menu-item" data-action="resync">Resync</div>
+            <div class="menu-item menu-reload" data-action="reload" style="display: none;">Reload<span class="shortcut">Ctrl+R</span></div>
+            <div class="menu-item menu-resync" data-action="resync">Resync</div>
             <div class="menu-item menu-clay-server" data-action="clay-server" style="display: none;">Clay Server</div>
             <div class="menu-sep menu-logout-divider" style="display: none;"></div>
             <div class="menu-item menu-logout" data-action="logout" style="display: none;">Logout</div>
@@ -95,6 +98,10 @@
                     <input type="text" id="auth-username" placeholder="Username" autocomplete="off">
                 </div>
                 <input type="password" id="auth-password" placeholder="Password" autocomplete="off">
+                <div id="auth-key-row" style="display: none;">
+                    <label id="auth-key-label" style="display: block; margin: 8px 0 4px; font-size: 0.85em; color: #aaa;">Auth Key</label>
+                    <input type="text" id="auth-key" placeholder="Auth key (auto-populated)" autocomplete="off" style="font-family: monospace; font-size: 0.85em;">
+                </div>
                 <div id="auth-error" class="error"></div>
                 <button id="auth-submit">Connect</button>
             </div>
@@ -531,26 +538,6 @@
                                 <span class="setting-label">ZWJ Sequence</span>
                                 <div class="setting-value">
                                     <div id="setup-zwj-toggle" class="toggle"></div>
-                                </div>
-                            </div>
-                            <div class="setting-row">
-                                <span class="setting-label">Up/Down arrow</span>
-                                <div class="setting-value">
-                                    <select id="setup-arrow-updown-select" class="form-select">
-                                        <option value="cycle_worlds">Cycle Worlds</option>
-                                        <option value="input_line">Input Up/Down</option>
-                                        <option value="command_history">Command History</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="setting-row">
-                                <span class="setting-label">Ctrl+Up/Down</span>
-                                <div class="setting-value">
-                                    <select id="setup-shift-arrow-select" class="form-select">
-                                        <option value="cycle_worlds">Cycle Worlds</option>
-                                        <option value="input_line">Input Up/Down</option>
-                                        <option value="command_history">Command History</option>
-                                    </select>
                                 </div>
                             </div>
                         </div>

@@ -184,6 +184,10 @@ pub const HELP_LINES: &[&str] = &[
     "  %L, %R                     Left/right of match",
     "  %P0-%P9                    Regex capture groups",
     "  %%                         Literal percent sign",
+    "",
+    "Editors:             (open in browser via HTTP port)",
+    "  /theme-editor              Customize GUI/web colors",
+    "  /keybind-editor            Configure keyboard bindings",
 ];
 
 /// Topic-specific help content for Clay commands.

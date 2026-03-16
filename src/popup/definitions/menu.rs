@@ -22,6 +22,8 @@ pub enum MenuItem {
     Actions,
     WorldSelector,
     ConnectedWorlds,
+    ThemeEditor,
+    KeybindEditor,
 }
 
 impl MenuItem {
@@ -33,6 +35,8 @@ impl MenuItem {
             MenuItem::Actions,
             MenuItem::WorldSelector,
             MenuItem::ConnectedWorlds,
+            MenuItem::ThemeEditor,
+            MenuItem::KeybindEditor,
         ]
     }
 
@@ -44,6 +48,8 @@ impl MenuItem {
             MenuItem::Actions => "Actions",
             MenuItem::WorldSelector => "World Selector",
             MenuItem::ConnectedWorlds => "Connected Worlds",
+            MenuItem::ThemeEditor => "Theme Editor",
+            MenuItem::KeybindEditor => "Keybind Editor",
         }
     }
 
@@ -55,6 +61,8 @@ impl MenuItem {
             MenuItem::Actions => "/actions",
             MenuItem::WorldSelector => "/worlds",
             MenuItem::ConnectedWorlds => "/connections",
+            MenuItem::ThemeEditor => "/theme-editor",
+            MenuItem::KeybindEditor => "/keybind-editor",
         }
     }
 }
@@ -106,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_menu_items() {
-        assert_eq!(MenuItem::all().len(), 6);
+        assert_eq!(MenuItem::all().len(), 8);
         assert_eq!(MenuItem::Help.label(), "Help");
         assert_eq!(MenuItem::Help.command(), "/help");
     }

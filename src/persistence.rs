@@ -202,8 +202,6 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
-    writeln!(file, "arrow_up_down_mode={}", app.settings.arrow_up_down_mode.name())?;
-    writeln!(file, "shift_arrow_up_down_mode={}", app.settings.shift_arrow_up_down_mode.name())?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -648,11 +646,8 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     "new_line_indicator" => {
                         app.settings.new_line_indicator = value == "true";
                     }
-                    "arrow_up_down_mode" => {
-                        app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(value);
-                    }
-                    "shift_arrow_up_down_mode" => {
-                        app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(value);
+                    "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
+                        // Legacy: silently ignore (now handled by keybindings system)
                     }
                     _ => {}
                 }
@@ -1166,8 +1161,6 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
-    writeln!(file, "arrow_up_down_mode={}", app.settings.arrow_up_down_mode.name())?;
-    writeln!(file, "shift_arrow_up_down_mode={}", app.settings.shift_arrow_up_down_mode.name())?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -1188,6 +1181,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "unseen_lines={}", world.unseen_lines)?;
         writeln!(file, "paused={}", world.paused)?;
         writeln!(file, "lines_since_pause={}", world.lines_since_pause)?;
+        writeln!(file, "visual_line_offset={}", world.visual_line_offset)?;
         writeln!(file, "is_tls={}", world.is_tls)?;
         writeln!(file, "was_connected={}", world.was_connected)?;
         writeln!(file, "showing_splash={}", world.showing_splash)?;
@@ -1418,6 +1412,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         paused: bool,
         pending_lines: Vec<OutputLine>,
         lines_since_pause: usize,
+        visual_line_offset: usize,
         is_tls: bool,
         was_connected: bool,
         showing_splash: bool,
@@ -1524,6 +1519,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         paused: false,
                         pending_lines: Vec::new(),
                         lines_since_pause: 0,
+                        visual_line_offset: 0,
                         is_tls: false,
                         was_connected: false,
                         showing_splash: false,
@@ -1775,11 +1771,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "new_line_indicator" => {
                         app.settings.new_line_indicator = value == "true";
                     }
-                    "arrow_up_down_mode" => {
-                        app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(value);
-                    }
-                    "shift_arrow_up_down_mode" => {
-                        app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(value);
+                    "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
+                        // Legacy: silently ignore (now handled by keybindings system)
                     }
                     "history_count" | "world_count" => {
                         // These are informational, not needed for parsing
@@ -1800,6 +1793,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "unseen_lines" => tw.unseen_lines = value.parse().unwrap_or(0),
                             "paused" => tw.paused = value == "true",
                             "lines_since_pause" => tw.lines_since_pause = value.parse().unwrap_or(0),
+                            "visual_line_offset" => tw.visual_line_offset = value.parse().unwrap_or(0),
                             "is_tls" => tw.is_tls = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
                             "showing_splash" => tw.showing_splash = value == "true",
@@ -1908,6 +1902,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.paused = tw.paused;
         world.pending_lines = tw.pending_lines;
         world.lines_since_pause = tw.lines_since_pause;
+        world.visual_line_offset = tw.visual_line_offset;
         world.is_tls = tw.is_tls;
         world.was_connected = tw.was_connected;
         world.showing_splash = tw.showing_splash;
@@ -1938,6 +1933,35 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
     // Validate current_world_index
     if app.current_world_index >= app.worlds.len() {
         app.current_world_index = 0;
+    }
+
+    // Load auth keys from ~/.clay.dat (they're not in the reload state file)
+    let settings_path = get_settings_path();
+    if settings_path.exists() {
+        if let Ok(settings_content) = std::fs::read_to_string(&settings_path) {
+            for line in settings_content.lines() {
+                let trimmed = line.trim();
+                if let Some(value) = trimmed.strip_prefix("websocket_auth_key=") {
+                    let (enc_part, timestamp) = if let Some(pipe_pos) = value.rfind('|') {
+                        let ts_str = &value[pipe_pos + 1..];
+                        if let Ok(ts) = ts_str.parse::<u64>() {
+                            (&value[..pipe_pos], ts)
+                        } else {
+                            (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                        }
+                    } else {
+                        (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                    };
+                    let key = decrypt_password(enc_part);
+                    if !key.is_empty() {
+                        let ak = crate::AuthKey { key, created_at: timestamp };
+                        if !ak.is_expired() {
+                            app.settings.websocket_auth_keys.push(ak);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Clean up the reload state file
@@ -2004,8 +2028,6 @@ mod tests {
             editor_side: EditorSide::Right,    // default: Left
             mouse_enabled: false,              // default: true
             zwj_enabled: true,                 // default: false
-            arrow_up_down_mode: ArrowKeyMode::InputLine, // default: CycleWorlds
-            shift_arrow_up_down_mode: ArrowKeyMode::CycleWorlds, // default: InputLine
             new_line_indicator: true,             // default: false
         }
     }
@@ -2082,8 +2104,6 @@ mod tests {
         assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
         assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
-        assert_eq!(a.arrow_up_down_mode.name(), b.arrow_up_down_mode.name(), "{context}: arrow_up_down_mode");
-        assert_eq!(a.shift_arrow_up_down_mode.name(), b.shift_arrow_up_down_mode.name(), "{context}: shift_arrow_up_down_mode");
         assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
     }
 
@@ -2192,8 +2212,6 @@ mod tests {
         assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
         assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
-        assert_ne!(non_default.arrow_up_down_mode.name(), default.arrow_up_down_mode.name(), "arrow_up_down_mode should differ");
-        assert_ne!(non_default.shift_arrow_up_down_mode.name(), default.shift_arrow_up_down_mode.name(), "shift_arrow_up_down_mode should differ");
         assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
     }
 

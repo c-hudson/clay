@@ -95,7 +95,7 @@ pub enum WsMessage {
     /// is_viewed: true if any interface (console/web/GUI) is viewing this world
     /// ts: timestamp in seconds since Unix epoch (when the line was received)
     /// from_server: true if data came from MUD server, false if client-generated
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default)] marked_new: bool, #[serde(default, skip_serializing_if = "is_false")] flush: bool },
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default)] marked_new: bool, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
@@ -229,10 +229,6 @@ pub enum WsMessage {
         mouse_enabled: bool,
         #[serde(default)]
         zwj_enabled: bool,
-        #[serde(default)]
-        arrow_up_down_mode: String,
-        #[serde(default)]
-        shift_arrow_up_down_mode: String,
         #[serde(default)]
         new_line_indicator: bool,
     },
@@ -476,10 +472,6 @@ pub struct GlobalSettingsMsg {
     pub mouse_enabled: bool,
     #[serde(default)]
     pub zwj_enabled: bool,
-    #[serde(default)]
-    pub arrow_up_down_mode: String,
-    #[serde(default)]
-    pub shift_arrow_up_down_mode: String,
     #[serde(default)]
     pub new_line_indicator: bool,
     /// Theme colors from ~/.clay.theme.dat (serialized as hex strings)
@@ -1349,7 +1341,7 @@ where
                                 if matches {
                                     (true, None, None)
                                 } else {
-                                    (false, Some("Invalid password".to_string()), None)
+                                    (false, Some("Authentication failed".to_string()), None)
                                 }
                             };
 

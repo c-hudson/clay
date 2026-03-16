@@ -36,6 +36,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **Notes Editor** - Per-world split-screen notes editor (`/edit`)
 - **Termux Support** - Runs on Android via Termux
 - **Android App** - WebSocket client with push notifications via `/notify`
+- **Grep Mode** - Search world output history or follow live output (`--grep`)
 - **Daemon Mode** - Run headless as a background process (`-D`)
 - **Multiuser Mode** - Shared server with per-user worlds and actions (`--multiuser`)
 
@@ -122,6 +123,12 @@ cargo build --release --no-default-features --features rustls-backend
 # Run as multiuser server
 ./clay --multiuser
 
+# Search world output history (glob pattern)
+CLAY_PASSWORD=pass ./clay --grep=hostname:port '*tells you*'
+
+# Follow live output matching a pattern (like tail -f | grep)
+CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
+
 # Use custom config file (default: ~/.clay.dat)
 ./clay --conf=/path/to/config.dat
 ```
@@ -186,8 +193,6 @@ All keybindings are configurable via `~/.clay.key.dat`. Defaults follow TinyFugu
 |-----|--------|
 | `Ctrl+Up/Down` | Switch between active worlds |
 | `Shift+Up/Down` | Cycle through all worlds |
-| `Escape b` | Previous world |
-| `Escape f` | Next world |
 | `Escape w` | Switch to world with activity |
 
 **Input Editing:**
@@ -195,7 +200,8 @@ All keybindings are configurable via `~/.clay.key.dat`. Defaults follow TinyFugu
 | Key | Action |
 |-----|--------|
 | `Left/Right` | Move cursor one character |
-| `Ctrl+B/F` | Move cursor one word left/right |
+| `Ctrl+B/F` | Move cursor left/right one character |
+| `Escape b/f` | Move cursor one word left/right |
 | `Up/Down` | Move cursor up/down (multi-line input) |
 | `Ctrl+A` / `Home` | Jump to start of line |
 | `Ctrl+E` / `End` | Jump to end of line |
