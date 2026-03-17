@@ -4468,14 +4468,19 @@
         // URL pattern that works on HTML-escaped text
         // Matches http://, https://, or www. followed by non-whitespace
         // Stops at HTML tags, quotes, or common punctuation at end
-        const urlPattern = /(\b(?:https?:\/\/|www\.)[^\s<>"']*[^\s<>"'.,;:!?\)\]}>])/gi;
+        const urlPattern = /(\b(?:https?:\/\/|www\.)[^\s<>"'\u201C\u201D\u2018\u2019]*[^\s<>"'\u201C\u201D\u2018\u2019.,;:!?\)\]}>])/gi;
 
         return html.replace(urlPattern, function(url) {
+            // Strip trailing HTML entities (complete like &quot; or partial like &quot
+            // that got included because escapeHtml converts " to &quot; before this runs).
+            // The regex stops at ; so we get partial entities like &quot or &amp at the end.
+            let trimmed = url.replace(/&[a-zA-Z#0-9]*$/, '');
+            const suffix = url.substring(trimmed.length);
             // Strip zero-width spaces from href (inserted by insertWordBreaks)
-            const cleanUrl = url.replace(/\u200B/g, '');
+            const cleanUrl = trimmed.replace(/\u200B/g, '');
             // Add protocol if missing (for www. URLs)
             const href = cleanUrl.startsWith('www.') ? 'https://' + cleanUrl : cleanUrl;
-            return `<a href="${href}" target="_blank" rel="noopener" class="output-link">${url}</a>`;
+            return `<a href="${href}" target="_blank" rel="noopener" class="output-link">${trimmed}</a>${suffix}`;
         });
     }
 

@@ -705,7 +705,8 @@ pub fn wrap_urls_with_osc8(s: &str) -> String {
                 // End URL at whitespace, ANSI escape, or common text delimiters
                 // ESC (0x1B) must be a delimiter to avoid including ANSI color codes in URLs
                 if c.is_whitespace() || c == '\x1b' || c == '"' || c == '\'' || c == '<' || c == '>'
-                   || c == '[' || c == ']' || c == '(' || c == ')' || c == '{' || c == '}' {
+                   || c == '[' || c == ']' || c == '(' || c == ')' || c == '{' || c == '}'
+                   || c == '\u{201C}' || c == '\u{201D}' || c == '\u{2018}' || c == '\u{2019}' {
                     break;
                 }
                 url_end += 1;
