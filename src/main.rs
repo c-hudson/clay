@@ -2448,6 +2448,9 @@ impl World {
     /// Release pending lines, counting by VISUAL lines (wrapped line count) to fill
     /// approximately one screenful. Always releases at least one logical line.
     pub fn release_pending(&mut self, visual_budget: usize, output_width: usize) {
+        // Reset visual_line_offset so truncated wrapped lines from the pause trigger
+        // are fully visible after releasing.
+        self.visual_line_offset = 0;
         if self.pending_lines.is_empty() {
             self.paused = false;
             self.lines_since_pause = 0;
@@ -2541,6 +2544,7 @@ impl World {
         for line in &mut self.pending_lines {
             line.marked_new = false;
         }
+        self.visual_line_offset = 0;
         // Adjust scroll offset if it's now past the end
         if self.scroll_offset > 0 && self.scroll_offset >= self.output_lines.len() {
             self.scroll_offset = self.output_lines.len().saturating_sub(1);
