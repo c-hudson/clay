@@ -1246,8 +1246,6 @@ pub enum Command {
     Font,
     /// /send [-W] [-w<world>] [-n] <text> - send text
     Send { text: String, all_worlds: bool, target_world: Option<String>, no_newline: bool },
-    /// /gag <pattern> - gag lines matching pattern
-    Gag { pattern: String },
     /// /remote - list remotely connected clients
     Remote,
     /// /remote --kill <id> - disconnect a remote client
@@ -1347,13 +1345,6 @@ pub fn parse_command(input: &str) -> Command {
         "/menu" => Command::Menu,
         "/font" => Command::Font,
         "/send" => parse_send_command(args, trimmed),
-        "/gag" => {
-            if args.is_empty() {
-                Command::Unknown { cmd: trimmed.to_string() }
-            } else {
-                Command::Gag { pattern: args.join(" ") }
-            }
-        }
         "/remote" => {
             if args.len() >= 2 && args[0] == "--kill" {
                 if let Ok(id) = args[1].parse::<u64>() {
@@ -5860,19 +5851,6 @@ impl App {
                         flush: false, gagged: false,
                     });
                 }
-            }
-            Command::Gag { pattern } => {
-                // TODO: Implement gag patterns storage
-                self.ws_broadcast(WsMessage::ServerData {
-                    world_index,
-                    data: format!("Gag pattern set: {}", pattern),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
             }
             Command::Remote => {
                 if let Some(ref ws_server) = self.ws_server {
@@ -19897,10 +19875,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 });
             }
         }
-        Command::Gag { pattern } => {
-            // TODO: Implement gag patterns
-            app.add_output(&format!("Gag pattern set: {}", pattern));
-        }
         Command::Remote => {
             let lines = if let Some(ref ws_server) = app.ws_server {
                 if let Ok(clients) = ws_server.clients.try_read() {
@@ -25761,7 +25735,7 @@ mod tests {
         let mut rust_commands: Vec<String> = vec![
             "help", "version", "quit", "reload", "update", "setup", "web", "actions",
             "connections", "l", "worlds", "world", "disconnect", "dc",
-            "flush", "menu", "send", "gag", "remote", "ban", "unban",
+            "flush", "menu", "send", "remote", "ban", "unban",
             "testmusic", "dump", "notify", "addworld", "edit", "tag", "tags",
             "dict", "urban", "translate", "tr", "font",
         ].into_iter().map(|s| s.to_string()).collect();

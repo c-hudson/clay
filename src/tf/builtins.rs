@@ -745,13 +745,25 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
     TfCommandResult::Recall(opts)
 }
 
-/// /gag pattern - Add a gag pattern (suppress matching output)
-/// Note: Returns a message for main.rs integration
+/// /gag [pattern] - Add a gag pattern, or list current gags if no pattern given
 pub fn cmd_gag(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pattern = args.trim();
 
     if pattern.is_empty() {
-        return TfCommandResult::Error("Usage: /gag pattern".to_string());
+        // List all gag patterns
+        let gags: Vec<_> = engine.macros.iter()
+            .filter(|m| m.attributes.gag && m.trigger.is_some())
+            .collect();
+        if gags.is_empty() {
+            return TfCommandResult::Success(Some("No gag patterns defined.".to_string()));
+        }
+        let mut lines = vec!["Gag patterns:".to_string()];
+        for m in &gags {
+            if let Some(ref trigger) = m.trigger {
+                lines.push(format!("  /gag {}  [{}]", trigger.pattern, m.name));
+            }
+        }
+        return TfCommandResult::Success(Some(lines.join("\n")));
     }
 
     // Create a macro with gag attribute

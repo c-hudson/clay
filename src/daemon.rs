@@ -763,18 +763,6 @@ pub async fn handle_daemon_ws_message(
                         });
                     }
                 }
-                Command::Gag { pattern } => {
-                    app.ws_broadcast(WsMessage::ServerData {
-                        world_index,
-                        data: format!("Gag pattern set: {}", pattern),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                    });
-                }
                 Command::Remote => {
                     if let Some(ref ws_server) = app.ws_server {
                         let output = if let Ok(clients) = ws_server.clients.try_read() {

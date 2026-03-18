@@ -500,7 +500,7 @@
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc',
-        'flush', 'menu', 'send', 'gag', 'remote', 'ban', 'unban',
+        'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'edit', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font',
     ];
@@ -3319,7 +3319,7 @@
             { l: '/translate &lt;lang&gt; &lt;prefix&gt; &lt;text&gt;', r: 'Translate text (or /tr)' },
             { heading: 'Actions &amp; Triggers' },
             { l: '/actions [world]', r: 'Open actions editor' },
-            { l: '/gag &lt;pattern&gt;', r: 'Gag lines matching pattern' },
+            { l: '/gag [pattern]', r: 'List gags, or gag lines matching pattern' },
             { l: '/&lt;action_name&gt; [args]', r: 'Execute named action' },
             { heading: 'Settings' },
             { l: '/setup', r: 'Open global settings' },

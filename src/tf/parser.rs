@@ -63,8 +63,8 @@ pub fn is_tf_command(input: &str) -> bool {
 }
 
 /// Check if a command name (without prefix) is a TF command
-/// Note: "help" and "gag" are NOT included here because they have Clay equivalents.
-/// Use /tfhelp and /tfgag for the TF versions.
+/// Note: "help" is NOT included here because it has a Clay equivalent.
+/// Use /tfhelp for the TF version.
 fn is_tf_command_name(cmd: &str) -> bool {
     matches!(cmd,
         "set" | "unset" | "let" | "setenv" | "listvar" |
@@ -75,7 +75,7 @@ fn is_tf_command_name(cmd: &str) -> bool {
         "bind" | "unbind" | "hook" | "unhook" |
         "load" | "save" | "require" | "loaded" | "lcd" | "log" |
         "sh" | "time" | "recall" | "repeat" | "ps" | "kill" |
-        "fg" | "trigger" | "input" | "grab" | "ungag" | "exit" | "shift" |
+        "fg" | "trigger" | "input" | "grab" | "gag" | "ungag" | "exit" | "shift" |
         // These are also TF commands (mapped to Clay equivalents)
         "quit" | "dc" | "disconnect" | "world" | "listworlds" |
         "listsockets" | "connections" | "connect" | "addworld" | "version" |
@@ -1000,7 +1000,7 @@ Output:
   /send [-w world] text - Send text to MUD
   /beep                - Terminal bell
   /quote text          - Send without substitution
-  /tfgag pattern       - Suppress matching lines (TF)
+  /gag [pattern]       - List gags, or suppress matching lines
   /ungag pattern       - Remove gag
   /recall [pattern]    - Search output history
 
@@ -1030,7 +1030,7 @@ Misc:
   /version             - Show version info
   /quit                - Exit Clay
 
-Use /tfhelp and /tfgag for TF versions of conflicting commands.
+Use /tfhelp for TF version of /help.
 
 Variable Substitution:
   %{varname}           - Variable value
