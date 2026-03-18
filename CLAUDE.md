@@ -2,9 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Debug Output
+## Critical Rules
 
-**IMPORTANT: Never write debug output to stdout or stderr (no `println!`, `eprintln!`, `dbg!`).**
+**NEVER write debug output to stdout or stderr (no `println!`, `eprintln!`, `dbg!`).** Debug output corrupts the TUI. Use instead:
+- `debug_log(true, msg)` for always-on logging (writes to `clay.debug.log`)
+- `debug_log(is_debug_enabled(), msg)` for user-toggled debug
+- `output_debug_log(msg)` for output/seq debugging (writes to `clay.output.debug`)
+- `add_tf_output()` to display messages in the output area
 
 Debug output interferes with the TUI and corrupts the terminal display. Instead:
 - Use `debug_log(true, msg)` for always-on logging or `debug_log(is_debug_enabled(), msg)` for user-toggled debug (writes to `clay.debug.log`)
@@ -13,17 +17,11 @@ Debug output interferes with the TUI and corrupts the terminal display. Instead:
 
 ## Build Commands
 
-**IMPORTANT: Always use the musl debug build. Never use release builds.**
-
 ```bash
 # Default build command (always use this)
 cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
-
 # Output: target/x86_64-unknown-linux-musl/debug/clay
-```
 
-Other commands:
-```bash
 cargo build --features webview-gui   # Build with webview GUI client
 cargo test                           # Run all tests
 cargo test test_name                 # Run a single test
@@ -109,6 +107,6 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 
 ### /release Skill
 
-Automated multi-platform build and GitHub release. Invoke with `/release [version]`.
+Automated multi-platform build and GitHub release. Invoke with `/release [version]`. Skill files in `.claude/skills/release/`.
 
 Skill files: `.claude/skills/release/SKILL.md` (instructions), `.claude/skills/release/machines.md` (machine details).
