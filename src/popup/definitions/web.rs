@@ -92,6 +92,8 @@ pub fn create_web_popup(
             tab_buttons_only: false,
         });
 
+    def = def.with_help(web_help_text());
+
     // Hide TLS fields if not secure
     if !web_secure {
         if let Some(field) = def.get_field_mut(WEB_FIELD_WS_CERT_FILE) {
@@ -103,6 +105,36 @@ pub fn create_web_popup(
     }
 
     def
+}
+
+/// Help text for the Web Settings popup
+fn web_help_text() -> Vec<String> {
+    vec![
+        "Web Settings - Remote Access",
+        "",
+        "These settings let you access Clay from a web",
+        "browser or mobile device on your network.",
+        "",
+        "Protocol: Choose Secure (HTTPS/WSS) or Non-Secure",
+        "  (HTTP/WS). Secure requires TLS certificate files.",
+        "",
+        "HTTP Enabled: Starts a web server so you can open",
+        "  Clay in a browser at http://yourhost:port.",
+        "",
+        "HTTP Port: The port number for the web server.",
+        "",
+        "WS Password: Password required for WebSocket clients",
+        "  (web, mobile, remote console) to connect.",
+        "",
+        "WS Allow List: Comma-separated IP addresses or",
+        "  subnets allowed to connect. Empty = allow all.",
+        "",
+        "TLS Cert File: Path to your TLS/SSL certificate",
+        "  file (.pem or .crt) for secure connections.",
+        "",
+        "TLS Key File: Path to your TLS/SSL private key",
+        "  file (.pem or .key) for secure connections.",
+    ].into_iter().map(|s| s.to_string()).collect()
 }
 
 /// Update visibility of TLS fields based on protocol selection

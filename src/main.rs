@@ -145,6 +145,7 @@ use tokio::{
 #[cfg(all(unix, not(target_os = "android")))]
 use tokio::signal::unix::{signal, SignalKind};
 use std::sync::Arc;
+// flate2 used in reader tasks via flate2::Decompress::new()
 
 // Rustls danger module for accepting invalid certificates (MUD servers often have self-signed certs)
 #[cfg(feature = "rustls-backend")]
@@ -11104,6 +11105,23 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         state.highlight = None;
     }
 
+    // Generic help button handler: '?' shortcut or Enter/Space on help button
+    {
+        let should_open_help = if let Some(state) = app.popup_manager.current() {
+            !state.definition.help_lines.is_empty()
+                && ((matches!(key.code, crossterm::event::KeyCode::Char('?')) && !state.editing)
+                    || (matches!(key.code, crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char(' '))
+                        && state.is_button_focused(popup::POPUP_BTN_HELP)))
+        } else {
+            false
+        };
+        if should_open_help {
+            let help_lines = app.popup_manager.current().unwrap().definition.help_lines.clone();
+            app.popup_manager.push(popup::definitions::help::create_topic_help_popup(help_lines));
+            return NewPopupAction::None;
+        }
+    }
+
     let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
     let is_menu = popup_id == Some(popup::PopupId("menu"));
     let is_confirm = app.popup_manager.current().map(|s| {
@@ -14109,6 +14127,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     let mut buffer = BytesMut::with_capacity(10240);
                     buffer.resize(10240, 0);
                     let mut line_buffer: Vec<u8> = Vec::new();
+                    let mut mccp2: Option<flate2::Decompress> = None;
 
                     loop {
                         match read_half.read(&mut buffer).await {
@@ -14153,14 +14172,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 break;
                             }
                             Ok(n) => {
-                                // Append new data to line buffer
-                                line_buffer.extend_from_slice(&buffer[..n]);
+                                // MCCP2: decompress if active, otherwise append raw
+                                if let Some(ref mut decomp) = mccp2 {
+                                    let decompressed = telnet::mccp2_decompress(decomp, &buffer[..n]);
+                                    line_buffer.extend_from_slice(&decompressed);
+                                } else {
+                                    line_buffer.extend_from_slice(&buffer[..n]);
+                                }
 
                                 // Find safe split point (complete lines with complete ANSI sequences)
                                 let split_at = find_safe_split_point(&line_buffer);
 
                                 // Send data immediately - either up to split point, or all if no incomplete sequences
-                                let to_send = if split_at > 0 {
+                                let to_send: Vec<u8> = if split_at > 0 {
                                     line_buffer.drain(..split_at).collect()
                                 } else if !line_buffer.is_empty() {
                                     // No safe split point but we have data - send it anyway
@@ -14176,6 +14200,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Send telnet responses if any
                                     if !result.responses.is_empty() {
                                         let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                    }
+
+                                    // MCCP2: if activated, decompress remaining data
+                                    if result.mccp2_activated {
+                                        let mut decomp = flate2::Decompress::new(true);
+                                        // Decompress tail of current chunk (after IAC SB MCCP2 IAC SE)
+                                        if result.mccp2_offset < to_send.len() {
+                                            let tail = telnet::mccp2_decompress(&mut decomp, &to_send[result.mccp2_offset..]);
+                                            // Prepend decompressed tail to line_buffer
+                                            let mut new_buf = tail;
+                                            new_buf.append(&mut line_buffer);
+                                            line_buffer = new_buf;
+                                        }
+                                        // Also decompress any remaining line_buffer content (was raw compressed)
+                                        if !line_buffer.is_empty() && result.mccp2_offset >= to_send.len() {
+                                            let remaining = std::mem::take(&mut line_buffer);
+                                            line_buffer = telnet::mccp2_decompress(&mut decomp, &remaining);
+                                        }
+                                        mccp2 = Some(decomp);
                                     }
 
                                     // Notify if telnet detected
@@ -14356,6 +14399,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         tokio::spawn(async move {
                             let mut buf = [0u8; 4096];
                             let mut line_buffer = Vec::new();
+                            let mut mccp2: Option<flate2::Decompress> = None;
                             loop {
                                 match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
                                     Ok(0) => {
@@ -14390,9 +14434,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         break;
                                     }
                                     Ok(n) => {
-                                        line_buffer.extend_from_slice(&buf[..n]);
+                                        if let Some(ref mut decomp) = mccp2 {
+                                            let decompressed = telnet::mccp2_decompress(decomp, &buf[..n]);
+                                            line_buffer.extend_from_slice(&decompressed);
+                                        } else {
+                                            line_buffer.extend_from_slice(&buf[..n]);
+                                        }
                                         let split_at = find_safe_split_point(&line_buffer);
-                                        let to_send = if split_at > 0 {
+                                        let to_send: Vec<u8> = if split_at > 0 {
                                             line_buffer.drain(..split_at).collect()
                                         } else if !line_buffer.is_empty() {
                                             std::mem::take(&mut line_buffer)
@@ -14403,6 +14452,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             let result = process_telnet(&to_send);
                                             if !result.responses.is_empty() {
                                                 let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                            }
+                                            if result.mccp2_activated {
+                                                let mut decomp = flate2::Decompress::new(true);
+                                                if result.mccp2_offset < to_send.len() {
+                                                    let tail = telnet::mccp2_decompress(&mut decomp, &to_send[result.mccp2_offset..]);
+                                                    let mut new_buf = tail;
+                                                    new_buf.append(&mut line_buffer);
+                                                    line_buffer = new_buf;
+                                                }
+                                                mccp2 = Some(decomp);
                                             }
                                             if result.telnet_detected {
                                                 let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
@@ -19546,6 +19605,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                     let mut buffer = BytesMut::with_capacity(4096);
                                     buffer.resize(4096, 0);
                                     let mut line_buffer: Vec<u8> = Vec::new();
+                                    let mut mccp2: Option<flate2::Decompress> = None;
 
                                     loop {
                                         match read_half.read(&mut buffer).await {
@@ -19587,9 +19647,14 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                 break;
                                             }
                                             Ok(n) => {
-                                                line_buffer.extend_from_slice(&buffer[..n]);
+                                                if let Some(ref mut decomp) = mccp2 {
+                                                    let decompressed = telnet::mccp2_decompress(decomp, &buffer[..n]);
+                                                    line_buffer.extend_from_slice(&decompressed);
+                                                } else {
+                                                    line_buffer.extend_from_slice(&buffer[..n]);
+                                                }
                                                 let split_at = find_safe_split_point(&line_buffer);
-                                                let to_send = if split_at > 0 {
+                                                let to_send: Vec<u8> = if split_at > 0 {
                                                     line_buffer.drain(..split_at).collect()
                                                 } else if !line_buffer.is_empty() {
                                                     std::mem::take(&mut line_buffer)
@@ -19601,6 +19666,16 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                     let result = process_telnet(&to_send);
                                                     if !result.responses.is_empty() {
                                                         let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                                    }
+                                                    if result.mccp2_activated {
+                                                        let mut decomp = flate2::Decompress::new(true);
+                                                        if result.mccp2_offset < to_send.len() {
+                                                            let tail = telnet::mccp2_decompress(&mut decomp, &to_send[result.mccp2_offset..]);
+                                                            let mut new_buf = tail;
+                                                            new_buf.append(&mut line_buffer);
+                                                            line_buffer = new_buf;
+                                                        }
+                                                        mccp2 = Some(decomp);
                                                     }
                                                     if result.telnet_detected {
                                                         let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;

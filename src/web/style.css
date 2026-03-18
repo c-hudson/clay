@@ -1026,6 +1026,50 @@ body.device-phone #output-container { padding: 6px 10px; }
     color: #ffffff;
 }
 
+/* Popup help overlay (above other modals) */
+#popup-help-modal {
+    z-index: 1100;
+}
+#popup-help-modal .help-modal-content {
+    width: auto;
+    min-width: 280px;
+    max-width: min(85vw, 480px);
+    text-align: left;
+    padding: 16px;
+}
+#popup-help-modal .modal-buttons {
+    text-align: right;
+    margin-top: 8px;
+}
+
+/* Help button (?) in popup footers */
+.btn-help {
+    min-width: 28px !important;
+    width: 28px !important;
+    padding: 4px 0 !important;
+    font-weight: bold;
+    font-size: 14px;
+    border-radius: 50%;
+    background: transparent;
+    border: 1px solid var(--theme-border, #555) !important;
+    color: var(--theme-fg, #ccc);
+    cursor: pointer;
+    opacity: 0.7;
+}
+.btn-help:hover {
+    opacity: 1;
+    background: var(--theme-input-bg, #333) !important;
+}
+.footer-spacer {
+    flex: 1;
+}
+.menu-footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+}
+
 #action-error {
     color: var(--error-color);
     font-size: 12px;

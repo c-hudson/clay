@@ -30,6 +30,7 @@ pub const TELNET_OPT_EOR: u8 = 25;    // End of Record
 pub const TELNET_OPT_NAWS: u8 = 31;   // Negotiate About Window Size
 pub const TELNET_OPT_CHARSET: u8 = 42; // CHARSET (RFC 2066)
 pub const TELNET_OPT_MSDP: u8 = 69;   // MUD Server Data Protocol
+pub const TELNET_OPT_MCCP2: u8 = 86;  // MUD Client Compression Protocol v2
 pub const TELNET_OPT_GMCP: u8 = 201;  // Generic MUD Communication Protocol
 
 // CHARSET subnegotiation opcodes (RFC 2066)
@@ -135,6 +136,8 @@ pub struct TelnetResult {
     pub gmcp_negotiated: bool,  // True if server sent WILL GMCP
     pub msdp_negotiated: bool,  // True if server sent WILL MSDP
     pub charset_request: Option<Vec<String>>,  // Charsets offered by server via CHARSET REQUEST
+    pub mccp2_activated: bool,  // True if IAC SB MCCP2 IAC SE was received (compression starts)
+    pub mccp2_offset: usize,    // Byte offset in input data where compressed stream begins
 }
 
 /// Process telnet sequences in incoming data.
@@ -152,6 +155,8 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
     let mut gmcp_negotiated = false;
     let mut msdp_negotiated = false;
     let mut charset_request: Option<Vec<String>> = None;
+    let mut mccp2_activated = false;
+    let mut mccp2_offset: usize = 0;
     let mut i = 0;
 
     while i < data.len() {
@@ -187,6 +192,9 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
                                 // Accept MSDP
                                 responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
                                 msdp_negotiated = true;
+                            } else if option == TELNET_OPT_MCCP2 {
+                                // Accept MCCP2 compression
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
                             } else if option == TELNET_OPT_CHARSET {
                                 // Accept CHARSET negotiation (RFC 2066)
                                 responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
@@ -229,6 +237,15 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
                             if data[i + 1] == TELNET_SE {
                                 // Found end of subnegotiation
                                 let sb_data = &data[sb_start..i];
+                                // Check for MCCP2 activation (option 86)
+                                // IAC SB MCCP2 IAC SE - all data after SE is zlib compressed
+                                if !sb_data.is_empty() && sb_data[0] == TELNET_OPT_MCCP2 {
+                                    mccp2_activated = true;
+                                    mccp2_offset = i + 2; // offset after IAC SE
+                                    // Stop processing - remaining bytes are compressed
+                                    i += 2;
+                                    break;
+                                }
                                 // Check for TTYPE SEND request
                                 if sb_data.len() >= 2 && sb_data[0] == TELNET_OPT_TTYPE && sb_data[1] == TTYPE_SEND {
                                     ttype_requested = true;
@@ -274,6 +291,10 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
                             }
                         }
                         i += 1;
+                    }
+                    // MCCP2: stop outer loop - remaining bytes are compressed
+                    if mccp2_activated {
+                        break;
                     }
                 }
                 TELNET_GA | TELNET_EOR => {
@@ -328,6 +349,8 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
         gmcp_negotiated,
         msdp_negotiated,
         charset_request,
+        mccp2_activated,
+        mccp2_offset,
     }
 }
 
@@ -553,6 +576,50 @@ pub fn build_charset_accepted(charset_name: &str) -> Vec<u8> {
 /// Build a CHARSET REJECTED subnegotiation response
 pub fn build_charset_rejected() -> Vec<u8> {
     vec![TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_REJECTED, TELNET_IAC, TELNET_SE]
+}
+
+/// Decompress MCCP2 zlib data. Returns decompressed bytes.
+/// The decompressor maintains state across calls for streaming decompression.
+pub fn mccp2_decompress(decompressor: &mut flate2::Decompress, compressed: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(compressed.len() * 4);
+    let mut buf = [0u8; 8192];
+    let mut total_in = 0;
+
+    loop {
+        let before_in = decompressor.total_in();
+        let before_out = decompressor.total_out();
+        let status = decompressor.decompress(
+            &compressed[total_in..],
+            &mut buf,
+            flate2::FlushDecompress::None,
+        );
+        let consumed = (decompressor.total_in() - before_in) as usize;
+        let produced = (decompressor.total_out() - before_out) as usize;
+        total_in += consumed;
+
+        if produced > 0 {
+            output.extend_from_slice(&buf[..produced]);
+        }
+
+        match status {
+            Ok(flate2::Status::Ok) => {
+                if consumed == 0 && produced == 0 {
+                    break; // No progress, need more input
+                }
+            }
+            Ok(flate2::Status::StreamEnd) => {
+                // Server ended compression (e.g., MCCP2 turned off)
+                break;
+            }
+            Ok(flate2::Status::BufError) => {
+                break; // Need more input or output space exhausted
+            }
+            Err(_) => {
+                break; // Decompression error
+            }
+        }
+    }
+    output
 }
 
 /// Check if there's an incomplete ANSI escape sequence or telnet sequence at the end.
@@ -806,5 +873,52 @@ mod tests {
             TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_TTABLE_REJECTED,
             TELNET_IAC, TELNET_SE,
         ]);
+    }
+
+    #[test]
+    fn test_mccp2_will_negotiation() {
+        // Server sends IAC WILL MCCP2 → client should respond IAC DO MCCP2
+        let data = [TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2];
+        let result = process_telnet(&data);
+        assert!(result.telnet_detected);
+        assert_eq!(result.responses, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2]);
+        assert!(!result.mccp2_activated);
+    }
+
+    #[test]
+    fn test_mccp2_activation() {
+        // Server sends IAC SB MCCP2 IAC SE followed by compressed data
+        // Text "Hello" before the subneg, then compressed data after
+        let mut data = Vec::new();
+        data.extend_from_slice(b"Hello\n");
+        data.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
+        // Append some compressed bytes (these would be zlib data)
+        data.extend_from_slice(&[0x78, 0x9c]); // zlib header
+
+        let result = process_telnet(&data);
+        assert!(result.mccp2_activated);
+        // mccp2_offset should point right after IAC SE
+        let expected_offset = 6 + 5; // "Hello\n" (6) + IAC SB MCCP2 IAC SE (5)
+        assert_eq!(result.mccp2_offset, expected_offset);
+        // cleaned should contain the text before activation
+        assert_eq!(result.cleaned, b"Hello\n");
+    }
+
+    #[test]
+    fn test_mccp2_decompress() {
+        // Create compressed data using flate2
+        use flate2::{Compress, FlushCompress};
+        let input = b"Hello, World! This is a test of MCCP2 compression.\n";
+        let mut compressed = vec![0u8; 256];
+        let mut compressor = Compress::new(flate2::Compression::default(), true);
+        let status = compressor.compress(input, &mut compressed, FlushCompress::Finish).unwrap();
+        assert_eq!(status, flate2::Status::StreamEnd);
+        let compressed_len = compressor.total_out() as usize;
+        compressed.truncate(compressed_len);
+
+        // Decompress
+        let mut decomp = flate2::Decompress::new(true);
+        let output = mccp2_decompress(&mut decomp, &compressed);
+        assert_eq!(output, input);
     }
 }

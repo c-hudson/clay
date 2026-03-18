@@ -130,6 +130,40 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             blank_line_before_list: false,
             tab_buttons_only: false,
         })
+        .with_help(actions_list_help_text())
+}
+
+/// Help text for the Actions List popup
+fn actions_list_help_text() -> Vec<String> {
+    vec![
+        "Actions - Triggers and Automation",
+        "",
+        "Actions automatically respond to MUD output. When",
+        "text from the MUD matches an action's pattern, the",
+        "action's command is executed.",
+        "",
+        "List columns:",
+        "  Name    - Action name (with enabled/disabled status)",
+        "  World   - Which world this action applies to",
+        "            (blank = all worlds)",
+        "  Pattern - The text pattern to match",
+        "",
+        "Navigation:",
+        "  Up/Down   Navigate the action list",
+        "  Enter     Edit the selected action",
+        "  Space     Toggle enabled/disabled",
+        "  Tab       Cycle between buttons",
+        "  Esc       Close this popup",
+        "",
+        "Buttons:",
+        "  Add (A)    Create a new action",
+        "  Edit (E)   Edit the selected action",
+        "  Delete (D) Remove the selected action",
+        "  Ok (O)     Close this popup",
+        "",
+        "Use the filter field at the top to search actions",
+        "by name, world, or pattern.",
+    ].into_iter().map(|s| s.to_string()).collect()
 }
 
 /// Action settings for the editor
@@ -200,6 +234,41 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
             blank_line_before_list: false,
             tab_buttons_only: false,
         })
+        .with_help(action_editor_help_text())
+}
+
+/// Help text for the Action Editor popup
+fn action_editor_help_text() -> Vec<String> {
+    vec![
+        "Action Editor - Configure a Trigger",
+        "",
+        "Name: A unique name for this action. Can be invoked",
+        "  manually with /name (e.g. /heal runs action 'heal').",
+        "",
+        "World: Which world this action applies to. Leave",
+        "  blank to match output from any world.",
+        "",
+        "Match Type:",
+        "  Regexp   - Regular expression (e.g. ^You are (\\w+))",
+        "  Wildcard - Simple wildcards (* matches anything)",
+        "",
+        "Pattern: The text to match against MUD output.",
+        "  Leave empty for actions that are only triggered",
+        "  manually (by typing /actionname).",
+        "",
+        "Command: What to execute when the pattern matches.",
+        "  Multiple commands separated by semicolons (;).",
+        "  Use $1-$9 for captured groups from the pattern.",
+        "  Special commands in the command field:",
+        "    /gag          - Hide the matched line",
+        "    /notify msg   - Send a push notification",
+        "    /echo msg     - Display a local message",
+        "",
+        "Enabled: Whether this action is active.",
+        "",
+        "Startup: Run this action's command when Clay starts",
+        "  or hot-reloads (useful for initialization scripts).",
+    ].into_iter().map(|s| s.to_string()).collect()
 }
 
 /// Filter actions based on filter text

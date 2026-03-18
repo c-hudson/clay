@@ -2273,6 +2273,7 @@ pub async fn connect_multiuser_world(
                 let mut buffer = BytesMut::with_capacity(4096);
                 buffer.resize(4096, 0);
                 let mut line_buffer: Vec<u8> = Vec::new();
+                let mut mccp2: Option<flate2::Decompress> = None;
 
                 loop {
                     match read_half.read(&mut buffer).await {
@@ -2305,9 +2306,14 @@ pub async fn connect_multiuser_world(
                             break;
                         }
                         Ok(n) => {
-                            line_buffer.extend_from_slice(&buffer[..n]);
+                            if let Some(ref mut decomp) = mccp2 {
+                                let decompressed = crate::telnet::mccp2_decompress(decomp, &buffer[..n]);
+                                line_buffer.extend_from_slice(&decompressed);
+                            } else {
+                                line_buffer.extend_from_slice(&buffer[..n]);
+                            }
                             let split_at = find_safe_split_point(&line_buffer);
-                            let to_send = if split_at > 0 {
+                            let to_send: Vec<u8> = if split_at > 0 {
                                 line_buffer.drain(..split_at).collect()
                             } else if !line_buffer.is_empty() {
                                 std::mem::take(&mut line_buffer)
@@ -2319,6 +2325,16 @@ pub async fn connect_multiuser_world(
                                 let result = process_telnet(&to_send);
                                 if !result.responses.is_empty() {
                                     let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                }
+                                if result.mccp2_activated {
+                                    let mut decomp = flate2::Decompress::new(true);
+                                    if result.mccp2_offset < to_send.len() {
+                                        let tail = crate::telnet::mccp2_decompress(&mut decomp, &to_send[result.mccp2_offset..]);
+                                        let mut new_buf = tail;
+                                        new_buf.append(&mut line_buffer);
+                                        line_buffer = new_buf;
+                                    }
+                                    mccp2 = Some(decomp);
                                 }
                                 if result.telnet_detected {
                                     let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
@@ -2509,6 +2525,7 @@ pub async fn connect_daemon_world(
                 let mut buffer = BytesMut::with_capacity(4096);
                 buffer.resize(4096, 0);
                 let mut line_buffer: Vec<u8> = Vec::new();
+                let mut mccp2: Option<flate2::Decompress> = None;
 
                 loop {
                     match read_half.read(&mut buffer).await {
@@ -2534,9 +2551,14 @@ pub async fn connect_daemon_world(
                             break;
                         }
                         Ok(n) => {
-                            line_buffer.extend_from_slice(&buffer[..n]);
+                            if let Some(ref mut decomp) = mccp2 {
+                                let decompressed = crate::telnet::mccp2_decompress(decomp, &buffer[..n]);
+                                line_buffer.extend_from_slice(&decompressed);
+                            } else {
+                                line_buffer.extend_from_slice(&buffer[..n]);
+                            }
                             let split_at = find_safe_split_point(&line_buffer);
-                            let to_send = if split_at > 0 {
+                            let to_send: Vec<u8> = if split_at > 0 {
                                 line_buffer.drain(..split_at).collect()
                             } else if !line_buffer.is_empty() {
                                 std::mem::take(&mut line_buffer)
@@ -2548,6 +2570,16 @@ pub async fn connect_daemon_world(
                                 let result = process_telnet(&to_send);
                                 if !result.responses.is_empty() {
                                     let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                }
+                                if result.mccp2_activated {
+                                    let mut decomp = flate2::Decompress::new(true);
+                                    if result.mccp2_offset < to_send.len() {
+                                        let tail = crate::telnet::mccp2_decompress(&mut decomp, &to_send[result.mccp2_offset..]);
+                                        let mut new_buf = tail;
+                                        new_buf.append(&mut line_buffer);
+                                        line_buffer = new_buf;
+                                    }
+                                    mccp2 = Some(decomp);
                                 }
                                 if let Some(ref charsets) = result.charset_request {
                                     let _ = event_tx_read.send(AppEvent::CharsetRequested(world_name_read.clone(), charsets.clone())).await;

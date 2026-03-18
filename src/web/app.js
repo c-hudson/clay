@@ -216,7 +216,21 @@
         fontWeightPlus: document.getElementById('font-weight-plus'),
         fontWeightValue: document.getElementById('font-weight-value'),
         fontCancelBtn: document.getElementById('font-cancel-btn'),
-        fontSaveBtn: document.getElementById('font-save-btn')
+        fontSaveBtn: document.getElementById('font-save-btn'),
+        // Popup help modal (shared)
+        popupHelpModal: document.getElementById('popup-help-modal'),
+        popupHelpContent: document.getElementById('popup-help-content'),
+        popupHelpCloseBtn: document.getElementById('popup-help-close-btn'),
+        popupHelpOkBtn: document.getElementById('popup-help-ok-btn'),
+        // Help buttons in each popup
+        setupHelpBtn: document.getElementById('setup-help-btn'),
+        webHelpBtn: document.getElementById('web-help-btn'),
+        worldEditHelpBtn: document.getElementById('world-edit-help-btn'),
+        worldSelectorHelpBtn: document.getElementById('world-selector-help-btn'),
+        actionsListHelpBtn: document.getElementById('actions-list-help-btn'),
+        actionEditorHelpBtn: document.getElementById('action-editor-help-btn'),
+        connectionsHelpBtn: document.getElementById('connections-help-btn'),
+        menuHelpBtn: document.getElementById('menu-help-btn')
     };
 
     // State
@@ -3423,6 +3437,137 @@
         helpPopupOpen = false;
         elements.helpModal.classList.remove('visible');
         elements.input.focus();
+    }
+
+    // Popup-specific help texts
+    const popupHelpTexts = {
+        setup: [
+            'Setup - Global Settings', '',
+            'World Switching: Controls Up/Down world switch order.',
+            '  "Unseen First" prioritizes worlds with new activity.',
+            '  "Alphabetical" cycles worlds in name order.', '',
+            'Theme: Dark or Light theme for web/GUI clients.', '',
+            'Color Offset: Shifts the base ANSI color palette.', '',
+            'Input Height: Number of input lines visible (1-10).', '',
+            'More Mode: Pauses output when a full screen of text',
+            '  arrives. Keeps you from missing important text.', '',
+            'TLS Proxy: Keeps a proxy alive during hot reload', '  so TLS connections survive.', '',
+            'New Indicator: Show a marker on new lines arriving', '  while scrolled up in the output buffer.', '',
+            'Debug: Enables debug logging to clay.debug.log.', '',
+            'ANSI Music: Play ANSI music sequences from MUDs.', '',
+            'ZWJ Sequence: For terminals that support combined',
+            '  emoji (ZWJ). If unsupported, shows two separate',
+            '  emoji instead of one combined one.'
+        ],
+        web: [
+            'Web Settings - Remote Access', '',
+            'These settings let you access Clay from a web',
+            'browser or mobile device on your network.', '',
+            'Protocol: Choose Secure (HTTPS/WSS) or Non-Secure',
+            '  (HTTP/WS). Secure requires TLS certificate files.', '',
+            'HTTP Enabled: Starts a web server so you can open',
+            '  Clay in a browser at http://yourhost:port.', '',
+            'HTTP Port: The port number for the web server.', '',
+            'Allow List: Comma-separated IP addresses or',
+            '  subnets allowed to connect. Empty = allow all.', '',
+            'TLS Cert/Key File: Paths to your TLS/SSL certificate',
+            '  and private key files for secure connections.'
+        ],
+        worldEditor: [
+            'World Settings - Configure a Connection', '',
+            'Name: A unique name for this connection.', '',
+            'Hostname: The server address (e.g. mud.example.com).', '',
+            'Port: The server port number (e.g. 4000, 23).', '',
+            'User: Your character/login name. Used for auto-login.', '',
+            'Password: Your password. Used for auto-login.', '',
+            'Use SSL: Enable TLS/SSL encryption for the connection.', '',
+            'Auto Login: How to send credentials on connect.',
+            '  Connect: Send "connect user password".',
+            '  Prompt: Wait for prompts, send user then password.',
+            '  None: Don\'t auto-login.', '',
+            'Keep Alive: Prevents idle disconnects.',
+            '  NOP: Sends a telnet NOP (invisible to server).',
+            '  Custom: Sends a custom command you specify.', '',
+            'Encoding: UTF-8 (modern), Latin-1 (older MUDs), FANSI.', '',
+            'GMCP Packages: Space-separated GMCP packages to request.'
+        ],
+        worldSelector: [
+            'World Selector - Browse and Connect', '',
+            'Shows all configured worlds. Connected worlds are',
+            'highlighted with a green dot.', '',
+            'Filter: Type to search worlds by name or hostname.', '',
+            'Connected toggle: Show only connected worlds.', '',
+            'Add: Create a new world.',
+            'Edit: Edit the selected world\'s settings.',
+            'Connect: Connect to the selected world.',
+            'Close: Close without action.'
+        ],
+        actionsList: [
+            'Actions - Triggers and Automation', '',
+            'Actions automatically respond to MUD output. When',
+            'text from the MUD matches an action\'s pattern, the',
+            'action\'s command is executed.', '',
+            'Click an action to edit it. Use the toggle to',
+            'enable or disable actions.', '',
+            'Add: Create a new action.',
+            'Edit: Edit the selected action.',
+            'Delete: Remove the selected action.', '',
+            'Use the filter to search by name, world, or pattern.'
+        ],
+        actionEditor: [
+            'Action Editor - Configure a Trigger', '',
+            'Name: A unique name for this action.', '',
+            'World: Which world this applies to (blank = all).', '',
+            'Match Type:',
+            '  Regexp - Regular expression (e.g. ^You are (\\w+))',
+            '  Wildcard - Simple wildcards (* matches anything)', '',
+            'Pattern: Text to match against MUD output.',
+            '  Leave empty for manual-only actions.', '',
+            'Command: What to execute when pattern matches.',
+            '  Multiple commands separated by semicolons (;).',
+            '  Use $1-$9 for captured groups from the pattern.',
+            '  /gag hides the matched line.',
+            '  /notify sends a push notification.', '',
+            'Enabled: Whether this action is active.', '',
+            'Startup: Run command when Clay starts/hot-reloads.'
+        ],
+        connections: [
+            'Connected Worlds - Active Connections', '',
+            'Shows all currently connected worlds.', '',
+            'Columns:',
+            '  World  - Name of the connected world',
+            '  Unseen - Lines received since you last viewed',
+            '  Last   - Time since last send/receive',
+            '  KA     - Time until next keep-alive packet',
+            '  Buffer - Number of lines in output buffer', '',
+            'Click a world to switch to it.'
+        ],
+        menu: [
+            'Menu - Quick Access', '',
+            'Select an item to open it.', '',
+            '  Help           - Keyboard shortcuts and commands',
+            '  Settings       - Global application settings',
+            '  Web Settings   - WebSocket/HTTP server config',
+            '  Actions        - Trigger and automation editor',
+            '  World Selector - Browse and connect to worlds',
+            '  Connected Worlds - View active connections'
+        ]
+    };
+
+    function openPopupHelp(key) {
+        const lines = popupHelpTexts[key];
+        if (!lines) return;
+        let html = '<div style="white-space:pre-wrap;font-family:var(--font-mono);font-size:13px;line-height:1.5;padding:4px 8px;text-align:left">';
+        for (const line of lines) {
+            html += escapeHtml(line) + '\n';
+        }
+        html += '</div>';
+        elements.popupHelpContent.innerHTML = html;
+        elements.popupHelpModal.classList.add('visible');
+    }
+
+    function closePopupHelp() {
+        elements.popupHelpModal.classList.remove('visible');
     }
 
     // Menu popup functions (/menu)
@@ -7945,6 +8090,18 @@
             fontEditSizeDesktop = Math.min(20, fontEditSizeDesktop + 1);
             updateFontPopupUI();
         };
+
+        // Popup help buttons
+        elements.popupHelpCloseBtn.onclick = closePopupHelp;
+        elements.popupHelpOkBtn.onclick = closePopupHelp;
+        if (elements.setupHelpBtn) elements.setupHelpBtn.onclick = function() { openPopupHelp('setup'); };
+        if (elements.webHelpBtn) elements.webHelpBtn.onclick = function() { openPopupHelp('web'); };
+        if (elements.worldEditHelpBtn) elements.worldEditHelpBtn.onclick = function() { openPopupHelp('worldEditor'); };
+        if (elements.worldSelectorHelpBtn) elements.worldSelectorHelpBtn.onclick = function() { openPopupHelp('worldSelector'); };
+        if (elements.actionsListHelpBtn) elements.actionsListHelpBtn.onclick = function() { openPopupHelp('actionsList'); };
+        if (elements.actionEditorHelpBtn) elements.actionEditorHelpBtn.onclick = function() { openPopupHelp('actionEditor'); };
+        if (elements.connectionsHelpBtn) elements.connectionsHelpBtn.onclick = function() { openPopupHelp('connections'); };
+        if (elements.menuHelpBtn) elements.menuHelpBtn.onclick = function() { openPopupHelp('menu'); };
 
         // Password change modal handlers
         if (elements.passwordSaveBtn) {

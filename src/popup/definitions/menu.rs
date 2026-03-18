@@ -96,6 +96,29 @@ pub fn create_menu_popup() -> PopupDefinition {
             blank_line_before_list: false,
             tab_buttons_only: false,
         })
+        .with_help(menu_help_text())
+}
+
+/// Help text for the Menu popup
+fn menu_help_text() -> Vec<String> {
+    vec![
+        "Menu - Quick Access",
+        "",
+        "Select an item and press Enter to open it.",
+        "",
+        "  Help             - Keyboard shortcuts and commands",
+        "  Settings         - Global application settings",
+        "  Web Settings     - WebSocket/HTTP server config",
+        "  Actions          - Trigger and automation editor",
+        "  World Selector   - Browse and connect to worlds",
+        "  Connected Worlds - View active connections",
+        "  Theme Editor     - Customize colors (opens browser)",
+        "  Keybind Editor   - Configure keys (opens browser)",
+        "",
+        "You can also access these with commands:",
+        "  /help  /setup  /web  /actions  /worlds",
+        "  /connections  /theme-editor  /keybind-editor",
+    ].into_iter().map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]

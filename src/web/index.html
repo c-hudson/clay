@@ -174,7 +174,10 @@
                     <div class="menu-item" data-command="/worlds">World Selector</div>
                     <div class="menu-item" data-command="/connections">Connected Worlds</div>
                 </div>
-                <div class="menu-hint">select, Enter open, Esc close</div>
+                <div class="menu-footer">
+                    <button id="menu-help-btn" class="btn-help">?</button>
+                    <span class="menu-hint">select, Enter open, Esc close</span>
+                </div>
             </div>
         </div>
 
@@ -191,7 +194,9 @@
                 </div>
                 <div id="actions-list" class="actions-list"></div>
                 <div class="modal-buttons">
+                    <button id="actions-list-help-btn" class="action-btn btn btn-help">?</button>
                     <button id="action-delete-btn" class="action-btn btn btn-danger">Delete</button>
+                    <span class="footer-spacer"></span>
                     <button id="action-add-btn" class="action-btn btn">Add</button>
                     <button id="action-edit-btn" class="action-btn btn">Edit</button>
                     <button id="action-cancel-btn" class="action-btn btn btn-primary">Ok</button>
@@ -245,7 +250,9 @@
                 </div>
                 <div id="action-error" class="error"></div>
                 <div class="modal-buttons">
+                    <button id="action-editor-help-btn" class="btn btn-help">?</button>
                     <button id="action-editor-delete-btn" class="btn btn-danger">Delete</button>
+                    <span class="footer-spacer"></span>
                     <button id="action-editor-cancel-btn" class="btn">Cancel</button>
                     <button id="action-save-btn" class="btn btn-primary">Save</button>
                 </div>
@@ -285,6 +292,8 @@
                     </table>
                 </div>
                 <div class="modal-buttons">
+                    <button id="connections-help-btn" class="btn-help">?</button>
+                    <span class="footer-spacer"></span>
                     <button id="worlds-close-btn">Close</button>
                 </div>
             </div>
@@ -321,6 +330,8 @@
                         </label>
                     </div>
                     <div class="modal-buttons">
+                        <button id="world-selector-help-btn" class="btn-help">?</button>
+                        <span class="footer-spacer"></span>
                         <button id="world-add-btn">Add</button>
                         <button id="world-edit-btn">Edit</button>
                         <button id="world-selector-cancel-btn">Close</button>
@@ -437,7 +448,9 @@
                     </div>
                 </div>
                 <div class="popup-footer">
+                    <button id="world-edit-help-btn" class="btn btn-help">?</button>
                     <button id="world-edit-delete-btn" class="btn btn-danger">Delete</button>
+                    <span class="footer-spacer"></span>
                     <button id="world-edit-cancel-btn" class="btn">Cancel</button>
                     <button id="world-edit-save-btn" class="btn">Save</button>
                     <button id="world-edit-connect-btn" class="btn btn-primary">Connect</button>
@@ -544,6 +557,8 @@
                     </div>
                 </div>
                 <div class="popup-footer">
+                    <button id="setup-help-btn" class="btn btn-help">?</button>
+                    <span class="footer-spacer"></span>
                     <button id="setup-cancel-btn" class="btn">Cancel</button>
                     <button id="setup-save-btn" class="btn btn-primary">Save</button>
                 </div>
@@ -651,6 +666,8 @@
                     </div>
                 </div>
                 <div class="modal-buttons">
+                    <button id="web-help-btn" class="btn-help">?</button>
+                    <span class="footer-spacer"></span>
                     <button id="web-cancel-btn">Cancel</button>
                     <button id="web-save-btn" class="btn-primary">Save</button>
                 </div>
@@ -691,6 +708,19 @@
                 <div class="modal-buttons">
                     <button id="password-cancel-btn">Cancel</button>
                     <button id="password-save-btn" class="btn-primary">Change Password</button>
+                </div>
+            </div>
+        </div>
+        <!-- Popup Help modal (shared by all popups) -->
+        <div id="popup-help-modal" class="modal">
+            <div class="modal-content help-modal-content">
+                <div class="popup-header">
+                    <span class="popup-title">Help</span>
+                    <button id="popup-help-close-btn" class="popup-close">&#10005;</button>
+                </div>
+                <div id="popup-help-content" class="help-content"></div>
+                <div class="modal-buttons">
+                    <button id="popup-help-ok-btn" class="action-btn btn-primary">Ok</button>
                 </div>
             </div>
         </div>

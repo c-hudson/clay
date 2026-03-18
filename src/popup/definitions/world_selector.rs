@@ -95,6 +95,36 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
             blank_line_before_list: true,
             tab_buttons_only: false,
         })
+        .with_help(world_selector_help_text())
+}
+
+/// Help text for the World Selector popup
+fn world_selector_help_text() -> Vec<String> {
+    vec![
+        "World Selector - Browse and Connect",
+        "",
+        "Shows all configured worlds. Connected worlds are",
+        "highlighted, and the current world is marked with *.",
+        "",
+        "Columns: World name, Hostname, Port, Username.",
+        "",
+        "Navigation:",
+        "  Up/Down     Navigate the world list",
+        "  Enter       Connect to the selected world",
+        "  Tab         Cycle between buttons and filter",
+        "  Esc         Close this popup",
+        "",
+        "Buttons:",
+        "  Add (A)     Create a new world",
+        "  Edit (E)    Edit the selected world's settings",
+        "  Delete (D)  Remove the selected world",
+        "  Connect (O) Connect to the selected world",
+        "  Cancel (C)  Close without action",
+        "",
+        "Filter: Type in the filter field to search worlds",
+        "  by name, hostname, or username. Press F to focus",
+        "  the filter field.",
+    ].into_iter().map(|s| s.to_string()).collect()
 }
 
 /// Filter the world list based on filter text
@@ -188,7 +218,7 @@ mod tests {
 
         assert_eq!(state.definition.id, PopupId("world_selector"));
         assert_eq!(state.definition.title, "World Selector");
-        assert_eq!(state.definition.buttons.len(), 5);
+        assert_eq!(state.definition.buttons.len(), 6); // ? + 5 original
     }
 
     #[test]
@@ -208,6 +238,7 @@ mod tests {
 
     #[test]
     fn test_world_selector_tab_order() {
+        use crate::popup::POPUP_BTN_HELP;
         let worlds = sample_worlds();
         let def = create_world_selector_popup(&worlds, 10);
         let mut state = PopupState::new(def);
@@ -216,7 +247,7 @@ mod tests {
         state.select_button(SELECTOR_BTN_ADD);
         assert!(state.is_button_focused(SELECTOR_BTN_ADD));
 
-        // Tab should cycle: Add -> Edit -> Connect -> Cancel -> Filter -> Delete -> Add
+        // Tab should cycle: Add -> Edit -> Connect -> Cancel -> Filter -> Delete -> ? -> Add
         state.cycle_field_buttons();
         assert!(state.is_button_focused(SELECTOR_BTN_EDIT), "After Add, should be on Edit");
 
@@ -233,6 +264,9 @@ mod tests {
         assert!(state.is_button_focused(SELECTOR_BTN_DELETE), "After Filter, should be on Delete");
 
         state.cycle_field_buttons();
-        assert!(state.is_button_focused(SELECTOR_BTN_ADD), "After Delete, should wrap to Add");
+        assert!(state.is_button_focused(POPUP_BTN_HELP), "After Delete, should be on Help (?)");
+
+        state.cycle_field_buttons();
+        assert!(state.is_button_focused(SELECTOR_BTN_ADD), "After Help, should wrap to Add");
     }
 }

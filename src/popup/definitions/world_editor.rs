@@ -285,7 +285,52 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
     // Set field visibility based on world type
     update_field_visibility(&mut def, world_type, show_keep_alive_cmd);
 
-    def
+    def.with_help(world_editor_help_text())
+}
+
+/// Help text for the World Editor popup
+fn world_editor_help_text() -> Vec<String> {
+    vec![
+        "World Settings - Configure a Connection",
+        "",
+        "World: A unique name for this connection.",
+        "",
+        "Type: MUD (telnet game server), Slack, or Discord.",
+        "",
+        "--- MUD Settings ---",
+        "",
+        "Hostname: The server address (e.g. mud.example.com).",
+        "",
+        "Port: The server port number (e.g. 4000, 23).",
+        "",
+        "User: Your character/login name. Used for auto-login.",
+        "",
+        "Password: Your password. Used for auto-login.",
+        "",
+        "Use SSL: Enable TLS/SSL encryption for the connection.",
+        "  Required if the MUD uses a secure port.",
+        "",
+        "Log File: Save all output to a timestamped log file.",
+        "",
+        "Encoding: Character encoding for the connection.",
+        "  UTF-8: Modern standard (most MUDs).",
+        "  Latin-1: Western European (older MUDs).",
+        "  FANSI: Extended ANSI art encoding.",
+        "",
+        "Auto Login: How to send your credentials on connect.",
+        "  Connect: Send 'connect user password'.",
+        "  Prompt: Wait for prompts, send user then password.",
+        "  MOO Prompt: Like Prompt but for MOO-style servers.",
+        "  None: Don't auto-login.",
+        "",
+        "Keep Alive: Prevents idle disconnects.",
+        "  NOP: Sends a telnet NOP (invisible to server).",
+        "  Custom: Sends a custom command you specify.",
+        "  Generic: Sends a generic keep-alive packet.",
+        "",
+        "GMCP Packages: Space-separated GMCP packages to",
+        "  request from the server (e.g. Char.Items Room.Info).",
+    ].into_iter().map(|s| s.to_string()).collect()
 }
 
 /// Update field visibility based on world type

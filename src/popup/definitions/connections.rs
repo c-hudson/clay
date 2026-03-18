@@ -139,6 +139,29 @@ pub fn create_connections_popup(connections: &[ConnectionInfo], visible_height: 
             blank_line_before_list: false,
             tab_buttons_only: false,
         })
+        .with_help(connections_help_text())
+}
+
+/// Help text for the Connections popup
+fn connections_help_text() -> Vec<String> {
+    vec![
+        "Connected Worlds - Active Connections",
+        "",
+        "Shows all currently connected worlds.",
+        "",
+        "Columns:",
+        "  (flag)  - * = current world",
+        "            SSH = TLS connection",
+        "            PRX = TLS via proxy",
+        "  World   - Name of the connected world",
+        "  Unseen  - Lines received since you last viewed",
+        "  Last    - Time since last send/receive",
+        "  KA      - Time until next keep-alive packet",
+        "  Buffer  - Number of lines in output buffer",
+        "",
+        "Use Up/Down arrows to switch worlds,",
+        "or Esc+W to jump to a world with activity.",
+    ].into_iter().map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]

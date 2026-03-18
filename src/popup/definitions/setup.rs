@@ -158,6 +158,54 @@ pub fn create_setup_popup(
             blank_line_before_list: false,
             tab_buttons_only: false,
         })
+        .with_help(setup_help_text())
+}
+
+/// Help text for the Setup popup
+fn setup_help_text() -> Vec<String> {
+    vec![
+        "Setup - Global Settings",
+        "",
+        "More Mode: Pauses output when a full screen of text",
+        "  arrives. Press Tab to release one page, Esc+J to",
+        "  release all. Keeps you from missing important text.",
+        "",
+        "Spell Check: Underlines misspelled words as you type.",
+        "  Press Ctrl+Q for spelling suggestions.",
+        "",
+        "Temp Convert: Automatically converts Fahrenheit temps",
+        "  in MUD output to Celsius (shown in parentheses).",
+        "",
+        "World Switching: Controls Up/Down world switch order.",
+        "  'Unseen First' prioritizes worlds with new activity.",
+        "  'Alphabetical' cycles worlds in name order.",
+        "",
+        "Debug: Enables debug logging to clay.debug.log.",
+        "",
+        "Input Height: Number of input lines visible (1-10).",
+        "",
+        "GUI Theme: Dark or Light theme for web/GUI clients.",
+        "",
+        "TLS Proxy: Keeps a background proxy process alive",
+        "  during hot reload so TLS connections survive.",
+        "",
+        "Dictionary Path: Path to a custom dictionary file",
+        "  for the spell checker.",
+        "",
+        "Editor Side: Which side the split-screen editor opens.",
+        "",
+        "Console Mouse: Enable mouse support in the terminal",
+        "  for clicking on popups, scrolling, and selecting.",
+        "",
+        "ZWJ Sequence: For terminals that support combined",
+        "  emoji (ZWJ). If unsupported, enabling this shows",
+        "  two separate emoji instead of one combined one.",
+        "",
+        "ANSI Music: Play ANSI music sequences from MUDs.",
+        "",
+        "New Indicator: Show a marker on new lines arriving",
+        "  while scrolled up in the output buffer.",
+    ].into_iter().map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]
@@ -177,7 +225,7 @@ mod tests {
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
         assert_eq!(state.definition.fields.len(), 14);
-        assert_eq!(state.definition.buttons.len(), 2);
+        assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
     #[test]

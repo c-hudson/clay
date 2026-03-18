@@ -20,6 +20,9 @@ pub struct FieldId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ButtonId(pub u32);
 
+/// Common button ID for the help button used across all popups
+pub const POPUP_BTN_HELP: ButtonId = ButtonId(99);
+
 /// Type-safe popup identifier
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PopupId(pub &'static str);
@@ -599,6 +602,8 @@ pub struct PopupDefinition {
     pub layout: PopupLayout,
     /// Custom key-value data for app-specific context (e.g., world index for delete confirm)
     pub custom_data: std::collections::HashMap<String, String>,
+    /// Help text lines shown when the user presses the ? button
+    pub help_lines: Vec<String>,
 }
 
 impl PopupDefinition {
@@ -610,6 +615,7 @@ impl PopupDefinition {
             buttons: Vec::new(),
             layout: PopupLayout::default(),
             custom_data: std::collections::HashMap::new(),
+            help_lines: Vec::new(),
         }
     }
 
@@ -629,6 +635,13 @@ impl PopupDefinition {
 
     pub fn with_layout(mut self, layout: PopupLayout) -> Self {
         self.layout = layout;
+        self
+    }
+
+    /// Add help text and a ? button to this popup
+    pub fn with_help(mut self, lines: Vec<String>) -> Self {
+        self.help_lines = lines;
+        self.buttons.insert(0, Button::new(POPUP_BTN_HELP, "?").left_align().with_shortcut('?'));
         self
     }
 
