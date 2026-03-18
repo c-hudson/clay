@@ -19355,7 +19355,44 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             let event_tx_connect = event_tx.clone();
 
             tokio::spawn(async move {
-                match TcpStream::connect(format!("{}:{}", connect_host, connect_port)).await {
+                // Resolve DNS and try connecting to each address.
+                // Prefer IPv4 errors over IPv6 "network unreachable" since IPv4
+                // errors (e.g. "connection refused") are more informative when
+                // the host is down but IPv6 is simply not routable.
+                let connect_result = async {
+                    use tokio::net::lookup_host;
+                    let addrs: Vec<std::net::SocketAddr> = lookup_host(
+                        format!("{}:{}", connect_host, connect_port)
+                    ).await?.collect();
+                    if addrs.is_empty() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrNotAvailable,
+                            format!("Could not resolve {}", connect_host),
+                        ));
+                    }
+                    // Try IPv4 addresses first, then IPv6
+                    let mut sorted = addrs.clone();
+                    sorted.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+                    let mut last_err = None;
+                    let mut ipv4_err = None;
+                    for addr in &sorted {
+                        match TcpStream::connect(addr).await {
+                            Ok(stream) => return Ok(stream),
+                            Err(e) => {
+                                if addr.is_ipv4() && ipv4_err.is_none() {
+                                    ipv4_err = Some(e);
+                                } else {
+                                    last_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    // Prefer IPv4 error (more informative) over IPv6 "network unreachable"
+                    Err(ipv4_err.or(last_err).unwrap_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "Connection failed")
+                    }))
+                }.await;
+                match connect_result {
                     Ok(tcp_stream) => {
                         // Store the socket fd/handle for hot reload (before splitting)
                         #[cfg(unix)]

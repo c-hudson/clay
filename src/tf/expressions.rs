@@ -232,6 +232,7 @@ impl Lexer {
             '(' => Ok(Token::LParen),
             ')' => Ok(Token::RParen),
             ',' => Ok(Token::Comma),
+            '#' => Ok(Token::Identifier("#".to_string())),
             _ => Err(format!("Unexpected character: {}", c)),
         }
     }

@@ -105,16 +105,28 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                             i += 1;
                         }
                     }
-                    // %* - all positional parameters (preserved for macro execution)
+                    // %* - all positional parameters
                     '*' => {
-                        result.push('%');
-                        result.push('*');
+                        if let Some(value) = engine.get_var("*") {
+                            result.push_str(&value.to_string_value());
+                        }
                         i += 2;
                     }
-                    // %L, %R - special positional parameters (preserved for macro execution)
+                    // %# - argument count
+                    '#' => {
+                        if let Some(value) = engine.get_var("#") {
+                            result.push_str(&value.to_string_value());
+                        } else {
+                            result.push_str("0");
+                        }
+                        i += 2;
+                    }
+                    // %L, %R - special positional parameters
                     'L' | 'R' => {
-                        result.push('%');
-                        result.push(chars[i + 1]);
+                        let var_name = chars[i + 1].to_string();
+                        if let Some(value) = engine.get_var(&var_name) {
+                            result.push_str(&value.to_string_value());
+                        }
                         i += 2;
                     }
                     // %varname form - variable name is alphanumeric + underscore
@@ -129,11 +141,13 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                         // If variable not found, substitute empty string
                         i = end_idx;
                     }
-                    // %n (digit) - positional parameter (handled separately in macro execution)
+                    // %n (digit) - positional parameter, resolved from local scope
                     c if c.is_ascii_digit() => {
-                        // For now, keep as-is; will be handled in macro context
-                        result.push('%');
-                        result.push(c);
+                        let var_name = c.to_string();
+                        if let Some(value) = engine.get_var(&var_name) {
+                            result.push_str(&value.to_string_value());
+                        }
+                        // If not found, substitute empty string (TF behavior)
                         i += 2;
                     }
                     // %P forms for capture groups from regmatch()

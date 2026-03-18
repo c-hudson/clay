@@ -12,6 +12,17 @@ use super::{TfEngine, TfCommandResult};
 /// Maximum iterations for loops to prevent infinite loops
 pub const MAX_ITERATIONS: usize = 10000;
 
+/// Execute a body line from control flow (while/for/if).
+/// Plain text (not starting with / or #) is sent to the MUD.
+fn execute_body_line(engine: &mut TfEngine, line: &str) -> TfCommandResult {
+    let trimmed = line.trim();
+    if trimmed.starts_with('/') || trimmed.starts_with('#') {
+        super::parser::execute_command_substituted(engine, trimmed)
+    } else {
+        TfCommandResult::SendToMud(trimmed.to_string())
+    }
+}
+
 /// State for tracking multi-line control structures
 #[derive(Debug, Clone, Default)]
 pub enum ControlState {
@@ -540,7 +551,7 @@ pub fn execute_single_if(engine: &mut TfEngine, condition: &str, command: &str) 
                 let command = engine.substitute_vars(command);
                 let command = super::variables::substitute_commands(engine, &command);
                 // Execute the command (already substituted)
-                super::parser::execute_command_substituted(engine, &command)
+                execute_body_line(engine, &command)
             } else {
                 TfCommandResult::Success(None)
             }
@@ -592,7 +603,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                                     // Substitute variables first, then expressions
                                     let cmd = engine.substitute_vars(&cmd);
                                     let cmd = super::variables::substitute_commands(engine, &cmd);
-                                    results.push(super::parser::execute_command_substituted(engine, &cmd));
+                                    results.push(execute_body_line(engine, &cmd));
                                 }
                             }
                             results
@@ -793,7 +804,7 @@ fn execute_while_loop(engine: &mut TfEngine, condition: &str, body: &[String]) -
                 super::variables::substitute_commands(engine, &line)
             };
 
-            let result = super::parser::execute_command_substituted(engine, &line);
+            let result = execute_body_line(engine, &line);
             // Check for break in nested execution
             if let TfCommandResult::Error(ref e) = result {
                 if e == "__break__" {
@@ -969,7 +980,7 @@ fn execute_for_loop(
                 super::variables::substitute_commands(engine, &line)
             };
 
-            let result = super::parser::execute_command_substituted(engine, &line);
+            let result = execute_body_line(engine, &line);
             if let TfCommandResult::Error(ref e) = result {
                 if e == "__break__" {
                     should_break = true;
@@ -1182,7 +1193,7 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
                                 super::variables::substitute_commands(engine, &line)
                             };
 
-                            results.push(super::parser::execute_command_substituted(engine, &line));
+                            results.push(execute_body_line(engine, &line));
                         }
                     }
                     return results;
@@ -1218,7 +1229,7 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
                 super::variables::substitute_commands(engine, &line)
             };
 
-            results.push(super::parser::execute_command_substituted(engine, &line));
+            results.push(execute_body_line(engine, &line));
         }
     }
 
@@ -1299,7 +1310,7 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
             // Substitute variables first, then expressions
             let line = engine.substitute_vars(line);
             let line = super::variables::substitute_commands(engine, &line);
-            let result = super::parser::execute_command_substituted(engine, &line);
+            let result = execute_body_line(engine, &line);
             // Check for break in nested execution
             if let TfCommandResult::Error(ref e) = result {
                 if e == "__break__" {
@@ -1419,7 +1430,7 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
             // Substitute variables first, then expressions
             let line = engine.substitute_vars(line);
             let line = super::variables::substitute_commands(engine, &line);
-            let result = super::parser::execute_command_substituted(engine, &line);
+            let result = execute_body_line(engine, &line);
             if let TfCommandResult::Error(ref e) = result {
                 if e == "__break__" {
                     should_break = true;

@@ -75,7 +75,7 @@ fn is_tf_command_name(cmd: &str) -> bool {
         "bind" | "unbind" | "hook" | "unhook" |
         "load" | "save" | "require" | "loaded" | "lcd" | "log" |
         "sh" | "time" | "recall" | "repeat" | "ps" | "kill" |
-        "fg" | "trigger" | "input" | "grab" | "ungag" | "exit" |
+        "fg" | "trigger" | "input" | "grab" | "ungag" | "exit" | "shift" |
         // These are also TF commands (mapped to Clay equivalents)
         "quit" | "dc" | "disconnect" | "world" | "listworlds" |
         "listsockets" | "connections" | "connect" | "addworld" | "version" |
@@ -246,7 +246,7 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "exit" => builtins::cmd_exit(engine),
         "dc" | "disconnect" => TfCommandResult::ClayCommand("/disconnect".to_string()),
         "world" => cmd_world(args),
-        "listworlds" => TfCommandResult::ClayCommand("/worlds".to_string()),
+        "listworlds" => cmd_listworlds(engine, args),
         "listsockets" | "connections" => TfCommandResult::ClayCommand("/connections".to_string()),
         "connect" => cmd_connect(args),
         "addworld" => cmd_addworld(args),
@@ -304,6 +304,9 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
 
         // World switching
         "fg" => cmd_fg(args),
+
+        // Argument manipulation
+        "shift" => cmd_shift(engine),
 
         // Variable management
         "listvar" => cmd_listvar(engine, args),
@@ -814,6 +817,141 @@ fn cmd_connect(args: &str) -> TfCommandResult {
 ///   /addworld MyMUD mud.example.com 4000
 ///   /addworld -x SecureMUD secure.example.com 4443
 ///   /addworld MyMUD player password mud.example.com 4000
+/// /shift - Shift positional parameters left (%2→%1, %3→%2, etc.)
+fn cmd_shift(engine: &mut TfEngine) -> TfCommandResult {
+    let argc = engine.get_var("#")
+        .and_then(|v| v.to_int())
+        .unwrap_or(0) as usize;
+
+    if argc == 0 {
+        return TfCommandResult::Success(None);
+    }
+
+    // Shift: 2→1, 3→2, etc.
+    for i in 1..argc {
+        let next_val = engine.get_var(&(i + 1).to_string()).cloned()
+            .unwrap_or(super::TfValue::String(String::new()));
+        engine.set_local(&i.to_string(), next_val);
+    }
+
+    // Remove the last one
+    engine.set_local(&argc.to_string(), super::TfValue::String(String::new()));
+
+    // Decrement count
+    engine.set_local("#", super::TfValue::Integer((argc - 1) as i64));
+
+    // Rebuild %* from remaining args
+    let mut parts = Vec::new();
+    for i in 1..argc {
+        if let Some(v) = engine.get_var(&i.to_string()) {
+            let s = v.to_string_value();
+            if !s.is_empty() {
+                parts.push(s);
+            }
+        }
+    }
+    engine.set_local("*", super::TfValue::String(parts.join(" ")));
+
+    TfCommandResult::Success(None)
+}
+
+/// /listworlds [-cs] [-Sfield] [name] - List world definitions (TF style)
+fn cmd_listworlds(engine: &TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    let mut short = false;
+    let mut cmd_format = false;
+    let mut sort_field = "name";
+    let mut name_pattern: Option<String> = None;
+
+    // Parse options
+    let mut i = 0;
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    while i < parts.len() {
+        let part = parts[i];
+        if part.starts_with('-') {
+            let flags = &part[1..];
+            if flags.starts_with('S') {
+                sort_field = match flags.chars().nth(1) {
+                    Some('n') => "name",
+                    Some('h') => "host",
+                    Some('p') => "port",
+                    Some('c') => "character",
+                    Some('-') => "-",
+                    _ => "name",
+                };
+            } else {
+                for c in flags.chars() {
+                    match c {
+                        's' => short = true,
+                        'c' => cmd_format = true,
+                        'u' | 'm' | 'T' => {} // ignored
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            name_pattern = Some(part.to_string());
+        }
+        i += 1;
+    }
+
+    let mut worlds: Vec<&super::WorldInfoCache> = engine.world_info_cache.iter().collect();
+
+    // Filter by name pattern
+    if let Some(ref pattern) = name_pattern {
+        let pat = pattern.to_lowercase();
+        worlds.retain(|w| w.name.to_lowercase().contains(&pat));
+    }
+
+    // Sort
+    match sort_field {
+        "host" => worlds.sort_by(|a, b| a.host.cmp(&b.host)),
+        "port" => worlds.sort_by(|a, b| a.port.cmp(&b.port)),
+        "character" => worlds.sort_by(|a, b| a.user.cmp(&b.user)),
+        "-" => {} // no sort
+        _ => worlds.sort_by(|a, b| a.name.cmp(&b.name)),
+    }
+
+    if worlds.is_empty() {
+        return TfCommandResult::Success(Some("No worlds defined.".to_string()));
+    }
+
+    if short {
+        // Short format: names only
+        let names: Vec<&str> = worlds.iter().map(|w| w.name.as_str()).collect();
+        return TfCommandResult::Success(Some(names.join("\n")));
+    }
+
+    if cmd_format {
+        // Command format: /test addworld("name", "type", "host", "port", "char", "pass")
+        let mut lines = Vec::new();
+        for w in &worlds {
+            lines.push(format!("/test addworld(\"{}\", \"\", \"{}\", \"{}\", \"{}\", \"{}\")",
+                w.name, w.host, w.port, w.user, w.password));
+        }
+        return TfCommandResult::Success(Some(lines.join("\n")));
+    }
+
+    // Table format matching TF: NAME  TYPE  HOST PORT  CHARACTER
+    // TYPE is always empty (Clay doesn't have world types), right-aligned HOST
+    let mut lines = Vec::new();
+    let name_w = worlds.iter().map(|w| w.name.len()).max().unwrap_or(4).max(4).max(15);
+    let host_w = worlds.iter().map(|w| w.host.len()).max().unwrap_or(4).max(4);
+    let port_w = 5;
+
+    lines.push(format!("{:<name_w$} {:<16}{:>host_w$} {:<port_w$}  {}",
+        "NAME", "TYPE", "HOST", "PORT", "CHARACTER",
+        name_w=name_w, host_w=host_w, port_w=port_w));
+
+    for w in &worlds {
+        lines.push(format!("{:<name_w$} {:<16}{:>host_w$} {:<port_w$}  {}",
+            w.name, "", w.host, w.port, w.user,
+            name_w=name_w, host_w=host_w, port_w=port_w));
+    }
+
+    TfCommandResult::Success(Some(lines.join("\n")))
+}
+
 fn cmd_addworld(args: &str) -> TfCommandResult {
     // Pass through to Clay's /addworld command which handles the actual creation
     if args.trim().is_empty() {
@@ -1289,7 +1427,7 @@ fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         // Reconstruct the full block by prepending "/if "
         let full_block = format!("/if {}", args);
         let results = control_flow::execute_inline_if_block(engine, &full_block);
-        return aggregate_inline_results(results);
+        return aggregate_inline_results(engine, results);
     }
 
     // Check for single-line form: /if (condition) command
@@ -1308,28 +1446,12 @@ fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 }
 
 /// Aggregate results from inline control flow execution
-fn aggregate_inline_results(results: Vec<TfCommandResult>) -> TfCommandResult {
-    let mut messages = vec![];
-    let mut has_error = false;
-
-    for result in results {
-        match result {
-            TfCommandResult::Success(Some(msg)) => messages.push(msg),
-            TfCommandResult::Error(e) => {
-                messages.push(format!("Error: {}", e));
-                has_error = true;
-            }
-            _ => {}
-        }
-    }
-
-    if has_error {
-        TfCommandResult::Error(messages.join("\n"))
-    } else if messages.is_empty() {
-        TfCommandResult::Success(None)
-    } else {
-        TfCommandResult::Success(Some(messages.join("\n")))
-    }
+fn aggregate_inline_results(engine: &mut super::TfEngine, results: Vec<TfCommandResult>) -> TfCommandResult {
+    // Use the engine-aware version which properly handles SendToMud
+    // by queueing commands in engine.pending_commands.
+    // Inline control flow (while/for/if) can produce SendToMud results that
+    // must not be silently dropped.
+    aggregate_results_with_engine(engine, results)
 }
 
 /// /while (condition) - Start a while loop
@@ -1341,7 +1463,7 @@ fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         // Reconstruct the full block by prepending "/while "
         let full_block = format!("/while {}", args);
         let results = control_flow::execute_inline_while_block(engine, &full_block);
-        return aggregate_inline_results(results);
+        return aggregate_inline_results(engine, results);
     }
 
     match control_flow::parse_condition(args) {
@@ -1360,7 +1482,7 @@ fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.contains('\n') && for_args_lower.contains("/done") {
         let full_block = format!("/for {}", args);
         let results = control_flow::execute_inline_for_block(engine, &full_block);
-        return aggregate_inline_results(results);
+        return aggregate_inline_results(engine, results);
     }
 
     match control_flow::parse_for_args(args) {
@@ -1934,5 +2056,55 @@ mod tests {
 
         // When a macro is EXECUTED (not defined), variables are substituted
         // This is handled by execute_macro, not by /def parsing
+    }
+
+    #[test]
+    fn test_macro_while_loop_count() {
+        // /def count = /let i=1%; /while (i <= {1}) /echo num: %{i}%; /let i=$[i + 1]%; /done
+        // /count 10 → "num: 1" through "num: 10"
+        let mut engine = TfEngine::new();
+        execute_command(&mut engine, "/def count =  /let i=1%;  /while (i <= {1})  /echo num: %{i}%;  /let i=$[i + 1]%; /done");
+
+        let result = execute_command(&mut engine, "/count 10");
+        match result {
+            TfCommandResult::Success(Some(msg)) => {
+                let lines: Vec<&str> = msg.lines().collect();
+                assert_eq!(lines.len(), 10, "Expected 10 lines, got {}: {:?}", lines.len(), lines);
+                for i in 1..=10 {
+                    assert_eq!(lines[i - 1], format!("num: {}", i),
+                        "Line {} should be 'num: {}', got '{}'", i, i, lines[i - 1]);
+                }
+            }
+            other => panic!("Expected success with num output, got {:?}", other),
+        }
+
+        // Also test with plain text (SendToMud) via pending_commands
+        execute_command(&mut engine, "/def count2 =  /let i=1%;  /while (i <= {1})  think num: %{i}%;  /let i=$[i + 1]%; /done");
+        engine.pending_commands.clear();
+        execute_command(&mut engine, "/count2 10");
+        let cmds: Vec<String> = engine.pending_commands.iter().map(|c| c.command.clone()).collect();
+        assert_eq!(cmds.len(), 10, "Expected 10 pending commands, got {:?}", cmds);
+        for i in 1..=10 {
+            assert_eq!(cmds[i - 1], format!("think num: {}", i));
+        }
+    }
+
+    #[test]
+    fn test_macro_while_shift() {
+        // /def w = /while ({#}) /echo # %1%; /shift%; /done
+        // /w global 8bit → "# global" then "# 8bit"
+        let mut engine = TfEngine::new();
+        execute_command(&mut engine, "/def w = /while ({#}) /echo # %1%; /shift%; /done");
+
+        let result = execute_command(&mut engine, "/w global 8bit");
+        match result {
+            TfCommandResult::Success(Some(msg)) => {
+                let lines: Vec<&str> = msg.lines().collect();
+                assert_eq!(lines.len(), 2, "Expected 2 lines, got {}: {:?}", lines.len(), lines);
+                assert_eq!(lines[0], "# global");
+                assert_eq!(lines[1], "# 8bit");
+            }
+            other => panic!("Expected success with world output, got {:?}", other),
+        }
     }
 }

@@ -566,11 +566,9 @@ pub fn execute_macro(
     engine.set_local("*", TfValue::String(args.join(" ")));
     engine.set_local("#", TfValue::Integer(args.len() as i64));
 
-    // Substitute variables and execute body
+    // Execute body - positional params are resolved at runtime from local scope
+    // (not pre-substituted) so that /shift works correctly
     let mut body = macro_def.body.clone();
-
-    // Substitute positional parameters first
-    body = variables::substitute_positional(&body, args);
 
     // Substitute capture groups if from trigger
     if let Some(tm) = trigger_match {
