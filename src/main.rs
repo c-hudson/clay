@@ -796,6 +796,64 @@ fn apply_tf_attrs(text: &str, attrs: &str) -> String {
     result
 }
 
+/// Result of running both Clay action triggers and TF triggers on a line.
+struct TriggerProcessingResult {
+    /// Whether the line should be gagged (suppressed from display)
+    pub is_gagged: bool,
+    /// Commands to send to the MUD server
+    pub send_commands: Vec<String>,
+    /// Clay commands to execute (e.g. /connect, /worlds)
+    pub clay_commands: Vec<String>,
+    /// Messages to display locally (from /echo, substitution, etc.)
+    pub messages: Vec<String>,
+    /// Highlight color from action triggers
+    pub highlight_color: Option<String>,
+}
+
+/// Run both Clay action triggers and TF triggers on a line.
+/// Returns combined results from both trigger systems.
+fn process_triggers(
+    line: &str,
+    world_name: &str,
+    actions: &[actions::Action],
+    tf_engine: &mut tf::TfEngine,
+) -> TriggerProcessingResult {
+    let mut result = TriggerProcessingResult {
+        is_gagged: false,
+        send_commands: Vec::new(),
+        clay_commands: Vec::new(),
+        messages: Vec::new(),
+        highlight_color: None,
+    };
+
+    // Check Clay action triggers
+    if let Some(action_result) = check_action_triggers(line, world_name, actions) {
+        result.send_commands.extend(action_result.commands);
+        result.is_gagged = action_result.should_gag;
+        result.highlight_color = action_result.highlight_color;
+    }
+
+    // Check TF triggers
+    let tf_result = tf::bridge::process_line(tf_engine, line, Some(world_name));
+    result.send_commands.extend(tf_result.send_commands);
+    result.clay_commands.extend(tf_result.clay_commands);
+    result.messages.extend(tf_result.messages);
+    result.is_gagged = result.is_gagged || tf_result.should_gag;
+
+    // Handle substitution: gag original, output substitute with attributes
+    if let Some((sub_text, sub_attrs)) = tf_result.substitution {
+        result.is_gagged = true;
+        let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
+            apply_tf_attrs(&sub_text, &sub_attrs)
+        } else {
+            sub_text
+        };
+        result.messages.push(sub_with_attrs);
+    }
+
+    result
+}
+
 /// Convert a wildcard filter pattern to regex for F4 filter popup.
 /// Always uses "contains" semantics - patterns match anywhere in the line.
 /// Supports \* and \? to match literal asterisk and question mark.
@@ -4726,35 +4784,11 @@ impl App {
                 self.worlds[world_idx].trigger_partial_line = line.to_string();
                 has_partial = true;
             } else {
-                let mut is_gagged = false;
-                let mut highlight_color: Option<String> = None;
-                // Check Clay action triggers
-                if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
-                    // Collect commands to execute
-                    commands_to_execute.extend(result.commands);
-                    is_gagged = result.should_gag;
-                    highlight_color = result.highlight_color;
-                }
-                // Check TF triggers
-                let tf_result = tf::bridge::process_line(&mut self.tf_engine, line, Some(&world_name_for_triggers));
-                commands_to_execute.extend(tf_result.send_commands);
-                tf_commands_to_execute.extend(tf_result.clay_commands);
-                tf_messages.extend(tf_result.messages);
-                is_gagged = is_gagged || tf_result.should_gag;
-                // Handle substitution: gag original, output substitute
-                if let Some((sub_text, sub_attrs)) = tf_result.substitution {
-                    is_gagged = true;  // Gag the original line
-                    // Add the substituted text as a message with attributes
-                    let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
-                        // Apply attributes - Cred means bold red, etc.
-                        apply_tf_attrs(&sub_text, &sub_attrs)
-                    } else {
-                        sub_text
-                    };
-                    tf_messages.push(sub_with_attrs);
-                }
-                // Only add complete lines with gagged flag and highlight color
-                processed_lines.push((line, is_gagged, highlight_color));
+                let tr = process_triggers(line, &world_name_for_triggers, &actions, &mut self.tf_engine);
+                commands_to_execute.extend(tr.send_commands);
+                tf_commands_to_execute.extend(tr.clay_commands);
+                tf_messages.extend(tr.messages);
+                processed_lines.push((line, tr.is_gagged, tr.highlight_color));
             }
         }
 
@@ -15312,36 +15346,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let world_name_for_triggers = world_name.clone();
                             let actions = app.settings.actions.clone();
 
-                            // Check action triggers on the message
-                            let mut is_gagged = false;
-                            let mut commands_to_execute: Vec<String> = Vec::new();
-                            let mut tf_commands_to_execute: Vec<String> = Vec::new();
-                            if let Some(result) = check_action_triggers(&message, &world_name_for_triggers, &actions) {
-                                commands_to_execute = result.commands;
-                                is_gagged = result.should_gag;
-                            }
-                            // Check TF triggers
-                            let tf_result = tf::bridge::process_line(&mut app.tf_engine, &message, Some(&world_name_for_triggers));
-                            commands_to_execute.extend(tf_result.send_commands);
-                            tf_commands_to_execute.extend(tf_result.clay_commands);
-                            for msg in &tf_result.messages {
+                            // Check action and TF triggers on the message
+                            let tr = process_triggers(&message, &world_name_for_triggers, &actions, &mut app.tf_engine);
+                            let commands_to_execute = tr.send_commands;
+                            let tf_commands_to_execute = tr.clay_commands;
+                            for msg in &tr.messages {
                                 app.add_tf_output(msg);
-                            }
-                            is_gagged = is_gagged || tf_result.should_gag;
-                            // Handle substitution
-                            if let Some((sub_text, sub_attrs)) = tf_result.substitution {
-                                is_gagged = true;
-                                let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
-                                    apply_tf_attrs(&sub_text, &sub_attrs)
-                                } else {
-                                    sub_text
-                                };
-                                app.add_tf_output(&sub_with_attrs);
                             }
 
                             let data = format!("{}\n", message);
 
-                            if is_gagged {
+                            if tr.is_gagged {
                                 // Add as gagged line (only visible with F2)
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
@@ -16067,37 +16082,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let world_name_for_triggers = world_name.clone();
                         let actions = app.settings.actions.clone();
 
-                        // Check action triggers on the message
-                        let mut is_gagged = false;
-                        let mut commands_to_execute: Vec<String> = Vec::new();
-                        let mut tf_commands_to_execute: Vec<String> = Vec::new();
-                        if let Some(result) = check_action_triggers(&message, &world_name_for_triggers, &actions) {
-                            commands_to_execute = result.commands;
-                            is_gagged = result.should_gag;
-                        }
-                        // Check TF triggers
-                        let tf_result = tf::bridge::process_line(&mut app.tf_engine, &message, Some(&world_name_for_triggers));
-                        commands_to_execute.extend(tf_result.send_commands);
-                        tf_commands_to_execute.extend(tf_result.clay_commands);
-                        is_gagged = is_gagged || tf_result.should_gag;
-                        // Output TF messages (from /echo etc)
-                        for msg in &tf_result.messages {
+                        // Check action and TF triggers on the message
+                        let tr = process_triggers(&message, &world_name_for_triggers, &actions, &mut app.tf_engine);
+                        let commands_to_execute = tr.send_commands;
+                        let tf_commands_to_execute = tr.clay_commands;
+                        for msg in &tr.messages {
                             app.add_tf_output(msg);
-                        }
-                        // Handle substitution
-                        if let Some((sub_text, sub_attrs)) = tf_result.substitution {
-                            is_gagged = true;
-                            let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
-                                apply_tf_attrs(&sub_text, &sub_attrs)
-                            } else {
-                                sub_text
-                            };
-                            app.add_tf_output(&sub_with_attrs);
                         }
 
                         let data = format!("{}\n", message);
 
-                        if is_gagged {
+                        if tr.is_gagged {
                             // Add as gagged line (only visible with F2)
                             let seq = app.worlds[world_idx].next_seq;
                             app.worlds[world_idx].next_seq += 1;
