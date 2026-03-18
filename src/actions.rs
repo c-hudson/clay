@@ -547,3 +547,410 @@ pub fn line_matches_compiled_patterns(
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- split_action_commands ---
+
+    #[test]
+    fn test_split_single_command() {
+        assert_eq!(split_action_commands("say hello"), vec!["say hello"]);
+    }
+
+    #[test]
+    fn test_split_multiple_commands() {
+        assert_eq!(
+            split_action_commands("say hello; wave; smile"),
+            vec!["say hello", "wave", "smile"]
+        );
+    }
+
+    #[test]
+    fn test_split_escaped_semicolon() {
+        assert_eq!(
+            split_action_commands("say hello\\; world; wave"),
+            vec!["say hello; world", "wave"]
+        );
+    }
+
+    #[test]
+    fn test_split_empty_segments() {
+        // Empty segments between semicolons should be skipped
+        assert_eq!(split_action_commands("say hi;;wave"), vec!["say hi", "wave"]);
+    }
+
+    #[test]
+    fn test_split_empty_string() {
+        let result: Vec<String> = Vec::new();
+        assert_eq!(split_action_commands(""), result);
+    }
+
+    #[test]
+    fn test_split_whitespace_trimming() {
+        assert_eq!(
+            split_action_commands("  say hi  ;  wave  "),
+            vec!["say hi", "wave"]
+        );
+    }
+
+    // --- substitute_action_args ---
+
+    #[test]
+    fn test_substitute_args_positional() {
+        assert_eq!(
+            substitute_action_args("say $1 to $2", "hello world"),
+            "say hello to world"
+        );
+    }
+
+    #[test]
+    fn test_substitute_args_star() {
+        assert_eq!(
+            substitute_action_args("say $*", "hello world"),
+            "say hello world"
+        );
+    }
+
+    #[test]
+    fn test_substitute_args_missing() {
+        // Missing args substitute to nothing
+        assert_eq!(
+            substitute_action_args("say $1 $2 $3", "only one"),
+            "say only one "
+        );
+    }
+
+    #[test]
+    fn test_substitute_args_no_substitution() {
+        assert_eq!(
+            substitute_action_args("plain text", "args"),
+            "plain text"
+        );
+    }
+
+    #[test]
+    fn test_substitute_args_dollar_at_end() {
+        assert_eq!(substitute_action_args("cost $", ""), "cost $");
+    }
+
+    #[test]
+    fn test_substitute_args_dollar_zero_not_substituted() {
+        // $0 is not substituted by substitute_action_args (only by pattern captures)
+        assert_eq!(substitute_action_args("$0", "hello"), "$0");
+    }
+
+    // --- substitute_pattern_captures ---
+
+    #[test]
+    fn test_substitute_captures_basic() {
+        let captures = vec!["full match", "group1", "group2"];
+        assert_eq!(
+            substitute_pattern_captures("got $1 and $2 from $0", &captures),
+            "got group1 and group2 from full match"
+        );
+    }
+
+    #[test]
+    fn test_substitute_captures_missing() {
+        let captures = vec!["match", "one"];
+        assert_eq!(
+            substitute_pattern_captures("$1 $2 $3", &captures),
+            "one  "
+        );
+    }
+
+    #[test]
+    fn test_substitute_captures_star_preserved() {
+        // $* should be preserved (not consumed) for later action arg substitution
+        let captures = vec!["match"];
+        assert_eq!(
+            substitute_pattern_captures("$0 $*", &captures),
+            "match $*"
+        );
+    }
+
+    // --- wildcard_to_regex ---
+
+    #[test]
+    fn test_wildcard_star() {
+        let re = Regex::new(&wildcard_to_regex("*hello*")).unwrap();
+        assert!(re.is_match("say hello world"));
+        assert!(!re.is_match("say goodbye"));
+    }
+
+    #[test]
+    fn test_wildcard_question() {
+        let re = Regex::new(&wildcard_to_regex("h?llo")).unwrap();
+        assert!(re.is_match("hello"));
+        assert!(re.is_match("hallo"));
+        assert!(!re.is_match("hllo"));
+    }
+
+    #[test]
+    fn test_wildcard_escaped() {
+        let re = Regex::new(&wildcard_to_regex("what\\?")).unwrap();
+        assert!(re.is_match("what?"));
+        assert!(!re.is_match("whatx"));
+    }
+
+    #[test]
+    fn test_wildcard_escaped_star() {
+        let re = Regex::new(&wildcard_to_regex("5\\*5")).unwrap();
+        assert!(re.is_match("5*5"));
+        assert!(!re.is_match("5x5"));
+    }
+
+    #[test]
+    fn test_wildcard_captures() {
+        let re = Regex::new(&wildcard_to_regex("* tells you: *")).unwrap();
+        let caps = re.captures("Bob tells you: Hello there").unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "Bob");
+        assert_eq!(caps.get(2).unwrap().as_str(), "Hello there");
+    }
+
+    #[test]
+    fn test_wildcard_regex_special_chars_escaped() {
+        // Regex special chars like . + should be escaped
+        let re = Regex::new(&wildcard_to_regex("file.txt")).unwrap();
+        assert!(re.is_match("file.txt"));
+        assert!(!re.is_match("filextxt"));
+    }
+
+    #[test]
+    fn test_wildcard_curly_quotes_normalized() {
+        let re = Regex::new(&wildcard_to_regex("say \"hello\"")).unwrap();
+        assert!(re.is_match("say \"hello\""));
+        assert!(re.is_match("say \u{201C}hello\u{201D}")); // curly double quotes
+    }
+
+    // --- Action compile_regex ---
+
+    #[test]
+    fn test_action_compile_regexp() {
+        let mut action = Action {
+            pattern: "^You say".to_string(),
+            match_type: MatchType::Regexp,
+            enabled: true,
+            ..Action::default()
+        };
+        action.compile_regex();
+        assert!(action.compiled_regex.is_some());
+        assert!(action.compiled_regex.as_ref().unwrap().is_match("You say hello"));
+    }
+
+    #[test]
+    fn test_action_compile_wildcard() {
+        let mut action = Action {
+            pattern: "*tells you*".to_string(),
+            match_type: MatchType::Wildcard,
+            enabled: true,
+            ..Action::default()
+        };
+        action.compile_regex();
+        assert!(action.compiled_regex.is_some());
+        assert!(action.compiled_regex.as_ref().unwrap().is_match("Bob tells you hello"));
+    }
+
+    #[test]
+    fn test_action_compile_disabled() {
+        let mut action = Action {
+            pattern: "test".to_string(),
+            enabled: false,
+            ..Action::default()
+        };
+        action.compile_regex();
+        assert!(action.compiled_regex.is_none());
+    }
+
+    #[test]
+    fn test_action_compile_empty_pattern() {
+        let mut action = Action {
+            pattern: String::new(),
+            enabled: true,
+            ..Action::default()
+        };
+        action.compile_regex();
+        assert!(action.compiled_regex.is_none());
+    }
+
+    #[test]
+    fn test_compile_all_action_regexes() {
+        let mut actions = vec![
+            Action { pattern: "test1".to_string(), enabled: true, ..Action::default() },
+            Action { pattern: "test2".to_string(), enabled: false, ..Action::default() },
+            Action { pattern: "test3".to_string(), enabled: true, ..Action::default() },
+        ];
+        compile_all_action_regexes(&mut actions);
+        assert!(actions[0].compiled_regex.is_some());
+        assert!(actions[1].compiled_regex.is_none()); // disabled
+        assert!(actions[2].compiled_regex.is_some());
+    }
+
+    // --- check_action_triggers ---
+
+    fn make_action(name: &str, pattern: &str, command: &str, match_type: MatchType) -> Action {
+        let mut a = Action {
+            name: name.to_string(),
+            pattern: pattern.to_string(),
+            command: command.to_string(),
+            match_type,
+            enabled: true,
+            ..Action::default()
+        };
+        a.compile_regex();
+        a
+    }
+
+    #[test]
+    fn test_trigger_regexp_match() {
+        let actions = vec![make_action("test", r"^You say", "nod", MatchType::Regexp)];
+        let result = check_action_triggers("You say hello", "", &actions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().commands, vec!["nod"]);
+    }
+
+    #[test]
+    fn test_trigger_wildcard_match() {
+        let actions = vec![make_action("test", "*tells you*", "nod", MatchType::Wildcard)];
+        let result = check_action_triggers("Bob tells you hi", "", &actions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().commands, vec!["nod"]);
+    }
+
+    #[test]
+    fn test_trigger_no_match() {
+        let actions = vec![make_action("test", "zzzzz", "nod", MatchType::Regexp)];
+        let result = check_action_triggers("Hello world", "", &actions);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_trigger_case_insensitive() {
+        let actions = vec![make_action("test", "hello", "nod", MatchType::Regexp)];
+        let result = check_action_triggers("HELLO WORLD", "", &actions);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_trigger_gag_command() {
+        let actions = vec![make_action("test", "spam", "/gag; say filtered", MatchType::Regexp)];
+        let result = check_action_triggers("spam message", "", &actions).unwrap();
+        assert!(result.should_gag);
+        // /gag itself should be filtered from commands
+        assert_eq!(result.commands, vec!["say filtered"]);
+    }
+
+    #[test]
+    fn test_trigger_highlight_command() {
+        let actions = vec![make_action("test", "important", "/highlight red", MatchType::Regexp)];
+        let result = check_action_triggers("important message", "", &actions).unwrap();
+        assert_eq!(result.highlight_color, Some("red".to_string()));
+        // /highlight should be filtered from commands
+        assert!(result.commands.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_capture_substitution() {
+        let actions = vec![make_action(
+            "test", r"(\w+) tells you: (.*)", "say Thanks, $1! Got: $2", MatchType::Regexp
+        )];
+        let result = check_action_triggers("Bob tells you: Hello", "", &actions).unwrap();
+        assert_eq!(result.commands, vec!["say Thanks, Bob! Got: Hello"]);
+    }
+
+    #[test]
+    fn test_trigger_wildcard_capture_substitution() {
+        let actions = vec![make_action(
+            "test", "* tells you: *", "say Thanks, $1!", MatchType::Wildcard
+        )];
+        let result = check_action_triggers("Bob tells you: Hello", "", &actions).unwrap();
+        assert_eq!(result.commands, vec!["say Thanks, Bob!"]);
+    }
+
+    #[test]
+    fn test_trigger_world_filter() {
+        let mut action = make_action("test", "hello", "wave", MatchType::Regexp);
+        action.world = "MyWorld".to_string();
+        let actions = vec![action];
+
+        // Should match when world matches (case-insensitive)
+        assert!(check_action_triggers("hello", "myworld", &actions).is_some());
+        // Should not match for a different world
+        assert!(check_action_triggers("hello", "OtherWorld", &actions).is_none());
+    }
+
+    #[test]
+    fn test_trigger_disabled_skipped() {
+        let mut action = make_action("test", "hello", "wave", MatchType::Regexp);
+        action.enabled = false;
+        action.compile_regex(); // re-compile after disabling
+        let actions = vec![action];
+        assert!(check_action_triggers("hello", "", &actions).is_none());
+    }
+
+    #[test]
+    fn test_trigger_empty_pattern_skipped() {
+        let actions = vec![make_action("manual", "", "wave", MatchType::Regexp)];
+        assert!(check_action_triggers("anything", "", &actions).is_none());
+    }
+
+    #[test]
+    fn test_trigger_strips_ansi() {
+        let actions = vec![make_action("test", "hello", "wave", MatchType::Regexp)];
+        // Line with ANSI color codes should still match
+        let result = check_action_triggers("\x1b[31mhello\x1b[0m", "", &actions);
+        assert!(result.is_some());
+    }
+
+    // --- compile_action_patterns / line_matches_compiled_patterns ---
+
+    #[test]
+    fn test_compiled_patterns_match() {
+        let actions = vec![
+            make_action("a", "hello", "", MatchType::Regexp),
+            make_action("b", "*world*", "", MatchType::Wildcard),
+        ];
+        let patterns = compile_action_patterns("", &actions);
+        assert_eq!(patterns.len(), 2);
+        assert!(line_matches_compiled_patterns("hello there", &patterns));
+        assert!(line_matches_compiled_patterns("big world here", &patterns));
+        assert!(!line_matches_compiled_patterns("nothing here", &patterns));
+    }
+
+    #[test]
+    fn test_compiled_patterns_empty() {
+        let patterns: Vec<Regex> = Vec::new();
+        assert!(!line_matches_compiled_patterns("anything", &patterns));
+    }
+
+    #[test]
+    fn test_compiled_patterns_world_filter() {
+        let mut action = make_action("test", "hello", "", MatchType::Regexp);
+        action.world = "MyWorld".to_string();
+        let actions = vec![action];
+
+        let patterns = compile_action_patterns("MyWorld", &actions);
+        assert_eq!(patterns.len(), 1);
+
+        let patterns = compile_action_patterns("Other", &actions);
+        assert_eq!(patterns.len(), 0);
+    }
+
+    // --- MatchType ---
+
+    #[test]
+    fn test_match_type_parse() {
+        assert_eq!(MatchType::parse("Wildcard"), MatchType::Wildcard);
+        assert_eq!(MatchType::parse("wildcard"), MatchType::Wildcard);
+        assert_eq!(MatchType::parse("Regexp"), MatchType::Regexp);
+        assert_eq!(MatchType::parse("anything_else"), MatchType::Regexp);
+    }
+
+    #[test]
+    fn test_match_type_as_str() {
+        assert_eq!(MatchType::Regexp.as_str(), "Regexp");
+        assert_eq!(MatchType::Wildcard.as_str(), "Wildcard");
+    }
+}

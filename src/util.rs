@@ -859,3 +859,409 @@ pub fn convert_temperatures(text: &str) -> String {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- strip_ansi_codes ---
+
+    #[test]
+    fn test_strip_ansi_plain_text() {
+        assert_eq!(strip_ansi_codes("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_ansi_color_codes() {
+        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn test_strip_ansi_multiple_codes() {
+        assert_eq!(
+            strip_ansi_codes("\x1b[1;31mbold red\x1b[0m normal \x1b[32mgreen\x1b[0m"),
+            "bold red normal green"
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_256_color() {
+        assert_eq!(strip_ansi_codes("\x1b[38;5;196mtext\x1b[0m"), "text");
+    }
+
+    #[test]
+    fn test_strip_ansi_empty() {
+        assert_eq!(strip_ansi_codes(""), "");
+    }
+
+    // --- normalize_prompt ---
+
+    #[test]
+    fn test_normalize_prompt_basic() {
+        assert_eq!(normalize_prompt("Enter command>"), "Enter command> ");
+    }
+
+    #[test]
+    fn test_normalize_prompt_trailing_spaces() {
+        assert_eq!(normalize_prompt("prompt>   "), "prompt> ");
+    }
+
+    #[test]
+    fn test_normalize_prompt_cr_lf() {
+        assert_eq!(normalize_prompt("prompt>\r\n"), "prompt> ");
+    }
+
+    #[test]
+    fn test_normalize_prompt_leading_spaces() {
+        assert_eq!(normalize_prompt("  prompt>  "), "prompt> ");
+    }
+
+    // --- color_name_to_ansi_bg ---
+
+    #[test]
+    fn test_color_named() {
+        assert!(color_name_to_ansi_bg("red").contains("48;5;52"));
+        assert!(color_name_to_ansi_bg("green").contains("48;5;22"));
+        assert!(color_name_to_ansi_bg("blue").contains("48;5;17"));
+    }
+
+    #[test]
+    fn test_color_empty_default() {
+        assert!(color_name_to_ansi_bg("").contains("48;5;23"));
+    }
+
+    #[test]
+    fn test_color_xterm_number() {
+        assert_eq!(color_name_to_ansi_bg("196"), "\x1b[48;5;196m");
+    }
+
+    #[test]
+    fn test_color_rgb_comma() {
+        assert_eq!(color_name_to_ansi_bg("255,0,128"), "\x1b[48;2;255;0;128m");
+    }
+
+    #[test]
+    fn test_color_rgb_semicolon() {
+        assert_eq!(color_name_to_ansi_bg("100;200;50"), "\x1b[48;2;100;200;50m");
+    }
+
+    #[test]
+    fn test_color_case_insensitive() {
+        assert_eq!(color_name_to_ansi_bg("RED"), color_name_to_ansi_bg("red"));
+    }
+
+    #[test]
+    fn test_color_unknown_fallback() {
+        assert!(color_name_to_ansi_bg("notacolor").contains("48;5;23"));
+    }
+
+    // --- visual_line_count ---
+
+    #[test]
+    fn test_visual_lines_short() {
+        assert_eq!(visual_line_count("hello", 80), 1);
+    }
+
+    #[test]
+    fn test_visual_lines_wrapping() {
+        assert_eq!(visual_line_count("12345678901234567890", 10), 2);
+    }
+
+    #[test]
+    fn test_visual_lines_empty() {
+        assert_eq!(visual_line_count("", 80), 1);
+    }
+
+    #[test]
+    fn test_visual_lines_zero_width() {
+        assert_eq!(visual_line_count("hello", 0), 1);
+    }
+
+    // --- truncate_str ---
+
+    #[test]
+    fn test_truncate_short_string() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_exact_length() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_long_string() {
+        assert_eq!(truncate_str("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_very_short_max() {
+        assert_eq!(truncate_str("hello", 3), "hel");
+    }
+
+    // --- strip_mud_tag ---
+
+    #[test]
+    fn test_strip_tag_colon() {
+        assert_eq!(strip_mud_tag("[Public:] Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn test_strip_tag_paren() {
+        assert_eq!(strip_mud_tag("[Chat(Bob)] Hello"), "Hello");
+    }
+
+    #[test]
+    fn test_strip_tag_no_tag() {
+        assert_eq!(strip_mud_tag("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn test_strip_tag_no_space_after() {
+        assert_eq!(strip_mud_tag("[tag:]text"), "[tag:]text");
+    }
+
+    #[test]
+    fn test_strip_tag_indented() {
+        assert_eq!(strip_mud_tag("  [Public:] Hello"), "  [Public:] Hello");
+    }
+
+    #[test]
+    fn test_strip_tag_with_ansi() {
+        let result = strip_mud_tag("\x1b[31m[Public:] Hello");
+        assert!(result.starts_with("\x1b[31m"));
+        assert!(result.ends_with("Hello"));
+        assert!(!result.contains("[Public:]"));
+    }
+
+    #[test]
+    fn test_strip_tag_empty_parens() {
+        assert_eq!(strip_mud_tag("[time()] Hello"), "[time()] Hello");
+    }
+
+    // --- format_duration_short ---
+
+    #[test]
+    fn test_duration_seconds() {
+        assert_eq!(format_duration_short(30), "30s");
+    }
+
+    #[test]
+    fn test_duration_minutes() {
+        assert_eq!(format_duration_short(300), "5m");
+    }
+
+    #[test]
+    fn test_duration_hours() {
+        assert_eq!(format_duration_short(9000), "2.5h");
+    }
+
+    #[test]
+    fn test_duration_days() {
+        assert_eq!(format_duration_short(172800), "2.0d");
+    }
+
+    // --- convert_temperatures ---
+
+    #[test]
+    fn test_temp_celsius_to_fahrenheit() {
+        assert_eq!(convert_temperatures("0C"), "0C (32F)");
+        assert_eq!(convert_temperatures("100C"), "100C (212F)");
+    }
+
+    #[test]
+    fn test_temp_fahrenheit_to_celsius() {
+        assert_eq!(convert_temperatures("32F"), "32F (0C)");
+        assert_eq!(convert_temperatures("212F"), "212F (100C)");
+    }
+
+    #[test]
+    fn test_temp_with_space() {
+        assert_eq!(convert_temperatures("100 C"), "100 C (212F)");
+    }
+
+    #[test]
+    fn test_temp_no_match() {
+        assert_eq!(convert_temperatures("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_temp_negative() {
+        assert_eq!(convert_temperatures("-40C"), "-40C (-40F)");
+    }
+
+    #[test]
+    fn test_temp_in_sentence() {
+        assert_eq!(convert_temperatures("It is 20C outside"), "It is 20C (68F) outside");
+    }
+
+    #[test]
+    fn test_temp_decimal() {
+        assert_eq!(convert_temperatures("37.5C"), "37.5C (100F)");
+    }
+
+    // --- world switching ---
+
+    #[test]
+    fn test_world_should_cycle() {
+        let connected = WorldSwitchInfo {
+            name: "a".into(), connected: true, unseen_lines: 0,
+            pending_lines: 0, first_unseen_at: None,
+        };
+        let unseen = WorldSwitchInfo {
+            name: "b".into(), connected: false, unseen_lines: 5,
+            pending_lines: 0, first_unseen_at: None,
+        };
+        let idle = WorldSwitchInfo {
+            name: "c".into(), connected: false, unseen_lines: 0,
+            pending_lines: 0, first_unseen_at: None,
+        };
+        assert!(world_should_cycle(&connected));
+        assert!(world_should_cycle(&unseen));
+        assert!(!world_should_cycle(&idle));
+    }
+
+    #[test]
+    fn test_world_switch_alphabetical() {
+        let worlds = vec![
+            WorldSwitchInfo { name: "Charlie".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+        ];
+        // Sorted: Alpha(1), Bravo(2), Charlie(0)
+        assert_eq!(calculate_next_world(&worlds, 1, WorldSwitchMode::Alphabetical), Some(2)); // Alpha -> Bravo
+        assert_eq!(calculate_next_world(&worlds, 2, WorldSwitchMode::Alphabetical), Some(0)); // Bravo -> Charlie
+        assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::Alphabetical), Some(1)); // Charlie -> Alpha (wrap)
+    }
+
+    #[test]
+    fn test_world_switch_previous() {
+        let worlds = vec![
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+        ];
+        assert_eq!(calculate_prev_world(&worlds, 1, WorldSwitchMode::Alphabetical), Some(0));
+        assert_eq!(calculate_prev_world(&worlds, 0, WorldSwitchMode::Alphabetical), Some(1)); // wrap
+    }
+
+    #[test]
+    fn test_world_switch_unseen_first() {
+        let t1 = std::time::Instant::now();
+        let t2 = t1 + std::time::Duration::from_secs(1);
+        let worlds = vec![
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 3, pending_lines: 0, first_unseen_at: Some(t2) },
+            WorldSwitchInfo { name: "Charlie".into(), connected: true, unseen_lines: 1, pending_lines: 0, first_unseen_at: Some(t1) },
+        ];
+        // From Alpha, should go to Charlie (oldest unseen)
+        assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::UnseenFirst), Some(2));
+    }
+
+    #[test]
+    fn test_world_switch_single_world() {
+        let worlds = vec![
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+        ];
+        assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::Alphabetical), None);
+    }
+
+    #[test]
+    fn test_world_switch_no_cycleable() {
+        let worlds = vec![
+            WorldSwitchInfo { name: "Alpha".into(), connected: false, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+        ];
+        assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::Alphabetical), None);
+    }
+
+    // --- format_worlds_list ---
+
+    #[test]
+    fn test_worlds_list_empty() {
+        assert_eq!(format_worlds_list(&[]), "No worlds connected.");
+    }
+
+    #[test]
+    fn test_worlds_list_none_connected() {
+        let worlds = vec![WorldListInfo {
+            name: "test".into(), connected: false, is_current: false,
+            is_ssl: false, is_proxy: false, unseen_lines: 0,
+            last_send_secs: None, last_recv_secs: None,
+            last_nop_secs: None, next_nop_secs: None, buffer_size: 0,
+        }];
+        assert_eq!(format_worlds_list(&worlds), "No worlds connected.");
+    }
+
+    #[test]
+    fn test_worlds_list_has_content() {
+        let worlds = vec![WorldListInfo {
+            name: "TestWorld".into(), connected: true, is_current: true,
+            is_ssl: true, is_proxy: false, unseen_lines: 5,
+            last_send_secs: Some(60), last_recv_secs: Some(30),
+            last_nop_secs: Some(120), next_nop_secs: Some(180),
+            buffer_size: 100,
+        }];
+        let result = format_worlds_list(&worlds);
+        assert!(result.contains("World"));
+        assert!(result.contains("TestWorld"));
+    }
+
+    // --- get_current_time_12hr ---
+
+    #[test]
+    fn test_time_12hr_format() {
+        let time = get_current_time_12hr();
+        assert!(time.contains(':'));
+        let parts: Vec<&str> = time.split(':').collect();
+        assert_eq!(parts.len(), 2);
+        let hour: u32 = parts[0].parse().unwrap();
+        assert!((1..=12).contains(&hour));
+    }
+
+    // --- local_time_from_epoch ---
+
+    #[test]
+    fn test_local_time_fields_valid() {
+        // Use a recent timestamp to avoid timezone edge cases with epoch 0
+        let lt = local_time_from_epoch(1700000000); // 2023-11-14
+        assert!(lt.year >= 2023);
+        assert!((1..=12).contains(&lt.month));
+        assert!((1..=31).contains(&lt.day));
+        assert!((0..=23).contains(&lt.hour));
+        assert!((0..=59).contains(&lt.minute));
+        assert!((0..=60).contains(&lt.second));
+        assert!((0..=6).contains(&lt.weekday));
+    }
+
+    // --- parse_discord_timestamps ---
+
+    #[test]
+    fn test_discord_timestamp_formats() {
+        let result = parse_discord_timestamps("<t:1736982420:t>");
+        assert!(result.contains(':'));
+        assert!(!result.contains("<t:"));
+    }
+
+    #[test]
+    fn test_discord_timestamp_no_match() {
+        assert_eq!(parse_discord_timestamps("no timestamps"), "no timestamps");
+    }
+
+    #[test]
+    fn test_discord_timestamp_date_format() {
+        let result = parse_discord_timestamps("<t:1736982420:d>");
+        assert!(result.contains('/'));
+    }
+
+    #[test]
+    fn test_discord_timestamp_invalid() {
+        assert_eq!(parse_discord_timestamps("<t:notanumber:t>"), "<t:notanumber:t>");
+    }
+
+    #[test]
+    fn test_discord_timestamp_mixed_text() {
+        let result = parse_discord_timestamps("Event at <t:1736982420:t> is cool");
+        assert!(result.starts_with("Event at "));
+        assert!(result.ends_with(" is cool"));
+        assert!(!result.contains("<t:"));
+    }
+}
