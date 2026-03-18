@@ -777,27 +777,29 @@ pub async fn handle_daemon_ws_message(
                 }
                 Command::Remote => {
                     if let Some(ref ws_server) = app.ws_server {
-                        let clients = ws_server.clients.blocking_read();
-                        let authed: Vec<_> = clients.iter().filter(|(_, c)| c.authenticated).collect();
-                        let output = if authed.is_empty() {
-                            "No remote clients connected.".to_string()
-                        } else {
-                            let mut lines = Vec::new();
-                            lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
-                                "ID", "IP", "Type", "Connected", "Idle", "User"));
-                            let mut sorted: Vec<_> = authed.iter().collect();
-                            sorted.sort_by_key(|(id, _)| *id);
-                            for (id, client) in sorted {
-                                let connected = format_duration_short(client.connected_at.elapsed());
-                                let idle = format_duration_short(client.last_activity.elapsed());
-                                let ctype = format!("{:?}", client.client_type);
-                                let user = client.username.as_deref().unwrap_or("");
+                        let output = if let Ok(clients) = ws_server.clients.try_read() {
+                            let authed: Vec<_> = clients.iter().filter(|(_, c)| c.authenticated).collect();
+                            if authed.is_empty() {
+                                "No remote clients connected.".to_string()
+                            } else {
+                                let mut lines = Vec::new();
                                 lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
-                                    id, client.ip_address, ctype, connected, idle, user));
+                                    "ID", "IP", "Type", "Connected", "Idle", "User"));
+                                let mut sorted: Vec<_> = authed.iter().collect();
+                                sorted.sort_by_key(|(id, _)| *id);
+                                for (id, client) in sorted {
+                                    let connected = format_duration_short(client.connected_at.elapsed());
+                                    let idle = format_duration_short(client.last_activity.elapsed());
+                                    let ctype = format!("{:?}", client.client_type);
+                                    let user = client.username.as_deref().unwrap_or("");
+                                    lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
+                                        id, client.ip_address, ctype, connected, idle, user));
+                                }
+                                lines.join("\n")
                             }
-                            lines.join("\n")
+                        } else {
+                            "Could not read client list (busy).".to_string()
                         };
-                        drop(clients);
                         app.ws_broadcast(WsMessage::ServerData {
                             world_index, data: output, is_viewed: false,
                             ts: current_timestamp_secs(), from_server: false,
@@ -807,16 +809,21 @@ pub async fn handle_daemon_ws_message(
                 }
                 Command::RemoteKill { client_id } => {
                     if let Some(ref ws_server) = app.ws_server {
-                        let clients = ws_server.clients.blocking_read();
-                        let msg = if let Some(client) = clients.get(&client_id) {
-                            let ip = client.ip_address.clone();
-                            drop(clients);
-                            let mut clients_mut = ws_server.clients.blocking_write();
-                            clients_mut.remove(&client_id);
-                            format!("Disconnected remote client {} ({})", client_id, ip)
+                        let msg = if let Ok(clients) = ws_server.clients.try_read() {
+                            if let Some(client) = clients.get(&client_id) {
+                                let ip = client.ip_address.clone();
+                                drop(clients);
+                                if let Ok(mut clients_mut) = ws_server.clients.try_write() {
+                                    clients_mut.remove(&client_id);
+                                    format!("Disconnected remote client {} ({})", client_id, ip)
+                                } else {
+                                    "Could not acquire write lock (busy).".to_string()
+                                }
+                            } else {
+                                format!("No client with ID {}.", client_id)
+                            }
                         } else {
-                            drop(clients);
-                            format!("No client with ID {}.", client_id)
+                            "Could not read client list (busy).".to_string()
                         };
                         app.ws_broadcast(WsMessage::ServerData {
                             world_index, data: msg, is_viewed: false,
