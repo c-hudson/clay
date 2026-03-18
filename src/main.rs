@@ -5988,7 +5988,7 @@ impl App {
                         let _ = writeln!(file, "Timestamp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
                             lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second);
                         let _ = writeln!(file, "Mode: daemon/ws");
-                        let _ = writeln!(file, "");
+                        let _ = writeln!(file);
 
                         // Global state
                         let _ = writeln!(file, "=== GLOBAL STATE ===");
@@ -5999,7 +5999,7 @@ impl App {
                         let _ = writeln!(file, "more_mode_enabled: {}", self.settings.more_mode_enabled);
                         let _ = writeln!(file, "show_tags: {}", self.show_tags);
                         let _ = writeln!(file, "new_line_indicator: {}", self.settings.new_line_indicator);
-                        let _ = writeln!(file, "");
+                        let _ = writeln!(file);
 
                         // WS client info
                         let _ = writeln!(file, "=== WS CLIENTS ===");
@@ -6008,7 +6008,7 @@ impl App {
                             let _ = writeln!(file, "  client {}: world_index={}, visible_lines={}, visible_columns={}, dimensions={:?}",
                                 cid, cv.world_index, cv.visible_lines, cv.visible_columns, cv.dimensions);
                         }
-                        let _ = writeln!(file, "");
+                        let _ = writeln!(file);
 
                         // Per-world state
                         for (wi, world) in self.worlds.iter().enumerate() {
@@ -6052,7 +6052,7 @@ impl App {
                             let _ = writeln!(file, "effective_output_height: {}", eff_height);
                             let _ = writeln!(file, "effective_output_width: {}", eff_width);
                             let _ = writeln!(file, "effective_max_lines: {}", (eff_height as usize).saturating_sub(2));
-                            let _ = writeln!(file, "");
+                            let _ = writeln!(file);
 
                             // Full scrollback dump (all output + pending lines)
                             let _ = writeln!(file, "--- OUTPUT LINES ({}) ---", world.output_lines.len());
@@ -6074,7 +6074,7 @@ impl App {
                                         line.text);
                                 }
                             }
-                            let _ = writeln!(file, "");
+                            let _ = writeln!(file);
                         }
 
                         // Don't broadcast — /dump must be passive and not disturb more-mode state
@@ -9290,7 +9290,7 @@ async fn run_grep_client(
         }
 
         // Deduplicate by seq within each world and sort
-        for (_world_idx, lines) in &mut world_lines {
+        for lines in world_lines.values_mut() {
             lines.sort_by_key(|l| l.seq);
             lines.dedup_by_key(|l| l.seq);
         }
@@ -12452,8 +12452,8 @@ async fn main() -> io::Result<()> {
         let mut i = 0;
         while i < args.len() {
             let arg = &args[i];
-            if arg.starts_with("--grep=") {
-                let mut addr = arg[7..].to_string();
+            if let Some(stripped) = arg.strip_prefix("--grep=") {
+                let mut addr = stripped.to_string();
                 // Default to port 9000 if no port specified
                 if !addr.contains(':') {
                     addr.push_str(":9000");
@@ -12578,7 +12578,7 @@ async fn main() -> io::Result<()> {
                     if grep_pattern.is_none() {
                         grep_pattern = Some(grep_extra_args[gi].clone());
                     } else {
-                        eprintln!("Error: Unexpected argument '{}'. Pattern already set to '{}'.", grep_extra_args[gi], grep_pattern.as_ref().unwrap());
+                        eprintln!("Error: Unexpected argument '{}'. Pattern already set to '{}'.", grep_extra_args[gi], grep_pattern.as_deref().unwrap_or(""));
                         std::process::exit(1);
                     }
                 }
@@ -19389,7 +19389,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     }
                     // Prefer IPv4 error (more informative) over IPv6 "network unreachable"
                     Err(ipv4_err.or(last_err).unwrap_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::Other, "Connection failed")
+                        std::io::Error::other("Connection failed")
                     }))
                 }.await;
                 match connect_result {
@@ -20001,7 +20001,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     let lt = local_time_from_epoch(now_ts as i64);
                     let _ = writeln!(file, "Timestamp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
                         lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second);
-                    let _ = writeln!(file, "");
+                    let _ = writeln!(file);
 
                     // Global state
                     let _ = writeln!(file, "=== GLOBAL STATE ===");
@@ -20014,7 +20014,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     let _ = writeln!(file, "show_tags: {}", app.show_tags);
                     let _ = writeln!(file, "new_line_indicator: {}", app.settings.new_line_indicator);
                     let _ = writeln!(file, "max_lines (output_height-2): {}", (app.output_height as usize).saturating_sub(2));
-                    let _ = writeln!(file, "");
+                    let _ = writeln!(file);
 
                     // WS client info
                     let _ = writeln!(file, "=== WS CLIENTS ===");
@@ -20023,7 +20023,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                         let _ = writeln!(file, "  client {}: world_index={}, visible_lines={}, visible_columns={}, dimensions={:?}",
                             cid, cv.world_index, cv.visible_lines, cv.visible_columns, cv.dimensions);
                     }
-                    let _ = writeln!(file, "");
+                    let _ = writeln!(file);
 
                     // Per-world state
                     for (wi, world) in app.worlds.iter().enumerate() {
@@ -20069,7 +20069,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                         let _ = writeln!(file, "effective_output_height: {}", eff_height);
                         let _ = writeln!(file, "effective_output_width: {}", eff_width);
                         let _ = writeln!(file, "effective_max_lines: {}", (eff_height as usize).saturating_sub(2));
-                        let _ = writeln!(file, "");
+                        let _ = writeln!(file);
 
                         // Full scrollback dump (all output + pending lines)
                         let _ = writeln!(file, "--- OUTPUT LINES ({}) ---", world.output_lines.len());
@@ -20091,7 +20091,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                     line.text);
                             }
                         }
-                        let _ = writeln!(file, "");
+                        let _ = writeln!(file);
                     }
 
                     // Don't use add_output — it resets lines_since_pause and scrolls.

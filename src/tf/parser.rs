@@ -868,8 +868,7 @@ fn cmd_listworlds(engine: &TfEngine, args: &str) -> TfCommandResult {
     let parts: Vec<&str> = args.split_whitespace().collect();
     while i < parts.len() {
         let part = parts[i];
-        if part.starts_with('-') {
-            let flags = &part[1..];
+        if let Some(flags) = part.strip_prefix('-') {
             if flags.starts_with('S') {
                 sort_field = match flags.chars().nth(1) {
                     Some('n') => "name",

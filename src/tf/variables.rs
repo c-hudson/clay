@@ -117,7 +117,7 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                         if let Some(value) = engine.get_var("#") {
                             result.push_str(&value.to_string_value());
                         } else {
-                            result.push_str("0");
+                            result.push('0');
                         }
                         i += 2;
                     }
