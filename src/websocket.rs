@@ -531,6 +531,12 @@ pub struct WsClientInfo {
     pub client_type: RemoteClientType,
     /// Client's viewport height (for calculating screenful)
     pub viewport_height: usize,
+    /// Client's IP address
+    pub ip_address: String,
+    /// When this client connected
+    pub connected_at: std::time::Instant,
+    /// When the client last sent a message
+    pub last_activity: std::time::Instant,
 }
 
 /// User credential for multiuser authentication
@@ -1221,6 +1227,9 @@ where
             received_initial_state: false,
             client_type: RemoteClientType::Web,  // Default, updated by ClientTypeDeclaration
             viewport_height: 24,  // Default, updated by UpdateViewState
+            ip_address: client_ip.clone(),
+            connected_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
         });
     }
 
@@ -1406,6 +1415,13 @@ where
                                 clients_guard.get(&client_id).map(|c| c.authenticated).unwrap_or(false)
                             };
                             if is_authed {
+                                // Update last activity time
+                                {
+                                    let mut clients_guard = clients.write().await;
+                                    if let Some(client) = clients_guard.get_mut(&client_id) {
+                                        client.last_activity = std::time::Instant::now();
+                                    }
+                                }
                                 // Handle RevokeKey inside auth check
                                 if let WsMessage::RevokeKey { ref auth_key } = ws_msg {
                                     let _ = event_tx.send(AppEvent::WsKeyRevoke(client_id, auth_key.clone())).await;

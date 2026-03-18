@@ -500,7 +500,7 @@
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc',
-        'flush', 'menu', 'send', 'gag', 'ban', 'unban',
+        'flush', 'menu', 'send', 'gag', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'edit', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font',
     ];

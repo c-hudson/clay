@@ -1248,6 +1248,10 @@ pub enum Command {
     Send { text: String, all_worlds: bool, target_world: Option<String>, no_newline: bool },
     /// /gag <pattern> - gag lines matching pattern
     Gag { pattern: String },
+    /// /remote - list remotely connected clients
+    Remote,
+    /// /remote --kill <id> - disconnect a remote client
+    RemoteKill { client_id: u64 },
     /// /ban - show banned hosts
     BanList,
     /// /unban <host> - remove ban for host
@@ -1348,6 +1352,17 @@ pub fn parse_command(input: &str) -> Command {
                 Command::Unknown { cmd: trimmed.to_string() }
             } else {
                 Command::Gag { pattern: args.join(" ") }
+            }
+        }
+        "/remote" => {
+            if args.len() >= 2 && args[0] == "--kill" {
+                if let Ok(id) = args[1].parse::<u64>() {
+                    Command::RemoteKill { client_id: id }
+                } else {
+                    Command::Unknown { cmd: trimmed.to_string() }
+                }
+            } else {
+                Command::Remote
             }
         }
         "/ban" => Command::BanList,
@@ -5859,6 +5874,56 @@ impl App {
                     marked_new: false,
                     flush: false, gagged: false,
                 });
+            }
+            Command::Remote => {
+                if let Some(ref ws_server) = self.ws_server {
+                    let clients = ws_server.clients.blocking_read();
+                    let authed: Vec<_> = clients.iter().filter(|(_, c)| c.authenticated).collect();
+                    let output = if authed.is_empty() {
+                        "No remote clients connected.".to_string()
+                    } else {
+                        let mut lines = Vec::new();
+                        lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
+                            "ID", "IP", "Type", "Connected", "Idle", "User"));
+                        let mut sorted: Vec<_> = authed.iter().collect();
+                        sorted.sort_by_key(|(id, _)| *id);
+                        for (id, client) in sorted {
+                            let connected = format_duration_short(client.connected_at.elapsed());
+                            let idle = format_duration_short(client.last_activity.elapsed());
+                            let ctype = format!("{:?}", client.client_type);
+                            let user = client.username.as_deref().unwrap_or("");
+                            lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
+                                id, client.ip_address, ctype, connected, idle, user));
+                        }
+                        lines.join("\n")
+                    };
+                    drop(clients);
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index, data: output, is_viewed: false,
+                        ts: current_timestamp_secs(), from_server: false,
+                        seq: 0, marked_new: false, flush: false, gagged: false,
+                    });
+                }
+            }
+            Command::RemoteKill { client_id: kill_id } => {
+                if let Some(ref ws_server) = self.ws_server {
+                    let clients = ws_server.clients.blocking_read();
+                    let msg = if let Some(client) = clients.get(&kill_id) {
+                        let ip = client.ip_address.clone();
+                        drop(clients);
+                        let mut clients_mut = ws_server.clients.blocking_write();
+                        clients_mut.remove(&kill_id);
+                        format!("Disconnected remote client {} ({})", kill_id, ip)
+                    } else {
+                        drop(clients);
+                        format!("No client with ID {}.", kill_id)
+                    };
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index, data: msg, is_viewed: false,
+                        ts: current_timestamp_secs(), from_server: false,
+                        seq: 0, marked_new: false, flush: false, gagged: false,
+                    });
+                }
             }
             Command::BanList => {
                 // Send current ban list
@@ -19830,6 +19895,61 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             // TODO: Implement gag patterns
             app.add_output(&format!("Gag pattern set: {}", pattern));
         }
+        Command::Remote => {
+            let lines = if let Some(ref ws_server) = app.ws_server {
+                let clients = ws_server.clients.blocking_read();
+                let authed: Vec<_> = clients.iter()
+                    .filter(|(_, c)| c.authenticated)
+                    .collect();
+                if authed.is_empty() {
+                    vec!["No remote clients connected.".to_string()]
+                } else {
+                    let mut lines = Vec::new();
+                    lines.push(String::new());
+                    lines.push("Remote Clients:".to_string());
+                    lines.push("─".repeat(75));
+                    lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
+                        "ID", "IP", "Type", "Connected", "Idle", "User"));
+                    lines.push("─".repeat(75));
+                    let mut sorted: Vec<_> = authed.iter().collect();
+                    sorted.sort_by_key(|(id, _)| *id);
+                    let count = sorted.len();
+                    for (id, client) in sorted {
+                        let connected = format_duration_short(client.connected_at.elapsed());
+                        let idle = format_duration_short(client.last_activity.elapsed());
+                        let ctype = format!("{:?}", client.client_type);
+                        let user = client.username.as_deref().unwrap_or("");
+                        lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
+                            id, client.ip_address, ctype, connected, idle, user));
+                    }
+                    lines.push("─".repeat(75));
+                    lines.push(format!("{} client(s). Use /remote --kill <ID> to disconnect.", count));
+                    lines
+                }
+            } else {
+                vec!["WebSocket server is not running.".to_string()]
+            };
+            for line in lines {
+                app.add_output(&line);
+            }
+        }
+        Command::RemoteKill { client_id } => {
+            let msg = if let Some(ref ws_server) = app.ws_server {
+                let clients = ws_server.clients.blocking_read();
+                if clients.get(&client_id).is_some() {
+                    let ip = clients.get(&client_id).unwrap().ip_address.clone();
+                    drop(clients);
+                    let mut clients_mut = ws_server.clients.blocking_write();
+                    clients_mut.remove(&client_id);
+                    format!("Disconnected remote client {} ({})", client_id, ip)
+                } else {
+                    format!("No client with ID {}.", client_id)
+                }
+            } else {
+                "WebSocket server is not running.".to_string()
+            };
+            app.add_output(&msg);
+        }
         Command::BanList => {
             // Show current banned hosts
             let bans = app.ban_list.get_ban_info();
@@ -25626,7 +25746,7 @@ mod tests {
         let mut rust_commands: Vec<String> = vec![
             "help", "version", "quit", "reload", "update", "setup", "web", "actions",
             "connections", "l", "worlds", "world", "disconnect", "dc",
-            "flush", "menu", "send", "gag", "ban", "unban",
+            "flush", "menu", "send", "gag", "remote", "ban", "unban",
             "testmusic", "dump", "notify", "addworld", "edit", "tag", "tags",
             "dict", "urban", "translate", "tr", "font",
         ].into_iter().map(|s| s.to_string()).collect();
