@@ -16,7 +16,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **More-Mode** - Pagination for fast-scrolling output
 - **Scrollback** - Unlimited history with PageUp/PageDown navigation
 - **Command History** - Navigate previous commands with Ctrl+P/N
-- **Telnet Protocol** - Full telnet negotiation with keepalive support (SGA, TTYPE, EOR, NAWS)
+- **Telnet Protocol** - Full telnet negotiation with keepalive support (SGA, TTYPE, EOR, NAWS, MCCP2)
 - **Auto-Login** - Configurable automatic login (Connect, Prompt, MOO modes)
 - **Hot Reload** - Update the binary without losing connections (`/reload`)
 - **Crash Recovery** - Automatic restart with state preservation on panic
@@ -28,11 +28,13 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **File Logging** - Per-world output logging
 - **ANSI Music** - BBS-style music playback (web/GUI interfaces)
 - **GMCP Media** - Server-driven sound effects and music via Client.Media protocol
+- **MCCP2 Compression** - Automatic zlib compression for reduced bandwidth (telnet option 86)
 - **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands, startup actions
 - **TinyFugue Compatibility** - Full TF command support (`/def`, `/set`, `/if`, `/load`, etc.)
 - **Configurable Keybindings** - All keys configurable via `~/.clay.key.dat` with TF defaults, browser-based editor
 - **Kill Ring** - Emacs-style kill ring (Ctrl+K/U/W push, Ctrl+Y yanks)
 - **Themes** - Customizable color themes for GUI/web via `~/clay.theme.dat` with browser-based theme editor
+- **Context Help** - Press `?` in any popup for beginner-friendly help
 - **Notes Editor** - Per-world split-screen notes editor (`/edit`)
 - **Termux Support** - Runs on Android via Termux
 - **Android App** - WebSocket client with push notifications via `/notify`
