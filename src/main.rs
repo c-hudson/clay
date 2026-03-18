@@ -5352,7 +5352,6 @@ impl App {
             // If challenge_response, client sent SHA256(auth_key + challenge)
             // We compute SHA256(stored_key + challenge) for each stored key and compare
             let is_valid = if uses_challenge {
-                use crate::websocket::hash_with_challenge;
                 self.settings.websocket_auth_keys.iter().any(|ak| {
                     hash_with_challenge(&ak.key, challenge) == key
                 })
@@ -9092,7 +9091,7 @@ async fn run_grep_client(
 
     let (ws_stream, _) = match connect_result {
         Ok(result) => result,
-        Err(e) if try_fallback => {
+        Err(_) if try_fallback => {
             let fallback_url = format!("ws://{}", addr);
             match connect_async(&fallback_url).await {
                 Ok(result) => result,
@@ -21334,7 +21333,7 @@ fn render_output_crossterm(app: &App) {
 /// Parses ANSI SGR escape sequences and sets cell styles accordingly.
 /// This bypasses ansi_to_tui and Paragraph for reliable color reproduction.
 fn ansi_string_to_buffer(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, s: &str, max_width: u16) {
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::Color;
 
     let mut col = 0u16;
     let mut style = Style::default();
