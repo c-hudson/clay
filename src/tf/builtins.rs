@@ -159,7 +159,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     let mut disposition_explicit = false;
     let mut world: Option<String> = None;
     let mut _synchronous = false;
-    let mut _on_prompt = false;  // -P flag: run on prompt (not yet implemented)
+    let mut on_prompt = false;  // -P flag: send one line per telnet prompt
     let mut delay_secs: f64 = 0.0;  // Timing between lines
 
     // Helper to parse time string: "seconds", "min:sec", or "hour:min:sec"
@@ -217,12 +217,12 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
             } else if opt == "-S" {
                 _synchronous = true;
             } else if opt == "-P" {
-                _on_prompt = true;
+                on_prompt = true;
             } else if opt.len() >= 2 && is_time_spec(&opt[1..]) {
                 // Timing option: -0, -1, -0.5, -1:30, -1:30:00, etc.
                 let time_str = &opt[1..];
                 if time_str == "P" {
-                    _on_prompt = true;
+                    on_prompt = true;
                 } else if let Some(secs) = parse_time_spec(time_str) {
                     delay_secs = secs;
                     if time_str == "S" {
@@ -283,6 +283,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                 disposition,
                 world,
                 delay_secs,
+                on_prompt,
                 recall_opts: None,
             };
         }
@@ -386,6 +387,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                         disposition,
                         world,
                         delay_secs,
+                        on_prompt,
                         recall_opts: Some((opts, prefix.to_string())),
                     };
                 }
@@ -456,6 +458,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
         disposition,
         world,
         delay_secs,
+        on_prompt,
         recall_opts: None,
     }
 }

@@ -5239,6 +5239,43 @@ impl App {
                 }
             }
         }
+
+        // Run one on_prompt process for this world (one line per prompt, like TF)
+        let world_name = self.worlds[world_idx].name.clone();
+        if let Some(idx) = self.tf_engine.processes.iter().position(|p| {
+            p.on_prompt && p.remaining.map_or(false, |r| r > 0) &&
+            p.world.as_ref().map_or(true, |w| w == &world_name)
+        }) {
+            let cmd = self.tf_engine.processes[idx].command.clone();
+            let process_world = self.tf_engine.processes[idx].world.clone();
+            self.tf_engine.processes.remove(idx);
+
+            self.sync_tf_world_info();
+            let result = self.tf_engine.execute(&cmd);
+            let target_idx = if let Some(ref wname) = process_world {
+                if wname.is_empty() { Some(self.current_world_index) }
+                else { self.find_world_index(wname) }
+            } else {
+                Some(self.current_world_index)
+            };
+            match result {
+                tf::TfCommandResult::SendToMud(text) => {
+                    if let Some(idx) = target_idx {
+                        if let Some(tx) = &self.worlds[idx].command_tx {
+                            let _ = tx.try_send(WriteCommand::Text(text));
+                            self.worlds[idx].last_send_time = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+                tf::TfCommandResult::Success(Some(msg)) => {
+                    self.add_tf_output(&msg);
+                }
+                tf::TfCommandResult::Error(err) => {
+                    self.add_tf_output(&format!("Error: {}", err));
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Handle GmcpNegotiated event.
@@ -5636,8 +5673,8 @@ impl App {
                                     tf::TfCommandResult::RepeatProcess(process) => {
                                         self.tf_engine.processes.push(process);
                                     }
-                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
-                                        self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts);
+                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, on_prompt, recall_opts } => {
+                                        self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, on_prompt, recall_opts);
                                         if disposition == tf::QuoteDisposition::Send && !lines.is_empty() {
                                             sent_to_server = true;
                                         }
@@ -5716,8 +5753,8 @@ impl App {
                         tf::TfCommandResult::RepeatProcess(process) => {
                             self.tf_engine.processes.push(process);
                         }
-                        tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
-                            self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts);
+                        tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, on_prompt, recall_opts } => {
+                            self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, on_prompt, recall_opts);
                         }
                         _ => {
                             self.ws_broadcast(WsMessage::ServerData {
@@ -6378,6 +6415,7 @@ impl App {
         disposition: tf::QuoteDisposition,
         world: &Option<String>,
         delay_secs: f64,
+        on_prompt: bool,
         recall_opts: Option<(tf::RecallOptions, String)>,
     ) {
         // If this is a /quote with backtick /recall, execute the recall now
@@ -6411,7 +6449,31 @@ impl App {
             None
         };
 
-        if delay_secs > 0.0 && lines.len() > 1 {
+        if on_prompt && !lines.is_empty() {
+            // -P flag: schedule each line as a process that fires on next prompt
+            for line in lines.drain(..) {
+                let cmd = match disposition {
+                    tf::QuoteDisposition::Send => line,
+                    tf::QuoteDisposition::Echo => format!("/echo {}", line),
+                    tf::QuoteDisposition::Exec => line,
+                };
+                let id = self.tf_engine.next_process_id;
+                self.tf_engine.next_process_id += 1;
+                let process = tf::TfProcess {
+                    id,
+                    command: cmd,
+                    interval: std::time::Duration::ZERO,
+                    count: Some(1),
+                    remaining: Some(1),
+                    next_run: std::time::Instant::now(),
+                    world: target_world_name.clone(),
+                    synchronous: false,
+                    on_prompt: true,
+                    priority: 0,
+                };
+                self.tf_engine.processes.push(process);
+            }
+        } else if delay_secs > 0.0 && lines.len() > 1 {
             // Schedule as processes with delays
             let delay = std::time::Duration::from_secs_f64(delay_secs);
             let now = std::time::Instant::now();
@@ -15057,7 +15119,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.tf_engine.processes.push(process);
                                         app.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
                                     }
-                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
+                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, on_prompt, recall_opts } => {
                                         // If this is a /quote with backtick /recall, execute the recall now
                                         if let Some((opts, recall_prefix)) = recall_opts {
                                             let output_lines = app.current_world().output_lines.clone();
@@ -15083,7 +15145,31 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             Some(app.current_world_index)
                                         };
 
-                                        if delay_secs > 0.0 && lines.len() > 1 {
+                                        if on_prompt && !lines.is_empty() {
+                                            // -P flag: schedule each line to fire on next prompt
+                                            for line in lines {
+                                                let cmd = match disposition {
+                                                    tf::QuoteDisposition::Send => line,
+                                                    tf::QuoteDisposition::Echo => format!("/echo {}", line),
+                                                    tf::QuoteDisposition::Exec => line,
+                                                };
+                                                let id = app.tf_engine.next_process_id;
+                                                app.tf_engine.next_process_id += 1;
+                                                let process = tf::TfProcess {
+                                                    id,
+                                                    command: cmd,
+                                                    interval: std::time::Duration::ZERO,
+                                                    count: Some(1),
+                                                    remaining: Some(1),
+                                                    next_run: std::time::Instant::now(),
+                                                    world: target_world.clone(),
+                                                    synchronous: false,
+                                                    on_prompt: true,
+                                                    priority: 0,
+                                                };
+                                                app.tf_engine.processes.push(process);
+                                            }
+                                        } else if delay_secs > 0.0 && lines.len() > 1 {
                                             // Schedule as processes with delays
                                             let delay = std::time::Duration::from_secs_f64(delay_secs);
                                             let now = std::time::Instant::now();
