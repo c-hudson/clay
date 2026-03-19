@@ -11,10 +11,33 @@ use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 use super::{TfEngine, TfProcess, TfCommandResult, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
 
-/// /beep - Sound the terminal bell
-pub fn cmd_beep() -> TfCommandResult {
-    // Return a special message that the main app can interpret
-    TfCommandResult::Success(Some("\x07".to_string()))
+/// /beep [number|on|off] - Sound the terminal bell
+pub fn cmd_beep(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
+    let arg = args.trim().to_lowercase();
+    match arg.as_str() {
+        "off" => {
+            engine.set_global("beep", super::TfValue::from("0"));
+            return TfCommandResult::Success(Some("beep off".to_string()));
+        }
+        "on" => {
+            engine.set_global("beep", super::TfValue::from("1"));
+            return TfCommandResult::Success(Some("beep on".to_string()));
+        }
+        _ => {}
+    }
+    // Check if beep is disabled
+    let beep_val = engine.get_var("beep").map(|v| v.to_string_value()).unwrap_or_default();
+    if beep_val == "0" {
+        return TfCommandResult::Success(None);
+    }
+    // Parse count (default 3)
+    let count = if arg.is_empty() {
+        3
+    } else {
+        arg.parse::<usize>().unwrap_or(3).min(100)
+    };
+    let beeps = "\x07".repeat(count);
+    TfCommandResult::Success(Some(beeps))
 }
 
 /// /time [format] - Display current time
@@ -1529,8 +1552,25 @@ mod tests {
 
     #[test]
     fn test_cmd_beep() {
-        let result = cmd_beep();
-        assert!(matches!(result, TfCommandResult::Success(Some(s)) if s == "\x07"));
+        let mut engine = super::TfEngine::new();
+        // Default: 3 beeps
+        let result = cmd_beep(&mut engine, "");
+        assert!(matches!(result, TfCommandResult::Success(Some(ref s)) if s == "\x07\x07\x07"));
+        // Explicit count
+        let result = cmd_beep(&mut engine, "5");
+        assert!(matches!(result, TfCommandResult::Success(Some(ref s)) if s == "\x07\x07\x07\x07\x07"));
+        // Off
+        let result = cmd_beep(&mut engine, "off");
+        assert!(matches!(result, TfCommandResult::Success(Some(ref s)) if s == "beep off"));
+        // Beep while off does nothing
+        let result = cmd_beep(&mut engine, "");
+        assert!(matches!(result, TfCommandResult::Success(None)));
+        // On
+        let result = cmd_beep(&mut engine, "on");
+        assert!(matches!(result, TfCommandResult::Success(Some(ref s)) if s == "beep on"));
+        // Works again
+        let result = cmd_beep(&mut engine, "1");
+        assert!(matches!(result, TfCommandResult::Success(Some(ref s)) if s == "\x07"));
     }
 
     #[test]

@@ -811,6 +811,61 @@ struct TriggerProcessingResult {
     pub highlight_color: Option<String>,
 }
 
+/// Parsed BAMF portal information
+struct BamfPortal {
+    name: String,
+    host: String,
+    port: String,
+}
+
+/// Parse a BAMF portal line: #### Please reconnect to name@addr (host) port NNN ####
+fn parse_bamf_portal(line: &str) -> Option<BamfPortal> {
+    let stripped = util::strip_ansi_codes(line);
+    let trimmed = stripped.trim();
+    if !trimmed.starts_with("####") || !trimmed.ends_with("####") {
+        return None;
+    }
+    // Extract inner text between #### markers
+    let inner = trimmed.trim_start_matches('#').trim_end_matches('#').trim();
+    // Expected: "Please reconnect to Name@addr (hostname) port NNN"
+    let inner_lower = inner.to_lowercase();
+    if !inner_lower.starts_with("please reconnect to ") {
+        return None;
+    }
+    let rest = &inner[20..]; // after "Please reconnect to "
+    // Parse: Name@addr (hostname) port NNN
+    // Find the port number at the end
+    let parts: Vec<&str> = rest.rsplitn(2, "port").collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let port = parts[0].trim().trim_end_matches('#').trim();
+    let before_port = parts[1].trim();
+    // before_port: "Name@addr (hostname)" or "Name@addr"
+    // Extract name from Name@addr
+    let at_pos = before_port.find('@')?;
+    let name = before_port[..at_pos].trim();
+    // Extract hostname - prefer the (hostname) if present, otherwise use addr
+    let after_at = &before_port[at_pos + 1..];
+    let host = if let Some(paren_start) = after_at.find('(') {
+        if let Some(paren_end) = after_at.find(')') {
+            after_at[paren_start + 1..paren_end].trim()
+        } else {
+            after_at.split_whitespace().next().unwrap_or(after_at).trim()
+        }
+    } else {
+        after_at.split_whitespace().next().unwrap_or(after_at).trim()
+    };
+    if name.is_empty() || host.is_empty() || port.is_empty() {
+        return None;
+    }
+    Some(BamfPortal {
+        name: name.to_string(),
+        host: host.to_string(),
+        port: port.to_string(),
+    })
+}
+
 /// Run both Clay action triggers and TF triggers on a line.
 /// Returns combined results from both trigger systems.
 fn process_triggers(
@@ -2287,6 +2342,23 @@ impl World {
             self.first_marked_new_index = None;
         }
         let max_lines = (output_height as usize).saturating_sub(2);
+
+        // For non-current worlds that aren't paused: recalculate lines_since_pause
+        // based on actual visible content at the bottom of output_lines.
+        // Without this, lines_since_pause carries over from when the user was viewing
+        // the world, causing immediate pause when new output arrives.
+        if !is_current && !self.paused && self.lines_since_pause >= max_lines && max_lines > 0 {
+            let width = (output_width as usize).max(1);
+            let mut visible = 0;
+            for line in self.output_lines.iter().rev() {
+                let vl = wrap_ansi_line(&line.text, width).len().max(1);
+                if visible + vl > max_lines {
+                    break;
+                }
+                visible += vl;
+            }
+            self.lines_since_pause = visible;
+        }
 
         // If we have a partial line from before, combine it with new text
         let had_partial = !self.partial_line.is_empty();
@@ -4758,6 +4830,7 @@ impl App {
         // Use persistent flag to track idler filtering across TCP packets
         let mut just_filtered_idler = self.worlds[world_idx].just_filtered_idler;
 
+
         for (i, line) in lines.iter().enumerate() {
             let is_last = i == line_count - 1;
             let is_partial = is_last && !ends_with_newline;
@@ -4790,6 +4863,32 @@ impl App {
                 tf_commands_to_execute.extend(tr.clay_commands);
                 tf_messages.extend(tr.messages);
                 processed_lines.push((line, tr.is_gagged, tr.highlight_color));
+            }
+        }
+
+        // BAMF portal detection: #### Please reconnect to name@addr (host) port NNN ####
+        let bamf_val = self.tf_engine.get_var("bamf").map(|v| v.to_string_value()).unwrap_or_default();
+        if bamf_val == "1" || bamf_val == "old" {
+            for (line, _, _) in &processed_lines {
+                if let Some(portal) = parse_bamf_portal(line) {
+                    let world_name = self.worlds[world_idx].name.clone();
+                    let user = self.worlds[world_idx].settings.user.clone();
+                    let password = self.worlds[world_idx].settings.password.clone();
+                    self.add_tf_output(&format!("Portal detected: {} ({}:{})", portal.name, portal.host, portal.port));
+                    if bamf_val == "1" {
+                        // Disconnect current world first
+                        commands_to_execute.push(format!("/disconnect {}", world_name));
+                    }
+                    // Create/update the world and connect
+                    commands_to_execute.push(format!("/addworld {} {} {}", portal.name, portal.host, portal.port));
+                    commands_to_execute.push(format!("/worlds {}", portal.name));
+                    // If login flag is set, auto-login with current world's credentials
+                    let login_val = self.tf_engine.get_var("login").map(|v| v.to_string_value()).unwrap_or_default();
+                    if (login_val == "1" || login_val == "on") && !user.is_empty() && !password.is_empty() {
+                        commands_to_execute.push(format!("/send connect {} {}", user, password));
+                    }
+                    break; // Only handle first portal per chunk
+                }
             }
         }
 
@@ -4844,13 +4943,18 @@ impl App {
                 (true, None) => console_height,
                 (false, Some(ws)) => ws as u16,
                 (false, None) => {
-                    // Daemon mode with no viewers (with visible_lines > 0) -
-                    // use minimum across all clients that have reported their size
-                    self.ws_client_worlds.values()
-                        .map(|s| s.visible_lines)
-                        .filter(|&v| v > 0)
-                        .min()
-                        .unwrap_or(24) as u16
+                    if is_daemon_mode {
+                        // Daemon mode with no viewers - use min of all WS clients or default
+                        self.ws_client_worlds.values()
+                            .map(|s| s.visible_lines)
+                            .filter(|&v| v > 0)
+                            .min()
+                            .unwrap_or(24) as u16
+                    } else {
+                        // Non-current world in console mode: use console height
+                        // so more-mode triggers at the right point for when user switches
+                        console_height
+                    }
                 }
             };
 
@@ -4861,13 +4965,15 @@ impl App {
                 (true, None) => console_width,
                 (false, Some(ws_w)) => ws_w as u16,
                 (false, None) => {
-                    // Daemon mode with no viewers reporting width -
-                    // use minimum across all clients that have reported their width
-                    self.ws_client_worlds.values()
-                        .map(|s| s.visible_columns)
-                        .filter(|&v| v > 0)
-                        .min()
-                        .unwrap_or(200) as u16
+                    if is_daemon_mode {
+                        self.ws_client_worlds.values()
+                            .map(|s| s.visible_columns)
+                            .filter(|&v| v > 0)
+                            .min()
+                            .unwrap_or(200) as u16
+                    } else {
+                        console_width
+                    }
                 }
             };
 
@@ -4943,10 +5049,8 @@ impl App {
                 }
             }
 
-            // Mark output for redraw if this is the current world
-            if world_idx == self.current_world_index {
-                self.needs_output_redraw = true;
-            }
+            // Mark output for redraw whenever output changes
+            self.needs_output_redraw = true;
 
             // For synchronized more-mode: only broadcast lines that went to output_lines
             // Lines that went to pending_lines will be broadcast when released
@@ -8081,6 +8185,10 @@ impl App {
                 });
             }
         }
+
+        // Mark output for redraw so released lines are rendered
+        self.needs_output_redraw = true;
+        self.needs_terminal_clear = true;
 
         // Broadcast release event so other clients sync
         self.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
@@ -21185,8 +21293,12 @@ fn render_output_crossterm(app: &App) {
                 old_visual_count += 1;
             }
 
-            // Need enough lines to fill screen, plus old context lines at top
-            if rev_lines.len() >= visible_height && old_visual_count >= min_old_context {
+            // Collect enough to fill screen. When NLI is enabled, keep going
+            // past visible_height until we have min_old_context non-new lines,
+            // so the display window can include them at the top.
+            if rev_lines.len() >= visible_height
+                && (!new_line_indicator || old_visual_count >= min_old_context)
+            {
                 break;
             }
             // Safety limit: don't collect more than 2x screen height
@@ -21247,30 +21359,34 @@ fn render_output_crossterm(app: &App) {
         }
     }
 
-    let lines_to_show: &[(String, bool, Option<String>, bool)] = if first_line_idx == 0 && visual_lines.len() <= visible_height {
-        &visual_lines[..visual_lines.len().min(visible_height)]
-    } else {
-        let mut display_start = visual_lines.len().saturating_sub(visible_height);
-        // When new_line_indicator is enabled and we collected extra old context lines,
-        // adjust display_start backwards to include at least min_old_context non-new lines
-        if new_line_indicator && visual_lines.len() > visible_height {
-            let mut old_count = 0;
-            for (i, (_,_,_,mn)) in visual_lines[display_start..].iter().enumerate() {
-                if !mn {
-                    old_count += 1;
-                }
-                if old_count >= min_old_context {
-                    break;
-                }
-                // If not enough old lines in current window, try starting earlier
-                if i == visual_lines[display_start..].len() - 1 && old_count < min_old_context {
-                    let needed = min_old_context - old_count;
-                    display_start = display_start.saturating_sub(needed);
-                }
-            }
+    // Build the final display slice. When NLI is enabled and the world is paused
+    // (has pending lines), compose: old context at top + newest lines at bottom,
+    // dropping middle lines so total fits in visible_height. Once pending is fully
+    // released, just show the bottom visible_height lines normally.
+    let mut composed_lines: Vec<(String, bool, Option<String>, bool)> = Vec::new();
+    let lines_to_show: &[(String, bool, Option<String>, bool)] = if visual_lines.len() <= visible_height {
+        &visual_lines[..visual_lines.len()]
+    } else if new_line_indicator && visual_lines.len() <= visible_height + min_old_context {
+        // Old context lines are close to the bottom (within one screen + context).
+        // Compose: old context at top + newest lines at bottom.
+        let mut old_prefix = 0;
+        for (_,_,_,mn) in &visual_lines {
+            if !mn { old_prefix += 1; } else { break; }
         }
-        let end = (display_start + visible_height).min(visual_lines.len());
-        &visual_lines[display_start..end]
+        let context = old_prefix.min(min_old_context);
+        if context > 0 {
+            let newest_count = visible_height - context;
+            composed_lines.extend_from_slice(&visual_lines[..context]);
+            let tail_start = visual_lines.len().saturating_sub(newest_count);
+            composed_lines.extend_from_slice(&visual_lines[tail_start..]);
+            &composed_lines
+        } else {
+            let start = visual_lines.len().saturating_sub(visible_height);
+            &visual_lines[start..]
+        }
+    } else {
+        let start = visual_lines.len().saturating_sub(visible_height);
+        &visual_lines[start..]
     };
 
     for (row_idx, (wrapped, highlight_f8, hl_color, marked_new)) in lines_to_show.iter().enumerate() {

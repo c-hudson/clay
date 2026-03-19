@@ -75,7 +75,7 @@ fn is_tf_command_name(cmd: &str) -> bool {
         "bind" | "unbind" | "hook" | "unhook" |
         "load" | "save" | "require" | "loaded" | "lcd" | "log" |
         "sh" | "time" | "recall" | "repeat" | "ps" | "kill" |
-        "fg" | "trigger" | "input" | "grab" | "gag" | "ungag" | "exit" | "shift" |
+        "fg" | "trigger" | "input" | "grab" | "gag" | "ungag" | "exit" | "shift" | "bamf" |
         // These are also TF commands (mapped to Clay equivalents)
         "quit" | "dc" | "disconnect" | "world" | "listworlds" |
         "listsockets" | "connections" | "connect" | "addworld" | "version" |
@@ -285,7 +285,7 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "unbind" => cmd_unbind(engine, args),
 
         // Additional builtins
-        "beep" => builtins::cmd_beep(),
+        "beep" => builtins::cmd_beep(engine, args),
         "time" => builtins::cmd_time(args),
         "lcd" => builtins::cmd_lcd(engine, args),
         "sh" => builtins::cmd_sh(args),
@@ -304,6 +304,9 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
 
         // World switching
         "fg" => cmd_fg(args),
+
+        // Portal/bamf
+        "bamf" => cmd_bamf(engine, args),
 
         // Argument manipulation
         "shift" => cmd_shift(engine),
@@ -1210,6 +1213,33 @@ not undone.
 When called outside of file loading, /exit is equivalent
 to /quit (exits Clay)."#.to_string()
             )),
+            "bamf" => TfCommandResult::Success(Some(
+                r#"/bamf [off|on|old]
+
+Controls portal handling. A portal is text from a MUD server
+of the form:
+  #### Please reconnect to Name@addr (host) port NNN ####
+
+If bamf is OFF (default), portal lines have no effect.
+
+If bamf is ON, Clay will disconnect from the current world
+and connect to the new world specified in the portal.
+
+If bamf is OLD, Clay will connect to the new world without
+disconnecting from the current one.
+
+If %{login} is also set to 1, Clay will auto-login to the
+new world using the current world's username and password.
+
+Warning: On many servers, other users can spoof portal text
+to redirect your client. Enable with caution.
+
+Examples:
+  /bamf on           Enable portals (disconnect + reconnect)
+  /bamf old          Enable portals (keep old connection)
+  /bamf off          Disable portals
+  /set login=1       Enable auto-login on portal"#.to_string()
+            )),
             "addworld" => TfCommandResult::Success(Some(
                 r#"/addworld [-xe] [-Ttype] name [char pass] host port
 
@@ -1698,6 +1728,26 @@ fn cmd_fg(args: &str) -> TfCommandResult {
         // Switch to specified world
         TfCommandResult::ClayCommand(format!("/worlds {}", world))
     }
+}
+
+/// Set the bamf flag for portal handling
+fn cmd_bamf(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let arg = args.trim().to_lowercase();
+    let value = match arg.as_str() {
+        "on" | "1" => "1",
+        "old" => "old",
+        "off" | "0" | "" => "0",
+        _ => {
+            return TfCommandResult::Error(format!("Usage: /bamf [off|on|old] (got '{}')", args.trim()));
+        }
+    };
+    engine.set_global("bamf", TfValue::from(value));
+    let state = match value {
+        "1" => "on (disconnect + reconnect)",
+        "old" => "old (reconnect without disconnect)",
+        _ => "off",
+    };
+    TfCommandResult::Success(Some(format!("bamf {}", state)))
 }
 
 /// List variables matching pattern
