@@ -21565,14 +21565,11 @@ fn ansi_string_to_buffer(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, s: &
                                     27 => style = style.remove_modifier(Modifier::REVERSED),
                                     28 => style = style.remove_modifier(Modifier::HIDDEN),
                                     29 => style = style.remove_modifier(Modifier::CROSSED_OUT),
-                                    30 => style = style.fg(Color::Black),
-                                    31 => style = style.fg(Color::Red),
-                                    32 => style = style.fg(Color::Green),
-                                    33 => style = style.fg(Color::Yellow),
-                                    34 => style = style.fg(Color::Blue),
-                                    35 => style = style.fg(Color::Magenta),
-                                    36 => style = style.fg(Color::Cyan),
-                                    37 => style = style.fg(Color::White),
+                                    // Use Indexed colors to exactly match SGR codes.
+                                    // ratatui's named Color variants (Red, White, etc.) map
+                                    // through crossterm to different palette indices than
+                                    // the raw SGR codes, causing bright/dark mismatches.
+                                    30..=37 => style = style.fg(Color::Indexed((nums[i] - 30) as u8)),
                                     38 => {
                                         // Extended foreground color
                                         if i + 1 < nums.len() && nums[i + 1] == 5 && i + 2 < nums.len() {
@@ -21588,14 +21585,7 @@ fn ansi_string_to_buffer(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, s: &
                                         }
                                     }
                                     39 => style = style.fg(Color::Reset),
-                                    40 => style = style.bg(Color::Black),
-                                    41 => style = style.bg(Color::Red),
-                                    42 => style = style.bg(Color::Green),
-                                    43 => style = style.bg(Color::Yellow),
-                                    44 => style = style.bg(Color::Blue),
-                                    45 => style = style.bg(Color::Magenta),
-                                    46 => style = style.bg(Color::Cyan),
-                                    47 => style = style.bg(Color::White),
+                                    40..=47 => style = style.bg(Color::Indexed((nums[i] - 40) as u8)),
                                     48 => {
                                         // Extended background color
                                         if i + 1 < nums.len() && nums[i + 1] == 5 && i + 2 < nums.len() {
@@ -21611,22 +21601,8 @@ fn ansi_string_to_buffer(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, s: &
                                         }
                                     }
                                     49 => style = style.bg(Color::Reset),
-                                    90 => style = style.fg(Color::DarkGray),
-                                    91 => style = style.fg(Color::LightRed),
-                                    92 => style = style.fg(Color::LightGreen),
-                                    93 => style = style.fg(Color::LightYellow),
-                                    94 => style = style.fg(Color::LightBlue),
-                                    95 => style = style.fg(Color::LightMagenta),
-                                    96 => style = style.fg(Color::LightCyan),
-                                    97 => style = style.fg(Color::White),
-                                    100 => style = style.bg(Color::DarkGray),
-                                    101 => style = style.bg(Color::LightRed),
-                                    102 => style = style.bg(Color::LightGreen),
-                                    103 => style = style.bg(Color::LightYellow),
-                                    104 => style = style.bg(Color::LightBlue),
-                                    105 => style = style.bg(Color::LightMagenta),
-                                    106 => style = style.bg(Color::LightCyan),
-                                    107 => style = style.bg(Color::White),
+                                    90..=97 => style = style.fg(Color::Indexed((nums[i] - 90 + 8) as u8)),
+                                    100..=107 => style = style.bg(Color::Indexed((nums[i] - 100 + 8) as u8)),
                                     _ => {}
                                 }
                                 i += 1;
