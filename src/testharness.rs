@@ -10,6 +10,7 @@ use crate::{
     App, World, WriteCommand, AutoConnectType,
     telnet,
     find_safe_split_point,
+    build_display_lines,
 };
 use crate::websocket::WsMessage;
 
@@ -110,6 +111,20 @@ pub enum TestAction {
     AssertMarkedNew { world_name: String, expected_count: usize },
     /// Assert a specific world/app state value
     AssertState { world_name: String, check: StateCheck },
+    /// Assert properties of the rendered display output (what the user would see)
+    AssertDisplay {
+        world_name: String,
+        visible_height: usize,
+        term_width: usize,
+        /// Expected total visible lines (if Some)
+        line_count: Option<usize>,
+        /// Last displayed line must contain this substring (if Some)
+        last_line_contains: Option<String>,
+        /// First displayed line must contain this substring (if Some)
+        first_line_contains: Option<String>,
+        /// Expected count of leading non-new (old context) lines (if Some)
+        old_context_count: Option<usize>,
+    },
 }
 
 /// Conditions to wait for
@@ -480,6 +495,60 @@ pub async fn run_test_scenario(
                     check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
                     continue;
                 }
+                TestAction::AssertDisplay {
+                    world_name, visible_height, term_width,
+                    line_count, last_line_contains, first_line_contains, old_context_count,
+                } => {
+                    let world_name = world_name.clone();
+                    let visible_height = *visible_height;
+                    let term_width = *term_width;
+                    let line_count = *line_count;
+                    let last_line_contains = last_line_contains.clone();
+                    let first_line_contains = first_line_contains.clone();
+                    let old_context_count = *old_context_count;
+                    action_iter.next();
+                    if let Some(idx) = app.find_world_index(&world_name) {
+                        let display = build_display_lines(
+                            &app.worlds[idx],
+                            &app.settings,
+                            visible_height,
+                            term_width,
+                            false, // show_tags
+                        );
+                        if let Some(expected) = line_count {
+                            assert_eq!(display.len(), expected,
+                                "AssertDisplay '{}': expected {} display lines, got {} (lines: {:?})",
+                                world_name, expected, display.len(),
+                                display.iter().map(|d| &d.text).collect::<Vec<_>>());
+                        }
+                        if let Some(ref substr) = last_line_contains {
+                            let last = display.last()
+                                .expect("AssertDisplay: no display lines to check last_line_contains");
+                            assert!(last.text.contains(substr),
+                                "AssertDisplay '{}': last line {:?} does not contain {:?}",
+                                world_name, last.text, substr);
+                        }
+                        if let Some(ref substr) = first_line_contains {
+                            let first = display.first()
+                                .expect("AssertDisplay: no display lines to check first_line_contains");
+                            assert!(first.text.contains(substr),
+                                "AssertDisplay '{}': first line {:?} does not contain {:?}",
+                                world_name, first.text, substr);
+                        }
+                        if let Some(expected_old) = old_context_count {
+                            let actual_old = display.iter()
+                                .take_while(|d| !d.marked_new)
+                                .count();
+                            assert_eq!(actual_old, expected_old,
+                                "AssertDisplay '{}': expected {} old context lines, got {}",
+                                world_name, expected_old, actual_old);
+                        }
+                    } else {
+                        panic!("AssertDisplay: world '{}' not found", world_name);
+                    }
+                    check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
+                    continue;
+                }
             }
         } else {
             // No more actions - check if all connections are done
@@ -611,8 +680,8 @@ fn check_state_changes(
     app: &mut App,
     events: &mut Vec<TestEvent>,
     prev_activity: &mut usize,
-    prev_unseen: &mut Vec<usize>,
-    prev_paused: &mut Vec<bool>,
+    prev_unseen: &mut [usize],
+    prev_paused: &mut [bool],
 ) {
     // Check activity count changes
     let current_activity = app.activity_count();

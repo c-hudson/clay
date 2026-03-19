@@ -21073,6 +21073,153 @@ fn process_output_line(line: &OutputLine, show_tags: bool, temp_convert_enabled:
     Some(processed.replace('\t', "        "))
 }
 
+/// A single visual line as it would appear in the output display.
+/// Used by `build_display_lines()` for testable display logic.
+#[derive(Debug, Clone)]
+pub struct DisplayLine {
+    /// The text content of the visual line (may contain ANSI sequences)
+    pub text: String,
+    /// True if this line is marked as new/unseen
+    pub marked_new: bool,
+    /// True if this line matches highlight actions (F8)
+    pub highlight_f8: bool,
+    /// Optional highlight color from /highlight action
+    pub highlight_color: Option<String>,
+}
+
+/// Build the list of visual lines that would be displayed in the output area.
+/// This is the pure, testable core of `render_output_crossterm` — it computes
+/// which lines are visible given the world state, settings, and terminal dimensions,
+/// but does NOT perform any terminal I/O.
+pub fn build_display_lines(
+    world: &World,
+    settings: &Settings,
+    visible_height: usize,
+    term_width: usize,
+    show_tags: bool,
+) -> Vec<DisplayLine> {
+    let temp_convert_enabled = settings.temp_convert_enabled;
+    let zwj_enabled = settings.zwj_enabled;
+    let new_line_indicator = settings.new_line_indicator;
+    let nli_prefix_width: usize = 2;
+    let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
+    let cached_now = CachedNow::new();
+
+    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool)> {
+        let expanded = match process_output_line(line, show_tags, temp_convert_enabled, zwj_enabled, cached_now) {
+            Some(text) if text.is_empty() => return vec![("".to_string(), false, None, false)],
+            Some(text) => text,
+            None => return Vec::new(),
+        };
+        let with_links = wrap_urls_with_osc8(&expanded);
+        let with_emoji_links = if show_tags {
+            with_links
+        } else {
+            convert_discord_emojis_with_links(&with_links)
+        };
+        let hl_color = line.highlight_color.clone();
+        let mn = line.marked_new;
+        let wrap_width = if new_line_indicator && mn {
+            term_width.saturating_sub(nli_prefix_width)
+        } else {
+            term_width
+        };
+        wrap_ansi_line(&with_emoji_links, wrap_width)
+            .into_iter()
+            .map(|s| (s, highlight_f8, hl_color.clone(), mn))
+            .collect()
+    };
+
+    if world.output_lines.is_empty() {
+        return Vec::new();
+    }
+
+    // Normal unfiltered rendering
+    let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
+
+    let mut rev_lines: Vec<(String, bool, Option<String>, bool)> = Vec::with_capacity(visible_height + 8);
+    let mut first_line_idx = end_line;
+    let mut old_visual_count: usize = 0;
+    let mut applied_vlo = false;
+    for line_idx in (0..=end_line).rev() {
+        first_line_idx = line_idx;
+        let line = &world.output_lines[line_idx];
+        // No highlight action matching in this pure function (would need compiled patterns)
+        let highlight = false;
+        let mut wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+
+        if !applied_vlo && world.visual_line_offset > 0
+           && !wrapped.is_empty() && wrapped.len() > world.visual_line_offset {
+            wrapped.truncate(world.visual_line_offset);
+            applied_vlo = true;
+        }
+
+        let is_new = line.marked_new;
+        for w in wrapped.into_iter().rev() {
+            rev_lines.push(w);
+        }
+        if !is_new {
+            old_visual_count += 1;
+        }
+
+        if rev_lines.len() >= visible_height
+            && (!new_line_indicator || old_visual_count >= min_old_context)
+        {
+            break;
+        }
+        if rev_lines.len() >= visible_height * 2 {
+            break;
+        }
+    }
+    rev_lines.reverse();
+    let mut visual_lines = rev_lines;
+
+    if visual_lines.len() < visible_height && first_line_idx == 0 {
+        for line_idx in (end_line + 1)..world.output_lines.len() {
+            let line = &world.output_lines[line_idx];
+            let highlight = false;
+            let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
+
+            for w in wrapped {
+                visual_lines.push(w);
+            }
+
+            if visual_lines.len() >= visible_height {
+                break;
+            }
+        }
+    }
+
+    // Build the final display slice (NLI composition logic)
+    let final_lines: Vec<(String, bool, Option<String>, bool)> = if visual_lines.len() <= visible_height {
+        visual_lines
+    } else if new_line_indicator && visual_lines.len() <= visible_height + min_old_context {
+        let mut old_prefix = 0;
+        for (_,_,_,mn) in &visual_lines {
+            if !mn { old_prefix += 1; } else { break; }
+        }
+        let context = old_prefix.min(min_old_context);
+        if context > 0 {
+            let newest_count = visible_height - context;
+            let mut composed = Vec::new();
+            composed.extend_from_slice(&visual_lines[..context]);
+            let tail_start = visual_lines.len().saturating_sub(newest_count);
+            composed.extend_from_slice(&visual_lines[tail_start..]);
+            composed
+        } else {
+            let start = visual_lines.len().saturating_sub(visible_height);
+            visual_lines[start..].to_vec()
+        }
+    } else {
+        let start = visual_lines.len().saturating_sub(visible_height);
+        visual_lines[start..].to_vec()
+    };
+
+    final_lines.into_iter().map(|(text, highlight_f8, highlight_color, marked_new)| {
+        DisplayLine { text, marked_new, highlight_f8, highlight_color }
+    }).collect()
+}
+
 /// Render output area using raw crossterm (bypasses ratatui's buggy rendering)
 /// Returns early if splash screen, popup, or editor is visible (let ratatui handle those)
 fn render_output_crossterm(app: &App) {
@@ -25939,6 +26086,353 @@ mod tests {
         assert!(is_newer_version("1.0.1", "1.0"));
         assert!(!is_newer_version("1.0", "1.0.1"));
         assert!(!is_newer_version("1.0", "1.0.0"));
+    }
+
+    // --- build_display_lines tests ---
+
+    /// Helper: create an OutputLine with the given text and marked_new flag
+    fn make_output_line(text: &str, marked_new: bool) -> OutputLine {
+        OutputLine {
+            text: text.to_string(),
+            timestamp: std::time::SystemTime::now(),
+            from_server: true,
+            gagged: false,
+            seq: 0,
+            highlight_color: None,
+            marked_new,
+        }
+    }
+
+    /// Test A: NLI does not drop bottom lines
+    /// 2 old lines + 20 new lines, visible_height=21, NLI enabled.
+    /// The last display line must be the last output line (not cut off).
+    #[test]
+    fn test_build_display_nli_does_not_drop_bottom_lines() {
+        let mut world = World::new("test");
+        // 2 old (is_current=true, so marked_new=false)
+        for i in 0..2 {
+            world.output_lines.push(make_output_line(&format!("Old line {}", i + 1), false));
+        }
+        // 20 new lines (marked_new=true)
+        for i in 0..20 {
+            world.output_lines.push(make_output_line(&format!("New line {}", i + 1), true));
+        }
+        // scroll_offset at the end
+        world.scroll_offset = world.output_lines.len() - 1;
+
+        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+
+        let display = build_display_lines(&world, &settings, 21, 80, false);
+
+        // Must show exactly 21 lines
+        assert_eq!(display.len(), 21, "Expected 21 display lines, got {}", display.len());
+
+        // Last line must contain the last new line text
+        assert!(display.last().unwrap().text.contains("New line 20"),
+            "Last display line should contain 'New line 20', got: {:?}", display.last().unwrap().text);
+
+        // First 2 lines should be old context (marked_new=false)
+        assert!(!display[0].marked_new, "First line should be old context");
+        assert!(!display[1].marked_new, "Second line should be old context");
+        assert!(display[0].text.contains("Old line 1"),
+            "First display line should be old context, got: {:?}", display[0].text);
+    }
+
+    /// Test B: Boundary case — exactly visible_height + min_old_context
+    /// 2 old + 21 new = 23 total visual lines, visible_height=21, NLI enabled.
+    /// Should compose: 2 old at top + 19 new at bottom = 21.
+    #[test]
+    fn test_build_display_nli_boundary_composition() {
+        let mut world = World::new("test");
+        // 2 old lines
+        for i in 0..2 {
+            world.output_lines.push(make_output_line(&format!("Old {}", i + 1), false));
+        }
+        // 21 new lines
+        for i in 0..21 {
+            world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
+        }
+        world.scroll_offset = world.output_lines.len() - 1;
+
+        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+
+        let display = build_display_lines(&world, &settings, 21, 80, false);
+
+        assert_eq!(display.len(), 21);
+
+        // First 2 should be old context
+        let old_context = display.iter().take_while(|d| !d.marked_new).count();
+        assert_eq!(old_context, 2, "Expected 2 old context lines, got {}", old_context);
+
+        // Last line must be "New 21"
+        assert!(display.last().unwrap().text.contains("New 21"),
+            "Last line should be 'New 21', got: {:?}", display.last().unwrap().text);
+
+        // The composition should skip 2 new lines (3 through 4) to fit
+        // 2 old + 19 new = 21. So display[2] should be "New 3"
+        assert!(display[2].text.contains("New 3"),
+            "Third line should be 'New 3' (skipping New 1-2), got: {:?}", display[2].text);
+    }
+
+    /// Test C: NLI context disappears when far from scroll_offset
+    /// After many lines, old context lines are far away — display should NOT compose.
+    #[test]
+    fn test_build_display_nli_context_disappears_when_far() {
+        let mut world = World::new("test");
+        // 2 old lines
+        for i in 0..2 {
+            world.output_lines.push(make_output_line(&format!("Old {}", i + 1), false));
+        }
+        // 100 new lines — far more than visible_height * 2
+        for i in 0..100 {
+            world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
+        }
+        world.scroll_offset = world.output_lines.len() - 1;
+
+        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+
+        let display = build_display_lines(&world, &settings, 21, 80, false);
+
+        assert_eq!(display.len(), 21);
+
+        // No old context should appear — all lines should be marked_new
+        let old_context = display.iter().take_while(|d| !d.marked_new).count();
+        assert_eq!(old_context, 0, "Expected 0 old context lines when far away, got {}", old_context);
+
+        // Last line should be "New 100"
+        assert!(display.last().unwrap().text.contains("New 100"),
+            "Last line should be 'New 100', got: {:?}", display.last().unwrap().text);
+    }
+
+    /// Test D: No NLI = simple bottom anchoring
+    /// With NLI disabled, always shows last visible_height lines.
+    #[test]
+    fn test_build_display_no_nli_simple_bottom_anchoring() {
+        let mut world = World::new("test");
+        // 2 old lines + 20 new lines
+        for i in 0..2 {
+            world.output_lines.push(make_output_line(&format!("Old {}", i + 1), false));
+        }
+        for i in 0..20 {
+            world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
+        }
+        world.scroll_offset = world.output_lines.len() - 1;
+
+        let settings = Settings { new_line_indicator: false, ..Settings::default() };
+
+        let display = build_display_lines(&world, &settings, 21, 80, false);
+
+        assert_eq!(display.len(), 21);
+
+        // With NLI disabled, should just show bottom 21 lines
+        // That's Old 2 + New 1..20 = 21 lines
+        assert!(display[0].text.contains("Old 2"),
+            "First line should be 'Old 2', got: {:?}", display[0].text);
+        assert!(display.last().unwrap().text.contains("New 20"),
+            "Last line should be 'New 20', got: {:?}", display.last().unwrap().text);
+    }
+
+    /// Test E: Empty world produces empty display
+    #[test]
+    fn test_build_display_empty_world() {
+        let world = World::new("test");
+        let settings = Settings::default();
+        let display = build_display_lines(&world, &settings, 21, 80, false);
+        assert!(display.is_empty());
+    }
+
+    /// Test F: Fewer lines than visible_height shows all
+    #[test]
+    fn test_build_display_fewer_than_visible_height() {
+        let mut world = World::new("test");
+        for i in 0..5 {
+            world.output_lines.push(make_output_line(&format!("Line {}", i + 1), false));
+        }
+        world.scroll_offset = world.output_lines.len() - 1;
+
+        let settings = Settings::default();
+        let display = build_display_lines(&world, &settings, 21, 80, false);
+
+        assert_eq!(display.len(), 5);
+        assert!(display[0].text.contains("Line 1"));
+        assert!(display[4].text.contains("Line 5"));
+    }
+
+    /// Test G: visual_line_offset (partial display) truncation
+    #[test]
+    fn test_build_display_visual_line_offset() {
+        let mut world = World::new("test");
+        // Add a line that wraps to multiple visual lines (long text)
+        let long_text = "A".repeat(200); // At width 80, wraps to 3 visual lines
+        world.output_lines.push(make_output_line(&long_text, false));
+        for i in 0..5 {
+            world.output_lines.push(make_output_line(&format!("Line {}", i + 1), false));
+        }
+        world.scroll_offset = world.output_lines.len() - 1;
+        world.visual_line_offset = 0; // No truncation
+
+        let settings = Settings::default();
+        let display_full = build_display_lines(&world, &settings, 21, 80, false);
+
+        // Now set visual_line_offset to 1 — should truncate the long line to 1 visual line
+        world.visual_line_offset = 1;
+        // scroll_offset needs to point to the long line for VLO to apply
+        world.scroll_offset = 0;
+        let display_partial = build_display_lines(&world, &settings, 21, 80, false);
+
+        // With VLO=1, the long line at scroll_offset=0 should be truncated to 1 visual line
+        assert!(display_partial.len() < display_full.len(),
+            "Partial display ({}) should have fewer lines than full ({})",
+            display_partial.len(), display_full.len());
+    }
+
+    // --- Integration test with test harness ---
+
+    #[tokio::test]
+    async fn test_more_mode_display_with_50_lines() {
+        use crate::testserver;
+        use crate::testharness::*;
+
+        // Pick random ports to avoid conflicts
+        let port_idle: u16 = 19401;
+        let port_flood: u16 = 19402;
+
+        // Start test servers
+        let idle_scenario = testserver::get_scenario("idle");
+        let flood_scenario = testserver::get_scenario("more_flood_50");
+
+        let server1 = tokio::spawn(testserver::run_server_port(port_idle, idle_scenario));
+        let server2 = tokio::spawn(testserver::run_server_port(port_flood, flood_scenario));
+
+        // Brief delay for servers to bind
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "idle".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port_idle,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::NoLogin,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "flood".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port_flood,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::NoLogin,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 21,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let actions = vec![
+            // Wait for all output to arrive (50 lines from flood world)
+            TestAction::WaitForEvent(WaitCondition::TextReceivedCount(50)),
+            // Flood world should be paused with pending lines
+            TestAction::AssertState {
+                world_name: "flood".to_string(),
+                check: StateCheck::Paused(true),
+            },
+            // Switch to the flood world
+            TestAction::SwitchWorld("flood".to_string()),
+            // Assert display shows the first screenful
+            TestAction::AssertDisplay {
+                world_name: "flood".to_string(),
+                visible_height: 21,
+                term_width: 80,
+                line_count: None, // Don't assert exact count yet (depends on how many fit before pause)
+                last_line_contains: None,
+                first_line_contains: Some("Line 001".to_string()), // First line should be visible
+                old_context_count: None,
+            },
+            // Release first screenful (Tab)
+            TestAction::TabRelease,
+            TestAction::Sleep(Duration::from_millis(50)),
+            // After Tab, display should show released lines
+            TestAction::AssertDisplay {
+                world_name: "flood".to_string(),
+                visible_height: 21,
+                term_width: 80,
+                line_count: Some(21),
+                last_line_contains: None, // Exact last line depends on release count
+                first_line_contains: None,
+                old_context_count: None,
+            },
+            // Release all remaining (Escape+j)
+            TestAction::JumpToEnd,
+            TestAction::Sleep(Duration::from_millis(50)),
+            // After full release, all 50 lines should be in output_lines
+            TestAction::AssertState {
+                world_name: "flood".to_string(),
+                check: StateCheck::OutputLineCount(50),
+            },
+            TestAction::AssertState {
+                world_name: "flood".to_string(),
+                check: StateCheck::PendingCount(0),
+            },
+            TestAction::AssertState {
+                world_name: "flood".to_string(),
+                check: StateCheck::Paused(false),
+            },
+            // Display should show last 21 lines with "Line 050" as last
+            TestAction::AssertDisplay {
+                world_name: "flood".to_string(),
+                visible_height: 21,
+                term_width: 80,
+                line_count: Some(21),
+                last_line_contains: Some("Line 050".to_string()),
+                first_line_contains: Some("Line 030".to_string()),
+                old_context_count: None,
+            },
+        ];
+
+        let _events = run_test_scenario(config, actions).await;
+
+        // Clean up servers
+        server1.abort();
+        server2.abort();
+    }
+
+    /// Unit test: NLI composition with build_display_lines called through the test harness pattern
+    /// Tests that after releasing some pending lines, the display correctly shows old context + new
+    #[test]
+    fn test_build_display_nli_after_partial_release() {
+        let mut world = World::new("test");
+
+        // Simulate: 2 old lines already in output, then 30 pending get partially released
+        for i in 0..2 {
+            world.output_lines.push(make_output_line(&format!("Old {}", i + 1), false));
+        }
+        // Release 19 lines from pending (they become output with marked_new=true)
+        for i in 0..19 {
+            world.output_lines.push(make_output_line(&format!("Pending {}", i + 1), true));
+        }
+        world.scroll_offset = world.output_lines.len() - 1;
+        // Still have 11 more in pending
+        world.paused = true;
+
+        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+
+        let display = build_display_lines(&world, &settings, 21, 80, false);
+
+        assert_eq!(display.len(), 21, "Expected 21 display lines, got {}", display.len());
+
+        // Should compose: 2 old context at top + 19 new at bottom
+        let old_context = display.iter().take_while(|d| !d.marked_new).count();
+        assert_eq!(old_context, 2, "Expected 2 old context lines, got {}", old_context);
+
+        assert!(display[0].text.contains("Old 1"));
+        assert!(display[1].text.contains("Old 2"));
+        assert!(display.last().unwrap().text.contains("Pending 19"));
     }
 
 

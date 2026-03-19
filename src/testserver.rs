@@ -39,6 +39,7 @@ pub struct PortScenario {
 pub fn get_scenario(name: &str) -> PortScenario {
     match name {
         "more_flood" => scenario_more_flood(30),
+        "more_flood_50" => scenario_more_flood(50),
         "more_flood_500" => scenario_more_flood(500),
         "auto_login_connect" => scenario_auto_login_connect(),
         "auto_login_prompt" => scenario_auto_login_prompt(),
