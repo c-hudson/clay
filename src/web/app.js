@@ -2069,7 +2069,11 @@
             case 'SetInputBuffer':
                 if (msg.text != null) {
                     elements.input.value = msg.text;
-                    elements.input.selectionStart = elements.input.selectionEnd = msg.text.length;
+                    if (msg.cursor_start) {
+                        elements.input.selectionStart = elements.input.selectionEnd = 0;
+                    } else {
+                        elements.input.selectionStart = elements.input.selectionEnd = msg.text.length;
+                    }
                 }
                 break;
 

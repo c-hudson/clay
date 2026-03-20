@@ -120,7 +120,7 @@ pub enum WsMessage {
     /// Tell client to execute a command locally (for action commands like /worlds)
     ExecuteLocalCommand { command: String },
     /// Set client's input buffer (server -> client, for API lookup results like /dict, /urban, /translate)
-    SetInputBuffer { text: String },
+    SetInputBuffer { text: String, #[serde(default)] cursor_start: bool },
 
     /// Notification for mobile clients (server -> client)
     Notification { title: String, message: String },

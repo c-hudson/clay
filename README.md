@@ -16,7 +16,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **More-Mode** - Pagination for fast-scrolling output
 - **Scrollback** - Unlimited history with PageUp/PageDown navigation
 - **Command History** - Navigate previous commands with Ctrl+P/N
-- **Telnet Protocol** - Full telnet negotiation with keepalive support (SGA, TTYPE, EOR, NAWS, MCCP2)
+- **Telnet Protocol** - Full telnet negotiation with keepalive support (SGA, TTYPE, EOR, NAWS, MCCP2, GMCP, MSDP)
 - **Auto-Login** - Configurable automatic login (Connect, Prompt, MOO modes)
 - **Hot Reload** - Update the binary without losing connections (`/reload`)
 - **Crash Recovery** - Automatic restart with state preservation on panic
@@ -27,8 +27,11 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **Output Filtering** - Search/filter output with F4
 - **File Logging** - Per-world output logging
 - **ANSI Music** - BBS-style music playback (web/GUI interfaces)
+- **GMCP** - Generic MUD Communication Protocol for structured data exchange
+- **MSDP** - MUD Server Data Protocol for server variable updates
 - **GMCP Media** - Server-driven sound effects and music via Client.Media protocol
 - **MCCP2 Compression** - Automatic zlib compression for reduced bandwidth (telnet option 86)
+- **Lookup Commands** - Dictionary, Urban Dictionary, translation, and URL shortening (`/dict`, `/urban`, `/translate`, `/url`)
 - **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands, startup actions
 - **TinyFugue Compatibility** - Full TF command support (`/def`, `/set`, `/if`, `/load`, etc.)
 - **Configurable Keybindings** - All keys configurable via `~/.clay.key.dat` with TF defaults, browser-based editor
@@ -137,25 +140,70 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 
 ## Commands
 
+**General:**
+
+| Command | Description |
+|---------|-------------|
+| `/help [topic]` | Show help (or topic-specific help) |
+| `/version` | Show version info |
+| `/quit` | Exit the client |
+| `/reload` | Hot reload the binary |
+| `/update [-f]` | Download and install latest release |
+| `/menu` | Open menu popup |
+
+**Worlds & Connections:**
+
 | Command | Description |
 |---------|-------------|
 | `/worlds` | Open world selector popup |
-| `/worlds <name>` | Connect to or create a world |
+| `/worlds <name>` | Connect to or switch to a world |
 | `/worlds -e [name]` | Edit world settings |
+| `/addworld <name> [host port]` | Add/update a world (TF-compatible) |
 | `/connections` or `/l` | List connected worlds |
+| `/connect [host port [ssl]]` | Connect to a server |
 | `/disconnect` or `/dc` | Disconnect current world |
 | `/send [-w world] text` | Send text to a world |
+| `/flush` | Clear output buffer for current world |
+
+**Settings & UI:**
+
+| Command | Description |
+|---------|-------------|
 | `/setup` | Open global settings |
 | `/web` | Open web/WebSocket settings |
-| `/actions` | Open actions/triggers editor |
-| `/edit` | Open split-screen notes editor |
-| `/menu` | Open menu popup |
-| `/reload` | Hot reload the binary |
-| `/update` | Download and install latest release |
+| `/actions [world]` | Open actions/triggers editor |
+| `/edit [file]` | Open split-screen notes editor |
+| `/edit -l` | Open notes list popup |
+| `/font` | Font settings popup (web/GUI only) |
+| `/tag` | Toggle MUD tag display with timestamps (same as F2) |
+
+**Lookup & Utility:**
+
+| Command | Description |
+|---------|-------------|
+| `/dict <word>` | Look up word definition (Free Dictionary API) |
+| `/urban <word>` | Look up word definition (Urban Dictionary) |
+| `/translate <lang> <text>` | Translate text (also `/tr`) |
+| `/url <url>` | Shorten a URL (is.gd) |
+
+Lookup commands place the result in the input buffer with the cursor at the start, so you can type a prefix (e.g. `say`) before sending.
+
+**Remote & Admin:**
+
+| Command | Description |
+|---------|-------------|
+| `/remote` | List remotely connected clients |
+| `/remote --kill <id>` | Disconnect a remote client |
+| `/ban` | Show banned hosts |
+| `/unban <host>` | Remove a ban |
 | `/notify <msg>` | Send notification to Android app |
+
+**Debug:**
+
+| Command | Description |
+|---------|-------------|
 | `/testmusic` | Play test ANSI music sequence |
-| `/quit` | Exit the client |
-| `/help` | Show help |
+| `/dump` | Dump scrollback buffers to `~/.clay.dmp.log` |
 
 ## TinyFugue Commands
 

@@ -311,9 +311,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             app.handle_charset_requested(world_idx, charsets);
                         }
                     }
-                    AppEvent::ApiLookupResult(client_id, world_index, result) => {
+                    AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                         match result {
-                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
+                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
                             Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
                                 world_index,
                                 data: e,
@@ -571,13 +571,13 @@ pub async fn handle_daemon_ws_message(
                     // Broadcast to all clients
                     app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
                 }
-                Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } => {
+                Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } | Command::TinyUrl { .. } => {
                     spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
                 }
                 Command::DictUsage => {
                     app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
-                        data: "Usage: /dict <prefix> <word>".to_string(),
+                        data: "Usage: /dict <word>".to_string(),
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
@@ -589,7 +589,7 @@ pub async fn handle_daemon_ws_message(
                 Command::UrbanUsage => {
                     app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
-                        data: "Usage: /urban <prefix> <word>".to_string(),
+                        data: "Usage: /urban <word>".to_string(),
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
@@ -601,7 +601,19 @@ pub async fn handle_daemon_ws_message(
                 Command::TranslateUsage => {
                     app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
-                        data: "Usage: /translate <lang> <prefix> <text>".to_string(),
+                        data: "Usage: /translate <lang> <text>".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                        seq: 0,
+                    marked_new: false,
+                    flush: false, gagged: false,
+                    });
+                }
+                Command::TinyUrlUsage => {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                        world_index,
+                        data: "Usage: /url <url>".to_string(),
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,

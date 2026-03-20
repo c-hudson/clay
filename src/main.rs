@@ -1389,18 +1389,22 @@ pub enum Command {
     EditList,
     /// /tag - toggle MUD tag display (same as F2)
     Tag,
-    /// /dict <prefix> <word> - look up word definition and send with prefix
-    Dict { prefix: String, word: String },
+    /// /dict <word> - look up word definition
+    Dict { word: String },
     /// /dict usage error
     DictUsage,
-    /// /urban <prefix> <word> - look up Urban Dictionary definition and send with prefix
-    Urban { prefix: String, word: String },
+    /// /urban <word> - look up Urban Dictionary definition
+    Urban { word: String },
     /// /urban usage error
     UrbanUsage,
-    /// /translate <lang> <prefix> <text> - translate text and send with prefix
-    Translate { lang: String, prefix: String, text: String },
+    /// /translate <lang> <text> - translate text
+    Translate { lang: String, text: String },
     /// /translate usage error
     TranslateUsage,
+    /// /url <url> - shorten URL via is.gd
+    TinyUrl { url: String },
+    /// /url usage error
+    TinyUrlUsage,
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -1499,34 +1503,34 @@ pub fn parse_command(input: &str) -> Command {
         }
         "/tag" | "/tags" => Command::Tag,
         "/dict" => {
-            if args.len() >= 2 {
-                Command::Dict {
-                    prefix: args[0].to_string(),
-                    word: args[1..].join(" "),
-                }
+            if !args.is_empty() {
+                Command::Dict { word: args.join(" ") }
             } else {
                 Command::DictUsage
             }
         }
         "/urban" => {
-            if args.len() >= 2 {
-                Command::Urban {
-                    prefix: args[0].to_string(),
-                    word: args[1..].join(" "),
-                }
+            if !args.is_empty() {
+                Command::Urban { word: args.join(" ") }
             } else {
                 Command::UrbanUsage
             }
         }
         "/translate" | "/tr" => {
-            if args.len() >= 3 {
+            if args.len() >= 2 {
                 Command::Translate {
                     lang: args[0].to_string(),
-                    prefix: args[1].to_string(),
-                    text: args[2..].join(" "),
+                    text: args[1..].join(" "),
                 }
             } else {
                 Command::TranslateUsage
+            }
+        }
+        "/url" => {
+            if !args.is_empty() {
+                Command::TinyUrl { url: args[0].to_string() }
+            } else {
+                Command::TinyUrlUsage
             }
         }
         _ => {
@@ -3711,9 +3715,9 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
-            WsMessage::SetInputBuffer { text } => {
+            WsMessage::SetInputBuffer { text, cursor_start } => {
                 self.input.buffer = text;
-                self.input.cursor_position = self.input.buffer.chars().count();
+                self.input.cursor_position = if cursor_start { 0 } else { self.input.buffer.len() };
                 self.needs_output_redraw = true;
             }
             WsMessage::ConnectionsListResponse { lines } => {
@@ -6406,13 +6410,13 @@ impl App {
                     });
                 }
             }
-            Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } => {
+            Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } | Command::TinyUrl { .. } => {
                 spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
             }
             Command::DictUsage => {
                 self.ws_send_to_client(client_id, WsMessage::ServerData {
                     world_index,
-                    data: "Usage: /dict <prefix> <word>".to_string(),
+                    data: "Usage: /dict <word>".to_string(),
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
@@ -6424,7 +6428,7 @@ impl App {
             Command::UrbanUsage => {
                 self.ws_send_to_client(client_id, WsMessage::ServerData {
                     world_index,
-                    data: "Usage: /urban <prefix> <word>".to_string(),
+                    data: "Usage: /urban <word>".to_string(),
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
@@ -6436,7 +6440,19 @@ impl App {
             Command::TranslateUsage => {
                 self.ws_send_to_client(client_id, WsMessage::ServerData {
                     world_index,
-                    data: "Usage: /translate <lang> <prefix> <text>".to_string(),
+                    data: "Usage: /translate <lang> <text>".to_string(),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                    seq: 0,
+                    marked_new: false,
+                    flush: false, gagged: false,
+                });
+            }
+            Command::TinyUrlUsage => {
+                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                    world_index,
+                    data: "Usage: /url <url>".to_string(),
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
@@ -8238,7 +8254,7 @@ pub enum AppEvent {
     // Media file downloaded and ready to play
     MediaFileReady(usize, String, std::path::PathBuf, i64, i64, bool),  // world_idx, key, path, volume, loops, is_music
     // API lookup result (dict/urban/translate) from spawned task
-    ApiLookupResult(u64, usize, Result<String, String>),  // client_id, world_index, Ok(input_text) or Err(error)
+    ApiLookupResult(u64, usize, Result<String, String>, bool),  // client_id, world_index, Ok(input_text) or Err(error), cursor_start
     // Result from background update check/download
     UpdateResult(Result<UpdateSuccess, String>),
 }
@@ -9191,10 +9207,18 @@ async fn run_grep_client(
     };
 
     // Connect to WebSocket server (same logic as run_console_client)
-    let (ws_url, try_fallback) = if addr.starts_with("ws://") || addr.starts_with("wss://") {
-        (addr.to_string(), false)
+    let addr_with_port = if addr.starts_with("ws://") || addr.starts_with("wss://") {
+        addr.to_string()
+    } else if addr.contains(':') {
+        addr.to_string()
     } else {
-        (format!("wss://{}", addr), true)
+        format!("{}:9000", addr)
+    };
+
+    let (ws_url, try_fallback) = if addr_with_port.starts_with("ws://") || addr_with_port.starts_with("wss://") {
+        (addr_with_port.clone(), false)
+    } else {
+        (format!("wss://{}", addr_with_port), true)
     };
 
     #[cfg(feature = "rustls-backend")]
@@ -9220,7 +9244,7 @@ async fn run_grep_client(
     let (ws_stream, _) = match connect_result {
         Ok(result) => result,
         Err(_) if try_fallback => {
-            let fallback_url = format!("ws://{}", addr);
+            let fallback_url = format!("ws://{}", addr_with_port);
             match connect_async(&fallback_url).await {
                 Ok(result) => result,
                 Err(e2) => {
@@ -9522,12 +9546,22 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use futures::SinkExt;
 
-    // Parse address - add wss:// prefix if not present (try secure first)
-    let (ws_url, try_fallback) = if addr.starts_with("ws://") || addr.starts_with("wss://") {
-        (addr.to_string(), false)
+    // Parse address - add default port 9000 if not specified, then wss:// prefix
+    let addr_with_port = if addr.starts_with("ws://") || addr.starts_with("wss://") {
+        addr.to_string()
+    } else if addr.contains(':') {
+        // Host:port already specified
+        addr.to_string()
+    } else {
+        // No port specified - default to 9000 (same as --gui)
+        format!("{}:9000", addr)
+    };
+
+    let (ws_url, try_fallback) = if addr_with_port.starts_with("ws://") || addr_with_port.starts_with("wss://") {
+        (addr_with_port.clone(), false)
     } else {
         // Default to wss:// for security, will fall back to ws:// if it fails
-        (format!("wss://{}", addr), true)
+        (format!("wss://{}", addr_with_port), true)
     };
 
     println!("Connecting to {}...", ws_url);
@@ -9558,7 +9592,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
         Ok(result) => result,
         Err(e) if try_fallback => {
             // wss:// failed, try ws:// fallback
-            let fallback_url = format!("ws://{}", addr);
+            let fallback_url = format!("ws://{}", addr_with_port);
             eprintln!("Secure connection failed ({}), trying {}...", e, fallback_url);
             match connect_async(&fallback_url).await {
                 Ok(result) => result,
@@ -12702,7 +12736,7 @@ async fn main() -> io::Result<()> {
         println!();
         println!("Options:");
         println!("    --console            Run in console (TUI) mode");
-        println!("    --console=host:port  Connect to a Clay server via console");
+        println!("    --console=host[:port] Connect to a Clay server via console (default port: 9000)");
         println!("    --gui                Run in GUI (webview) mode");
         println!("    --gui=host[:port]    Connect to a Clay server via GUI (default port: 9000)");
         println!("    -D                   Run as headless daemon server");
@@ -13675,9 +13709,9 @@ pub async fn run_app_headless(
                             app.media_processes.insert(key, (world_idx, handle));
                         }
                     }
-                    AppEvent::ApiLookupResult(client_id, world_index, result) => {
+                    AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                         match result {
-                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
+                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
                             Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
                                 world_index,
                                 data: e,
@@ -15724,9 +15758,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.media_processes.insert(key, (world_idx, handle));
                         }
                     }
-                    AppEvent::ApiLookupResult(client_id, world_index, result) => {
+                    AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                         match result {
-                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
+                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
                             Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
                                 world_index,
                                 data: e,
@@ -16412,9 +16446,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.media_processes.insert(key, (world_idx, handle));
                     }
                 }
-                AppEvent::ApiLookupResult(client_id, world_index, result) => {
+                AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                     match result {
-                        Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
+                        Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
                         Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
                             world_index,
                             data: e,
@@ -19017,6 +19051,40 @@ pub fn normalize_language_code(lang: &str) -> String {
     }
 }
 
+/// Shorten a URL using is.gd (direct redirect, no landing page)
+pub async fn lookup_tinyurl(url: &str) -> Result<String, String> {
+    let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("format", "simple")
+        .append_pair("url", url)
+        .finish();
+    let api_url = format!("https://is.gd/create.php?{}", encoded);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .get(&api_url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("API error: {}", response.status()));
+    }
+
+    let body = response.text().await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    let trimmed = body.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Empty response from is.gd".to_string());
+    }
+
+    Ok(trimmed)
+}
+
 /// Translate text using MyMemory API (free, no API key required for up to 1000 words/day)
 pub async fn lookup_translation(text: &str, target_lang: &str) -> Result<String, String> {
     // Normalize language input (accepts both codes and names)
@@ -19090,7 +19158,7 @@ fn cap_text(s: String, max_len: usize) -> String {
     }
 }
 
-/// Spawn an async API lookup task for /dict, /urban, or /translate commands.
+/// Spawn an async API lookup task for /dict, /urban, /translate, or /tiny commands.
 /// Results are sent back via event_tx as ApiLookupResult for the main loop to route to the client.
 pub fn spawn_api_lookup(
     event_tx: mpsc::Sender<AppEvent>,
@@ -19099,40 +19167,49 @@ pub fn spawn_api_lookup(
     command: Command,
 ) {
     match command {
-        Command::Dict { prefix, word } => {
+        Command::Dict { word } => {
             tokio::spawn(async move {
                 let result = match lookup_definition(&word).await {
                     Ok(def) => {
                         let ascii = transliterate_to_ascii(&def);
-                        Ok(cap_text(format!("{} {}: {}", prefix, word, ascii), 1024))
+                        Ok(cap_text(format!("{}: {}", word, ascii), 1024))
                     }
                     Err(e) => Err(format!("Definition lookup failed: {}", e)),
                 };
-                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result)).await;
+                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result, true)).await;
             });
         }
-        Command::Urban { prefix, word } => {
+        Command::Urban { word } => {
             tokio::spawn(async move {
                 let result = match lookup_urban_definition(&word).await {
                     Ok(def) => {
                         let ascii = transliterate_to_ascii(&def);
-                        Ok(cap_text(format!("{} Urban Dict: {}: {}", prefix, word, ascii), 1024))
+                        Ok(cap_text(format!("{}: {}", word, ascii), 1024))
                     }
                     Err(e) => Err(format!("Urban Dictionary lookup failed: {}", e)),
                 };
-                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result)).await;
+                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result, true)).await;
             });
         }
-        Command::Translate { lang, prefix, text } => {
+        Command::Translate { lang, text } => {
             tokio::spawn(async move {
                 let result = match lookup_translation(&text, &lang).await {
                     Ok(trans) => {
                         let ascii = transliterate_to_ascii(&trans);
-                        Ok(cap_text(format!("{} {}", prefix, ascii), 1024))
+                        Ok(cap_text(ascii, 1024))
                     }
                     Err(e) => Err(format!("Translation failed: {}", e)),
                 };
-                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result)).await;
+                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result, true)).await;
+            });
+        }
+        Command::TinyUrl { url } => {
+            tokio::spawn(async move {
+                let result = match lookup_tinyurl(&url).await {
+                    Ok(short) => Ok(short),
+                    Err(e) => Err(format!("TinyURL failed: {}", e)),
+                };
+                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result, true)).await;
             });
         }
         _ => {}
@@ -19878,6 +19955,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             });
         }
         Command::Disconnect => {
+            let world_index = app.current_world_index;
             if app.current_world().connected {
                 // Kill proxy process if one exists
                 #[cfg(unix)]
@@ -19886,6 +19964,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
                 app.current_world_mut().clear_connection_state(true, true);
                 app.add_output("Disconnected.");
+                app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
             } else {
                 app.add_output("Not connected.");
             }
@@ -20175,54 +20254,26 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             });
             app.add_output(&format!("Notification sent: {}", message));
         }
-        Command::Dict { prefix, word } => {
-            // Look up word definition from Free Dictionary API
+        Command::Dict { word } => {
             match lookup_definition(&word).await {
                 Ok(definition) => {
-                    // Transliterate to ASCII for non-UTF-8 MUD compatibility
                     let ascii_def = transliterate_to_ascii(&definition);
-                    // Format: prefix word: definition, capped at 1024 bytes, single line
-                    let full_text = format!("{} {}: {}", prefix, word, ascii_def);
-                    let capped = if full_text.len() > 1024 {
-                        let mut end = 1024;
-                        // Don't cut in the middle of a UTF-8 character
-                        while end > 0 && !full_text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        full_text[..end].to_string()
-                    } else {
-                        full_text
-                    };
-                    // Put result in input buffer for user to review/send
-                    app.input.buffer = capped;
-                    app.input.cursor_position = app.input.buffer.len();
+                    let full_text = cap_text(format!("{}: {}", word, ascii_def), 1024);
+                    app.input.buffer = full_text;
+                    app.input.cursor_position = 0;
                 }
                 Err(e) => {
                     app.add_output(&format!("Definition lookup failed: {}", e));
                 }
             }
         }
-        Command::Urban { prefix, word } => {
-            // Look up word definition from Urban Dictionary API
+        Command::Urban { word } => {
             match lookup_urban_definition(&word).await {
                 Ok(definition) => {
-                    // Transliterate to ASCII for non-UTF-8 MUD compatibility
                     let ascii_def = transliterate_to_ascii(&definition);
-                    // Format: prefix Urban Dict: word: definition, capped at 1024 bytes, single line
-                    let full_text = format!("{} Urban Dict: {}: {}", prefix, word, ascii_def);
-                    let capped = if full_text.len() > 1024 {
-                        let mut end = 1024;
-                        // Don't cut in the middle of a UTF-8 character
-                        while end > 0 && !full_text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        full_text[..end].to_string()
-                    } else {
-                        full_text
-                    };
-                    // Put result in input buffer for user to review/send
-                    app.input.buffer = capped;
-                    app.input.cursor_position = app.input.buffer.len();
+                    let full_text = cap_text(format!("{}: {}", word, ascii_def), 1024);
+                    app.input.buffer = full_text;
+                    app.input.cursor_position = 0;
                 }
                 Err(e) => {
                     app.add_output(&format!("Urban Dictionary lookup failed: {}", e));
@@ -20230,36 +20281,22 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::DictUsage => {
-            app.add_output("Usage: /dict <prefix> <word>");
-            app.add_output("  Looks up <word> in the dictionary and sends '<prefix> <word>: <definition>' to the MUD.");
-            app.add_output("  Example: /dict say hello");
+            app.add_output("Usage: /dict <word>");
+            app.add_output("  Looks up <word> in the dictionary and places the definition in the input buffer.");
+            app.add_output("  Example: /dict hello");
         }
         Command::UrbanUsage => {
-            app.add_output("Usage: /urban <prefix> <word>");
-            app.add_output("  Looks up <word> in Urban Dictionary and sends '<prefix> Urban Dict: <word>: <definition>' to the MUD.");
-            app.add_output("  Example: /urban say yeet");
+            app.add_output("Usage: /urban <word>");
+            app.add_output("  Looks up <word> in Urban Dictionary and places the definition in the input buffer.");
+            app.add_output("  Example: /urban yeet");
         }
-        Command::Translate { lang, prefix, text } => {
-            // Translate text using MyMemory API
+        Command::Translate { lang, text } => {
             match lookup_translation(&text, &lang).await {
                 Ok(translation) => {
-                    // Transliterate to ASCII for non-UTF-8 MUD compatibility
                     let ascii_trans = transliterate_to_ascii(&translation);
-                    // Format: prefix translated_text, capped at 1024 bytes, single line
-                    let full_text = format!("{} {}", prefix, ascii_trans);
-                    let capped = if full_text.len() > 1024 {
-                        let mut end = 1024;
-                        // Don't cut in the middle of a UTF-8 character
-                        while end > 0 && !full_text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        full_text[..end].to_string()
-                    } else {
-                        full_text
-                    };
-                    // Put result in input buffer for user to review/send
-                    app.input.buffer = capped;
-                    app.input.cursor_position = app.input.buffer.len();
+                    let full_text = cap_text(ascii_trans, 1024);
+                    app.input.buffer = full_text;
+                    app.input.cursor_position = 0;
                 }
                 Err(e) => {
                     app.add_output(&format!("Translation failed: {}", e));
@@ -20267,11 +20304,27 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::TranslateUsage => {
-            app.add_output("Usage: /translate <lang> <prefix> <text>");
-            app.add_output("  Translates <text> to <lang> and puts '<prefix> <translated text>' in input.");
+            app.add_output("Usage: /translate <lang> <text>");
+            app.add_output("  Translates <text> to <lang> and places the result in the input buffer.");
             app.add_output("  <lang> can be a code (es, fr, de) or name (spanish, french, german).");
-            app.add_output("  Example: /translate spanish say Hello, how are you?");
-            app.add_output("  Example: /tr es say Hello");
+            app.add_output("  Example: /translate spanish Hello, how are you?");
+            app.add_output("  Example: /tr es Hello");
+        }
+        Command::TinyUrl { url } => {
+            match lookup_tinyurl(&url).await {
+                Ok(short) => {
+                    app.input.buffer = short;
+                    app.input.cursor_position = 0;
+                }
+                Err(e) => {
+                    app.add_output(&format!("URL shortening failed: {}", e));
+                }
+            }
+        }
+        Command::TinyUrlUsage => {
+            app.add_output("Usage: /url <url>");
+            app.add_output("  Shortens <url> via is.gd and places the result in the input buffer.");
+            app.add_output("  Example: /url https://github.com/c-hudson/clay");
         }
         Command::Dump => {
             // Dump comprehensive debug state to ~/.clay.dmp.log
