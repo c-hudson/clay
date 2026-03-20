@@ -908,11 +908,11 @@ pub async fn handle_daemon_ws_message(
                         ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 },
                         ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 },
                     ];
-                    app.ws_broadcast(WsMessage::AnsiMusic {
+                    app.ws_send_to_client(client_id, WsMessage::AnsiMusic {
                         world_index,
                         notes: test_notes,
                     });
-                    app.ws_broadcast(WsMessage::ServerData {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
                         data: "Playing test music (C-D-E-F-G)...".to_string(),
                         is_viewed: false,

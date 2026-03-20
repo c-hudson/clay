@@ -6125,13 +6125,12 @@ impl App {
             }
             Command::TestMusic => {
                 let test_notes = generate_test_music_notes();
-                // Play locally on console via mpv/ffplay
-                self.play_ansi_music_console(&test_notes);
-                self.ws_broadcast(WsMessage::AnsiMusic {
+                // Play only on the client that invoked the command
+                self.ws_send_to_client(client_id, WsMessage::AnsiMusic {
                     world_index,
                     notes: test_notes,
                 });
-                self.ws_broadcast(WsMessage::ServerData {
+                self.ws_send_to_client(client_id, WsMessage::ServerData {
                     world_index,
                     data: "Playing test music (Super Mario Bros)...".to_string(),
                     is_viewed: false,
@@ -20239,10 +20238,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::TestMusic => {
             let test_notes = generate_test_music_notes();
             app.play_ansi_music_console(&test_notes);
-            app.ws_broadcast(WsMessage::AnsiMusic {
-                world_index: app.current_world_index,
-                notes: test_notes,
-            });
             app.add_output("Playing test music (Super Mario Bros)...");
         }
         Command::Notify { message } => {
