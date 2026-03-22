@@ -146,7 +146,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Use Remote Hostname when device IP doesn't match Local Netmask."
+            android:text="Tries the main host first. If unreachable, falls back to remote hostname."
             android:textSize="11sp"
             android:textColor="#8b949e"
             android:layout_marginBottom="4dp" />
@@ -154,31 +154,10 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Local Netmask"
-            android:textSize="12sp"
-            android:textColor="#8b949e"
-            android:layout_marginTop="4dp" />
-
-        <EditText
-            android:id="@+id/localNetmask"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="192.168.1.*"
-            android:inputType="text"
-            android:textColor="#e6edf3"
-            android:textColorHint="#484f58"
-            android:textSize="15sp"
-            android:backgroundTint="#3fb950"
-            android:paddingTop="6dp"
-            android:paddingBottom="6dp" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
             android:text="Remote Hostname"
             android:textSize="12sp"
             android:textColor="#8b949e"
-            android:layout_marginTop="8dp" />
+            android:layout_marginTop="4dp" />
 
         <EditText
             android:id="@+id/remoteHostname"

@@ -1125,6 +1125,15 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::String(s.to_uppercase()))
             }
 
+            "escape" => {
+                if args.len() != 2 {
+                    return Err("escape requires 2 arguments: escape(metacharacters, string)".to_string());
+                }
+                let metacharacters = self.eval(&args[0])?.to_string_value();
+                let string = self.eval(&args[1])?.to_string_value();
+                Ok(TfValue::String(super::parser::tf_escape(&metacharacters, &string)))
+            }
+
             "time" => {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let now = SystemTime::now()

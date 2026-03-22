@@ -1162,11 +1162,143 @@ pub fn cmd_loaded(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 /// When called outside of file loading, this is equivalent to /quit.
 pub fn cmd_exit(engine: &TfEngine) -> TfCommandResult {
     if engine.loading_files.is_empty() {
-        // Not loading a file - quit the application
-        TfCommandResult::ClayCommand("/quit".to_string())
+        // Not loading a file - /exit has no effect (per TF spec)
+        TfCommandResult::Success(None)
     } else {
         // Loading a file - abort early
         TfCommandResult::ExitLoad
+    }
+}
+
+/// /hilite [pattern [= response]] - Hilite matching text
+/// With no args: sets %{hilite} to 1.
+/// With args: creates a macro equivalent to /def -ah -t"pattern" [= response].
+pub fn cmd_hilite(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+
+    if args.is_empty() {
+        // No args: enable hilite flag
+        engine.set_global("hilite", super::TfValue::Integer(1));
+        return TfCommandResult::Success(Some("Hilite enabled.".to_string()));
+    }
+
+    // Parse: pattern [= response]
+    let (pattern, body) = if let Some(eq_pos) = args.find('=') {
+        let before = args[..eq_pos].trim_end();
+        let after = args[eq_pos + 1..].trim_start();
+        (before.to_string(), after.to_string())
+    } else {
+        (args.to_string(), String::new())
+    };
+
+    // Get hiliteattr from variable (default "B" = bold)
+    let hiliteattr = engine.get_var("hiliteattr")
+        .map(|v| v.to_string_value())
+        .unwrap_or_else(|| "B".to_string());
+
+    // Parse the attribute string to get TfAttributes
+    let attrs = super::macros::parse_hiliteattr(&hiliteattr);
+
+    let hilite_name = format!("__hilite_{}", engine.next_macro_sequence);
+    let macro_def = super::TfMacro {
+        name: hilite_name,
+        body,
+        trigger: Some(super::TfTrigger {
+            pattern: pattern.clone(),
+            match_mode: super::TfMatchMode::Glob,
+            compiled: regex::Regex::new(&super::macros::glob_to_regex(&pattern)).ok(),
+        }),
+        attributes: attrs,
+        ..Default::default()
+    };
+
+    let macro_num = engine.next_macro_sequence;
+    engine.add_macro(macro_def);
+    TfCommandResult::Success(Some(format!("{}", macro_num)))
+}
+
+/// /nohilite pattern - Remove hilite macro matching pattern
+pub fn cmd_nohilite(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let pattern = args.trim();
+
+    if pattern.is_empty() {
+        // No args: disable hilite flag
+        engine.set_global("hilite", super::TfValue::Integer(0));
+        return TfCommandResult::Success(Some("Hilite disabled.".to_string()));
+    }
+
+    // Remove hilite macros matching the pattern
+    let before = engine.macros.len();
+    engine.macros.retain(|m| {
+        if let Some(ref trigger) = m.trigger {
+            // Remove if it's a hilite macro with matching pattern
+            if (m.attributes.hilite.is_some() || m.attributes.bold)
+                && trigger.pattern == pattern
+            {
+                return false;
+            }
+        }
+        true
+    });
+    let removed = before - engine.macros.len();
+
+    if removed > 0 {
+        TfCommandResult::Success(Some(format!("Removed {} hilite(s) matching '{}'", removed, pattern)))
+    } else {
+        TfCommandResult::Success(Some(format!("No hilite found matching '{}'", pattern)))
+    }
+}
+
+/// /partial regexp - Hilite matching portion of lines (partial hilite)
+/// Equivalent to /def -Ph -F -tregexp
+pub fn cmd_partial(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let pattern = args.trim();
+
+    if pattern.is_empty() {
+        return TfCommandResult::Error("Usage: /partial regexp".to_string());
+    }
+
+    // Get hiliteattr from variable (default "B" = bold)
+    let hiliteattr = engine.get_var("hiliteattr")
+        .map(|v| v.to_string_value())
+        .unwrap_or_else(|| "B".to_string());
+
+    let attrs = super::macros::parse_hiliteattr(&hiliteattr);
+
+    let partial_name = format!("__partial_{}", engine.next_macro_sequence);
+    let macro_def = super::TfMacro {
+        name: partial_name,
+        body: String::new(),
+        trigger: Some(super::TfTrigger {
+            pattern: pattern.to_string(),
+            match_mode: super::TfMatchMode::Regexp,
+            compiled: regex::Regex::new(pattern).ok(),
+        }),
+        attributes: attrs,
+        fall_through: true,
+        partial_hilite: true,
+        ..Default::default()
+    };
+
+    let macro_num = engine.next_macro_sequence;
+    engine.add_macro(macro_def);
+    TfCommandResult::Success(Some(format!("{}", macro_num)))
+}
+
+/// /export variable - Make a global variable an environment variable
+pub fn cmd_export(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let var_name = args.trim();
+
+    if var_name.is_empty() {
+        return TfCommandResult::Error("Usage: /export variable".to_string());
+    }
+
+    if let Some(value) = engine.get_var(var_name) {
+        let val_str = value.to_string_value();
+        std::env::set_var(var_name, &val_str);
+        TfCommandResult::Success(None)
+    } else {
+        TfCommandResult::Error(format!("Variable '{}' not found.", var_name))
     }
 }
 

@@ -303,6 +303,7 @@ pub struct TfMacro {
     pub attributes: TfAttributes,
     pub priority: i32,
     pub fall_through: bool,
+    pub partial_hilite: bool,   // -P: hilite only the matched portion, not the whole line
     pub one_shot: Option<u32>,  // None = permanent, Some(n) = fire n times
     pub shots_remaining: Option<u32>,
     pub condition: Option<String>,  // Expression to evaluate before firing

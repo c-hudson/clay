@@ -68,7 +68,7 @@ pub fn is_tf_command(input: &str) -> bool {
 fn is_tf_command_name(cmd: &str) -> bool {
     matches!(cmd,
         "set" | "unset" | "let" | "setenv" | "listvar" |
-        "echo" | "beep" | "quote" | "substitute" |
+        "echo" | "beep" | "quote" | "substitute" | "escape" | "hilite" | "nohilite" | "partial" | "export" |
         "expr" | "test" | "eval" |
         "if" | "elseif" | "else" | "endif" | "while" | "for" | "done" | "break" |
         "def" | "undef" | "undefn" | "undeft" | "list" | "purge" |
@@ -238,8 +238,17 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
 
         // Output commands
         "echo" => cmd_echo(engine, args),
+        "escape" => cmd_escape(args),
         "send" => cmd_send(engine, args),
         "substitute" => cmd_substitute(engine, args),
+
+        // Hilite/trigger shortcuts
+        "hilite" => builtins::cmd_hilite(engine, args),
+        "nohilite" => builtins::cmd_nohilite(engine, args),
+        "partial" => builtins::cmd_partial(engine, args),
+
+        // Variable commands
+        "export" => builtins::cmd_export(engine, args),
 
         // Mapped to Clay commands
         "quit" => TfCommandResult::ClayCommand("/quit".to_string()),
@@ -608,6 +617,39 @@ fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
     // @{Crgb} = foreground color, @{BCrgb} = background color
     let message = process_attr_codes(remaining);
     TfCommandResult::Success(Some(message))
+}
+
+/// /escape metacharacters string - Escape metacharacters and backslashes in string
+/// Echoes string with any metacharacters or '\' preceded by '\'.
+fn cmd_escape(args: &str) -> TfCommandResult {
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: /escape metacharacters string".to_string());
+    }
+    // First word is the set of metacharacters, rest is the string
+    let (metacharacters, string) = if let Some(space_pos) = args.find(char::is_whitespace) {
+        let meta = &args[..space_pos];
+        let rest = args[space_pos..].trim_start();
+        (meta, rest)
+    } else {
+        // Only metacharacters provided, no string — result is empty
+        return TfCommandResult::Success(Some(String::new()));
+    };
+
+    let result = tf_escape(metacharacters, string);
+    TfCommandResult::Success(Some(result))
+}
+
+/// Core escape logic shared by /escape command and escape() function.
+/// Precedes any character in `string` that is in `metacharacters` or is '\' with a '\'.
+pub fn tf_escape(metacharacters: &str, string: &str) -> String {
+    let mut result = String::with_capacity(string.len() * 2);
+    for c in string.chars() {
+        if c == '\\' || metacharacters.contains(c) {
+            result.push('\\');
+        }
+        result.push(c);
+    }
+    result
 }
 
 /// /substitute [-a attrs] [--] text - Replace trigger line with substituted text
@@ -986,12 +1028,19 @@ Hooks & Keys:
 
 Output:
   /echo message        - Display message locally
+  /escape meta string  - Escape metacharacters in string
   /send [-w world] text - Send text to MUD
   /beep                - Terminal bell
   /quote text          - Send without substitution
+  /hilite [pattern]    - Hilite matching lines (-ah trigger)
+  /nohilite [pattern]  - Remove hilite
+  /partial regexp      - Hilite matched portion (-Ph -F)
   /gag [pattern]       - List gags, or suppress matching lines
   /ungag pattern       - Remove gag
   /recall [pattern]    - Search output history
+
+Variables:
+  /export variable     - Export variable to environment
 
 World Management:
   /fg [name]           - Switch to or list worlds
@@ -1037,6 +1086,21 @@ Use /tfhelp functions for list of expression functions."#;
             )),
             "echo" => TfCommandResult::Success(Some(
                 "/echo message\n\nDisplay a message locally (not sent to MUD).\nVariable substitution is performed on the message.\nExample: /echo Hello %{name}!".to_string()
+            )),
+            "escape" => TfCommandResult::Success(Some(
+                "/escape metacharacters string\n\nEchoes string with any metacharacters or '\\' characters\npreceded by a '\\' character.\n\nFunction form: $[escape(metacharacters, string)]\n\nExample:\n  /def blue = /def -aCblue -t\"$(/escape \" %*)\"\n  /blue * pages, \"*\"\n  => /def -aCblue -t\"* pages, \\\"*\\\"\"".to_string()
+            )),
+            "hilite" => TfCommandResult::Success(Some(
+                "/hilite [pattern [= response]]\n\nWith no args: enables hilite (sets %{hilite} to 1).\nWith args: creates a trigger that hilites matching lines.\nEquivalent to: /def -ah -t\"pattern\" [= response]\n\nHilite style is set by %{hiliteattr} (default: B = bold).\nExample: /hilite {*} tried to kill you!".to_string()
+            )),
+            "nohilite" => TfCommandResult::Success(Some(
+                "/nohilite [pattern]\n\nWith no args: disables hilite (sets %{hilite} to 0).\nWith a pattern: removes hilite macros matching that pattern.".to_string()
+            )),
+            "partial" => TfCommandResult::Success(Some(
+                "/partial regexp\n\nHilites the matched portion of lines (not the whole line).\nCreates a fall-through trigger so multiple can match.\nEquivalent to: /def -Ph -F -tregexp\n\nHilite style is set by %{hiliteattr} (default: B = bold).\nExample: /partial [Hh]awkeye".to_string()
+            )),
+            "export" => TfCommandResult::Success(Some(
+                "/export variable\n\nMakes a global variable an environment variable,\navailable to /sh and /quote commands.\nLocal variables may not be exported.\n\nSee also: /setenv".to_string()
             )),
             "send" => TfCommandResult::Success(Some(
                 "/send [-w world] text\n\nSend text to the MUD server.\n-w world: Send to specific world\nExample: /send say Hello everyone!".to_string()
@@ -1269,6 +1333,7 @@ String Functions:
   strrep(str, n)           - Repeat string n times
   tolower(str)             - Convert to lowercase
   toupper(str)             - Convert to uppercase
+  escape(meta, str)        - Escape metacharacters in string
   replace(str, old, new [,count]) - Replace occurrences
   ascii(str)               - ASCII code of first character
   char(code)               - Character from ASCII code
@@ -1347,7 +1412,7 @@ File I/O:
 
 Usage: $[function(args)] or in /expr//test"#.to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill, load, require, loaded, exit, addworld, functions", topic))),
+            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, escape, send, def, if, while, for, expr, bind, hooks, hilite, partial, export, repeat, ps, kill, load, require, loaded, exit, addworld, functions", topic))),
         }
     }
 }

@@ -43,7 +43,6 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_SAVED_USERNAME = "savedUsername";
     private static final String KEY_AUTH_KEY = "authKey";  // Device auth key for passwordless login
     private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
-    private static final String KEY_LOCAL_NETMASK = "localNetmask";
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
 
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
@@ -54,6 +53,11 @@ public class MainActivity extends AppCompatActivity {
     private static final long BACKGROUND_SHUTDOWN_MS = 60 * 60 * 1000; // 1 hour - auto-disconnect when in background
 
     private WebView webView;
+    private android.widget.LinearLayout connectingOverlay;
+    private android.widget.TextView connectingText;
+    private android.widget.TextView connectingUrl;
+    private android.widget.Button connectingCancelBtn;
+    private volatile boolean connectCancelled = false;
     private boolean connectionFailed = false;
     private int notificationId = 1000;
     private boolean isConnected = false;
@@ -316,6 +320,15 @@ public class MainActivity extends AppCompatActivity {
         createServiceNotificationChannel();
 
         webView = findViewById(R.id.webView);
+        connectingOverlay = findViewById(R.id.connectingOverlay);
+        connectingText = findViewById(R.id.connectingText);
+        connectingUrl = findViewById(R.id.connectingUrl);
+        connectingCancelBtn = findViewById(R.id.connectingCancelBtn);
+        connectingCancelBtn.setOnClickListener(v -> {
+            connectCancelled = true;
+            hideConnectingOverlay();
+            openSettings("Connection cancelled");
+        });
         setupWebView();
 
         // Start permission flow - will call proceedAfterPermissions when done
@@ -657,6 +670,7 @@ public class MainActivity extends AppCompatActivity {
                 if (request.isForMainFrame()) {
                     connectionFailed = true;
                     runOnUiThread(() -> {
+                        hideConnectingOverlay();
                         openSettings("Connection failed to " + request.getUrl().getHost() + ": " + error.getDescription());
                     });
                 }
@@ -674,6 +688,7 @@ public class MainActivity extends AppCompatActivity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 connectionFailed = false;
+                hideConnectingOverlay();
                 android.util.Log.i("Clay", "Page loaded: " + url);
             }
 
@@ -722,146 +737,98 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * Resolves which hostname to use based on advanced settings.
-     * If advanced mode is enabled and both local netmask and remote hostname are set,
-     * checks the device's current IP against the netmask pattern.
-     * Returns the remote hostname if no local IP matches, standard hostname otherwise.
+     * Resolves which hostname to use.
+     * If advanced mode is enabled, tries the local (standard) hostname first with a fast
+     * TCP probe. If that fails, falls back to the remote hostname.
+     * This avoids unreliable IP/netmask matching and handles NAT hairpinning issues.
      */
-    private String resolveHostname() {
+    private void resolveHostnameAndLoad() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String standardHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
-        boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
-
-        if (!advancedEnabled) {
-            android.util.Log.i("Clay", "resolveHostname: advanced mode disabled, using standard: " + standardHost);
-            return standardHost;
-        }
-
-        String localNetmask = prefs.getString(KEY_LOCAL_NETMASK, "");
-        String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
-
-        if (localNetmask.isEmpty() || remoteHostname.isEmpty()) {
-            android.util.Log.i("Clay", "resolveHostname: netmask or remote empty, using standard: " + standardHost);
-            return standardHost;
-        }
-
-        // Check if any device IP matches the local netmask
-        java.util.List<String> deviceIps = getDeviceIpAddresses();
-        for (String ip : deviceIps) {
-            if (matchesWildcard(ip, localNetmask)) {
-                android.util.Log.i("Clay", "Device IP " + ip + " matches local netmask " + localNetmask + ", using standard hostname: " + standardHost);
-                return standardHost;
-            }
-        }
-
-        android.util.Log.i("Clay", "No device IP matches local netmask " + localNetmask + ", using remote hostname: " + remoteHostname);
-        return remoteHostname;
-    }
-
-    /**
-     * Gets IPv4 addresses from the active network only.
-     * Uses ConnectivityManager to avoid matching stale IPs from inactive interfaces
-     * (e.g. old WiFi IPs when on mobile data).
-     * Falls back to enumerating all interfaces on older Android versions.
-     */
-    private java.util.List<String> getDeviceIpAddresses() {
-        java.util.List<String> addresses = new java.util.ArrayList<>();
-
-        // Try ConnectivityManager first (API 23+) for active network only
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-            try {
-                android.net.ConnectivityManager cm = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-                if (cm != null) {
-                    android.net.Network activeNetwork = cm.getActiveNetwork();
-                    if (activeNetwork != null) {
-                        android.net.LinkProperties lp = cm.getLinkProperties(activeNetwork);
-                        if (lp != null) {
-                            for (android.net.LinkAddress la : lp.getLinkAddresses()) {
-                                java.net.InetAddress addr = la.getAddress();
-                                if (addr instanceof java.net.Inet4Address && !addr.isLoopbackAddress()) {
-                                    addresses.add(addr.getHostAddress());
-                                }
-                            }
-                        }
-                    }
-                }
-                if (!addresses.isEmpty()) {
-                    android.util.Log.i("Clay", "Active network IPs: " + addresses);
-                    return addresses;
-                }
-            } catch (Exception e) {
-                android.util.Log.w("Clay", "ConnectivityManager failed: " + e.getMessage());
-            }
-        }
-
-        // Fallback: enumerate all network interfaces
-        try {
-            java.util.Enumeration<java.net.NetworkInterface> interfaces = java.net.NetworkInterface.getNetworkInterfaces();
-            while (interfaces != null && interfaces.hasMoreElements()) {
-                java.net.NetworkInterface iface = interfaces.nextElement();
-                if (iface.isLoopback() || !iface.isUp()) continue;
-
-                java.util.Enumeration<java.net.InetAddress> addrs = iface.getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    java.net.InetAddress addr = addrs.nextElement();
-                    if (addr instanceof java.net.Inet4Address && !addr.isLoopbackAddress()) {
-                        addresses.add(addr.getHostAddress());
-                    }
-                }
-            }
-        } catch (Exception e) {
-            android.util.Log.w("Clay", "Failed to enumerate network interfaces: " + e.getMessage());
-        }
-        android.util.Log.i("Clay", "All interface IPs (fallback): " + addresses);
-        return addresses;
-    }
-
-    /**
-     * Matches an IP address against a wildcard pattern.
-     * Splits both by '.' and compares segment by segment.
-     * '*' in a pattern segment matches any value.
-     */
-    private boolean matchesWildcard(String ip, String pattern) {
-        String[] ipParts = ip.split("\\.");
-        String[] patternParts = pattern.split("\\.");
-
-        if (ipParts.length != patternParts.length) {
-            return false;
-        }
-
-        for (int i = 0; i < ipParts.length; i++) {
-            if (!patternParts[i].equals("*") && !patternParts[i].equals(ipParts[i])) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private void loadWebInterface() {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String host = resolveHostname();
         int port = prefs.getInt(KEY_SERVER_PORT, 9000);
         boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
-
-        String protocol = useSecure ? "https" : "http";
-        final String url = protocol + "://" + host + ":" + port;
+        boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
+        String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
 
         connectionFailed = false;
+        connectCancelled = false;
 
-        // For HTTPS, fetch ALL resources ourselves and inline them
-        // This completely bypasses WebView's SSL handling - no network requests from WebView
+        if (!advancedEnabled || remoteHostname.isEmpty()) {
+            // No advanced mode — just connect to the standard host
+            String protocol = useSecure ? "https" : "http";
+            String url = protocol + "://" + standardHost + ":" + port;
+            showConnectingOverlay(url);
+            loadUrl(url, useSecure);
+            return;
+        }
+
+        // Advanced mode: try local first, fall back to remote
+        showConnectingOverlay(standardHost + " ...");
+
+        new Thread(() -> {
+            // Quick TCP probe to the local address (2 second timeout)
+            boolean localReachable = false;
+            try {
+                java.net.Socket socket = new java.net.Socket();
+                socket.connect(new java.net.InetSocketAddress(standardHost, port), 2000);
+                socket.close();
+                localReachable = true;
+                android.util.Log.i("Clay", "Local host " + standardHost + ":" + port + " is reachable");
+            } catch (Exception e) {
+                android.util.Log.i("Clay", "Local host " + standardHost + ":" + port + " unreachable: " + e.getMessage());
+            }
+
+            if (connectCancelled) return;
+
+            String host = localReachable ? standardHost : remoteHostname;
+            String protocol = useSecure ? "https" : "http";
+            String url = protocol + "://" + host + ":" + port;
+
+            android.util.Log.i("Clay", "Using hostname: " + host + (localReachable ? " (local)" : " (remote)"));
+
+            runOnUiThread(() -> {
+                if (connectCancelled) return;
+                connectingUrl.setText(host);
+                loadUrl(url, useSecure);
+            });
+        }).start();
+    }
+
+    private void showConnectingOverlay(String urlText) {
+        connectingOverlay.setVisibility(android.view.View.VISIBLE);
+        connectingText.setText("Connecting...");
+        connectingUrl.setText(urlText);
+        webView.setVisibility(android.view.View.INVISIBLE);
+    }
+
+    private void hideConnectingOverlay() {
+        connectingOverlay.setVisibility(android.view.View.GONE);
+        webView.setVisibility(android.view.View.VISIBLE);
+    }
+
+    /**
+     * Load the web interface from a resolved URL.
+     * For HTTPS, fetches resources via OkHttp and inlines them.
+     * For HTTP, loads directly in the WebView.
+     */
+    private void loadUrl(String url, boolean useSecure) {
         if (useSecure) {
             new Thread(() -> {
                 try {
+                    if (connectCancelled) return;
                     okhttp3.OkHttpClient client = createTrustAllClient();
 
                     // Fetch HTML
                     okhttp3.Response htmlResp = client.newCall(
                         new okhttp3.Request.Builder().url(url).build()).execute();
+                    if (connectCancelled) { htmlResp.close(); return; }
                     if (!htmlResp.isSuccessful()) {
                         final int code = htmlResp.code();
                         htmlResp.close();
-                        runOnUiThread(() -> openSettings("HTTP " + code + " loading " + url));
+                        runOnUiThread(() -> {
+                            hideConnectingOverlay();
+                            openSettings("HTTP " + code + " loading " + url);
+                        });
                         return;
                     }
                     String html = htmlResp.body().string();
@@ -889,8 +856,9 @@ public class MainActivity extends AppCompatActivity {
                         jsResp.close();
                     } catch (Exception e) { /* ignore */ }
 
+                    if (connectCancelled) return;
+
                     // Inline CSS and JS into HTML
-                    // Replace <link rel="stylesheet" href="style.css"> with inline <style>
                     if (!css.isEmpty()) {
                         html = html.replace(
                             "<link rel=\"stylesheet\" href=\"style.css\">",
@@ -899,8 +867,6 @@ public class MainActivity extends AppCompatActivity {
                             "<link rel=\"stylesheet\" href=\"/style.css\">",
                             "<style>\n" + css + "\n</style>");
                     }
-
-                    // Replace <script src="app.js"></script> with inline <script>
                     if (!js.isEmpty()) {
                         html = html.replace(
                             "<script src=\"app.js\"></script>",
@@ -912,20 +878,30 @@ public class MainActivity extends AppCompatActivity {
 
                     final String finalHtml = html;
                     runOnUiThread(() -> {
-                        // Load as data URL - WebView makes no network requests
+                        if (connectCancelled) return;
                         webView.loadDataWithBaseURL(url, finalHtml, "text/html", "UTF-8", null);
                         interfaceLoaded = true;
                         loadedInterfaceUrl = url;
+                        hideConnectingOverlay();
                     });
                 } catch (Exception e) {
-                    runOnUiThread(() -> openSettings("Failed to connect to " + url + ": " + e.getMessage()));
+                    runOnUiThread(() -> {
+                        hideConnectingOverlay();
+                        openSettings("Failed to connect to " + url + ": " + e.getMessage());
+                    });
                 }
             }).start();
         } else {
             webView.loadUrl(url);
             interfaceLoaded = true;
             loadedInterfaceUrl = url;
+            // For HTTP, WebView handles loading — hide overlay when page loads
+            // (WebViewClient.onPageFinished will hide it, or error handler will catch failures)
         }
+    }
+
+    private void loadWebInterface() {
+        resolveHostnameAndLoad();
     }
 
     /**
@@ -1025,19 +1001,8 @@ public class MainActivity extends AppCompatActivity {
         boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
 
         if (host != null && !host.isEmpty() && port > 0) {
-            String resolvedHost = resolveHostname();
-            String protocol = useSecure ? "https" : "http";
-            String expectedUrl = protocol + "://" + resolvedHost + ":" + port;
-
-            // Only reload if:
-            // 1. Interface hasn't been loaded yet
-            // 2. Settings changed (URL differs from what we loaded)
-            boolean needsLoad = !interfaceLoaded ||
-                (loadedInterfaceUrl != null && !expectedUrl.equals(loadedInterfaceUrl));
-
-            if (needsLoad) {
-                android.util.Log.i("Clay", "Loading interface: interfaceLoaded=" + interfaceLoaded +
-                    ", loadedUrl=" + loadedInterfaceUrl + ", expectedUrl=" + expectedUrl);
+            if (!interfaceLoaded) {
+                android.util.Log.i("Clay", "Loading interface: not yet loaded");
                 loadWebInterface();
             } else if (webView != null) {
                 // Interface loaded - always verify connection health on resume.

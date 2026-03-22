@@ -60,6 +60,7 @@ pub fn parse_def(args: &str) -> Result<TfMacro, String> {
             }
             DefOption::Priority(p) => macro_def.priority = p,
             DefOption::FallThrough => macro_def.fall_through = true,
+            DefOption::PartialHilite => macro_def.partial_hilite = true,
             DefOption::OneShot => {
                 macro_def.one_shot = Some(1);
                 macro_def.shots_remaining = Some(1);
@@ -115,6 +116,7 @@ enum DefOption {
     MatchMode(TfMatchMode),
     Priority(i32),
     FallThrough,
+    PartialHilite,
     OneShot,
     ShotCount(u32),
     Attributes(TfAttributes),
@@ -162,6 +164,10 @@ fn parse_option(input: &str) -> Result<(DefOption, &str), String> {
         'F' => {
             // -F (fall-through)
             Ok((DefOption::FallThrough, &input[1..]))
+        }
+        'P' => {
+            // -P (partial hilite)
+            Ok((DefOption::PartialHilite, &input[1..]))
         }
         '1' => {
             // -1 (one-shot)
@@ -266,6 +272,27 @@ fn parse_word(input: &str) -> (String, &str) {
         .unwrap_or(input.len());
 
     (input[..end].to_string(), &input[end..])
+}
+
+/// Parse %{hiliteattr} variable value into TfAttributes.
+/// Default is "B" (bold). Supports TF single-letter codes like "B", "Cred", etc.
+pub fn parse_hiliteattr(hiliteattr: &str) -> super::TfAttributes {
+    match parse_attributes(hiliteattr) {
+        Ok(mut attrs) => {
+            // If no explicit hilite/bold/underline was set, default to hilite marker
+            if attrs.hilite.is_none() && !attrs.bold && !attrs.underline {
+                attrs.hilite = Some("hilite".to_string());
+            }
+            attrs
+        }
+        Err(_) => {
+            // Fallback to default bold hilite
+            super::TfAttributes {
+                hilite: Some("hilite".to_string()),
+                ..Default::default()
+            }
+        }
+    }
 }
 
 /// Parse attribute string (e.g., "gag,bold,hilite:red")
