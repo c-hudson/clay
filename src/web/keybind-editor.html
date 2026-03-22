@@ -465,6 +465,101 @@ button.danger:hover { background: #5a3030; }
   gap: 8px;
   margin-top: 8px;
 }
+
+/* Find overlay */
+.find-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.55);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.find-overlay.hidden { display: none; }
+
+.find-box {
+  background: var(--editor-bg3);
+  border: 1px solid var(--editor-accent);
+  border-radius: 6px;
+  padding: 20px 28px;
+  min-width: 320px;
+  text-align: center;
+}
+
+.find-box h3 {
+  color: var(--editor-accent);
+  font-size: 14px;
+  margin-bottom: 14px;
+}
+
+.find-capture-area {
+  border: 2px dashed var(--editor-border);
+  border-radius: 6px;
+  padding: 16px;
+  color: var(--editor-fg2);
+  font-size: 13px;
+  margin-bottom: 14px;
+  transition: all 0.2s;
+  animation: capture-pulse 1.5s ease-in-out infinite;
+  border-color: var(--editor-accent);
+}
+
+.find-captured-key {
+  font-size: 16px;
+  color: var(--editor-accent);
+  font-weight: bold;
+  margin-bottom: 10px;
+}
+
+.find-result-info {
+  font-size: 12px;
+  color: var(--editor-fg2);
+  margin-bottom: 14px;
+}
+
+.find-result-action {
+  color: var(--editor-fg);
+  font-weight: bold;
+}
+
+.find-nav {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  margin-bottom: 6px;
+}
+
+.find-btn {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 4px 14px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.find-btn:hover { background: var(--editor-hover); }
+
+.action-item.find-match {
+  background: rgba(212,132,90,0.12);
+  border-left-color: var(--editor-accent);
+}
+
+/* Search button */
+.search-btn {
+  background: none;
+  border: 1px solid var(--editor-border);
+  color: var(--editor-fg2);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  line-height: 1;
+}
+.search-btn:hover { color: var(--editor-accent); border-color: var(--editor-accent); }
 </style>
 </head>
 <body>
@@ -489,10 +584,21 @@ button.danger:hover { background: #5a3030; }
       <span class="unsaved-dot" id="unsavedDot"></span>
     </div>
     <div class="toolbar-group">
+      <button class="search-btn" onclick="openFind()" title="Find binding">&#128269;</button>
       <button class="primary" onclick="doSave()">Save</button>
       <button onclick="doCancel()">Cancel</button>
       <button class="danger" onclick="doResetDefaults()">Reset Defaults</button>
       <span class="save-status" id="saveStatus"></span>
+    </div>
+  </div>
+
+  <!-- Find overlay -->
+  <div class="find-overlay hidden" id="findOverlay">
+    <div class="find-box" id="findBox">
+      <h3>Find Binding</h3>
+      <div id="findContent">
+        <div class="find-capture-area">Press a key combination...</div>
+      </div>
     </div>
   </div>
 
@@ -524,6 +630,10 @@ let capturing = false;
 let lastEscapeTime = 0;
 let pendingCapture = null; // {key, conflictAction} awaiting confirmation
 let saveStatusTimeout = null;
+let findMode = false;
+let findKey = null;       // the key name being searched for
+let findMatches = [];     // [{actionId, keyName}] matching actions
+let findIndex = 0;        // current match index
 
 // WebSocket connection
 function connect() {
@@ -1067,12 +1177,39 @@ function doResetDefaults() {
   wsSend({ type: 'ResetKeybindDefaults' });
 }
 
-// Global key handler for capture mode
+// Global key handler for capture mode and find mode
 document.addEventListener('keydown', function(e) {
   // Auth password entry
   if (!document.getElementById('authOverlay').classList.contains('hidden')) {
     if (e.key === 'Enter') doAuth();
     return;
+  }
+
+  // Find mode - capture key to search for
+  if (findMode && !findKey) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Escape closes the find overlay
+    if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      closeFind();
+      return;
+    }
+
+    const name = handleEscapeSequence(e);
+    if (name) {
+      doFind(name);
+    }
+    return;
+  }
+
+  // Find mode with results - Escape closes
+  if (findMode && findKey) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeFind();
+      return;
+    }
   }
 
   // Capture mode
@@ -1087,6 +1224,138 @@ document.addEventListener('keydown', function(e) {
     return;
   }
 });
+
+// Find binding feature
+function openFind() {
+  findMode = true;
+  findKey = null;
+  findMatches = [];
+  findIndex = 0;
+  const overlay = document.getElementById('findOverlay');
+  overlay.classList.remove('hidden');
+  document.getElementById('findContent').innerHTML =
+    '<div class="find-capture-area">Press a key combination...</div>';
+}
+
+function closeFind() {
+  findMode = false;
+  findKey = null;
+  findMatches = [];
+  findIndex = 0;
+  document.getElementById('findOverlay').classList.add('hidden');
+  // Remove find-match highlights
+  document.querySelectorAll('.action-item.find-match').forEach(el => el.classList.remove('find-match'));
+}
+
+function doFind(keyName) {
+  findKey = keyName;
+  findMatches = [];
+  findIndex = 0;
+
+  // Find all actions that have this key bound (current bindings)
+  const actionId = bindings[keyName];
+  if (actionId) {
+    findMatches.push({ actionId, keyName, source: 'current' });
+  }
+
+  // Also check defaults (if different from current)
+  const defActionId = defaults[keyName];
+  if (defActionId && defActionId !== actionId) {
+    findMatches.push({ actionId: defActionId, keyName, source: 'default' });
+  }
+
+  updateFindUI();
+
+  if (findMatches.length > 0) {
+    navigateToMatch(0);
+  }
+}
+
+function updateFindUI() {
+  const content = document.getElementById('findContent');
+  let html = '<div class="find-captured-key">' + esc(findKey) + '</div>';
+
+  if (findMatches.length === 0) {
+    html += '<div class="find-result-info">No bindings found for this key</div>';
+    html += '<div class="find-nav">';
+    html += '<button class="find-btn" onclick="resetFind()">Search Again</button> ';
+    html += '<button class="find-btn" onclick="closeFind()">Close</button>';
+    html += '</div>';
+  } else {
+    const m = findMatches[findIndex];
+    const action = actions.find(a => a.id === m.actionId);
+    const label = m.source === 'default' ? ' (default only)' : '';
+    html += '<div class="find-result-info">Bound to: <span class="find-result-action">' + esc(action ? action.name : m.actionId) + '</span>' + label + '</div>';
+    if (findMatches.length > 1) {
+      html += '<div class="find-result-info">' + (findIndex + 1) + ' of ' + findMatches.length + ' matches</div>';
+    }
+    html += '<div class="find-nav">';
+    if (findMatches.length > 1) {
+      html += '<button class="find-btn" onclick="findPrev()">&larr; Prev</button>';
+      html += '<button class="find-btn" onclick="findNext()">Next &rarr;</button>';
+    }
+    html += '<button class="find-btn" onclick="resetFind()">Search Again</button>';
+    html += '<button class="find-btn" onclick="closeFind()">Close</button>';
+    html += '</div>';
+  }
+
+  content.innerHTML = html;
+}
+
+function resetFind() {
+  findKey = null;
+  findMatches = [];
+  findIndex = 0;
+  document.querySelectorAll('.action-item.find-match').forEach(el => el.classList.remove('find-match'));
+  document.getElementById('findContent').innerHTML =
+    '<div class="find-capture-area">Press a key combination...</div>';
+}
+
+function findPrev() {
+  if (findMatches.length === 0) return;
+  findIndex = (findIndex - 1 + findMatches.length) % findMatches.length;
+  navigateToMatch(findIndex);
+  updateFindUI();
+}
+
+function findNext() {
+  if (findMatches.length === 0) return;
+  findIndex = (findIndex + 1) % findMatches.length;
+  navigateToMatch(findIndex);
+  updateFindUI();
+}
+
+function navigateToMatch(idx) {
+  const m = findMatches[idx];
+
+  // Remove old highlights
+  document.querySelectorAll('.action-item.find-match').forEach(el => el.classList.remove('find-match'));
+
+  // Expand the category group if collapsed
+  const item = document.querySelector('.action-item[data-action-id="' + m.actionId + '"]');
+  if (item) {
+    const groupItems = item.closest('.action-group-items');
+    if (groupItems && groupItems.classList.contains('collapsed')) {
+      groupItems.classList.remove('collapsed');
+      const arrow = groupItems.previousElementSibling.querySelector('.action-group-arrow');
+      if (arrow) arrow.classList.remove('collapsed');
+    }
+    item.classList.add('find-match');
+    item.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  // Select the action in the detail panel
+  selectedAction = m.actionId;
+  rebuildDetail();
+
+  // Re-highlight after rebuildDetail (which doesn't touch the left panel items' classes)
+  // But we need to update the selected state in the left panel
+  document.querySelectorAll('.action-item.selected').forEach(el => el.classList.remove('selected'));
+  if (item) {
+    item.classList.add('selected');
+    item.classList.add('find-match');
+  }
+}
 
 // Beforeunload warning
 window.addEventListener('beforeunload', function(e) {

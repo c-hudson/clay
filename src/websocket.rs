@@ -340,6 +340,10 @@ pub enum WsMessage {
     // Keepalive
     Ping,
     Pong,
+
+    // Liveness check for /remote command (server -> client -> server)
+    PingCheck { nonce: u64 },
+    PongCheck { nonce: u64 },
 }
 
 /// A line of output with timestamp

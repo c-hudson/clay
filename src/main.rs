@@ -1457,7 +1457,7 @@ pub fn parse_command(input: &str) -> Command {
         }
         "/connections" | "/l" => Command::WorldsList,
         "/worlds" | "/world" => parse_world_command(args),
-        "/connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
+        "/__connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
         "/disconnect" | "/dc" => Command::Disconnect,
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
@@ -2835,6 +2835,10 @@ pub struct App {
     pub ansi_music_handle: Option<audio::PlayHandle>,
     /// Counter for unique ANSI music WAV filenames (external player only)
     pub ansi_music_counter: u32,
+    /// Shared set of client IDs that have responded to the current /remote PingCheck
+    pub remote_ping_responses: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>>,
+    /// Nonce for current /remote ping check (to ignore stale PongCheck responses)
+    pub remote_ping_nonce: u64,
     /// Test-only: log of all messages passed to ws_broadcast() and ws_broadcast_to_world()
     #[cfg(test)]
     pub ws_broadcast_log: std::sync::Arc<std::sync::Mutex<Vec<WsMessage>>>,
@@ -2918,6 +2922,8 @@ impl App {
             event_tx: None,
             ansi_music_handle: None,
             ansi_music_counter: 0,
+            remote_ping_responses: None,
+            remote_ping_nonce: 0,
             #[cfg(test)]
             ws_broadcast_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -3876,6 +3882,12 @@ impl App {
                 // Master or another client updated global settings - sync our local copy
                 self.apply_global_settings(&settings);
                 self.needs_output_redraw = true;
+            }
+            WsMessage::PingCheck { nonce } => {
+                // Server liveness check for /remote command - respond immediately
+                if let Some(ref tx) = self.ws_client_tx {
+                    let _ = tx.send(WsMessage::PongCheck { nonce });
+                }
             }
             _ => {}
         }
@@ -5996,36 +6008,7 @@ impl App {
                 }
             }
             Command::Remote => {
-                if let Some(ref ws_server) = self.ws_server {
-                    let output = if let Ok(clients) = ws_server.clients.try_read() {
-                        let authed: Vec<_> = clients.iter().filter(|(_, c)| c.authenticated).collect();
-                        if authed.is_empty() {
-                            "No remote clients connected.".to_string()
-                        } else {
-                            let mut lines = Vec::new();
-                            lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
-                                "ID", "IP", "Type", "Connected", "Idle", "User"));
-                            let mut sorted: Vec<_> = authed.iter().collect();
-                            sorted.sort_by_key(|(id, _)| *id);
-                            for (id, client) in sorted {
-                                let connected = format_duration_short(client.connected_at.elapsed());
-                                let idle = format_duration_short(client.last_activity.elapsed());
-                                let ctype = format!("{:?}", client.client_type);
-                                let user = client.username.as_deref().unwrap_or("");
-                                lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
-                                    id, client.ip_address, ctype, connected, idle, user));
-                            }
-                            lines.join("\n")
-                        }
-                    } else {
-                        "Could not read client list (busy).".to_string()
-                    };
-                    self.ws_broadcast(WsMessage::ServerData {
-                        world_index, data: output, is_viewed: false,
-                        ts: current_timestamp_secs(), from_server: false,
-                        seq: 0, marked_new: false, flush: false, gagged: false,
-                    });
-                }
+                spawn_remote_ping_check(self, event_tx.clone(), client_id, world_index);
             }
             Command::RemoteKill { client_id: kill_id } => {
                 if let Some(ref ws_server) = self.ws_server {
@@ -7523,6 +7506,16 @@ impl App {
                     }
                 }
             }
+            WsMessage::PongCheck { nonce } => {
+                // Client responded to a /remote liveness check
+                if nonce == self.remote_ping_nonce {
+                    if let Some(ref responses) = self.remote_ping_responses {
+                        if let Ok(mut set) = responses.lock() {
+                            set.insert(client_id);
+                        }
+                    }
+                }
+            }
             _ => {
                 // Other message types handled elsewhere or ignored
             }
@@ -8254,6 +8247,8 @@ pub enum AppEvent {
     MediaFileReady(usize, String, std::path::PathBuf, i64, i64, bool),  // world_idx, key, path, volume, loops, is_music
     // API lookup result (dict/urban/translate) from spawned task
     ApiLookupResult(u64, usize, Result<String, String>, bool),  // client_id, world_index, Ok(input_text) or Err(error), cursor_start
+    // /remote ping check result (after 2s timeout)
+    RemoteListResult(u64, usize, Vec<String>),  // requesting_client_id (0 = console), world_index, output lines
     // Result from background update check/download
     UpdateResult(Result<UpdateSuccess, String>),
 }
@@ -9419,6 +9414,9 @@ async fn run_grep_client(
                                 Ok(WsMessage::Ping) => {
                                     let _ = ws_tx.send(WsMessage::Pong);
                                 }
+                                Ok(WsMessage::PingCheck { nonce }) => {
+                                    let _ = ws_tx.send(WsMessage::PongCheck { nonce });
+                                }
                                 _ => {}
                             }
                         }
@@ -9493,6 +9491,9 @@ async fn run_grep_client(
                         }
                         Ok(WsMessage::Ping) => {
                             let _ = ws_tx.send(WsMessage::Pong);
+                        }
+                        Ok(WsMessage::PingCheck { nonce }) => {
+                            let _ = ws_tx.send(WsMessage::PongCheck { nonce });
                         }
                         _ => {}
                     }
@@ -9755,6 +9756,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     execute!(
         stdout,
         EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
         crossterm::cursor::MoveTo(0, 0)
     )?;
@@ -9804,6 +9806,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             }
         } else {
             disable_raw_mode()?;
+            let _ = execute!(terminal.backend_mut(), crossterm::event::DisableBracketedPaste);
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
             eprintln!("Connection closed while waiting for initial state");
             return Ok(());
@@ -9852,12 +9855,14 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                 // Full terminal reset: unconditionally tear down and re-setup
                 let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
                 app.mouse_capture_active = false;
+                let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
                 let _ = crossterm::terminal::disable_raw_mode();
                 let _ = execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
                 crossterm::terminal::enable_raw_mode()?;
                 execute!(
                     std::io::stdout(),
                     crossterm::terminal::EnterAlternateScreen,
+                    crossterm::event::EnableBracketedPaste,
                     crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                     crossterm::cursor::MoveTo(0, 0)
                 )?;
@@ -9926,6 +9931,17 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                             }
                             needs_redraw = true;
                         }
+                        Event::Paste(text) => {
+                            for c in text.chars() {
+                                if c == '\n' || c == '\r' {
+                                    app.input.insert_char('\n');
+                                } else if !c.is_control() {
+                                    app.input.insert_char(c);
+                                }
+                            }
+                            app.last_input_was_delete = false;
+                            needs_redraw = true;
+                        }
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             // Handle Ctrl+C with double-press to quit
                             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
@@ -9971,7 +9987,8 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                                         let _ = crossterm::terminal::enable_raw_mode();
                                         let _ = crossterm::execute!(
                                             std::io::stdout(),
-                                            crossterm::terminal::EnterAlternateScreen
+                                            crossterm::terminal::EnterAlternateScreen,
+                                            crossterm::event::EnableBracketedPaste
                                         );
                                         app.add_output(&format!("Reload failed: {}", err));
                                     } else {
@@ -10125,6 +10142,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     ws_write_handle.abort();
     disable_raw_mode()?;
     let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+    let _ = execute!(terminal.backend_mut(), crossterm::event::DisableBracketedPaste);
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
 }
@@ -13026,6 +13044,7 @@ async fn main() -> io::Result<()> {
     execute!(
         stdout,
         EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste,
         Clear(ClearType::All),
         cursor::MoveTo(0, 0)
     )?;
@@ -13721,6 +13740,27 @@ pub async fn run_app_headless(
                                 marked_new: false,
                                 flush: false, gagged: false,
                             }),
+                        }
+                    }
+                    AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
+                        app.remote_ping_responses = None;
+                        if requesting_client_id == 0 {
+                            for line in &lines {
+                                app.add_output(line);
+                            }
+                        } else {
+                            for line in &lines {
+                                app.ws_send_to_client(requesting_client_id, WsMessage::ServerData {
+                                    world_index,
+                                    data: line.clone(),
+                                    is_viewed: false,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                    seq: 0,
+                                    marked_new: false,
+                                    flush: false, gagged: false,
+                                });
+                            }
                         }
                     }
                     AppEvent::UpdateResult(result) => {
@@ -15054,6 +15094,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         continue;
                     }
                 }
+                if let Event::Paste(ref text) = event {
+                    // Bracketed paste: entire pasted text arrives as one event.
+                    // Insert all characters directly into the input buffer.
+                    for c in text.chars() {
+                        if c == '\n' || c == '\r' {
+                            // Pastes may contain newlines — insert literal newline
+                            app.input.insert_char('\n');
+                        } else if !c.is_control() {
+                            app.input.insert_char(c);
+                        }
+                    }
+                    app.last_input_was_delete = false;
+                    continue;
+                }
                 if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press { continue; }
                     match handle_key_event(key, &mut app) {
@@ -15065,12 +15119,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Always disable mouse capture to clear any stuck state
                             let _ = execute!(std::io::stdout(), DisableMouseCapture);
                             app.mouse_capture_active = false;
+                            let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
                             disable_raw_mode()?;
                             execute!(std::io::stdout(), LeaveAlternateScreen)?;
                             enable_raw_mode()?;
                             execute!(
                                 std::io::stdout(),
                                 EnterAlternateScreen,
+                                crossterm::event::EnableBracketedPaste,
                                 Clear(ClearType::All),
                                 cursor::MoveTo(0, 0)
                             )?;
@@ -15084,7 +15140,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         KeyAction::Connect => {
                             if !app.current_world().connected
-                                && handle_command("/connect", &mut app, event_tx.clone()).await
+                                && handle_command("/__connect", &mut app, event_tx.clone()).await
                             {
                                 return Ok(());
                             }
@@ -15102,6 +15158,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if app.mouse_capture_active {
                                     let _ = execute!(std::io::stdout(), DisableMouseCapture);
                                 }
+                                let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
                                 disable_raw_mode()?;
                                 execute!(std::io::stdout(), LeaveAlternateScreen)?;
 
@@ -15112,7 +15169,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                 // When we resume (after fg), re-enter raw mode and redraw
                                 enable_raw_mode()?;
-                                execute!(std::io::stdout(), EnterAlternateScreen)?;
+                                execute!(std::io::stdout(), EnterAlternateScreen, crossterm::event::EnableBracketedPaste)?;
                                 if app.mouse_capture_active {
                                     let _ = execute!(std::io::stdout(), EnableMouseCapture);
                                 }
@@ -15397,6 +15454,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     app.check_word_ended();
                     app.check_temp_conversion();
+
                 }
                 } // close if let Some(Ok(event))
             }
@@ -15711,7 +15769,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let op = app.handle_ws_client_msg(client_id, *msg, &event_tx);
                         match op {
                             WsAsyncAction::Connect { world_index, prev_index, broadcast } => {
-                                if handle_command("/connect", &mut app, event_tx.clone()).await {
+                                if handle_command("/__connect", &mut app, event_tx.clone()).await {
                                     return Ok(());
                                 }
                                 if broadcast && world_index < app.worlds.len() && app.worlds[world_index].connected {
@@ -15770,6 +15828,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 marked_new: false,
                                 flush: false, gagged: false,
                             }),
+                        }
+                    }
+                    AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
+                        app.remote_ping_responses = None;
+                        if requesting_client_id == 0 {
+                            for line in &lines {
+                                app.add_output(line);
+                            }
+                        } else {
+                            for line in &lines {
+                                app.ws_send_to_client(requesting_client_id, WsMessage::ServerData {
+                                    world_index,
+                                    data: line.clone(),
+                                    is_viewed: false,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                    seq: 0,
+                                    marked_new: false,
+                                    flush: false, gagged: false,
+                                });
+                            }
                         }
                     }
                     AppEvent::UpdateResult(result) => {
@@ -16396,7 +16475,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     let op = app.handle_ws_client_msg(client_id, *msg, &event_tx);
                     match op {
                         WsAsyncAction::Connect { world_index, prev_index, broadcast } => {
-                            if handle_command("/connect", &mut app, event_tx.clone()).await {
+                            if handle_command("/__connect", &mut app, event_tx.clone()).await {
                                 return Ok(());
                             }
                             if broadcast && world_index < app.worlds.len() && app.worlds[world_index].connected {
@@ -16458,6 +16537,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             marked_new: false,
                             flush: false, gagged: false,
                         }),
+                    }
+                }
+                AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
+                    app.remote_ping_responses = None;
+                    for line in &lines {
+                        app.ws_send_to_client(requesting_client_id, WsMessage::ServerData {
+                            world_index,
+                            data: line.clone(),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                            seq: 0,
+                            marked_new: false,
+                            flush: false, gagged: false,
+                        });
                     }
                 }
             }
@@ -17018,7 +17112,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.switch_world(idx);
                             if !app.current_world().connected {
                                 if app.current_world().settings.has_connection_settings() {
-                                    return KeyAction::SendCommand("/connect".to_string());
+                                    return KeyAction::SendCommand("/__connect".to_string());
                                 } else {
                                     app.add_output(&format!("World '{}' has no connection settings.", name));
                                 }
@@ -19215,6 +19309,84 @@ pub fn spawn_api_lookup(
     }
 }
 
+/// Snapshot of a remote client for the /remote ping check
+struct RemoteClientSnapshot {
+    id: u64,
+    ip: String,
+    ctype: String,
+    connected: String,
+    idle: String,
+    user: String,
+}
+
+/// Start an async /remote ping check: send PingCheck to all clients, wait 2s, build output.
+/// `requesting_client_id` is 0 for console, or the WS client_id that invoked /remote.
+fn spawn_remote_ping_check(
+    app: &mut App,
+    event_tx: mpsc::Sender<AppEvent>,
+    requesting_client_id: u64,
+    world_index: usize,
+) {
+    let responses = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::<u64>::new()));
+    app.remote_ping_nonce += 1;
+    let nonce = app.remote_ping_nonce;
+    app.remote_ping_responses = Some(responses.clone());
+
+    // Gather client snapshot and send PingCheck to each
+    let mut snapshots = Vec::new();
+    if let Some(ref ws_server) = app.ws_server {
+        if let Ok(clients) = ws_server.clients.try_read() {
+            let mut sorted: Vec<_> = clients.iter()
+                .filter(|(_, c)| c.authenticated)
+                .collect();
+            sorted.sort_by_key(|(id, _)| *id);
+            for (&id, client) in &sorted {
+                snapshots.push(RemoteClientSnapshot {
+                    id,
+                    ip: client.ip_address.clone(),
+                    ctype: format!("{:?}", client.client_type),
+                    connected: format_duration_short(client.connected_at.elapsed()),
+                    idle: format_duration_short(client.last_activity.elapsed()),
+                    user: client.username.as_deref().unwrap_or("").to_string(),
+                });
+            }
+            // Send PingCheck to each authenticated client
+            for (&id, client) in &sorted {
+                let _ = client.tx.send(WsMessage::PingCheck { nonce });
+                let _ = id;
+            }
+        }
+    }
+
+    if snapshots.is_empty() {
+        // No clients — send result immediately
+        app.remote_ping_responses = None;
+        let lines = vec!["No remote clients connected.".to_string()];
+        let event_tx_clone = event_tx.clone();
+        tokio::spawn(async move {
+            let _ = event_tx_clone.send(AppEvent::RemoteListResult(requesting_client_id, world_index, lines)).await;
+        });
+        return;
+    }
+
+    // Spawn a 2-second timer that builds the output
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let responded = responses.lock().unwrap().clone();
+
+        let mut lines = Vec::new();
+        lines.push(format!("{:<6} {:<16} {:<8} {:<8} {:<6} {:<5} {}",
+            "ID", "IP", "Type", "Conn", "Idle", "Alive", "User"));
+        for snap in &snapshots {
+            let alive = if responded.contains(&snap.id) { "Yes" } else { "No" };
+            lines.push(format!("{:<6} {:<16} {:<8} {:<8} {:<6} {:<5} {}",
+                snap.id, snap.ip, snap.ctype, snap.connected, snap.idle, alive, snap.user));
+        }
+
+        let _ = event_tx.send(AppEvent::RemoteListResult(requesting_client_id, world_index, lines)).await;
+    });
+}
+
 #[async_recursion(?Send)]
 async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
     let parsed = parse_command(cmd);
@@ -19300,7 +19472,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     if app.current_world().settings.has_connection_settings() {
                         // Set flag to skip auto-login
                         app.current_world_mut().skip_auto_login = true;
-                        return Box::pin(handle_command("/connect", app, event_tx)).await;
+                        return Box::pin(handle_command("/__connect", app, event_tx)).await;
                     } else {
                         app.add_output(&format!("World '{}' has no connection settings.", name));
                     }
@@ -19318,7 +19490,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 if !app.current_world().connected
                     && app.current_world().settings.has_connection_settings()
                 {
-                    return Box::pin(handle_command("/connect", app, event_tx)).await;
+                    return Box::pin(handle_command("/__connect", app, event_tx)).await;
                 }
             } else {
                 // World doesn't exist - show error message (goes through more-mode flow)
@@ -20105,6 +20277,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                         let _ = crossterm::execute!(
                             std::io::stdout(),
                             crossterm::terminal::EnterAlternateScreen,
+                            crossterm::event::EnableBracketedPaste,
                             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                             crossterm::cursor::MoveTo(0, 0)
                         );
@@ -20132,45 +20305,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::Remote => {
-            let lines = if let Some(ref ws_server) = app.ws_server {
-                if let Ok(clients) = ws_server.clients.try_read() {
-                    let authed: Vec<_> = clients.iter()
-                        .filter(|(_, c)| c.authenticated)
-                        .collect();
-                    if authed.is_empty() {
-                        vec!["No remote clients connected.".to_string()]
-                    } else {
-                        let mut lines = Vec::new();
-                        lines.push(String::new());
-                        lines.push("Remote Clients:".to_string());
-                        lines.push("─".repeat(75));
-                        lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
-                            "ID", "IP", "Type", "Connected", "Idle", "User"));
-                        lines.push("─".repeat(75));
-                        let mut sorted: Vec<_> = authed.iter().collect();
-                        sorted.sort_by_key(|(id, _)| *id);
-                        let count = sorted.len();
-                        for (id, client) in sorted {
-                            let connected = format_duration_short(client.connected_at.elapsed());
-                            let idle = format_duration_short(client.last_activity.elapsed());
-                            let ctype = format!("{:?}", client.client_type);
-                            let user = client.username.as_deref().unwrap_or("");
-                            lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
-                                id, client.ip_address, ctype, connected, idle, user));
-                        }
-                        lines.push("─".repeat(75));
-                        lines.push(format!("{} client(s). Use /remote --kill <ID> to disconnect.", count));
-                        lines
-                    }
-                } else {
-                    vec!["Could not read client list (busy).".to_string()]
-                }
-            } else {
-                vec!["WebSocket server is not running.".to_string()]
-            };
-            for line in lines {
-                app.add_output(&line);
-            }
+            // requesting_client_id 0 = console (results displayed via add_output in RemoteListResult handler)
+            spawn_remote_ping_check(app, event_tx.clone(), 0, app.current_world_index);
         }
         Command::RemoteKill { client_id } => {
             let msg = if let Some(ref ws_server) = app.ws_server {
@@ -21670,24 +21806,36 @@ fn render_output_crossterm(app: &App) {
     let input_area_width = term_width.max(1);
 
     if viewport_line < app.input_height as usize {
-        // Use display width for cursor positioning (handles zero-width chars)
-        let width_before_cursor = display_width(&app.input.buffer[..app.input.cursor_position]);
-
-        // Calculate cursor column - must match cursor_line() logic exactly
+        // Calculate cursor column accounting for newlines in the buffer
         let first_line_capacity = input_area_width.saturating_sub(prompt_len);
-        let cursor_col = if first_line_capacity == 0 {
-            // Prompt fills entire line
-            width_before_cursor % input_area_width
-        } else if width_before_cursor < first_line_capacity {
-            // On first line - add prompt offset if viewport shows it
-            if app.input.viewport_start_line == 0 {
-                width_before_cursor + prompt_len
-            } else {
-                width_before_cursor
+        let text_before_cursor = &app.input.buffer[..app.input.cursor_position];
+
+        let mut col_width = 0usize;
+        let mut is_first_line = true;
+
+        for c in text_before_cursor.chars() {
+            if c == '\n' {
+                col_width = 0;
+                is_first_line = false;
+                continue;
             }
+            let cw = display_width(&c.to_string());
+            let capacity = if is_first_line { first_line_capacity } else { input_area_width };
+            col_width += cw;
+            if capacity > 0 && col_width >= capacity {
+                if col_width == capacity {
+                    col_width = 0;
+                } else {
+                    col_width = cw;
+                }
+                is_first_line = false;
+            }
+        }
+
+        let cursor_col = if is_first_line && app.input.viewport_start_line == 0 {
+            col_width + prompt_len
         } else {
-            // Past first line - get remainder within the line
-            (width_before_cursor - first_line_capacity) % input_area_width
+            col_width
         };
 
         let cursor_x = cursor_col as u16;
@@ -22352,30 +22500,54 @@ fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
 
     if viewport_line < app.input_height as usize {
         let inner_width = area.width.max(1) as usize;
-        // Use display width for cursor positioning (handles zero-width chars)
-        let width_before_cursor = display_width(&app.input.buffer[..app.input.cursor_position]);
-
-        // Calculate cursor column - must match cursor_line() logic exactly
         let first_line_capacity = inner_width.saturating_sub(prompt_len);
-        let cursor_col = if first_line_capacity == 0 {
-            // Prompt fills entire line
-            width_before_cursor % inner_width
-        } else if width_before_cursor < first_line_capacity {
-            // On first line - add prompt offset if viewport shows it
-            if app.input.viewport_start_line == 0 {
-                width_before_cursor + prompt_len
-            } else {
-                width_before_cursor
+        let text_before_cursor = &app.input.buffer[..app.input.cursor_position];
+
+        let mut col_width = 0usize;
+        let mut is_first_line = true;
+
+        for c in text_before_cursor.chars() {
+            if c == '\n' {
+                col_width = 0;
+                is_first_line = false;
+                continue;
             }
+            let cw = display_width(&c.to_string());
+            let capacity = if is_first_line { first_line_capacity } else { inner_width };
+            col_width += cw;
+            if capacity > 0 && col_width >= capacity {
+                if col_width == capacity {
+                    col_width = 0;
+                } else {
+                    col_width = cw;
+                }
+                is_first_line = false;
+            }
+        }
+
+        let cursor_col = if is_first_line && app.input.viewport_start_line == 0 {
+            col_width + prompt_len
         } else {
-            // Past first line - get remainder within the line
-            (width_before_cursor - first_line_capacity) % inner_width
+            col_width
         };
 
         let cursor_x = area.x + cursor_col as u16;
         // Calculate visual line within viewport
         let cursor_y = area.y + viewport_line as u16;
         f.set_cursor(cursor_x, cursor_y.min(area.y + area.height - 1));
+    }
+}
+
+/// Like chars_for_display_width but also breaks at '\n'.
+/// Returns (chars_count, has_newline). If has_newline is true, the caller should
+/// skip the newline character after advancing by chars_count.
+fn chars_for_line(chars: &[char], width: usize) -> (usize, bool) {
+    // Check for newline before the width-based wrap point
+    let (wrap_count, _) = chars_for_display_width(chars, width);
+    if let Some(nl_pos) = chars[..wrap_count].iter().position(|&c| c == '\n') {
+        (nl_pos, true)
+    } else {
+        (wrap_count, false)
     }
 }
 
@@ -22436,7 +22608,7 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
         if remaining_width > 0 && !chars.is_empty() {
             // Add user input to the same line as prompt
             // Use display width to determine how many chars fit
-            let (input_chars_on_first_line, _) = chars_for_display_width(&chars, remaining_width);
+            let (input_chars_on_first_line, first_line_has_nl) = chars_for_line(&chars, remaining_width);
             let first_input: String = chars[..input_chars_on_first_line].iter().collect();
 
             // Get the last line (which has the prompt) and append user input
@@ -22477,9 +22649,12 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
 
             // Now handle remaining input on subsequent lines
             let mut char_pos = input_chars_on_first_line;
+            // Skip newline char from first line if present
+            if first_line_has_nl && char_pos < chars.len() && chars[char_pos] == '\n' {
+                char_pos += 1;
+            }
             while char_pos < chars.len() && lines.len() < app.input_height as usize {
-                // Use display width to determine how many chars fit on this line
-                let (chars_on_line, _) = chars_for_display_width(&chars[char_pos..], width);
+                let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
                 let line_end = char_pos + chars_on_line;
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 let mut current_pos = char_pos;
@@ -22522,25 +22697,30 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                     lines.push(Line::from(spans));
                 }
                 char_pos = line_end;
+                // Skip the newline character
+                if has_nl && char_pos < chars.len() && chars[char_pos] == '\n' {
+                    char_pos += 1;
+                }
             }
         } else if remaining_width == 0 {
             // Prompt fills the line exactly, user input starts on next line
             let mut char_pos = 0;
             while char_pos < chars.len() && lines.len() < app.input_height as usize {
-                // Use display width to determine how many chars fit on this line
-                let (chars_on_line, _) = chars_for_display_width(&chars[char_pos..], width);
+                let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
                 let line_end = char_pos + chars_on_line;
                 let text: String = chars[char_pos..line_end].iter().collect();
                 lines.push(Line::from(text));
                 char_pos = line_end;
+                if has_nl && char_pos < chars.len() && chars[char_pos] == '\n' {
+                    char_pos += 1;
+                }
             }
         }
     } else if app.input.viewport_start_line == 0 && prompt.is_empty() {
         // No prompt, just render user input
         let mut char_pos = 0;
         while char_pos < chars.len() && lines.len() < app.input_height as usize {
-            // Use display width to determine how many chars fit on this line
-            let (chars_on_line, _) = chars_for_display_width(&chars[char_pos..], width);
+            let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
             let line_end = char_pos + chars_on_line;
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut current_pos = char_pos;
@@ -22583,6 +22763,9 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                 lines.push(Line::from(spans));
             }
             char_pos = line_end;
+            if has_nl && char_pos < chars.len() && chars[char_pos] == '\n' {
+                char_pos += 1;
+            }
         }
     } else {
         // Scrolled down, don't show prompt
@@ -22597,13 +22780,15 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
             }
             // First line has reduced width due to prompt, subsequent lines have full width
             let line_width = if line_idx == 0 { first_line_width } else { width };
-            let (chars_on_line, _) = chars_for_display_width(&chars[start_char..], line_width);
+            let (chars_on_line, has_nl) = chars_for_line(&chars[start_char..], line_width);
             start_char += chars_on_line.max(1); // Ensure progress even with weird chars
+            if has_nl && start_char < chars.len() && chars[start_char] == '\n' {
+                start_char += 1;
+            }
         }
         let mut char_pos = start_char;
         while char_pos < chars.len() && lines.len() < app.input_height as usize {
-            // Use display width to determine how many chars fit on this line
-            let (chars_on_line, _) = chars_for_display_width(&chars[char_pos..], width);
+            let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
             let line_end = char_pos + chars_on_line;
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut current_pos = char_pos;
@@ -22646,6 +22831,9 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                 lines.push(Line::from(spans));
             }
             char_pos = line_end;
+            if has_nl && char_pos < chars.len() && chars[char_pos] == '\n' {
+                char_pos += 1;
+            }
         }
     }
 

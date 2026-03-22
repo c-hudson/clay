@@ -67,26 +67,41 @@ impl InputArea {
         if self.width == 0 {
             return 0;
         }
-        // Use display width instead of character count (handles zero-width chars)
-        let width_before = display_width(&self.buffer[..self.cursor_position]);
         let width = self.width as usize;
-
-        // Account for prompt taking up space on the first line
-        // First line capacity is reduced by prompt_len
         let first_line_capacity = width.saturating_sub(self.prompt_len);
+        let text_before_cursor = &self.buffer[..self.cursor_position];
 
-        if first_line_capacity == 0 {
-            // Prompt fills entire first line, so all input is on subsequent lines
-            // Add 1 for the prompt line, then calculate remaining lines
-            1 + width_before / width
-        } else if width_before < first_line_capacity {
-            // Still on first line
-            0
-        } else {
-            // Past first line: subtract first line display width, then divide by width
-            let remaining_width = width_before - first_line_capacity;
-            1 + remaining_width / width
+        // Walk through lines, splitting at newlines and width-based wraps
+        let mut line = 0;
+        let mut col_width = 0; // display width consumed on current line
+        let mut is_first_line = true;
+
+        for c in text_before_cursor.chars() {
+            if c == '\n' {
+                line += 1;
+                col_width = 0;
+                is_first_line = false;
+                continue;
+            }
+            let cw = display_width(&c.to_string());
+            let capacity = if is_first_line { first_line_capacity } else { width };
+            col_width += cw;
+            if capacity > 0 && col_width >= capacity {
+                // Line is full — if exactly full, cursor wraps to next line
+                // (col_width resets so next char starts fresh)
+                if col_width == capacity {
+                    line += 1;
+                    col_width = 0;
+                    is_first_line = false;
+                } else {
+                    // Overflows — char itself is on next line
+                    line += 1;
+                    col_width = cw;
+                    is_first_line = false;
+                }
+            }
         }
+        line
     }
 
     pub fn adjust_viewport(&mut self) {
@@ -358,62 +373,115 @@ impl InputArea {
         if self.width == 0 {
             return 0;
         }
-        let width_before = display_width(&self.buffer[..self.cursor_position]);
         let width = self.width as usize;
         let first_line_capacity = width.saturating_sub(self.prompt_len);
+        let text_before_cursor = &self.buffer[..self.cursor_position];
 
-        if first_line_capacity == 0 {
-            // Prompt fills entire first line
-            width_before % width
-        } else if width_before < first_line_capacity {
-            // Still on first line
-            width_before
-        } else {
-            // Past first line
-            let remaining_width = width_before - first_line_capacity;
-            remaining_width % width
+        let mut col_width = 0usize;
+        let mut is_first_line = true;
+
+        for c in text_before_cursor.chars() {
+            if c == '\n' {
+                col_width = 0;
+                is_first_line = false;
+                continue;
+            }
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            let capacity = if is_first_line { first_line_capacity } else { width };
+            col_width += cw;
+            if capacity > 0 && col_width >= capacity {
+                if col_width == capacity {
+                    col_width = 0;
+                } else {
+                    col_width = cw;
+                }
+                is_first_line = false;
+            }
         }
+        col_width
+    }
+
+    /// Build a map of (line_index -> byte_offset_of_line_start) for the buffer,
+    /// accounting for both newlines and width-based wrapping.
+    fn line_starts(&self) -> Vec<usize> {
+        let width = self.width as usize;
+        let first_line_capacity = width.saturating_sub(self.prompt_len);
+        let mut starts = vec![0usize]; // line 0 starts at byte 0
+        let mut col_width = 0usize;
+        let mut is_first_line = true;
+        let mut byte_pos = 0;
+
+        for c in self.buffer.chars() {
+            if c == '\n' {
+                byte_pos += c.len_utf8();
+                starts.push(byte_pos);
+                col_width = 0;
+                is_first_line = false;
+                continue;
+            }
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            let capacity = if is_first_line { first_line_capacity } else { width };
+            col_width += cw;
+            if capacity > 0 && col_width >= capacity {
+                byte_pos += c.len_utf8();
+                if col_width == capacity {
+                    // Exact fill — next char starts a new line
+                    starts.push(byte_pos);
+                    col_width = 0;
+                } else {
+                    // Overflow — this char starts a new line
+                    starts.push(byte_pos - c.len_utf8());
+                    col_width = cw;
+                }
+                is_first_line = false;
+                continue;
+            }
+            byte_pos += c.len_utf8();
+        }
+        starts
     }
 
     /// Move cursor up one line, maintaining column position if possible
     pub fn move_cursor_up(&mut self) {
         let current_line = self.cursor_line();
         if current_line == 0 {
-            // Already on first line, move to start
             self.cursor_position = 0;
             self.adjust_viewport();
             return;
         }
 
         let current_col = self.cursor_column();
-        let width = self.width as usize;
-        let first_line_capacity = width.saturating_sub(self.prompt_len);
+        let starts = self.line_starts();
+        let target_line = current_line - 1;
 
-        // Calculate target display-width offset from start of buffer
-        let target_display_width = if current_line == 1 {
-            // Moving to first line (which has prompt) - maintain screen column
-            // current_col is screen column on line 1 (no prompt), so subtract
-            // prompt_len to get the text column on line 0
-            let target_text_col = current_col.saturating_sub(self.prompt_len);
-            target_text_col.min(first_line_capacity.saturating_sub(1))
+        // Target column: maintain screen column, adjusted for prompt on first line
+        let target_col = if target_line == 0 {
+            // Moving to first line — current_col might include prompt offset visually,
+            // but cursor_column returns text column without prompt
+            current_col.min(self.prompt_len + current_col).saturating_sub(self.prompt_len)
         } else {
-            // Moving to a non-first line
-            let width_before_target_line = first_line_capacity + (current_line - 2) * width;
-            width_before_target_line + current_col.min(width - 1)
+            current_col
         };
 
-        // Convert display-width position to byte position
-        let mut accumulated_width = 0;
-        let mut byte_pos = 0;
-        for c in self.buffer.chars() {
-            let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
-            if accumulated_width + char_width > target_display_width {
-                break;
+        if target_line < starts.len() {
+            let line_start = starts[target_line];
+            // Walk from line_start to find the byte position at target_col display width
+            let mut col = 0;
+            let mut pos = line_start;
+            for c in self.buffer[line_start..].chars() {
+                if c == '\n' { break; }
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if col + cw > target_col { break; }
+                col += cw;
+                pos += c.len_utf8();
+                // Stop at line boundary (next line start)
+                if target_line + 1 < starts.len() && pos >= starts[target_line + 1] {
+                    pos = starts[target_line + 1];
+                    break;
+                }
             }
-            accumulated_width += char_width;
-            byte_pos += c.len_utf8();
+            self.cursor_position = pos.min(self.buffer.len());
         }
-        self.cursor_position = byte_pos.min(self.buffer.len());
         self.adjust_viewport();
     }
 
@@ -421,50 +489,44 @@ impl InputArea {
     pub fn move_cursor_down(&mut self) {
         let current_line = self.cursor_line();
         let current_col = self.cursor_column();
-        let width = self.width as usize;
-        let first_line_capacity = width.saturating_sub(self.prompt_len);
-        let total_display_width = display_width(&self.buffer);
-
-        // Calculate total lines using display width
-        let total_lines = if first_line_capacity == 0 {
-            1 + total_display_width.div_ceil(width)
-        } else if total_display_width <= first_line_capacity {
-            1
-        } else {
-            1 + (total_display_width - first_line_capacity).div_ceil(width)
-        };
+        let starts = self.line_starts();
+        let total_lines = starts.len();
 
         if current_line >= total_lines.saturating_sub(1) {
-            // Already on last line, move to end
             self.cursor_position = self.buffer.len();
             self.adjust_viewport();
             return;
         }
 
-        // Calculate target display-width offset on next line
-        let target_display_width = if current_line == 0 {
-            // Moving from first line to second line - maintain screen column
-            // current_col is text column on line 0, screen column is prompt_len + current_col
+        let target_line = current_line + 1;
+        // Maintain column position
+        let target_col = if current_line == 0 {
+            // Moving from first line — screen column includes prompt,
+            // but on subsequent lines there's no prompt offset
             let screen_col = self.prompt_len + current_col;
-            first_line_capacity + screen_col.min(width - 1)
+            screen_col.min(self.width as usize - 1)
         } else {
-            // Moving from non-first line to next line
-            let width_before_next_line = first_line_capacity + current_line * width;
-            width_before_next_line + current_col.min(width - 1)
+            current_col
         };
 
-        // Convert display-width position to byte position, clamping to buffer length
-        let mut accumulated_width = 0;
-        let mut byte_pos = 0;
-        for c in self.buffer.chars() {
-            let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
-            if accumulated_width + char_width > target_display_width {
-                break;
+        if target_line < starts.len() {
+            let line_start = starts[target_line];
+            let mut col = 0;
+            let mut pos = line_start;
+            for c in self.buffer[line_start..].chars() {
+                if c == '\n' { break; }
+                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                if col + cw > target_col { break; }
+                col += cw;
+                pos += c.len_utf8();
+                // Stop at line boundary
+                if target_line + 1 < starts.len() && pos >= starts[target_line + 1] {
+                    pos = starts[target_line + 1];
+                    break;
+                }
             }
-            accumulated_width += char_width;
-            byte_pos += c.len_utf8();
+            self.cursor_position = pos.min(self.buffer.len());
         }
-        self.cursor_position = byte_pos.min(self.buffer.len());
         self.adjust_viewport();
     }
 

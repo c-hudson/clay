@@ -78,7 +78,7 @@ fn is_tf_command_name(cmd: &str) -> bool {
         "fg" | "trigger" | "input" | "grab" | "gag" | "ungag" | "exit" | "shift" | "bamf" |
         // These are also TF commands (mapped to Clay equivalents)
         "quit" | "dc" | "disconnect" | "world" | "listworlds" |
-        "listsockets" | "connections" | "connect" | "addworld" | "version" |
+        "listsockets" | "connections" | "addworld" | "version" |
         // Note: "send" maps to Clay's /send command, but TF's /send has different options
         // so we route it through TF to handle -w flag properly
         "send"
@@ -248,7 +248,6 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "world" => cmd_world(args),
         "listworlds" => cmd_listworlds(engine, args),
         "listsockets" | "connections" => TfCommandResult::ClayCommand("/connections".to_string()),
-        "connect" => cmd_connect(args),
         "addworld" => cmd_addworld(args),
 
         // Info commands
@@ -788,19 +787,6 @@ fn cmd_world(args: &str) -> TfCommandResult {
         TfCommandResult::ClayCommand("/worlds".to_string())
     } else {
         // Connect/switch to named world
-        TfCommandResult::ClayCommand(format!("/worlds {}", name))
-    }
-}
-
-/// /connect [world] - Connect to a world
-fn cmd_connect(args: &str) -> TfCommandResult {
-    let name = args.trim();
-
-    if name.is_empty() {
-        // Connect current world
-        TfCommandResult::ClayCommand("/connect".to_string())
-    } else {
-        // Connect named world
         TfCommandResult::ClayCommand(format!("/worlds {}", name))
     }
 }

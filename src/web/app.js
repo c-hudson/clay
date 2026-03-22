@@ -2239,6 +2239,11 @@
                 }
                 break;
 
+            case 'PingCheck':
+                // Server liveness check for /remote command - respond immediately
+                send({ type: 'PongCheck', nonce: msg.nonce || 0 });
+                break;
+
             case 'ActionsUpdated':
                 actions = msg.actions || [];
                 if (actionsListPopupOpen) {

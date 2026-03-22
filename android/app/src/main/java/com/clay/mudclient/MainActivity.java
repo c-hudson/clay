@@ -733,6 +733,7 @@ public class MainActivity extends AppCompatActivity {
         boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
 
         if (!advancedEnabled) {
+            android.util.Log.i("Clay", "resolveHostname: advanced mode disabled, using standard: " + standardHost);
             return standardHost;
         }
 
@@ -740,6 +741,7 @@ public class MainActivity extends AppCompatActivity {
         String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
 
         if (localNetmask.isEmpty() || remoteHostname.isEmpty()) {
+            android.util.Log.i("Clay", "resolveHostname: netmask or remote empty, using standard: " + standardHost);
             return standardHost;
         }
 
@@ -757,10 +759,41 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * Gets all non-loopback IPv4 addresses from all network interfaces.
+     * Gets IPv4 addresses from the active network only.
+     * Uses ConnectivityManager to avoid matching stale IPs from inactive interfaces
+     * (e.g. old WiFi IPs when on mobile data).
+     * Falls back to enumerating all interfaces on older Android versions.
      */
     private java.util.List<String> getDeviceIpAddresses() {
         java.util.List<String> addresses = new java.util.ArrayList<>();
+
+        // Try ConnectivityManager first (API 23+) for active network only
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            try {
+                android.net.ConnectivityManager cm = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    android.net.Network activeNetwork = cm.getActiveNetwork();
+                    if (activeNetwork != null) {
+                        android.net.LinkProperties lp = cm.getLinkProperties(activeNetwork);
+                        if (lp != null) {
+                            for (java.net.InetAddress addr : lp.getAddresses()) {
+                                if (addr instanceof java.net.Inet4Address && !addr.isLoopbackAddress()) {
+                                    addresses.add(addr.getHostAddress());
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!addresses.isEmpty()) {
+                    android.util.Log.i("Clay", "Active network IPs: " + addresses);
+                    return addresses;
+                }
+            } catch (Exception e) {
+                android.util.Log.w("Clay", "ConnectivityManager failed: " + e.getMessage());
+            }
+        }
+
+        // Fallback: enumerate all network interfaces
         try {
             java.util.Enumeration<java.net.NetworkInterface> interfaces = java.net.NetworkInterface.getNetworkInterfaces();
             while (interfaces != null && interfaces.hasMoreElements()) {
@@ -778,6 +811,7 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             android.util.Log.w("Clay", "Failed to enumerate network interfaces: " + e.getMessage());
         }
+        android.util.Log.i("Clay", "All interface IPs (fallback): " + addresses);
         return addresses;
     }
 

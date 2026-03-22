@@ -326,6 +326,21 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             }),
                         }
                     }
+                    AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
+                        app.remote_ping_responses = None;
+                        for line in &lines {
+                            app.ws_send_to_client(requesting_client_id, WsMessage::ServerData {
+                                world_index,
+                                data: line.clone(),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                                seq: 0,
+                                marked_new: false,
+                                flush: false, gagged: false,
+                            });
+                        }
+                    }
                     AppEvent::Sigusr1Received => {
                         #[cfg(all(unix, not(target_os = "android")))]
                         {
@@ -776,36 +791,7 @@ pub async fn handle_daemon_ws_message(
                     }
                 }
                 Command::Remote => {
-                    if let Some(ref ws_server) = app.ws_server {
-                        let output = if let Ok(clients) = ws_server.clients.try_read() {
-                            let authed: Vec<_> = clients.iter().filter(|(_, c)| c.authenticated).collect();
-                            if authed.is_empty() {
-                                "No remote clients connected.".to_string()
-                            } else {
-                                let mut lines = Vec::new();
-                                lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
-                                    "ID", "IP", "Type", "Connected", "Idle", "User"));
-                                let mut sorted: Vec<_> = authed.iter().collect();
-                                sorted.sort_by_key(|(id, _)| *id);
-                                for (id, client) in sorted {
-                                    let connected = format_duration_short(client.connected_at.elapsed());
-                                    let idle = format_duration_short(client.last_activity.elapsed());
-                                    let ctype = format!("{:?}", client.client_type);
-                                    let user = client.username.as_deref().unwrap_or("");
-                                    lines.push(format!("{:<8} {:<18} {:<10} {:<10} {:<10} {}",
-                                        id, client.ip_address, ctype, connected, idle, user));
-                                }
-                                lines.join("\n")
-                            }
-                        } else {
-                            "Could not read client list (busy).".to_string()
-                        };
-                        app.ws_broadcast(WsMessage::ServerData {
-                            world_index, data: output, is_viewed: false,
-                            ts: current_timestamp_secs(), from_server: false,
-                            seq: 0, marked_new: false, flush: false, gagged: false,
-                        });
-                    }
+                    spawn_remote_ping_check(app, event_tx.clone(), client_id, world_index);
                 }
                 Command::RemoteKill { client_id } => {
                     if let Some(ref ws_server) = app.ws_server {

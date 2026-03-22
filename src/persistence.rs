@@ -1293,7 +1293,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
 
     // Save output lines in a separate section (can be large)
     // Format: timestamp_secs|flags|seq|escaped_text
-    // Flags: s = from_server (omit if false), g = gagged (omit if false)
+    // Flags: s = from_server, g = gagged, n = marked_new (omit if false)
     for (idx, world) in app.worlds.iter().enumerate() {
         writeln!(file)?;
         writeln!(file, "[output:{}]", idx)?;
@@ -1302,6 +1302,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             let mut flags = String::new();
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
+            if line.marked_new { flags.push('n'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -1311,6 +1312,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             let mut flags = String::new();
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
+            if line.marked_new { flags.push('n'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -1431,7 +1433,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
     }
 
     // Parse a saved output/pending line with timestamp
-    // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged)
+    // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged, n=marked_new)
     // Older format: timestamp_secs|flags|text (flags: s=from_server, g=gagged) - seq=0
     // Old format: timestamp_secs|text (for backward compatibility) - seq=0
     fn parse_timestamped_line(line: &str) -> OutputLine {
@@ -1448,6 +1450,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     let text = unescape_string(parts[3]);
                     let from_server = flags.contains('s');
                     let gagged = flags.contains('g');
+                    let marked_new = flags.contains('n');
                     return OutputLine {
                         text,
                         timestamp,
@@ -1455,7 +1458,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         gagged,
                         seq,
                         highlight_color: None,
-                        marked_new: false,
+                        marked_new,
                     };
                 } else if parts.len() == 3 {
                     // Older format: timestamp|flags|text (no seq)
@@ -1896,6 +1899,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
     for tw in temp_worlds {
         let mut world = World::new(&tw.name);
         world.output_lines = tw.output_lines;
+        world.first_marked_new_index = world.output_lines.iter().position(|l| l.marked_new);
         world.scroll_offset = tw.scroll_offset;
         world.connected = tw.connected;
         world.unseen_lines = tw.unseen_lines;
