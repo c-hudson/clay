@@ -776,7 +776,8 @@ public class MainActivity extends AppCompatActivity {
                     if (activeNetwork != null) {
                         android.net.LinkProperties lp = cm.getLinkProperties(activeNetwork);
                         if (lp != null) {
-                            for (java.net.InetAddress addr : lp.getAddresses()) {
+                            for (android.net.LinkAddress la : lp.getLinkAddresses()) {
+                                java.net.InetAddress addr = la.getAddress();
                                 if (addr instanceof java.net.Inet4Address && !addr.isLoopbackAddress()) {
                                     addresses.add(addr.getHostAddress());
                                 }
