@@ -19316,7 +19316,7 @@ struct RemoteClientSnapshot {
     ctype: String,
     connected: String,
     idle: String,
-    user: String,
+    world: String,
 }
 
 /// Start an async /remote ping check: send PingCheck to all clients, wait 2s, build output.
@@ -19341,13 +19341,17 @@ fn spawn_remote_ping_check(
                 .collect();
             sorted.sort_by_key(|(id, _)| *id);
             for (&id, client) in &sorted {
+                let world_name = client.current_world
+                    .and_then(|wi| app.worlds.get(wi))
+                    .map(|w| w.name.clone())
+                    .unwrap_or_else(|| "-".to_string());
                 snapshots.push(RemoteClientSnapshot {
                     id,
                     ip: client.ip_address.clone(),
                     ctype: format!("{:?}", client.client_type),
                     connected: format_duration_short(client.connected_at.elapsed()),
                     idle: format_duration_short(client.last_activity.elapsed()),
-                    user: client.username.as_deref().unwrap_or("").to_string(),
+                    world: world_name,
                 });
             }
             // Send PingCheck to each authenticated client
@@ -19375,12 +19379,12 @@ fn spawn_remote_ping_check(
         let responded = responses.lock().unwrap().clone();
 
         let mut lines = Vec::new();
-        lines.push(format!("{:<6} {:<16} {:<8} {:<8} {:<6} {:<5} {}",
-            "ID", "IP", "Type", "Conn", "Idle", "Alive", "User"));
+        lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
+            "ID", "IP", "Type", "Conn", "Idle", "Live", "World"));
         for snap in &snapshots {
             let alive = if responded.contains(&snap.id) { "Yes" } else { "No" };
-            lines.push(format!("{:<6} {:<16} {:<8} {:<8} {:<6} {:<5} {}",
-                snap.id, snap.ip, snap.ctype, snap.connected, snap.idle, alive, snap.user));
+            lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
+                snap.id, snap.ip, snap.ctype, snap.connected, snap.idle, alive, snap.world));
         }
 
         let _ = event_tx.send(AppEvent::RemoteListResult(requesting_client_id, world_index, lines)).await;
