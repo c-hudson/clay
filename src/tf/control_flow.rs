@@ -812,6 +812,12 @@ fn execute_while_loop(engine: &mut TfEngine, condition: &str, body: &[String]) -
                     break;
                 }
             }
+            // Check for /return - propagate up
+            if matches!(result, TfCommandResult::Return(_)) {
+                results.push(result);
+                should_break = true;
+                break;
+            }
             results.push(result);
         }
 
@@ -986,6 +992,11 @@ fn execute_for_loop(
                     should_break = true;
                     break;
                 }
+            }
+            if matches!(result, TfCommandResult::Return(_)) {
+                results.push(result);
+                should_break = true;
+                break;
             }
             results.push(result);
         }
@@ -1436,6 +1447,11 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
                     should_break = true;
                     break;
                 }
+            }
+            if matches!(result, TfCommandResult::Return(_)) {
+                results.push(result);
+                should_break = true;
+                break;
             }
             results.push(result);
         }

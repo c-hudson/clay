@@ -292,6 +292,21 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public String getConnectionInfo() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            String localHost = prefs.getString(KEY_SERVER_HOST, "");
+            String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
+            int port = prefs.getInt(KEY_SERVER_PORT, 9000);
+            boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
+            boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
+            return "{\"localHost\":\"" + localHost.replace("\"", "") +
+                   "\",\"remoteHost\":\"" + remoteHost.replace("\"", "") +
+                   "\",\"port\":" + port +
+                   ",\"advancedEnabled\":" + advancedEnabled +
+                   ",\"useSecure\":" + useSecure + "}";
+        }
+
+        @JavascriptInterface
         public void reloadPage() {
             runOnUiThread(() -> {
                 // Close WebSocket connection

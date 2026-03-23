@@ -650,6 +650,13 @@ pub fn execute_macro(
             TfCommandResult::SendToMud(cmd.to_string())
         };
 
+        // Check for /return - stop executing body, set %? to return value
+        if let TfCommandResult::Return(ref val) = result {
+            let val_str = val.clone();
+            engine.set_global("?", TfValue::from(val_str.as_str()));
+            break;
+        }
+
         results.push(result);
     }
 

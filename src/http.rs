@@ -122,6 +122,39 @@ const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
 /// Embedded keybind editor HTML
 const WEB_KEYBIND_EDITOR_HTML: &str = include_str!("web/keybind-editor.html");
 
+/// Handle a plain HTTP connection on the HTTPS port by sending a redirect to HTTPS.
+/// Reads the HTTP request, extracts Host and path, and responds with 301.
+async fn redirect_http_to_https<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, port: u16) {
+    let mut buf = [0u8; 4096];
+    let n = match stream.read(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let path = parse_http_request(&request)
+        .map(|(_, p)| p)
+        .unwrap_or("/");
+    let host = get_host_from_request(&request);
+    let host = if host.is_empty() { "localhost".to_string() } else { host };
+    let location = if port == 443 {
+        format!("https://{}{}", host, path)
+    } else {
+        format!("https://{}:{}{}", host, port, path)
+    };
+    let body = format!("Redirecting to <a href=\"{loc}\">{loc}</a>", loc=location);
+    let response = format!(
+        "HTTP/1.1 301 Moved Permanently\r\n\
+         Location: {}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        location, body.len(), body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
 /// Parse an HTTP request line and return the method and path
 fn parse_http_request(request: &str) -> Option<(&str, &str)> {
     let first_line = request.lines().next()?;
@@ -399,6 +432,7 @@ pub async fn start_https_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
 
+    let server_port = server.port;
     let running = Arc::clone(&server.running);
     *running.write().await = true;
 
@@ -419,6 +453,17 @@ pub async fn start_https_server(
                             let ws_state = ws_state.clone();
                             let ban_list = ban_list.clone();
                             tokio::spawn(async move {
+                                // Peek first byte to detect plain HTTP vs TLS
+                                let mut peek = [0u8; 1];
+                                match stream.peek(&mut peek).await {
+                                    Ok(1) if peek[0] != 0x16 => {
+                                        // Not a TLS ClientHello — redirect HTTP to HTTPS
+                                        redirect_http_to_https(stream, server_port).await;
+                                        return;
+                                    }
+                                    Ok(0) | Err(_) => return,
+                                    _ => {}
+                                }
                                 match tls_acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
                                         route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, &ban_list, true).await;
@@ -531,6 +576,7 @@ pub async fn start_https_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
 
+    let server_port = server.port;
     let running = Arc::clone(&server.running);
     *running.write().await = true;
 
@@ -551,6 +597,17 @@ pub async fn start_https_server(
                             let ws_state = ws_state.clone();
                             let ban_list = ban_list.clone();
                             tokio::spawn(async move {
+                                // Peek first byte to detect plain HTTP vs TLS
+                                let mut peek = [0u8; 1];
+                                match stream.peek(&mut peek).await {
+                                    Ok(1) if peek[0] != 0x16 => {
+                                        // Not a TLS ClientHello — redirect HTTP to HTTPS
+                                        redirect_http_to_https(stream, server_port).await;
+                                        return;
+                                    }
+                                    Ok(0) | Err(_) => return,
+                                    _ => {}
+                                }
                                 match tls_acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
                                         route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, &ban_list, true).await;

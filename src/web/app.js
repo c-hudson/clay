@@ -991,6 +991,10 @@
     // Track if we should use native WebSocket (only after browser WebSocket fails)
     let useNativeWebSocket = false;
 
+    // Track alternate host for Android advanced mode (local/remote fallback)
+    let alternateHost = null;
+    let triedAlternateHost = false;
+
     // Debug logging - console only (no Toast)
     function debugLog(msg) {
         console.log('[Clay Debug] ' + msg);
@@ -1018,6 +1022,7 @@
             if (ws) ws.readyState = WebSocket.OPEN;
             connectionFailures = 0;
             triedWsFallback = false;
+            triedAlternateHost = false;
             hideCertWarning();
             showConnecting(false);
 
@@ -1151,6 +1156,29 @@
                 window.Android.stopBackgroundService();
             }
 
+            // Try alternate host (Android advanced mode) before giving up
+            if (connectionFailures >= 2 && !triedAlternateHost) {
+                triedAlternateHost = true;
+                if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
+                    try {
+                        const info = JSON.parse(window.Android.getConnectionInfo());
+                        if (info.advancedEnabled && info.remoteHost) {
+                            const currentHost = alternateHost || window.WS_HOST || window.location.hostname;
+                            const altHost = (currentHost === info.remoteHost) ? info.localHost : info.remoteHost;
+                            if (altHost && altHost !== currentHost) {
+                                console.log('Native WS failed on ' + currentHost + ', trying alternate: ' + altHost);
+                                alternateHost = altHost;
+                                connectionFailures = 0;
+                                setTimeout(connect, 500);
+                                return;
+                            }
+                        }
+                    } catch (e) {
+                        console.log('getConnectionInfo error: ' + e);
+                    }
+                }
+            }
+
             if (connectionFailures >= 2) {
                 showConnectionErrorModal();
             } else {
@@ -1231,8 +1259,8 @@
     function connect() {
         showConnecting(true);
 
-        // Use WS_HOST if available (needed for Android loadDataWithBaseURL), fallback to location
-        const host = window.WS_HOST || window.location.hostname;
+        // Use alternate host if we're in fallback mode, otherwise use WS_HOST
+        const host = alternateHost || window.WS_HOST || window.location.hostname;
         // Use ws:// fallback if we've already failed with wss://
         const protocol = usingWsFallback ? 'ws' : window.WS_PROTOCOL;
         // WS_PORT=0 means WS shares the HTTP port (unified server)
@@ -1282,6 +1310,7 @@
                 }
                 connectionFailures = 0;
                 triedWsFallback = false; // Reset for future reconnects
+                triedAlternateHost = false;
                 hideCertWarning();
                 showConnecting(false);
 
@@ -1411,7 +1440,34 @@
                     return;
                 }
 
-                // After 2 failures, show error modal instead of auto-reconnecting
+                // After 2 failures, try alternate host (Android advanced mode) before giving up
+                if (connectionFailures >= 2 && !triedAlternateHost) {
+                    triedAlternateHost = true;
+                    // Get alternate host from Android bridge
+                    if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
+                        try {
+                            const info = JSON.parse(window.Android.getConnectionInfo());
+                            if (info.advancedEnabled && info.remoteHost) {
+                                const currentHost = window.WS_HOST || window.location.hostname;
+                                // Switch to whichever host we're NOT currently using
+                                const altHost = (currentHost === info.remoteHost) ? info.localHost : info.remoteHost;
+                                if (altHost && altHost !== currentHost) {
+                                    console.log('Connection failed on ' + currentHost + ', trying alternate: ' + altHost);
+                                    alternateHost = altHost;
+                                    connectionFailures = 0;
+                                    triedWsFallback = false;
+                                    usingWsFallback = false;
+                                    useNativeWebSocket = false;
+                                    setTimeout(connect, 500);
+                                    return;
+                                }
+                            }
+                        } catch (e) {
+                            console.log('getConnectionInfo error: ' + e);
+                        }
+                    }
+                }
+
                 if (connectionFailures >= 2) {
                     // If using wss://, show certificate warning
                     if (window.WS_PROTOCOL === 'wss' && !usingWsFallback && !usingNativeWebSocket) {
@@ -7839,6 +7895,9 @@
             // Keep using ws:// fallback if it worked, otherwise reset to try wss:// again
             // (user can refresh page to fully reset)
             triedWsFallback = false;
+            // Reset alternate host state so retry starts fresh
+            alternateHost = null;
+            triedAlternateHost = false;
             connect();
         };
         elements.connectionCancelBtn.onclick = function() {
@@ -7856,6 +7915,8 @@
             // Reconnect and resend the command after authentication
             connectionFailures = 0;
             triedWsFallback = false;
+            alternateHost = null;
+            triedAlternateHost = false;
             connect();
         };
         elements.reconnectCancelBtn.onclick = function() {

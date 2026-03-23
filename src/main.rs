@@ -910,6 +910,33 @@ fn process_triggers(
     result
 }
 
+/// Strip ANSI escape sequences from a line for watchdog/watchname comparison
+fn strip_ansi_for_watchdog(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_escape = false;
+    let mut in_csi = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+            in_csi = false;
+        } else if in_escape && !in_csi {
+            if c == '[' {
+                in_csi = true;
+            } else {
+                in_escape = false;
+            }
+        } else if in_csi {
+            if ('@'..='~').contains(&c) {
+                in_escape = false;
+                in_csi = false;
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Convert a wildcard filter pattern to regex for F4 filter popup.
 /// Always uses "contains" semantics - patterns match anywhere in the line.
 /// Supports \* and \? to match literal asterisk and question mark.
@@ -2126,6 +2153,8 @@ pub struct World {
     pub max_received_seq: u64,       // Highest seq received from server (remote console dedup)
     pub first_marked_new_index: Option<usize>, // Index of first marked_new line in output_lines (for fast clear)
     pub visual_line_offset: usize, // When > 0, show only first N visual lines of scroll_offset line (partial display for more-mode)
+    pub watchdog_history: std::collections::VecDeque<String>,  // Rolling window of recent lines (stripped) for /watchdog
+    pub watchname_history: std::collections::VecDeque<String>, // Rolling window of first-words for /watchname
 }
 
 impl World {
@@ -2199,6 +2228,8 @@ impl World {
             max_received_seq: 0,
             first_marked_new_index: None,
             visual_line_offset: 0,
+            watchdog_history: std::collections::VecDeque::new(),
+            watchname_history: std::collections::VecDeque::new(),
         }
     }
 
@@ -3075,6 +3106,7 @@ impl App {
         };
 
         // Build world info cache
+        let now = std::time::Instant::now();
         self.tf_engine.world_info_cache.clear();
         for world in &self.worlds {
             self.tf_engine.world_info_cache.push(tf::WorldInfoCache {
@@ -3085,6 +3117,9 @@ impl App {
                 password: world.settings.password.clone(),
                 is_connected: world.connected,
                 use_ssl: world.settings.use_ssl,
+                unseen_lines: world.unseen_lines,
+                last_receive_secs_ago: world.last_receive_time.map(|t| now.duration_since(t).as_secs() as i64),
+                last_send_secs_ago: world.last_send_time.map(|t| now.duration_since(t).as_secs() as i64),
             });
         }
 
@@ -4874,11 +4909,46 @@ impl App {
                 self.worlds[world_idx].trigger_partial_line = line.to_string();
                 has_partial = true;
             } else {
+                // Watchdog/watchname spam detection (before triggers)
+                let mut watchdog_gagged = false;
+                let stripped = strip_ansi_for_watchdog(line);
+                if self.tf_engine.watchdog_enabled {
+                    let n1 = self.tf_engine.watchdog_n1;
+                    let n2 = self.tf_engine.watchdog_n2;
+                    let count = self.worlds[world_idx].watchdog_history.iter()
+                        .filter(|h| *h == &stripped)
+                        .count();
+                    if count >= n1 {
+                        watchdog_gagged = true;
+                    }
+                    self.worlds[world_idx].watchdog_history.push_back(stripped.clone());
+                    while self.worlds[world_idx].watchdog_history.len() > n2 {
+                        self.worlds[world_idx].watchdog_history.pop_front();
+                    }
+                }
+                if self.tf_engine.watchname_enabled {
+                    let n1 = self.tf_engine.watchname_n1;
+                    let n2 = self.tf_engine.watchname_n2;
+                    let first_word = stripped.split_whitespace().next().unwrap_or("").to_string();
+                    if !first_word.is_empty() {
+                        let count = self.worlds[world_idx].watchname_history.iter()
+                            .filter(|h| *h == &first_word)
+                            .count();
+                        if count >= n1 {
+                            watchdog_gagged = true;
+                        }
+                    }
+                    self.worlds[world_idx].watchname_history.push_back(first_word);
+                    while self.worlds[world_idx].watchname_history.len() > n2 {
+                        self.worlds[world_idx].watchname_history.pop_front();
+                    }
+                }
+
                 let tr = process_triggers(line, &world_name_for_triggers, &actions, &mut self.tf_engine);
                 commands_to_execute.extend(tr.send_commands);
                 tf_commands_to_execute.extend(tr.clay_commands);
                 tf_messages.extend(tr.messages);
-                processed_lines.push((line, tr.is_gagged, tr.highlight_color));
+                processed_lines.push((line, tr.is_gagged || watchdog_gagged, tr.highlight_color));
             }
         }
 
@@ -15421,6 +15491,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     tf::TfCommandResult::ExitLoad => {
                                         // ExitLoad from command line means nothing (not in a file load)
                                         // This shouldn't normally happen since cmd_exit checks loading_files
+                                    }
+                                    tf::TfCommandResult::Return(_) => {
+                                        // Return outside of macro execution - no-op
                                     }
                                 }
                                 // Process any pending world operations from TF functions like addworld()

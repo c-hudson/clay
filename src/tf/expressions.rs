@@ -1713,12 +1713,21 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Integer(if exists { 1 } else { 0 }))
             }
 
-            // nactive() - count active (connected) worlds
+            // nactive([world]) - count active worlds, or unseen lines for named world
             "nactive" => {
-                let count = self.engine.world_info_cache.iter()
-                    .filter(|w| w.is_connected)
-                    .count();
-                Ok(TfValue::Integer(count as i64))
+                if args.is_empty() {
+                    let count = self.engine.world_info_cache.iter()
+                        .filter(|w| w.is_connected)
+                        .count();
+                    Ok(TfValue::Integer(count as i64))
+                } else {
+                    let name = self.eval(&args[0])?.to_string_value();
+                    let unseen = self.engine.world_info_cache.iter()
+                        .find(|w| w.name.eq_ignore_ascii_case(&name))
+                        .map(|w| w.unseen_lines as i64)
+                        .unwrap_or(-1);
+                    Ok(TfValue::Integer(unseen))
+                }
             }
 
             // nworlds() - count total worlds
@@ -1757,14 +1766,38 @@ impl<'a> Evaluator<'a> {
                 }
             }
 
-            // idle() - seconds since last user input (not tracked, return 0)
+            // idle([world]) - seconds since last text received on world
             "idle" => {
-                Ok(TfValue::Integer(0))
+                if args.is_empty() {
+                    let secs = self.engine.world_info_cache.iter()
+                        .find(|w| Some(&w.name) == self.engine.current_world.as_ref())
+                        .and_then(|w| w.last_receive_secs_ago)
+                        .unwrap_or(0);
+                    Ok(TfValue::Integer(secs))
+                } else {
+                    let name = self.eval(&args[0])?.to_string_value();
+                    let secs = self.engine.world_info_cache.iter()
+                        .find(|w| w.name.eq_ignore_ascii_case(&name))
+                        .and_then(|w| w.last_receive_secs_ago);
+                    Ok(TfValue::Integer(secs.unwrap_or(-1)))
+                }
             }
 
-            // sidle() - seconds since last send to server (not tracked, return 0)
+            // sidle([world]) - seconds since last text sent to world
             "sidle" => {
-                Ok(TfValue::Integer(0))
+                if args.is_empty() {
+                    let secs = self.engine.world_info_cache.iter()
+                        .find(|w| Some(&w.name) == self.engine.current_world.as_ref())
+                        .and_then(|w| w.last_send_secs_ago)
+                        .unwrap_or(0);
+                    Ok(TfValue::Integer(secs))
+                } else {
+                    let name = self.eval(&args[0])?.to_string_value();
+                    let secs = self.engine.world_info_cache.iter()
+                        .find(|w| w.name.eq_ignore_ascii_case(&name))
+                        .and_then(|w| w.last_send_secs_ago);
+                    Ok(TfValue::Integer(secs.unwrap_or(-1)))
+                }
             }
 
             // columns() - number of columns on screen
@@ -2248,12 +2281,15 @@ impl<'a> Evaluator<'a> {
                 }
             }
 
-            // tfflush(handle) - flush file (returns 1 on success, 0 on failure)
+            // tfflush(handle [,autoflush]) - flush file (returns 1 on success, 0 on failure)
+            // 2nd arg controls auto-flushing (no-op in our implementation)
             "tfflush" => {
-                if args.len() != 1 {
-                    return Err("tfflush requires 1 argument (handle)".to_string());
+                if args.is_empty() || args.len() > 2 {
+                    return Err("tfflush requires 1 or 2 arguments (handle [,autoflush])".to_string());
                 }
                 let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
+
+                // 2nd arg (autoflush on/off) is accepted but ignored - we always flush immediately
 
                 // Flush the stored file handle
                 match self.engine.open_files.get_mut(&handle) {
@@ -2312,6 +2348,7 @@ impl<'a> Evaluator<'a> {
             }
 
             // send(s [,world [,flags]]) - function form of /send
+            // flags: 0 or "off" = don't append EOL
             // Returns 1 on success
             "send" => {
                 if args.is_empty() {
@@ -2324,11 +2361,16 @@ impl<'a> Evaluator<'a> {
                 } else {
                     None
                 };
-                // flags argument is ignored in our implementation
+                let no_eol = if args.len() > 2 {
+                    let f = self.eval(&args[2])?.to_string_value();
+                    f == "0" || f.eq_ignore_ascii_case("off")
+                } else {
+                    false
+                };
                 self.engine.pending_commands.push(super::TfCommand {
                     command: text,
                     world,
-                    no_eol: false,
+                    no_eol,
                 });
                 Ok(TfValue::Integer(1))
             }
@@ -2386,7 +2428,79 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::String(result))
             }
 
-            _ => Err(format!("Unknown function: {}", name)),
+            // tr(domain, range, string) - translate characters
+            "tr" => {
+                if args.len() != 3 {
+                    return Err("tr requires 3 arguments (domain, range, string)".to_string());
+                }
+                let domain_str = self.eval(&args[0])?.to_string_value();
+                let range_str = self.eval(&args[1])?.to_string_value();
+                let string = self.eval(&args[2])?.to_string_value();
+                let domain: Vec<char> = domain_str.chars().collect();
+                let range: Vec<char> = range_str.chars().collect();
+                Ok(TfValue::String(super::builtins::tr_translate(&domain, &range, &string)))
+            }
+
+            // read() - obsolete, use tfread() instead
+            "read" => {
+                Err("read() is obsolete. Use tfread() instead.".to_string())
+            }
+
+            _ => {
+                // Try calling as a user-defined macro
+                let macro_def = self.engine.macros.iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(name))
+                    .cloned();
+                if let Some(macro_def) = macro_def {
+                    // Evaluate all args to strings for positional params
+                    let mut arg_strs: Vec<String> = Vec::new();
+                    for arg in args {
+                        arg_strs.push(self.eval(arg)?.to_string_value());
+                    }
+                    let arg_refs: Vec<&str> = arg_strs.iter().map(|s| s.as_str()).collect();
+                    let results = super::macros::execute_macro(self.engine, &macro_def, &arg_refs, None);
+                    // Process results: collect messages, handle Return
+                    let mut return_val = None;
+                    for result in &results {
+                        match result {
+                            super::TfCommandResult::Return(val) => {
+                                return_val = Some(TfValue::from(val.as_str()));
+                            }
+                            super::TfCommandResult::Error(e) => {
+                                self.engine.set_global("?", TfValue::Integer(0));
+                                return Err(e.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(val) = return_val {
+                        self.engine.set_global("?", val.clone());
+                        Ok(val)
+                    } else {
+                        Ok(self.engine.get_var("?").cloned().unwrap_or(TfValue::Integer(1)))
+                    }
+                } else if super::parser::is_tf_command_name(name) {
+                    // Try calling as a builtin command
+                    let mut arg_strs: Vec<String> = Vec::new();
+                    for arg in args {
+                        arg_strs.push(self.eval(arg)?.to_string_value());
+                    }
+                    let cmd = format!("/{} {}", name, arg_strs.join(" "));
+                    let result = self.engine.execute(&cmd);
+                    match result {
+                        super::TfCommandResult::Success(_) => {
+                            Ok(self.engine.get_var("?").cloned().unwrap_or(TfValue::Integer(1)))
+                        }
+                        super::TfCommandResult::Error(e) => {
+                            self.engine.set_global("?", TfValue::Integer(0));
+                            Err(e)
+                        }
+                        _ => Ok(TfValue::Integer(1))
+                    }
+                } else {
+                    Err(format!("Unknown function: {}", name))
+                }
+            }
         }
     }
 }

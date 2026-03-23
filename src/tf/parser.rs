@@ -65,7 +65,7 @@ pub fn is_tf_command(input: &str) -> bool {
 /// Check if a command name (without prefix) is a TF command
 /// Note: "help" is NOT included here because it has a Clay equivalent.
 /// Use /tfhelp for the TF version.
-fn is_tf_command_name(cmd: &str) -> bool {
+pub fn is_tf_command_name(cmd: &str) -> bool {
     matches!(cmd,
         "set" | "unset" | "let" | "setenv" | "listvar" |
         "echo" | "beep" | "quote" | "substitute" | "escape" | "hilite" | "nohilite" | "partial" | "export" |
@@ -81,7 +81,19 @@ fn is_tf_command_name(cmd: &str) -> bool {
         "listsockets" | "connections" | "addworld" | "version" |
         // Note: "send" maps to Clay's /send command, but TF's /send has different options
         // so we route it through TF to handle -w flag properly
-        "send"
+        "send" |
+        // Tier 1: Simple commands
+        "toggle" | "return" | "not" | "suspend" | "dokey" | "histsize" |
+        "localecho" | "sub" | "replace" | "tr" | "cat" | "paste" | "endpaste" |
+        // Tier 2: Trigger shortcuts
+        "trig" | "trigp" | "trigc" | "trigpc" | "untrig" |
+        // Tier 3: World management
+        "unworld" | "purgeworld" | "saveworld" |
+        // Tier 4: Spam detection
+        "watchdog" | "watchname" |
+        // Tier 5: Stubs
+        "telnet" | "finger" | "getfile" | "putfile" | "liststreams" |
+        "changes" | "tick" | "recordline" | "edit"
     )
 }
 
@@ -329,6 +341,47 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "input" => cmd_input(engine, args),
         "grab" => cmd_grab(args),
 
+        // Tier 1: Simple commands
+        "toggle" => builtins::cmd_toggle(engine, args),
+        "return" => builtins::cmd_return(engine, args),
+        "not" => builtins::cmd_not(engine, args),
+        "suspend" => builtins::cmd_suspend(),
+        "dokey" => builtins::cmd_dokey(engine, args),
+        "histsize" => builtins::cmd_histsize(engine, args),
+        "localecho" => builtins::cmd_localecho(engine, args),
+        "sub" => builtins::cmd_sub(engine, args),
+        "replace" => builtins::cmd_replace(engine, args),
+        "tr" => builtins::cmd_tr(engine, args),
+        "cat" => TfCommandResult::Success(Some("% /cat not supported in Clay. Use bracketed paste instead.".to_string())),
+        "paste" => TfCommandResult::Success(Some("% /paste not supported in Clay. Use bracketed paste instead.".to_string())),
+        "endpaste" => TfCommandResult::Success(None),
+
+        // Tier 2: Trigger shortcuts
+        "trig" => builtins::cmd_trig(engine, args),
+        "trigp" => builtins::cmd_trigp(engine, args),
+        "trigc" => builtins::cmd_trigc(engine, args),
+        "trigpc" => builtins::cmd_trigpc(engine, args),
+        "untrig" => builtins::cmd_untrig(engine, args),
+
+        // Tier 3: World management
+        "unworld" => builtins::cmd_unworld(args),
+        "purgeworld" => TfCommandResult::Success(Some("% /purgeworld: Use /worlds to manage worlds in Clay.".to_string())),
+        "saveworld" => TfCommandResult::Success(Some("% /saveworld: Worlds are auto-saved in Clay.".to_string())),
+
+        // Tier 4: Spam detection
+        "watchdog" => builtins::cmd_watchdog(engine, args),
+        "watchname" => builtins::cmd_watchname(engine, args),
+
+        // Tier 5: Stubs
+        "telnet" => TfCommandResult::Success(Some("% /telnet: Use /worlds to connect in Clay.".to_string())),
+        "finger" => TfCommandResult::Success(Some("% /finger: Command not available in Clay.".to_string())),
+        "getfile" | "putfile" => TfCommandResult::Success(Some("% File transfer not available in Clay.".to_string())),
+        "liststreams" => TfCommandResult::Success(Some("% /liststreams: Streams not available in Clay.".to_string())),
+        "changes" => TfCommandResult::Success(Some("% /changes: Not applicable in Clay. See /version.".to_string())),
+        "tick" => TfCommandResult::Success(Some("% /tick: Use /repeat for timed commands in Clay.".to_string())),
+        "recordline" => TfCommandResult::Success(Some("% /recordline: Not available in Clay.".to_string())),
+        "edit" => TfCommandResult::Success(Some("% /edit: Not available in Clay. Use the built-in input editor.".to_string())),
+
         // Check for user-defined macro with this name
         _ => {
             // Look for a macro with this name (case-insensitive)
@@ -369,6 +422,7 @@ fn aggregate_results_with_engine(engine: &mut super::TfEngine, results: Vec<TfCo
                 // Collect clay commands to return (first one wins)
                 pending_clay_commands.push(cmd);
             }
+            TfCommandResult::Return(_) => {} // Handled in execute_macro
             _ => {}
         }
     }
@@ -1008,6 +1062,8 @@ Expressions:
   /expr expression     - Evaluate and display result
   /test expression     - Evaluate expression, set %?
   /eval expression     - Evaluate and execute as command
+  /not expression      - Negate expression, set %?
+  /return [expr]       - Return from macro, set %?
 
 Control Flow:
   /if (expr) cmd       - Conditional execution
@@ -1021,10 +1077,16 @@ Macros/Triggers:
   /undef name          - Remove macro
   /list [pattern]      - List macros
   /purge [pattern]     - Remove all macros
+  /trig pattern=body   - Create trigger (glob mode)
+  /trigp pri pat=body  - Trigger with priority
+  /trigc chance pat=body - Trigger with probability
+  /trigpc pri ch pat=body - Trigger with priority+chance
+  /untrig pattern      - Remove trigger by pattern
 
 Hooks & Keys:
   /bind key=command    - Bind key to command
   /unbind key          - Remove key binding
+  /dokey name          - Simulate named edit key
 
 Output:
   /echo message        - Display message locally
@@ -1038,15 +1100,26 @@ Output:
   /gag [pattern]       - List gags, or suppress matching lines
   /ungag pattern       - Remove gag
   /recall [pattern]    - Search output history
+  /substitute text     - Replace current trigger line
 
 Variables:
   /export variable     - Export variable to environment
+  /toggle var          - Toggle variable between 0 and 1
+
+String:
+  /replace old new str - Replace occurrences in string
+  /tr domain range str - Translate characters
 
 World Management:
   /fg [name]           - Switch to or list worlds
   /connect [world]     - Connect to a world
   /addworld [opts] name [args] - Add/update world
   /dc, /disconnect     - Disconnect current world
+  /unworld name        - Remove world
+
+Spam Detection:
+  /watchdog [off|on|n1 [n2]] - Suppress duplicate lines
+  /watchname [off|on|n1 [n2]] - Suppress repeated names
 
 File Operations:
   /load [-q] filename  - Load TF script (-q = quiet)
@@ -1060,6 +1133,12 @@ Process:
   /repeat [opts] count cmd - Repeat command on timer
   /ps                  - List background processes
   /kill id             - Kill background process
+
+Settings:
+  /histsize [-i] [n]   - Get/set history size
+  /localecho [on|off]  - Toggle local echo
+  /sub [off|on|full]   - Set substitution mode
+  /suspend             - Suspend process (Ctrl+Z)
 
 Misc:
   /time                - Display current time
@@ -1335,6 +1414,7 @@ String Functions:
   toupper(str)             - Convert to uppercase
   escape(meta, str)        - Escape metacharacters in string
   replace(str, old, new [,count]) - Replace occurrences
+  tr(domain, range, str)   - Translate characters
   ascii(str)               - ASCII code of first character
   char(code)               - Character from ASCII code
   sprintf(fmt, args...)    - Formatted string (%s, %d, %c, %%)
@@ -1363,10 +1443,11 @@ World Functions:
   fg_world()               - Current world name
   world_info(field [,world]) - Get world info (name/host/port/character)
   nactive()                - Count of connected worlds
+  nactive(world)           - Unseen lines in named world
   nworlds()                - Total world count
   is_connected([world])    - Check if world is connected
-  idle()                   - Seconds since last input
-  sidle()                  - Seconds since last send
+  idle([world])            - Seconds since last receive
+  sidle([world])           - Seconds since last send
 
 Info Functions:
   time()                   - Current Unix timestamp
@@ -1384,7 +1465,7 @@ Macro Functions:
 
 Command Functions:
   echo(text [,attrs])      - Display local message (queues output)
-  send(text [,world])      - Send text to MUD (queues command)
+  send(text [,world [,f]])  - Send text to MUD (f=0/"off": no EOL)
   substitute(text [,attrs]) - Replace trigger line with text
   keycode(str)             - Key sequence for string (^X for ctrl)
 
@@ -1406,13 +1487,71 @@ File I/O:
   tfclose(handle)          - Close file
   tfread(handle, var)      - Read line into variable
   tfwrite(handle, text)    - Write text to file
-  tfflush(handle)          - Flush file buffer
+  tfflush(handle [,auto])  - Flush file buffer (auto: on/off)
   tfeof(handle)            - Check for end of file
   fwrite(file, text)       - Append text to file (simple)
 
+Macro/Builtin Call Syntax:
+  macroname(arg1, arg2)    - Call macro with positional params (%1, %2)
+  command(args)            - Call builtin as function (e.g. def("-t..."))
+
 Usage: $[function(args)] or in /expr//test"#.to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, escape, send, def, if, while, for, expr, bind, hooks, hilite, partial, export, repeat, ps, kill, load, require, loaded, exit, addworld, functions", topic))),
+            "toggle" => TfCommandResult::Success(Some(
+                "/toggle varname\n\nToggle a variable between 0 and 1.\nIf current value is 0, sets to 1; otherwise sets to 0.\n\nExample: /toggle gag".to_string()
+            )),
+            "return" => TfCommandResult::Success(Some(
+                "/return [expression]\n\nStop executing the current macro and return.\nIf an expression is given, it is evaluated and %? is set to the result.\nWithout an argument, %? is set to 1.\n\nExample:\n  /def check = /if (hp > 50) /return 1%; /echo Low HP!".to_string()
+            )),
+            "not" => TfCommandResult::Success(Some(
+                "/not expression\n\nNegate the result of an expression.\nSets %? to 1 if expression is false, 0 if true.\n\nExample: /not (connected)".to_string()
+            )),
+            "suspend" => TfCommandResult::Success(Some(
+                "/suspend\n\nSuspend the process (equivalent to Ctrl+Z).".to_string()
+            )),
+            "dokey" => TfCommandResult::Success(Some(
+                "/dokey keyname\n\nSimulate pressing a named edit key.\n\nKey names:\n  BSPC/BACKSPACE  - Backspace\n  DCH/DELETE      - Delete character\n  DLINE           - Delete entire line\n  LEFT/RIGHT      - Move cursor\n  HOME/END        - Start/end of line\n  UP/RECALLB      - Previous history\n  DOWN/RECALLF    - Next history\n  WLEFT/WRIGHT    - Word left/right\n  NEWLINE/ENTER   - Submit input\n  HPAGE/PAGEUP    - Page up\n  PAGE/PAGEDN     - Page down\n  REFRESH         - Redraw screen".to_string()
+            )),
+            "histsize" => TfCommandResult::Success(Some(
+                "/histsize [-i] [size]\n\nGet or set the history buffer size.\n-i: Input history (default)\n\nExample: /histsize 500".to_string()
+            )),
+            "localecho" => TfCommandResult::Success(Some(
+                "/localecho [on|off]\n\nGet or set local echo mode.\nWhen on, typed commands are displayed locally.".to_string()
+            )),
+            "sub" => TfCommandResult::Success(Some(
+                "/sub [off|on|full]\n\nGet or set the substitution mode.\n  off  - No variable substitution\n  on   - Normal substitution (default)\n  full - Full substitution".to_string()
+            )),
+            "replace" => TfCommandResult::Success(Some(
+                "/replace old new string\n\nReplace all occurrences of 'old' with 'new' in string.\nEchoes the result.\n\nFunction form: $[replace(str, old, new [,count])]\n\nExample: /replace foo bar \"foo and foo\"  => \"bar and bar\"".to_string()
+            )),
+            "tr" => TfCommandResult::Success(Some(
+                "/tr domain range string\n\nTranslate characters: each character in 'domain' is replaced\nby the corresponding character in 'range'.\n\nFunction form: $[tr(domain, range, string)]\n\nExample: /tr abc ABC \"a big cat\"  => \"A Big CAt\"".to_string()
+            )),
+            "trig" => TfCommandResult::Success(Some(
+                "/trig pattern = body\n\nCreate an unnamed trigger (glob mode).\nEquivalent to: /def -t\"pattern\" = body\n\nSee also: /trigp, /trigc, /trigpc, /untrig".to_string()
+            )),
+            "trigp" => TfCommandResult::Success(Some(
+                "/trigp priority pattern = body\n\nCreate a trigger with specified priority.\nEquivalent to: /def -p<pri> -t\"pattern\" = body".to_string()
+            )),
+            "trigc" => TfCommandResult::Success(Some(
+                "/trigc chance pattern = body\n\nCreate a trigger with specified probability (0.0-1.0).\nEquivalent to: /def -c<chance> -t\"pattern\" = body".to_string()
+            )),
+            "trigpc" => TfCommandResult::Success(Some(
+                "/trigpc priority chance pattern = body\n\nCreate a trigger with both priority and probability.\nEquivalent to: /def -p<pri> -c<chance> -t\"pattern\" = body".to_string()
+            )),
+            "untrig" => TfCommandResult::Success(Some(
+                "/untrig [-a attrs] pattern\n\nRemove triggers matching the given pattern.\n\nExample: /untrig * says *".to_string()
+            )),
+            "unworld" => TfCommandResult::Success(Some(
+                "/unworld name\n\nRemove a world definition. Maps to /close in Clay.".to_string()
+            )),
+            "watchdog" => TfCommandResult::Success(Some(
+                "/watchdog [off|on|n1 [n2]]\n\nSuppress duplicate lines from the MUD.\nIf a line has appeared n1 times in the last n2 lines, it is gagged.\n\nDefaults: n1=2 (threshold), n2=5 (window size)\n\nExamples:\n  /watchdog on       - Enable with defaults\n  /watchdog 3 10     - Gag after 3 repeats in last 10 lines\n  /watchdog off      - Disable\n  /watchdog          - Show current settings".to_string()
+            )),
+            "watchname" => TfCommandResult::Success(Some(
+                "/watchname [off|on|n1 [n2]]\n\nSuppress spam from repeated character names.\nIf the first word of a line has appeared as the first word\nof n1 of the last n2 lines, the line is gagged.\n\nDefaults: n1=4 (threshold), n2=5 (window size)\n\nExamples:\n  /watchname on      - Enable with defaults\n  /watchname 3 8     - Gag after name appears 3 times in last 8 lines\n  /watchname off     - Disable".to_string()
+            )),
+            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, escape, send, def, if, while, for, expr, test, not, return, bind, hooks, hilite, partial, export, toggle, replace, tr, trig, untrig, repeat, ps, kill, load, require, loaded, exit, addworld, watchdog, watchname, dokey, histsize, suspend, functions", topic))),
         }
     }
 }

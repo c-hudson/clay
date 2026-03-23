@@ -199,6 +199,8 @@ pub enum TfCommandResult {
         /// When backtick source is /recall, pass opts to caller for execution
         recall_opts: Option<(RecallOptions, String)>,  // (opts, prefix)
     },
+    /// Return from macro execution with optional value for %?
+    Return(String),
     /// Abort file loading early (/exit during load)
     ExitLoad,
     /// Not a TF command (doesn't start with /)
@@ -365,6 +367,14 @@ pub struct TfEngine {
     pub pending_outputs: Vec<TfOutput>,
     /// Pending substitution (from substitute() function)
     pub pending_substitution: Option<TfSubstitution>,
+    /// Watchdog: suppress duplicate lines
+    pub watchdog_enabled: bool,
+    pub watchdog_n1: usize,  // occurrence threshold (default 2)
+    pub watchdog_n2: usize,  // window size (default 5)
+    /// Watchname: suppress spam from repeated character names
+    pub watchname_enabled: bool,
+    pub watchname_n1: usize,  // occurrence threshold (default 4)
+    pub watchname_n2: usize,  // window size (default 5)
 }
 
 /// A pending world operation to be processed by the main app
@@ -388,6 +398,9 @@ pub struct WorldInfoCache {
     pub password: String,
     pub is_connected: bool,
     pub use_ssl: bool,
+    pub unseen_lines: usize,
+    pub last_receive_secs_ago: Option<i64>,
+    pub last_send_secs_ago: Option<i64>,
 }
 
 /// Cached keyboard buffer state for TF functions (kbhead, kbtail, etc.)
@@ -454,7 +467,12 @@ pub struct TfFileHandle {
 
 impl TfEngine {
     pub fn new() -> Self {
-        TfEngine::default()
+        let mut engine = TfEngine::default();
+        engine.watchdog_n1 = 2;
+        engine.watchdog_n2 = 5;
+        engine.watchname_n1 = 4;
+        engine.watchname_n2 = 5;
+        engine
     }
 
     /// Get a variable value, checking local scope first, then global

@@ -1677,6 +1677,515 @@ pub fn cmd_kill(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 /// Convert glob pattern to regex (re-exported from macros for use here)
 pub use super::macros::glob_to_regex;
 
+// =============================================================================
+// Tier 1: Simple commands
+// =============================================================================
+
+/// /toggle var - Toggle a variable between 0 and 1
+pub fn cmd_toggle(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let name = args.trim();
+    if name.is_empty() {
+        return TfCommandResult::Error("Usage: /toggle varname".to_string());
+    }
+
+    let current = engine.get_var(name)
+        .map(|v| v.to_int().unwrap_or(0))
+        .unwrap_or(0);
+
+    let new_val = if current == 0 { 1 } else { 0 };
+    engine.set_global(name, super::TfValue::Integer(new_val));
+    TfCommandResult::Success(Some(format!("{}={}", name, new_val)))
+}
+
+/// /return [expr] - Stop macro execution, set %? to expr result
+pub fn cmd_return(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Return("1".to_string());
+    }
+
+    match super::expressions::evaluate(engine, args) {
+        Ok(value) => TfCommandResult::Return(value.to_string_value()),
+        Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
+    }
+}
+
+/// /not expr - Negate: set %? to logical negation of expr
+pub fn cmd_not(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: /not expression".to_string());
+    }
+
+    match super::expressions::evaluate(engine, args) {
+        Ok(value) => {
+            let negated = if value.to_bool() { 0i64 } else { 1i64 };
+            engine.set_global("?", super::TfValue::Integer(negated));
+            TfCommandResult::Success(None)
+        }
+        Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
+    }
+}
+
+/// /suspend - Suspend the process (Ctrl+Z)
+pub fn cmd_suspend() -> TfCommandResult {
+    TfCommandResult::ClayCommand("/suspend".to_string())
+}
+
+/// /dokey name - Execute an edit key function by name
+pub fn cmd_dokey(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let name = args.trim().to_uppercase();
+    if name.is_empty() {
+        return TfCommandResult::Error("Usage: /dokey keyname".to_string());
+    }
+
+    match name.as_str() {
+        "BSPC" | "BACKSPACE" => {
+            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Delete(-1));
+            TfCommandResult::Success(None)
+        }
+        "DLINE" | "DELINE" => {
+            // Delete entire line
+            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(0));
+            let len = engine.keyboard_state.buffer.len() as i32;
+            if len > 0 {
+                engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Delete(len));
+            }
+            TfCommandResult::Success(None)
+        }
+        "UP" | "RECALLB" => TfCommandResult::ClayCommand("__dokey_up".to_string()),
+        "DOWN" | "RECALLF" => TfCommandResult::ClayCommand("__dokey_down".to_string()),
+        "LEFT" => {
+            let pos = engine.keyboard_state.cursor_position;
+            if pos > 0 {
+                engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(pos - 1));
+            }
+            TfCommandResult::Success(None)
+        }
+        "RIGHT" => {
+            let pos = engine.keyboard_state.cursor_position;
+            let len = engine.keyboard_state.buffer.chars().count();
+            if pos < len {
+                engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(pos + 1));
+            }
+            TfCommandResult::Success(None)
+        }
+        "HOME" => {
+            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(0));
+            TfCommandResult::Success(None)
+        }
+        "END" => {
+            let len = engine.keyboard_state.buffer.chars().count();
+            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(len));
+            TfCommandResult::Success(None)
+        }
+        "DCH" | "DELETE" => {
+            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Delete(1));
+            TfCommandResult::Success(None)
+        }
+        "WLEFT" => {
+            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::WordLeft);
+            TfCommandResult::Success(None)
+        }
+        "WRIGHT" => {
+            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::WordRight);
+            TfCommandResult::Success(None)
+        }
+        "NEWLINE" | "ENTER" => TfCommandResult::ClayCommand("__dokey_enter".to_string()),
+        "REFRESH" | "REDRAW" => TfCommandResult::ClayCommand("/redraw".to_string()),
+        "FLUSH" => TfCommandResult::ClayCommand("__dokey_flush".to_string()),
+        "HPAGE" | "PAGEUP" => TfCommandResult::ClayCommand("__dokey_pageup".to_string()),
+        "PAGE" | "PAGEDN" | "PAGEDOWN" => TfCommandResult::ClayCommand("__dokey_pagedown".to_string()),
+        "SEARCHB" => TfCommandResult::ClayCommand("__dokey_searchb".to_string()),
+        "SEARCHF" => TfCommandResult::ClayCommand("__dokey_searchf".to_string()),
+        "LNEXT" => TfCommandResult::Success(None), // No-op in Clay
+        "PAUSE" => TfCommandResult::ClayCommand("__dokey_pause".to_string()),
+        _ => TfCommandResult::Error(format!("Unknown key name: {}", name)),
+    }
+}
+
+/// /histsize [-lig] [size] - Get/set history buffer size
+pub fn cmd_histsize(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+
+    if args.is_empty() {
+        let size = engine.get_var("histsize")
+            .and_then(|v| v.to_int())
+            .unwrap_or(1000);
+        return TfCommandResult::Success(Some(format!("histsize={}", size)));
+    }
+
+    // Parse options
+    let mut remaining = args;
+    let mut _mode = 'i'; // default: input history
+
+    while remaining.starts_with('-') {
+        if remaining.starts_with("-i") {
+            _mode = 'i';
+            remaining = remaining[2..].trim_start();
+        } else if remaining.starts_with("-l") {
+            _mode = 'l';
+            remaining = remaining[2..].trim_start();
+        } else if remaining.starts_with("-g") {
+            _mode = 'g';
+            remaining = remaining[2..].trim_start();
+        } else {
+            break;
+        }
+    }
+
+    if remaining.is_empty() {
+        let size = engine.get_var("histsize")
+            .and_then(|v| v.to_int())
+            .unwrap_or(1000);
+        return TfCommandResult::Success(Some(format!("histsize={}", size)));
+    }
+
+    if let Ok(size) = remaining.parse::<i64>() {
+        engine.set_global("histsize", super::TfValue::Integer(size));
+        TfCommandResult::Success(Some(format!("histsize={}", size)))
+    } else {
+        TfCommandResult::Error(format!("Invalid size: {}", remaining))
+    }
+}
+
+/// /localecho [on|off] - Toggle local echo mode
+pub fn cmd_localecho(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let arg = args.trim().to_lowercase();
+
+    match arg.as_str() {
+        "" => {
+            let val = engine.get_var("localecho")
+                .map(|v| v.to_string_value())
+                .unwrap_or_else(|| "off".to_string());
+            TfCommandResult::Success(Some(format!("localecho={}", val)))
+        }
+        "on" | "1" => {
+            engine.set_global("localecho", super::TfValue::Integer(1));
+            TfCommandResult::Success(Some("localecho=on".to_string()))
+        }
+        "off" | "0" => {
+            engine.set_global("localecho", super::TfValue::Integer(0));
+            TfCommandResult::Success(Some("localecho=off".to_string()))
+        }
+        _ => TfCommandResult::Error("Usage: /localecho [on|off]".to_string()),
+    }
+}
+
+/// /sub [off|on|full] - Set substitution mode
+pub fn cmd_sub(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let arg = args.trim().to_lowercase();
+
+    match arg.as_str() {
+        "" => {
+            let val = engine.get_var("sub")
+                .map(|v| v.to_string_value())
+                .unwrap_or_else(|| "on".to_string());
+            TfCommandResult::Success(Some(format!("sub={}", val)))
+        }
+        "on" | "1" => {
+            engine.set_global("sub", super::TfValue::String("on".to_string()));
+            TfCommandResult::Success(Some("sub=on".to_string()))
+        }
+        "off" | "0" => {
+            engine.set_global("sub", super::TfValue::String("off".to_string()));
+            TfCommandResult::Success(Some("sub=off".to_string()))
+        }
+        "full" => {
+            engine.set_global("sub", super::TfValue::String("full".to_string()));
+            TfCommandResult::Success(Some("sub=full".to_string()))
+        }
+        _ => TfCommandResult::Error("Usage: /sub [off|on|full]".to_string()),
+    }
+}
+
+/// /replace old new string - Replace occurrences in string
+pub fn cmd_replace(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let _ = engine;
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: /replace old new string".to_string());
+    }
+
+    // Parse: first two words are old and new, rest is string
+    let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
+    if parts.len() < 3 {
+        return TfCommandResult::Error("Usage: /replace old new string".to_string());
+    }
+
+    let old = parts[0];
+    let new = parts[1];
+    let string = parts[2];
+
+    let result = string.replace(old, new);
+    TfCommandResult::Success(Some(result))
+}
+
+/// /tr domain range string - Translate characters
+/// Maps each char in domain to the corresponding char in range
+pub fn cmd_tr(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let _ = engine;
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: /tr domain range string".to_string());
+    }
+
+    let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
+    if parts.len() < 3 {
+        return TfCommandResult::Error("Usage: /tr domain range string".to_string());
+    }
+
+    let domain: Vec<char> = parts[0].chars().collect();
+    let range: Vec<char> = parts[1].chars().collect();
+    let string = parts[2];
+
+    let result = tr_translate(&domain, &range, string);
+    TfCommandResult::Success(Some(result))
+}
+
+/// Core tr translation logic - shared by /tr command and tr() function
+pub fn tr_translate(domain: &[char], range: &[char], string: &str) -> String {
+    string.chars().map(|c| {
+        if let Some(pos) = domain.iter().position(|&d| d == c) {
+            if pos < range.len() {
+                range[pos]
+            } else if !range.is_empty() {
+                *range.last().unwrap()
+            } else {
+                c
+            }
+        } else {
+            c
+        }
+    }).collect()
+}
+
+// =============================================================================
+// Tier 2: Trigger shortcuts
+// =============================================================================
+
+/// /trig pattern = body - Create unnamed trigger (glob mode)
+pub fn cmd_trig(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: /trig pattern = body".to_string());
+    }
+
+    let (pattern, body) = split_trigger_pattern_body(args);
+    create_trigger_macro(engine, &pattern, &body, 0, None)
+}
+
+/// /trigp pri pattern = body - Create trigger with priority
+pub fn cmd_trigp(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+    if parts.len() < 2 {
+        return TfCommandResult::Error("Usage: /trigp priority pattern = body".to_string());
+    }
+
+    let priority = parts[0].parse::<i32>().unwrap_or(0);
+    let (pattern, body) = split_trigger_pattern_body(parts[1]);
+    create_trigger_macro(engine, &pattern, &body, priority, None)
+}
+
+/// /trigc chance pattern = body - Create trigger with probability
+pub fn cmd_trigc(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+    if parts.len() < 2 {
+        return TfCommandResult::Error("Usage: /trigc chance pattern = body".to_string());
+    }
+
+    let chance = parts[0].parse::<f32>().unwrap_or(1.0);
+    let (pattern, body) = split_trigger_pattern_body(parts[1]);
+    create_trigger_macro(engine, &pattern, &body, 0, Some(chance))
+}
+
+/// /trigpc pri chance pattern = body - Create trigger with priority and probability
+pub fn cmd_trigpc(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
+    if parts.len() < 3 {
+        return TfCommandResult::Error("Usage: /trigpc priority chance pattern = body".to_string());
+    }
+
+    let priority = parts[0].parse::<i32>().unwrap_or(0);
+    let chance = parts[1].parse::<f32>().unwrap_or(1.0);
+    let (pattern, body) = split_trigger_pattern_body(parts[2]);
+    create_trigger_macro(engine, &pattern, &body, priority, Some(chance))
+}
+
+/// Split "pattern = body" or "pattern" from trigger shortcut args
+fn split_trigger_pattern_body(args: &str) -> (String, String) {
+    if let Some(eq_pos) = args.find('=') {
+        let before = args[..eq_pos].trim_end();
+        let after = args[eq_pos + 1..].trim_start();
+        (before.to_string(), after.to_string())
+    } else {
+        (args.to_string(), String::new())
+    }
+}
+
+/// Create a trigger macro (shared by /trig, /trigp, /trigc, /trigpc)
+fn create_trigger_macro(engine: &mut TfEngine, pattern: &str, body: &str, priority: i32, probability: Option<f32>) -> TfCommandResult {
+    let trig_name = format!("__trig_{}", engine.next_macro_sequence);
+    let macro_def = super::TfMacro {
+        name: trig_name,
+        body: body.to_string(),
+        trigger: Some(super::TfTrigger {
+            pattern: pattern.to_string(),
+            match_mode: super::TfMatchMode::Glob,
+            compiled: regex::Regex::new(&super::macros::glob_to_regex(pattern)).ok(),
+        }),
+        priority,
+        probability,
+        ..Default::default()
+    };
+
+    let macro_num = engine.next_macro_sequence;
+    engine.add_macro(macro_def);
+    TfCommandResult::Success(Some(format!("{}", macro_num)))
+}
+
+/// /untrig [-a attrs] pattern - Remove triggers matching pattern
+pub fn cmd_untrig(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: /untrig pattern".to_string());
+    }
+
+    // Parse optional -a attrs
+    let pattern = if args.starts_with("-a") {
+        // Skip -a and attrs, get to pattern
+        let rest = &args[2..];
+        if let Some(space_pos) = rest.find(char::is_whitespace) {
+            rest[space_pos..].trim_start()
+        } else {
+            return TfCommandResult::Error("Usage: /untrig [-a attrs] pattern".to_string());
+        }
+    } else {
+        args
+    };
+
+    let before = engine.macros.len();
+    engine.macros.retain(|m| {
+        if let Some(ref trigger) = m.trigger {
+            trigger.pattern != pattern
+        } else {
+            true
+        }
+    });
+
+    let removed = before - engine.macros.len();
+    if removed > 0 {
+        TfCommandResult::Success(Some(format!("Removed {} trigger(s) matching '{}'", removed, pattern)))
+    } else {
+        TfCommandResult::Success(Some(format!("No trigger found matching '{}'", pattern)))
+    }
+}
+
+// =============================================================================
+// Tier 3: World management
+// =============================================================================
+
+/// /unworld name - Remove world definition
+pub fn cmd_unworld(args: &str) -> TfCommandResult {
+    let name = args.trim();
+    if name.is_empty() {
+        return TfCommandResult::Error("Usage: /unworld name".to_string());
+    }
+    TfCommandResult::ClayCommand(format!("/close {}", name))
+}
+
+// =============================================================================
+// Tier 4: Spam detection
+// =============================================================================
+
+/// /watchdog [off|on|n1 [n2]] - Suppress duplicate lines
+pub fn cmd_watchdog(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+
+    if args.is_empty() {
+        let status = if engine.watchdog_enabled { "on" } else { "off" };
+        return TfCommandResult::Success(Some(format!(
+            "watchdog={} (threshold={}, window={})",
+            status, engine.watchdog_n1, engine.watchdog_n2
+        )));
+    }
+
+    match args.to_lowercase().as_str() {
+        "on" => {
+            engine.watchdog_enabled = true;
+            TfCommandResult::Success(Some("watchdog=on".to_string()))
+        }
+        "off" => {
+            engine.watchdog_enabled = false;
+            TfCommandResult::Success(Some("watchdog=off".to_string()))
+        }
+        _ => {
+            // Parse n1 [n2]
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if let Ok(n1) = parts[0].parse::<usize>() {
+                engine.watchdog_n1 = n1;
+                if parts.len() > 1 {
+                    if let Ok(n2) = parts[1].parse::<usize>() {
+                        engine.watchdog_n2 = n2;
+                    }
+                }
+                engine.watchdog_enabled = true;
+                TfCommandResult::Success(Some(format!(
+                    "watchdog=on (threshold={}, window={})",
+                    engine.watchdog_n1, engine.watchdog_n2
+                )))
+            } else {
+                TfCommandResult::Error("Usage: /watchdog [off|on|n1 [n2]]".to_string())
+            }
+        }
+    }
+}
+
+/// /watchname [off|on|n1 [n2]] - Suppress spam from repeated character names
+pub fn cmd_watchname(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+
+    if args.is_empty() {
+        let status = if engine.watchname_enabled { "on" } else { "off" };
+        return TfCommandResult::Success(Some(format!(
+            "watchname={} (threshold={}, window={})",
+            status, engine.watchname_n1, engine.watchname_n2
+        )));
+    }
+
+    match args.to_lowercase().as_str() {
+        "on" => {
+            engine.watchname_enabled = true;
+            TfCommandResult::Success(Some("watchname=on".to_string()))
+        }
+        "off" => {
+            engine.watchname_enabled = false;
+            TfCommandResult::Success(Some("watchname=off".to_string()))
+        }
+        _ => {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if let Ok(n1) = parts[0].parse::<usize>() {
+                engine.watchname_n1 = n1;
+                if parts.len() > 1 {
+                    if let Ok(n2) = parts[1].parse::<usize>() {
+                        engine.watchname_n2 = n2;
+                    }
+                }
+                engine.watchname_enabled = true;
+                TfCommandResult::Success(Some(format!(
+                    "watchname=on (threshold={}, window={})",
+                    engine.watchname_n1, engine.watchname_n2
+                )))
+            } else {
+                TfCommandResult::Error("Usage: /watchname [off|on|n1 [n2]]".to_string())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
