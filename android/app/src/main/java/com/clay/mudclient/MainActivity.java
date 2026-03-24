@@ -73,6 +73,8 @@ public class MainActivity extends AppCompatActivity {
     private Handler backgroundShutdownHandler;
     private Runnable backgroundShutdownRunnable;
     private NativeWebSocket nativeWebSocket;
+    private int nativeWsFailures = 0;
+    private long lastWsConnectTime = 0;
     private Handler heartbeatHandler;
     private Runnable heartbeatRunnable;
     private int missedHeartbeats = 0;
@@ -229,6 +231,8 @@ public class MainActivity extends AppCompatActivity {
                 nativeWebSocket = new NativeWebSocket(new NativeWebSocket.WebSocketCallback() {
                     @Override
                     public void onOpen() {
+                        nativeWsFailures = 0;
+                        lastWsConnectTime = System.currentTimeMillis();
                         runOnUiThread(() -> {
                             webView.evaluateJavascript("if (typeof onNativeWebSocketOpen === 'function') onNativeWebSocketOpen();", null);
                         });
@@ -252,6 +256,20 @@ public class MainActivity extends AppCompatActivity {
 
                     @Override
                     public void onClose(int code, String reason) {
+                        nativeWsFailures++;
+                        // If we've failed 4+ times and the last successful connect was >30s ago
+                        // (or never), the current host is likely unreachable — reload with
+                        // host resolution to try the alternate address (local↔remote fallback)
+                        boolean staleConnection = lastWsConnectTime == 0
+                            || (System.currentTimeMillis() - lastWsConnectTime) > 30000;
+                        if (nativeWsFailures >= 4 && staleConnection) {
+                            nativeWsFailures = 0;
+                            android.util.Log.i("Clay", "Multiple WS failures, reloading with host resolution");
+                            runOnUiThread(() -> {
+                                resolveHostnameAndLoad();
+                            });
+                            return;
+                        }
                         runOnUiThread(() -> {
                             String escaped = reason != null ? reason.replace("\"", "\\\"") : "";
                             webView.evaluateJavascript("if (typeof onNativeWebSocketClose === 'function') onNativeWebSocketClose(" + code + ", \"" + escaped + "\");", null);
