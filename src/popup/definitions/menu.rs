@@ -95,9 +95,12 @@ pub fn create_menu_popup() -> PopupDefinition {
             buttons_right_align: false,
             blank_line_before_list: false,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         })
         .with_help(menu_help_text())
 }
+
 
 /// Help text for the Menu popup
 fn menu_help_text() -> Vec<String> {

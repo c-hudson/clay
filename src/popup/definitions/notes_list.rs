@@ -76,5 +76,7 @@ pub fn create_notes_list_popup(notes: &[NoteInfo], visible_height: usize) -> Pop
             buttons_right_align: true,
             blank_line_before_list: true,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         })
 }

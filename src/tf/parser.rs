@@ -63,10 +63,9 @@ pub fn is_tf_command(input: &str) -> bool {
 }
 
 /// Check if a command name (without prefix) is a TF command
-/// Note: "help" is NOT included here because it has a Clay equivalent.
-/// Use /tfhelp for the TF version.
 pub fn is_tf_command_name(cmd: &str) -> bool {
     matches!(cmd,
+        "help" |
         "set" | "unset" | "let" | "setenv" | "listvar" |
         "echo" | "beep" | "quote" | "substitute" | "escape" | "hilite" | "nohilite" | "partial" | "export" |
         "expr" | "test" | "eval" |
@@ -380,7 +379,7 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "changes" => TfCommandResult::Success(Some("% /changes: Not applicable in Clay. See /version.".to_string())),
         "tick" => TfCommandResult::Success(Some("% /tick: Use /repeat for timed commands in Clay.".to_string())),
         "recordline" => TfCommandResult::Success(Some("% /recordline: Not available in Clay.".to_string())),
-        "edit" => TfCommandResult::Success(Some("% /edit: Not available in Clay. Use the built-in input editor.".to_string())),
+        "edit" => cmd_edit(engine, args),
 
         // Check for user-defined macro with this name
         _ => {
@@ -1049,114 +1048,31 @@ fn cmd_help(args: &str) -> TfCommandResult {
     let topic = args.trim().trim_start_matches('/').to_lowercase();
 
     if topic.is_empty() {
-        let help_text = r#"TinyFugue Commands (use / prefix)
-
-Variables:
-  /set [name [value]]  - Set/list global variables
-  /unset name          - Remove a variable
-  /let name value      - Set a local variable
-  /setenv name         - Export variable to environment
-  /listvar [pattern]   - List variables
-
-Expressions:
-  /expr expression     - Evaluate and display result
-  /test expression     - Evaluate expression, set %?
-  /eval expression     - Evaluate and execute as command
-  /not expression      - Negate expression, set %?
-  /return [expr]       - Return from macro, set %?
-
-Control Flow:
-  /if (expr) cmd       - Conditional execution
-  /if /elseif /else /endif - Multi-line conditional
-  /while (expr) /done  - While loop
-  /for var s e [step] /done - For loop
-  /break               - Exit loop
-
-Macros/Triggers:
-  /def [opts] name=body - Define macro (-t -m -p -F -1 -ag -h -b)
-  /undef name          - Remove macro
-  /list [pattern]      - List macros
-  /purge [pattern]     - Remove all macros
-  /trig pattern=body   - Create trigger (glob mode)
-  /trigp pri pat=body  - Trigger with priority
-  /trigc chance pat=body - Trigger with probability
-  /trigpc pri ch pat=body - Trigger with priority+chance
-  /untrig pattern      - Remove trigger by pattern
-
-Hooks & Keys:
-  /bind key=command    - Bind key to command
-  /unbind key          - Remove key binding
-  /dokey name          - Simulate named edit key
-
-Output:
-  /echo message        - Display message locally
-  /escape meta string  - Escape metacharacters in string
-  /send [-w world] text - Send text to MUD
-  /beep                - Terminal bell
-  /quote text          - Send without substitution
-  /hilite [pattern]    - Hilite matching lines (-ah trigger)
-  /nohilite [pattern]  - Remove hilite
-  /partial regexp      - Hilite matched portion (-Ph -F)
-  /gag [pattern]       - List gags, or suppress matching lines
-  /ungag pattern       - Remove gag
-  /recall [pattern]    - Search output history
-  /substitute text     - Replace current trigger line
-
-Variables:
-  /export variable     - Export variable to environment
-  /toggle var          - Toggle variable between 0 and 1
-
-String:
-  /replace old new str - Replace occurrences in string
-  /tr domain range str - Translate characters
-
-World Management:
-  /fg [name]           - Switch to or list worlds
-  /connect [world]     - Connect to a world
-  /addworld [opts] name [args] - Add/update world
-  /dc, /disconnect     - Disconnect current world
-  /unworld name        - Remove world
-
-Spam Detection:
-  /watchdog [off|on|n1 [n2]] - Suppress duplicate lines
-  /watchname [off|on|n1 [n2]] - Suppress repeated names
-
-File Operations:
-  /load [-q] filename  - Load TF script (-q = quiet)
-  /require [-q] file   - Load file if not already loaded
-  /loaded token        - Mark file as loaded (for /require)
-  /save filename       - Save macros to file
-  /lcd path            - Change local directory
-  /exit                - Abort loading file / quit
-
-Process:
-  /repeat [opts] count cmd - Repeat command on timer
-  /ps                  - List background processes
-  /kill id             - Kill background process
-
-Settings:
-  /histsize [-i] [n]   - Get/set history size
-  /localecho [on|off]  - Toggle local echo
-  /sub [off|on|full]   - Set substitution mode
-  /suspend             - Suspend process (Ctrl+Z)
-
-Misc:
-  /time                - Display current time
-  /sh command          - Execute shell command
-  /tfhelp [topic]      - Show this TF help
-  /version             - Show version info
+        let help_text = r#"Getting Started:
+  /setup               - Open settings (server, colors, etc.)
+  /world               - Setup connection(s) to a world(s)
+  /world <name>        - Connect/switch to a world
+  /dc                  - Disconnect from current world
+  /connections         - Show all connected worlds
   /quit                - Exit Clay
 
-Use /tfhelp for TF version of /help.
+Keys:
+  PgUp / PgDn          - Scroll through output history
+  Ctrl-Up or Down      - Switch Worlds
+  Tab                  - Release world output when paused.
 
-Variable Substitution:
-  %{varname}           - Variable value
-  %1-%9, %*            - Positional params from trigger
-  %L, %R               - Left/right of match
-  %%                   - Literal percent sign
+Basic Configuration:
+  /setup               - General settings popup
+  /web                 - Web interface / remote access settings
+  /actions             - Manage triggers and actions
+  /keybinds            - Open keybinding editor (browser)
 
-Use /tfhelp <command> for detailed help on specific commands.
-Use /tfhelp functions for list of expression functions."#;
+For more help:
+  /help commands       - List of commands
+  /help functions      - List of functions
+  /help <command>      - Help on a specific command (e.g. /help def)
+  /help keys           - All keyboard bindings
+  /help web            - Websocket help (remote interfaces)"#;
         TfCommandResult::Success(Some(help_text.to_string()))
     } else {
         match topic.as_str() {
@@ -1497,6 +1413,92 @@ Macro/Builtin Call Syntax:
 
 Usage: $[function(args)] or in /expr//test"#.to_string()
             )),
+            "commands" | "cmds" => TfCommandResult::Success(Some(
+                r#"Commands (/help <command> for details)
+Clay:
+  /setup  /web  /actions  /keybinds  /menu  /connections
+  /world  /connect  /disconnect  /dc  /addworld  /unworld
+  /reload  /version  /quit  /remote  /ban  /unban
+  /flush  /dump  /note  /tag  /notify
+Variables:
+  /set  /unset  /let  /setenv  /listvar  /toggle  /export
+Expressions & Control Flow:
+  /expr  /test  /eval  /not  /return
+  /if  /elseif  /else  /endif  /while  /for  /done  /break
+Macros & Triggers:
+  /def  /undef  /undefn  /undeft  /list  /purge
+  /trig  /trigp  /trigc  /trigpc  /untrig
+  /bind  /unbind  /dokey
+Output:
+  /echo  /send  /beep  /quote  /recall  /substitute
+  /hilite  /nohilite  /partial  /gag  /ungag
+  /escape  /replace  /tr
+World:
+  /fg  /addworld  /dc  /watchdog  /watchname  /bamf
+Files & Scripts:
+  /load  /require  /loaded  /save  /lcd  /exit  /log  /sh
+Process:
+  /repeat  /ps  /kill
+Settings:
+  /histsize  /localecho  /sub  /suspend  /time  /shift
+  /input  /grab  /trigger"#.to_string()
+            )),
+            "keys" | "keybindings" => TfCommandResult::Success(Some(
+                r#"Keyboard Shortcuts
+
+World Switching:
+  Ctrl+Up/Down         - Switch between active worlds
+  Shift+Up/Down        - Switch between all worlds
+  Esc+W                - Switch to world with activity
+
+Input Editing:
+  Left/Right, Ctrl+B/F - Move cursor
+  Up/Down              - Move cursor up/down lines
+  Alt+Up/Down          - Resize input area
+  Ctrl+A / Home        - Jump to start of line
+  Ctrl+E / End         - Jump to end of line
+  Ctrl+K               - Delete to end of line
+  Ctrl+U               - Clear input
+  Ctrl+W               - Delete word before cursor
+  Ctrl+D               - Delete character under cursor
+  Ctrl+T               - Transpose characters
+  Ctrl+Y               - Yank (paste killed text)
+  Esc+B / Esc+F        - Word left / word right
+  Esc+D                - Delete word forward
+  Esc+C                - Capitalize word forward
+  Esc+L                - Lowercase word forward
+  Esc+U                - Uppercase word forward
+  Esc+Space            - Collapse spaces to one
+  Esc+-                - Goto matching bracket
+  Esc+. or Esc+_       - Insert last arg from history
+  Ctrl+P/N             - Command history
+  Esc+P                - Search history backward
+  Esc+N                - Search history forward
+  Ctrl+Q               - Spell suggestions
+  Tab                  - Command completion / release pending output
+
+Output:
+  PageUp/PageDown      - Scroll output
+  Esc+J (lowercase)    - Jump to end, release all
+  Esc+J (uppercase)    - Selective flush (keep hilite)
+  Esc+H                - Half-page scroll/release
+
+Display:
+  F1                   - Show help
+  F2                   - Toggle MUD tag display
+  F4                   - Filter output
+  F8                   - Highlight action matches
+
+System:
+  Ctrl+C (twice)       - Quit
+  Ctrl+L               - Redraw screen
+  Ctrl+R               - Hot reload
+  Ctrl+Z               - Suspend
+
+Customize with /keybinds or /bind:
+  /bind F5 = cast heal
+  /bind ^S = /save macros.tf"#.to_string()
+            )),
             "toggle" => TfCommandResult::Success(Some(
                 "/toggle varname\n\nToggle a variable between 0 and 1.\nIf current value is 0, sets to 1; otherwise sets to 0.\n\nExample: /toggle gag".to_string()
             )),
@@ -1551,7 +1553,199 @@ Usage: $[function(args)] or in /expr//test"#.to_string()
             "watchname" => TfCommandResult::Success(Some(
                 "/watchname [off|on|n1 [n2]]\n\nSuppress spam from repeated character names.\nIf the first word of a line has appeared as the first word\nof n1 of the last n2 lines, the line is gagged.\n\nDefaults: n1=4 (threshold), n2=5 (window size)\n\nExamples:\n  /watchname on      - Enable with defaults\n  /watchname 3 8     - Gag after name appears 3 times in last 8 lines\n  /watchname off     - Disable".to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, escape, send, def, if, while, for, expr, test, not, return, bind, hooks, hilite, partial, export, toggle, replace, tr, trig, untrig, repeat, ps, kill, load, require, loaded, exit, addworld, watchdog, watchname, dokey, histsize, suspend, functions", topic))),
+            "unset" => TfCommandResult::Success(Some(
+                "/unset name\n\nRemove a global variable.\n\nExample: /unset foo".to_string()
+            )),
+            "let" => TfCommandResult::Success(Some(
+                "/let name=value\n\nSet a local variable in the current scope.\nLocal variables shadow globals and are removed when\nthe macro finishes executing.\n\nExamples:\n  /let x=hello\n  /let count=0".to_string()
+            )),
+            "setenv" => TfCommandResult::Success(Some(
+                "/setenv name [value]\n\nSet or export a variable to the shell environment.\nIf value is given, sets the variable first.\nThe variable becomes available to /sh and child processes.\n\nExample: /setenv TERM vt100".to_string()
+            )),
+            "listvar" => TfCommandResult::Success(Some(
+                "/listvar [pattern]\n\nList global variables matching a pattern.\nWithout a pattern, lists all variables.\nGlob patterns (* and ?) are supported.\n\nExamples:\n  /listvar        - List all variables\n  /listvar foo*   - List variables starting with foo".to_string()
+            )),
+            "eval" => TfCommandResult::Success(Some(
+                "/eval expression\n\nEvaluate expression and execute the result as a command.\nIf the result starts with /, it is executed as a Clay command.\nOtherwise it is sent to the MUD.\n\nExample:\n  /set cmd=/echo hello\n  /eval cmd   - Executes /echo hello".to_string()
+            )),
+            "beep" => TfCommandResult::Success(Some(
+                "/beep [count]\n\nSound the terminal bell.\nOptional count (default 1) specifies how many beeps.\n\nExample: /beep 3".to_string()
+            )),
+            "quote" => TfCommandResult::Success(Some(
+                r#"/quote [-w world] [-S|-dC] [-0] [text | 'command | `command | !command]
+
+Send text or command output without variable substitution.
+
+Prefixes:
+  'command    Echo output locally
+  `command    Execute each line of output as TF command
+  !command    Run shell command, send output to MUD
+
+Options:
+  -w world   Send to specific world
+  -S         Use semicolons as newlines
+  -dC        Use character C as delimiter
+  -0         No newlines (NUL delimiter)
+
+Examples:
+  /quote Say %this literally    - Sends without expanding %this
+  /quote !/bin/date             - Sends date output to MUD
+  /quote '!cat file.txt         - Echoes file contents locally
+  /quote `!echo /set x=1        - Executes /set x=1"#.to_string()
+            )),
+            "recall" => TfCommandResult::Success(Some(
+                r#"/recall [options] [range] [pattern]
+
+Search output history.
+
+Options:
+  -w[world]   Search specific world (default: current)
+  -l          Search local (TF) output only
+  -g          Search all worlds + local
+  -i          Search input history
+  -t[format]  Show timestamps
+  -v          Invert match (show non-matching)
+  -q          Quiet (set %? but don't display)
+  -mtype      Match type: simple, glob (default), regexp
+  -ag         Include gagged lines
+  -An         Show n lines after each match
+  -Bn         Show n lines before each match
+  #           Show line numbers
+
+Range: N (last N), -N (Nth previous), N-M, N-
+
+Examples:
+  /recall 20                    - Last 20 lines
+  /recall -i /def               - Input history matching /def
+  /recall -mregexp \d{3}-\d{4}  - Regex match"#.to_string()
+            )),
+            "gag" => TfCommandResult::Success(Some(
+                "/gag [pattern]\n\nWith no args: list all gag triggers.\nWith a pattern: create a trigger that suppresses matching lines.\nEquivalent to: /def -ag -t\"pattern\"\n\nExample: /gag * has left the game.".to_string()
+            )),
+            "ungag" => TfCommandResult::Success(Some(
+                "/ungag pattern\n\nRemove gag triggers matching the given pattern.\n\nExample: /ungag * has left the game.".to_string()
+            )),
+            "fg" => TfCommandResult::Success(Some(
+                "/fg [world]\n\nSwitch to a world or list worlds.\nWithout arguments, equivalent to /connections.\n\nExample: /fg MyMUD".to_string()
+            )),
+            "dc" | "disconnect" => TfCommandResult::Success(Some(
+                "/dc or /disconnect\n\nDisconnect from the current world.".to_string()
+            )),
+            "world" => TfCommandResult::Success(Some(
+                "/world [name]\n\nSwitch to a world by name.\nWithout arguments, lists available worlds.\n\nExample: /world MyMUD".to_string()
+            )),
+            "listworlds" => TfCommandResult::Success(Some(
+                "/listworlds\n\nList all defined worlds with their connection status.".to_string()
+            )),
+            "listsockets" | "connections" => TfCommandResult::Success(Some(
+                "/listsockets or /connections\n\nList all connected worlds. Maps to Clay's /connections command.".to_string()
+            )),
+            "undef" => TfCommandResult::Success(Some(
+                "/undef name\n\nRemove a macro by name.\n\nExample: /undef my_trigger".to_string()
+            )),
+            "undefn" => TfCommandResult::Success(Some(
+                "/undefn number\n\nRemove a macro by its sequence number.\nUse /list to see sequence numbers.\n\nExample: /undefn 42".to_string()
+            )),
+            "undeft" => TfCommandResult::Success(Some(
+                "/undeft pattern\n\nRemove all macros whose trigger matches the given pattern.\n\nExample: /undeft * tells you *".to_string()
+            )),
+            "list" => TfCommandResult::Success(Some(
+                "/list [pattern]\n\nList macro definitions matching a pattern.\nWithout a pattern, lists all macros.\nGlob patterns (* and ?) are supported.\n\nExample: /list auto_*".to_string()
+            )),
+            "purge" => TfCommandResult::Success(Some(
+                "/purge\n\nRemove all macro definitions.".to_string()
+            )),
+            "unbind" => TfCommandResult::Success(Some(
+                "/unbind key\n\nRemove a key binding.\nKey names: F1-F12, ^A-^Z (Ctrl), @a-@z (Alt)\n\nExample: /unbind F5".to_string()
+            )),
+            "unhook" => TfCommandResult::Success(Some(
+                "/unhook macro_name\n\nRemove a hook by macro name.\nThe macro is not deleted, only its hook association.\n\nExample: /unhook auto_look".to_string()
+            )),
+            "save" => TfCommandResult::Success(Some(
+                "/save filename\n\nSave all current macro definitions to a file.\nThe file can be loaded later with /load.\n\nExample: /save ~/.tf/macros.tf".to_string()
+            )),
+            "lcd" => TfCommandResult::Success(Some(
+                "/lcd path\n\nChange the local working directory.\nAffects /sh, /load, and file operations.\n\nExample: /lcd ~/tf-scripts".to_string()
+            )),
+            "log" => TfCommandResult::Success(Some(
+                "/log [filename | off]\n\nStart or stop logging output to a file.\n/log filename - Start logging to file\n/log off      - Stop logging\n/log           - Show logging status\n\nExample: /log ~/mud.log".to_string()
+            )),
+            "sh" => TfCommandResult::Success(Some(
+                "/sh command\n\nExecute a shell command and display the output.\nEnvironment variables set with /setenv or /export are available.\n\nExample: /sh ls -la".to_string()
+            )),
+            "time" => TfCommandResult::Success(Some(
+                "/time [command]\n\nWithout arguments, display the current date and time.\nWith a command, execute it and display how long it took.\n\nExamples:\n  /time\n  /time /load big_script.tf".to_string()
+            )),
+            "version" => TfCommandResult::Success(Some(
+                "/version\n\nDisplay Clay version information.".to_string()
+            )),
+            "quit" => TfCommandResult::Success(Some(
+                "/quit\n\nExit Clay.".to_string()
+            )),
+            "shift" => TfCommandResult::Success(Some(
+                "/shift\n\nShift positional parameters: %2 becomes %1, %3 becomes %2, etc.\nUsed inside macros to iterate through arguments.\n\nExample:\n  /def showargs = /while ({1} !~ \"\") /echo %1%; /shift%; /done".to_string()
+            )),
+            "trigger" => TfCommandResult::Success(Some(
+                "/trigger [-d] pattern\n\nTest trigger matching against a pattern.\n-d: Delete matching triggers\nWithout -d: show which macros would fire for this text.\n\nExample: /trigger You are hungry".to_string()
+            )),
+            "input" => TfCommandResult::Success(Some(
+                "/input text\n\nInsert text into the input buffer at the cursor position.\n\nFunction form: $[input(text)]\n\nExample: /input say hello".to_string()
+            )),
+            "grab" => TfCommandResult::Success(Some(
+                "/grab text\n\nReplace the input buffer with the given text.\nIf no text given, grab the last line of output.\n\nExample: /grab say ".to_string()
+            )),
+            "substitute" => TfCommandResult::Success(Some(
+                "/substitute text\n\nReplace the current trigger line with different text.\nOnly works inside a trigger body.\n\nFunction form: $[substitute(text [,attrs])]\n\nExample:\n  /def -t\"* says *\" colorize = /substitute [%1] %2".to_string()
+            )),
+            "cat" | "paste" => TfCommandResult::Success(Some(
+                "/cat and /paste are not supported in Clay.\nUse bracketed paste instead (paste normally into the input area).".to_string()
+            )),
+            "help" | "tfhelp" => TfCommandResult::Success(Some(
+                "/help [topic] or /tfhelp [topic]\n\nShow help on TF commands and features.\n\nTopics: set, echo, send, def, if, while, for, expr, test,\n  bind, hooks, repeat, load, recall, quote, gag, addworld,\n  watchdog, watchname, functions, and more.\n\nExample: /help def".to_string()
+            )),
+            "purgeworld" | "saveworld" => TfCommandResult::Success(Some(
+                "/purgeworld and /saveworld are stubs.\nUse Clay's world management instead.".to_string()
+            )),
+            "telnet" | "finger" => TfCommandResult::Success(Some(
+                "/telnet and /finger are not implemented.\nUse /sh to run system commands instead.\n\nExample: /sh telnet host port".to_string()
+            )),
+            "getfile" | "putfile" => TfCommandResult::Success(Some(
+                "/getfile and /putfile are not implemented.\nFile transfer protocols are not supported.".to_string()
+            )),
+            "liststreams" => TfCommandResult::Success(Some(
+                "/liststreams\n\nList active streams. Not implemented in Clay.".to_string()
+            )),
+            "changes" => TfCommandResult::Success(Some(
+                "/changes\n\nShow TF changelog. Not implemented in Clay.\nUse /version for version info.".to_string()
+            )),
+            "tick" => TfCommandResult::Success(Some(
+                "/tick\n\nTick timer (for MUD combat rounds). Not implemented in Clay.\nUse /repeat for periodic timers instead.".to_string()
+            )),
+            "recordline" => TfCommandResult::Success(Some(
+                "/recordline\n\nRecord a line to history. Not implemented in Clay.".to_string()
+            )),
+            "edit" => TfCommandResult::Success(Some(
+                r#"/edit [options] name [= body]
+
+Edit an existing macro. The macro is found by name, or:
+  #num       Find by sequence number (from /list)
+  $pattern   Find by trigger pattern
+
+Options are the same as /def. Only specified options are
+changed; unspecified options remain from the original.
+
+Body is only changed if "=" is present. Use "=" alone
+to clear the body.
+
+Examples:
+  /edit -c0 greet           - Set probability to 0%
+  /edit -p5 greet           - Change priority to 5
+  /edit #42 = new body      - Edit macro #42's body
+  /edit $"* says *" -ag     - Add gag to trigger
+
+See also: /def, /list, /undef"#.to_string()
+            )),
+            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nUse /help for a list of all commands.", topic))),
         }
     }
 }
@@ -1752,6 +1946,106 @@ fn cmd_def(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         }
         Err(e) => TfCommandResult::Error(e),
     }
+}
+
+/// /edit [options] name [= body] - Edit an existing macro
+fn cmd_edit(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args_trimmed = args.trim();
+    if args_trimmed.is_empty() {
+        return TfCommandResult::Error("Usage: /edit [options] name [= body]".to_string());
+    }
+
+    // Parse the edit args the same way as /def
+    let edit_def = match macros::parse_def(args_trimmed) {
+        Ok(d) => d,
+        Err(e) => return TfCommandResult::Error(e),
+    };
+
+    // Find the existing macro by name, #num, or $pattern
+    let name = &edit_def.name;
+    let existing_idx = if name.starts_with('#') {
+        // #num — find by sequence number
+        if let Ok(num) = name[1..].parse::<u32>() {
+            engine.macros.iter().position(|m| m.sequence_number == num)
+        } else {
+            None
+        }
+    } else if name.starts_with('$') {
+        // $pattern — find by trigger pattern
+        let pattern = &name[1..];
+        engine.macros.iter().position(|m| {
+            m.trigger.as_ref().map(|t| t.pattern == pattern).unwrap_or(false)
+        })
+    } else {
+        engine.macros.iter().position(|m| m.name.eq_ignore_ascii_case(name))
+    };
+
+    let idx = match existing_idx {
+        Some(i) => i,
+        None => return TfCommandResult::Error(format!("Macro '{}' not found.", name)),
+    };
+
+    // Clone the existing macro and apply edits
+    let mut edited = engine.macros[idx].clone();
+
+    // Apply options from the edit command (only if explicitly given)
+    // Trigger
+    if edit_def.trigger.is_some() {
+        edited.trigger = edit_def.trigger;
+    }
+    // Hook
+    if edit_def.hook.is_some() {
+        edited.hook = edit_def.hook;
+    }
+    // Keybinding
+    if edit_def.keybinding.is_some() {
+        edited.keybinding = edit_def.keybinding;
+    }
+    // Priority (non-default)
+    if edit_def.priority != 0 {
+        edited.priority = edit_def.priority;
+    }
+    // Fall-through
+    if edit_def.fall_through {
+        edited.fall_through = true;
+    }
+    // One-shot
+    if edit_def.one_shot.is_some() {
+        edited.one_shot = edit_def.one_shot;
+        edited.shots_remaining = edit_def.one_shot;
+    }
+    // Attributes (apply if any are set)
+    if edit_def.attributes.gag || edit_def.attributes.bold || edit_def.attributes.underline ||
+       edit_def.attributes.reverse || edit_def.attributes.flash || edit_def.attributes.dim ||
+       edit_def.attributes.bell || edit_def.attributes.norecord || edit_def.attributes.hilite.is_some() {
+        edited.attributes = edit_def.attributes;
+    }
+    // Condition
+    if edit_def.condition.is_some() {
+        edited.condition = edit_def.condition;
+    }
+    // Probability
+    if edit_def.probability.is_some() {
+        edited.probability = edit_def.probability;
+    }
+    // World
+    if edit_def.world.is_some() {
+        edited.world = edit_def.world;
+    }
+    // Partial hilite
+    if edit_def.partial_hilite {
+        edited.partial_hilite = true;
+    }
+
+    // Body: only update if '=' was present in the args
+    if args_trimmed.contains(" = ") || args_trimmed.ends_with(" =") {
+        edited.body = edit_def.body;
+    }
+
+    // Replace the macro (preserves sequence number)
+    engine.replace_macro(idx, edited);
+
+    TfCommandResult::Success(Some(format!("Macro '{}' edited.", engine.macros[idx].name)))
 }
 
 /// /undef name - Undefine a macro by exact name

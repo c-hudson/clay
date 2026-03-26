@@ -129,6 +129,8 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             buttons_right_align: true,
             blank_line_before_list: false,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         })
         .with_help(actions_list_help_text())
 }
@@ -233,6 +235,8 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
             buttons_right_align: true,
             blank_line_before_list: false,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         })
         .with_help(action_editor_help_text())
 }

@@ -537,6 +537,10 @@ pub struct PopupLayout {
     pub blank_line_before_list: bool,
     /// Whether Tab should only cycle through buttons (skip fields)
     pub tab_buttons_only: bool,
+    /// Anchor popup to bottom (just above separator bar) at anchor_x position
+    pub anchor_bottom_left: bool,
+    /// X position for anchor_bottom_left (0 = left edge)
+    pub anchor_x: u16,
 }
 
 impl Default for PopupLayout {
@@ -551,6 +555,8 @@ impl Default for PopupLayout {
             buttons_right_align: false,
             blank_line_before_list: false,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         }
     }
 }

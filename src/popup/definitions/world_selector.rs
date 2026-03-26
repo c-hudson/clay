@@ -94,6 +94,8 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
             buttons_right_align: true,
             blank_line_before_list: true,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         })
         .with_help(world_selector_help_text())
 }

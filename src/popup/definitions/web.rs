@@ -90,6 +90,8 @@ pub fn create_web_popup(
             buttons_right_align: true,
             blank_line_before_list: false,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         });
 
     def = def.with_help(web_help_text());

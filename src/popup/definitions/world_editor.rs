@@ -280,6 +280,8 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             buttons_right_align: false,
             blank_line_before_list: false,
             tab_buttons_only: true,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         });
 
     // Set field visibility based on world type

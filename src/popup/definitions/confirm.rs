@@ -38,6 +38,8 @@ pub fn create_confirm_dialog(id: &'static str, title: &str, message: &str) -> Po
             buttons_right_align: false,
             blank_line_before_list: false,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         })
 }
 

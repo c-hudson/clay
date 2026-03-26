@@ -89,7 +89,9 @@ fn calculate_popup_area(area: Rect, layout: &PopupLayout, state: &PopupState) ->
         .max(5);
 
     // Calculate position
-    let x = if layout.center_horizontal {
+    let x = if layout.anchor_bottom_left {
+        layout.anchor_x.min(area.width.saturating_sub(popup_width))
+    } else if layout.center_horizontal {
         area.width.saturating_sub(popup_width) / 2
     } else {
         // Position in upper right for non-centered popups (like filter)
@@ -97,9 +99,14 @@ fn calculate_popup_area(area: Rect, layout: &PopupLayout, state: &PopupState) ->
     };
 
     // For vertical positioning:
+    // - anchor_bottom_left: position just above separator bar
     // - center_vertical=true: center in the full area
     // - center_vertical=false: center between line 2 (y=1) and above input window
-    let y = if layout.center_vertical {
+    let y = if layout.anchor_bottom_left {
+        // Place popup so its bottom edge is just above the separator bar
+        // Separator is at area.height - 3 (separator + 2 input lines)
+        area.height.saturating_sub(popup_height).saturating_sub(3)
+    } else if layout.center_vertical {
         area.height.saturating_sub(popup_height) / 2
     } else {
         // Center between y=1 (line 2) and max position (leave 3 lines for separator + input)

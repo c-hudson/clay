@@ -138,6 +138,8 @@ pub fn create_connections_popup(connections: &[ConnectionInfo], visible_height: 
             buttons_right_align: false,
             blank_line_before_list: false,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         })
         .with_help(connections_help_text())
 }

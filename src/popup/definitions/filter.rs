@@ -27,6 +27,8 @@ pub fn create_filter_popup() -> PopupDefinition {
             buttons_right_align: false,
             blank_line_before_list: false,
             tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
         })
 }
 

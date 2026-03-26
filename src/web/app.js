@@ -147,29 +147,30 @@
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
         worldEditSaveBtn: document.getElementById('world-edit-save-btn'),
         worldEditConnectBtn: document.getElementById('world-edit-connect-btn'),
-        // Web settings popup
-        webModal: document.getElementById('web-modal'),
+        // Web settings fields (inside combined settings modal)
         webProtocolSelect: document.getElementById('web-protocol-select'),
         webHttpEnabledSelect: document.getElementById('web-http-enabled-select'),
         webHttpPort: document.getElementById('web-http-port'),
-        // webWsEnabledSelect and webWsPort removed — WS shares HTTP port
         webAllowList: document.getElementById('web-allow-list'),
         webCertFile: document.getElementById('web-cert-file'),
         webKeyFile: document.getElementById('web-key-file'),
         tlsCertField: document.getElementById('tls-cert-field'),
         tlsKeyField: document.getElementById('tls-key-field'),
-        webSaveBtn: document.getElementById('web-save-btn'),
-        webCancelBtn: document.getElementById('web-cancel-btn'),
-        webCloseBtn: document.getElementById('web-close-btn'),
         httpLabel: document.getElementById('http-label'),
         httpPortLabel: document.getElementById('http-port-label'),
         // wsLabel removed — WS shares HTTP port
         // wsPortLabel removed — WS shares HTTP port
-        // Setup popup
-        setupModal: document.getElementById('setup-modal'),
-        setupCloseBtn: document.getElementById('setup-close-btn'),
+        // Combined settings popup (/setup + /web)
+        settingsModal: document.getElementById('settings-modal'),
+        settingsCloseBtn: document.getElementById('settings-close-btn'),
+        settingsSaveBtn: document.getElementById('settings-save-btn'),
+        settingsCancelBtn: document.getElementById('settings-cancel-btn'),
+        settingsHelpBtn: document.getElementById('settings-help-btn'),
+        settingsTitle: document.getElementById('settings-title'),
+        settingsGeneralSection: document.getElementById('settings-general'),
+        settingsWebSection: document.getElementById('settings-web'),
+        // Setup fields (inside combined settings modal)
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
-        // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
@@ -186,8 +187,6 @@
         setupTransparencyRow: document.getElementById('setup-transparency-row'),
         setupTransparencySlider: document.getElementById('setup-transparency-slider'),
         setupTransparencyValue: document.getElementById('setup-transparency-value'),
-        setupSaveBtn: document.getElementById('setup-save-btn'),
-        setupCancelBtn: document.getElementById('setup-cancel-btn'),
         // Filter popup (F4)
         filterPopup: document.getElementById('filter-popup'),
         filterInput: document.getElementById('filter-input'),
@@ -199,10 +198,9 @@
         // Menu popup (/menu)
         menuModal: document.getElementById('menu-modal'),
         menuList: document.getElementById('menu-list'),
-        // Font popup (/font)
-        fontModal: document.getElementById('font-modal'),
+        // Font fields (inside combined settings modal)
+        settingsFontSection: document.getElementById('settings-font'),
         fontFamilyList: document.getElementById('font-family-list'),
-        fontCloseBtn: document.getElementById('font-close-btn'),
         fontPhoneMinus: document.getElementById('font-phone-minus'),
         fontPhonePlus: document.getElementById('font-phone-plus'),
         fontPhoneValue: document.getElementById('font-phone-value'),
@@ -215,16 +213,12 @@
         fontWeightMinus: document.getElementById('font-weight-minus'),
         fontWeightPlus: document.getElementById('font-weight-plus'),
         fontWeightValue: document.getElementById('font-weight-value'),
-        fontCancelBtn: document.getElementById('font-cancel-btn'),
-        fontSaveBtn: document.getElementById('font-save-btn'),
         // Popup help modal (shared)
         popupHelpModal: document.getElementById('popup-help-modal'),
         popupHelpContent: document.getElementById('popup-help-content'),
         popupHelpCloseBtn: document.getElementById('popup-help-close-btn'),
         popupHelpOkBtn: document.getElementById('popup-help-ok-btn'),
-        // Help buttons in each popup
-        setupHelpBtn: document.getElementById('setup-help-btn'),
-        webHelpBtn: document.getElementById('web-help-btn'),
+        // Help buttons in each popup (settings-help-btn in combined modal, referenced as settingsHelpBtn above)
         worldEditHelpBtn: document.getElementById('world-edit-help-btn'),
         worldSelectorHelpBtn: document.getElementById('world-selector-help-btn'),
         actionsListHelpBtn: document.getElementById('actions-list-help-btn'),
@@ -316,7 +310,8 @@
     let worldEditorIndex = -1;  // Index of world being edited
 
     // Web settings popup state (global state from server)
-    let webPopupOpen = false;
+    let settingsPopupOpen = false;
+    let settingsActiveTab = 'general';
     let webSecure = false;
     let httpEnabled = false;
     let httpPort = 9000;
@@ -334,7 +329,7 @@
     let selectedWorldsRowIndex = -1; // For worlds list popup (/connections)
 
     // Setup popup state
-    let setupPopupOpen = false;
+    // setupPopupOpen removed — merged into settingsPopupOpen
     let setupMoreMode = true;
     let setupWorldSwitchMode = 'Unseen First';
     // Note: show tags removed from setup - controlled by F2 or /tag command
@@ -353,7 +348,7 @@
     let filterText = '';
 
     // Font popup state (/font)
-    let fontPopupOpen = false;
+    // fontPopupOpen removed — merged into settingsPopupOpen
     let fontName = '';  // Shared font family name (synced from server)
     let guiFontSize = 14.0;  // GUI font size (not used by web, but preserved for server)
     let fontEditName = '';
@@ -515,7 +510,7 @@
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
-        'testmusic', 'dump', 'notify', 'addworld', 'edit', 'tag', 'tags',
+        'testmusic', 'dump', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font',
     ];
 
@@ -3222,11 +3217,11 @@
                 break;
 
             case '/web':
-                openWebPopup();
+                openSettingsPopup('web');
                 break;
 
             case '/setup':
-                openSetupPopup();
+                openSettingsPopup('general');
                 break;
 
             case '/connections':
@@ -3271,10 +3266,10 @@
                 break;
 
             case '/font':
-                openFontPopup();
+                openSettingsPopup('font');
                 break;
 
-            case '/edit':
+            case '/note':
                 // Open split-screen editor locally
                 // (handled by specific client-side logic if implemented)
                 break;
@@ -3408,7 +3403,7 @@
             { l: '/menu', r: 'Open menu popup' },
             { l: '/flush', r: 'Clear output buffer' },
             { l: '/dump', r: 'Dump scrollback to file' },
-            { l: '/edit [file]', r: 'Open split-screen editor' },
+            { l: '/note [file]', r: 'Open split-screen editor' },
             { heading: 'System' },
             { l: '/help [topic]', r: 'Show help (topic = command)' },
             { l: '/version', r: 'Show version info' },
@@ -5414,13 +5409,28 @@
         }
     }
 
-    // Setup popup functions (/setup)
-    function openSetupPopup() {
-        setupPopupOpen = true;
-        // Load current values
+    // Combined settings popup functions (/setup + /web)
+    function switchSettingsTab(tab) {
+        settingsActiveTab = tab;
+        document.querySelectorAll('.settings-tab-btn').forEach(function(btn) {
+            btn.classList.toggle('active', btn.dataset.tab === tab);
+        });
+        elements.settingsGeneralSection.classList.toggle('active', tab === 'general');
+        elements.settingsWebSection.classList.toggle('active', tab === 'web');
+        elements.settingsFontSection.classList.toggle('active', tab === 'font');
+        var titles = { general: 'General', web: 'Web', font: 'Font' };
+        elements.settingsTitle.textContent = titles[tab] || tab;
+    }
+
+    function openSettingsPopup(tab) {
+        if (tab === 'web' && multiuserMode) {
+            appendClientLine('Web settings are disabled in multiuser mode.', currentWorldIndex, 'system');
+            return;
+        }
+        settingsPopupOpen = true;
+        // Load general edit state
         setupMoreMode = moreModeEnabled;
         setupWorldSwitchMode = worldSwitchMode;
-        // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
         setupTlsProxy = tlsProxyEnabled;
@@ -5430,15 +5440,29 @@
         setupGuiTheme = guiTheme;
         setupColorOffset = colorOffsetPercent;
         setupTransparency = guiTransparency;
-        elements.setupModal.className = 'modal visible';
-        elements.setupModal.style.display = 'flex';
+        // Load web edit state
+        editWebSecure = webSecure;
+        editHttpEnabled = httpEnabled;
+        // Load font edit state
+        fontEditName = fontName;
+        fontEditSizePhone = Math.round(webFontSizePhone);
+        fontEditSizeTablet = Math.round(webFontSizeTablet);
+        fontEditSizeDesktop = Math.round(webFontSizeDesktop);
+        fontEditWeight = webFontWeight;
+        // Show modal
+        elements.settingsModal.className = 'modal visible';
+        elements.settingsModal.style.display = 'flex';
+        switchSettingsTab(tab || 'general');
         updateSetupPopupUI();
+        updateWebPopupUI();
+        renderFontFamilyList();
+        updateFontPopupUI();
     }
 
-    function closeSetupPopup() {
-        setupPopupOpen = false;
-        elements.setupModal.className = 'modal';
-        elements.setupModal.style.display = 'none';
+    function closeSettingsPopup() {
+        settingsPopupOpen = false;
+        elements.settingsModal.className = 'modal';
+        elements.settingsModal.style.display = 'none';
         focusInputWithKeyboard();
     }
 
@@ -5531,17 +5555,15 @@
         };
     }
 
-    function saveSetupSettings() {
-        // Read values from UI (stepper value is already tracked)
+    function saveSettingsAll() {
+        // Save general settings
         if (setupInputHeightValue < 1) setupInputHeightValue = 1;
         if (setupInputHeightValue > 15) setupInputHeightValue = 15;
         if (setupColorOffset < 0) setupColorOffset = 0;
         if (setupColorOffset > 100) setupColorOffset = 100;
 
-        // Apply locally
         moreModeEnabled = setupMoreMode;
         worldSwitchMode = setupWorldSwitchMode;
-        // Note: show tags removed from setup - controlled by F2 or /tag command
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
         tlsProxyEnabled = setupTlsProxy;
@@ -5552,39 +5574,27 @@
         applyTheme(guiTheme);
         setInputHeight(setupInputHeightValue);
         applyTransparency(setupTransparency);
-
-        // Re-render output with new show_tags and color_offset settings
         renderOutput();
 
-        // Send to server
+        // Save web settings (skip if multiuser)
+        if (!multiuserMode) {
+            webSecure = editWebSecure;
+            httpEnabled = editHttpEnabled;
+            httpPort = parseInt(elements.webHttpPort.value) || 9000;
+            wsAllowList = elements.webAllowList.value;
+            wsCertFile = elements.webCertFile.value;
+            wsKeyFile = elements.webKeyFile.value;
+        }
+
+        // Save font settings
+        _saveFontSettingsInline();
+
+        // Send combined update to server
         const msg = buildUpdateGlobalSettings();
         msg.input_height = setupInputHeightValue;
         send(msg);
 
-        closeSetupPopup();
-    }
-
-    // Web settings popup functions (/web)
-    function openWebPopup() {
-        // Block web settings in multiuser mode
-        if (multiuserMode) {
-            appendClientLine('Web settings are disabled in multiuser mode.', currentWorldIndex, 'system');
-            return;
-        }
-        webPopupOpen = true;
-        // Copy global state to edit state
-        editWebSecure = webSecure;
-        editHttpEnabled = httpEnabled;
-        elements.webModal.className = 'modal visible';
-        elements.webModal.style.display = 'flex';
-        updateWebPopupUI();
-    }
-
-    function closeWebPopup() {
-        webPopupOpen = false;
-        elements.webModal.className = 'modal';
-        elements.webModal.style.display = 'none';
-        focusInputWithKeyboard();
+        closeSettingsPopup();
     }
 
     function updateWebPopupUI() {
@@ -5621,43 +5631,9 @@
         elements.tlsKeyField.style.display = editWebSecure ? 'flex' : 'none';
     }
 
-    function saveWebSettings() {
-        // Copy edit state to global state
-        webSecure = editWebSecure;
-        httpEnabled = editHttpEnabled;
-        // Read text field values from UI
-        httpPort = parseInt(elements.webHttpPort.value) || 9000;
-        wsAllowList = elements.webAllowList.value;
-        wsCertFile = elements.webCertFile.value;
-        wsKeyFile = elements.webKeyFile.value;
+    // saveWebSettings removed — merged into saveSettingsAll
 
-        // Send to server
-        send(buildUpdateGlobalSettings());
-
-        closeWebPopup();
-    }
-
-    // Font popup functions (/font)
-    function openFontPopup() {
-        fontPopupOpen = true;
-        // Copy current state to edit state
-        fontEditName = fontName;
-        fontEditSizePhone = Math.round(webFontSizePhone);
-        fontEditSizeTablet = Math.round(webFontSizeTablet);
-        fontEditSizeDesktop = Math.round(webFontSizeDesktop);
-        fontEditWeight = webFontWeight;
-        elements.fontModal.className = 'modal visible';
-        elements.fontModal.style.display = 'flex';
-        renderFontFamilyList();
-        updateFontPopupUI();
-    }
-
-    function closeFontPopup() {
-        fontPopupOpen = false;
-        elements.fontModal.className = 'modal';
-        elements.fontModal.style.display = 'none';
-        focusInputWithKeyboard();
-    }
+    // openFontPopup/closeFontPopup removed — merged into openSettingsPopup/closeSettingsPopup
 
     function renderFontFamilyList() {
         const list = elements.fontFamilyList;
@@ -5695,28 +5671,18 @@
         elements.fontWeightValue.textContent = fontEditWeight;
     }
 
-    function saveFontSettings() {
-        // Apply font family
+    // saveFontSettings removed — merged into saveSettingsAll
+    function _saveFontSettingsInline() {
+        // Called from saveSettingsAll — applies font changes
         applyFontFamily(fontEditName);
-
-        // Apply font sizes
         webFontSizePhone = fontEditSizePhone;
         webFontSizeTablet = fontEditSizeTablet;
         webFontSizeDesktop = fontEditSizeDesktop;
-
-        // Apply font weight
         webFontWeight = fontEditWeight;
         applyFontWeight(webFontWeight);
-
-        // Apply the right font size for current device
-        const fontPx = deviceType === 'phone' ? webFontSizePhone :
-                       deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
+        var fontPx = deviceType === 'phone' ? webFontSizePhone :
+                     deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
         setFontSize(clampFontSize(fontPx), false);
-
-        // Send to server
-        send(buildUpdateGlobalSettings());
-
-        closeFontPopup();
     }
 
     // Worlds list popup functions (/connections, /l)
@@ -6397,7 +6363,7 @@
 
     // Check if any popup is open
     function isAnyPopupOpen() {
-        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || webPopupOpen || setupPopupOpen || fontPopupOpen;
+        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || settingsPopupOpen;
     }
 
     // Check if a world should be included in cycling (connected OR has activity)
@@ -6911,13 +6877,13 @@
                 openActionsPopup();
                 break;
             case 'setup':
-                openSetupPopup();
+                openSettingsPopup('general');
                 break;
             case 'web':
-                openWebPopup();
+                openSettingsPopup('web');
                 break;
             case 'font':
-                openFontPopup();
+                openSettingsPopup('font');
                 break;
             case 'theme-editor':
                 window.open('/theme-editor', '_blank');
@@ -7393,9 +7359,8 @@
                 !elements.actionConfirmModal.classList.contains('visible') &&
                 !elements.worldsModal.classList.contains('visible') &&
                 !elements.worldSelectorModal.classList.contains('visible') &&
-                !elements.setupModal?.classList.contains('visible') &&
+                !elements.settingsModal?.classList.contains('visible') &&
                 !elements.worldEditorModal?.classList.contains('visible') &&
-                !elements.webModal?.classList.contains('visible') &&
                 !e.target.closest('#status-bar') &&
                 !e.target.closest('#nav-bar') &&
                 !e.target.closest('.menu-dropdown') &&
@@ -7414,8 +7379,7 @@
                     elements.actionConfirmModal.classList.contains('visible') ||
                     elements.worldsModal.classList.contains('visible') ||
                     elements.worldSelectorModal.classList.contains('visible') ||
-                    elements.webModal.classList.contains('visible') ||
-                    elements.setupModal.classList.contains('visible') ||
+                    elements.settingsModal.classList.contains('visible') ||
                     elements.worldEditorModal?.classList.contains('visible') ||
                     elements.passwordModal?.classList.contains('visible') ||
                     filterPopupOpen ||
@@ -7731,31 +7695,15 @@
             }
 
             // Handle setup popup
-            if (setupPopupOpen) {
+            if (settingsPopupOpen) {
                 if (e.key === 'Escape') {
                     e.preventDefault();
-                    closeSetupPopup();
+                    closeSettingsPopup();
                 }
                 return;
             }
 
-            // Handle web settings popup
-            if (webPopupOpen) {
-                if (e.key === 'Escape') {
-                    e.preventDefault();
-                    closeWebPopup();
-                }
-                return;
-            }
-
-            // Handle font popup
-            if (fontPopupOpen) {
-                if (e.key === 'Escape') {
-                    e.preventDefault();
-                    closeFontPopup();
-                }
-                return;
-            }
+            // Font popup keyboard handling removed — merged into settingsPopupOpen check
 
             // Handle world delete confirm popup
             if (worldConfirmPopupOpen) {
@@ -8044,7 +7992,14 @@
         };
 
         // Setup popup
-        elements.setupCloseBtn.onclick = closeSetupPopup;
+        elements.settingsCloseBtn.onclick = closeSettingsPopup;
+        // Tab switching
+        document.querySelectorAll('.settings-tab-btn').forEach(function(btn) {
+            btn.onclick = function() {
+                if (btn.dataset.tab === 'web' && multiuserMode) return;
+                switchSettingsTab(btn.dataset.tab);
+            };
+        });
         elements.setupMoreModeToggle.onclick = function() {
             setupMoreMode = !setupMoreMode;
             updateSetupPopupUI();
@@ -8108,8 +8063,8 @@
                 applyTransparency(setupTransparency);
             };
         }
-        elements.setupSaveBtn.onclick = saveSetupSettings;
-        elements.setupCancelBtn.onclick = closeSetupPopup;
+        elements.settingsSaveBtn.onclick = saveSettingsAll;
+        elements.settingsCancelBtn.onclick = closeSettingsPopup;
 
         // Web settings popup (use edit state, not global state)
         elements.webProtocolSelect.onchange = function() {
@@ -8120,14 +8075,10 @@
             editHttpEnabled = this.value === 'on';
             updateWebPopupUI();
         };
-        elements.webSaveBtn.onclick = saveWebSettings;
-        elements.webCancelBtn.onclick = closeWebPopup;
-        elements.webCloseBtn.onclick = closeWebPopup;
+        // Web save/cancel/close handled by unified settings buttons above
 
         // Font popup
-        elements.fontCloseBtn.onclick = closeFontPopup;
-        elements.fontCancelBtn.onclick = closeFontPopup;
-        elements.fontSaveBtn.onclick = saveFontSettings;
+        // Font close/cancel/save handled by unified settings buttons
         elements.fontWeightMinus.onclick = function() {
             fontEditWeight = Math.max(100, fontEditWeight - 100);
             updateFontPopupUI();
@@ -8164,8 +8115,10 @@
         // Popup help buttons
         elements.popupHelpCloseBtn.onclick = closePopupHelp;
         elements.popupHelpOkBtn.onclick = closePopupHelp;
-        if (elements.setupHelpBtn) elements.setupHelpBtn.onclick = function() { openPopupHelp('setup'); };
-        if (elements.webHelpBtn) elements.webHelpBtn.onclick = function() { openPopupHelp('web'); };
+        if (elements.settingsHelpBtn) elements.settingsHelpBtn.onclick = function() {
+            var helpTab = settingsActiveTab === 'web' ? 'web' : settingsActiveTab === 'font' ? 'font' : 'setup';
+            openPopupHelp(helpTab);
+        };
         if (elements.worldEditHelpBtn) elements.worldEditHelpBtn.onclick = function() { openPopupHelp('worldEditor'); };
         if (elements.worldSelectorHelpBtn) elements.worldSelectorHelpBtn.onclick = function() { openPopupHelp('worldSelector'); };
         if (elements.actionsListHelpBtn) elements.actionsListHelpBtn.onclick = function() { openPopupHelp('actionsList'); };

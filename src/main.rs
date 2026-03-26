@@ -1519,7 +1519,7 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "/addworld" => parse_addworld_command(args),
-        "/edit" => {
+        "/note" => {
             if args.first() == Some(&"-l") {
                 Command::EditList
             } else if args.is_empty() {
@@ -2155,6 +2155,8 @@ pub struct World {
     pub visual_line_offset: usize, // When > 0, show only first N visual lines of scroll_offset line (partial display for more-mode)
     pub watchdog_history: std::collections::VecDeque<String>,  // Rolling window of recent lines (stripped) for /watchdog
     pub watchname_history: std::collections::VecDeque<String>, // Rolling window of first-words for /watchname
+    fansi_detect_until: Option<std::time::Instant>,  // FANSI client detection window (2s after connect)
+    fansi_login_pending: Option<String>,             // Deferred login command for FANSI worlds
 }
 
 impl World {
@@ -2230,6 +2232,8 @@ impl World {
             visual_line_offset: 0,
             watchdog_history: std::collections::VecDeque::new(),
             watchname_history: std::collections::VecDeque::new(),
+            fansi_detect_until: None,
+            fansi_login_pending: None,
         }
     }
 
@@ -2309,6 +2313,8 @@ impl World {
         self.reader_name = None;
         // Reset skip_auto_login so next fresh connection triggers auto-login
         self.skip_auto_login = false;
+        self.fansi_detect_until = None;
+        self.fansi_login_pending = None;
         // Clear timing fields so /connections doesn't show stale times
         self.last_send_time = None;
         self.last_receive_time = None;
@@ -2999,8 +3005,8 @@ impl App {
             http_port: self.settings.http_port,
             ws_enabled: false,  // Legacy
             ws_port: 0,        // Legacy
-            ws_cert_file: String::new(),
-            ws_key_file: String::new(),
+            ws_cert_file: self.settings.websocket_cert_file.clone(),
+            ws_key_file: self.settings.websocket_key_file.clone(),
             tls_configured: !self.settings.websocket_cert_file.is_empty() && !self.settings.websocket_key_file.is_empty(),
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
             dictionary_path: self.settings.dictionary_path.clone(),
@@ -3505,6 +3511,8 @@ impl App {
                 buttons_right_align: false,
                 blank_line_before_list: false,
                 tab_buttons_only: false,
+            anchor_bottom_left: false,
+            anchor_x: 0,
             });
 
         self.popup_manager.open(def);
@@ -3799,7 +3807,6 @@ impl App {
                                 state.select_field(HELP_FIELD_CONTENT);
                             }
                         }
-                        // TF help not available in this context
                     }
                     Command::Setup => {
                         self.open_setup_popup_new();
@@ -4829,6 +4836,33 @@ impl App {
     ) -> Vec<String> {
         self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
 
+        // FANSI client detection: check for "Detecting client..." within 2s window
+        if let Some(deadline) = self.worlds[world_idx].fansi_detect_until {
+            if std::time::Instant::now() < deadline {
+                let peek = self.worlds[world_idx].effective_encoding().decode(bytes);
+                for line in peek.lines() {
+                    let stripped = crate::util::strip_ansi_codes(line).trim().to_string();
+                    if stripped == "Detecting client..." {
+                        if let Some(tx) = &self.worlds[world_idx].command_tx {
+                            let _ = tx.try_send(WriteCommand::Text("CLIENT WEBCLIENT2".to_string()));
+                            let _ = tx.try_send(WriteCommand::Text(String::new()));
+                        }
+                        // Delay login by 2s to let the MUD process the client response
+                        self.worlds[world_idx].fansi_detect_until = Some(std::time::Instant::now() + Duration::from_secs(2));
+                        break;
+                    }
+                }
+            } else {
+                // Detection window expired — send deferred login now
+                if let Some(login_cmd) = self.worlds[world_idx].fansi_login_pending.take() {
+                    if let Some(tx) = &self.worlds[world_idx].command_tx {
+                        let _ = tx.try_send(WriteCommand::Text(login_cmd));
+                    }
+                }
+                self.worlds[world_idx].fansi_detect_until = None;
+            }
+        }
+
         // Consider "current" if console OR any web/GUI client is viewing this world
         let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
         let decoded_data = self.worlds[world_idx].effective_encoding().decode(bytes);
@@ -5716,7 +5750,14 @@ impl App {
             if auto_connect_type == AutoConnectType::Connect {
                 self.worlds[world_idx].skip_auto_login = false;
             }
-            if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+            // FANSI worlds: always set up client detection window
+            if self.worlds[world_idx].settings.encoding == Encoding::Fansi {
+                self.worlds[world_idx].fansi_detect_until = Some(std::time::Instant::now() + Duration::from_secs(2));
+                if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                    let connect_cmd = format!("connect {} {}", user, password);
+                    self.worlds[world_idx].fansi_login_pending = Some(connect_cmd);
+                }
+            } else if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
                 let connect_cmd = format!("connect {} {}", user, password);
                 let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
             }
@@ -6338,8 +6379,11 @@ impl App {
             Command::Reload => {
                 return WsAsyncAction::Reload;
             }
+            Command::Help => {
+                self.handle_ws_help_via_tf(client_id, world_index, "/help");
+            }
             // UI popup commands - send back to client for local handling
-            Command::Help | Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
+            Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
             Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
             }
@@ -6514,32 +6558,39 @@ impl App {
                 });
             }
             Command::HelpTopic { ref topic } => {
-                // Try Clay help first, then TF help
+                // Try Clay help first, then TF help via engine
                 use popup::definitions::help::get_topic_help;
-                let help_text = if let Some(lines) = get_topic_help(topic) {
-                    lines.join("\n")
-                } else {
-                    // Try TF help
-                    match self.tf_engine.execute(&format!("#help {}", topic)) {
-                        tf::TfCommandResult::Success(Some(msg)) => msg,
-                        _ => format!("No help available for '{}'", topic),
+                if let Some(lines) = get_topic_help(topic) {
+                    let help_text = lines.join("\n");
+                    for line in help_text.lines() {
+                        self.ws_send_to_client(client_id, WsMessage::ServerData {
+                            world_index, data: line.to_string(), is_viewed: false,
+                            ts: current_timestamp_secs(), from_server: false, seq: 0,
+                            marked_new: false, flush: false, gagged: false,
+                        });
                     }
-                };
-                for line in help_text.lines() {
-                    self.ws_send_to_client(client_id, WsMessage::ServerData {
-                        world_index,
-                        data: line.to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                        marked_new: false,
-                        flush: false, gagged: false,
-                    });
+                } else {
+                    self.handle_ws_help_via_tf(client_id, world_index, &format!("/help {}", topic));
                 }
             }
         }
         WsAsyncAction::Done
+    }
+
+    /// Send TF help output to a WebSocket client
+    fn handle_ws_help_via_tf(&mut self, client_id: u64, world_index: usize, cmd: &str) {
+        self.sync_tf_world_info();
+        let help_text = match self.tf_engine.execute(cmd) {
+            tf::TfCommandResult::Success(Some(msg)) => msg,
+            _ => format!("No help available. Try /help commands"),
+        };
+        for line in help_text.lines() {
+            self.ws_send_to_client(client_id, WsMessage::ServerData {
+                world_index, data: line.to_string(), is_viewed: false,
+                ts: current_timestamp_secs(), from_server: false, seq: 0,
+                marked_new: false, flush: false, gagged: false,
+            });
+        }
     }
 
     /// Handle TfCommandResult::Quote from a WebSocket client command.
@@ -10243,12 +10294,6 @@ fn handle_remote_client_key(
                             if let Some(state) = app.popup_manager.current_mut() {
                                 state.select_field(HELP_FIELD_CONTENT);
                             }
-                        } else {
-                            // Send to server for TF help
-                            let _ = ws_tx.send(WsMessage::SendCommand {
-                                world_index: app.current_world_index,
-                                command: format!("/tfhelp {}", topic),
-                            });
                         }
                     }
                     Command::Version => {
@@ -10722,11 +10767,6 @@ fn handle_remote_client_key(
                             if let Some(state) = app.popup_manager.current_mut() {
                                 state.select_field(HELP_FIELD_CONTENT);
                             }
-                        } else {
-                            let _ = ws_tx.send(WsMessage::SendCommand {
-                                world_index: app.current_world_index,
-                                command: format!("/tfhelp {}", topic),
-                            });
                         }
                     }
                     Command::Version => {
@@ -13646,6 +13686,10 @@ pub async fn run_app_headless(
                             if app.worlds[world_idx].wont_echo_time.is_some() {
                                 prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
                             }
+                            // Activate timer for FANSI login timeout
+                            if app.worlds[world_idx].fansi_detect_until.is_some() {
+                                prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+                            }
                             // Activate pending update if lines were paused
                             if !app.worlds[world_idx].pending_lines.is_empty() {
                                 pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
@@ -14026,8 +14070,22 @@ pub async fn run_app_headless(
                         }
                     }
                 }
+                // Check for expired FANSI detection windows
+                let now_fansi = std::time::Instant::now();
+                for world in &mut app.worlds {
+                    if let Some(deadline) = world.fansi_detect_until {
+                        if now_fansi >= deadline {
+                            if let Some(login_cmd) = world.fansi_login_pending.take() {
+                                if let Some(tx) = &world.command_tx {
+                                    let _ = tx.try_send(WriteCommand::Text(login_cmd));
+                                }
+                            }
+                            world.fansi_detect_until = None;
+                        }
+                    }
+                }
                 // Re-arm: check again in 150ms if any world still needs it
-                let any_pending = app.worlds.iter().any(|w| w.wont_echo_time.is_some());
+                let any_pending = app.worlds.iter().any(|w| w.wont_echo_time.is_some() || w.fansi_detect_until.is_some());
                 if any_pending {
                     prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
                 } else {
@@ -15002,6 +15060,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         });
     }
 
+    // Reset terminal state after reload — clear stale mouse capture, etc.
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    app.mouse_capture_active = false;
+
     // Initial draw - after reload, we need to force a complete redraw
     // because the terminal state may be inconsistent
     terminal.clear()?;
@@ -15108,7 +15170,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 if let Some(Ok(event)) = maybe_event {
                 // Handle mouse events
                 if let Event::Mouse(mouse) = event {
-                    if app.settings.mouse_enabled && app.has_new_popup() {
+                    if !app.settings.mouse_enabled {
+                        continue;
+                    }
+                    if app.has_new_popup() {
+                        // Popup mode: existing popup mouse handling
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
                                 // Try highlight first (content area click)
@@ -15140,7 +15206,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if let Some(state) = app.popup_manager.current_mut() {
                                     state.mouse_scroll_up();
                                 }
-                                // Fast direct render bypassing ratatui
                                 let tc = app.settings.theme;
                                 if let Some(state) = app.popup_manager.current() {
                                     popup::console_renderer::render_popup_content_direct(state, &tc);
@@ -15151,7 +15216,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if let Some(state) = app.popup_manager.current_mut() {
                                     state.mouse_scroll_down();
                                 }
-                                // Fast direct render bypassing ratatui
                                 let tc = app.settings.theme;
                                 if let Some(state) = app.popup_manager.current() {
                                     popup::console_renderer::render_popup_content_direct(state, &tc);
@@ -15551,6 +15615,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                             // Activate prompt check if server data set wont_echo_time
                             if app.worlds[world_idx].wont_echo_time.is_some() {
+                                prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+                            }
+                            // Activate timer for FANSI login timeout
+                            if app.worlds[world_idx].fansi_detect_until.is_some() {
                                 prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
                             }
                             // Activate pending update if lines were paused
@@ -16135,8 +16203,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                 }
+                // Check for expired FANSI detection windows
+                let now_fansi = std::time::Instant::now();
+                for world in &mut app.worlds {
+                    if let Some(deadline) = world.fansi_detect_until {
+                        if now_fansi >= deadline {
+                            if let Some(login_cmd) = world.fansi_login_pending.take() {
+                                if let Some(tx) = &world.command_tx {
+                                    let _ = tx.try_send(WriteCommand::Text(login_cmd));
+                                }
+                            }
+                            world.fansi_detect_until = None;
+                        }
+                    }
+                }
                 // Re-arm: check again in 150ms if any world still needs it
-                let any_pending_prompt = app.worlds.iter().any(|w| w.wont_echo_time.is_some());
+                let any_pending_prompt = app.worlds.iter().any(|w| w.wont_echo_time.is_some() || w.fansi_detect_until.is_some());
                 if any_pending_prompt {
                     prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
                 } else {
@@ -19435,10 +19517,20 @@ fn spawn_remote_ping_check(
         }
     }
 
+    // Console line showing which world the console/server is viewing
+    let console_world = app.worlds.get(app.current_world_index)
+        .map(|w| w.name.clone())
+        .unwrap_or_else(|| "-".to_string());
+
     if snapshots.is_empty() {
-        // No clients — send result immediately
+        // No remote clients — still show console line
         app.remote_ping_responses = None;
-        let lines = vec!["No remote clients connected.".to_string()];
+        let lines = vec![
+            format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
+                "ID", "IP", "Type", "Conn", "Idle", "Live", "World"),
+            format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
+                "-", "localhost", "Console", "-", "-", "Yes", console_world),
+        ];
         let event_tx_clone = event_tx.clone();
         tokio::spawn(async move {
             let _ = event_tx_clone.send(AppEvent::RemoteListResult(requesting_client_id, world_index, lines)).await;
@@ -19454,6 +19546,8 @@ fn spawn_remote_ping_check(
         let mut lines = Vec::new();
         lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
             "ID", "IP", "Type", "Conn", "Idle", "Live", "World"));
+        lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
+            "-", "localhost", "Console", "-", "-", "Yes", console_world));
         for snap in &snapshots {
             let alive = if responded.contains(&snap.id) { "Yes" } else { "No" };
             lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
@@ -19473,7 +19567,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.open_help_popup_new();
         }
         Command::HelpTopic { ref topic } => {
-            // Try Clay help first, then TF help
             use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
             if let Some(lines) = get_topic_help(topic) {
                 app.popup_manager.open(create_topic_help_popup(lines));
@@ -19481,19 +19574,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     state.select_field(HELP_FIELD_CONTENT);
                 }
             } else {
-                // Try TF help
-                match app.tf_engine.execute(&format!("#help {}", topic)) {
-                    tf::TfCommandResult::Success(Some(msg)) => {
-                        let lines: Vec<String> = msg.lines().map(|l| l.to_string()).collect();
-                        app.popup_manager.open(create_topic_help_popup(lines));
-                        if let Some(state) = app.popup_manager.current_mut() {
-                            state.select_field(HELP_FIELD_CONTENT);
-                        }
-                    }
-                    _ => {
-                        app.add_output(&format!("No help available for '{}'", topic));
-                    }
-                }
+                app.add_output(&format!("No help available for '{}'", topic));
             }
         }
         Command::Version => {
@@ -19644,7 +19725,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
             // MUD connection: Determine host/port/ssl: use args if provided, else use stored settings
             let world_settings = &app.current_world().settings;
-            let (host, port, use_ssl) = if let (Some(h), Some(p)) = (arg_host, arg_port) {
+            let (raw_host, port, use_ssl) = if let (Some(h), Some(p)) = (arg_host, arg_port) {
                 (h, p, arg_ssl)
             } else if !world_settings.hostname.is_empty() && !world_settings.port.is_empty() {
                 (
@@ -19655,6 +19736,15 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             } else {
                 app.add_output("Configure host/port in world settings (/worlds)");
                 return false;
+            };
+
+            // Split comma-separated hostnames (primary,fallback)
+            let (host, fallback_host) = if let Some(comma) = raw_host.find(',') {
+                let primary = raw_host[..comma].trim().to_string();
+                let fallback = raw_host[comma+1..].trim().to_string();
+                (primary, if fallback.is_empty() { None } else { Some(fallback) })
+            } else {
+                (raw_host, None)
             };
 
             // Check if using TLS proxy for connection preservation
@@ -19740,7 +19830,14 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 }
                                 let user = app.current_world().settings.user.clone();
                                 let password = app.current_world().settings.password.clone();
-                                if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                // FANSI worlds: always set up client detection window
+                                if app.current_world().settings.encoding == Encoding::Fansi {
+                                    app.current_world_mut().fansi_detect_until = Some(std::time::Instant::now() + Duration::from_secs(2));
+                                    if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                        let connect_cmd = format!("connect {} {}", user, password);
+                                        app.current_world_mut().fansi_login_pending = Some(connect_cmd);
+                                    }
+                                } else if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
                                     let connect_cmd = format!("connect {} {}", user, password);
                                     let _ = cmd_tx.send(WriteCommand::Text(connect_cmd)).await;
                                 }
@@ -19886,27 +19983,24 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             let reader_conn_id = app.current_world().connection_id;
             let world_name = app.current_world().name.clone();
             let connect_host = host.clone();
+            let connect_fallback = fallback_host.clone();
             let connect_port = port.clone();
             let connect_use_ssl = use_ssl;
             let event_tx_connect = event_tx.clone();
 
             tokio::spawn(async move {
-                // Resolve DNS and try connecting to each address.
-                // Prefer IPv4 errors over IPv6 "network unreachable" since IPv4
-                // errors (e.g. "connection refused") are more informative when
-                // the host is down but IPv6 is simply not routable.
-                let connect_result = async {
+                // Try connecting to a host, resolving DNS and preferring IPv4
+                async fn try_connect_host(host: &str, port: &str) -> Result<TcpStream, std::io::Error> {
                     use tokio::net::lookup_host;
                     let addrs: Vec<std::net::SocketAddr> = lookup_host(
-                        format!("{}:{}", connect_host, connect_port)
+                        format!("{}:{}", host, port)
                     ).await?.collect();
                     if addrs.is_empty() {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::AddrNotAvailable,
-                            format!("Could not resolve {}", connect_host),
+                            format!("Could not resolve {}", host),
                         ));
                     }
-                    // Try IPv4 addresses first, then IPv6
                     let mut sorted = addrs.clone();
                     sorted.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
                     let mut last_err = None;
@@ -19923,11 +20017,26 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             }
                         }
                     }
-                    // Prefer IPv4 error (more informative) over IPv6 "network unreachable"
                     Err(ipv4_err.or(last_err).unwrap_or_else(|| {
                         std::io::Error::other("Connection failed")
                     }))
-                }.await;
+                }
+
+                // Try primary host, fall back to secondary if configured
+                let connect_result = match try_connect_host(&connect_host, &connect_port).await {
+                    Ok(stream) => Ok(stream),
+                    Err(primary_err) => {
+                        if let Some(ref fallback) = connect_fallback {
+                            let _ = event_tx_connect.send(AppEvent::ServerData(
+                                world_name.clone(),
+                                format!("Primary host {} failed: {}, trying {}...\r\n", connect_host, primary_err, fallback).into_bytes(),
+                            )).await;
+                            try_connect_host(fallback, &connect_port).await
+                        } else {
+                            Err(primary_err)
+                        }
+                    }
+                };
                 match connect_result {
                     Ok(tcp_stream) => {
                         // Store the socket fd/handle for hot reload (before splitting)
@@ -26358,7 +26467,7 @@ mod tests {
             "help", "version", "quit", "reload", "update", "setup", "web", "actions",
             "connections", "l", "worlds", "world", "disconnect", "dc",
             "flush", "menu", "send", "remote", "ban", "unban",
-            "testmusic", "dump", "notify", "addworld", "edit", "tag", "tags",
+            "testmusic", "dump", "notify", "addworld", "note", "tag", "tags",
             "dict", "urban", "translate", "tr", "font",
         ].into_iter().map(|s| s.to_string()).collect();
         rust_commands.sort();

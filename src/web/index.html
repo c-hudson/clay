@@ -72,9 +72,7 @@
             <div class="menu-item" data-action="world-selector">World Selector<span class="shortcut">/worlds</span></div>
             <div class="menu-item" data-action="actions">Actions<span class="shortcut">/actions</span></div>
             <div class="menu-sep"></div>
-            <div class="menu-item" data-action="setup">Setup<span class="shortcut">/setup</span></div>
-            <div class="menu-item" data-action="web">Web Settings<span class="shortcut">/web</span></div>
-            <div class="menu-item" data-action="font">Font<span class="shortcut">/font</span></div>
+            <div class="menu-item" data-action="setup">Settings<span class="shortcut">/setup</span></div>
             <div class="menu-item" data-action="theme-editor">Theme Editor</div>
             <div class="menu-item" data-action="keybind-editor">Keybind Editor</div>
             <div class="menu-sep"></div>
@@ -169,7 +167,6 @@
                 <div id="menu-list" class="menu-list">
                     <div class="menu-item" data-command="/help">Help</div>
                     <div class="menu-item" data-command="/setup">Settings</div>
-                    <div class="menu-item" data-command="/web">Web Settings</div>
                     <div class="menu-item" data-command="/actions">Actions</div>
                     <div class="menu-item" data-command="/worlds">World Selector</div>
                     <div class="menu-item" data-command="/connections">Connected Worlds</div>
@@ -458,221 +455,237 @@
             </div>
         </div>
 
-        <!-- Setup popup (/setup) -->
-        <div id="setup-modal" class="modal">
-            <div class="modal-content setup-modal-content">
-                <div class="popup-header">
-                    <span class="popup-title">Settings</span>
-                    <button id="setup-close-btn" class="popup-close">&#10005;</button>
-                </div>
-                <div class="popup-body">
-                    <div class="setting-row">
-                        <span class="setting-label">World switching</span>
-                        <div class="setting-value">
-                            <select id="setup-world-switch-select" class="form-select">
-                                <option value="Unseen First">Unseen First</option>
-                                <option value="Alphabetical">Alphabetical</option>
-                            </select>
-                        </div>
+        <!-- Combined Settings popup (/setup, /web) -->
+        <div id="settings-modal" class="modal">
+            <div class="modal-content settings-modal-content">
+                <div class="settings-layout">
+                    <div class="settings-sidebar">
+                        <button class="settings-tab-btn active" data-tab="general" title="General">
+                            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                                <circle cx="10" cy="10" r="2.8"/><path d="M10 2v2.2M10 15.8V18M2 10h2.2M15.8 10H18M4.2 4.2l1.6 1.6M14.2 14.2l1.6 1.6M4.2 15.8l1.6-1.6M14.2 5.8l1.6-1.6"/>
+                            </svg>
+                        </button>
+                        <button class="settings-tab-btn" data-tab="web" title="Web">
+                            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                                <circle cx="10" cy="10" r="7.5"/><ellipse cx="10" cy="10" rx="3.2" ry="7.5"/><path d="M2.8 7.5h14.4M2.8 12.5h14.4"/>
+                            </svg>
+                        </button>
+                        <button class="settings-tab-btn" data-tab="font" title="Font">
+                            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M4 16L10 4l6 12M6 12h8"/>
+                            </svg>
+                        </button>
                     </div>
-                    <div class="setting-row">
-                        <span class="setting-label">Theme</span>
-                        <div class="setting-value">
-                            <select id="setup-theme-select" class="form-select">
-                                <option value="Dark">Dark</option>
-                                <option value="Light">Light</option>
-                            </select>
+                    <div class="settings-content">
+                        <div class="popup-header">
+                            <span class="popup-title" id="settings-title">General</span>
+                            <button id="settings-close-btn" class="popup-close">&#10005;</button>
                         </div>
-                    </div>
-                    <div class="setting-row">
-                        <span class="setting-label">Color Offset</span>
-                        <div class="setting-value">
-                            <div class="stepper">
-                                <button id="setup-color-offset-minus" class="stepper-btn">&#8722;</button>
-                                <span id="setup-color-offset-value" class="stepper-value">OFF</span>
-                                <button id="setup-color-offset-plus" class="stepper-btn">+</button>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="setting-row">
-                        <span class="setting-label">Input height</span>
-                        <div class="setting-value">
-                            <div class="stepper">
-                                <button id="setup-height-minus" class="stepper-btn">&#8722;</button>
-                                <span id="setup-input-height-value" class="stepper-value">3</span>
-                                <button id="setup-height-plus" class="stepper-btn">+</button>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="setting-row" id="setup-transparency-row" style="display:none">
-                        <span class="setting-label">Transparency</span>
-                        <div class="setting-value" style="flex:1">
-                            <div class="slider-container">
-                                <input type="range" id="setup-transparency-slider" min="30" max="100" value="100" class="slider">
-                                <span id="setup-transparency-value" class="stepper-value" style="min-width:36px;text-align:center">100%</span>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="settings-two-column">
-                        <div class="settings-column">
-                            <div class="setting-row">
-                                <span class="setting-label">More mode</span>
-                                <div class="setting-value">
-                                    <div id="setup-more-mode-toggle" class="toggle"></div>
+                        <!-- General section -->
+                        <div class="settings-section active" id="settings-general">
+                            <div class="popup-body">
+                                <div class="setting-row">
+                                    <span class="setting-label">World switching</span>
+                                    <div class="setting-value">
+                                        <select id="setup-world-switch-select" class="form-select">
+                                            <option value="Unseen First">Unseen First</option>
+                                            <option value="Alphabetical">Alphabetical</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">Theme</span>
+                                    <div class="setting-value">
+                                        <select id="setup-theme-select" class="form-select">
+                                            <option value="Dark">Dark</option>
+                                            <option value="Light">Light</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">Color Offset</span>
+                                    <div class="setting-value">
+                                        <div class="stepper">
+                                            <button id="setup-color-offset-minus" class="stepper-btn">&#8722;</button>
+                                            <span id="setup-color-offset-value" class="stepper-value">OFF</span>
+                                            <button id="setup-color-offset-plus" class="stepper-btn">+</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">Input height</span>
+                                    <div class="setting-value">
+                                        <div class="stepper">
+                                            <button id="setup-height-minus" class="stepper-btn">&#8722;</button>
+                                            <span id="setup-input-height-value" class="stepper-value">3</span>
+                                            <button id="setup-height-plus" class="stepper-btn">+</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="setting-row" id="setup-transparency-row" style="display:none">
+                                    <span class="setting-label">Transparency</span>
+                                    <div class="setting-value" style="flex:1">
+                                        <div class="slider-container">
+                                            <input type="range" id="setup-transparency-slider" min="30" max="100" value="100" class="slider">
+                                            <span id="setup-transparency-value" class="stepper-value" style="min-width:36px;text-align:center">100%</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="settings-two-column">
+                                    <div class="settings-column">
+                                        <div class="setting-row">
+                                            <span class="setting-label">More mode</span>
+                                            <div class="setting-value">
+                                                <div id="setup-more-mode-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row">
+                                            <span class="setting-label">TLS Proxy</span>
+                                            <div class="setting-value">
+                                                <div id="setup-tls-proxy-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row">
+                                            <span class="setting-label">New Indicator</span>
+                                            <div class="setting-value">
+                                                <div id="setup-new-line-indicator-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row">
+                                            <span class="setting-label">Debug</span>
+                                            <div class="setting-value">
+                                                <div id="setup-debug-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="settings-column">
+                                        <div class="setting-row">
+                                            <span class="setting-label">ANSI Music</span>
+                                            <div class="setting-value">
+                                                <div id="setup-ansi-music-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row">
+                                            <span class="setting-label">ZWJ Sequence</span>
+                                            <div class="setting-value">
+                                                <div id="setup-zwj-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
-                            <div class="setting-row">
-                                <span class="setting-label">TLS Proxy</span>
-                                <div class="setting-value">
-                                    <div id="setup-tls-proxy-toggle" class="toggle"></div>
+                        </div>
+                        <!-- Web section -->
+                        <div class="settings-section" id="settings-web">
+                            <div class="popup-body">
+                                <div class="setting-row">
+                                    <span class="setting-label">Protocol</span>
+                                    <div class="setting-value">
+                                        <select id="web-protocol-select" class="form-select">
+                                            <option value="non-secure">Non-Secure</option>
+                                            <option value="secure">Secure</option>
+                                        </select>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="setting-row">
-                                <span class="setting-label">New Indicator</span>
-                                <div class="setting-value">
-                                    <div id="setup-new-line-indicator-toggle" class="toggle"></div>
+                                <div class="setting-row">
+                                    <span class="setting-label" id="http-label">HTTP enabled</span>
+                                    <div class="setting-value">
+                                        <select id="web-http-enabled-select" class="form-select">
+                                            <option value="off">off</option>
+                                            <option value="on">on</option>
+                                        </select>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="setting-row">
-                                <span class="setting-label">Debug</span>
-                                <div class="setting-value">
-                                    <div id="setup-debug-toggle" class="toggle"></div>
+                                <div class="setting-row">
+                                    <span class="setting-label" id="http-port-label">HTTP port</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="web-http-port" autocomplete="off" class="web-input">
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">Allow List</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="localhost, 192.168.*">
+                                    </div>
+                                </div>
+                                <div class="setting-row tls-field" id="tls-cert-field" style="display: none;">
+                                    <span class="setting-label">TLS cert file</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="web-cert-file" autocomplete="off" class="web-input" placeholder="/path/to/cert.pem">
+                                    </div>
+                                </div>
+                                <div class="setting-row tls-field" id="tls-key-field" style="display: none;">
+                                    <span class="setting-label">TLS key file</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="web-key-file" autocomplete="off" class="web-input" placeholder="/path/to/key.pem">
+                                    </div>
                                 </div>
                             </div>
                         </div>
-                        <div class="settings-column">
-                            <div class="setting-row">
-                                <span class="setting-label">ANSI Music</span>
-                                <div class="setting-value">
-                                    <div id="setup-ansi-music-toggle" class="toggle"></div>
+                        <!-- Font section -->
+                        <div class="settings-section" id="settings-font">
+                            <div class="popup-body">
+                                <div class="font-family-label">Font family</div>
+                                <div class="font-family-list" id="font-family-list"></div>
+                                <div class="font-size-section">
+                                    <div class="setting-row">
+                                        <span class="setting-label">Weight</span>
+                                        <div class="setting-value">
+                                            <div class="stepper">
+                                                <button id="font-weight-minus" class="stepper-btn">&#8722;</button>
+                                                <span id="font-weight-value" class="stepper-value">400</span>
+                                                <button id="font-weight-plus" class="stepper-btn">+</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="setting-label">Phone</span>
+                                        <div class="setting-value">
+                                            <div class="stepper">
+                                                <button id="font-phone-minus" class="stepper-btn">&#8722;</button>
+                                                <span id="font-phone-value" class="stepper-value">10</span>
+                                                <button id="font-phone-plus" class="stepper-btn">+</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="setting-label">Tablet</span>
+                                        <div class="setting-value">
+                                            <div class="stepper">
+                                                <button id="font-tablet-minus" class="stepper-btn">&#8722;</button>
+                                                <span id="font-tablet-value" class="stepper-value">14</span>
+                                                <button id="font-tablet-plus" class="stepper-btn">+</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="setting-label">Desktop</span>
+                                        <div class="setting-value">
+                                            <div class="stepper">
+                                                <button id="font-desktop-minus" class="stepper-btn">&#8722;</button>
+                                                <span id="font-desktop-value" class="stepper-value">18</span>
+                                                <button id="font-desktop-plus" class="stepper-btn">+</button>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
-                            <div class="setting-row">
-                                <span class="setting-label">ZWJ Sequence</span>
-                                <div class="setting-value">
-                                    <div id="setup-zwj-toggle" class="toggle"></div>
-                                </div>
-                            </div>
+                        </div>
+                        <!-- Shared footer -->
+                        <div class="popup-footer">
+                            <button id="settings-help-btn" class="btn btn-help">?</button>
+                            <span class="footer-spacer"></span>
+                            <button id="settings-cancel-btn" class="btn">Cancel</button>
+                            <button id="settings-save-btn" class="btn btn-primary">Save</button>
                         </div>
                     </div>
-                </div>
-                <div class="popup-footer">
-                    <button id="setup-help-btn" class="btn btn-help">?</button>
-                    <span class="footer-spacer"></span>
-                    <button id="setup-cancel-btn" class="btn">Cancel</button>
-                    <button id="setup-save-btn" class="btn btn-primary">Save</button>
                 </div>
             </div>
         </div>
 
-        <!-- Font popup (/font) -->
-        <div id="font-modal" class="modal">
-            <div class="modal-content font-modal-content">
-                <div class="popup-header">
-                    <span class="popup-title">Font</span>
-                    <button id="font-close-btn" class="popup-close">&#10005;</button>
-                </div>
-                <div class="popup-body">
-                    <div class="font-family-label">Font family</div>
-                    <div class="font-family-list" id="font-family-list"></div>
-                    <div class="font-size-section">
-                        <div class="setting-row">
-                            <span class="setting-label">Weight</span>
-                            <div class="setting-value">
-                                <div class="stepper">
-                                    <button id="font-weight-minus" class="stepper-btn">&#8722;</button>
-                                    <span id="font-weight-value" class="stepper-value">400</span>
-                                    <button id="font-weight-plus" class="stepper-btn">+</button>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="setting-row">
-                            <span class="setting-label">Phone</span>
-                            <div class="setting-value">
-                                <div class="stepper">
-                                    <button id="font-phone-minus" class="stepper-btn">&#8722;</button>
-                                    <span id="font-phone-value" class="stepper-value">10</span>
-                                    <button id="font-phone-plus" class="stepper-btn">+</button>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="setting-row">
-                            <span class="setting-label">Tablet</span>
-                            <div class="setting-value">
-                                <div class="stepper">
-                                    <button id="font-tablet-minus" class="stepper-btn">&#8722;</button>
-                                    <span id="font-tablet-value" class="stepper-value">14</span>
-                                    <button id="font-tablet-plus" class="stepper-btn">+</button>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="setting-row">
-                            <span class="setting-label">Desktop</span>
-                            <div class="setting-value">
-                                <div class="stepper">
-                                    <button id="font-desktop-minus" class="stepper-btn">&#8722;</button>
-                                    <span id="font-desktop-value" class="stepper-value">18</span>
-                                    <button id="font-desktop-plus" class="stepper-btn">+</button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="popup-footer">
-                    <button id="font-cancel-btn" class="btn">Cancel</button>
-                    <button id="font-save-btn" class="btn btn-primary">Save</button>
-                </div>
-            </div>
-        </div>
+        <!-- Font popup removed — merged into #settings-modal -->
 
-        <!-- Web Settings popup (/web) -->
-        <div id="web-modal" class="modal">
-            <div class="modal-content web-modal-content">
-                <div class="popup-header">
-                    <span class="popup-title">Web Settings</span>
-                    <button id="web-close-btn" class="popup-close">&#10005;</button>
-                </div>
-                <div class="web-settings-form">
-                    <div class="web-field">
-                        <label>Protocol</label>
-                        <select id="web-protocol-select" class="form-select">
-                            <option value="non-secure">Non-Secure</option>
-                            <option value="secure">Secure</option>
-                        </select>
-                    </div>
-                    <div class="web-field">
-                        <label id="http-label">HTTP enabled</label>
-                        <select id="web-http-enabled-select" class="form-select">
-                            <option value="off">off</option>
-                            <option value="on">on</option>
-                        </select>
-                    </div>
-                    <div class="web-field">
-                        <label id="http-port-label">HTTP port</label>
-                        <input type="text" id="web-http-port" autocomplete="off" class="web-input">
-                    </div>
-                    <!-- WS enabled and WS port removed — WS now shares the HTTP port -->
-                    <div class="web-field">
-                        <label>Allow List</label>
-                        <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="localhost, 192.168.*">
-                    </div>
-                    <div class="web-field tls-field" id="tls-cert-field" style="display: none;">
-                        <label>TLS cert file</label>
-                        <input type="text" id="web-cert-file" autocomplete="off" class="web-input" placeholder="/path/to/cert.pem">
-                    </div>
-                    <div class="web-field tls-field" id="tls-key-field" style="display: none;">
-                        <label>TLS key file</label>
-                        <input type="text" id="web-key-file" autocomplete="off" class="web-input" placeholder="/path/to/key.pem">
-                    </div>
-                </div>
-                <div class="modal-buttons">
-                    <button id="web-help-btn" class="btn-help">?</button>
-                    <span class="footer-spacer"></span>
-                    <button id="web-cancel-btn">Cancel</button>
-                    <button id="web-save-btn" class="btn-primary">Save</button>
-                </div>
-            </div>
-        </div>
+        <!-- Web Settings popup removed — merged into #settings-modal above -->
 
         <!-- Device Mode selector (long-press hamburger menu) -->
         <div id="device-mode-modal" class="modal">
