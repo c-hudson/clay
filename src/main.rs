@@ -9928,6 +9928,18 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
 #[tokio::main]
 async fn main() -> io::Result<()> {
 
+    // On Windows, ensure Winsock is initialized before any socket operations.
+    // This is needed because inherited socket handles from a parent process
+    // (during hot reload) require WSAStartup in the new process.
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn WSAStartup(wVersionRequired: u16, lpWSAData: *mut [u8; 408]) -> i32;
+        }
+        let mut wsa_data = [0u8; 408];
+        unsafe { WSAStartup(0x0202, &mut wsa_data); }
+    }
+
     // =========================================================================
     // CLI argument parsing - single structured pass with validation
     // =========================================================================
@@ -10946,7 +10958,7 @@ pub async fn run_app_headless(
                                 ));
                             }
                             app.ws_broadcast(WsMessage::ServerReloading);
-                            exec_reload(&app)?;
+                            exec_reload(&mut app)?;
                             return Ok(());
                         }
                     }
@@ -11043,7 +11055,7 @@ pub async fn run_app_headless(
                                                         let _ = std::fs::remove_file(&success.temp_path);
                                                         app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
                                                         app.ws_broadcast(WsMessage::ServerReloading);
-                                                        exec_reload(&app)?;
+                                                        exec_reload(&mut app)?;
                                                         return Ok(());
                                                     }
                                                     Err(e2) => {
@@ -11054,7 +11066,7 @@ pub async fn run_app_headless(
                                             } else {
                                                 app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
                                                 app.ws_broadcast(WsMessage::ServerReloading);
-                                                exec_reload(&app)?;
+                                                exec_reload(&mut app)?;
                                                 return Ok(());
                                             }
                                         }
@@ -11347,7 +11359,7 @@ pub async fn run_app_headless(
                             ));
                         }
                         app.ws_broadcast(WsMessage::ServerReloading);
-                        exec_reload(&app)?;
+                        exec_reload(&mut app)?;
                         return Ok(());
                     }
                 }
@@ -13085,7 +13097,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 {
                                     debug_log(is_debug_enabled(), "HEADLESS: WS client requested reload");
                                     app.ws_broadcast(WsMessage::ServerReloading);
-                                    exec_reload(&app)?;
+                                    exec_reload(&mut app)?;
                                     return Ok(());
                                 }
                             }
@@ -13169,7 +13181,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                             std::io::stdout(),
                                                             crossterm::terminal::LeaveAlternateScreen
                                                         );
-                                                        exec_reload(&app)?;
+                                                        exec_reload(&mut app)?;
                                                         return Ok(());
                                                     }
                                                     Err(e2) => {
@@ -13185,7 +13197,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     std::io::stdout(),
                                                     crossterm::terminal::LeaveAlternateScreen
                                                 );
-                                                exec_reload(&app)?;
+                                                exec_reload(&mut app)?;
                                                 return Ok(());
                                             }
                                         }

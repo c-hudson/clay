@@ -345,7 +345,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         #[cfg(all(unix, not(target_os = "android")))]
                         {
                             app.ws_broadcast(WsMessage::ServerReloading);
-                            crate::exec_reload(&app)?;
+                            crate::exec_reload(&mut app)?;
                             return Ok(());
                         }
                     }

@@ -888,7 +888,7 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
 }
 
 #[cfg(all(unix, not(target_os = "android")))]
-pub fn exec_reload(app: &App) -> io::Result<()> {
+pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // Always log reload (not gated by debug flag) so we can trace issues
     debug_log(true, "RELOAD: Starting exec_reload");
 
@@ -950,7 +950,7 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
 /// Uses a named event to synchronize so the old process stays alive until
 /// the new one has taken over the console (prevents shell prompt flash).
 #[cfg(windows)]
-pub fn exec_reload(app: &App) -> io::Result<()> {
+pub fn exec_reload(app: &mut App) -> io::Result<()> {
     extern "system" {
         fn CreateEventA(
             lpEventAttributes: *const std::ffi::c_void,
@@ -963,6 +963,27 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
     }
 
     debug_log(true, "RELOAD: Starting exec_reload (Windows)");
+
+    // Shut down HTTP/HTTPS servers to release the port before spawning new process
+    if let Some(ref mut server) = app.http_server {
+        if let Some(tx) = server.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+    #[cfg(feature = "rustls-backend")]
+    if let Some(ref mut server) = app.https_server {
+        if let Some(tx) = server.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+    #[cfg(feature = "native-tls-backend")]
+    if let Some(ref mut server) = app.https_server {
+        if let Some(tx) = server.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+    // Give the server tasks a moment to release the port
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
     debug_log(true, "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
