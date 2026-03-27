@@ -54,8 +54,7 @@ fn main() {
     embed_windows_icon();
 
     // On Windows GNU targets with webview-gui, copy WebView2Loader.dll next to the binary.
-    // The static lib (WebView2LoaderStatic.lib) is MSVC-only and can't be used with MinGW.
-    // Without this DLL next to the exe, Windows silently fails to start the process.
+    // The DLL is a link-time import — Windows won't start the exe without it.
     copy_webview2_dll_if_needed();
 }
 

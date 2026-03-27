@@ -917,6 +917,128 @@ fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
         .ok()
 }
 
+/// Get all non-loopback IPv4 addresses on this machine.
+fn get_local_ip_addresses() -> Vec<String> {
+    let mut addrs = Vec::new();
+
+    // Use socket trick: connect UDP to a public IP (doesn't send anything)
+    // to discover the default local IP
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local_addr) = socket.local_addr() {
+                let ip = local_addr.ip().to_string();
+                if ip != "0.0.0.0" && !addrs.contains(&ip) {
+                    addrs.push(ip);
+                }
+            }
+        }
+    }
+
+    // On Linux, parse /proc/net/fib_trie or use ip command
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("hostname")
+            .arg("-I")
+            .output()
+        {
+            let ips = String::from_utf8_lossy(&output.stdout);
+            for ip in ips.split_whitespace() {
+                let ip = ip.trim().to_string();
+                if !ip.is_empty() && ip != "127.0.0.1" && !addrs.contains(&ip) {
+                    addrs.push(ip);
+                }
+            }
+        }
+    }
+
+    addrs
+}
+
+/// Generate a self-signed TLS certificate and key, saving to the given paths.
+/// Uses rcgen for pure-Rust X.509 cert generation (no external tools needed).
+fn generate_self_signed_cert(cert_path: &std::path::Path, key_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    use rcgen::{CertificateParams, KeyPair};
+    use std::io::Write;
+
+    let mut san_names = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+
+    // Add all local IP addresses so the cert works across the LAN
+    if let Ok(hostname) = std::process::Command::new("hostname").output() {
+        let name = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
+        if !name.is_empty() && !san_names.contains(&name) {
+            san_names.push(name);
+        }
+    }
+    for iface in get_local_ip_addresses() {
+        if !san_names.contains(&iface) {
+            san_names.push(iface);
+        }
+    }
+
+    let params = CertificateParams::new(san_names.clone())?;
+
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+
+    let mut cert_file = std::fs::File::create(cert_path)?;
+    cert_file.write_all(cert.pem().as_bytes())?;
+
+    let mut key_file = std::fs::File::create(key_path)?;
+    key_file.write_all(key_pair.serialize_pem().as_bytes())?;
+
+    // Save the SAN list so we can detect IP changes on next startup
+    let ips_path = cert_path.with_extension("ips");
+    let mut sorted = san_names;
+    sorted.sort();
+    let _ = std::fs::write(&ips_path, sorted.join("\n"));
+
+    Ok(())
+}
+
+/// Check if a Clay-generated cert needs regeneration due to IP changes.
+/// Returns true if the cert should be regenerated.
+fn cert_needs_regeneration(cert_path: &std::path::Path) -> bool {
+    let ips_path = cert_path.with_extension("ips");
+
+    // No IPs file means not a Clay-generated cert — don't touch it
+    if !ips_path.exists() {
+        return false;
+    }
+
+    // Read saved IPs
+    let saved = match std::fs::read_to_string(&ips_path) {
+        Ok(s) => s,
+        Err(_) => return true, // Can't read — regenerate
+    };
+    let mut saved_ips: Vec<String> = saved.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    saved_ips.sort();
+
+    // Build current IPs list (same logic as generate_self_signed_cert)
+    let mut current_ips = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(hostname) = std::process::Command::new("hostname").output() {
+        let name = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
+        if !name.is_empty() && !current_ips.contains(&name) {
+            current_ips.push(name);
+        }
+    }
+    for ip in get_local_ip_addresses() {
+        if !current_ips.contains(&ip) {
+            current_ips.push(ip);
+        }
+    }
+    current_ips.sort();
+
+    saved_ips != current_ips
+}
+
 pub fn get_home_dir() -> String {
     home::home_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -10727,6 +10849,38 @@ pub async fn run_app_headless(
 
     // Start unified HTTP+WS server if enabled
     if app.settings.http_enabled {
+        // Auto-generate self-signed certs if secure mode enabled but no cert files
+        if app.settings.web_secure
+            && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
+        {
+            let home = get_home_dir();
+            let cert_path = std::path::PathBuf::from(&home).join(clay_filename("clay.cert.pem"));
+            let key_path = std::path::PathBuf::from(&home).join(clay_filename("clay.key.pem"));
+
+            // Generate if files don't exist, or regenerate if IPs changed
+            let needs_gen = !cert_path.exists() || !key_path.exists();
+            let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
+            if needs_gen || needs_regen {
+                if needs_regen {
+                    app.add_output("\u{2728} IP address changed, regenerating TLS certificate...");
+                }
+                match generate_self_signed_cert(&cert_path, &key_path) {
+                    Ok(()) => {
+                        app.add_output("\u{2728} Generated self-signed TLS certificate.");
+                    }
+                    Err(e) => {
+                        app.add_output(&format!("\u{2728} Failed to generate TLS certificate: {}", e));
+                        app.add_output("\u{2728} Falling back to non-secure HTTP.");
+                    }
+                }
+            }
+
+            if cert_path.exists() && key_path.exists() {
+                app.settings.websocket_cert_file = cert_path.to_string_lossy().to_string();
+                app.settings.websocket_key_file = key_path.to_string_lossy().to_string();
+                let _ = persistence::save_settings(&app);
+            }
+        }
         if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
             && !app.settings.websocket_key_file.is_empty()
@@ -12172,6 +12326,37 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     // Start unified HTTP+WS server if enabled
     if app.settings.http_enabled {
+        // Auto-generate self-signed certs if secure mode enabled but no cert files
+        if app.settings.web_secure
+            && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
+        {
+            let home = get_home_dir();
+            let cert_path = std::path::PathBuf::from(&home).join(clay_filename("clay.cert.pem"));
+            let key_path = std::path::PathBuf::from(&home).join(clay_filename("clay.key.pem"));
+
+            let needs_gen = !cert_path.exists() || !key_path.exists();
+            let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
+            if needs_gen || needs_regen {
+                if needs_regen {
+                    app.add_output("\u{2728} IP address changed, regenerating TLS certificate...");
+                }
+                match generate_self_signed_cert(&cert_path, &key_path) {
+                    Ok(()) => {
+                        app.add_output("\u{2728} Generated self-signed TLS certificate.");
+                    }
+                    Err(e) => {
+                        app.add_output(&format!("\u{2728} Failed to generate TLS certificate: {}", e));
+                        app.add_output("\u{2728} Falling back to non-secure HTTP.");
+                    }
+                }
+            }
+
+            if cert_path.exists() && key_path.exists() {
+                app.settings.websocket_cert_file = cert_path.to_string_lossy().to_string();
+                app.settings.websocket_key_file = key_path.to_string_lossy().to_string();
+                let _ = persistence::save_settings(&app);
+            }
+        }
         if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
             && !app.settings.websocket_key_file.is_empty()

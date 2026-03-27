@@ -19,6 +19,9 @@ aes-gcm = "0.10"
 getrandom = "0.2"
 base64 = "0.21"
 
+# Self-signed certificate generation (pure Rust, same crypto as rustls)
+rcgen = "0.14"
+
 # TLS support - native-tls by default, rustls for static builds
 tokio-native-tls = { version = "0.3", optional = true }
 native-tls = { version = "0.2", optional = true }

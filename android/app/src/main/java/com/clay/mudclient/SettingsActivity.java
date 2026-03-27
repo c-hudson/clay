@@ -116,7 +116,7 @@ public class SettingsActivity extends AppCompatActivity {
 
     private void updatePortHint() {
         if (secureSwitch.isChecked()) {
-            serverPortInput.setHint("9001");
+            serverPortInput.setHint("9000");
         } else {
             serverPortInput.setHint("9000");
         }
@@ -141,7 +141,7 @@ public class SettingsActivity extends AppCompatActivity {
         int port;
         if (portStr.isEmpty()) {
             // Use default port based on secure setting
-            port = useSecure ? 9001 : 9000;
+            port = 9000;
         } else {
             try {
                 port = Integer.parseInt(portStr);
