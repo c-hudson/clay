@@ -1676,8 +1676,16 @@ pub(crate) fn dispatch_remote_action(
         "cursor_word_right" => { app.input.word_right(); }
         "cursor_home" => { app.input.home(); }
         "cursor_end" => { app.input.end(); }
-        "cursor_up" => { app.input.move_cursor_up(); }
-        "cursor_down" => { app.input.move_cursor_down(); }
+        "cursor_up" => {
+            if app.input.move_cursor_up() {
+                app.input.history_prev();
+            }
+        }
+        "cursor_down" => {
+            if app.input.move_cursor_down() {
+                app.input.history_next();
+            }
+        }
 
         // Editing
         "delete_backward" => { app.input.delete_char(); app.last_input_was_delete = true; }

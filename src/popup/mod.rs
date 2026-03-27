@@ -723,6 +723,8 @@ pub struct PopupState {
     pub edit_buffer: String,
     /// Error message to display
     pub error: Option<String>,
+    /// When the error was set (for auto-clear)
+    pub error_at: Option<std::time::Instant>,
     /// Scroll offset for scrollable content
     pub scroll_offset: usize,
     /// Custom state for complex popups (e.g., filter text)
@@ -788,6 +790,7 @@ impl PopupState {
             edit_scroll: 0,
             edit_buffer: String::new(),
             error: None,
+            error_at: None,
             scroll_offset: 0,
             custom: HashMap::new(),
             actual_content_height: None,

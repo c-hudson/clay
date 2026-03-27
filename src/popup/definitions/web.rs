@@ -17,10 +17,13 @@ pub const WEB_FIELD_WS_PASSWORD: FieldId = FieldId(6);
 pub const WEB_FIELD_WS_ALLOW_LIST: FieldId = FieldId(7);
 pub const WEB_FIELD_WS_CERT_FILE: FieldId = FieldId(8);
 pub const WEB_FIELD_WS_KEY_FILE: FieldId = FieldId(9);
+pub const WEB_FIELD_AUTH_KEY: FieldId = FieldId(10);
 
 // Button IDs
 pub const WEB_BTN_SAVE: ButtonId = ButtonId(1);
 pub const WEB_BTN_CANCEL: ButtonId = ButtonId(2);
+pub const WEB_BTN_REGEN_KEY: ButtonId = ButtonId(3);
+pub const WEB_BTN_COPY_KEY: ButtonId = ButtonId(4);
 
 /// Protocol options
 pub fn protocol_options() -> Vec<SelectOption> {
@@ -39,6 +42,7 @@ pub fn create_web_popup(
     ws_allow_list: &str,
     ws_cert_file: &str,
     ws_key_file: &str,
+    auth_key: &str,
 ) -> PopupDefinition {
     let protocol_idx = if web_secure { 1 } else { 0 };
 
@@ -78,6 +82,13 @@ pub fn create_web_popup(
             "TLS Key File",
             FieldKind::text(ws_key_file),
         ))
+        .with_field(Field::new(
+            WEB_FIELD_AUTH_KEY,
+            "Auth Key",
+            FieldKind::text(auth_key),
+        ))
+        .with_button(Button::new(WEB_BTN_COPY_KEY, "Copy Key").with_shortcut('K'))
+        .with_button(Button::new(WEB_BTN_REGEN_KEY, "Regen Key").with_shortcut('R'))
         .with_button(Button::new(WEB_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(WEB_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
@@ -136,6 +147,11 @@ fn web_help_text() -> Vec<String> {
         "",
         "TLS Key File: Path to your TLS/SSL private key",
         "  file (.pem or .key) for secure connections.",
+        "",
+        "Auth Key: Device authentication key for passwordless",
+        "  login from the Android app or trusted devices.",
+        "  Use Regen Key to generate a new key. Copy the key",
+        "  to paste into the Android app's settings.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -162,6 +178,7 @@ mod tests {
             false, true, "9000",
             "secret", "",
             "/path/to/cert", "/path/to/key",
+            "testkey123",
         );
         let state = PopupState::new(def);
 
@@ -176,6 +193,7 @@ mod tests {
             false, true, "9000",
             "secret", "",
             "", "",
+            "",
         );
         let state = PopupState::new(def);
 
@@ -187,6 +205,7 @@ mod tests {
             true, true, "9000",
             "secret", "",
             "", "",
+            "",
         );
         let state = PopupState::new(def);
 

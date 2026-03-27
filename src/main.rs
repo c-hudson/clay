@@ -3107,6 +3107,10 @@ impl App {
     fn open_web_popup_new(&mut self) {
         use popup::definitions::web::{create_web_popup, WEB_FIELD_PROTOCOL};
 
+        let auth_key_str = self.settings.websocket_auth_key
+            .as_ref()
+            .map(|ak| ak.key.clone())
+            .unwrap_or_default();
         let def = create_web_popup(
             self.settings.web_secure,
             self.settings.http_enabled,
@@ -3115,6 +3119,7 @@ impl App {
             &self.settings.websocket_allow_list,
             &self.settings.websocket_cert_file,
             &self.settings.websocket_key_file,
+            &auth_key_str,
         );
         self.popup_manager.open(def);
 
@@ -8403,6 +8408,7 @@ pub(crate) struct WebSettings {
     pub(crate) ws_allow_list: String,
     pub(crate) ws_cert_file: String,
     pub(crate) ws_key_file: String,
+    pub(crate) auth_key: String,
 }
 
 /// Apply web settings to app and save to disk
@@ -8420,6 +8426,14 @@ pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
     app.settings.websocket_allow_list = settings.ws_allow_list.clone();
     app.settings.websocket_cert_file = settings.ws_cert_file.clone();
     app.settings.websocket_key_file = settings.ws_key_file.clone();
+
+    // Update auth key if changed
+    if !settings.auth_key.is_empty() {
+        let current_key = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.as_str()).unwrap_or("");
+        if settings.auth_key != current_key {
+            app.settings.websocket_auth_key = Some(AuthKey::new(settings.auth_key.clone()));
+        }
+    }
 
     // Update the running server's allow list and password immediately (no reload needed)
     if let Some(ref server) = app.ws_server {
@@ -8448,6 +8462,7 @@ pub(crate) fn web_settings_from_custom_data(data: &std::collections::HashMap<Str
         ws_allow_list: data.get("ws_allow_list").cloned().unwrap_or_default(),
         ws_cert_file: data.get("ws_cert_file").cloned().unwrap_or_default(),
         ws_key_file: data.get("ws_key_file").cloned().unwrap_or_default(),
+        auth_key: data.get("auth_key").cloned().unwrap_or_default(),
     }
 }
 
@@ -8522,9 +8537,10 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     };
     use popup::definitions::web::{
         WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT,
-        WEB_FIELD_WS_PASSWORD,
+        WEB_FIELD_WS_PASSWORD, WEB_FIELD_AUTH_KEY,
         WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
-        WEB_BTN_SAVE, WEB_BTN_CANCEL, update_tls_visibility,
+        WEB_BTN_SAVE, WEB_BTN_CANCEL, WEB_BTN_REGEN_KEY, WEB_BTN_COPY_KEY,
+        update_tls_visibility,
     };
     use popup::definitions::actions::{
         ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST,
@@ -8960,6 +8976,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     ws_allow_list: state.get_text(WEB_FIELD_WS_ALLOW_LIST).unwrap_or("").to_string(),
                     ws_cert_file: state.get_text(WEB_FIELD_WS_CERT_FILE).unwrap_or("").to_string(),
                     ws_key_file: state.get_text(WEB_FIELD_WS_KEY_FILE).unwrap_or("").to_string(),
+                    auth_key: state.get_text(WEB_FIELD_AUTH_KEY).unwrap_or("").to_string(),
                 }
             };
 
@@ -8982,6 +8999,42 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             let settings = extract_settings();
                             app.popup_manager.close();
                             return NewPopupAction::WebSaved(settings);
+                        } else if state.is_button_focused(WEB_BTN_REGEN_KEY) {
+                            // Generate a new auth key and update the field
+                            use sha2::{Sha256, Digest};
+                            let mut hasher = Sha256::new();
+                            hasher.update(std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_nanos().to_le_bytes());
+                            hasher.update(std::process::id().to_le_bytes());
+                            let mut random_bytes = [0u8; 16];
+                            let _ = getrandom::getrandom(&mut random_bytes);
+                            hasher.update(&random_bytes);
+                            let new_key = hex::encode(hasher.finalize());
+                            if let Some(field) = state.definition.fields.iter_mut()
+                                .find(|f| f.id == WEB_FIELD_AUTH_KEY)
+                            {
+                                if let popup::FieldKind::Text { ref mut value, .. } = field.kind {
+                                    *value = new_key;
+                                }
+                            }
+                        } else if state.is_button_focused(WEB_BTN_COPY_KEY) {
+                            // Copy auth key to clipboard via OSC 52
+                            if let Some(key_text) = state.get_text(WEB_FIELD_AUTH_KEY) {
+                                if !key_text.is_empty() {
+                                    use std::io::Write;
+                                    let encoded = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        key_text.as_bytes(),
+                                    );
+                                    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+                                    let _ = std::io::stdout().write_all(osc52.as_bytes());
+                                    let _ = std::io::stdout().flush();
+                                    // Show feedback (auto-clears after 10s)
+                                    state.error = Some("Auth key copied to clipboard".to_string());
+                                    state.error_at = Some(std::time::Instant::now());
+                                }
+                            }
                         } else if state.is_button_focused(WEB_BTN_CANCEL) {
                             app.popup_manager.close();
                         }
@@ -12239,8 +12292,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Flush stdout to ensure everything is displayed
     std::io::Write::flush(&mut std::io::stdout())?;
 
-    // Create a persistent interval for periodic tasks (clock updates, keepalive checks)
-    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(60));
+    // Create a persistent interval for periodic tasks (clock updates, keepalive checks, error timeouts)
+    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
     // Skip the first tick which fires immediately
     keepalive_interval.tick().await;
 
@@ -13223,6 +13276,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Periodic timer for clock updates and keepalive checks (once per minute)
             _ = keepalive_interval.tick() => {
                 needs_draw = true; // Clock display updates every minute
+
+                // Clear popup error messages after timeout
+                if let Some(state) = app.popup_manager.current_mut() {
+                    if let Some(error_time) = state.error_at {
+                        if error_time.elapsed() >= std::time::Duration::from_secs(10) {
+                            state.error = None;
+                            state.error_at = None;
+                        }
+                    }
+                }
+
                 // Check keepalive for all connected worlds (send NOP if no activity in 5 min)
                 for world in &mut app.worlds {
                     if world.connected {

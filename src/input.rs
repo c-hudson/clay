@@ -442,12 +442,12 @@ impl InputArea {
     }
 
     /// Move cursor up one line, maintaining column position if possible
-    pub fn move_cursor_up(&mut self) {
+    /// Move cursor up one line. Returns true if already at the top line
+    /// (caller should trigger history_prev).
+    pub fn move_cursor_up(&mut self) -> bool {
         let current_line = self.cursor_line();
         if current_line == 0 {
-            self.cursor_position = 0;
-            self.adjust_viewport();
-            return;
+            return true; // At top — caller should navigate history
         }
 
         let current_col = self.cursor_column();
@@ -483,19 +483,19 @@ impl InputArea {
             self.cursor_position = pos.min(self.buffer.len());
         }
         self.adjust_viewport();
+        false
     }
 
-    /// Move cursor down one line, maintaining column position if possible
-    pub fn move_cursor_down(&mut self) {
+    /// Move cursor down one line. Returns true if already at the bottom line
+    /// (caller should trigger history_next).
+    pub fn move_cursor_down(&mut self) -> bool {
         let current_line = self.cursor_line();
         let current_col = self.cursor_column();
         let starts = self.line_starts();
         let total_lines = starts.len();
 
         if current_line >= total_lines.saturating_sub(1) {
-            self.cursor_position = self.buffer.len();
-            self.adjust_viewport();
-            return;
+            return true; // At bottom — caller should navigate history
         }
 
         let target_line = current_line + 1;
@@ -528,6 +528,7 @@ impl InputArea {
             self.cursor_position = pos.min(self.buffer.len());
         }
         self.adjust_viewport();
+        false
     }
 
     /// Check if a character at the given position should be part of a word.

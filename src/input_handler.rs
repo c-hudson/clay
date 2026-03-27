@@ -1256,11 +1256,15 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
             KeyAction::None
         }
         "cursor_up" => {
-            app.input.move_cursor_up();
+            if app.input.move_cursor_up() {
+                app.input.history_prev();
+            }
             KeyAction::None
         }
         "cursor_down" => {
-            app.input.move_cursor_down();
+            if app.input.move_cursor_down() {
+                app.input.history_next();
+            }
             KeyAction::None
         }
 

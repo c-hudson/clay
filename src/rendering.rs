@@ -1172,6 +1172,8 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
     // Build visual lines (wrapped ANSI strings) by working backwards from scroll_offset
     let mut wrapped_lines: Vec<String> = Vec::new();
+    let new_line_indicator = app.settings.new_line_indicator;
+    let nli_prefix_width: usize = 2; // "▶ " = 2 columns
 
     if !world.output_lines.is_empty() {
         let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
@@ -1181,10 +1183,12 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
         for line_idx in (0..=end_line).rev() {
             let line = &world.output_lines[line_idx];
+            let is_new = new_line_indicator && line.marked_new;
 
             let expanded = match process_output_line(line, app.show_tags, app.settings.temp_convert_enabled, app.settings.zwj_enabled, &cached_now) {
                 Some(text) if text.is_empty() => {
-                    wrapped_lines.insert(0, String::new());
+                    let prefix = if is_new { "\x1b[32m▶\x1b[0m ".to_string() } else { String::new() };
+                    wrapped_lines.insert(0, prefix);
                     if wrapped_lines.len() >= visible_height {
                         break;
                     }
@@ -1194,11 +1198,17 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
                 None => continue,
             };
 
-            // Wrap the line to fit the output area width
-            let wrapped = wrap_ansi_line(&expanded, area_width);
+            // Wrap the line to fit the output area width (narrower if NLI prefix)
+            let wrap_width = if is_new { area_width.saturating_sub(nli_prefix_width) } else { area_width };
+            let wrapped = wrap_ansi_line(&expanded, wrap_width);
 
             for w in wrapped.into_iter().rev() {
-                wrapped_lines.insert(0, w);
+                let prefixed = if is_new {
+                    format!("\x1b[32m▶\x1b[0m {}", w)
+                } else {
+                    w
+                };
+                wrapped_lines.insert(0, prefixed);
             }
 
             if wrapped_lines.len() >= visible_height {
