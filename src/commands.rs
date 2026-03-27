@@ -2179,6 +2179,18 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             });
             app.add_output(&format!("Notification sent: {}", message));
         }
+        Command::Say { text } => {
+            // Speak text via TTS
+            // Console: use local TTS subprocess
+            crate::tts::speak(&app.tts_backend, &text);
+            // Web/GUI: broadcast ServerSpeak to WebSocket clients
+            let world_index = app.current_world_index;
+            app.ws_broadcast(WsMessage::ServerSpeak {
+                text: crate::util::strip_ansi_codes(&text),
+                world_index,
+            });
+            app.add_output(&format!("TTS: {}", text));
+        }
         Command::Dict { word } => {
             match lookup_definition(&word).await {
                 Ok(definition) => {

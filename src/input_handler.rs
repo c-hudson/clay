@@ -580,6 +580,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_line_indicator = settings.new_line_indicator;
+                app.settings.tts_enabled = settings.tts_enabled;
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }

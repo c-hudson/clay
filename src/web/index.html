@@ -571,6 +571,12 @@
                                                 <div id="setup-zwj-toggle" class="toggle"></div>
                                             </div>
                                         </div>
+                                        <div class="setting-row">
+                                            <span class="setting-label">TTS</span>
+                                            <div class="setting-value">
+                                                <div id="setup-tts-toggle" class="toggle"></div>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -606,6 +612,13 @@
                                     <span class="setting-label">Allow List</span>
                                     <div class="setting-value">
                                         <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="localhost, 192.168.*">
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">Auth Key</span>
+                                    <div class="setting-value" style="display: flex; gap: 4px; align-items: center;">
+                                        <input type="text" id="web-auth-key" autocomplete="off" class="web-input" style="font-family: monospace; font-size: 0.8em; flex: 1;">
+                                        <button id="web-auth-key-regen" class="stepper-btn" title="Regenerate" style="padding: 2px 8px; white-space: nowrap;">Regen</button>
                                     </div>
                                 </div>
                                 <div class="setting-row tls-field" id="tls-cert-field" style="display: none;">

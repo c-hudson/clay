@@ -930,6 +930,25 @@ pub async fn handle_daemon_ws_message(
                     flush: false, gagged: false,
                     });
                 }
+                Command::Say { text } => {
+                    // Speak text via TTS (console subprocess + broadcast to web clients)
+                    tts::speak(&app.tts_backend, &text);
+                    let clean_text = strip_ansi_codes(&text);
+                    app.ws_broadcast(WsMessage::ServerSpeak {
+                        text: clean_text,
+                        world_index,
+                    });
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: format!("TTS: {}", text),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                        seq: 0,
+                    marked_new: false,
+                    flush: false, gagged: false,
+                    });
+                }
                 Command::Dump => {
                     use std::io::Write;
                     let ts = current_timestamp_secs();
@@ -1295,7 +1314,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_enabled } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1329,6 +1348,7 @@ pub async fn handle_daemon_ws_message(
             app.settings.mouse_enabled = mouse_enabled;
             app.settings.zwj_enabled = zwj_enabled;
             app.settings.new_line_indicator = new_line_indicator;
+            app.settings.tts_enabled = tts_enabled;
             if app.settings.dictionary_path != dictionary_path {
                 app.settings.dictionary_path = dictionary_path;
                 app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);

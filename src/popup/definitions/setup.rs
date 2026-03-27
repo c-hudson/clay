@@ -23,6 +23,7 @@ pub const SETUP_FIELD_MOUSE: FieldId = FieldId(12);
 pub const SETUP_FIELD_ZWJ: FieldId = FieldId(13);
 pub const SETUP_FIELD_ANSI_MUSIC: FieldId = FieldId(14);
 pub const SETUP_FIELD_NEW_LINE_INDICATOR: FieldId = FieldId(17);
+pub const SETUP_FIELD_TTS: FieldId = FieldId(18);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -69,6 +70,7 @@ pub fn create_setup_popup(
     zwj_enabled: bool,
     ansi_music: bool,
     new_line_indicator: bool,
+    tts_enabled: bool,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -145,6 +147,11 @@ pub fn create_setup_popup(
             "New Indicator",
             FieldKind::toggle(new_line_indicator),
         ))
+        .with_field(Field::new(
+            SETUP_FIELD_TTS,
+            "TTS",
+            FieldKind::toggle(tts_enabled),
+        ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
@@ -207,6 +214,11 @@ fn setup_help_text() -> Vec<String> {
         "",
         "New Indicator: Show a marker on new lines arriving",
         "  while scrolled up in the output buffer.",
+        "",
+        "TTS: Text-to-speech. Speaks MUD output aloud.",
+        "  Console uses espeak/say. Web/Android uses the",
+        "  browser's Web Speech API. Use /say <text> to",
+        "  speak manually even when auto-TTS is off.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -220,13 +232,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false,
+            false, false,
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 14);
+        assert_eq!(state.definition.fields.len(), 15);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -235,7 +247,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false,
+            false, true,
         );
         let state = PopupState::new(def);
 

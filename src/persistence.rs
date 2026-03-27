@@ -188,11 +188,9 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
-    // Save device auth keys (encrypted, with timestamp)
-    for ak in &app.settings.websocket_auth_keys {
-        if !ak.is_expired() {
-            writeln!(file, "websocket_auth_key={}|{}", encrypt_password(&ak.key), ak.created_at)?;
-        }
+    // Save single device auth key (encrypted, with timestamp)
+    if let Some(ref ak) = app.settings.websocket_auth_key {
+        writeln!(file, "websocket_auth_key={}|{}", encrypt_password(&ak.key), ak.created_at)?;
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
     if !app.settings.dictionary_path.is_empty() {
@@ -202,6 +200,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
+    writeln!(file, "tts_enabled={}", app.settings.tts_enabled)?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -579,23 +578,25 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                         app.settings.websocket_key_file = value.to_string();
                     }
                     "websocket_auth_key" => {
-                        // Load device auth key (format: ENC:...|timestamp or legacy ENC:...)
-                        let (enc_part, timestamp) = if let Some(pipe_pos) = value.rfind('|') {
-                            let ts_str = &value[pipe_pos + 1..];
-                            if let Ok(ts) = ts_str.parse::<u64>() {
-                                (&value[..pipe_pos], ts)
+                        // Load single device auth key (format: ENC:...|timestamp or legacy ENC:...)
+                        // If multiple lines found, ignore all (migration: startup will generate fresh)
+                        if app.settings.websocket_auth_key.is_some() {
+                            // Multiple keys found — clear and let startup generate a fresh one
+                            app.settings.websocket_auth_key = None;
+                        } else {
+                            let (enc_part, timestamp) = if let Some(pipe_pos) = value.rfind('|') {
+                                let ts_str = &value[pipe_pos + 1..];
+                                if let Ok(ts) = ts_str.parse::<u64>() {
+                                    (&value[..pipe_pos], ts)
+                                } else {
+                                    (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                                }
                             } else {
                                 (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
-                            }
-                        } else {
-                            // Legacy format without timestamp — give fresh 30-day window
-                            (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
-                        };
-                        let key = decrypt_password(enc_part);
-                        if !key.is_empty() {
-                            let ak = crate::AuthKey { key, created_at: timestamp };
-                            if !ak.is_expired() {
-                                app.settings.websocket_auth_keys.push(ak);
+                            };
+                            let key = decrypt_password(enc_part);
+                            if !key.is_empty() {
+                                app.settings.websocket_auth_key = Some(crate::AuthKey { key, created_at: timestamp });
                             }
                         }
                     }
@@ -645,6 +646,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     }
                     "new_line_indicator" => {
                         app.settings.new_line_indicator = value == "true";
+                    }
+                    "tts_enabled" => {
+                        app.settings.tts_enabled = value == "true";
                     }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
@@ -1161,6 +1165,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
+    writeln!(file, "tts_enabled={}", app.settings.tts_enabled)?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -1774,6 +1779,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "new_line_indicator" => {
                         app.settings.new_line_indicator = value == "true";
                     }
+                    "tts_enabled" => {
+                        app.settings.tts_enabled = value == "true";
+                    }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
@@ -1939,13 +1947,20 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         app.current_world_index = 0;
     }
 
-    // Load auth keys from ~/.clay.dat (they're not in the reload state file)
+    // Load auth key from ~/.clay.dat (it's not in the reload state file)
     let settings_path = get_settings_path();
     if settings_path.exists() {
         if let Ok(settings_content) = std::fs::read_to_string(&settings_path) {
+            let mut found_count = 0u32;
             for line in settings_content.lines() {
                 let trimmed = line.trim();
                 if let Some(value) = trimmed.strip_prefix("websocket_auth_key=") {
+                    found_count += 1;
+                    if found_count > 1 {
+                        // Multiple keys found — clear and let startup generate a fresh one
+                        app.settings.websocket_auth_key = None;
+                        break;
+                    }
                     let (enc_part, timestamp) = if let Some(pipe_pos) = value.rfind('|') {
                         let ts_str = &value[pipe_pos + 1..];
                         if let Ok(ts) = ts_str.parse::<u64>() {
@@ -1958,18 +1973,16 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     };
                     let key = decrypt_password(enc_part);
                     if !key.is_empty() {
-                        let ak = crate::AuthKey { key, created_at: timestamp };
-                        if !ak.is_expired() {
-                            app.settings.websocket_auth_keys.push(ak);
-                        }
+                        app.settings.websocket_auth_key = Some(crate::AuthKey { key, created_at: timestamp });
                     }
                 }
             }
         }
     }
 
-    // Clean up the reload state file
+    // Clean up the reload state file and env var
     let _ = std::fs::remove_file(&path);
+    std::env::remove_var("CLAY_RELOAD_PID");
 
     Ok(true)
 }
@@ -2007,13 +2020,10 @@ mod tests {
             websocket_whitelisted_host: Some("10.0.0.1".to_string()), // default: None (not persisted to .clay.dat)
             websocket_cert_file: "/tmp/cert.pem".to_string(), // default: ""
             websocket_key_file: "/tmp/key.pem".to_string(),   // default: ""
-            websocket_auth_keys: {
+            websocket_auth_key: {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                vec![
-                    crate::AuthKey { key: "key1".to_string(), created_at: now },
-                    crate::AuthKey { key: "key2".to_string(), created_at: now },
-                ]
-            }, // default: []
+                Some(crate::AuthKey { key: "key1".to_string(), created_at: now })
+            }, // default: None
             actions: vec![
                 {
                     let mut a = Action::new();
@@ -2033,6 +2043,7 @@ mod tests {
             mouse_enabled: false,              // default: true
             zwj_enabled: true,                 // default: false
             new_line_indicator: true,             // default: false
+            tts_enabled: true,                    // default: false
         }
     }
 
@@ -2089,9 +2100,9 @@ mod tests {
         // websocket_whitelisted_host is not persisted to .clay.dat (runtime state)
         assert_eq!(a.websocket_cert_file, b.websocket_cert_file, "{context}: websocket_cert_file");
         assert_eq!(a.websocket_key_file, b.websocket_key_file, "{context}: websocket_key_file");
-        assert_eq!(a.websocket_auth_keys.len(), b.websocket_auth_keys.len(), "{context}: websocket_auth_keys.len()");
-        for (i, (ak_a, ak_b)) in a.websocket_auth_keys.iter().zip(b.websocket_auth_keys.iter()).enumerate() {
-            assert_eq!(ak_a.key, ak_b.key, "{context}: auth_key[{i}].key");
+        assert_eq!(a.websocket_auth_key.is_some(), b.websocket_auth_key.is_some(), "{context}: websocket_auth_key.is_some()");
+        if let (Some(ak_a), Some(ak_b)) = (&a.websocket_auth_key, &b.websocket_auth_key) {
+            assert_eq!(ak_a.key, ak_b.key, "{context}: websocket_auth_key.key");
         }
         assert_eq!(a.actions.len(), b.actions.len(), "{context}: actions.len()");
         for (i, (aa, bb)) in a.actions.iter().zip(b.actions.iter()).enumerate() {
@@ -2109,6 +2120,7 @@ mod tests {
         assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
         assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
+        assert_eq!(a.tts_enabled, b.tts_enabled, "{context}: tts_enabled");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -2209,7 +2221,7 @@ mod tests {
         assert_ne!(non_default.websocket_allow_list, default.websocket_allow_list, "websocket_allow_list should differ");
         assert_ne!(non_default.websocket_cert_file, default.websocket_cert_file, "websocket_cert_file should differ");
         assert_ne!(non_default.websocket_key_file, default.websocket_key_file, "websocket_key_file should differ");
-        assert!(!non_default.websocket_auth_keys.is_empty(), "websocket_auth_keys should be non-empty");
+        assert!(non_default.websocket_auth_key.is_some(), "websocket_auth_key should be Some");
         assert!(!non_default.actions.is_empty(), "actions should be non-empty");
         assert_ne!(non_default.tls_proxy_enabled, default.tls_proxy_enabled, "tls_proxy_enabled should differ");
         assert_ne!(non_default.dictionary_path, default.dictionary_path, "dictionary_path should differ");
@@ -2217,6 +2229,7 @@ mod tests {
         assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
         assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
+        assert_ne!(non_default.tts_enabled, default.tts_enabled, "tts_enabled should differ");
     }
 
     #[test]

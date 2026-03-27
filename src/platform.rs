@@ -186,6 +186,8 @@ pub(crate) fn crash_restart() {
     // Increment crash count in env
     let new_count = crash_count + 1;
     std::env::set_var(CRASH_COUNT_ENV, new_count.to_string());
+    // Tell new process which reload file to load (PID-specific)
+    std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
     // Try to exec the binary
     if let Ok((exe, _)) = get_executable_path() {
@@ -239,6 +241,7 @@ pub(crate) fn crash_restart() {
 
     let new_count = crash_count + 1;
     std::env::set_var(CRASH_COUNT_ENV, new_count.to_string());
+    std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
     if let Ok((exe, _)) = get_executable_path() {
         let mut args: Vec<String> = std::env::args()
@@ -927,6 +930,8 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     std::env::set_var(RELOAD_FDS_ENV, &fds_str);
+    // Tell new process which reload file to load (PID-specific)
+    std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
@@ -991,6 +996,8 @@ pub fn exec_reload(app: &App) -> io::Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     std::env::set_var(RELOAD_FDS_ENV, &fds_str);
+    // Tell new process which reload file to load (PID-specific)
+    std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
     // Only create a sync event in console mode (not headless/GUI/daemon).
     // In headless mode there's no console terminal to fight over, and waiting

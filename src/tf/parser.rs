@@ -76,6 +76,7 @@ pub fn is_tf_command_name(cmd: &str) -> bool {
         "sh" | "time" | "recall" | "repeat" | "ps" | "kill" |
         "fg" | "trigger" | "input" | "grab" | "gag" | "ungag" | "exit" | "shift" | "bamf" |
         // These are also TF commands (mapped to Clay equivalents)
+        "say" |
         "quit" | "dc" | "disconnect" | "world" | "listworlds" |
         "listsockets" | "connections" | "addworld" | "version" |
         // Note: "send" maps to Clay's /send command, but TF's /send has different options
@@ -260,6 +261,15 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
 
         // Variable commands
         "export" => builtins::cmd_export(engine, args),
+
+        // Text-to-speech
+        "say" => {
+            if args.trim().is_empty() {
+                TfCommandResult::Error("/say requires text to speak".to_string())
+            } else {
+                TfCommandResult::ClayCommand(format!("/say {}", args))
+            }
+        }
 
         // Mapped to Clay commands
         "quit" => TfCommandResult::ClayCommand("/quit".to_string()),
@@ -1099,6 +1109,9 @@ For more help:
             )),
             "send" => TfCommandResult::Success(Some(
                 "/send [-w world] text\n\nSend text to the MUD server.\n-w world: Send to specific world\nExample: /send say Hello everyone!".to_string()
+            )),
+            "say" => TfCommandResult::Success(Some(
+                "/say <text>\n\nSpeak text aloud via text-to-speech.\nConsole: uses espeak, espeak-ng, say (macOS), or PowerShell (Windows).\nWeb/Android: uses the browser's Web Speech API.\n\nExample: /say Hello world\n\nEnable automatic TTS for MUD output in Setup > TTS.".to_string()
             )),
             "def" => TfCommandResult::Success(Some(
                 r#"/def [options] name = body

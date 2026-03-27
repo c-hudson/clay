@@ -169,10 +169,13 @@
         settingsTitle: document.getElementById('settings-title'),
         settingsGeneralSection: document.getElementById('settings-general'),
         settingsWebSection: document.getElementById('settings-web'),
+        webAuthKey: document.getElementById('web-auth-key'),
+        webAuthKeyRegen: document.getElementById('web-auth-key-regen'),
         // Setup fields (inside combined settings modal)
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
+        setupTtsToggle: document.getElementById('setup-tts-toggle'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupDebugToggle: document.getElementById('setup-debug-toggle'),
@@ -321,6 +324,7 @@
     let wsCertFile = '';
     let wsKeyFile = '';
     let tlsConfigured = false;  // True if server has TLS cert+key configured
+    let serverAuthKey = '';  // Auth key from server (for display in web settings)
     // Temporary editing state for web popup (only saved on Save button)
     let editWebSecure = false;
     let editHttpEnabled = false;
@@ -336,6 +340,7 @@
     let setupColorOffset = 0;
     let setupAnsiMusic = true;
     let setupZwj = false;
+    let setupTts = false;
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
     let setupDebug = false;
@@ -421,6 +426,7 @@
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
     let zwjEnabled = false;  // Will be synced from server settings
+    let ttsEnabled = false;  // Will be synced from server settings
     let newLineIndicator = false;  // Will be synced from server settings
 
     // MCMP (MUD Client Media Protocol) state
@@ -1600,10 +1606,15 @@
                 break;
 
             case 'KeyGenerated':
-                // Server sent us a new auth key after successful password auth
+                // Server sent us a new auth key after successful password auth or regeneration
                 if (msg.auth_key) {
                     debugLog('Received auth key from server');
                     saveAuthKey(msg.auth_key);
+                    serverAuthKey = msg.auth_key;
+                    // Update the web settings input if it's visible
+                    if (elements.webAuthKey) {
+                        elements.webAuthKey.value = msg.auth_key;
+                    }
                 }
                 break;
 
@@ -1709,6 +1720,7 @@
                     }
                     if (msg.settings.zwj_enabled !== undefined) {
                         zwjEnabled = msg.settings.zwj_enabled;
+                        if (msg.settings.tts_enabled !== undefined) ttsEnabled = msg.settings.tts_enabled;
                     }
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
@@ -1758,6 +1770,9 @@
                     }
                     if (msg.settings.tls_configured !== undefined) {
                         tlsConfigured = msg.settings.tls_configured;
+                    }
+                    if (msg.settings.auth_key !== undefined) {
+                        serverAuthKey = msg.settings.auth_key;
                     }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
@@ -2162,6 +2177,7 @@
                     }
                     if (msg.settings.zwj_enabled !== undefined) {
                         zwjEnabled = msg.settings.zwj_enabled;
+                        if (msg.settings.tts_enabled !== undefined) ttsEnabled = msg.settings.tts_enabled;
                     }
                     if (msg.settings.new_line_indicator !== undefined) {
                         const oldNli = newLineIndicator;
@@ -2218,6 +2234,9 @@
                     }
                     if (msg.settings.tls_configured !== undefined) {
                         tlsConfigured = msg.settings.tls_configured;
+                    }
+                    if (msg.settings.auth_key !== undefined) {
+                        serverAuthKey = msg.settings.auth_key;
                     }
                     if (msg.settings.console_theme !== undefined) {
                         consoleTheme = msg.settings.console_theme;
@@ -2431,6 +2450,14 @@
                 // Send notification to Android app if available
                 if (window.Android && window.Android.showNotification) {
                     window.Android.showNotification(msg.title || 'Clay', msg.message || '');
+                }
+                break;
+
+            case 'ServerSpeak':
+                // Text-to-speech via Web Speech API
+                if (window.speechSynthesis && msg.text) {
+                    var utterance = new SpeechSynthesisUtterance(msg.text);
+                    window.speechSynthesis.speak(utterance);
                 }
                 break;
 
@@ -5433,6 +5460,7 @@
         setupWorldSwitchMode = worldSwitchMode;
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
+        setupTts = ttsEnabled;
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupDebug = debugEnabled;
@@ -5483,6 +5511,11 @@
             elements.setupZwjToggle.classList.add('active');
         } else {
             elements.setupZwjToggle.classList.remove('active');
+        }
+        if (setupTts) {
+            elements.setupTtsToggle.classList.add('active');
+        } else {
+            elements.setupTtsToggle.classList.remove('active');
         }
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
@@ -5548,6 +5581,7 @@
             ws_key_file: wsKeyFile,
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
+            tts_enabled: ttsEnabled,
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
@@ -5566,6 +5600,7 @@
         worldSwitchMode = setupWorldSwitchMode;
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
+        ttsEnabled = setupTts;
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         debugEnabled = setupDebug;
@@ -5629,6 +5664,11 @@
         // Show/hide TLS fields based on protocol
         elements.tlsCertField.style.display = editWebSecure ? 'flex' : 'none';
         elements.tlsKeyField.style.display = editWebSecure ? 'flex' : 'none';
+
+        // Populate auth key field
+        if (elements.webAuthKey) {
+            elements.webAuthKey.value = serverAuthKey || '';
+        }
     }
 
     // saveWebSettings removed — merged into saveSettingsAll
@@ -8013,6 +8053,10 @@
             setupZwj = !setupZwj;
             updateSetupPopupUI();
         };
+        elements.setupTtsToggle.onclick = function() {
+            setupTts = !setupTts;
+            updateSetupPopupUI();
+        };
         elements.setupTlsProxyToggle.onclick = function() {
             setupTlsProxy = !setupTlsProxy;
             updateSetupPopupUI();
@@ -8075,6 +8119,12 @@
             editHttpEnabled = this.value === 'on';
             updateWebPopupUI();
         };
+        // Auth key regenerate button
+        if (elements.webAuthKeyRegen) {
+            elements.webAuthKeyRegen.onclick = function() {
+                send({ type: 'RegenerateAuthKey' });
+            };
+        }
         // Web save/cancel/close handled by unified settings buttons above
 
         // Font popup

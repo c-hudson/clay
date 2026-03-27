@@ -65,6 +65,8 @@ pub enum WsMessage {
     KeyRevoked {
         success: bool,
     },
+    // Client requests auth key regeneration (from web settings UI)
+    RegenerateAuthKey,
 
     // Password change (multiuser mode)
     ChangePassword {
@@ -124,6 +126,10 @@ pub enum WsMessage {
 
     /// Notification for mobile clients (server -> client)
     Notification { title: String, message: String },
+
+    /// Text-to-speech: speak text aloud on client (server -> client)
+    /// Console uses espeak/say subprocess; web/Android uses Web Speech API
+    ServerSpeak { text: String, world_index: usize },
 
     /// ANSI Music sequence to play (server -> client)
     AnsiMusic { world_index: usize, notes: Vec<MusicNote> },
@@ -231,6 +237,8 @@ pub enum WsMessage {
         zwj_enabled: bool,
         #[serde(default)]
         new_line_indicator: bool,
+        #[serde(default)]
+        tts_enabled: bool,
     },
 
     // Settings update confirmations (server -> client)
@@ -478,12 +486,17 @@ pub struct GlobalSettingsMsg {
     pub zwj_enabled: bool,
     #[serde(default)]
     pub new_line_indicator: bool,
+    #[serde(default)]
+    pub tts_enabled: bool,
     /// Theme colors from ~/.clay.theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
     /// Keyboard bindings (serialized as JSON object: key -> action)
     #[serde(default)]
     pub keybindings_json: String,
+    /// Auth key value for display in web settings (only sent to authenticated clients)
+    #[serde(default)]
+    pub auth_key: String,
 }
 
 fn default_gui_transparency() -> f32 {
@@ -1426,9 +1439,11 @@ where
                                         client.last_activity = std::time::Instant::now();
                                     }
                                 }
-                                // Handle RevokeKey inside auth check
+                                // Handle RevokeKey and RegenerateAuthKey inside auth check
                                 if let WsMessage::RevokeKey { ref auth_key } = ws_msg {
                                     let _ = event_tx.send(AppEvent::WsKeyRevoke(client_id, auth_key.clone())).await;
+                                } else if let WsMessage::RegenerateAuthKey = ws_msg {
+                                    let _ = event_tx.send(AppEvent::WsKeyRequest(client_id)).await;
                                 } else {
                                     let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
                                 }

@@ -20,6 +20,7 @@ pub mod audio;
 pub mod platform;
 pub mod commands;
 pub mod remote_client;
+pub mod tts;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
 #[cfg(test)]
@@ -1016,7 +1017,7 @@ fn generate_test_music_notes() -> Vec<crate::ansi_music::MusicNote> {
 }
 
 
-/// An authentication key with creation timestamp for expiry
+/// An authentication key with creation timestamp
 #[derive(Clone, Debug)]
 pub struct AuthKey {
     pub key: String,
@@ -1024,8 +1025,6 @@ pub struct AuthKey {
 }
 
 impl AuthKey {
-    const EXPIRY_SECS: u64 = 30 * 24 * 3600;  // 30 days
-
     fn new(key: String) -> Self {
         Self {
             key,
@@ -1034,14 +1033,6 @@ impl AuthKey {
                 .unwrap_or_default()
                 .as_secs(),
         }
-    }
-
-    fn is_expired(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now.saturating_sub(self.created_at) > Self::EXPIRY_SECS
     }
 }
 
@@ -1075,9 +1066,8 @@ pub struct Settings {
     websocket_whitelisted_host: Option<String>,  // Currently whitelisted host (authenticated from allow list)
     websocket_cert_file: String,   // Path to TLS certificate file (PEM) - only used when web_secure=true
     websocket_key_file: String,    // Path to TLS private key file (PEM) - only used when web_secure=true
-    // Persistent auth keys for passwordless device authentication (generated after successful password auth)
-    // Keys expire after 30 days
-    websocket_auth_keys: Vec<AuthKey>,
+    // Single persistent auth key for passwordless device authentication
+    websocket_auth_key: Option<AuthKey>,
     // User-defined actions/triggers
     actions: Vec<Action>,
     // TLS proxy for connection preservation over hot reload
@@ -1092,6 +1082,8 @@ pub struct Settings {
     zwj_enabled: bool,
     // New line indicator - prefix unseen/pending lines with green "+"
     pub new_line_indicator: bool,
+    /// Text-to-speech: speak MUD output aloud (console uses espeak/say, web uses Web Speech API)
+    pub tts_enabled: bool,
 }
 
 impl Default for Settings {
@@ -1122,7 +1114,7 @@ impl Default for Settings {
             websocket_whitelisted_host: None,
             websocket_cert_file: String::new(),
             websocket_key_file: String::new(),
-            websocket_auth_keys: Vec::new(),
+            websocket_auth_key: None,
             actions: Vec::new(),
             tls_proxy_enabled: false,
             dictionary_path: String::new(),
@@ -1130,6 +1122,7 @@ impl Default for Settings {
             mouse_enabled: true,
             zwj_enabled: false,
             new_line_indicator: false,
+            tts_enabled: false,
         }
     }
 }
@@ -1352,6 +1345,8 @@ pub enum Command {
     TinyUrl { url: String },
     /// /url usage error
     TinyUrlUsage,
+    /// /say <text> - speak text aloud via TTS
+    Say { text: String },
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -1478,6 +1473,15 @@ pub fn parse_command(input: &str) -> Command {
                 Command::TinyUrl { url: args[0].to_string() }
             } else {
                 Command::TinyUrlUsage
+            }
+        }
+        "/say" => {
+            if !args.is_empty() {
+                // Preserve the original text after /say (not split by whitespace)
+                let text = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+                Command::Say { text: text.to_string() }
+            } else {
+                Command::Unknown { cmd: trimmed.to_string() }
             }
         }
         _ => {
@@ -1693,9 +1697,14 @@ fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
     Command::Send { text, all_worlds, target_world, no_newline }
 }
 
-fn get_reload_state_path() -> PathBuf {
+pub(crate) fn get_reload_state_path() -> PathBuf {
     let home = get_home_dir();
-    PathBuf::from(home).join(clay_filename("clay.reload"))
+    // Use PID from env (set by old process during reload) or current PID
+    let pid = std::env::var("CLAY_RELOAD_PID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(std::process::id());
+    PathBuf::from(home).join(clay_filename(&format!("clay.reload.{}", pid)))
 }
 
 /// Get current time as seconds since Unix epoch (for WebSocket timestamps)
@@ -2616,6 +2625,8 @@ pub struct App {
     pub remote_ping_responses: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>>,
     /// Nonce for current /remote ping check (to ignore stale PongCheck responses)
     pub remote_ping_nonce: u64,
+    /// Text-to-speech backend (console: espeak/say subprocess, web: ServerSpeak WS message)
+    pub tts_backend: tts::TtsBackend,
     /// Test-only: log of all messages passed to ws_broadcast() and ws_broadcast_to_world()
     #[cfg(test)]
     pub ws_broadcast_log: std::sync::Arc<std::sync::Mutex<Vec<WsMessage>>>,
@@ -2701,6 +2712,7 @@ impl App {
             ansi_music_counter: 0,
             remote_ping_responses: None,
             remote_ping_nonce: 0,
+            tts_backend: tts::init_tts(),
             #[cfg(test)]
             ws_broadcast_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -2753,8 +2765,10 @@ impl App {
             mouse_enabled: self.settings.mouse_enabled,
             zwj_enabled: self.settings.zwj_enabled,
             new_line_indicator: self.settings.new_line_indicator,
+            tts_enabled: self.settings.tts_enabled,
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
+            auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
         }
     }
 
@@ -2798,6 +2812,7 @@ impl App {
         self.settings.mouse_enabled = settings.mouse_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
         self.settings.new_line_indicator = settings.new_line_indicator;
+        self.settings.tts_enabled = settings.tts_enabled;
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
             self.keybindings = keybindings::KeyBindings::from_json(&settings.keybindings_json);
@@ -3078,6 +3093,7 @@ impl App {
             self.settings.zwj_enabled,
             self.settings.ansi_music_enabled,
             self.settings.new_line_indicator,
+            self.settings.tts_enabled,
         );
         self.popup_manager.open(def);
 
@@ -4968,6 +4984,26 @@ impl App {
 
             // Broadcast activity count to keep all clients in sync
             self.broadcast_activity();
+
+            // Text-to-speech: speak non-gagged MUD output when TTS is enabled
+            if self.settings.tts_enabled {
+                // Collect non-gagged line text for speaking
+                let speak_lines: Vec<&str> = non_gagged_lines.iter()
+                    .map(|(line, _)| *line)
+                    .collect();
+                let speak_text = speak_lines.join(" ");
+                let clean_text = strip_ansi_codes(&speak_text);
+                let clean_text = clean_text.trim();
+                if !clean_text.is_empty() {
+                    // Console: speak via local TTS subprocess
+                    tts::speak(&self.tts_backend, clean_text);
+                    // Web/GUI: broadcast ServerSpeak to WebSocket clients
+                    self.ws_broadcast(WsMessage::ServerSpeak {
+                        text: clean_text.to_string(),
+                        world_index: world_idx,
+                    });
+                }
+            }
         }
 
         // Add gagged lines to output (they'll only show with F2)
@@ -5330,23 +5366,21 @@ impl App {
     /// Handle WsAuthKeyValidation event.
     fn handle_ws_auth_key_validation(&mut self, client_id: u64, msg: WsMessage, client_ip: &str, challenge: &str) {
         if let WsMessage::AuthRequest { auth_key: Some(key), current_world, challenge_response: uses_challenge, .. } = msg {
-            let keys_before = self.settings.websocket_auth_keys.len();
-            // Prune expired keys
-            self.settings.websocket_auth_keys.retain(|ak| !ak.is_expired());
-            let keys_after = self.settings.websocket_auth_keys.len();
-            let expired = keys_before - keys_after;
+            let has_key = self.settings.websocket_auth_key.is_some();
 
             crate::http::log_remote_event("WS-KEY", client_ip,
-                &format!("challenge={}, stored_keys={}, expired={}", uses_challenge, keys_after, expired));
+                &format!("challenge={}, has_stored_key={}", uses_challenge, has_key));
 
             // If challenge_response, client sent SHA256(auth_key + challenge)
-            // We compute SHA256(stored_key + challenge) for each stored key and compare
-            let is_valid = if uses_challenge {
-                self.settings.websocket_auth_keys.iter().any(|ak| {
+            // We compute SHA256(stored_key + challenge) and compare
+            let is_valid = if let Some(ref ak) = self.settings.websocket_auth_key {
+                if uses_challenge {
                     hash_with_challenge(&ak.key, challenge) == key
-                })
+                } else {
+                    ak.key == key
+                }
             } else {
-                self.settings.websocket_auth_keys.iter().any(|ak| ak.key == key)
+                false
             };
             if is_valid {
                 crate::http::log_remote_event("WS-KEY-OK", client_ip, "accepted");
@@ -5370,8 +5404,7 @@ impl App {
                     dimensions: None,
                 });
             } else {
-                crate::http::log_remote_event("WS-KEY-REJECT", client_ip,
-                    &format!("key not found in {} stored keys", keys_after));
+                crate::http::log_remote_event("WS-KEY-REJECT", client_ip, "no matching key");
                 self.ban_list.record_violation(client_ip, "WebSocket: failed auth key");
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: false,
@@ -5383,8 +5416,22 @@ impl App {
         }
     }
 
-    /// Handle WsKeyRequest event.
+    /// Handle WsKeyRequest event — generate a new single auth key (replaces any existing).
     fn handle_ws_key_request(&mut self, client_id: u64) {
+        let key = self.generate_auth_key();
+        self.settings.websocket_auth_key = Some(AuthKey::new(key.clone()));
+        let _ = persistence::save_settings(self);
+        self.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+    }
+
+    /// Handle WsKeyRevoke event — clear the single auth key.
+    fn handle_ws_key_revoke(&mut self, _key: &str) {
+        self.settings.websocket_auth_key = None;
+        let _ = persistence::save_settings(self);
+    }
+
+    /// Generate a new auth key string.
+    fn generate_auth_key(&self) -> String {
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(std::time::SystemTime::now()
@@ -5393,18 +5440,10 @@ impl App {
             .as_nanos()
             .to_le_bytes());
         hasher.update(std::process::id().to_le_bytes());
-        hasher.update(client_id.to_le_bytes());
-        hasher.update(self.settings.websocket_auth_keys.len().to_le_bytes());
-        let key = hex::encode(hasher.finalize());
-        self.settings.websocket_auth_keys.push(AuthKey::new(key.clone()));
-        let _ = persistence::save_settings(self);
-        self.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
-    }
-
-    /// Handle WsKeyRevoke event.
-    fn handle_ws_key_revoke(&mut self, key: &str) {
-        self.settings.websocket_auth_keys.retain(|ak| ak.key != key);
-        let _ = persistence::save_settings(self);
+        let mut random_bytes = [0u8; 16];
+        let _ = getrandom::getrandom(&mut random_bytes);
+        hasher.update(&random_bytes);
+        hex::encode(hasher.finalize())
     }
 
     /// Handle initial WsClientMessage (AuthRequest) after authentication.
@@ -5989,6 +6028,25 @@ impl App {
                 self.ws_broadcast(WsMessage::ServerData {
                     world_index,
                     data: format!("Notification sent: {}", message),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                    seq: 0,
+                    marked_new: false,
+                    flush: false, gagged: false,
+                });
+            }
+            Command::Say { text } => {
+                // Speak text via TTS (console subprocess + broadcast to web clients)
+                tts::speak(&self.tts_backend, &text);
+                let clean_text = strip_ansi_codes(&text);
+                self.ws_broadcast(WsMessage::ServerSpeak {
+                    text: clean_text.clone(),
+                    world_index,
+                });
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: format!("TTS: {}", text),
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
@@ -6806,7 +6864,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_enabled } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -6851,6 +6909,7 @@ impl App {
                 self.settings.mouse_enabled = mouse_enabled;
                 self.settings.zwj_enabled = zwj_enabled;
                 self.settings.new_line_indicator = new_line_indicator;
+                self.settings.tts_enabled = tts_enabled;
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
                     self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
@@ -8327,6 +8386,7 @@ pub(crate) struct SetupSettings {
     pub(crate) zwj_enabled: bool,
     pub(crate) ansi_music: bool,
     pub(crate) new_line_indicator: bool,
+    pub(crate) tts_enabled: bool,
 }
 
 /// Settings from the web popup
@@ -8452,7 +8512,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
-        SETUP_FIELD_NEW_LINE_INDICATOR,
+        SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -8697,6 +8757,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
                     ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
                     new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
+                    tts_enabled: state.get_bool(SETUP_FIELD_TTS).unwrap_or(false),
                 }
             };
 
@@ -10346,6 +10407,13 @@ pub async fn run_app_headless(
 
     app.ensure_has_world();
 
+    // Auto-generate auth key if none exists (fresh install or migration from multi-key)
+    if app.settings.websocket_auth_key.is_none() {
+        let key = app.generate_auth_key();
+        app.settings.websocket_auth_key = Some(AuthKey::new(key));
+        let _ = persistence::save_settings(&app);
+    }
+
     // Re-create spell checker with custom dictionary path if configured
     if !app.settings.dictionary_path.is_empty() {
         app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
@@ -10793,6 +10861,14 @@ pub async fn run_app_headless(
                                                     app.ws_broadcast(WsMessage::Notification {
                                                         title,
                                                         message: message.clone(),
+                                                    });
+                                                }
+                                                Command::Say { text } => {
+                                                    tts::speak(&app.tts_backend, &text);
+                                                    let clean_text = strip_ansi_codes(&text);
+                                                    app.ws_broadcast(WsMessage::ServerSpeak {
+                                                        text: clean_text,
+                                                        world_index: world_idx,
                                                     });
                                                 }
                                                 _ => {}
@@ -11404,6 +11480,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     debug_log(is_debug_enabled(), "STARTUP: Ensuring has world...");
     app.ensure_has_world();
     debug_log(is_debug_enabled(), &format!("STARTUP: Have {} worlds", app.worlds.len()));
+
+    // Auto-generate auth key if none exists (fresh install or migration from multi-key)
+    if app.settings.websocket_auth_key.is_none() {
+        let key = app.generate_auth_key();
+        app.settings.websocket_auth_key = Some(AuthKey::new(key));
+        let _ = persistence::save_settings(&app);
+    }
 
     // Re-create spell checker with custom dictionary path if configured
     if !app.settings.dictionary_path.is_empty() {
