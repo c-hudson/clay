@@ -49,6 +49,8 @@ indexmap = ">=2.2.0, <2.5.0"
 url = "=2.5.0"
 hashbrown = "0.14"
 home = "=0.5.5"
+time = ">=0.3.0, <0.3.37"
+time-core = ">=0.1.0, <0.1.3"
 
 # MCCP2 (MUD Client Compression Protocol) zlib decompression
 flate2 = "1"
