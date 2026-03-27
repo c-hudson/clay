@@ -1082,8 +1082,8 @@ pub struct Settings {
     zwj_enabled: bool,
     // New line indicator - prefix unseen/pending lines with green "+"
     pub new_line_indicator: bool,
-    /// Text-to-speech: speak MUD output aloud (console uses espeak/say, web uses Web Speech API)
-    pub tts_enabled: bool,
+    /// Text-to-speech mode: Off, Local (espeak/say), or Edge (MS neural TTS)
+    pub tts_mode: tts::TtsMode,
 }
 
 impl Default for Settings {
@@ -1122,7 +1122,7 @@ impl Default for Settings {
             mouse_enabled: true,
             zwj_enabled: false,
             new_line_indicator: false,
-            tts_enabled: false,
+            tts_mode: tts::TtsMode::Off,
         }
     }
 }
@@ -2765,7 +2765,7 @@ impl App {
             mouse_enabled: self.settings.mouse_enabled,
             zwj_enabled: self.settings.zwj_enabled,
             new_line_indicator: self.settings.new_line_indicator,
-            tts_enabled: self.settings.tts_enabled,
+            tts_mode: self.settings.tts_mode.name().to_string(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
@@ -2812,7 +2812,7 @@ impl App {
         self.settings.mouse_enabled = settings.mouse_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
         self.settings.new_line_indicator = settings.new_line_indicator;
-        self.settings.tts_enabled = settings.tts_enabled;
+        self.settings.tts_mode = tts::TtsMode::from_name(&settings.tts_mode);
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
             self.keybindings = keybindings::KeyBindings::from_json(&settings.keybindings_json);
@@ -3093,7 +3093,7 @@ impl App {
             self.settings.zwj_enabled,
             self.settings.ansi_music_enabled,
             self.settings.new_line_indicator,
-            self.settings.tts_enabled,
+            self.settings.tts_mode.name(),
         );
         self.popup_manager.open(def);
 
@@ -4986,7 +4986,7 @@ impl App {
             self.broadcast_activity();
 
             // Text-to-speech: speak non-gagged MUD output when TTS is enabled
-            if self.settings.tts_enabled {
+            if self.settings.tts_mode != tts::TtsMode::Off {
                 // Collect non-gagged line text for speaking
                 let speak_lines: Vec<&str> = non_gagged_lines.iter()
                     .map(|(line, _)| *line)
@@ -4996,7 +4996,7 @@ impl App {
                 let clean_text = clean_text.trim();
                 if !clean_text.is_empty() {
                     // Console: speak via local TTS subprocess
-                    tts::speak(&self.tts_backend, clean_text);
+                    tts::speak(&self.tts_backend, clean_text, self.settings.tts_mode);
                     // Web/GUI: broadcast ServerSpeak to WebSocket clients
                     self.ws_broadcast(WsMessage::ServerSpeak {
                         text: clean_text.to_string(),
@@ -5498,8 +5498,13 @@ impl App {
             { self.worlds[world_idx].socket_fd = socket_fd; }
             self.worlds[world_idx].is_tls = is_tls;
 
-            // Discard any unused initial world
+            // Discard any unused initial world (may shift indices)
             self.discard_initial_world();
+            // Re-find world index since discard may have shifted the vec
+            let world_idx = match self.find_world_index(world_name) {
+                Some(idx) => idx,
+                None => return,
+            };
 
             // Open log file if enabled
             if self.worlds[world_idx].settings.log_enabled {
@@ -6038,7 +6043,7 @@ impl App {
             }
             Command::Say { text } => {
                 // Speak text via TTS (console subprocess + broadcast to web clients)
-                tts::speak(&self.tts_backend, &text);
+                tts::speak(&self.tts_backend, &text, self.settings.tts_mode);
                 let clean_text = strip_ansi_codes(&text);
                 self.ws_broadcast(WsMessage::ServerSpeak {
                     text: clean_text.clone(),
@@ -6864,7 +6869,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_enabled } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -6909,7 +6914,7 @@ impl App {
                 self.settings.mouse_enabled = mouse_enabled;
                 self.settings.zwj_enabled = zwj_enabled;
                 self.settings.new_line_indicator = new_line_indicator;
-                self.settings.tts_enabled = tts_enabled;
+                self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
                     self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
@@ -8386,7 +8391,7 @@ pub(crate) struct SetupSettings {
     pub(crate) zwj_enabled: bool,
     pub(crate) ansi_music: bool,
     pub(crate) new_line_indicator: bool,
-    pub(crate) tts_enabled: bool,
+    pub(crate) tts_mode: String,
 }
 
 /// Settings from the web popup
@@ -8757,7 +8762,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
                     ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
                     new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
-                    tts_enabled: state.get_bool(SETUP_FIELD_TTS).unwrap_or(false),
+                    tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
                 }
             };
 
@@ -10864,7 +10869,7 @@ pub async fn run_app_headless(
                                                     });
                                                 }
                                                 Command::Say { text } => {
-                                                    tts::speak(&app.tts_backend, &text);
+                                                    tts::speak(&app.tts_backend, &text, app.settings.tts_mode);
                                                     let clean_text = strip_ansi_codes(&text);
                                                     app.ws_broadcast(WsMessage::ServerSpeak {
                                                         text: clean_text,

@@ -1157,7 +1157,7 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_line_indicator = settings.new_line_indicator;
-                app.settings.tts_enabled = settings.tts_enabled;
+                app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -1192,7 +1192,7 @@ pub(crate) fn handle_remote_client_key(
                     mouse_enabled: app.settings.mouse_enabled,
                     zwj_enabled: app.settings.zwj_enabled,
                     new_line_indicator: app.settings.new_line_indicator,
-                    tts_enabled: app.settings.tts_enabled,
+                    tts_mode: app.settings.tts_mode.name().to_string(),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -1913,7 +1913,7 @@ pub(crate) fn apply_remote_web_settings(
         mouse_enabled: app.settings.mouse_enabled,
         zwj_enabled: app.settings.zwj_enabled,
         new_line_indicator: app.settings.new_line_indicator,
-        tts_enabled: app.settings.tts_enabled,
+        tts_mode: app.settings.tts_mode.name().to_string(),
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {

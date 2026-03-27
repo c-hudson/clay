@@ -200,7 +200,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
-    writeln!(file, "tts_enabled={}", app.settings.tts_enabled)?;
+    writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -647,8 +647,14 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     "new_line_indicator" => {
                         app.settings.new_line_indicator = value == "true";
                     }
+                    "tts_mode" => {
+                        app.settings.tts_mode = crate::tts::TtsMode::from_name(value);
+                    }
                     "tts_enabled" => {
-                        app.settings.tts_enabled = value == "true";
+                        // Legacy: convert bool to TtsMode
+                        if value == "true" {
+                            app.settings.tts_mode = crate::tts::TtsMode::Local;
+                        }
                     }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
@@ -1165,7 +1171,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
-    writeln!(file, "tts_enabled={}", app.settings.tts_enabled)?;
+    writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -1779,8 +1785,14 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "new_line_indicator" => {
                         app.settings.new_line_indicator = value == "true";
                     }
+                    "tts_mode" => {
+                        app.settings.tts_mode = crate::tts::TtsMode::from_name(value);
+                    }
                     "tts_enabled" => {
-                        app.settings.tts_enabled = value == "true";
+                        // Legacy: convert bool to TtsMode
+                        if value == "true" {
+                            app.settings.tts_mode = crate::tts::TtsMode::Local;
+                        }
                     }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
@@ -2043,7 +2055,7 @@ mod tests {
             mouse_enabled: false,              // default: true
             zwj_enabled: true,                 // default: false
             new_line_indicator: true,             // default: false
-            tts_enabled: true,                    // default: false
+            tts_mode: crate::tts::TtsMode::Edge,  // default: Off
         }
     }
 
@@ -2120,7 +2132,7 @@ mod tests {
         assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
         assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
-        assert_eq!(a.tts_enabled, b.tts_enabled, "{context}: tts_enabled");
+        assert_eq!(a.tts_mode, b.tts_mode, "{context}: tts_mode");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -2229,7 +2241,7 @@ mod tests {
         assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
         assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
-        assert_ne!(non_default.tts_enabled, default.tts_enabled, "tts_enabled should differ");
+        assert_ne!(non_default.tts_mode, default.tts_mode, "tts_mode should differ");
     }
 
     #[test]

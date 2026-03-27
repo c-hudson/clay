@@ -175,7 +175,7 @@
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
-        setupTtsToggle: document.getElementById('setup-tts-toggle'),
+        setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupDebugToggle: document.getElementById('setup-debug-toggle'),
@@ -340,7 +340,7 @@
     let setupColorOffset = 0;
     let setupAnsiMusic = true;
     let setupZwj = false;
-    let setupTts = false;
+    let setupTtsMode = 'Off';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
     let setupDebug = false;
@@ -426,7 +426,7 @@
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
     let zwjEnabled = false;  // Will be synced from server settings
-    let ttsEnabled = false;  // Will be synced from server settings
+    let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'edge')
     let newLineIndicator = false;  // Will be synced from server settings
 
     // MCMP (MUD Client Media Protocol) state
@@ -1720,8 +1720,8 @@
                     }
                     if (msg.settings.zwj_enabled !== undefined) {
                         zwjEnabled = msg.settings.zwj_enabled;
-                        if (msg.settings.tts_enabled !== undefined) ttsEnabled = msg.settings.tts_enabled;
                     }
+                    if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
                     }
@@ -2177,8 +2177,8 @@
                     }
                     if (msg.settings.zwj_enabled !== undefined) {
                         zwjEnabled = msg.settings.zwj_enabled;
-                        if (msg.settings.tts_enabled !== undefined) ttsEnabled = msg.settings.tts_enabled;
                     }
+                    if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.new_line_indicator !== undefined) {
                         const oldNli = newLineIndicator;
                         newLineIndicator = msg.settings.new_line_indicator;
@@ -5460,7 +5460,7 @@
         setupWorldSwitchMode = worldSwitchMode;
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
-        setupTts = ttsEnabled;
+        setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'edge' ? 'Edge' : 'Off';
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupDebug = debugEnabled;
@@ -5512,11 +5512,8 @@
         } else {
             elements.setupZwjToggle.classList.remove('active');
         }
-        if (setupTts) {
-            elements.setupTtsToggle.classList.add('active');
-        } else {
-            elements.setupTtsToggle.classList.remove('active');
-        }
+        elements.setupTtsSelect.value = setupTtsMode;
+        updateCustomDropdown(elements.setupTtsSelect);
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
         } else {
@@ -5581,7 +5578,7 @@
             ws_key_file: wsKeyFile,
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
-            tts_enabled: ttsEnabled,
+            tts_mode: ttsMode,
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
@@ -5600,7 +5597,7 @@
         worldSwitchMode = setupWorldSwitchMode;
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
-        ttsEnabled = setupTts;
+        ttsMode = setupTtsMode.toLowerCase();
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         debugEnabled = setupDebug;
@@ -8053,9 +8050,8 @@
             setupZwj = !setupZwj;
             updateSetupPopupUI();
         };
-        elements.setupTtsToggle.onclick = function() {
-            setupTts = !setupTts;
-            updateSetupPopupUI();
+        elements.setupTtsSelect.onchange = function() {
+            setupTtsMode = this.value;
         };
         elements.setupTlsProxyToggle.onclick = function() {
             setupTlsProxy = !setupTlsProxy;

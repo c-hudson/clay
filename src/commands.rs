@@ -36,6 +36,10 @@ use crate::platform::{
     get_executable_path, exec_reload, check_and_download_update,
     spawn_tls_proxy,
 };
+#[cfg(windows)]
+use crate::platform::{
+    get_executable_path, exec_reload, check_and_download_update,
+};
 
 pub(crate) async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
     // Capture world name for the reader task (stable across world deletions)
@@ -2182,7 +2186,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         Command::Say { text } => {
             // Speak text via TTS
             // Console: use local TTS subprocess
-            crate::tts::speak(&app.tts_backend, &text);
+            crate::tts::speak(&app.tts_backend, &text, app.settings.tts_mode);
             // Web/GUI: broadcast ServerSpeak to WebSocket clients
             let world_index = app.current_world_index;
             app.ws_broadcast(WsMessage::ServerSpeak {

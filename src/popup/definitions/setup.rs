@@ -53,6 +53,15 @@ pub fn editor_side_options() -> Vec<SelectOption> {
     ]
 }
 
+/// TTS mode options
+pub fn tts_mode_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption::new("off", "Off"),
+        SelectOption::new("local", "Local"),
+        SelectOption::new("edge", "Edge"),
+    ]
+}
+
 /// Create the setup popup definition with current values
 #[allow(clippy::too_many_arguments)]
 pub fn create_setup_popup(
@@ -70,11 +79,16 @@ pub fn create_setup_popup(
     zwj_enabled: bool,
     ansi_music: bool,
     new_line_indicator: bool,
-    tts_enabled: bool,
+    tts_mode: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
     let editor_side_idx = if editor_side == "right" { 1 } else { 0 };
+    let tts_mode_idx = match tts_mode {
+        "local" => 1,
+        "edge" => 2,
+        _ => 0,  // "off"
+    };
 
     PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -150,7 +164,7 @@ pub fn create_setup_popup(
         .with_field(Field::new(
             SETUP_FIELD_TTS,
             "TTS",
-            FieldKind::toggle(tts_enabled),
+            FieldKind::select(tts_mode_options(), tts_mode_idx),
         ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
@@ -215,10 +229,11 @@ fn setup_help_text() -> Vec<String> {
         "New Indicator: Show a marker on new lines arriving",
         "  while scrolled up in the output buffer.",
         "",
-        "TTS: Text-to-speech. Speaks MUD output aloud.",
-        "  Console uses espeak/say. Web/Android uses the",
-        "  browser's Web Speech API. Use /say <text> to",
-        "  speak manually even when auto-TTS is off.",
+        "TTS: Text-to-speech mode for MUD output.",
+        "  Off: disabled. Local: uses espeak/say subprocess.",
+        "  Edge: Microsoft Edge neural TTS (needs internet).",
+        "  Web/Android always use the browser's Speech API.",
+        "  Use /say <text> to speak manually when TTS is off.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -232,7 +247,7 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, false,
+            false, "off",
         );
         let state = PopupState::new(def);
 
@@ -247,7 +262,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, true,
+            false, "edge",
         );
         let state = PopupState::new(def);
 

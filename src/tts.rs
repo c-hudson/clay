@@ -1,51 +1,84 @@
-//! Text-to-speech backend for console mode.
+//! Text-to-speech backend for Clay MUD client.
 //!
-//! Uses external TTS commands (espeak, say, PowerShell) to speak text aloud.
-//! No additional Rust dependencies needed — works with musl static builds.
+//! Two backends:
+//! - **Local**: External TTS commands (espeak, say, PowerShell). Works offline.
+//! - **Edge**: Microsoft Edge neural TTS via cloud WebSocket API. Higher quality, needs internet.
+//!     Uses the same tokio-tungstenite + rustls stack as the rest of Clay (no openssl needed).
 //!
 //! Web/Android clients use the browser's Web Speech API via ServerSpeak WebSocket messages.
 
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-/// TTS backend holding the detected command and a handle to the current process.
-pub struct TtsBackend {
-    /// The TTS command to use (e.g. "espeak", "espeak-ng", "say")
-    command: Option<String>,
-    /// Handle to the currently running TTS process (for stopping)
-    current_process: Arc<Mutex<Option<std::process::Child>>>,
+/// TTS mode setting
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TtsMode {
+    Off,
+    Local,  // espeak, say, PowerShell
+    Edge,   // Microsoft Edge neural TTS
 }
 
-// Safety: TtsBackend is only accessed from the App's owning task/thread.
-// The Arc<Mutex<Child>> is already Send+Sync, and the rest is just String/Option.
-unsafe impl Send for TtsBackend {}
+impl TtsMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TtsMode::Off => "off",
+            TtsMode::Local => "local",
+            TtsMode::Edge => "edge",
+        }
+    }
 
-/// Detect available TTS command on the system.
-pub fn init_tts() -> TtsBackend {
-    let command = detect_tts_command();
-    TtsBackend {
-        command,
-        current_process: Arc::new(Mutex::new(None)),
+    pub fn from_name(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "local" => TtsMode::Local,
+            "edge" => TtsMode::Edge,
+            _ => TtsMode::Off,
+        }
     }
 }
 
-/// Detect which TTS command is available on this system.
+impl Default for TtsMode {
+    fn default() -> Self {
+        TtsMode::Off
+    }
+}
+
+/// TTS backend holding the detected local command and Edge TTS state.
+pub struct TtsBackend {
+    /// The local TTS command to use (e.g. "espeak", "espeak-ng", "say")
+    local_command: Option<String>,
+    /// Handle to the currently running local TTS process (for stopping)
+    current_process: Arc<Mutex<Option<std::process::Child>>>,
+    /// Tokio handle for spawning Edge TTS async tasks
+    tokio_handle: Option<tokio::runtime::Handle>,
+}
+
+// Safety: TtsBackend is only accessed from the App's owning task/thread.
+unsafe impl Send for TtsBackend {}
+
+/// Initialize the TTS backend.
+pub fn init_tts() -> TtsBackend {
+    let tokio_handle = tokio::runtime::Handle::try_current().ok();
+    TtsBackend {
+        local_command: detect_tts_command(),
+        current_process: Arc::new(Mutex::new(None)),
+        tokio_handle,
+    }
+}
+
+/// Detect which local TTS command is available on this system.
 fn detect_tts_command() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        // macOS always has "say"
         return Some("say".to_string());
     }
 
     #[cfg(target_os = "windows")]
     {
-        // Windows uses PowerShell for TTS
         return Some("powershell".to_string());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        // Linux/Unix: check for espeak-ng first, then espeak, then festival
         for cmd in &["espeak-ng", "espeak", "festival"] {
             if Command::new("which")
                 .arg(cmd)
@@ -62,18 +95,8 @@ fn detect_tts_command() -> Option<String> {
     }
 }
 
-/// Speak text aloud using the TTS backend.
-///
-/// Strips ANSI escape codes from the text before speaking.
-/// Spawns the TTS command as a background process (non-blocking).
-/// Kills any previously running TTS process before starting a new one.
-pub fn speak(backend: &TtsBackend, text: &str) {
-    let cmd = match &backend.command {
-        Some(c) => c.clone(),
-        None => return, // No TTS available
-    };
-
-    // Strip ANSI codes from the text
+/// Speak text aloud using the specified TTS mode.
+pub fn speak(backend: &TtsBackend, text: &str, mode: TtsMode) {
     let clean_text = crate::util::strip_ansi_codes(text);
     let clean_text = clean_text.trim().to_string();
 
@@ -81,26 +104,36 @@ pub fn speak(backend: &TtsBackend, text: &str) {
         return;
     }
 
-    // Kill any currently running TTS process
-    stop(backend);
+    match mode {
+        TtsMode::Off => {}
+        TtsMode::Local => speak_local(backend, &clean_text),
+        TtsMode::Edge => speak_edge(backend, &clean_text),
+    }
+}
 
-    // Spawn the TTS command
+/// Speak using local TTS command (espeak, say, PowerShell).
+fn speak_local(backend: &TtsBackend, text: &str) {
+    let cmd = match &backend.local_command {
+        Some(c) => c.clone(),
+        None => return,
+    };
+
+    stop_local(backend);
+
     let child = match cmd.as_str() {
         "say" => {
-            // macOS
             Command::new("say")
-                .arg(&clean_text)
+                .arg(text)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
         }
         "powershell" => {
-            // Windows PowerShell
             let script = format!(
                 "Add-Type -AssemblyName System.Speech; \
                  $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
                  $s.Speak('{}')",
-                clean_text.replace('\'', "''")
+                text.replace('\'', "''")
             );
             Command::new("powershell")
                 .args(["-NoProfile", "-Command", &script])
@@ -109,7 +142,6 @@ pub fn speak(backend: &TtsBackend, text: &str) {
                 .spawn()
         }
         "festival" => {
-            // festival uses stdin
             let mut child = Command::new("festival")
                 .arg("--tts")
                 .stdin(Stdio::piped())
@@ -119,17 +151,15 @@ pub fn speak(backend: &TtsBackend, text: &str) {
             if let Ok(ref mut c) = child {
                 if let Some(ref mut stdin) = c.stdin {
                     use std::io::Write;
-                    let _ = stdin.write_all(clean_text.as_bytes());
-                    // Drop stdin to signal EOF
+                    let _ = stdin.write_all(text.as_bytes());
                 }
                 c.stdin = None;
             }
             child
         }
         _ => {
-            // espeak, espeak-ng, or any other command
             Command::new(&cmd)
-                .arg(&clean_text)
+                .arg(text)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -143,8 +173,165 @@ pub fn speak(backend: &TtsBackend, text: &str) {
     }
 }
 
-/// Stop any currently running TTS process.
+/// Speak using Microsoft Edge neural TTS via WebSocket.
+fn speak_edge(backend: &TtsBackend, text: &str) {
+    let handle = match &backend.tokio_handle {
+        Some(h) => h.clone(),
+        None => return,
+    };
+
+    let text = text.to_string();
+    handle.spawn(async move {
+        if let Err(e) = edge_tts_speak(&text).await {
+            crate::debug_log(crate::is_debug_enabled(), &format!("Edge TTS error: {}", e));
+        }
+    });
+}
+
+/// Edge TTS WebSocket protocol implementation.
+/// Connects to Microsoft's TTS endpoint, sends SSML, receives MP3 audio.
+async fn edge_tts_speak(text: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio_tungstenite::tungstenite::Message;
+    use futures::StreamExt;
+
+    let request_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let voice = "en-US-AriaNeural";
+    let output_format = "audio-24khz-48kbitrate-mono-mp3";
+
+    // Build the WebSocket URL with required parameters
+    let ws_url = format!(
+        "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId={}",
+        &request_id
+    );
+
+    // Connect via tungstenite with rustls
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+
+    // Send speech config
+    let config_msg = format!(
+        "Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n\
+        {{\"context\":{{\"synthesis\":{{\"audio\":{{\"metadataoptions\":{{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}},\"outputFormat\":\"{}\"}}}}}}}}",
+        output_format
+    );
+    {
+        use futures::SinkExt;
+        ws.send(Message::Text(config_msg)).await?;
+    }
+
+    // Escape text for SSML
+    let escaped_text = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;");
+
+    // Send SSML synthesis request
+    let ssml = format!(
+        "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>\
+        <voice name='{}'>{}</voice></speak>",
+        voice, escaped_text
+    );
+
+    let ssml_msg = format!(
+        "X-RequestId:{}\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n{}",
+        request_id, ssml
+    );
+    {
+        use futures::SinkExt;
+        ws.send(Message::Text(ssml_msg)).await?;
+    }
+
+    // Collect audio bytes from response
+    let mut audio_data: Vec<u8> = Vec::new();
+    let header_separator = b"Path:audio\r\n";
+
+    while let Some(msg) = ws.next().await {
+        match msg? {
+            Message::Binary(data) => {
+                // Binary messages contain audio data after a header
+                // Find "Path:audio\r\n" in the binary data and extract audio after it
+                if let Some(pos) = find_subsequence(&data, header_separator) {
+                    let audio_start = pos + header_separator.len();
+                    if audio_start < data.len() {
+                        audio_data.extend_from_slice(&data[audio_start..]);
+                    }
+                }
+            }
+            Message::Text(text) => {
+                // Check for turn.end which signals completion
+                if text.contains("Path:turn.end") {
+                    break;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Play the collected MP3 audio
+    if !audio_data.is_empty() {
+        play_mp3_bytes_async(audio_data).await;
+    }
+
+    Ok(())
+}
+
+/// Find a subsequence in a byte slice.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+/// Play MP3 bytes via rodio.
+async fn play_mp3_bytes_async(data: Vec<u8>) {
+    #[cfg(feature = "native-audio")]
+    {
+        // Spawn blocking since rodio playback blocks
+        let _ = tokio::task::spawn_blocking(move || {
+            use std::io::Cursor;
+            if let Ok((_stream, stream_handle)) = rodio::OutputStream::try_default() {
+                if let Ok(source) = rodio::Decoder::new(Cursor::new(data)) {
+                    if let Ok(sink) = rodio::Sink::try_new(&stream_handle) {
+                        sink.append(source);
+                        sink.sleep_until_end();
+                    }
+                }
+            }
+        }).await;
+    }
+
+    #[cfg(not(feature = "native-audio"))]
+    {
+        // Without rodio, write to temp file and play with external player
+        use std::io::Write;
+        let tmp_path = std::env::temp_dir().join("clay_edge_tts.mp3");
+        if let Ok(mut f) = std::fs::File::create(&tmp_path) {
+            let _ = f.write_all(&data);
+            drop(f);
+            // Try mpv, ffplay, or play as external player
+            for player in &["mpv", "ffplay", "play"] {
+                if Command::new(player)
+                    .args(["--no-video", "--really-quiet", tmp_path.to_str().unwrap_or("")])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+            }
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+}
+
+/// Stop any currently running TTS.
 pub fn stop(backend: &TtsBackend) {
+    stop_local(backend);
+}
+
+fn stop_local(backend: &TtsBackend) {
     if let Ok(mut guard) = backend.current_process.lock() {
         if let Some(ref mut child) = *guard {
             let _ = child.kill();
@@ -154,12 +341,12 @@ pub fn stop(backend: &TtsBackend) {
     }
 }
 
-/// Returns true if a TTS command was detected on this system.
+/// Returns true if a local TTS command was detected.
 pub fn is_available(backend: &TtsBackend) -> bool {
-    backend.command.is_some()
+    backend.local_command.is_some()
 }
 
-/// Returns the name of the detected TTS command, if any.
+/// Returns the name of the detected local TTS command, if any.
 pub fn command_name(backend: &TtsBackend) -> Option<&str> {
-    backend.command.as_deref()
+    backend.local_command.as_deref()
 }
