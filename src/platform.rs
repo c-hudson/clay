@@ -1047,15 +1047,23 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
 
     match std::process::Command::new(&exe).args(&args).spawn() {
         Ok(mut child) => {
-            // Wait briefly for the new process to signal it has taken over the console
+            // Wait for the new process to signal it has taken over the console
             if sync_event != 0 {
                 debug_log(true, "RELOAD: Waiting for new process to take over console...");
                 unsafe { WaitForSingleObject(sync_event, 5000); }
                 unsafe { CloseHandle(sync_event); }
             }
+
+            // Detach from the console so the old process stops competing with the
+            // new one for stdin/stdout. FreeConsole() releases our console handle
+            // while the child inherits the console and has exclusive access.
+            extern "system" {
+                fn FreeConsole() -> i32;
+            }
+            unsafe { FreeConsole(); }
+
             // Wait for the child to exit — this keeps the old process alive from the
-            // shell's perspective, preventing the shell from reclaiming the console
-            // and showing a prompt while the new Clay is running.
+            // shell's perspective, preventing cmd.exe/PowerShell from showing a prompt.
             let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(0);
             std::process::exit(code);
         }
