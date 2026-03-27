@@ -1046,14 +1046,18 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     debug_log(true, &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
 
     match std::process::Command::new(&exe).args(&args).spawn() {
-        Ok(_) => {
-            // Wait for the new process to signal it has taken over the console
+        Ok(mut child) => {
+            // Wait briefly for the new process to signal it has taken over the console
             if sync_event != 0 {
                 debug_log(true, "RELOAD: Waiting for new process to take over console...");
                 unsafe { WaitForSingleObject(sync_event, 5000); }
                 unsafe { CloseHandle(sync_event); }
             }
-            std::process::exit(0);
+            // Wait for the child to exit — this keeps the old process alive from the
+            // shell's perspective, preventing the shell from reclaiming the console
+            // and showing a prompt while the new Clay is running.
+            let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(0);
+            std::process::exit(code);
         }
         Err(e) => {
             if sync_event != 0 {
