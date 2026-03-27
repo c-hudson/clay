@@ -2055,9 +2055,8 @@ pub fn cmd_untrig(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 
     // Parse optional -a attrs
-    let pattern = if args.starts_with("-a") {
+    let pattern = if let Some(rest) = args.strip_prefix("-a") {
         // Skip -a and attrs, get to pattern
-        let rest = &args[2..];
         if let Some(space_pos) = rest.find(char::is_whitespace) {
             rest[space_pos..].trim_start()
         } else {

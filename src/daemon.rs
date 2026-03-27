@@ -2219,7 +2219,7 @@ pub async fn connect_multiuser_world(
 
                     let config = rustls::ClientConfig::builder()
                         .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(crate::danger::NoCertificateVerification::new()))
+                        .with_custom_certificate_verifier(Arc::new(crate::platform::danger::NoCertificateVerification::new()))
                         .with_no_client_auth();
 
                     let connector = TlsConnector::from(Arc::new(config));
@@ -2464,7 +2464,7 @@ pub async fn connect_daemon_world(
 
                     let config = rustls::ClientConfig::builder()
                         .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(crate::danger::NoCertificateVerification::new()))
+                        .with_custom_certificate_verifier(Arc::new(crate::platform::danger::NoCertificateVerification::new()))
                         .with_no_client_auth();
 
                     let connector = TlsConnector::from(Arc::new(config));

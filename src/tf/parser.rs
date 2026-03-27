@@ -1963,16 +1963,15 @@ fn cmd_edit(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
     // Find the existing macro by name, #num, or $pattern
     let name = &edit_def.name;
-    let existing_idx = if name.starts_with('#') {
+    let existing_idx = if let Some(num_str) = name.strip_prefix('#') {
         // #num — find by sequence number
-        if let Ok(num) = name[1..].parse::<u32>() {
+        if let Ok(num) = num_str.parse::<u32>() {
             engine.macros.iter().position(|m| m.sequence_number == num)
         } else {
             None
         }
-    } else if name.starts_with('$') {
+    } else if let Some(pattern) = name.strip_prefix('$') {
         // $pattern — find by trigger pattern
-        let pattern = &name[1..];
         engine.macros.iter().position(|m| {
             m.trigger.as_ref().map(|t| t.pattern == pattern).unwrap_or(false)
         })

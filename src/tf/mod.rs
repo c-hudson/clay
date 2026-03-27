@@ -467,12 +467,13 @@ pub struct TfFileHandle {
 
 impl TfEngine {
     pub fn new() -> Self {
-        let mut engine = TfEngine::default();
-        engine.watchdog_n1 = 2;
-        engine.watchdog_n2 = 5;
-        engine.watchname_n1 = 4;
-        engine.watchname_n2 = 5;
-        engine
+        TfEngine {
+            watchdog_n1: 2,
+            watchdog_n2: 5,
+            watchname_n1: 4,
+            watchname_n2: 5,
+            ..Default::default()
+        }
     }
 
     /// Get a variable value, checking local scope first, then global

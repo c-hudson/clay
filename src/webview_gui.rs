@@ -390,7 +390,7 @@ async fn ws_proxy_bridge(
             let tls_config = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(std::sync::Arc::new(
-                    crate::danger::NoCertificateVerification::new()
+                    crate::platform::danger::NoCertificateVerification::new()
                 ))
                 .with_no_client_auth();
             let connector = tokio_tungstenite::Connector::Rustls(
