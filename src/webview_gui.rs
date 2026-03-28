@@ -5,10 +5,11 @@
 // --gui=host:port  Remote mode: opens WebView window connected to remote Clay instance
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
-use tao::window::WindowBuilder;
+use tao::window::{WindowBuilder, WindowId};
 use wry::WebViewBuilder;
 
 /// Temporarily suppress stderr (e.g. WebKit/JSC prints harmless warnings on init).
@@ -79,6 +80,7 @@ const WEB_APP_JS: &str = include_str!("web/app.js");
 const CLAY_LOGO_PNG: &[u8] = include_bytes!("../clay2.png");
 
 /// Parameters for building the WebView HTML content
+#[derive(Clone)]
 struct WebViewParams {
     ws_host: String,
     ws_port: u16,
@@ -667,52 +669,27 @@ document.addEventListener('DOMContentLoaded', function() {
     html
 }
 
-/// Create and run the WebView window with custom protocol to serve embedded web content.
-/// Uses custom protocol (clay://) instead of with_html() because with_html() loads
-/// content with a null origin, which blocks WebSocket connections on WebKit2GTK.
-fn create_webview_window(
-    title: &str,
+/// Build a WebView for a given window, returning the WebView.
+/// Extracts WebView construction so it can be reused for new windows.
+fn build_webview(
+    window: &tao::window::Window,
     params: &WebViewParams,
-    reload_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
-) -> io::Result<()> {
-    // Suppress WebKit/JSC stderr noise during init (WebKit/JSC overrides SIGUSR1 handler
-    // for GC signaling — this is why we use a channel for reload instead of SIGUSR1)
-    #[cfg(unix)]
-    let _stderr_guard = StderrSuppress::new();
+    proxy: &EventLoopProxy<WvEvent>,
+    reload_tx: &Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
+    world_lock: Option<&str>,
+) -> io::Result<wry::WebView> {
+    // Build HTML with WS params baked into template placeholders
+    let mut html_content = build_html(params);
 
-    let event_loop = EventLoopBuilder::<WvEvent>::with_user_event().build();
-    let proxy: EventLoopProxy<WvEvent> = event_loop.create_proxy();
-
-    let window_theme = if load_gui_theme_name() == "light" {
-        Some(tao::window::Theme::Light)
-    } else {
-        Some(tao::window::Theme::Dark)
-    };
-    let window = WindowBuilder::new()
-        .with_title(title)
-        .with_theme(window_theme)
-        .with_inner_size(tao::dpi::LogicalSize::new(800.0, 600.0))
-        .build(&event_loop)
-        .map_err(|e| io::Error::other(format!("Failed to create window: {}", e)))?;
-
-    // Enable spell checking on Linux (WebKit2GTK)
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "android",
-    ))]
-    {
-        use webkit2gtk::{WebContextExt, WebContext};
-        let ctx = WebContext::default().unwrap();
-        ctx.set_spell_checking_enabled(true);
-        ctx.set_spell_checking_languages(&["en"]);
+    // Inject world lock if provided (for new windows locked to a specific world)
+    if let Some(world_name) = world_lock {
+        html_content = html_content.replace(
+            &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
+            &format!("window.WS_PROTOCOL = '{}';\n        window.LOCK_WORLD = '{}';",
+                params.ws_protocol, world_name.replace('\'', "\\'")),
+        );
     }
 
-    // Build HTML with WS params baked into template placeholders
-    let html_content = build_html(params);
     let css_content = WEB_STYLE_CSS.to_string();
     let js_content = WEB_APP_JS.to_string();
 
@@ -737,6 +714,7 @@ fn create_webview_window(
         .with_devtools(cfg!(debug_assertions))
         .with_ipc_handler({
             let is_master = params.auto_password.is_some();
+            let proxy = proxy.clone();
             let reload_tx = reload_tx.clone();
             move |req| {
             let body = req.body();
@@ -744,11 +722,10 @@ fn create_webview_window(
                 let url = &body[9..];
                 open_url_in_browser(url);
             } else if body.starts_with("new-window:") {
-                // Spawn a new WebView window (optionally locked to a world)
+                // Open a new WebView window in-process (optionally locked to a world)
                 let world_name = body[11..].trim().to_string();
                 let world = if world_name.is_empty() { None } else { Some(world_name) };
-                let proxy_clone = proxy.clone();
-                let _ = proxy_clone.send_event(WvEvent::NewWindow(world));
+                let _ = proxy.send_event(WvEvent::NewWindow(world));
             } else if body == "quit" {
                 let _ = proxy.send_event(WvEvent::Quit);
             } else if body == "update" || body == "update-force" {
@@ -859,7 +836,7 @@ fn create_webview_window(
         target_os = "openbsd",
         target_os = "android",
     ))]
-    let _webview = {
+    let webview = {
         use tao::platform::unix::WindowExtUnix;
         use wry::WebViewBuilderExtUnix;
         let vbox = window.default_vbox()
@@ -876,29 +853,102 @@ fn create_webview_window(
         target_os = "openbsd",
         target_os = "android",
     )))]
-    let _webview = builder.build(&window)
+    let webview = builder.build(window)
         .map_err(|e| io::Error::other(format!("Failed to create WebView: {}", e)))?;
+
+    Ok(webview)
+}
+
+/// Create and run the WebView window with custom protocol to serve embedded web content.
+/// Uses custom protocol (clay://) instead of with_html() because with_html() loads
+/// content with a null origin, which blocks WebSocket connections on WebKit2GTK.
+/// Supports multiple windows within a single event loop.
+fn create_webview_window(
+    title: &str,
+    params: &WebViewParams,
+    reload_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
+) -> io::Result<()> {
+    // Suppress WebKit/JSC stderr noise during init (WebKit/JSC overrides SIGUSR1 handler
+    // for GC signaling — this is why we use a channel for reload instead of SIGUSR1)
+    #[cfg(unix)]
+    let _stderr_guard = StderrSuppress::new();
+
+    let event_loop = EventLoopBuilder::<WvEvent>::with_user_event().build();
+    let proxy: EventLoopProxy<WvEvent> = event_loop.create_proxy();
+
+    let window_theme = if load_gui_theme_name() == "light" {
+        Some(tao::window::Theme::Light)
+    } else {
+        Some(tao::window::Theme::Dark)
+    };
+    let window = WindowBuilder::new()
+        .with_title(title)
+        .with_theme(window_theme)
+        .with_inner_size(tao::dpi::LogicalSize::new(800.0, 600.0))
+        .build(&event_loop)
+        .map_err(|e| io::Error::other(format!("Failed to create window: {}", e)))?;
+
+    // Enable spell checking on Linux (WebKit2GTK)
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "android",
+    ))]
+    {
+        use webkit2gtk::{WebContextExt, WebContext};
+        let ctx = WebContext::default().unwrap();
+        ctx.set_spell_checking_enabled(true);
+        ctx.set_spell_checking_languages(&["en"]);
+    }
+
+    // Read initial world lock from env var (set by CLAY_WINDOW_WORLD for backward compat)
+    let initial_world_lock: Option<String> = std::env::var("CLAY_WINDOW_WORLD").ok();
+
+    // Build the first webview (initial_world_lock is handled inside build_html via env var)
+    let webview = build_webview(&window, params, &proxy, &reload_tx, None)?;
+
+    // Store windows and webviews in HashMaps keyed by WindowId for multi-window support
+    let mut windows: HashMap<WindowId, tao::window::Window> = HashMap::new();
+    let mut webviews: HashMap<WindowId, wry::WebView> = HashMap::new();
+    let window_id = window.id();
+    windows.insert(window_id, window);
+    webviews.insert(window_id, webview);
+
+    // Suppress the unused variable warning — initial_world_lock was read from env
+    // and consumed by build_html() via CLAY_WINDOW_WORLD env var
+    let _ = initial_world_lock;
+
+    // Clone params for use inside the event loop closure (needed for creating new windows)
+    let params = params.clone();
 
     #[cfg(unix)]
     drop(_stderr_guard);
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, event_loop_target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
+                window_id,
                 ..
             } => {
-                *control_flow = ControlFlow::Exit;
+                // Remove the closed window and its webview
+                windows.remove(&window_id);
+                webviews.remove(&window_id);
+                // Only exit if all windows are closed
+                if windows.is_empty() {
+                    *control_flow = ControlFlow::Exit;
+                }
             }
             Event::UserEvent(WvEvent::Quit) => {
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(WvEvent::SetOpacity(opacity)) => {
-                // Use GTK's window opacity — sets _NET_WM_WINDOW_OPACITY on X11.
-                // This is handled by the compositor (xfwm4, etc.) and is instant/reliable,
-                // unlike per-pixel alpha through WebKit2GTK's rendering pipeline.
+                // Broadcast opacity to all windows
                 #[cfg(any(
                     target_os = "linux",
                     target_os = "dragonfly",
@@ -910,8 +960,10 @@ fn create_webview_window(
                 {
                     use tao::platform::unix::WindowExtUnix;
                     use gtk::prelude::WidgetExt;
-                    let gtk_win = window.gtk_window();
-                    gtk_win.set_opacity(opacity);
+                    for win in windows.values() {
+                        let gtk_win = win.gtk_window();
+                        gtk_win.set_opacity(opacity);
+                    }
                 }
                 #[cfg(not(any(
                     target_os = "linux",
@@ -924,12 +976,17 @@ fn create_webview_window(
                 { let _ = opacity; }
             }
             Event::UserEvent(WvEvent::UpdateStatus(ref msg)) => {
-                // Show update status in WebView via JS
+                // Broadcast update status to all webviews
                 let escaped = msg.replace('\\', "\\\\").replace('\'', "\\'");
-                let _ = _webview.evaluate_script(&format!("window.showUpdateStatus('{}')", escaped));
+                let script = format!("window.showUpdateStatus('{}')", escaped);
+                for wv in webviews.values() {
+                    let _ = wv.evaluate_script(&script);
+                }
             }
             Event::UserEvent(WvEvent::Reload) => {
                 // Remote GUI reload: restart the binary (no state to save — state lives on server)
+                // Show error in first available webview if exec fails
+                let _first_wv = webviews.values().next();
                 #[cfg(all(unix, not(target_os = "android")))]
                 {
                     if let Ok((exe_path, _)) = crate::get_executable_path() {
@@ -944,11 +1001,13 @@ fn create_webview_window(
                             .collect();
                         unsafe { libc::execv(c_exe.as_ptr(), c_arg_ptrs.as_ptr()); }
                         // If exec fails, show error in WebView
-                        let _ = _webview.evaluate_script(
-                            "window.showUpdateStatus('Reload failed: exec error')"
-                        );
-                    } else {
-                        let _ = _webview.evaluate_script(
+                        if let Some(wv) = _first_wv {
+                            let _ = wv.evaluate_script(
+                                "window.showUpdateStatus('Reload failed: exec error')"
+                            );
+                        }
+                    } else if let Some(wv) = _first_wv {
+                        let _ = wv.evaluate_script(
                             "window.showUpdateStatus('Reload failed: cannot find binary')"
                         );
                     }
@@ -960,35 +1019,54 @@ fn create_webview_window(
                         match std::process::Command::new(&exe_path).args(&args[1..]).spawn() {
                             Ok(_) => std::process::exit(0),
                             Err(_) => {
-                                let _ = _webview.evaluate_script(
-                                    "window.showUpdateStatus('Reload failed: spawn error')"
-                                );
+                                if let Some(wv) = _first_wv {
+                                    let _ = wv.evaluate_script(
+                                        "window.showUpdateStatus('Reload failed: spawn error')"
+                                    );
+                                }
                             }
                         }
-                    } else {
-                        let _ = _webview.evaluate_script(
+                    } else if let Some(wv) = _first_wv {
+                        let _ = wv.evaluate_script(
                             "window.showUpdateStatus('Reload failed: cannot find binary')"
                         );
                     }
                 }
                 #[cfg(not(any(unix, windows)))]
                 {
-                    let _ = _webview.evaluate_script(
-                        "window.showUpdateStatus('Reload not supported on this platform')"
-                    );
+                    if let Some(wv) = _first_wv {
+                        let _ = wv.evaluate_script(
+                            "window.showUpdateStatus('Reload not supported on this platform')"
+                        );
+                    }
                 }
             }
             Event::UserEvent(WvEvent::NewWindow(ref world)) => {
-                // Spawn a new Clay GUI process for the new window
-                if let Ok((exe_path, _)) = crate::get_executable_path() {
-                    let args: Vec<String> = std::env::args().skip(1).collect();
-                    let mut cmd = std::process::Command::new(&exe_path);
-                    cmd.args(&args);
-                    // Pass world lock via env var (cleared by child after reading)
-                    if let Some(ref w) = world {
-                        cmd.env("CLAY_WINDOW_WORLD", w);
+                // Create a new window in the same process
+                let win_title = match world {
+                    Some(ref w) => format!("Clay - {}", w),
+                    None => "Clay".to_string(),
+                };
+                let new_window = match WindowBuilder::new()
+                    .with_title(&win_title)
+                    .with_theme(window_theme)
+                    .with_inner_size(tao::dpi::LogicalSize::new(800.0, 600.0))
+                    .build(event_loop_target)
+                {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+
+                let world_lock = world.as_deref();
+                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock) {
+                    Ok(wv) => {
+                        let id = new_window.id();
+                        windows.insert(id, new_window);
+                        webviews.insert(id, wv);
                     }
-                    let _ = cmd.spawn();
+                    Err(_) => {
+                        // Window will be dropped, which is fine
+                    }
                 }
             }
             _ => {}
