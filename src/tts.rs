@@ -3,7 +3,7 @@
 //! Two backends:
 //! - **Local**: External TTS commands (espeak, say, PowerShell). Works offline.
 //! - **Edge**: Microsoft Edge neural TTS via cloud WebSocket API. Higher quality, needs internet.
-//!     Uses the same tokio-tungstenite + rustls stack as the rest of Clay (no openssl needed).
+//!   Uses the same tokio-tungstenite + rustls stack as the rest of Clay (no openssl needed).
 //!
 //! Web/Android clients use the browser's Web Speech API via ServerSpeak WebSocket messages.
 
@@ -11,8 +11,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 /// TTS mode setting
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TtsMode {
+    #[default]
     Off,
     Local,  // espeak, say, PowerShell
     Edge,   // Microsoft Edge neural TTS
@@ -33,12 +34,6 @@ impl TtsMode {
             "edge" => TtsMode::Edge,
             _ => TtsMode::Off,
         }
-    }
-}
-
-impl Default for TtsMode {
-    fn default() -> Self {
-        TtsMode::Off
     }
 }
 

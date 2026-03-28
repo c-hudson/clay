@@ -75,9 +75,7 @@ pub(crate) async fn run_grep_client(
     };
 
     // Connect to WebSocket server (same logic as run_console_client)
-    let addr_with_port = if addr.starts_with("ws://") || addr.starts_with("wss://") {
-        addr.to_string()
-    } else if addr.contains(':') {
+    let addr_with_port = if addr.starts_with("ws://") || addr.starts_with("wss://") || addr.contains(':') {
         addr.to_string()
     } else {
         format!("{}:9000", addr)

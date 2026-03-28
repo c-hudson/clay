@@ -1629,7 +1629,7 @@ pub fn parse_command(input: &str) -> Command {
         "/say" => {
             if !args.is_empty() {
                 // Preserve the original text after /say (not split by whitespace)
-                let text = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+                let text = trimmed.split_once(char::is_whitespace).map(|x| x.1).unwrap_or("").trim();
                 Command::Say { text: text.to_string() }
             } else {
                 Command::Unknown { cmd: trimmed.to_string() }
@@ -5614,7 +5614,7 @@ impl App {
         hasher.update(std::process::id().to_le_bytes());
         let mut random_bytes = [0u8; 16];
         let _ = getrandom::getrandom(&mut random_bytes);
-        hasher.update(&random_bytes);
+        hasher.update(random_bytes);
         hex::encode(hasher.finalize())
     }
 
@@ -6561,7 +6561,7 @@ impl App {
         self.sync_tf_world_info();
         let help_text = match self.tf_engine.execute(cmd) {
             tf::TfCommandResult::Success(Some(msg)) => msg,
-            _ => format!("No help available. Try /help commands"),
+            _ => "No help available. Try /help commands".to_string(),
         };
         for line in help_text.lines() {
             self.ws_send_to_client(client_id, WsMessage::ServerData {
@@ -9180,7 +9180,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             hasher.update(std::process::id().to_le_bytes());
                             let mut random_bytes = [0u8; 16];
                             let _ = getrandom::getrandom(&mut random_bytes);
-                            hasher.update(&random_bytes);
+                            hasher.update(random_bytes);
                             let new_key = hex::encode(hasher.finalize());
                             if let Some(field) = state.definition.fields.iter_mut()
                                 .find(|f| f.id == WEB_FIELD_AUTH_KEY)
