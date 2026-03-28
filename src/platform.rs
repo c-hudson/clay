@@ -4,6 +4,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+#[cfg(unix)]
 use std::sync::Arc;
 
 #[cfg(unix)]
@@ -12,6 +13,7 @@ use std::os::unix::io::RawFd;
 use std::path::Path;
 
 use tokio::net::TcpStream;
+#[allow(unused_imports)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crossterm::{execute, terminal::{disable_raw_mode, LeaveAlternateScreen}};
@@ -958,7 +960,6 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             bInitialState: i32,
             lpName: *const u8,
         ) -> isize;
-        fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
         fn CloseHandle(hObject: isize) -> i32;
     }
 

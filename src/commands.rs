@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+#[allow(unused_imports)]
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
@@ -13,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+#[allow(unused_imports)]
 use crate::{
     App, AppEvent, Command, World, WorldType, SocketFd,
     WsMessage, WriteCommand, StreamReader, StreamWriter,
@@ -37,6 +39,7 @@ use crate::platform::{
     spawn_tls_proxy,
 };
 #[cfg(windows)]
+#[allow(unused_imports)]
 use crate::platform::{
     get_executable_path, exec_reload, check_and_download_update,
 };
