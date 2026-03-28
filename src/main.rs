@@ -6342,9 +6342,21 @@ impl App {
                     Err(_e) => {}
                 }
             }
-            Command::Window { world } => {
-                // Send OpenWindow message to requesting client only — client opens a new browser tab
-                self.ws_send_to_client(client_id, WsMessage::OpenWindow { world });
+            Command::Window { ref world } => {
+                // Auto-connect if the world exists but isn't connected
+                if let Some(ref name) = world {
+                    if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                        if !self.worlds[idx].connected && self.worlds[idx].settings.has_connection_settings() {
+                            let prev_index = self.current_world_index;
+                            self.current_world_index = idx;
+                            // Return Connect action — caller will handle the async connect
+                            self.ws_send_to_client(client_id, WsMessage::OpenWindow { world: world.clone() });
+                            return WsAsyncAction::Connect { world_index: idx, prev_index, broadcast: true };
+                        }
+                    }
+                }
+                // Send OpenWindow message to requesting client
+                self.ws_send_to_client(client_id, WsMessage::OpenWindow { world: world.clone() });
             }
             Command::Quit => {
                 // Tell the requesting client to close (GUI window closes)
@@ -10945,12 +10957,15 @@ pub async fn run_app_headless(
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
-                    Ok(()) => { app.https_server = Some(https_server); }
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                            eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                    Ok(()) => {
+                        if !app.is_reload {
+                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
+                        app.https_server = Some(https_server);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                        app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
                     }
                 }
             }
@@ -10965,12 +10980,15 @@ pub async fn run_app_headless(
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
-                    Ok(()) => { app.https_server = Some(https_server); }
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                            eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                    Ok(()) => {
+                        if !app.is_reload {
+                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
+                        app.https_server = Some(https_server);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                        app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
                     }
                 }
             }
@@ -10982,12 +11000,15 @@ pub async fn run_app_headless(
                 app.ban_list.clone(),
                 app.gui_theme_colors().to_css_vars(),
             ).await {
-                Ok(()) => { app.http_server = Some(http_server); }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                        eprintln!("Warning: Failed to start HTTP server: {}", e);
+                Ok(()) => {
+                    if !app.is_reload {
+                        app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
                     }
+                    app.http_server = Some(http_server);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to start HTTP server: {}", e);
+                    app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
                 }
             }
         }
