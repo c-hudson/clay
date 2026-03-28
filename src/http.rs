@@ -230,7 +230,9 @@ fn handle_http_routes(
     theme_css_vars: &str,
     is_https: bool,
 ) -> Option<RouteResult> {
-    let (method, path) = parse_http_request(request)?;
+    let (method, full_path) = parse_http_request(request)?;
+    // Strip query string for route matching (e.g. "/?world=Name" → "/")
+    let path = full_path.split('?').next().unwrap_or(full_path);
 
     if method != "GET" {
         return Some(RouteResult::MethodNotAllowed(

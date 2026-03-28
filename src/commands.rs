@@ -2474,6 +2474,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 app.needs_terminal_clear = true;
             }
         }
+        Command::Window { .. } => {
+            app.add_output("Use /window from a web or GUI client to open a new window.");
+        }
         Command::Tag => {
             // Toggle MUD tag display (same as F2) - silent, no output
             app.show_tags = !app.show_tags;

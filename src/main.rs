@@ -1496,6 +1496,8 @@ pub enum Command {
     TinyUrlUsage,
     /// /say <text> - speak text aloud via TTS
     Say { text: String },
+    /// /window [world] - open a new GUI/web window, optionally locked to a world
+    Window { world: Option<String> },
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -1631,6 +1633,13 @@ pub fn parse_command(input: &str) -> Command {
                 Command::Say { text: text.to_string() }
             } else {
                 Command::Unknown { cmd: trimmed.to_string() }
+            }
+        }
+        "/window" => {
+            if args.is_empty() {
+                Command::Window { world: None }
+            } else {
+                Command::Window { world: Some(args.join(" ")) }
             }
         }
         _ => {
@@ -6332,6 +6341,10 @@ impl App {
                     }
                     Err(_e) => {}
                 }
+            }
+            Command::Window { world } => {
+                // Send OpenWindow message to requesting client only — client opens a new browser tab
+                self.ws_send_to_client(client_id, WsMessage::OpenWindow { world });
             }
             Command::Quit => {
                 // Tell the requesting client to close (GUI window closes)

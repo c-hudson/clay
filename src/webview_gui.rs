@@ -56,6 +56,8 @@ enum WvEvent {
     UpdateStatus(String),
     /// Hot reload: exec a new binary (remote GUI only)
     Reload,
+    /// Open a new window (optionally locked to a world)
+    NewWindow(Option<String>),
 }
 
 use crate::theme::{ThemeColors, ThemeFile};
@@ -83,6 +85,10 @@ struct WebViewParams {
     ws_protocol: String,
     auto_password: Option<String>,
     theme_css: String,
+    /// Real server address (for /window command — may differ from ws_host when using proxy)
+    server_host: Option<String>,
+    server_port: Option<u16>,
+    server_secure: bool,
 }
 
 /// Read the gui_theme name from ~/.clay.dat (defaults to "dark").
@@ -209,6 +215,9 @@ pub fn run_master_webgui() -> io::Result<()> {
         ws_protocol: "ws".to_string(),
         auto_password: Some(password_hash),
         theme_css: load_user_theme_css(),
+        server_host: None, // Master mode — no separate server URL needed
+        server_port: None,
+        server_secure: false,
     };
 
     let result = create_webview_window("Clay", &params, Some(gui_to_app_tx));
@@ -298,6 +307,9 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
             ws_protocol: "ws".to_string(),
             auto_password: None,
             theme_css: load_user_theme_css(),
+            server_host: Some(host.clone()),
+            server_port: Some(port),
+            server_secure: true,
         };
 
         let result = create_webview_window("Clay", &params, None);
@@ -306,11 +318,14 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
     } else {
         // Direct ws:// connection — no proxy needed
         let params = WebViewParams {
-            ws_host: host,
+            ws_host: host.clone(),
             ws_port: port,
             ws_protocol: "ws".to_string(),
             auto_password: None,
             theme_css: load_user_theme_css(),
+            server_host: Some(host),
+            server_port: Some(port),
+            server_secure: false,
         };
 
         create_webview_window("Clay", &params, None)
@@ -449,6 +464,26 @@ fn build_html(params: &WebViewParams) -> String {
         .replace("{{WS_PORT}}", &params.ws_port.to_string())
         .replace("{{WS_PROTOCOL}}", &params.ws_protocol)
         .replace("{{THEME_CSS_VARS}}", &params.theme_css);
+
+    // Inject world lock from env var (set by parent when spawning /window <world>)
+    if let Ok(world_name) = std::env::var("CLAY_WINDOW_WORLD") {
+        std::env::remove_var("CLAY_WINDOW_WORLD");
+        html = html.replace(
+            &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
+            &format!("window.WS_PROTOCOL = '{}';\n        window.LOCK_WORLD = '{}';",
+                params.ws_protocol, world_name.replace('\'', "\\'")),
+        );
+    }
+
+    // Inject real server address for /window command (when using WS proxy)
+    if let (Some(ref real_host), Some(real_port)) = (&params.server_host, params.server_port) {
+        let proto = if params.server_secure { "https" } else { "http" };
+        html = html.replace(
+            &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
+            &format!("window.WS_PROTOCOL = '{}';\n        window.SERVER_URL = '{}://{}:{}';",
+                params.ws_protocol, proto, real_host, real_port),
+        );
+    }
 
     // Inject AUTO_PASSWORD into the template's existing <script> block
     if let Some(ref pw_hash) = params.auto_password {
@@ -705,7 +740,16 @@ fn create_webview_window(
             let reload_tx = reload_tx.clone();
             move |req| {
             let body = req.body();
-            if body == "quit" {
+            if body.starts_with("open-url:") {
+                let url = &body[9..];
+                open_url_in_browser(url);
+            } else if body.starts_with("new-window:") {
+                // Spawn a new WebView window (optionally locked to a world)
+                let world_name = body[11..].trim().to_string();
+                let world = if world_name.is_empty() { None } else { Some(world_name) };
+                let proxy_clone = proxy.clone();
+                let _ = proxy_clone.send_event(WvEvent::NewWindow(world));
+            } else if body == "quit" {
                 let _ = proxy.send_event(WvEvent::Quit);
             } else if body == "update" || body == "update-force" {
                 let force = body == "update-force";
@@ -932,6 +976,19 @@ fn create_webview_window(
                     let _ = _webview.evaluate_script(
                         "window.showUpdateStatus('Reload not supported on this platform')"
                     );
+                }
+            }
+            Event::UserEvent(WvEvent::NewWindow(ref world)) => {
+                // Spawn a new Clay GUI process for the new window
+                if let Ok((exe_path, _)) = crate::get_executable_path() {
+                    let args: Vec<String> = std::env::args().skip(1).collect();
+                    let mut cmd = std::process::Command::new(&exe_path);
+                    cmd.args(&args);
+                    // Pass world lock via env var (cleared by child after reading)
+                    if let Some(ref w) = world {
+                        cmd.env("CLAY_WINDOW_WORLD", w);
+                    }
+                    let _ = cmd.spawn();
                 }
             }
             _ => {}

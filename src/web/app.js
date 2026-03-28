@@ -244,6 +244,11 @@
     let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
+
+    // Check for world lock parameter in URL or injected by WebView
+    var urlParams = new URLSearchParams(window.location.search);
+    var lockedWorldName = urlParams.get('world') || window.LOCK_WORLD || null;
+    var lockedWorld = false;
     let pendingReconnectCommand = null;  // Command to resend after reconnect
     let pendingReconnectWorldIndex = null;  // World index to switch to after reconnect
     let commandHistory = [];
@@ -517,7 +522,7 @@
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'note', 'tag', 'tags',
-        'dict', 'urban', 'translate', 'tr', 'font',
+        'dict', 'urban', 'translate', 'tr', 'font', 'window',
     ];
 
     function isInternalCommand(name) {
@@ -1833,6 +1838,17 @@
                 sendViewStateIfChanged();
                 // Schedule lazy backfill of remaining scrollback history
                 startBackfill();
+                // Lock to specific world if URL parameter specified
+                if (lockedWorldName && !lockedWorld) {
+                    for (var i = 0; i < worlds.length; i++) {
+                        if (worlds[i].name === lockedWorldName) {
+                            switchWorldLocal(i);
+                            lockedWorld = true;
+                            document.title = 'Clay - ' + lockedWorldName;
+                            break;
+                        }
+                    }
+                }
                 // Handle pending reconnect command (resend after reconnection)
                 if (pendingReconnectCommand !== null) {
                     // Switch to the world that was active when the command failed
@@ -2379,6 +2395,17 @@
                 if (msg.command) {
                     executeLocalCommand(msg.command);
                 }
+                break;
+
+            case 'OpenWindow':
+                var worldParam = msg.world ? '?world=' + encodeURIComponent(msg.world) : '';
+                // Use WS_HOST/WS_PORT if available (WebView uses custom protocol, not real host)
+                var wsProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
+                var wsHost = window.WS_HOST || window.location.hostname;
+                var wsPort = (window.WS_PORT && window.WS_PORT !== 0)
+                    ? window.WS_PORT : window.location.port;
+                var openUrl = wsProto + '://' + wsHost + ':' + wsPort + '/' + worldParam;
+                window.open(openUrl, '_blank');
                 break;
 
             case 'AnsiMusic':
@@ -2965,6 +2992,31 @@
             return;
         }
 
+        // Intercept /window locally — open new browser/tab directly from client
+        if (cmdTrimmed === '/window' || cmdTrimmed.startsWith('/window ')) {
+            elements.input.value = '';
+            var winWorld = cmdTrimmed.length > 8 ? cmdTrimmed.substring(8).trim() : '';
+            var winParam = winWorld ? '?world=' + encodeURIComponent(winWorld) : '';
+            // Build URL using real server address (SERVER_URL set by WebView, else use WS_HOST)
+            var winUrl;
+            if (window.SERVER_URL) {
+                winUrl = window.SERVER_URL + '/' + winParam;
+            } else {
+                var winProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
+                var winHost = window.WS_HOST || window.location.hostname;
+                var winPort = (window.WS_PORT && window.WS_PORT !== 0)
+                    ? window.WS_PORT : window.location.port;
+                winUrl = winProto + '://' + winHost + ':' + winPort + '/' + winParam;
+            }
+            // In WebView mode, use IPC to spawn a new WebView window (not system browser)
+            if (window.ipc && window.ipc.postMessage) {
+                window.ipc.postMessage('new-window:' + (winWorld || ''));
+            } else {
+                window.open(winUrl, '_blank');
+            }
+            return;
+        }
+
         // Intercept /reload in remote WebView mode — restart the local GUI binary
         // (master WebView passes through to server which handles exec_reload with state)
         if (window.WEBVIEW_MODE && !window.AUTO_PASSWORD &&
@@ -3345,6 +3397,7 @@
 
     // Switch world locally (does not affect console)
     function switchWorldLocal(index) {
+        if (lockedWorld) return; // Don't switch worlds in locked windows
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
             // Clear new line indicators on the world we're LEAVING (matches console behavior)
@@ -6943,6 +6996,14 @@
                 } else {
                     window.location.reload();
                 }
+                break;
+            case 'new-window':
+                var nwProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
+                var nwHost = window.WS_HOST || window.location.hostname;
+                var nwPort = (window.WS_PORT && window.WS_PORT !== 0)
+                    ? window.WS_PORT : window.location.port;
+                var newWindowUrl = nwProto + '://' + nwHost + ':' + nwPort + '/';
+                window.open(newWindowUrl, '_blank');
                 break;
             case 'resync':
                 // On Android, call native reload method if available

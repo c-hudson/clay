@@ -3324,7 +3324,7 @@
             "connections", "l", "worlds", "world", "disconnect", "dc",
             "flush", "menu", "send", "remote", "ban", "unban",
             "testmusic", "dump", "notify", "addworld", "note", "tag", "tags",
-            "dict", "urban", "translate", "tr", "font",
+            "dict", "urban", "translate", "tr", "font", "window",
         ].into_iter().map(|s| s.to_string()).collect();
         rust_commands.sort();
         rust_commands.dedup();

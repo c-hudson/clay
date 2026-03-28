@@ -1027,6 +1027,10 @@ pub async fn handle_daemon_ws_message(
                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                 }
+                Command::Window { world } => {
+                    // Send OpenWindow message to requesting client only — client opens a new browser tab
+                    app.ws_send_to_client(client_id, WsMessage::OpenWindow { world });
+                }
                 Command::Version => {
                     app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
