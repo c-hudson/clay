@@ -110,19 +110,28 @@ pub fn init_audio() -> AudioBackend {
 
 /// Detect mpv or ffplay on the system
 fn detect_external_player() -> Option<String> {
-    for cmd in &["mpv", "ffplay"] {
-        if std::process::Command::new("which")
-            .arg(cmd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(cmd.to_string());
+    // On Windows, skip external player detection — use native audio only.
+    // Spawning processes to search PATH can be very slow if large apps
+    // (e.g. LibreOffice) add many directories to PATH.
+    #[cfg(windows)]
+    { return None; }
+
+    #[cfg(not(windows))]
+    {
+        for cmd in &["mpv", "ffplay"] {
+            if std::process::Command::new("which")
+                .arg(cmd)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return Some(cmd.to_string());
+            }
         }
+        None
     }
-    None
 }
 
 /// Play WAV data from memory (for ANSI music).

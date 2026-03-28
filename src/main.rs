@@ -917,6 +917,36 @@ fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
         .ok()
 }
 
+/// Run a command with a timeout. Returns None if the command fails or times out.
+fn run_command_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let output = child.wait_with_output().ok()?;
+                return String::from_utf8(output.stdout).ok();
+            }
+            Ok(Some(_)) => return None, // Exited with error
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Get all non-loopback IPv4 addresses on this machine.
 fn get_local_ip_addresses() -> Vec<String> {
     let mut addrs = Vec::new();
@@ -934,14 +964,11 @@ fn get_local_ip_addresses() -> Vec<String> {
         }
     }
 
-    // On Linux, parse /proc/net/fib_trie or use ip command
+    // On Linux, use hostname -I to get all local IPs
     #[cfg(target_os = "linux")]
     {
-        if let Ok(output) = std::process::Command::new("hostname")
-            .arg("-I")
-            .output()
-        {
-            let ips = String::from_utf8_lossy(&output.stdout);
+        if let Some(output) = run_command_with_timeout("hostname", &["-I"], 2) {
+            let ips = output;
             for ip in ips.split_whitespace() {
                 let ip = ip.trim().to_string();
                 if !ip.is_empty() && ip != "127.0.0.1" && !addrs.contains(&ip) {
@@ -967,8 +994,8 @@ fn generate_self_signed_cert(cert_path: &std::path::Path, key_path: &std::path::
     ];
 
     // Add all local IP addresses so the cert works across the LAN
-    if let Ok(hostname) = std::process::Command::new("hostname").output() {
-        let name = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
+    if let Some(name) = run_command_with_timeout("hostname", &[], 2) {
+        let name = name.trim().to_string();
         if !name.is_empty() && !san_names.contains(&name) {
             san_names.push(name);
         }
@@ -2822,7 +2849,7 @@ impl App {
             backfill_next: None,
             gui_tx: None, // Set when running in master GUI mode (--gui)
             gui_repaint: None,
-            audio_backend: audio::init_audio(),
+            audio_backend: audio::AudioBackend::None, // Lazy init on first use
             media_cache_dir: {
                 let home = get_home_dir();
                 PathBuf::from(home).join(clay_filename("clay")).join("media")
@@ -4234,6 +4261,13 @@ impl App {
         }
     }
 
+    /// Ensure audio backend is initialized (lazy init on first use)
+    fn ensure_audio(&mut self) {
+        if matches!(self.audio_backend, audio::AudioBackend::None) {
+            self.audio_backend = audio::init_audio();
+        }
+    }
+
     fn add_output(&mut self, text: &str) {
         let is_current = true;
         let settings = self.settings.clone();
@@ -4369,8 +4403,9 @@ impl App {
                                 self.worlds[world_idx].active_media.insert(key.to_string(), json_data.to_string());
                             }
 
-                            // Only play audio when play_audio is true and backend is available
-                            if play_audio && !matches!(self.audio_backend, audio::AudioBackend::None) {
+                            // Only play audio when play_audio is true; lazy-init backend
+                            if play_audio {
+                                self.ensure_audio();
                                 // For music type: stop previous music (unless continue)
                                 if media_type == "music" {
                                     if cont
@@ -4495,6 +4530,7 @@ impl App {
 
         let wav_data = generate_wav_from_notes(notes);
         self.ansi_music_counter = self.ansi_music_counter.wrapping_add(1);
+        self.ensure_audio();
 
         if let Some(handle) = audio::play_wav_memory(
             &self.audio_backend,
@@ -11198,6 +11234,7 @@ pub async fn run_app_headless(
                         }
                     }
                     AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
+                        app.ensure_audio();
                         if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
                             if is_music {
                                 app.media_music_key = Some((world_idx, key.clone()));
@@ -13351,6 +13388,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                     AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
+                        app.ensure_audio();
                         if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
                             if is_music {
                                 app.media_music_key = Some((world_idx, key.clone()));
@@ -14085,6 +14123,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                 }
                 AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
+                    app.ensure_audio();
                     if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
                         if is_music {
                             app.media_music_key = Some((world_idx, key.clone()));
