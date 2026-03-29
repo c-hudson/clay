@@ -1018,7 +1018,8 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // Tell new process which reload file to load (PID-specific)
     std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
-    let is_headless = std::env::args().any(|a| a == "--gui" || a == "-D");
+    // Detect GUI mode from App state (not args — GUI is default on Windows/macOS with no flag)
+    let is_headless = app.gui_tx.is_some() || std::env::args().any(|a| a == "-D");
 
     // Only create a sync event in console mode (not headless/GUI/daemon).
     let sync_event = if !is_headless {
