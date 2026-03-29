@@ -1799,7 +1799,16 @@ fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
                 TfCommandResult::SendToMud(cmd)
             }
         }
-        Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
+        Err(_) => {
+            // If expression evaluation fails, treat the input as literal text
+            // This handles cases like: /eval think $(/time)
+            // where $() is already substituted, leaving plain text to send
+            if args.starts_with('/') {
+                TfCommandResult::ClayCommand(args.to_string())
+            } else {
+                TfCommandResult::SendToMud(args.to_string())
+            }
+        }
     }
 }
 

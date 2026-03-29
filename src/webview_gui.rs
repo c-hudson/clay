@@ -141,13 +141,13 @@ pub fn run_master_webgui() -> io::Result<()> {
         }
     }
 
-    // Pick a random available port by binding to port 0
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| io::Error::other(format!("Failed to find available port: {}", e)))?;
-        listener.local_addr()?.port()
+    // Read the configured HTTP port and secure mode from settings (default: port 9000, not secure)
+    // The GUI uses the same port as the web interface
+    let (port, is_secure) = {
+        let mut tmp_app = crate::App::new();
+        let _ = crate::persistence::load_settings(&mut tmp_app);
+        (tmp_app.settings.http_port, tmp_app.settings.web_secure)
     };
-    // listener is dropped here, freeing the port for the WS server
 
     // Generate a random password using time + pid as entropy
     let random_bytes: [u8; 32] = {
@@ -184,7 +184,7 @@ pub fn run_master_webgui() -> io::Result<()> {
         if let Err(_e) = crate::run_app_headless(
             app_to_gui_tx,
             gui_to_app_rx,
-            Some((port, ws_password)),
+            Some(ws_password),
             None, // No GUI repaint callback (webview is event-driven)
         ).await {
         }
@@ -213,12 +213,12 @@ pub fn run_master_webgui() -> io::Result<()> {
     let params = WebViewParams {
         ws_host: "127.0.0.1".to_string(),
         ws_port: port,
-        ws_protocol: "ws".to_string(),
+        ws_protocol: if is_secure { "wss" } else { "ws" }.to_string(),
         auto_password: Some(password_hash),
         theme_css: load_user_theme_css(),
         server_host: None, // Master mode — no separate server URL needed
         server_port: None,
-        server_secure: false,
+        server_secure: is_secure,
     };
 
     let result = create_webview_window("Clay", &params, Some(gui_to_app_tx));

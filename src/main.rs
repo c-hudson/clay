@@ -2718,12 +2718,6 @@ pub struct App {
     pub https_server: Option<HttpsServer>,
     #[cfg(feature = "rustls-backend")]
     pub https_server: Option<HttpsServer>,
-    // External HTTP/HTTPS server (used in GUI mode to also serve user's configured port)
-    pub http_server_ext: Option<HttpServer>,
-    #[cfg(feature = "native-tls-backend")]
-    pub https_server_ext: Option<HttpsServer>,
-    #[cfg(feature = "rustls-backend")]
-    pub https_server_ext: Option<HttpsServer>,
     // Track if popup was visible last frame (for terminal clear on transition)
     pub popup_was_visible: bool,
     /// Cache of each WS client's view state (for activity indicator and more-mode)
@@ -2842,11 +2836,6 @@ impl App {
             https_server: None,
             #[cfg(feature = "rustls-backend")]
             https_server: None,
-            http_server_ext: None,
-            #[cfg(feature = "native-tls-backend")]
-            https_server_ext: None,
-            #[cfg(feature = "rustls-backend")]
-            https_server_ext: None,
             popup_was_visible: false,
             ws_client_worlds: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
@@ -10595,7 +10584,7 @@ async fn main() -> io::Result<()> {
 pub async fn run_app_headless(
     gui_tx: mpsc::UnboundedSender<WsMessage>,
     mut gui_rx: mpsc::UnboundedReceiver<WsMessage>,
-    ws_override: Option<(u16, String)>,  // (port, password) for auto-started WS
+    ws_override: Option<String>,  // password for auto-started WS (GUI master mode)
     gui_repaint: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) -> io::Result<()> {
     let mut app = App::new();
@@ -10900,16 +10889,9 @@ pub async fn run_app_headless(
         app.add_output(reload_msg);
     }
 
-    // Apply WS override for webview-gui master mode (local-only server)
-    // Save original HTTP settings before overriding, so we can also start the user's server
-    let user_http_enabled = app.settings.http_enabled;
-    let user_http_port = app.settings.http_port;
-    let user_web_secure = app.settings.web_secure;
-    let user_websocket_password = app.settings.websocket_password.clone();
-    if let Some((_ws_port, ref ws_password)) = ws_override {
+    // In GUI master mode, enable the web interface and set the auto-generated password
+    if let Some(ref ws_password) = ws_override {
         app.settings.http_enabled = true;
-        app.settings.http_port = _ws_port;
-        app.settings.web_secure = false; // Internal WebView uses plain ws://, not wss://
         app.settings.websocket_password = ws_password.clone();
     }
 
@@ -10931,8 +10913,7 @@ pub async fn run_app_headless(
     };
 
     // Auto-generate self-signed certs if secure mode enabled but no cert files
-    // (do this before WS override so certs are ready for both internal and external servers)
-    if user_web_secure
+    if app.settings.web_secure
         && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
     {
         let home = get_home_dir();
@@ -10964,7 +10945,6 @@ pub async fn run_app_headless(
     }
 
     // Start unified HTTP+WS server if enabled
-    // In GUI mode: web_secure is false (internal WebView uses plain ws://), so this starts HTTP
     if app.settings.http_enabled {
         if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
@@ -11030,74 +11010,6 @@ pub async fn run_app_headless(
                 }
                 Err(e) => {
                     app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
-                }
-            }
-        }
-    }
-
-    // In GUI master mode, also start the user's external HTTP server on their configured port
-    // (the internal server above runs on a random port for the WebView using plain HTTP)
-    if ws_override.is_some() && user_http_enabled && user_http_port != app.settings.http_port {
-        // Restore user's password for external server authentication
-        app.settings.websocket_password = user_websocket_password;
-        if user_web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            #[cfg(feature = "native-tls-backend")]
-            {
-                let mut https_server = HttpsServer::new(user_http_port);
-                match start_https_server(
-                    &mut https_server,
-                    &app.settings.websocket_cert_file,
-                    &app.settings.websocket_key_file,
-                    ws_state.clone(),
-                    app.ban_list.clone(),
-                    app.gui_theme_colors().to_css_vars(),
-                ).await {
-                    Ok(()) => {
-                        app.add_output(&format!("HTTPS web interface started on port {}", user_http_port));
-                        app.https_server_ext = Some(https_server);
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("Warning: Failed to start external HTTPS server on port {}: {}", user_http_port, e));
-                    }
-                }
-            }
-            #[cfg(feature = "rustls-backend")]
-            {
-                let mut https_server = HttpsServer::new(user_http_port);
-                match start_https_server(
-                    &mut https_server,
-                    &app.settings.websocket_cert_file,
-                    &app.settings.websocket_key_file,
-                    ws_state.clone(),
-                    app.ban_list.clone(),
-                    app.gui_theme_colors().to_css_vars(),
-                ).await {
-                    Ok(()) => {
-                        app.add_output(&format!("HTTPS web interface started on port {}", user_http_port));
-                        app.https_server_ext = Some(https_server);
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("Warning: Failed to start external HTTPS server on port {}: {}", user_http_port, e));
-                    }
-                }
-            }
-        } else {
-            let mut http_server = HttpServer::new(user_http_port);
-            match start_http_server(
-                &mut http_server,
-                ws_state.clone(),
-                app.ban_list.clone(),
-                app.gui_theme_colors().to_css_vars(),
-            ).await {
-                Ok(()) => {
-                    app.add_output(&format!("HTTP web interface started on port {}", user_http_port));
-                    app.http_server_ext = Some(http_server);
-                }
-                Err(e) => {
-                    app.add_output(&format!("Warning: Failed to start external HTTP server on port {}: {}", user_http_port, e));
                 }
             }
         }
