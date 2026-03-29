@@ -1780,35 +1780,20 @@ fn cmd_expr(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// /eval expression - Evaluate expression and execute result as command
-fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+/// /eval args - Execute args as a command (after variable/command substitution)
+///
+/// Substitution ($(), $[], %vars) has already happened before this is called.
+/// If the result starts with /, execute as a Clay/TF command.
+/// Otherwise, send to the MUD.
+fn cmd_eval(_engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: /eval expression".to_string());
+        return TfCommandResult::Success(None);
     }
 
-    match super::expressions::evaluate(engine, args) {
-        Ok(value) => {
-            let cmd = value.to_string_value();
-            if cmd.is_empty() {
-                TfCommandResult::Success(None)
-            } else if cmd.starts_with('/') {
-                // Execute as Clay command
-                TfCommandResult::ClayCommand(cmd)
-            } else {
-                // Send to MUD
-                TfCommandResult::SendToMud(cmd)
-            }
-        }
-        Err(_) => {
-            // If expression evaluation fails, treat the input as literal text
-            // This handles cases like: /eval think $(/time)
-            // where $() is already substituted, leaving plain text to send
-            if args.starts_with('/') {
-                TfCommandResult::ClayCommand(args.to_string())
-            } else {
-                TfCommandResult::SendToMud(args.to_string())
-            }
-        }
+    if args.starts_with('/') {
+        TfCommandResult::ClayCommand(args.to_string())
+    } else {
+        TfCommandResult::SendToMud(args.to_string())
     }
 }
 
