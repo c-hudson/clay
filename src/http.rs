@@ -877,6 +877,9 @@ pub async fn start_http_server(
         }
     };
 
+    // Signal that the HTTP server has bound successfully
+    crate::GUI_HTTP_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
 

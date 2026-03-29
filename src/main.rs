@@ -49,6 +49,8 @@ static OUTPUT_DEBUG_HEADER_WRITTEN: AtomicBool = AtomicBool::new(false);
 static STARTUP_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Flag set by IPC handler to request reload — checked by headless event loop
 pub static GUI_RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Flag set by HTTP server after successful bind — checked by GUI readiness wait
+pub static GUI_HTTP_READY: AtomicBool = AtomicBool::new(false);
 
 /// Check if debug logging is enabled
 pub fn is_debug_enabled() -> bool {

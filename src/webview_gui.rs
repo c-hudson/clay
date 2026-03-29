@@ -190,15 +190,16 @@ pub fn run_master_webgui() -> io::Result<()> {
         }
     });
 
-    // Wait for the HTTP server to be ready.
-    // Simple TCP connect check — the JS client has its own retry logic for WebSocket.
+    // Wait for the HTTP server to signal it has bound the port.
+    // Uses an atomic flag set by start_http_server after successful bind,
+    // avoiding the race where TCP connect succeeds against a dying old socket.
+    crate::GUI_HTTP_READY.store(false, std::sync::atomic::Ordering::SeqCst);
     let ws_ready = {
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let mut ready = false;
         for _ in 0..100 {
-            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok() {
-                // Port is listening — wait a bit more for the accept loop to start
-                std::thread::sleep(std::time::Duration::from_millis(500));
+            if crate::GUI_HTTP_READY.load(std::sync::atomic::Ordering::SeqCst) {
+                // Server has bound — give the accept loop a moment to start
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 ready = true;
                 break;
             }
