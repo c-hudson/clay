@@ -1036,6 +1036,11 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
 
     let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
     args.push("--reload".to_string());
+    // On Windows/macOS, GUI is the default mode (no --gui flag in args).
+    // Ensure the reload child also runs in GUI mode.
+    if is_headless && !args.iter().any(|a| a == "--gui" || a.starts_with("--gui=")) {
+        args.push("--gui".to_string());
+    }
     debug_log(true, &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
 
     // On Windows, disable raw mode and leave alternate screen BEFORE spawning
