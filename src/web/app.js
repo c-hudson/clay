@@ -1896,6 +1896,7 @@
                         world.showing_splash = false;
                         worldOutputCache[msg.world_index] = [];
                         partialLines[msg.world_index] = '';
+                        world._max_seq = 0; // Reset dedup tracking after flush
                         if (msg.world_index === currentWorldIndex) {
                             elements.output.innerHTML = '';
                             linesSincePause = 0;
@@ -2014,6 +2015,11 @@
                         }
                         if (msg.world_index !== currentWorldIndex) {
                             updateStatusBar();
+                        }
+                        // After flush, force full re-render to ensure output is visible
+                        // (handles case where splash image was re-rendered by WorldConnected)
+                        if (msg.flush && msg.world_index === currentWorldIndex) {
+                            renderOutput();
                         }
                     }
                 }
