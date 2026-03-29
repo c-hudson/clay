@@ -429,7 +429,26 @@ pub async fn start_https_server(
     let tls_acceptor = Arc::new(tls_acceptor);
 
     let addr = format!("0.0.0.0:{}", server.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Retry binding with delays — on reload, the previous process may still be releasing the port
+    let listener = {
+        let mut last_err = None;
+        let mut bound = None;
+        for attempt in 0..10 {
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => { bound = Some(l); break; }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 9 {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                }
+            }
+        }
+        match bound {
+            Some(l) => l,
+            None => return Err(format!("Failed to bind HTTPS to port {}: {}", server.port, last_err.unwrap()).into()),
+        }
+    };
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
@@ -572,8 +591,26 @@ pub async fn start_https_server(
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
 
     let addr = format!("0.0.0.0:{}", server.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await
-        .map_err(|e| format!("Failed to bind to port {}: {}", server.port, e))?;
+    // Retry binding with delays — on reload, the previous process may still be releasing the port
+    let listener = {
+        let mut last_err = None;
+        let mut bound = None;
+        for attempt in 0..10 {
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => { bound = Some(l); break; }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 9 {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                }
+            }
+        }
+        match bound {
+            Some(l) => l,
+            None => return Err(format!("Failed to bind HTTPS to port {}: {}", server.port, last_err.unwrap()).into()),
+        }
+    };
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
@@ -817,8 +854,26 @@ pub async fn start_http_server(
     theme_css_vars: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("0.0.0.0:{}", server.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await
-        .map_err(|e| format!("Failed to bind HTTP to port {}: {}", server.port, e))?;
+    // Retry binding with delays — on reload, the previous process may still be releasing the port
+    let listener = {
+        let mut last_err = None;
+        let mut bound = None;
+        for attempt in 0..10 {
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => { bound = Some(l); break; }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 9 {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                }
+            }
+        }
+        match bound {
+            Some(l) => l,
+            None => return Err(format!("Failed to bind HTTP to port {}: {}", server.port, last_err.unwrap()).into()),
+        }
+    };
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);

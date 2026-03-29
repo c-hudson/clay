@@ -983,8 +983,10 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             let _ = tx.send(());
         }
     }
-    // Give the server tasks a moment to release the port
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Give the server tasks time to release the port.
+    // In GUI mode the tokio runtime runs on background threads, so the shutdown
+    // signal needs time to be processed and the TCP listener dropped.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     debug_log(true, "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
