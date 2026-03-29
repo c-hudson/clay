@@ -1064,9 +1064,15 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
                 unsafe { CloseHandle(sync_event); }
             }
             if is_headless {
-                // GUI/headless mode: exit immediately so the old process releases the port.
-                // The new process runs independently as the new GUI window.
-                std::process::exit(0);
+                // GUI/headless mode: terminate immediately so the old process releases the port.
+                // Use TerminateProcess for a hard exit — std::process::exit runs atexit handlers
+                // which can hang when WebView2 is loaded.
+                extern "system" {
+                    fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
+                    fn GetCurrentProcess() -> isize;
+                }
+                unsafe { TerminateProcess(GetCurrentProcess(), 0); }
+                unreachable!();
             } else {
                 // Console mode: wait for the child to exit so the shell prompt
                 // doesn't appear between the old and new process.
