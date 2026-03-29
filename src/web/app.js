@@ -1185,10 +1185,12 @@
                 }
             }
 
-            if (connectionFailures >= 2) {
+            // WebView mode: allow more retries (server may still be starting after reload)
+            const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
+            if (connectionFailures >= maxFailures) {
                 showConnectionErrorModal();
             } else {
-                setTimeout(connect, 3000);
+                setTimeout(connect, 2000);
             }
         };
 

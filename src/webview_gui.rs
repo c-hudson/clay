@@ -190,25 +190,17 @@ pub fn run_master_webgui() -> io::Result<()> {
         }
     });
 
-    // Wait for the HTTP server to be fully ready (serving responses, not just bound)
+    // Wait for the HTTP server to be ready.
+    // Simple TCP connect check — the JS client has its own retry logic for WebSocket.
     let ws_ready = {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let mut ready = false;
-        for _ in 0..120 {
-            if let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)) {
-                use std::io::{Read, Write};
-                // Short read timeout — we just need to see any response
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(2000)));
-                let req = b"GET /style.css HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-                if stream.write_all(req).is_ok() {
-                    let mut buf = [0u8; 64];
-                    if let Ok(n) = stream.read(&mut buf) {
-                        if n > 0 {
-                            ready = true;
-                            break;
-                        }
-                    }
-                }
+        for _ in 0..100 {
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok() {
+                // Port is listening — wait a bit more for the accept loop to start
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                ready = true;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
