@@ -190,15 +190,30 @@ pub fn run_master_webgui() -> io::Result<()> {
         }
     });
 
-    // Wait for the WS server to be ready (retry connecting for up to 3 seconds)
-    // Use std::net (not tokio) to avoid "block_on inside runtime" panic
+    // Wait for the NEW HTTP server to be ready.
+    // On reload, the old process may still briefly hold the port, so a simple TCP connect
+    // could succeed to the dying old server. Instead, verify we get a valid HTTP response
+    // containing our page content, which confirms the new server is serving.
     let ws_ready = {
         let addr = format!("127.0.0.1:{}", port);
         let mut ready = false;
-        for _ in 0..30 {
-            if std::net::TcpStream::connect(&addr).is_ok() {
-                ready = true;
-                break;
+        for _ in 0..60 {
+            // Try an HTTP GET and check for a valid response from our server
+            if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let req = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", port);
+                if stream.write_all(req.as_bytes()).is_ok() {
+                    let mut buf = [0u8; 512];
+                    if let Ok(n) = stream.read(&mut buf) {
+                        let response = String::from_utf8_lossy(&buf[..n]);
+                        // Check for a valid HTTP response with HTML content (our server)
+                        if response.starts_with("HTTP/1.") && response.contains("text/html") {
+                            ready = true;
+                            break;
+                        }
+                    }
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
