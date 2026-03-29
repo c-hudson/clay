@@ -10899,9 +10899,12 @@ pub async fn run_app_headless(
     // Save original HTTP settings before overriding, so we can also start the user's server
     let user_http_enabled = app.settings.http_enabled;
     let user_http_port = app.settings.http_port;
+    let user_web_secure = app.settings.web_secure;
+    let user_websocket_password = app.settings.websocket_password.clone();
     if let Some((_ws_port, ref ws_password)) = ws_override {
         app.settings.http_enabled = true;
         app.settings.http_port = _ws_port;
+        app.settings.web_secure = false; // Internal WebView uses plain ws://, not wss://
         app.settings.websocket_password = ws_password.clone();
     }
 
@@ -10922,44 +10925,46 @@ pub async fn run_app_headless(
         None
     };
 
+    // Auto-generate self-signed certs if secure mode enabled but no cert files
+    // (do this before WS override so certs are ready for both internal and external servers)
+    if user_web_secure
+        && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
+    {
+        let home = get_home_dir();
+        let cert_path = std::path::PathBuf::from(&home).join(clay_filename("clay.cert.pem"));
+        let key_path = std::path::PathBuf::from(&home).join(clay_filename("clay.key.pem"));
+
+        let needs_gen = !cert_path.exists() || !key_path.exists();
+        let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
+        if needs_gen || needs_regen {
+            if needs_regen {
+                app.add_output("\u{2728} IP address changed, regenerating TLS certificate...");
+            }
+            match generate_self_signed_cert(&cert_path, &key_path) {
+                Ok(()) => {
+                    app.add_output("\u{2728} Generated self-signed TLS certificate.");
+                }
+                Err(e) => {
+                    app.add_output(&format!("\u{2728} Failed to generate TLS certificate: {}", e));
+                    app.add_output("\u{2728} Falling back to non-secure HTTP.");
+                }
+            }
+        }
+
+        if cert_path.exists() && key_path.exists() {
+            app.settings.websocket_cert_file = cert_path.to_string_lossy().to_string();
+            app.settings.websocket_key_file = key_path.to_string_lossy().to_string();
+            let _ = persistence::save_settings(&app);
+        }
+    }
+
     // Start unified HTTP+WS server if enabled
+    // In GUI mode: web_secure is false (internal WebView uses plain ws://), so this starts HTTP
     debug_log(true, &format!("HTTP STARTUP: http_enabled={}, web_secure={}, port={}, cert='{}', key='{}'",
         app.settings.http_enabled, app.settings.web_secure, app.settings.http_port,
         app.settings.websocket_cert_file, app.settings.websocket_key_file));
     if app.settings.http_enabled {
         debug_log(true, &format!("HTTP STARTUP: Attempting to start server on port {}", app.settings.http_port));
-        // Auto-generate self-signed certs if secure mode enabled but no cert files
-        if app.settings.web_secure
-            && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
-        {
-            let home = get_home_dir();
-            let cert_path = std::path::PathBuf::from(&home).join(clay_filename("clay.cert.pem"));
-            let key_path = std::path::PathBuf::from(&home).join(clay_filename("clay.key.pem"));
-
-            // Generate if files don't exist, or regenerate if IPs changed
-            let needs_gen = !cert_path.exists() || !key_path.exists();
-            let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
-            if needs_gen || needs_regen {
-                if needs_regen {
-                    app.add_output("\u{2728} IP address changed, regenerating TLS certificate...");
-                }
-                match generate_self_signed_cert(&cert_path, &key_path) {
-                    Ok(()) => {
-                        app.add_output("\u{2728} Generated self-signed TLS certificate.");
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("\u{2728} Failed to generate TLS certificate: {}", e));
-                        app.add_output("\u{2728} Falling back to non-secure HTTP.");
-                    }
-                }
-            }
-
-            if cert_path.exists() && key_path.exists() {
-                app.settings.websocket_cert_file = cert_path.to_string_lossy().to_string();
-                app.settings.websocket_key_file = key_path.to_string_lossy().to_string();
-                let _ = persistence::save_settings(&app);
-            }
-        }
         if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
             && !app.settings.websocket_key_file.is_empty()
@@ -11038,10 +11043,12 @@ pub async fn run_app_headless(
     }
 
     // In GUI master mode, also start the user's external HTTP server on their configured port
-    // (the internal server above runs on a random port for the WebView)
+    // (the internal server above runs on a random port for the WebView using plain HTTP)
     if ws_override.is_some() && user_http_enabled && user_http_port != app.settings.http_port {
-        debug_log(true, &format!("HTTP STARTUP: Starting external server on user port {}", user_http_port));
-        if app.settings.web_secure
+        debug_log(true, &format!("HTTP STARTUP: Starting external server on user port {} (secure={})", user_http_port, user_web_secure));
+        // Restore user's password for external server authentication
+        app.settings.websocket_password = user_websocket_password;
+        if user_web_secure
             && !app.settings.websocket_cert_file.is_empty()
             && !app.settings.websocket_key_file.is_empty()
         {
