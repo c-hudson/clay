@@ -2718,6 +2718,12 @@ pub struct App {
     pub https_server: Option<HttpsServer>,
     #[cfg(feature = "rustls-backend")]
     pub https_server: Option<HttpsServer>,
+    // External HTTP/HTTPS server (used in GUI mode to also serve user's configured port)
+    pub http_server_ext: Option<HttpServer>,
+    #[cfg(feature = "native-tls-backend")]
+    pub https_server_ext: Option<HttpsServer>,
+    #[cfg(feature = "rustls-backend")]
+    pub https_server_ext: Option<HttpsServer>,
     // Track if popup was visible last frame (for terminal clear on transition)
     pub popup_was_visible: bool,
     /// Cache of each WS client's view state (for activity indicator and more-mode)
@@ -2836,6 +2842,11 @@ impl App {
             https_server: None,
             #[cfg(feature = "rustls-backend")]
             https_server: None,
+            http_server_ext: None,
+            #[cfg(feature = "native-tls-backend")]
+            https_server_ext: None,
+            #[cfg(feature = "rustls-backend")]
+            https_server_ext: None,
             popup_was_visible: false,
             ws_client_worlds: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
@@ -10885,6 +10896,9 @@ pub async fn run_app_headless(
     }
 
     // Apply WS override for webview-gui master mode (local-only server)
+    // Save original HTTP settings before overriding, so we can also start the user's server
+    let user_http_enabled = app.settings.http_enabled;
+    let user_http_port = app.settings.http_port;
     if let Some((_ws_port, ref ws_password)) = ws_override {
         app.settings.http_enabled = true;
         app.settings.http_port = _ws_port;
@@ -10909,7 +10923,11 @@ pub async fn run_app_headless(
     };
 
     // Start unified HTTP+WS server if enabled
+    debug_log(true, &format!("HTTP STARTUP: http_enabled={}, web_secure={}, port={}, cert='{}', key='{}'",
+        app.settings.http_enabled, app.settings.web_secure, app.settings.http_port,
+        app.settings.websocket_cert_file, app.settings.websocket_key_file));
     if app.settings.http_enabled {
+        debug_log(true, &format!("HTTP STARTUP: Attempting to start server on port {}", app.settings.http_port));
         // Auto-generate self-signed certs if secure mode enabled but no cert files
         if app.settings.web_secure
             && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
@@ -10958,13 +10976,14 @@ pub async fn run_app_headless(
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
+                        debug_log(true, &format!("HTTP STARTUP: HTTPS server started successfully on port {}", app.settings.http_port));
                         if !app.is_reload {
                             app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                        debug_log(true, &format!("HTTP STARTUP: HTTPS server FAILED: {}", e));
                         app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
                     }
                 }
@@ -10981,13 +11000,14 @@ pub async fn run_app_headless(
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
+                        debug_log(true, &format!("HTTP STARTUP: HTTPS server started successfully on port {}", app.settings.http_port));
                         if !app.is_reload {
                             app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                        debug_log(true, &format!("HTTP STARTUP: HTTPS server FAILED: {}", e));
                         app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
                     }
                 }
@@ -11001,14 +11021,90 @@ pub async fn run_app_headless(
                 app.gui_theme_colors().to_css_vars(),
             ).await {
                 Ok(()) => {
+                    debug_log(true, &format!("HTTP STARTUP: HTTP server started successfully on port {}", app.settings.http_port));
                     if !app.is_reload {
                         app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
                     }
                     app.http_server = Some(http_server);
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to start HTTP server: {}", e);
+                    debug_log(true, &format!("HTTP STARTUP: HTTP server FAILED: {}", e));
                     app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
+                }
+            }
+        }
+    } else {
+        debug_log(true, "HTTP STARTUP: http_enabled is false, skipping server start");
+    }
+
+    // In GUI master mode, also start the user's external HTTP server on their configured port
+    // (the internal server above runs on a random port for the WebView)
+    if ws_override.is_some() && user_http_enabled && user_http_port != app.settings.http_port {
+        debug_log(true, &format!("HTTP STARTUP: Starting external server on user port {}", user_http_port));
+        if app.settings.web_secure
+            && !app.settings.websocket_cert_file.is_empty()
+            && !app.settings.websocket_key_file.is_empty()
+        {
+            #[cfg(feature = "native-tls-backend")]
+            {
+                let mut https_server = HttpsServer::new(user_http_port);
+                match start_https_server(
+                    &mut https_server,
+                    &app.settings.websocket_cert_file,
+                    &app.settings.websocket_key_file,
+                    ws_state.clone(),
+                    app.ban_list.clone(),
+                    app.gui_theme_colors().to_css_vars(),
+                ).await {
+                    Ok(()) => {
+                        debug_log(true, &format!("HTTP STARTUP: External HTTPS server started on port {}", user_http_port));
+                        app.add_output(&format!("HTTPS web interface started on port {}", user_http_port));
+                        app.https_server_ext = Some(https_server);
+                    }
+                    Err(e) => {
+                        debug_log(true, &format!("HTTP STARTUP: External HTTPS server FAILED: {}", e));
+                        app.add_output(&format!("Warning: Failed to start external HTTPS server on port {}: {}", user_http_port, e));
+                    }
+                }
+            }
+            #[cfg(feature = "rustls-backend")]
+            {
+                let mut https_server = HttpsServer::new(user_http_port);
+                match start_https_server(
+                    &mut https_server,
+                    &app.settings.websocket_cert_file,
+                    &app.settings.websocket_key_file,
+                    ws_state.clone(),
+                    app.ban_list.clone(),
+                    app.gui_theme_colors().to_css_vars(),
+                ).await {
+                    Ok(()) => {
+                        debug_log(true, &format!("HTTP STARTUP: External HTTPS server started on port {}", user_http_port));
+                        app.add_output(&format!("HTTPS web interface started on port {}", user_http_port));
+                        app.https_server_ext = Some(https_server);
+                    }
+                    Err(e) => {
+                        debug_log(true, &format!("HTTP STARTUP: External HTTPS server FAILED: {}", e));
+                        app.add_output(&format!("Warning: Failed to start external HTTPS server on port {}: {}", user_http_port, e));
+                    }
+                }
+            }
+        } else {
+            let mut http_server = HttpServer::new(user_http_port);
+            match start_http_server(
+                &mut http_server,
+                ws_state.clone(),
+                app.ban_list.clone(),
+                app.gui_theme_colors().to_css_vars(),
+            ).await {
+                Ok(()) => {
+                    debug_log(true, &format!("HTTP STARTUP: External HTTP server started on port {}", user_http_port));
+                    app.add_output(&format!("HTTP web interface started on port {}", user_http_port));
+                    app.http_server_ext = Some(http_server);
+                }
+                Err(e) => {
+                    debug_log(true, &format!("HTTP STARTUP: External HTTP server FAILED: {}", e));
+                    app.add_output(&format!("Warning: Failed to start external HTTP server on port {}: {}", user_http_port, e));
                 }
             }
         }
@@ -12396,7 +12492,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     };
 
     // Start unified HTTP+WS server if enabled
+    debug_log(true, &format!("HTTP STARTUP: http_enabled={}, web_secure={}, port={}, cert='{}', key='{}'",
+        app.settings.http_enabled, app.settings.web_secure, app.settings.http_port,
+        app.settings.websocket_cert_file, app.settings.websocket_key_file));
     if app.settings.http_enabled {
+        debug_log(true, &format!("HTTP STARTUP: Attempting to start server on port {}", app.settings.http_port));
         // Auto-generate self-signed certs if secure mode enabled but no cert files
         if app.settings.web_secure
             && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
@@ -12445,12 +12545,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
+                        debug_log(true, &format!("HTTP STARTUP: HTTPS server started successfully on port {}", app.settings.http_port));
                         if !app.is_reload {
                             app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
                     }
                     Err(e) => {
+                        debug_log(true, &format!("HTTP STARTUP: HTTPS server FAILED: {}", e));
                         let err_str = e.to_string();
                         if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
                             app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
@@ -12470,12 +12572,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
+                        debug_log(true, &format!("HTTP STARTUP: HTTPS server started successfully on port {}", app.settings.http_port));
                         if !app.is_reload {
                             app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
                     }
                     Err(e) => {
+                        debug_log(true, &format!("HTTP STARTUP: HTTPS server FAILED: {}", e));
                         let err_str = e.to_string();
                         if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
                             app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
@@ -12493,12 +12597,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 app.gui_theme_colors().to_css_vars(),
             ).await {
                 Ok(()) => {
+                    debug_log(true, &format!("HTTP STARTUP: HTTP server started successfully on port {}", app.settings.http_port));
                     if !app.is_reload {
                         app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
                     }
                     app.http_server = Some(http_server);
                 }
                 Err(e) => {
+                    debug_log(true, &format!("HTTP STARTUP: HTTP server FAILED: {}", e));
                     let err_str = e.to_string();
                     if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
                         app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
@@ -12506,6 +12612,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
             }
         }
+    } else {
+        debug_log(true, "HTTP STARTUP: http_enabled is false, skipping server start");
     }
 
     // Keepalive: send NOP every 5 minutes if telnet mode and idle

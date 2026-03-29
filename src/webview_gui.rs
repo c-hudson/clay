@@ -61,6 +61,7 @@ enum WvEvent {
     NewWindow(Option<String>),
 }
 
+use crate::debug_log;
 use crate::theme::{ThemeColors, ThemeFile};
 use crate::websocket::hash_password;
 
@@ -148,6 +149,7 @@ pub fn run_master_webgui() -> io::Result<()> {
         listener.local_addr()?.port()
     };
     // listener is dropped here, freeing the port for the WS server
+    debug_log(true, &format!("GUI MASTER: Internal WS on port {}", port));
 
     // Generate a random password using time + pid as entropy
     let random_bytes: [u8; 32] = {
@@ -180,6 +182,7 @@ pub fn run_master_webgui() -> io::Result<()> {
 
     // Spawn the headless App with WS override
     let ws_password = password.clone();
+    debug_log(true, &format!("GUI MASTER: Spawning run_app_headless with WS port={}", port));
     handle.spawn(async move {
         if let Err(e) = crate::run_app_headless(
             app_to_gui_tx,
@@ -187,7 +190,7 @@ pub fn run_master_webgui() -> io::Result<()> {
             Some((port, ws_password)),
             None, // No GUI repaint callback (webview is event-driven)
         ).await {
-            eprintln!("App error: {}", e);
+            debug_log(true, &format!("GUI MASTER: run_app_headless error: {}", e));
         }
     });
 
