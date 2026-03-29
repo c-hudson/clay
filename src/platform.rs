@@ -1060,15 +1060,19 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
 
     match std::process::Command::new(&exe).args(&args).spawn() {
         Ok(mut child) => {
-            // Wait for the child process to exit — this keeps the original process
-            // as the shell's foreground job so the prompt doesn't appear.
-            // We've already released raw mode and the alternate screen, so the
-            // child process can initialize the terminal fresh without competing.
             if sync_event != 0 {
                 unsafe { CloseHandle(sync_event); }
             }
-            let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(0);
-            std::process::exit(code);
+            if is_headless {
+                // GUI/headless mode: exit immediately so the old process releases the port.
+                // The new process runs independently as the new GUI window.
+                std::process::exit(0);
+            } else {
+                // Console mode: wait for the child to exit so the shell prompt
+                // doesn't appear between the old and new process.
+                let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(0);
+                std::process::exit(code);
+            }
         }
         Err(e) => {
             if sync_event != 0 {
