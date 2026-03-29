@@ -983,11 +983,6 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             let _ = tx.send(());
         }
     }
-    // Give the server tasks time to release the port.
-    // In GUI mode the tokio runtime runs on background threads, so the shutdown
-    // signal needs time to be processed and the TCP listener dropped.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     debug_log(true, "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
     debug_log(true, "RELOAD: State saved successfully");
@@ -1023,14 +1018,10 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // Tell new process which reload file to load (PID-specific)
     std::env::set_var("CLAY_RELOAD_PID", std::process::id().to_string());
 
-    // Only create a sync event in console mode (not headless/GUI/daemon).
-    // In headless mode there's no console terminal to fight over, and waiting
-    // would block the old process from releasing the WebSocket port.
     let is_headless = std::env::args().any(|a| a == "--gui" || a == "-D");
+
+    // Only create a sync event in console mode (not headless/GUI/daemon).
     let sync_event = if !is_headless {
-        // Create a named event so the new process can signal when it has taken over the console.
-        // This prevents the parent shell (cmd.exe/PowerShell) from reclaiming the console
-        // in the gap between old process exit and new process raw mode entry.
         let event_name = format!("ClayReloadSync-{}\0", std::process::id());
         let handle = unsafe {
             CreateEventA(std::ptr::null(), 1, 0, event_name.as_ptr())
@@ -1043,13 +1034,11 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         0
     };
 
-    // Spawn new process with --reload argument
     let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
     args.push("--reload".to_string());
     debug_log(true, &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
 
     // On Windows, disable raw mode and leave alternate screen BEFORE spawning
-    // so the new process gets a clean console state
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stdout(),
@@ -1058,27 +1047,62 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         crossterm::terminal::LeaveAlternateScreen
     );
 
-    match std::process::Command::new(&exe).args(&args).spawn() {
-        Ok(mut child) => {
-            if sync_event != 0 {
-                unsafe { CloseHandle(sync_event); }
+    if is_headless {
+        // GUI/headless mode: release port, spawn child, then hard-kill this process.
+        // The child has retry logic for binding and will wait for the port.
+
+        // Shut down HTTP/HTTPS servers to release port 9000
+        if let Some(ref mut server) = app.http_server {
+            if let Some(tx) = server.shutdown_tx.take() {
+                let _ = tx.send(());
             }
-            if is_headless {
-                // GUI/headless mode: terminate immediately so the old process releases the port.
-                // Use TerminateProcess for a hard exit — std::process::exit runs atexit handlers
-                // which can hang when WebView2 is loaded.
+        }
+        #[cfg(feature = "rustls-backend")]
+        if let Some(ref mut server) = app.https_server {
+            if let Some(tx) = server.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        #[cfg(feature = "native-tls-backend")]
+        if let Some(ref mut server) = app.https_server {
+            if let Some(tx) = server.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        // Drop WS server to release connections
+        app.ws_server = None;
+
+        // Wait for port to be released by tokio background threads
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        // Spawn child — it will retry binding port 9000
+        debug_log(true, "RELOAD GUI: Spawning child process");
+        match std::process::Command::new(&exe).args(&args).spawn() {
+            Ok(_child) => {
+                debug_log(true, "RELOAD GUI: Child spawned, terminating old process");
+                // Hard-kill: TerminateProcess won't run atexit handlers that WebView2 hooks
                 extern "system" {
                     fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
                     fn GetCurrentProcess() -> isize;
                 }
                 unsafe { TerminateProcess(GetCurrentProcess(), 0); }
                 unreachable!();
-            } else {
-                // Console mode: wait for the child to exit so the shell prompt
-                // doesn't appear between the old and new process.
-                let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(0);
-                std::process::exit(code);
             }
+            Err(e) => {
+                return Err(io::Error::other(format!("Failed to spawn reload process: {}", e)));
+            }
+        }
+    }
+
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(mut child) => {
+            if sync_event != 0 {
+                unsafe { CloseHandle(sync_event); }
+            }
+            // Console mode: wait for the child to exit so the shell prompt
+            // doesn't appear between the old and new process.
+            let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(0);
+            std::process::exit(code);
         }
         Err(e) => {
             if sync_event != 0 {
