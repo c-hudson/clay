@@ -729,18 +729,25 @@ impl WebSocketServer {
         }
     }
 
-    /// Send InitialState to a client AND atomically mark received_initial_state = true.
-    /// Uses a spawned task with write().await to avoid the race condition where
-    /// try_write() silently fails due to concurrent read locks.
+    /// Send InitialState to a client AND mark received_initial_state = true.
+    /// Tries synchronous write first to avoid race where broadcasts are dropped
+    /// before the flag is set. Falls back to spawned task if lock is contended.
     pub fn send_initial_state_and_mark(&self, client_id: u64, msg: WsMessage) {
-        let clients = self.clients.clone();
-        tokio::spawn(async move {
-            let mut guard = clients.write().await;
+        if let Ok(mut guard) = self.clients.try_write() {
             if let Some(client) = guard.get_mut(&client_id) {
                 let _ = client.tx.send(msg);
                 client.received_initial_state = true;
             }
-        });
+        } else {
+            let clients = self.clients.clone();
+            tokio::spawn(async move {
+                let mut guard = clients.write().await;
+                if let Some(client) = guard.get_mut(&client_id) {
+                    let _ = client.tx.send(msg);
+                    client.received_initial_state = true;
+                }
+            });
+        }
     }
 
     /// Set the client type for a connected client

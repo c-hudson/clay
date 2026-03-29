@@ -4647,11 +4647,10 @@ impl App {
         }
     }
 
-    /// Send InitialState to a client AND atomically mark it as having received InitialState.
-    /// This prevents a race condition where ws_send_to_client spawns an async task that
-    /// holds a read lock on clients, causing the subsequent try_write() in
-    /// mark_initial_state_sent to silently fail. When that happens, received_initial_state
-    /// stays false and broadcast_to_world_viewers never sends ServerData to the client.
+    /// Send InitialState to a client AND mark it as having received InitialState.
+    /// Uses try_write first for immediate marking (avoids race where broadcasts
+    /// are dropped before the spawned task runs). Falls back to spawned task
+    /// if the lock is contended.
     fn ws_send_initial_state_and_mark(&self, client_id: u64, msg: WsMessage) {
         // client_id 0 is the embedded GUI - send directly, no tracking needed
         if client_id == 0 {
@@ -4664,18 +4663,24 @@ impl App {
             return;
         }
         if let Some(ref server) = self.ws_server {
-            let clients = server.clients.clone();
-            tokio::spawn(async move {
-                // Use a write lock so we can both send AND mark atomically.
-                // This avoids the race where a spawned read-lock task from
-                // ws_send_to_client blocks a subsequent try_write() in
-                // mark_initial_state_sent, leaving received_initial_state = false.
-                let mut clients_guard = clients.write().await;
+            // Try synchronous write first — this avoids the race where broadcasts
+            // are skipped because received_initial_state hasn't been set yet
+            if let Ok(mut clients_guard) = server.clients.try_write() {
                 if let Some(client) = clients_guard.get_mut(&client_id) {
                     let _ = client.tx.send(msg);
                     client.received_initial_state = true;
                 }
-            });
+            } else {
+                // Lock contended — fall back to spawned task
+                let clients = server.clients.clone();
+                tokio::spawn(async move {
+                    let mut clients_guard = clients.write().await;
+                    if let Some(client) = clients_guard.get_mut(&client_id) {
+                        let _ = client.tx.send(msg);
+                        client.received_initial_state = true;
+                    }
+                });
+            }
         }
     }
 
