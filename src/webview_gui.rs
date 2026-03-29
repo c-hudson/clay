@@ -141,12 +141,12 @@ pub fn run_master_webgui() -> io::Result<()> {
         }
     }
 
-    // Read the configured HTTP port and secure mode from settings (default: port 9000, not secure)
+    // Read the configured HTTP port from settings (default 9000)
     // The GUI uses the same port as the web interface
-    let (port, is_secure) = {
+    let port = {
         let mut tmp_app = crate::App::new();
         let _ = crate::persistence::load_settings(&mut tmp_app);
-        (tmp_app.settings.http_port, tmp_app.settings.web_secure)
+        tmp_app.settings.http_port
     };
 
     // Generate a random password using time + pid as entropy
@@ -213,12 +213,12 @@ pub fn run_master_webgui() -> io::Result<()> {
     let params = WebViewParams {
         ws_host: "127.0.0.1".to_string(),
         ws_port: port,
-        ws_protocol: if is_secure { "wss" } else { "ws" }.to_string(),
+        ws_protocol: "ws".to_string(),
         auto_password: Some(password_hash),
         theme_css: load_user_theme_css(),
         server_host: None, // Master mode — no separate server URL needed
         server_port: None,
-        server_secure: is_secure,
+        server_secure: false,
     };
 
     let result = create_webview_window("Clay", &params, Some(gui_to_app_tx));

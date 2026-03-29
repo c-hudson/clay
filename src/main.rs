@@ -10890,8 +10890,10 @@ pub async fn run_app_headless(
     }
 
     // In GUI master mode, enable the web interface and set the auto-generated password
+    // Force plain HTTP — WebView connects via ws:// on localhost, doesn't need TLS
     if let Some(ref ws_password) = ws_override {
         app.settings.http_enabled = true;
+        app.settings.web_secure = false;
         app.settings.websocket_password = ws_password.clone();
     }
 
