@@ -190,48 +190,19 @@ pub fn run_master_webgui() -> io::Result<()> {
         }
     });
 
-    // Wait for the HTTP server to be ready
+    // Wait for the HTTP server to be ready (TCP connect check)
     let ws_ready = {
         let addr = format!("127.0.0.1:{}", port);
         let mut ready = false;
-        for attempt in 0..60 {
-            match std::net::TcpStream::connect(&addr) {
-                Ok(mut stream) => {
-                    use std::io::{Read, Write};
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                    let req = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", port);
-                    if stream.write_all(req.as_bytes()).is_ok() {
-                        let mut buf = [0u8; 512];
-                        match stream.read(&mut buf) {
-                            Ok(n) if n > 0 => {
-                                let response = String::from_utf8_lossy(&buf[..n]);
-                                if response.starts_with("HTTP/1.") && response.contains("text/html") {
-                                    crate::debug_log(true, &format!("WS READY: attempt {} - HTTP OK", attempt));
-                                    ready = true;
-                                    break;
-                                } else {
-                                    crate::debug_log(true, &format!("WS READY: attempt {} - bad response: {}", attempt, &response[..response.len().min(100)]));
-                                }
-                            }
-                            Ok(_) => {
-                                crate::debug_log(true, &format!("WS READY: attempt {} - empty read", attempt));
-                            }
-                            Err(e) => {
-                                crate::debug_log(true, &format!("WS READY: attempt {} - read error: {}", attempt, e));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if attempt % 10 == 0 {
-                        crate::debug_log(true, &format!("WS READY: attempt {} - connect failed: {}", attempt, e));
-                    }
-                }
+        for _ in 0..60 {
+            if std::net::TcpStream::connect_timeout(
+                &addr.parse::<std::net::SocketAddr>().unwrap(),
+                std::time::Duration::from_millis(200),
+            ).is_ok() {
+                ready = true;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        if !ready {
-            crate::debug_log(true, "WS READY: FAILED after 60 attempts");
         }
         ready
     };
