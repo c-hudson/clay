@@ -5119,6 +5119,11 @@ impl App {
             // For synchronized more-mode: only broadcast lines that went to output_lines
             // Lines that went to pending_lines will be broadcast when released
             // Only send to clients viewing this world (Phase 2 output routing)
+            debug_log(true, &format!(
+                "SERVERDATA BROADCAST: world={} splash_cleared={} output_before={} output_after={} lines_to_output={} skip={} partial_in_output={} lines_to_pending={}",
+                world_idx, splash_was_cleared, output_before, output_after, lines_to_output, skip_count,
+                has_partial_in_output, pending_after.saturating_sub(pending_before)
+            ));
             if lines_to_output > 0 {
                 // Get the seq of the first line being broadcast (for client-side dedup)
                 let first_seq = self.worlds[world_idx]

@@ -832,10 +832,23 @@ impl WebSocketServer {
     /// This avoids race conditions where client switches world but server hasn't processed the update yet
     pub fn broadcast_to_world_viewers(&self, _world_index: usize, msg: WsMessage) {
         if let Ok(clients) = self.clients.try_read() {
+            let mut sent_count = 0;
+            let mut skipped_count = 0;
             for client in clients.values() {
                 if client.authenticated && client.received_initial_state {
                     let _ = client.tx.send(msg.clone());
+                    sent_count += 1;
+                } else {
+                    skipped_count += 1;
                 }
+            }
+            if sent_count == 0 && skipped_count > 0 {
+                crate::debug_log(true, &format!(
+                    "WS BROADCAST: 0 sent, {} skipped (auth={}, initial_state={})",
+                    skipped_count,
+                    clients.values().filter(|c| c.authenticated).count(),
+                    clients.values().filter(|c| c.received_initial_state).count()
+                ));
             }
         } else {
             // Lock contention - fall back to async broadcast to avoid silently dropping messages
