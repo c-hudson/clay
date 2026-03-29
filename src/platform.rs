@@ -1085,14 +1085,11 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         debug_log(true, "RELOAD GUI: Spawning child process");
         match std::process::Command::new(&exe).args(&args).spawn() {
             Ok(_child) => {
-                debug_log(true, "RELOAD GUI: Child spawned, terminating old process");
-                // Hard-kill: TerminateProcess won't run atexit handlers that WebView2 hooks
-                extern "system" {
-                    fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
-                    fn GetCurrentProcess() -> isize;
-                }
-                unsafe { TerminateProcess(GetCurrentProcess(), 0); }
-                unreachable!();
+                debug_log(true, "RELOAD GUI: Child spawned, exiting old process");
+                // Use exit(0) for clean shutdown — lets the OS properly close sockets
+                // so the new process can bind port 9000. TerminateProcess was leaving
+                // the port in a zombie state on Windows.
+                std::process::exit(0);
             }
             Err(e) => {
                 return Err(io::Error::other(format!("Failed to spawn reload process: {}", e)));
