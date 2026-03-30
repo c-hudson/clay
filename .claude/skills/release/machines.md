@@ -15,7 +15,7 @@ cargo build --release --target x86_64-unknown-linux-musl --no-default-features -
 
 ### Linux GUI+audio (x86_64, non-static)
 ```bash
-cargo build --release --features webview-gui,native-audio,native-audio
+cargo build --release --features webview-gui,native-audio
 cp target/release/clay /tmp/clay-linux-x86_64-gui
 ```
 - Binary: `target/release/clay` → copy to `/tmp/clay-linux-x86_64-gui` (avoids filename collision with musl build during upload)
