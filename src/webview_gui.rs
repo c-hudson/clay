@@ -753,49 +753,53 @@ fn build_webview(
             } else if body == "quit" {
                 let _ = proxy.send_event(WvEvent::Quit);
             } else if body == "update" || body == "update-force" {
-                let force = body == "update-force";
-                let proxy_clone = proxy.clone();
-                let is_master_clone = is_master;
-                let reload_tx_clone = reload_tx.clone();
-                std::thread::spawn(move || {
-                    let rt = match tokio::runtime::Runtime::new() {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            let _ = proxy_clone.send_event(WvEvent::UpdateStatus(
-                                format!("Failed to start update: {}", e)
-                            ));
-                            return;
-                        }
-                    };
-                    let result = rt.block_on(crate::platform::check_and_download_update(force));
-                    match result {
-                        Ok(success) => {
-                            // Install the update
-                            let msg = install_update(&success.temp_path, &success.version);
-                            let is_success = msg.starts_with("Updated to");
-                            let _ = proxy_clone.send_event(WvEvent::UpdateStatus(msg));
-                            // Auto-reload after successful update
-                            if is_success {
-                                // Brief delay so the status message is visible
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                if is_master_clone {
-                                    crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    if let Some(ref tx) = reload_tx_clone {
-                                        let _ = tx.send(crate::WsMessage::SendCommand {
-                                            world_index: 0,
-                                            command: "/reload".to_string(),
-                                        });
+                #[cfg(not(target_os = "android"))]
+                {
+                    let force = body == "update-force";
+                    let proxy_clone = proxy.clone();
+                    let is_master_clone = is_master;
+                    let reload_tx_clone = reload_tx.clone();
+                    std::thread::spawn(move || {
+                        let rt = match tokio::runtime::Runtime::new() {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                let _ = proxy_clone.send_event(WvEvent::UpdateStatus(
+                                    format!("Failed to start update: {}", e)
+                                ));
+                                return;
+                            }
+                        };
+                        let result = rt.block_on(crate::platform::check_and_download_update(force));
+                        match result {
+                            Ok(success) => {
+                                let msg = install_update(&success.temp_path, &success.version);
+                                let is_success = msg.starts_with("Updated to");
+                                let _ = proxy_clone.send_event(WvEvent::UpdateStatus(msg));
+                                if is_success {
+                                    std::thread::sleep(std::time::Duration::from_millis(500));
+                                    if is_master_clone {
+                                        crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        if let Some(ref tx) = reload_tx_clone {
+                                            let _ = tx.send(crate::WsMessage::SendCommand {
+                                                world_index: 0,
+                                                command: "/reload".to_string(),
+                                            });
+                                        }
+                                    } else {
+                                        let _ = proxy_clone.send_event(WvEvent::Reload);
                                     }
-                                } else {
-                                    let _ = proxy_clone.send_event(WvEvent::Reload);
                                 }
                             }
+                            Err(e) => {
+                                let _ = proxy_clone.send_event(WvEvent::UpdateStatus(e));
+                            }
                         }
-                        Err(e) => {
-                            let _ = proxy_clone.send_event(WvEvent::UpdateStatus(e));
-                        }
-                    }
-                });
+                    });
+                }
+                #[cfg(target_os = "android")]
+                {
+                    let _ = proxy.send_event(WvEvent::UpdateStatus("Update not available on Android".to_string()));
+                }
             } else if body == "reload" {
                 // Hot reload: master mode uses both atomic flag AND channel for reliability
                 // (can't use SIGUSR1 because WebKit/JSC overrides the signal handler),
