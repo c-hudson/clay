@@ -767,7 +767,7 @@ fn build_webview(
                             return;
                         }
                     };
-                    let result = rt.block_on(crate::check_and_download_update(force));
+                    let result = rt.block_on(crate::platform::check_and_download_update(force));
                     match result {
                         Ok(success) => {
                             // Install the update
