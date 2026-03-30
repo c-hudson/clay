@@ -1060,15 +1060,12 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             if let Some(handle) = server.listener_handle {
                 if make_inheritable(handle as u64).is_ok() {
                     std::env::set_var("CLAY_HTTP_LISTENER", handle.to_string());
-                    debug_log(true, &format!("RELOAD GUI: Passing HTTP listener handle {}", handle));
                 }
             }
         }
 
-        debug_log(true, "RELOAD GUI: Spawning child process");
         match std::process::Command::new(&exe).args(&args).spawn() {
             Ok(_child) => {
-                debug_log(true, "RELOAD GUI: Child spawned, exiting old process");
                 // Use exit(0) for clean shutdown — lets the OS properly close sockets
                 // so the new process can bind port 9000. TerminateProcess was leaving
                 // the port in a zombie state on Windows.

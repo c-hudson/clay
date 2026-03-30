@@ -314,7 +314,6 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if let Some(ws_state) = ws_state {
             let client_id = ws_state.next_client_id();
             let pw_hash = ws_state.password_hash.read().unwrap().clone();
-            crate::debug_log(true, &format!("WS UPGRADE: client_id={}, from={}, pw_hash_len={}", client_id, client_addr, pw_hash.len()));
             let prefixed = PrefixedStream::new(buf[..n].to_vec(), stream);
             let _ = crate::websocket::handle_ws_client(
                 prefixed,
@@ -330,7 +329,6 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 ws_state.ban_list.clone(),
             ).await;
         } else {
-            crate::debug_log(true, &format!("WS UPGRADE REJECTED: no ws_state, from={}", client_addr));
             // WebSocket not configured (no password set)
             let response = build_http_response(503, "Service Unavailable", "text/plain", "WebSocket not configured", is_https);
             let _ = stream.write_all(&response).await;
@@ -920,7 +918,6 @@ pub async fn start_http_server(
                 result = listener.accept() => {
                     match result {
                         Ok((mut stream, addr)) => {
-                            crate::debug_log(true, &format!("HTTP ACCEPT: connection from {}", addr));
                             let client_ip = addr.ip().to_string();
                             if ban_list.is_banned(&client_ip) {
                                 let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;

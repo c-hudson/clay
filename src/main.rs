@@ -10897,14 +10897,9 @@ pub async fn run_app_headless(
         app.settings.http_enabled = true;
         app.settings.web_secure = false;
         app.settings.websocket_password = ws_password.clone();
-        debug_log(true, &format!("GUI OVERRIDE: http_enabled=true, web_secure=false, port={}, password_len={}",
-            app.settings.http_port, ws_password.len()));
     }
 
     // Create WebSocket server state (for client management, no standalone listener)
-    debug_log(true, &format!("WS STATE: password_empty={}, http_enabled={}, http_port={}, web_secure={}",
-        app.settings.websocket_password.is_empty(), app.settings.http_enabled,
-        app.settings.http_port, app.settings.web_secure));
     let ws_state = if !app.settings.websocket_password.is_empty() {
         let server = WebSocketServer::new(
             &app.settings.websocket_password,
@@ -10954,8 +10949,6 @@ pub async fn run_app_headless(
     }
 
     // Start unified HTTP+WS server if enabled
-    debug_log(true, &format!("HTTP SERVER HEADLESS: http_enabled={}, ws_state_some={}, port={}",
-        app.settings.http_enabled, ws_state.is_some(), app.settings.http_port));
     if app.settings.http_enabled {
         if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
@@ -11011,7 +11004,6 @@ pub async fn run_app_headless(
                 .and_then(|s| s.parse::<u64>().ok());
             if inherited_handle.is_some() {
                 std::env::remove_var("CLAY_HTTP_LISTENER");
-                debug_log(true, &format!("HTTP SERVER: Using inherited listener handle {:?}", inherited_handle));
             }
             let mut http_server = HttpServer::new(app.settings.http_port);
             match start_http_server(
