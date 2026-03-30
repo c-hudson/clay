@@ -249,6 +249,37 @@
     var urlParams = new URLSearchParams(window.location.search);
     var lockedWorldName = urlParams.get('world') || window.LOCK_WORLD || null;
     var lockedWorld = false;
+
+    // Grep mode: filter output by pattern (set by /window --grep or URL ?grep=)
+    var grepMode = null;
+    var grepRegex = null;
+    if (window.GREP_MODE) {
+        grepMode = window.GREP_MODE;
+    } else if (urlParams.get('grep')) {
+        grepMode = {
+            pattern: urlParams.get('grep'),
+            regex: urlParams.get('regexp') === '1'
+        };
+        var grepWorldParam = urlParams.get('world');
+        if (grepWorldParam) {
+            lockedWorldName = grepWorldParam;
+        }
+    }
+    if (grepMode) {
+        try {
+            if (grepMode.regex) {
+                grepRegex = new RegExp(grepMode.pattern, 'i');
+            } else {
+                // Convert glob to regex: * → .*, ? → ., escape rest
+                var escaped = grepMode.pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+                escaped = escaped.replace(/\*/g, '.*').replace(/\?/g, '.');
+                grepRegex = new RegExp(escaped, 'i');
+            }
+        } catch (e) {
+            // Invalid pattern — match everything
+            grepRegex = null;
+        }
+    }
     let pendingReconnectCommand = null;  // Command to resend after reconnect
     let pendingReconnectWorldIndex = null;  // World index to switch to after reconnect
     let commandHistory = [];
@@ -1851,6 +1882,16 @@
                         }
                     }
                 }
+                // Grep mode: hide UI, enable timestamps, filter output
+                if (grepMode) {
+                    if (elements.statusBar) elements.statusBar.style.display = 'none';
+                    if (elements.inputContainer) elements.inputContainer.style.display = 'none';
+                    if (elements.navBar) elements.navBar.style.display = 'none';
+                    document.title = 'Clay - grep: ' + grepMode.pattern;
+                    showTags = true; // Enable timestamps
+                    renderOutput();
+                }
+
                 // Handle pending reconnect command (resend after reconnection)
                 if (pendingReconnectCommand !== null) {
                     // Switch to the world that was active when the command failed
@@ -1972,6 +2013,13 @@
                             // Filter out keep-alive idler message lines
                             if (line.includes('###_idler_message_') && line.includes('_###')) {
                                 return;
+                            }
+                            // Grep mode: skip non-matching lines
+                            if (grepRegex) {
+                                const plainLine = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+                                if (!grepRegex.test(plainLine)) {
+                                    return;
+                                }
                             }
                             const lineIndex = world.output_lines.length;
                             const hasRealSeq = msg.seq !== undefined && msg.seq > 0;
@@ -3003,7 +3051,38 @@
         // Intercept /window locally — open new browser/tab directly from client
         if (cmdTrimmed === '/window' || cmdTrimmed.startsWith('/window ')) {
             elements.input.value = '';
-            var winWorld = cmdTrimmed.length > 8 ? cmdTrimmed.substring(8).trim() : '';
+            var winArgs = cmdTrimmed.length > 8 ? cmdTrimmed.substring(8).trim() : '';
+
+            // Check for --grep flag: /window --grep pattern [-w world] [--regexp]
+            var grepMatch = winArgs.match(/--grep\s+(\S+)/);
+            if (grepMatch) {
+                var grepPattern = grepMatch[1];
+                var grepWorldMatch = winArgs.match(/-w\s+(\S+)/);
+                var grepWorld = grepWorldMatch ? grepWorldMatch[1] : null;
+                var grepRegexp = winArgs.includes('--regexp');
+
+                if (window.ipc && window.ipc.postMessage) {
+                    window.ipc.postMessage('grep-window:' + JSON.stringify({
+                        pattern: grepPattern,
+                        world: grepWorld,
+                        regex: grepRegexp
+                    }));
+                } else {
+                    // Browser mode: open new tab with grep params in URL
+                    var winProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
+                    var winHost = window.WS_HOST || window.location.hostname;
+                    var winPort = (window.WS_PORT && window.WS_PORT !== 0)
+                        ? window.WS_PORT : window.location.port;
+                    var grepUrl = winProto + '://' + winHost + ':' + winPort + '/'
+                        + '?grep=' + encodeURIComponent(grepPattern)
+                        + (grepWorld ? '&world=' + encodeURIComponent(grepWorld) : '')
+                        + (grepRegexp ? '&regexp=1' : '');
+                    window.open(grepUrl, '_blank');
+                }
+                return;
+            }
+
+            var winWorld = winArgs;
             var winParam = winWorld ? '?world=' + encodeURIComponent(winWorld) : '';
             // Build URL using real server address (SERVER_URL set by WebView, else use WS_HOST)
             var winUrl;
@@ -3919,6 +3998,14 @@
             if (filterPopupOpen && filterText.length > 0) {
                 const plainLine = stripAnsiForFilter(cleanLine);
                 if (!matchesFilter(plainLine, filterText)) {
+                    continue;
+                }
+            }
+
+            // Grep mode: skip lines that don't match the grep pattern
+            if (grepRegex) {
+                const plainLine = stripAnsiForFilter(cleanLine);
+                if (!grepRegex.test(plainLine)) {
                     continue;
                 }
             }

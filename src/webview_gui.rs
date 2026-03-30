@@ -59,6 +59,8 @@ enum WvEvent {
     Reload,
     /// Open a new window (optionally locked to a world)
     NewWindow(Option<String>),
+    /// Open a grep results window (half height, no status/input, filtered output)
+    GrepWindow { pattern: String, world: Option<String>, use_regex: bool },
 }
 
 use crate::theme::{ThemeColors, ThemeFile};
@@ -679,6 +681,7 @@ fn build_webview(
     proxy: &EventLoopProxy<WvEvent>,
     reload_tx: &Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
     world_lock: Option<&str>,
+    extra_js: Option<&str>,
 ) -> io::Result<wry::WebView> {
     // Build HTML with WS params baked into template placeholders
     let mut html_content = build_html(params);
@@ -689,6 +692,14 @@ fn build_webview(
             &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
             &format!("window.WS_PROTOCOL = '{}';\n        window.LOCK_WORLD = '{}';",
                 params.ws_protocol, world_name.replace('\'', "\\'")),
+        );
+    }
+
+    // Inject extra JavaScript (e.g. GREP_MODE for grep windows)
+    if let Some(js) = extra_js {
+        html_content = html_content.replace(
+            &format!("window.WS_PROTOCOL = '{}';", params.ws_protocol),
+            &format!("window.WS_PROTOCOL = '{}';\n        {}", params.ws_protocol, js),
         );
     }
 
@@ -728,6 +739,17 @@ fn build_webview(
                 let world_name = body[11..].trim().to_string();
                 let world = if world_name.is_empty() { None } else { Some(world_name) };
                 let _ = proxy.send_event(WvEvent::NewWindow(world));
+            } else if body.starts_with("grep-window:") {
+                // Open a grep results window (half height, filtered output)
+                let json_str = &body[12..];
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let pattern = v["pattern"].as_str().unwrap_or("").to_string();
+                    let world = v["world"].as_str().map(|s| s.to_string());
+                    let use_regex = v["regex"].as_bool().unwrap_or(false);
+                    if !pattern.is_empty() {
+                        let _ = proxy.send_event(WvEvent::GrepWindow { pattern, world, use_regex });
+                    }
+                }
             } else if body == "quit" {
                 let _ = proxy.send_event(WvEvent::Quit);
             } else if body == "update" || body == "update-force" {
@@ -910,7 +932,7 @@ fn create_webview_window(
     let initial_world_lock: Option<String> = std::env::var("CLAY_WINDOW_WORLD").ok();
 
     // Build the first webview (initial_world_lock is handled inside build_html via env var)
-    let webview = build_webview(&window, params, &proxy, &reload_tx, None)?;
+    let webview = build_webview(&window, params, &proxy, &reload_tx, None, None)?;
 
     // Store windows and webviews in HashMaps keyed by WindowId for multi-window support
     let mut windows: HashMap<WindowId, tao::window::Window> = HashMap::new();
@@ -1060,7 +1082,7 @@ fn create_webview_window(
                 };
 
                 let world_lock = world.as_deref();
-                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock) {
+                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, None) {
                     Ok(wv) => {
                         let id = new_window.id();
                         windows.insert(id, new_window);
@@ -1069,6 +1091,35 @@ fn create_webview_window(
                     Err(_) => {
                         // Window will be dropped, which is fine
                     }
+                }
+            }
+            Event::UserEvent(WvEvent::GrepWindow { ref pattern, ref world, use_regex }) => {
+                // Create a half-height grep results window
+                let win_title = format!("Clay - grep: {}", pattern);
+                let new_window = match WindowBuilder::new()
+                    .with_title(&win_title)
+                    .with_theme(window_theme)
+                    .with_inner_size(tao::dpi::LogicalSize::new(800.0, 300.0))
+                    .build(event_loop_target)
+                {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+
+                // Build GREP_MODE JS injection
+                let escaped_pattern = pattern.replace('\\', "\\\\").replace('\'', "\\'");
+                let grep_js = format!(
+                    "window.GREP_MODE = {{ pattern: '{}', regex: {} }};",
+                    escaped_pattern, use_regex
+                );
+                let world_lock = world.as_deref();
+                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, Some(&grep_js)) {
+                    Ok(wv) => {
+                        let id = new_window.id();
+                        windows.insert(id, new_window);
+                        webviews.insert(id, wv);
+                    }
+                    Err(_) => {}
                 }
             }
             _ => {}
