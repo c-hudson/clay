@@ -41,7 +41,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **Notes Editor** - Per-world split-screen notes editor (`/edit`)
 - **Termux Support** - Runs on Android via Termux
 - **Android App** - WebSocket client with push notifications via `/notify`
-- **Grep Mode** - Search world output history or follow live output (`--grep`)
+- **Grep Mode** - Search world output history or follow live output (`--grep`, `/window --grep`)
 - **Daemon Mode** - Run headless as a background process (`-D`)
 - **Multiuser Mode** - Shared server with per-user worlds and actions (`--multiuser`)
 
@@ -95,8 +95,11 @@ cargo build --release --features webview-gui
 
 ```bash
 # Install Rust from https://rustup.rs
+# Install Visual Studio Build Tools (MSVC)
 
 # Build with WebView GUI + audio (uses WebView2)
+# Static CRT linking eliminates vcruntime140.dll dependency
+set RUSTFLAGS=-C target-feature=+crt-static
 cargo build --release --features webview-gui
 ```
 
@@ -164,6 +167,8 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 | `/disconnect` or `/dc` | Disconnect current world |
 | `/send [-w world] text` | Send text to a world |
 | `/flush` | Clear output buffer for current world |
+| `/window [world]` | Open new GUI/browser window |
+| `/window --grep <pat> [-w world]` | Open grep results window (searchs scrollback + live) |
 
 **Settings & UI:**
 
@@ -327,11 +332,10 @@ Features:
 Enable in `/web` settings:
 
 1. Set `HTTP enabled` to Yes (default port: 9000)
-2. Set `WS enabled` to Yes for secure WebSocket (default port: 9002)
-3. Set a `WS password` (required for authentication)
-4. Optionally configure TLS cert/key for HTTPS
+2. Set a `WS password` (required for authentication)
+3. Optionally enable `Secure` for HTTPS (auto-generates self-signed certs)
 
-Access via browser at `http://localhost:9000`.
+Access via browser at `http://localhost:9000`. HTTP and WebSocket share the same port.
 
 ## Actions/Triggers
 

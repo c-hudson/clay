@@ -34,7 +34,7 @@ cargo clippy                         # Lint
 
 - **Termux:** `cargo build --no-default-features --features rustls-backend` (no musl target). GUI requires X11 patches via `./patches/apply-patches.sh`. No hot reload, TLS proxy, or Ctrl+Z on Android.
 - **macOS:** `cargo build --no-default-features --features rustls-backend` (no musl). Universal binary via `lipo` combining x86_64-apple-darwin and aarch64-apple-darwin targets.
-- **Windows:** `cargo build --target x86_64-pc-windows-gnu --features webview-gui`
+- **Windows:** `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo build --release --features webview-gui` (MSVC, not cross-compiled)
 
 ## Architecture
 
@@ -99,7 +99,9 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 
 - **Borrow checker with App**: Clone data out of App before mutable borrows (e.g., ThemeColors, world info for WebSocket)
 - **WebSocket InitialState**: `build_initial_state()` sends only `output_lines` (NOT pending_lines) to avoid duplicates. Partial lines excluded from broadcasts.
-- **Hot reload**: `exec()` replaces process, TCP socket fds preserved via cleared FD_CLOEXEC. TLS connections need proxy process.
+- **Hot reload**: `exec()` replaces process, TCP socket fds preserved via cleared FD_CLOEXEC. TLS connections need proxy process. On Windows GUI, the HTTP listener socket handle is passed to the child process via `CLAY_HTTP_LISTENER` env var to avoid port zombie issues.
+- **GUI mode**: Default on Windows/macOS (no `--gui` flag needed). Uses `run_master_webgui()` → `run_app_headless()`. Forces `web_secure=false` and `http_enabled=true`. WebView connects via `ws://127.0.0.1:<http_port>`.
+- **`/window --grep`**: Opens a half-height WebView with `GREP_MODE` JS var injected. Client-side filtering — no server changes. Matches against displayed text (strips ANSI + MUD tags). Regex compiled once at startup.
 - **Console rendering**: `render_output_crossterm()` bypasses ratatui for output area (raw crossterm for ANSI fidelity). Popups use ratatui.
 - **Web content**: HTML/CSS/JS embedded via `include_str!()` in http.rs. Changes require rebuild + `/reload`.
 - **TF control flow in macros**: Body split by `%;`, control flow blocks grouped by `split_body_preserving_control_flow()`. Plain text in loop bodies becomes `SendToMud`, queued in `engine.pending_commands`.
