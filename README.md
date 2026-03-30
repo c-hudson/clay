@@ -1,9 +1,9 @@
 # Clay MUD Client
 
-A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi-world support, ANSI color rendering, and a web interface.
+A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi-world support, ANSI color rendering, spell checking, tinyfugue compatibility and remote viewing with a web interface and android app.
 
-![Clay screenshot showing one instance with remote terminal, Firefox web client, native GUI, and theme editor](screenshot.png)
-*A single Clay instance viewed simultaneously from a remote terminal, a Firefox web client, and a native WebView GUI — with the browser-based theme editor open for live color customization.*
+![Clay screenshot showing one instance with remote terminal, Firefox web client, and native WebView GUI](screenshot.png)
+*A single Clay instance viewed simultaneously from a remote terminal, a Firefox web client, and a native WebView GUI.*
 
 ## Features
 
