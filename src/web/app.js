@@ -2014,8 +2014,9 @@
                                 return;
                             }
                             // Grep mode: skip non-matching lines
+                            // Match against displayed text (strip ANSI codes AND MUD tags)
                             if (grepRegex) {
-                                const plainLine = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+                                const plainLine = stripMudTag(line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''));
                                 if (!grepRegex.test(plainLine)) {
                                     return;
                                 }
@@ -4004,8 +4005,9 @@
             }
 
             // Grep mode: skip lines that don't match the grep pattern
+            // Match against displayed text (strip ANSI codes AND MUD tags)
             if (grepRegex) {
-                const plainLine = stripAnsiForFilter(cleanLine);
+                const plainLine = stripMudTag(stripAnsiForFilter(cleanLine));
                 if (!grepRegex.test(plainLine)) {
                     continue;
                 }
