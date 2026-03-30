@@ -1882,13 +1882,12 @@
                         }
                     }
                 }
-                // Grep mode: hide UI, enable timestamps, filter output
+                // Grep mode: hide UI, filter output (F2 toggles timestamps)
                 if (grepMode) {
                     if (elements.statusBar) elements.statusBar.style.display = 'none';
                     if (elements.inputContainer) elements.inputContainer.style.display = 'none';
                     if (elements.navBar) elements.navBar.style.display = 'none';
                     document.title = 'Clay - grep: ' + grepMode.pattern;
-                    showTags = true; // Enable timestamps
                     renderOutput();
                 }
 
