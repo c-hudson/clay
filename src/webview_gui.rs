@@ -856,13 +856,16 @@ fn build_webview(
 
     // On Linux/GTK, must use build_gtk() to properly embed WebView in tao's GTK container.
     // build(&window) silently produces a non-visible webview on Linux.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "android",
+    // On Android/Termux (patched tao), use regular build() — no GTK available.
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        ),
+        not(target_os = "android"),
     ))]
     let webview = {
         use tao::platform::unix::WindowExtUnix;
@@ -873,14 +876,17 @@ fn build_webview(
             .map_err(|e| io::Error::other(format!("Failed to create WebView: {}", e)))?
     };
 
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
+    // On macOS, Windows, and Android/Termux (patched tao): use regular build()
+    #[cfg(any(
         target_os = "android",
-    )))]
+        not(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        )),
+    ))]
     let webview = builder.build(window)
         .map_err(|e| io::Error::other(format!("Failed to create WebView: {}", e)))?;
 
@@ -977,13 +983,15 @@ fn create_webview_window(
             }
             Event::UserEvent(WvEvent::SetOpacity(opacity)) => {
                 // Broadcast opacity to all windows
-                #[cfg(any(
-                    target_os = "linux",
-                    target_os = "dragonfly",
-                    target_os = "freebsd",
-                    target_os = "netbsd",
-                    target_os = "openbsd",
-                    target_os = "android",
+                #[cfg(all(
+                    any(
+                        target_os = "linux",
+                        target_os = "dragonfly",
+                        target_os = "freebsd",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                    ),
+                    not(target_os = "android"),
                 ))]
                 {
                     use tao::platform::unix::WindowExtUnix;
@@ -993,14 +1001,16 @@ fn create_webview_window(
                         gtk_win.set_opacity(opacity);
                     }
                 }
-                #[cfg(not(any(
-                    target_os = "linux",
-                    target_os = "dragonfly",
-                    target_os = "freebsd",
-                    target_os = "netbsd",
-                    target_os = "openbsd",
+                #[cfg(any(
                     target_os = "android",
-                )))]
+                    not(any(
+                        target_os = "linux",
+                        target_os = "dragonfly",
+                        target_os = "freebsd",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                    )),
+                ))]
                 { let _ = opacity; }
             }
             Event::UserEvent(WvEvent::UpdateStatus(ref msg)) => {
