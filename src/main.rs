@@ -11006,12 +11006,20 @@ pub async fn run_app_headless(
                 }
             }
         } else {
+            // Check for inherited HTTP listener handle (from GUI reload)
+            let inherited_handle = std::env::var("CLAY_HTTP_LISTENER").ok()
+                .and_then(|s| s.parse::<u64>().ok());
+            if inherited_handle.is_some() {
+                std::env::remove_var("CLAY_HTTP_LISTENER");
+                debug_log(true, &format!("HTTP SERVER: Using inherited listener handle {:?}", inherited_handle));
+            }
             let mut http_server = HttpServer::new(app.settings.http_port);
             match start_http_server(
                 &mut http_server,
                 ws_state.clone(),
                 app.ban_list.clone(),
                 app.gui_theme_colors().to_css_vars(),
+                inherited_handle,
             ).await {
                 Ok(()) => {
                     if !app.is_reload {
@@ -12503,6 +12511,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 ws_state.clone(),
                 app.ban_list.clone(),
                 app.gui_theme_colors().to_css_vars(),
+                None,
             ).await {
                 Ok(()) => {
                     if !app.is_reload {

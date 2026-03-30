@@ -1054,34 +1054,17 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     );
 
     if is_headless {
-        // GUI/headless mode: release port, spawn child, then hard-kill this process.
-        // The child has retry logic for binding and will wait for the port.
-
-        // Shut down HTTP/HTTPS servers to release port 9000
-        if let Some(ref mut server) = app.http_server {
-            if let Some(tx) = server.shutdown_tx.take() {
-                let _ = tx.send(());
+        // GUI/headless mode: pass the HTTP listener socket to the child process
+        // so it can reuse port 9000 without rebinding (avoids Windows port zombie issue).
+        if let Some(ref server) = app.http_server {
+            if let Some(handle) = server.listener_handle {
+                if make_inheritable(handle as u64).is_ok() {
+                    std::env::set_var("CLAY_HTTP_LISTENER", handle.to_string());
+                    debug_log(true, &format!("RELOAD GUI: Passing HTTP listener handle {}", handle));
+                }
             }
         }
-        #[cfg(feature = "rustls-backend")]
-        if let Some(ref mut server) = app.https_server {
-            if let Some(tx) = server.shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-        }
-        #[cfg(feature = "native-tls-backend")]
-        if let Some(ref mut server) = app.https_server {
-            if let Some(tx) = server.shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-        }
-        // Drop WS server to release connections
-        app.ws_server = None;
 
-        // Wait for port to be released by tokio background threads
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-
-        // Spawn child — it will retry binding port 9000
         debug_log(true, "RELOAD GUI: Spawning child process");
         match std::process::Command::new(&exe).args(&args).spawn() {
             Ok(_child) => {

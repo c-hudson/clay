@@ -385,14 +385,11 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> 
 
             // Add timestamp if requested
             if opts.show_timestamps {
-                let ts = line.timestamp.duration_since(std::time::UNIX_EPOCH)
+                let epoch_secs = line.timestamp.duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                // Simple timestamp format HH:MM:SS
-                let secs = ts % 60;
-                let mins = (ts / 60) % 60;
-                let hours = (ts / 3600) % 24;
-                let ts_str = format!("{:02}:{:02}:{:02}", hours, mins, secs);
+                    .unwrap_or(0) as i64;
+                let lt = crate::util::local_time_from_epoch(epoch_secs);
+                let ts_str = format!("{:02}:{:02}:{:02}", lt.hour, lt.minute, lt.second);
                 display_line = format!("[{}] {}", ts_str, display_line);
             }
 

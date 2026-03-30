@@ -93,7 +93,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
         } else {
             // Start HTTP+WS
             let mut http_server = HttpServer::new(app.settings.http_port);
-            match start_http_server(&mut http_server, ws_state.clone(), app.ban_list.clone(), app.gui_theme_colors().to_css_vars()).await {
+            match start_http_server(&mut http_server, ws_state.clone(), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), None).await {
                 Ok(()) => {
                     let protocol = if ws_state.is_some() { "HTTP+WS" } else { "HTTP" };
                     println!("{}: http://0.0.0.0:{}", protocol, app.settings.http_port);
@@ -1898,7 +1898,7 @@ keep_alive_type=Generic
     // Start unified HTTP+WS server
     {
         let mut http_server = HttpServer::new(app.settings.http_port);
-        match start_http_server(&mut http_server, Some(ws_state.clone()), app.ban_list.clone(), app.gui_theme_colors().to_css_vars()).await {
+        match start_http_server(&mut http_server, Some(ws_state.clone()), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), None).await {
             Ok(()) => {
                 println!("HTTP+WS: http://0.0.0.0:{}", app.settings.http_port);
                 app.http_server = Some(http_server);

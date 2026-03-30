@@ -836,6 +836,11 @@ pub struct HttpServer {
     pub running: Arc<RwLock<bool>>,
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub port: u16,
+    /// Raw socket handle of the TCP listener (for passing to child process on reload)
+    #[cfg(windows)]
+    pub listener_handle: Option<u64>,
+    #[cfg(not(windows))]
+    pub listener_handle: Option<i32>,
 }
 
 impl HttpServer {
@@ -843,6 +848,7 @@ impl HttpServer {
         Self {
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: None,
+            listener_handle: None,
             port,
         }
     }
@@ -854,10 +860,25 @@ pub async fn start_http_server(
     ws_state: Option<Arc<WsConnectionState>>,
     ban_list: BanList,
     theme_css_vars: String,
+    inherited_handle: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = format!("0.0.0.0:{}", server.port);
-    // Retry binding with delays — on reload, the previous process may still be releasing the port
-    let listener = {
+    let listener = if let Some(handle) = inherited_handle {
+        // Reconstruct listener from inherited socket handle (reload on Windows)
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::FromRawSocket;
+            let std_listener = unsafe { std::net::TcpListener::from_raw_socket(handle) };
+            std_listener.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(std_listener)?
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = handle;
+            return Err("inherited_handle not supported on this platform".into());
+        }
+    } else {
+        let addr = format!("0.0.0.0:{}", server.port);
+        // Retry binding with delays — on reload, the previous process may still be releasing the port
         let mut last_err = None;
         let mut bound = None;
         for attempt in 0..10 {
@@ -876,6 +897,13 @@ pub async fn start_http_server(
             None => return Err(format!("Failed to bind HTTP to port {}: {}", server.port, last_err.unwrap()).into()),
         }
     };
+
+    // Store the listener handle for passing to child process on reload
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        server.listener_handle = Some(listener.as_raw_socket());
+    }
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     server.shutdown_tx = Some(shutdown_tx);
