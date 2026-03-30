@@ -2613,7 +2613,8 @@
                     // Re-render only if user has scrolled up into history.
                     // Backfill lines are old content at the top — not visible when at bottom.
                     // Skipping renderOutput() avoids restarting CSS animations (e.g. blink).
-                    if (msg.world_index === currentWorldIndex && !wasBottom) {
+                    // In grep mode, always re-render to show newly available matching lines.
+                    if (msg.world_index === currentWorldIndex && (!wasBottom || grepRegex)) {
                         renderOutput();
                         // Adjust scrollTop by the height difference (new content at top)
                         {
@@ -3054,7 +3055,8 @@
             var winArgs = cmdTrimmed.length > 8 ? cmdTrimmed.substring(8).trim() : '';
 
             // Check for --grep flag: /window --grep pattern [-w world] [--regexp]
-            var grepMatch = winArgs.match(/--grep\s+(\S+)/);
+            // Supports quoted patterns: --grep "*some pattern*" or --grep pattern
+            var grepMatch = winArgs.match(/--grep\s+"([^"]+)"/) || winArgs.match(/--grep\s+'([^']+)'/) || winArgs.match(/--grep\s+(\S+)/);
             if (grepMatch) {
                 var grepPattern = grepMatch[1];
                 var grepWorldMatch = winArgs.match(/-w\s+(\S+)/);
