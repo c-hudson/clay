@@ -183,6 +183,25 @@ fn speak_edge(backend: &TtsBackend, text: &str) {
     });
 }
 
+/// Generate the Sec-MS-GEC DRM token required by Edge TTS API.
+/// Based on current time rounded to 5-minute intervals, hashed with the trusted client token.
+fn generate_sec_ms_gec() -> String {
+    use sha2::{Sha256, Digest};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    // Convert to Windows file time epoch (1601-01-01)
+    let ticks = now + 11644473600.0;
+    // Round down to nearest 5 minutes
+    let ticks = ticks - (ticks % 300.0);
+    // Convert to 100-nanosecond intervals
+    let ticks = ticks * 1e7;
+    let str_to_hash = format!("{:.0}6A5AA1D4EAFF4E9FB37E23D68491D6F4", ticks);
+    let hash = Sha256::digest(str_to_hash.as_bytes());
+    hex::encode(hash).to_uppercase()
+}
+
 /// Edge TTS WebSocket protocol implementation.
 /// Connects to Microsoft's TTS endpoint, sends SSML, receives MP3 audio.
 async fn edge_tts_speak(text: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -193,14 +212,32 @@ async fn edge_tts_speak(text: &str) -> Result<(), Box<dyn std::error::Error + Se
     let voice = "en-US-AriaNeural";
     let output_format = "audio-24khz-48kbitrate-mono-mp3";
 
+    // Generate DRM token
+    let sec_ms_gec = generate_sec_ms_gec();
+    let sec_ms_gec_version = "1-143.0.3650.75";
+
     // Build the WebSocket URL with required parameters
     let ws_url = format!(
-        "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId={}",
-        &request_id
+        "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId={}&Sec-MS-GEC={}&Sec-MS-GEC-Version={}",
+        &request_id, &sec_ms_gec, sec_ms_gec_version
     );
 
+    // Build request with required headers
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(&ws_url)
+        .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0")
+        .header("Pragma", "no-cache")
+        .header("Cache-Control", "no-cache")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Host", "speech.platform.bing.com")
+        .body(())?;
+
     // Connect via tungstenite with rustls
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await?;
 
     // Send speech config
     let config_msg = format!(
