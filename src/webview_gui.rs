@@ -503,7 +503,9 @@ fn build_html(params: &WebViewParams) -> String {
     // Inject WebView-specific CSS and JS overrides
     let webview_overrides = r#"<style>
 /* WebView overrides - native app, not mobile browser */
-#output-container { padding: 2px 4px; -webkit-user-select: text; user-select: text; cursor: text; }
+#output-container { padding: 2px 4px; -webkit-user-select: text; user-select: text; cursor: text; scrollbar-width: none; }
+.clay-scrollbar { position: absolute; right: 1px; width: 5px; background: rgba(255,255,255,0.25); border-radius: 3px; z-index: 50; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+.clay-scrollbar.visible { opacity: 1; }
 #input-container { padding: 2px 4px; }
 #output { -webkit-user-select: text; user-select: text; }
 #output * { -webkit-user-select: text; user-select: text; }
@@ -525,6 +527,28 @@ fn build_html(params: &WebViewParams) -> String {
 window.WEBVIEW_MODE = true;
 window.WEBVIEW_DEVICE_OVERRIDE = 'desktop';
 document.addEventListener('DOMContentLoaded', function() {
+    /* Custom scroll indicator (replaces hidden native scrollbar) */
+    var scrollThumb = document.createElement('div');
+    scrollThumb.className = 'clay-scrollbar';
+    var scrollTimer = null;
+    function initScrollbar() {
+        var oc = document.getElementById('output-container');
+        if (!oc) return;
+        oc.style.position = 'relative';
+        oc.appendChild(scrollThumb);
+        oc.addEventListener('scroll', function() {
+            var ratio = oc.scrollTop / (oc.scrollHeight - oc.clientHeight);
+            var thumbH = Math.max(20, (oc.clientHeight / oc.scrollHeight) * oc.clientHeight);
+            var thumbTop = ratio * (oc.clientHeight - thumbH);
+            scrollThumb.style.height = thumbH + 'px';
+            scrollThumb.style.top = (oc.scrollTop + thumbTop) + 'px';
+            scrollThumb.classList.add('visible');
+            if (scrollTimer) clearTimeout(scrollTimer);
+            scrollTimer = setTimeout(function() { scrollThumb.classList.remove('visible'); }, 1500);
+        });
+    }
+    setTimeout(initScrollbar, 100);
+
     /* Selection highlight overlays */
     var overlays = [];
     function clearOverlays() {
