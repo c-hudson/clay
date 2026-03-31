@@ -3988,8 +3988,10 @@
         elements.output.innerHTML = htmlParts.join('<br>');
     }
 
+    var _renderRafId = null;
     function renderOutput() {
-        elements.output.innerHTML = '';
+        // Cancel any pending render from a previous call
+        if (_renderRafId) { cancelAnimationFrame(_renderRafId); _renderRafId = null; }
 
         const world = worlds[currentWorldIndex];
 
@@ -4093,9 +4095,10 @@
 
         // Join with <br> tags for explicit line breaks
         var html = htmlParts.join('<br>');
-        // Use requestAnimationFrame to ensure WebKitGTK paints the new content
-        // Direct innerHTML assignment during rapid world switching can be lost
-        requestAnimationFrame(function() {
+        // Use requestAnimationFrame to ensure WebKitGTK paints the new content.
+        // Cancel previous pending render to avoid stale content.
+        _renderRafId = requestAnimationFrame(function() {
+            _renderRafId = null;
             elements.output.innerHTML = html;
             scrollToBottom();
         });
