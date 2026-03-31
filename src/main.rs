@@ -7161,6 +7161,7 @@ impl App {
                 });
             }
             WsMessage::CalculateNextWorld { current_index } => {
+                debug_log(true, &format!("WS: CalculateNextWorld from client {} current_index={}", client_id, current_index));
                 // Calculate next world using shared logic
                 let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
                     .map(|w| crate::util::WorldSwitchInfo {
@@ -7176,9 +7177,11 @@ impl App {
                     current_index,
                     self.settings.world_switch_mode,
                 );
+                debug_log(true, &format!("WS: Sending CalculatedWorld index={:?} to client {}", next_idx, client_id));
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
             }
             WsMessage::CalculatePrevWorld { current_index } => {
+                debug_log(true, &format!("WS: CalculatePrevWorld from client {} current_index={}", client_id, current_index));
                 // Calculate prev world using shared logic
                 let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
                     .map(|w| crate::util::WorldSwitchInfo {
@@ -13417,6 +13420,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.handle_ws_key_revoke(&key);
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
+                        // Log the message type (first 80 chars of debug format)
+                        let dbg = format!("{:?}", msg);
+                        debug_log(true, &format!("TUI WS MSG: client={} {}", client_id, &dbg[..dbg.len().min(80)]));
                         let op = app.handle_ws_client_msg(client_id, *msg, &event_tx);
                         match op {
                             WsAsyncAction::Connect { world_index, prev_index, broadcast } => {

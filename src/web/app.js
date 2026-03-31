@@ -2431,7 +2431,6 @@
 
             case 'CalculatedWorld':
                 // Server calculated next/prev world - switch to it
-                document.title = 'Clay [CALC idx=' + msg.index + ' cur=' + currentWorldIndex + ']';
                 if (msg.index !== null && msg.index !== undefined && msg.index !== currentWorldIndex) {
                     switchWorldLocal(msg.index);
                 }
@@ -3524,7 +3523,6 @@
     // Switch world locally (does not affect console)
     function switchWorldLocal(index) {
         if (lockedWorld) return; // Don't switch worlds in locked windows
-        document.title = 'Clay [switch ' + index + ' lines=' + (worlds[index] ? (worlds[index].output_lines||[]).length : '?') + ']';
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
             // Clear new line indicators on the world we're LEAVING (matches console behavior)
@@ -6655,7 +6653,6 @@
 
     // Request next world from server (uses shared world switching logic)
     function requestNextWorld() {
-        document.title = 'Clay [REQ next from=' + currentWorldIndex + ']';
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'CalculateNextWorld',
