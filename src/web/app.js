@@ -4092,12 +4092,13 @@
         }
 
         // Join with <br> tags for explicit line breaks
-        elements.output.innerHTML = htmlParts.join('<br>');
-
-        // Force WebView repaint — WebKitGTK sometimes doesn't repaint after innerHTML change
-        elements.outputContainer.style.display = 'none';
-        void elements.outputContainer.offsetHeight;
-        elements.outputContainer.style.display = '';
+        var html = htmlParts.join('<br>');
+        // Use requestAnimationFrame to ensure WebKitGTK paints the new content
+        // Direct innerHTML assignment during rapid world switching can be lost
+        requestAnimationFrame(function() {
+            elements.output.innerHTML = html;
+            scrollToBottom();
+        });
 
         // Debug: report rendered count
         send({ type: 'ReportSeqMismatch', world_index: currentWorldIndex,
@@ -4107,8 +4108,6 @@
 
         // Clear unseen for current world
         world.unseen_lines = 0;
-
-        scrollToBottom();
     }
 
     // Create cached HTML for a line
