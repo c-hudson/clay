@@ -3523,6 +3523,7 @@
     // Switch world locally (does not affect console)
     function switchWorldLocal(index) {
         if (lockedWorld) return; // Don't switch worlds in locked windows
+        document.title = 'Clay [switch ' + index + ' lines=' + (worlds[index] ? (worlds[index].output_lines||[]).length : '?') + ']';
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
             // Clear new line indicators on the world we're LEAVING (matches console behavior)
