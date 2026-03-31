@@ -5567,8 +5567,8 @@ impl App {
                 stored_key.clone()
             };
             crate::http::log_remote_event("WS-KEY", client_ip,
-                &format!("challenge={}, has_stored_key={}, client_key={}, expected_key={}",
-                    uses_challenge, has_key, key, expected));
+                &format!("challenge={}, stored_raw={}, client_sent={}, expected_after_challenge={}",
+                    uses_challenge, stored_key, key, expected));
 
             // If challenge_response, client sent SHA256(auth_key + challenge)
             // We compute SHA256(stored_key + challenge) and compare
