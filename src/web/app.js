@@ -3988,11 +3988,7 @@
         elements.output.innerHTML = htmlParts.join('<br>');
     }
 
-    var _renderRafId = null;
     function renderOutput() {
-        // Cancel any pending render from a previous call
-        if (_renderRafId) { cancelAnimationFrame(_renderRafId); _renderRafId = null; }
-
         const world = worlds[currentWorldIndex];
 
         // Debug: send render info to server so it appears in clay.debug.log
@@ -4094,14 +4090,8 @@
         }
 
         // Join with <br> tags for explicit line breaks
-        var html = htmlParts.join('<br>');
-        // Use requestAnimationFrame to ensure WebKitGTK paints the new content.
-        // Cancel previous pending render to avoid stale content.
-        _renderRafId = requestAnimationFrame(function() {
-            _renderRafId = null;
-            elements.output.innerHTML = html;
-            scrollToBottom();
-        });
+        elements.output.innerHTML = htmlParts.join('<br>');
+        scrollToBottom();
 
         // Debug: report rendered count
         send({ type: 'ReportSeqMismatch', world_index: currentWorldIndex,
