@@ -12727,9 +12727,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                     app.last_input_was_delete = false;
-                    continue;
-                }
-                if let Event::Key(key) = event {
+                    // Fall through to the draw at the end of the loop
+                } else if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press { continue; }
                     match handle_key_event(key, &mut app) {
                         KeyAction::Quit => return Ok(()),
