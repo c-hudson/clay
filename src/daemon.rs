@@ -1792,6 +1792,66 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
             }
         }
+        WsMessage::CalculateNextWorld { current_index } => {
+            let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
+                .map(|w| crate::util::WorldSwitchInfo {
+                    name: w.name.clone(),
+                    connected: w.connected,
+                    unseen_lines: w.unseen_lines,
+                    pending_lines: w.pending_lines.len(),
+                    first_unseen_at: w.first_unseen_at,
+                })
+                .collect();
+            let next_idx = crate::util::calculate_next_world(
+                &world_info, current_index, app.settings.world_switch_mode,
+            );
+            if let Some(ref ws) = app.ws_server {
+                ws.send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
+            }
+        }
+        WsMessage::CalculatePrevWorld { current_index } => {
+            let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
+                .map(|w| crate::util::WorldSwitchInfo {
+                    name: w.name.clone(),
+                    connected: w.connected,
+                    unseen_lines: w.unseen_lines,
+                    pending_lines: w.pending_lines.len(),
+                    first_unseen_at: w.first_unseen_at,
+                })
+                .collect();
+            let prev_idx = crate::util::calculate_prev_world(
+                &world_info, current_index, app.settings.world_switch_mode,
+            );
+            if let Some(ref ws) = app.ws_server {
+                ws.send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
+            }
+        }
+        WsMessage::CalculateOldestPending { current_index } => {
+            let mut oldest_idx: Option<usize> = None;
+            let mut oldest_time: Option<std::time::Instant> = None;
+            for (idx, world) in app.worlds.iter().enumerate() {
+                if idx != current_index && !world.pending_lines.is_empty() {
+                    if let Some(since) = world.pending_since {
+                        if oldest_time.is_none() || since < oldest_time.unwrap() {
+                            oldest_time = Some(since);
+                            oldest_idx = Some(idx);
+                        }
+                    }
+                }
+            }
+            // Fall back to any world with unseen lines
+            if oldest_idx.is_none() {
+                for (idx, world) in app.worlds.iter().enumerate() {
+                    if idx != current_index && world.unseen_lines > 0 {
+                        oldest_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+            if let Some(ref ws) = app.ws_server {
+                ws.send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
+            }
+        }
         _ => {}
     }
 }

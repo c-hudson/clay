@@ -3523,9 +3523,6 @@
     // Switch world locally (does not affect console)
     function switchWorldLocal(index) {
         if (lockedWorld) return; // Don't switch worlds in locked windows
-        // DEBUG: always show what switchWorldLocal is doing
-        var dbgWorld = worlds[index];
-        elements.output.innerHTML = '<div style="color:#0f0;padding:4px;font-size:10px">DEBUG switchWorldLocal: idx=' + index + ' cur=' + currentWorldIndex + ' name=' + (dbgWorld ? dbgWorld.name : 'null') + ' lines=' + (dbgWorld && dbgWorld.output_lines ? dbgWorld.output_lines.length : 'null') + '</div>' + elements.output.innerHTML;
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
             // Clear new line indicators on the world we're LEAVING (matches console behavior)
@@ -3998,13 +3995,14 @@
 
         // If no world selected (multiuser mode before connecting), show splash
         if (!world) {
-            elements.output.innerHTML = '<div style="color:#ff0;padding:8px">DEBUG: no world at index ' + currentWorldIndex + ' (worlds.length=' + worlds.length + ')</div>';
+            if (splashLines && splashLines.length > 0) {
+                renderSplashScreen();
+            }
             return;
         }
 
         // WebView mode: show image splash instead of text splash (only if no output yet)
         if (window.WEBVIEW_MODE && world.showing_splash && (!world.output_lines || world.output_lines.length === 0)) {
-            elements.output.innerHTML += '<div style="color:#ff0;padding:2px;font-size:10px">DEBUG: splash active, lines=' + (world.output_lines ? world.output_lines.length : 'null') + ' name=' + world.name + ' connected=' + world.connected + '</div>';
             // On Windows WebView2, custom protocol "clay://" is served as "http://clay.localhost/"
             const imgBase = window.location.origin || 'clay://localhost';
             elements.output.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:5px;">' +
@@ -4081,11 +4079,6 @@
 
         // Join with <br> tags for explicit line breaks
         elements.output.innerHTML = htmlParts.join('<br>');
-
-        // Debug: show diagnostic info for blank output
-        if (htmlParts.length === 0) {
-            elements.output.innerHTML = '<div style="color:#ff0;padding:8px">DEBUG: 0 rendered, lines=' + lines.length + ', world="' + (world.name || '?') + '" idx=' + currentWorldIndex + ', splash=' + world.showing_splash + ', connected=' + world.connected + ', filter=' + (filterPopupOpen && filterText.length > 0) + ', grep=' + !!grepRegex + '</div>';
-        }
 
         // Clear unseen for current world
         world.unseen_lines = 0;
