@@ -1635,6 +1635,11 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
             } else {
                 app.stop_world_media(idx);
             }
+            // Also toggle TTS mute
+            app.settings.tts_muted = !app.settings.tts_muted;
+            if app.settings.tts_muted {
+                crate::tts::stop(&app.tts_backend);
+            }
             app.needs_output_redraw = true;
             KeyAction::Redraw
         }

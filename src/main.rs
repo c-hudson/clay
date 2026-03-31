@@ -1238,6 +1238,8 @@ pub struct Settings {
     pub new_line_indicator: bool,
     /// Text-to-speech mode: Off, Local (espeak/say), or Edge (MS neural TTS)
     pub tts_mode: tts::TtsMode,
+    pub tts_speak_mode: tts::TtsSpeakMode,
+    pub tts_muted: bool,  // Runtime-only, toggled by F9
 }
 
 impl Default for Settings {
@@ -1280,6 +1282,8 @@ impl Default for Settings {
             zwj_enabled: false,
             new_line_indicator: false,
             tts_mode: tts::TtsMode::Off,
+            tts_speak_mode: tts::TtsSpeakMode::All,
+            tts_muted: false,
         }
     }
 }
@@ -2064,6 +2068,7 @@ pub struct World {
     pub mcmp_default_url: String,    // MCMP default URL from Client.Media.Default
     pub active_media: std::collections::HashMap<String, String>, // key -> Client.Media.Play JSON (for restart on world switch)
     pub gmcp_user_enabled: bool,     // True if user has enabled GMCP processing (F9 toggle)
+    pub tts_speaker_whitelist: std::collections::HashSet<String>, // Per-world TTS speaker whitelist
     pub connection_id: u64,          // Incremented on each connection, used to ignore stale disconnect events
     pub max_received_seq: u64,       // Highest seq received from server (remote console dedup)
     pub first_marked_new_index: Option<usize>, // Index of first marked_new line in output_lines (for fast clear)
@@ -2141,6 +2146,7 @@ impl World {
             mcmp_default_url: String::new(),
             active_media: std::collections::HashMap::new(),
             gmcp_user_enabled: false,
+            tts_speaker_whitelist: std::collections::HashSet::new(),
             connection_id: 0,
             max_received_seq: 0,
             first_marked_new_index: None,
@@ -2935,6 +2941,7 @@ impl App {
             zwj_enabled: self.settings.zwj_enabled,
             new_line_indicator: self.settings.new_line_indicator,
             tts_mode: self.settings.tts_mode.name().to_string(),
+            tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
@@ -2984,7 +2991,13 @@ impl App {
         self.settings.mouse_enabled = settings.mouse_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
         self.settings.new_line_indicator = settings.new_line_indicator;
+        let old_tts_mode = self.settings.tts_mode;
         self.settings.tts_mode = tts::TtsMode::from_name(&settings.tts_mode);
+        self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
+        // Auto-unmute when TTS is enabled
+        if old_tts_mode == tts::TtsMode::Off && self.settings.tts_mode != tts::TtsMode::Off {
+            self.settings.tts_muted = false;
+        }
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
             self.keybindings = keybindings::KeyBindings::from_json(&settings.keybindings_json);
@@ -3266,6 +3279,7 @@ impl App {
             self.settings.ansi_music_enabled,
             self.settings.new_line_indicator,
             self.settings.tts_mode.name(),
+            self.settings.tts_speak_mode.name(),
         );
         self.popup_manager.open(def);
 
@@ -5176,13 +5190,22 @@ impl App {
             // Broadcast activity count to keep all clients in sync
             self.broadcast_activity();
 
-            // Text-to-speech: speak non-gagged MUD output when TTS is enabled
-            if self.settings.tts_mode != tts::TtsMode::Off {
-                // Collect non-gagged line text for speaking
-                let speak_lines: Vec<&str> = non_gagged_lines.iter()
-                    .map(|(line, _)| *line)
-                    .collect();
-                let speak_text = speak_lines.join(" ");
+            // Text-to-speech: speak non-gagged MUD output when TTS is enabled and not muted
+            if self.settings.tts_mode != tts::TtsMode::Off && !self.settings.tts_muted {
+                // Filter lines based on speak mode
+                let lines_to_speak: Vec<&str> = if self.settings.tts_speak_mode == tts::TtsSpeakMode::Limit {
+                    non_gagged_lines.iter()
+                        .filter(|(line, _)| {
+                            tts::should_speak(line, &mut self.worlds[world_idx].tts_speaker_whitelist)
+                        })
+                        .map(|(line, _)| *line)
+                        .collect()
+                } else {
+                    non_gagged_lines.iter()
+                        .map(|(line, _)| *line)
+                        .collect()
+                };
+                let speak_text = lines_to_speak.join(" ");
                 let clean_text = strip_ansi_codes(&speak_text);
                 let clean_text = clean_text.trim();
                 if !clean_text.is_empty() {
@@ -7077,7 +7100,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -7126,6 +7149,7 @@ impl App {
                 self.settings.zwj_enabled = zwj_enabled;
                 self.settings.new_line_indicator = new_line_indicator;
                 self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
+                self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
                     self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
@@ -8603,6 +8627,7 @@ pub(crate) struct SetupSettings {
     pub(crate) ansi_music: bool,
     pub(crate) new_line_indicator: bool,
     pub(crate) tts_mode: String,
+    pub(crate) tts_speak_mode: String,
 }
 
 /// Settings from the web popup
@@ -8738,7 +8763,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
-        SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS,
+        SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -8985,6 +9010,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
                     new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
                     tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
+                    tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
                 }
             };
 

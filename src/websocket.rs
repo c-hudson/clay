@@ -247,6 +247,8 @@ pub enum WsMessage {
         new_line_indicator: bool,
         #[serde(default)]
         tts_mode: String,
+        #[serde(default)]
+        tts_speak_mode: String,
     },
 
     // Settings update confirmations (server -> client)
@@ -502,6 +504,8 @@ pub struct GlobalSettingsMsg {
     pub new_line_indicator: bool,
     #[serde(default)]
     pub tts_mode: String,
+    #[serde(default)]
+    pub tts_speak_mode: String,
     /// Theme colors from ~/.clay.theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,

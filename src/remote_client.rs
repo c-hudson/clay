@@ -1194,6 +1194,7 @@ pub(crate) fn handle_remote_client_key(
                     zwj_enabled: app.settings.zwj_enabled,
                     new_line_indicator: app.settings.new_line_indicator,
                     tts_mode: app.settings.tts_mode.name().to_string(),
+                    tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -1926,6 +1927,7 @@ pub(crate) fn apply_remote_web_settings(
         zwj_enabled: app.settings.zwj_enabled,
         new_line_indicator: app.settings.new_line_indicator,
         tts_mode: app.settings.tts_mode.name().to_string(),
+        tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {

@@ -24,6 +24,7 @@ pub const SETUP_FIELD_ZWJ: FieldId = FieldId(13);
 pub const SETUP_FIELD_ANSI_MUSIC: FieldId = FieldId(14);
 pub const SETUP_FIELD_NEW_LINE_INDICATOR: FieldId = FieldId(17);
 pub const SETUP_FIELD_TTS: FieldId = FieldId(18);
+pub const SETUP_FIELD_TTS_SPEAK_MODE: FieldId = FieldId(19);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -62,6 +63,14 @@ pub fn tts_mode_options() -> Vec<SelectOption> {
     ]
 }
 
+/// TTS speak mode options (which lines to speak)
+pub fn tts_speak_mode_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption::new("all", "All"),
+        SelectOption::new("limit", "Limit"),
+    ]
+}
+
 /// Create the setup popup definition with current values
 #[allow(clippy::too_many_arguments)]
 pub fn create_setup_popup(
@@ -80,6 +89,7 @@ pub fn create_setup_popup(
     ansi_music: bool,
     new_line_indicator: bool,
     tts_mode: &str,
+    tts_speak_mode: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -89,6 +99,7 @@ pub fn create_setup_popup(
         "edge" => 2,
         _ => 0,  // "off"
     };
+    let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
 
     PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -165,6 +176,11 @@ pub fn create_setup_popup(
             SETUP_FIELD_TTS,
             "TTS",
             FieldKind::select(tts_mode_options(), tts_mode_idx),
+        ))
+        .with_field(Field::new(
+            SETUP_FIELD_TTS_SPEAK_MODE,
+            "Speak Mode",
+            FieldKind::select(tts_speak_mode_options(), tts_speak_mode_idx),
         ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))

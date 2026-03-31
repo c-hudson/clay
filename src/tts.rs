@@ -37,6 +37,62 @@ impl TtsMode {
     }
 }
 
+/// TTS speak mode — controls which lines are spoken
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum TtsSpeakMode {
+    #[default]
+    All,    // Speak all non-gagged output
+    Limit,  // Only speak lines matching say patterns or whitelisted speakers
+}
+
+impl TtsSpeakMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TtsSpeakMode::All => "all",
+            TtsSpeakMode::Limit => "limit",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "limit" => TtsSpeakMode::Limit,
+            _ => TtsSpeakMode::All,
+        }
+    }
+}
+
+/// Check if a line should be spoken in Limit mode.
+/// Detects "X says, ..." patterns and builds a whitelist of speaker names.
+/// Lines starting with a whitelisted name are also spoken.
+pub fn should_speak(text: &str, whitelist: &mut std::collections::HashSet<String>) -> bool {
+    use std::sync::OnceLock;
+    static SAY_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+    let re = SAY_REGEX.get_or_init(|| {
+        regex::Regex::new(r#"(?i)^(\S+) says?,? [""\u{201c}\u{201d}']"#).unwrap()
+    });
+
+    let stripped = crate::util::strip_ansi_codes(text);
+    let stripped = crate::util::strip_mud_tag(&stripped);
+    let trimmed = stripped.trim();
+
+    // Check if line matches "X says, ..." pattern
+    if let Some(caps) = re.captures(trimmed) {
+        if let Some(name) = caps.get(1) {
+            whitelist.insert(name.as_str().to_string());
+        }
+        return true;
+    }
+
+    // Check if line starts with any whitelisted name
+    for name in whitelist.iter() {
+        if trimmed.starts_with(name.as_str()) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// TTS backend holding the detected local command and Edge TTS state.
 pub struct TtsBackend {
     /// The local TTS command to use (e.g. "espeak", "espeak-ng", "say")

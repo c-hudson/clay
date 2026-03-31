@@ -204,6 +204,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
+    writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -667,6 +668,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     }
                     "tts_mode" => {
                         app.settings.tts_mode = crate::tts::TtsMode::from_name(value);
+                    }
+                    "tts_speak_mode" => {
+                        app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(value);
                     }
                     "tts_enabled" => {
                         // Legacy: convert bool to TtsMode
@@ -1196,6 +1200,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
+    writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -1826,6 +1831,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     }
                     "tts_mode" => {
                         app.settings.tts_mode = crate::tts::TtsMode::from_name(value);
+                    }
+                    "tts_speak_mode" => {
+                        app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(value);
                     }
                     "tts_enabled" => {
                         // Legacy: convert bool to TtsMode
