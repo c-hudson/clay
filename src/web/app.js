@@ -216,6 +216,17 @@
         fontWeightMinus: document.getElementById('font-weight-minus'),
         fontWeightPlus: document.getElementById('font-weight-plus'),
         fontWeightValue: document.getElementById('font-weight-value'),
+        fontAdvancedToggle: document.getElementById('font-advanced-toggle'),
+        fontAdvancedSection: document.getElementById('font-advanced-section'),
+        fontLineheightMinus: document.getElementById('font-lineheight-minus'),
+        fontLineheightPlus: document.getElementById('font-lineheight-plus'),
+        fontLineheightValue: document.getElementById('font-lineheight-value'),
+        fontLetterspacingMinus: document.getElementById('font-letterspacing-minus'),
+        fontLetterspacingPlus: document.getElementById('font-letterspacing-plus'),
+        fontLetterspacingValue: document.getElementById('font-letterspacing-value'),
+        fontWordspacingMinus: document.getElementById('font-wordspacing-minus'),
+        fontWordspacingPlus: document.getElementById('font-wordspacing-plus'),
+        fontWordspacingValue: document.getElementById('font-wordspacing-value'),
         // Popup help modal (shared)
         popupHelpModal: document.getElementById('popup-help-modal'),
         popupHelpContent: document.getElementById('popup-help-content'),
@@ -398,6 +409,12 @@
     let fontEditSizeDesktop = 18;
     let webFontWeight = 400;
     let fontEditWeight = 400;
+    let webFontLineHeight = 1.2;
+    let webFontLetterSpacing = 0;
+    let webFontWordSpacing = 0;
+    let fontEditLineHeight = 1.2;
+    let fontEditLetterSpacing = 0;
+    let fontEditWordSpacing = 0;
 
     // Font families (matching remote GUI FONT_FAMILIES)
     const FONT_FAMILIES = [
@@ -540,6 +557,17 @@
 
     function applyFontWeight(w) {
         document.body.style.fontWeight = w;
+    }
+
+    function applyAdvancedFontSettings() {
+        var output = elements.output;
+        var input = elements.input;
+        output.style.lineHeight = webFontLineHeight;
+        input.style.lineHeight = webFontLineHeight;
+        output.style.letterSpacing = webFontLetterSpacing ? webFontLetterSpacing + 'px' : '';
+        input.style.letterSpacing = webFontLetterSpacing ? webFontLetterSpacing + 'px' : '';
+        output.style.wordSpacing = webFontWordSpacing ? webFontWordSpacing + 'px' : '';
+        input.style.wordSpacing = webFontWordSpacing ? webFontWordSpacing + 'px' : '';
     }
 
     // ============================================================================
@@ -1857,6 +1885,10 @@
                         webFontWeight = msg.settings.web_font_weight;
                         applyFontWeight(webFontWeight);
                     }
+                    if (msg.settings.web_font_line_height !== undefined) webFontLineHeight = msg.settings.web_font_line_height;
+                    if (msg.settings.web_font_letter_spacing !== undefined) webFontLetterSpacing = msg.settings.web_font_letter_spacing;
+                    if (msg.settings.web_font_word_spacing !== undefined) webFontWordSpacing = msg.settings.web_font_word_spacing;
+                    applyAdvancedFontSettings();
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
@@ -2359,6 +2391,10 @@
                         webFontWeight = msg.settings.web_font_weight;
                         applyFontWeight(webFontWeight);
                     }
+                    if (msg.settings.web_font_line_height !== undefined) webFontLineHeight = msg.settings.web_font_line_height;
+                    if (msg.settings.web_font_letter_spacing !== undefined) webFontLetterSpacing = msg.settings.web_font_letter_spacing;
+                    if (msg.settings.web_font_word_spacing !== undefined) webFontWordSpacing = msg.settings.web_font_word_spacing;
+                    applyAdvancedFontSettings();
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
@@ -5628,6 +5664,13 @@
         fontEditSizeTablet = Math.round(webFontSizeTablet);
         fontEditSizeDesktop = Math.round(webFontSizeDesktop);
         fontEditWeight = webFontWeight;
+        fontEditLineHeight = webFontLineHeight;
+        fontEditLetterSpacing = webFontLetterSpacing;
+        fontEditWordSpacing = webFontWordSpacing;
+        // Set advanced checkbox based on whether any advanced setting is non-default
+        if (elements.fontAdvancedToggle) {
+            elements.fontAdvancedToggle.checked = (webFontLineHeight !== 1.2 || webFontLetterSpacing !== 0 || webFontWordSpacing !== 0);
+        }
         // Show modal
         elements.settingsModal.className = 'modal visible';
         elements.settingsModal.style.display = 'flex';
@@ -5719,6 +5762,9 @@
             web_font_size_tablet: webFontSizeTablet,
             web_font_size_desktop: webFontSizeDesktop,
             web_font_weight: webFontWeight,
+            web_font_line_height: webFontLineHeight,
+            web_font_letter_spacing: webFontLetterSpacing,
+            web_font_word_spacing: webFontWordSpacing,
             ws_allow_list: wsAllowList,
             web_secure: webSecure,
             http_enabled: httpEnabled,
@@ -5857,6 +5903,16 @@
         elements.fontTabletValue.textContent = fontEditSizeTablet;
         elements.fontDesktopValue.textContent = fontEditSizeDesktop;
         elements.fontWeightValue.textContent = fontEditWeight;
+        if (elements.fontLineheightValue) elements.fontLineheightValue.textContent = fontEditLineHeight.toFixed(1);
+        if (elements.fontLetterspacingValue) elements.fontLetterspacingValue.textContent = fontEditLetterSpacing.toFixed(1);
+        if (elements.fontWordspacingValue) elements.fontWordspacingValue.textContent = fontEditWordSpacing.toFixed(1);
+        // Grey out advanced section based on checkbox
+        var adv = elements.fontAdvancedSection;
+        var chk = elements.fontAdvancedToggle;
+        if (adv && chk) {
+            adv.style.opacity = chk.checked ? '1' : '0.35';
+            adv.style.pointerEvents = chk.checked ? '' : 'none';
+        }
     }
 
     // saveFontSettings removed — merged into saveSettingsAll
@@ -5867,7 +5923,11 @@
         webFontSizeTablet = fontEditSizeTablet;
         webFontSizeDesktop = fontEditSizeDesktop;
         webFontWeight = fontEditWeight;
+        webFontLineHeight = fontEditLineHeight;
+        webFontLetterSpacing = fontEditLetterSpacing;
+        webFontWordSpacing = fontEditWordSpacing;
         applyFontWeight(webFontWeight);
+        applyAdvancedFontSettings();
         var fontPx = deviceType === 'phone' ? webFontSizePhone :
                      deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
         setFontSize(clampFontSize(fontPx), false);
@@ -8316,6 +8376,49 @@
             fontEditSizeDesktop = Math.min(20, fontEditSizeDesktop + 1);
             updateFontPopupUI();
         };
+
+        // Advanced font settings toggle
+        if (elements.fontAdvancedToggle) {
+            elements.fontAdvancedToggle.onchange = function() {
+                updateFontPopupUI();
+            };
+        }
+        if (elements.fontLineheightMinus) {
+            elements.fontLineheightMinus.onclick = function() {
+                fontEditLineHeight = Math.max(0.5, Math.round((fontEditLineHeight - 0.1) * 10) / 10);
+                updateFontPopupUI();
+            };
+        }
+        if (elements.fontLineheightPlus) {
+            elements.fontLineheightPlus.onclick = function() {
+                fontEditLineHeight = Math.min(3.0, Math.round((fontEditLineHeight + 0.1) * 10) / 10);
+                updateFontPopupUI();
+            };
+        }
+        if (elements.fontLetterspacingMinus) {
+            elements.fontLetterspacingMinus.onclick = function() {
+                fontEditLetterSpacing = Math.max(-5, Math.round((fontEditLetterSpacing - 0.5) * 10) / 10);
+                updateFontPopupUI();
+            };
+        }
+        if (elements.fontLetterspacingPlus) {
+            elements.fontLetterspacingPlus.onclick = function() {
+                fontEditLetterSpacing = Math.min(10, Math.round((fontEditLetterSpacing + 0.5) * 10) / 10);
+                updateFontPopupUI();
+            };
+        }
+        if (elements.fontWordspacingMinus) {
+            elements.fontWordspacingMinus.onclick = function() {
+                fontEditWordSpacing = Math.max(-5, Math.round((fontEditWordSpacing - 0.5) * 10) / 10);
+                updateFontPopupUI();
+            };
+        }
+        if (elements.fontWordspacingPlus) {
+            elements.fontWordspacingPlus.onclick = function() {
+                fontEditWordSpacing = Math.min(20, Math.round((fontEditWordSpacing + 0.5) * 10) / 10);
+                updateFontPopupUI();
+            };
+        }
 
         // Popup help buttons
         elements.popupHelpCloseBtn.onclick = closePopupHelp;

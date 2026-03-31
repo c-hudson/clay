@@ -220,6 +220,12 @@ pub enum WsMessage {
         web_font_size_desktop: f32,
         #[serde(default = "default_web_font_weight")]
         web_font_weight: u16,
+        #[serde(default = "default_web_font_line_height")]
+        web_font_line_height: f32,
+        #[serde(default)]
+        web_font_letter_spacing: f32,
+        #[serde(default)]
+        web_font_word_spacing: f32,
         ws_allow_list: String,
         web_secure: bool,
         http_enabled: bool,
@@ -466,6 +472,12 @@ pub struct GlobalSettingsMsg {
     pub web_font_size_desktop: f32,
     #[serde(default = "default_web_font_weight")]
     pub web_font_weight: u16,
+    #[serde(default = "default_web_font_line_height")]
+    pub web_font_line_height: f32,
+    #[serde(default)]
+    pub web_font_letter_spacing: f32,
+    #[serde(default)]
+    pub web_font_word_spacing: f32,
     pub ws_allow_list: String,
     pub web_secure: bool,
     pub http_enabled: bool,
@@ -519,6 +531,10 @@ fn default_web_font_size_desktop() -> f32 {
 
 fn default_web_font_weight() -> u16 {
     400
+}
+
+fn default_web_font_line_height() -> f32 {
+    1.2
 }
 
 /// Type of remote client connected via WebSocket

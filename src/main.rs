@@ -1208,6 +1208,9 @@ pub struct Settings {
     web_font_size_tablet: f32,
     web_font_size_desktop: f32,
     web_font_weight: u16,
+    web_font_line_height: f32,     // Line height multiplier (default 1.2)
+    web_font_letter_spacing: f32,  // Letter spacing in px (default 0)
+    web_font_word_spacing: f32,    // Word spacing in px (default 0)
     // Web server settings (consolidated)
     web_secure: bool,              // Protocol: true=Secure (https/wss), false=Non-Secure (http/ws)
     http_enabled: bool,            // Enable HTTP/HTTPS web server (name depends on web_secure)
@@ -1257,6 +1260,9 @@ impl Default for Settings {
             web_font_size_tablet: 14.0,  // Default for tablets
             web_font_size_desktop: 18.0, // Default for desktop
             web_font_weight: 400,      // Default font weight (normal)
+            web_font_line_height: 1.2,
+            web_font_letter_spacing: 0.0,
+            web_font_word_spacing: 0.0,
             web_secure: false,         // Default to non-secure
             http_enabled: false,
             http_port: 9000,
@@ -2911,6 +2917,9 @@ impl App {
             web_font_size_tablet: self.settings.web_font_size_tablet,
             web_font_size_desktop: self.settings.web_font_size_desktop,
             web_font_weight: self.settings.web_font_weight,
+            web_font_line_height: self.settings.web_font_line_height,
+            web_font_letter_spacing: self.settings.web_font_letter_spacing,
+            web_font_word_spacing: self.settings.web_font_word_spacing,
             ws_allow_list: self.settings.websocket_allow_list.clone(),
             web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
@@ -2955,6 +2964,9 @@ impl App {
         self.settings.web_font_size_tablet = settings.web_font_size_tablet;
         self.settings.web_font_size_desktop = settings.web_font_size_desktop;
         self.settings.web_font_weight = settings.web_font_weight;
+        self.settings.web_font_line_height = settings.web_font_line_height;
+        self.settings.web_font_letter_spacing = settings.web_font_letter_spacing;
+        self.settings.web_font_word_spacing = settings.web_font_word_spacing;
         self.settings.websocket_allow_list = settings.ws_allow_list.clone();
         self.settings.web_secure = settings.web_secure;
         self.settings.http_enabled = settings.http_enabled;
@@ -7064,7 +7076,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -7087,7 +7099,10 @@ impl App {
                 self.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
                 self.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
                 self.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
-                self.settings.web_font_weight = web_font_weight.clamp(100, 900);
+                self.settings.web_font_weight = web_font_weight.clamp(1, 900);
+                self.settings.web_font_line_height = web_font_line_height.clamp(0.5, 3.0);
+                self.settings.web_font_letter_spacing = web_font_letter_spacing.clamp(-5.0, 10.0);
+                self.settings.web_font_word_spacing = web_font_word_spacing.clamp(-5.0, 20.0);
                 self.settings.websocket_allow_list = ws_allow_list.clone();
                 // Update the running WebSocket server's allow list
                 if let Some(ref server) = self.ws_server {

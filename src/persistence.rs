@@ -173,6 +173,9 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "web_font_size_tablet={}", app.settings.web_font_size_tablet)?;
     writeln!(file, "web_font_size_desktop={}", app.settings.web_font_size_desktop)?;
     writeln!(file, "web_font_weight={}", app.settings.web_font_weight)?;
+    writeln!(file, "web_font_line_height={}", app.settings.web_font_line_height)?;
+    writeln!(file, "web_font_letter_spacing={}", app.settings.web_font_letter_spacing)?;
+    writeln!(file, "web_font_word_spacing={}", app.settings.web_font_word_spacing)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -542,7 +545,22 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     }
                     "web_font_weight" => {
                         if let Ok(w) = value.parse::<u16>() {
-                            app.settings.web_font_weight = w.clamp(100, 900);
+                            app.settings.web_font_weight = w.clamp(1, 900);
+                        }
+                    }
+                    "web_font_line_height" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            app.settings.web_font_line_height = v.clamp(0.5, 3.0);
+                        }
+                    }
+                    "web_font_letter_spacing" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            app.settings.web_font_letter_spacing = v.clamp(-5.0, 10.0);
+                        }
+                    }
+                    "web_font_word_spacing" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            app.settings.web_font_word_spacing = v.clamp(-5.0, 20.0);
                         }
                     }
                     "gui_transparency" => {
@@ -1147,6 +1165,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "web_font_size_tablet={}", app.settings.web_font_size_tablet)?;
     writeln!(file, "web_font_size_desktop={}", app.settings.web_font_size_desktop)?;
     writeln!(file, "web_font_weight={}", app.settings.web_font_weight)?;
+    writeln!(file, "web_font_line_height={}", app.settings.web_font_line_height)?;
+    writeln!(file, "web_font_letter_spacing={}", app.settings.web_font_letter_spacing)?;
+    writeln!(file, "web_font_word_spacing={}", app.settings.web_font_word_spacing)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -1703,7 +1724,22 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     }
                     "web_font_weight" => {
                         if let Ok(w) = value.parse::<u16>() {
-                            app.settings.web_font_weight = w.clamp(100, 900);
+                            app.settings.web_font_weight = w.clamp(1, 900);
+                        }
+                    }
+                    "web_font_line_height" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            app.settings.web_font_line_height = v.clamp(0.5, 3.0);
+                        }
+                    }
+                    "web_font_letter_spacing" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            app.settings.web_font_letter_spacing = v.clamp(-5.0, 10.0);
+                        }
+                    }
+                    "web_font_word_spacing" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            app.settings.web_font_word_spacing = v.clamp(-5.0, 20.0);
                         }
                     }
                     "gui_transparency" => {
