@@ -4080,6 +4080,11 @@
         // Join with <br> tags for explicit line breaks
         elements.output.innerHTML = htmlParts.join('<br>');
 
+        // Debug: if no visible lines rendered but world has data, show diagnostic
+        if (htmlParts.length === 0 && lines.length > 0) {
+            elements.output.innerHTML = '<div style="color:#ff0;padding:8px">DEBUG: ' + lines.length + ' lines in buffer but 0 rendered for world "' + (world.name || '?') + '" (idx=' + currentWorldIndex + ', splash=' + world.showing_splash + ', connected=' + world.connected + ')</div>';
+        }
+
         // Clear unseen for current world
         world.unseen_lines = 0;
 
