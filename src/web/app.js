@@ -4089,6 +4089,12 @@
         // Join with <br> tags for explicit line breaks
         elements.output.innerHTML = htmlParts.join('<br>');
 
+        // Debug: report rendered count
+        send({ type: 'ReportSeqMismatch', world_index: currentWorldIndex,
+            expected_seq_gt: 0, actual_seq: 0,
+            line_text: 'RENDER_DONE: idx=' + currentWorldIndex + ' htmlParts=' + htmlParts.length + ' innerHTML_len=' + elements.output.innerHTML.length,
+            source: 'render_debug' });
+
         // Clear unseen for current world
         world.unseen_lines = 0;
 
