@@ -12534,7 +12534,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
             }
         }
-    } else {
     }
 
     // Keepalive: send NOP every 5 minutes if telnet mode and idle
