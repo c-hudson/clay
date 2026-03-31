@@ -5191,7 +5191,10 @@ impl App {
             self.broadcast_activity();
 
             // Text-to-speech: speak non-gagged MUD output when TTS is enabled and not muted
-            if self.settings.tts_mode != tts::TtsMode::Off && !self.settings.tts_muted {
+            // Only speak output from the currently visible world
+            if self.settings.tts_mode != tts::TtsMode::Off && !self.settings.tts_muted
+                && (world_idx == self.current_world_index || self.ws_client_viewing(world_idx))
+            {
                 // Filter lines based on speak mode
                 let lines_to_speak: Vec<&str> = if self.settings.tts_speak_mode == tts::TtsSpeakMode::Limit {
                     non_gagged_lines.iter()
@@ -5205,11 +5208,17 @@ impl App {
                         .map(|(line, _)| *line)
                         .collect()
                 };
-                let speak_text = lines_to_speak.join(" ");
-                let clean_text = strip_ansi_codes(&speak_text);
-                let clean_text = clean_text.trim();
+                // Strip ANSI codes and MUD tags — only speak what's displayed on screen
+                let speak_text = lines_to_speak.iter()
+                    .map(|line| {
+                        let stripped = strip_ansi_codes(line);
+                        crate::util::strip_mud_tag(&stripped)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let clean_text = speak_text.trim();
                 if !clean_text.is_empty() {
-                    // Console: speak via local TTS subprocess
+                    // Console: speak via local TTS subprocess (queued — waits for previous to finish)
                     tts::speak(&self.tts_backend, clean_text, self.settings.tts_mode);
                     // Web/GUI: broadcast ServerSpeak to WebSocket clients
                     self.ws_broadcast(WsMessage::ServerSpeak {

@@ -101,6 +101,8 @@ pub struct TtsBackend {
     current_process: Arc<Mutex<Option<std::process::Child>>>,
     /// Tokio handle for spawning Edge TTS async tasks
     tokio_handle: Option<tokio::runtime::Handle>,
+    /// Queue for Edge TTS — ensures utterances play one at a time
+    edge_queue_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 // Safety: TtsBackend is only accessed from the App's owning task/thread.
@@ -109,10 +111,27 @@ unsafe impl Send for TtsBackend {}
 /// Initialize the TTS backend.
 pub fn init_tts() -> TtsBackend {
     let tokio_handle = tokio::runtime::Handle::try_current().ok();
+
+    // Spawn Edge TTS queue processor — plays utterances one at a time
+    let edge_queue_tx = if let Some(ref handle) = tokio_handle {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        handle.spawn(async move {
+            while let Some(text) = rx.recv().await {
+                if let Err(e) = edge_tts_speak(&text).await {
+                    crate::debug_log(true, &format!("Edge TTS error: {}", e));
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     TtsBackend {
         local_command: detect_tts_command(),
         current_process: Arc::new(Mutex::new(None)),
         tokio_handle,
+        edge_queue_tx,
     }
 }
 
@@ -225,18 +244,11 @@ fn speak_local(backend: &TtsBackend, text: &str) {
 }
 
 /// Speak using Microsoft Edge neural TTS via WebSocket.
+/// Queued — utterances play one at a time, never overlapping.
 fn speak_edge(backend: &TtsBackend, text: &str) {
-    let handle = match &backend.tokio_handle {
-        Some(h) => h.clone(),
-        None => return,
-    };
-
-    let text = text.to_string();
-    handle.spawn(async move {
-        if let Err(e) = edge_tts_speak(&text).await {
-            crate::debug_log(true, &format!("Edge TTS error: {}", e));
-        }
-    });
+    if let Some(ref tx) = backend.edge_queue_tx {
+        let _ = tx.send(text.to_string());
+    }
 }
 
 /// Generate the Sec-MS-GEC DRM token required by Edge TTS API.
