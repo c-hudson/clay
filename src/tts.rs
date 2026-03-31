@@ -340,10 +340,18 @@ async fn play_mp3_bytes_async(data: Vec<u8>) {
         if let Ok(mut f) = std::fs::File::create(&tmp_path) {
             let _ = f.write_all(&data);
             drop(f);
-            // Try mpv, ffplay, or play as external player
-            for player in &["mpv", "ffplay", "play"] {
+            // Try external players with appropriate flags for each
+            let tmp = tmp_path.to_str().unwrap_or("");
+            let players: &[(&str, &[&str])] = &[
+                ("mpv", &["--no-video", "--really-quiet", tmp]),
+                ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", tmp]),
+                ("play", &["-q", tmp]),
+                ("aplay", &[tmp]),  // ALSA player (wav only, but worth trying)
+                ("paplay", &[tmp]), // PulseAudio player
+            ];
+            for (player, args) in players {
                 if Command::new(player)
-                    .args(["--no-video", "--really-quiet", tmp_path.to_str().unwrap_or("")])
+                    .args(*args)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
