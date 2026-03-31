@@ -4024,9 +4024,14 @@
 
         const lines = world.output_lines || [];
 
-        // Build all lines as HTML with explicit <br> line breaks
+        // Limit initial render to last 500 lines to avoid overwhelming WebKitGTK
+        // Full scrollback is available via PageUp which triggers a re-render
+        const maxRenderLines = 500;
+        const startIdx = Math.max(0, lines.length - maxRenderLines);
+
+        // Build lines as HTML with explicit <br> line breaks
         const htmlParts = [];
-        for (let i = 0; i < lines.length; i++) {
+        for (let i = startIdx; i < lines.length; i++) {
             const lineObj = lines[i];
             if (lineObj === undefined || lineObj === null) continue;
 
