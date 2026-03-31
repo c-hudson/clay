@@ -178,7 +178,7 @@ fn speak_edge(backend: &TtsBackend, text: &str) {
     let text = text.to_string();
     handle.spawn(async move {
         if let Err(e) = edge_tts_speak(&text).await {
-            crate::debug_log(crate::is_debug_enabled(), &format!("Edge TTS error: {}", e));
+            crate::debug_log(true, &format!("Edge TTS error: {}", e));
         }
     });
 }
