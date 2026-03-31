@@ -4089,6 +4089,11 @@
         // Join with <br> tags for explicit line breaks
         elements.output.innerHTML = htmlParts.join('<br>');
 
+        // Force WebView repaint — WebKitGTK sometimes doesn't repaint after innerHTML change
+        elements.outputContainer.style.display = 'none';
+        void elements.outputContainer.offsetHeight;
+        elements.outputContainer.style.display = '';
+
         // Debug: report rendered count
         send({ type: 'ReportSeqMismatch', world_index: currentWorldIndex,
             expected_seq_gt: 0, actual_seq: 0,
