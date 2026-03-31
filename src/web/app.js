@@ -3531,6 +3531,11 @@
                 oldWorld.output_lines.forEach(l => { l.marked_new = false; });
             }
             currentWorldIndex = index;
+            // Clear splash on world switch — if the world has output, show it
+            const newWorld = worlds[index];
+            if (newWorld && newWorld.showing_splash && newWorld.output_lines && newWorld.output_lines.length > 0) {
+                newWorld.showing_splash = false;
+            }
             // Reset more-mode state for new world
             paused = false;
             pendingLines = [];
@@ -3996,8 +4001,8 @@
             return;
         }
 
-        // WebView mode: show image splash instead of text splash
-        if (window.WEBVIEW_MODE && world.showing_splash) {
+        // WebView mode: show image splash instead of text splash (only if no output yet)
+        if (window.WEBVIEW_MODE && world.showing_splash && (!world.output_lines || world.output_lines.length === 0)) {
             // On Windows WebView2, custom protocol "clay://" is served as "http://clay.localhost/"
             const imgBase = window.location.origin || 'clay://localhost';
             elements.output.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:5px;">' +
