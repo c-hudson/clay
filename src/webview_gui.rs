@@ -506,6 +506,7 @@ fn build_html(params: &WebViewParams) -> String {
 #input-container { padding: 2px 4px; }
 #output { -webkit-user-select: text; user-select: text; }
 #output * { -webkit-user-select: text; user-select: text; }
+* { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.25) transparent; }
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.25); border-radius: 3px; }
