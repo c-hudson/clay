@@ -142,16 +142,31 @@ pub fn run_master_webgui() -> io::Result<()> {
             ));
         }
 
-        // Force GTK dark theme variant for WebKitGTK widgets (scrollbars, etc.)
-        // WebKitGTK uses native GTK widgets that ignore CSS scrollbar styling.
-        // Setting prefer-dark-theme works across all GTK themes (Adwaita, XFCE, etc.)
+        // Force dark scrollbars in WebKitGTK by injecting GTK CSS.
+        // WebKitGTK uses native GTK widgets that ignore web CSS scrollbar styling.
         #[cfg(feature = "webview-gui")]
         {
-            // gtk::init is idempotent — safe to call multiple times
             let _ = gtk::init();
+            // Set prefer-dark-theme
             if let Some(settings) = gtk::Settings::default() {
-                use gtk::prelude::{SettingsExt, ObjectExt};
+                use gtk::prelude::ObjectExt;
                 settings.set_property("gtk-application-prefer-dark-theme", true);
+            }
+            // Override scrollbar colors directly via GTK CSS
+            use gtk::prelude::CssProviderExt;
+            let css_provider = gtk::CssProvider::new();
+            css_provider.load_from_data(
+                b"scrollbar { background: transparent; } \
+                  scrollbar slider { background: alpha(white, 0.25); min-width: 6px; min-height: 6px; border-radius: 3px; } \
+                  scrollbar slider:hover { background: alpha(white, 0.4); } \
+                  scrollbar trough { background: transparent; }"
+            ).ok();
+            if let Some(screen) = gdk::Screen::default() {
+                gtk::StyleContext::add_provider_for_screen(
+                    &screen,
+                    &css_provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 100,
+                );
             }
         }
     }
