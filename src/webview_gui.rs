@@ -141,6 +141,12 @@ pub fn run_master_webgui() -> io::Result<()> {
                 "No display server found. Set DISPLAY (X11) or WAYLAND_DISPLAY environment variable."
             ));
         }
+
+        // Force GTK dark theme for WebKitGTK widgets (scrollbars, etc.)
+        // WebKitGTK uses native GTK widgets that ignore CSS scrollbar styling.
+        if std::env::var("GTK_THEME").is_err() {
+            std::env::set_var("GTK_THEME", "Adwaita:dark");
+        }
     }
 
     // Read the configured HTTP port from settings (default 9000)
