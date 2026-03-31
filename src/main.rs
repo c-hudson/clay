@@ -5559,16 +5559,8 @@ impl App {
         if let WsMessage::AuthRequest { auth_key: Some(key), current_world, challenge_response: uses_challenge, .. } = msg {
             let has_key = self.settings.websocket_auth_key.is_some();
 
-            let stored_key = self.settings.websocket_auth_key.as_ref()
-                .map(|ak| ak.key.clone()).unwrap_or_default();
-            let expected = if uses_challenge && has_key {
-                hash_with_challenge(&stored_key, challenge)
-            } else {
-                stored_key.clone()
-            };
             crate::http::log_remote_event("WS-KEY", client_ip,
-                &format!("challenge={}, stored_raw={}, client_sent={}, expected_after_challenge={}",
-                    uses_challenge, stored_key, key, expected));
+                &format!("challenge={}, has_stored_key={}", uses_challenge, has_key));
 
             // If challenge_response, client sent SHA256(auth_key + challenge)
             // We compute SHA256(stored_key + challenge) and compare
@@ -5603,8 +5595,7 @@ impl App {
                     dimensions: None,
                 });
             } else {
-                crate::http::log_remote_event("WS-KEY-REJECT", client_ip,
-                    &format!("client={} expected={}", key, expected));
+                crate::http::log_remote_event("WS-KEY-REJECT", client_ip, "no matching key");
                 self.ban_list.record_violation(client_ip, "WebSocket: failed auth key");
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: false,
@@ -7161,7 +7152,6 @@ impl App {
                 });
             }
             WsMessage::CalculateNextWorld { current_index } => {
-                debug_log(true, &format!("WS: CalculateNextWorld from client {} current_index={}", client_id, current_index));
                 // Calculate next world using shared logic
                 let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
                     .map(|w| crate::util::WorldSwitchInfo {
@@ -7177,11 +7167,9 @@ impl App {
                     current_index,
                     self.settings.world_switch_mode,
                 );
-                debug_log(true, &format!("WS: Sending CalculatedWorld index={:?} to client {}", next_idx, client_id));
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
             }
             WsMessage::CalculatePrevWorld { current_index } => {
-                debug_log(true, &format!("WS: CalculatePrevWorld from client {} current_index={}", client_id, current_index));
                 // Calculate prev world using shared logic
                 let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
                     .map(|w| crate::util::WorldSwitchInfo {
@@ -7450,10 +7438,7 @@ impl App {
                 self.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
             }
             WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-                // Always log render_debug messages to clay.debug.log
-                if source == "render_debug" {
-                    debug_log(true, &format!("JS {}", line_text));
-                } else if is_debug_enabled() {
+                if is_debug_enabled() {
                     let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
                     output_debug_log(&format!("SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
                         source, world_name, expected_seq_gt, actual_seq,
@@ -13423,9 +13408,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.handle_ws_key_revoke(&key);
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
-                        // Log the message type (first 80 chars of debug format)
-                        let dbg = format!("{:?}", msg);
-                        debug_log(true, &format!("TUI WS MSG: client={} {}", client_id, &dbg[..dbg.len().min(80)]));
                         let op = app.handle_ws_client_msg(client_id, *msg, &event_tx);
                         match op {
                             WsAsyncAction::Connect { world_index, prev_index, broadcast } => {
