@@ -5559,8 +5559,16 @@ impl App {
         if let WsMessage::AuthRequest { auth_key: Some(key), current_world, challenge_response: uses_challenge, .. } = msg {
             let has_key = self.settings.websocket_auth_key.is_some();
 
+            let stored_key = self.settings.websocket_auth_key.as_ref()
+                .map(|ak| ak.key.clone()).unwrap_or_default();
+            let expected = if uses_challenge && has_key {
+                hash_with_challenge(&stored_key, challenge)
+            } else {
+                stored_key.clone()
+            };
             crate::http::log_remote_event("WS-KEY", client_ip,
-                &format!("challenge={}, has_stored_key={}", uses_challenge, has_key));
+                &format!("challenge={}, has_stored_key={}, client_key={}, expected_key={}",
+                    uses_challenge, has_key, key, expected));
 
             // If challenge_response, client sent SHA256(auth_key + challenge)
             // We compute SHA256(stored_key + challenge) and compare
@@ -5595,7 +5603,8 @@ impl App {
                     dimensions: None,
                 });
             } else {
-                crate::http::log_remote_event("WS-KEY-REJECT", client_ip, "no matching key");
+                crate::http::log_remote_event("WS-KEY-REJECT", client_ip,
+                    &format!("client={} expected={}", key, expected));
                 self.ban_list.record_violation(client_ip, "WebSocket: failed auth key");
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: false,
