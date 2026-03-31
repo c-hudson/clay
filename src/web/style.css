@@ -596,21 +596,12 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 /* ─── Scrollbar ─── */
+/* Hide native scrollbar — use overlay approach to avoid white GTK trough */
 ::-webkit-scrollbar {
-    width: 8px;
+    display: none;
 }
-
-::-webkit-scrollbar-track {
-    background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-    background: var(--theme-border-light, rgba(255,255,255,0.2));
-    border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-    background: var(--theme-fg-muted, rgba(255,255,255,0.35));
+#output-container {
+    -ms-overflow-style: none;  /* IE/Edge */
 }
 
 /* ─── Modal ─── */
