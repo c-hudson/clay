@@ -2431,6 +2431,7 @@
 
             case 'CalculatedWorld':
                 // Server calculated next/prev world - switch to it
+                document.title = 'Clay [CALC idx=' + msg.index + ' cur=' + currentWorldIndex + ']';
                 if (msg.index !== null && msg.index !== undefined && msg.index !== currentWorldIndex) {
                     switchWorldLocal(msg.index);
                 }
@@ -6654,6 +6655,7 @@
 
     // Request next world from server (uses shared world switching logic)
     function requestNextWorld() {
+        document.title = 'Clay [REQ next from=' + currentWorldIndex + ']';
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'CalculateNextWorld',
