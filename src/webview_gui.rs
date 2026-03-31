@@ -506,11 +506,11 @@ fn build_html(params: &WebViewParams) -> String {
 #input-container { padding: 2px 4px; }
 #output { -webkit-user-select: text; user-select: text; }
 #output * { -webkit-user-select: text; user-select: text; }
-* { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.25) transparent; }
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.25); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4); }
+*, #output-container, body { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.25) transparent !important; }
+::-webkit-scrollbar { width: 6px !important; background: transparent !important; }
+::-webkit-scrollbar-track { background: transparent !important; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.25) !important; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4) !important; }
 #nav-bar { display: none !important; }
 .wv-sel-overlay { position: absolute; background: rgba(50,120,220,0.35); pointer-events: none; z-index: 999; }
 .wv-ctx-menu {
