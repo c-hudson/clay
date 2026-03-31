@@ -176,6 +176,7 @@
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
         setupTtsSelect: document.getElementById('setup-tts-select'),
+        setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupDebugToggle: document.getElementById('setup-debug-toggle'),
@@ -480,6 +481,7 @@
     let ansiMusicEnabled = true;  // Will be synced from server settings
     let zwjEnabled = false;  // Will be synced from server settings
     let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'edge')
+    let ttsSpeakMode = 'all';  // 'all' or 'limit'
     let newLineIndicator = false;  // Will be synced from server settings
 
     // MCMP (MUD Client Media Protocol) state
@@ -1788,6 +1790,7 @@
                         zwjEnabled = msg.settings.zwj_enabled;
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
+                    if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
                     }
@@ -2283,6 +2286,7 @@
                         zwjEnabled = msg.settings.zwj_enabled;
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
+                    if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
                     if (msg.settings.new_line_indicator !== undefined) {
                         const oldNli = newLineIndicator;
                         newLineIndicator = msg.settings.new_line_indicator;
@@ -5715,6 +5719,10 @@
         }
         elements.setupTtsSelect.value = setupTtsMode;
         updateCustomDropdown(elements.setupTtsSelect);
+        if (elements.setupTtsSpeakModeSelect) {
+            elements.setupTtsSpeakModeSelect.value = ttsSpeakMode;
+            updateCustomDropdown(elements.setupTtsSpeakModeSelect);
+        }
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
         } else {
@@ -5783,6 +5791,7 @@
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
             tts_mode: ttsMode,
+            tts_speak_mode: ttsSpeakMode,
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
@@ -8279,6 +8288,11 @@
         elements.setupTtsSelect.onchange = function() {
             setupTtsMode = this.value;
         };
+        if (elements.setupTtsSpeakModeSelect) {
+            elements.setupTtsSpeakModeSelect.onchange = function() {
+                ttsSpeakMode = this.value;
+            };
+        }
         elements.setupTlsProxyToggle.onclick = function() {
             setupTlsProxy = !setupTlsProxy;
             updateSetupPopupUI();

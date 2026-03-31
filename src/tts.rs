@@ -68,7 +68,7 @@ pub fn should_speak(text: &str, whitelist: &mut std::collections::HashSet<String
     use std::sync::OnceLock;
     static SAY_REGEX: OnceLock<regex::Regex> = OnceLock::new();
     let re = SAY_REGEX.get_or_init(|| {
-        regex::Regex::new(r#"(?i)^(\S+) says?,? [""\u{201c}\u{201d}']"#).unwrap()
+        regex::Regex::new(r#"(?i)^(\S+) (?:says?|asks?),? [""\u{201c}\u{201d}']"#).unwrap()
     });
 
     let stripped = crate::util::strip_ansi_codes(text);
