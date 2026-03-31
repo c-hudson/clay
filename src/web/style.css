@@ -70,7 +70,7 @@ body {
     position: relative;
     z-index: 1;
     scrollbar-width: thin;
-    scrollbar-color: var(--theme-border-light, #888) var(--theme-bg, #121212);
+    scrollbar-color: rgba(255,255,255,0.2) transparent;
 }
 
 #output {
@@ -597,21 +597,20 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 /* ─── Scrollbar ─── */
 ::-webkit-scrollbar {
-    width: 12px;
+    width: 8px;
 }
 
 ::-webkit-scrollbar-track {
-    background: var(--theme-bg, #121212);
+    background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-    background: var(--theme-border-light, #888);
-    border: 2px solid var(--theme-bg, #121212);
-    border-radius: 6px;
+    background: var(--theme-border-light, rgba(255,255,255,0.2));
+    border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-    background: var(--theme-fg-muted, #aaa);
+    background: var(--theme-fg-muted, rgba(255,255,255,0.35));
 }
 
 /* ─── Modal ─── */

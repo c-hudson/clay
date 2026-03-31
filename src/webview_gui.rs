@@ -142,33 +142,6 @@ pub fn run_master_webgui() -> io::Result<()> {
             ));
         }
 
-        // Force dark scrollbars in WebKitGTK by injecting GTK CSS.
-        // WebKitGTK uses native GTK widgets that ignore web CSS scrollbar styling.
-        #[cfg(feature = "webview-gui")]
-        {
-            let _ = gtk::init();
-            // Set prefer-dark-theme
-            if let Some(settings) = gtk::Settings::default() {
-                use gtk::prelude::ObjectExt;
-                settings.set_property("gtk-application-prefer-dark-theme", true);
-            }
-            // Override scrollbar colors directly via GTK CSS
-            use gtk::prelude::CssProviderExt;
-            let css_provider = gtk::CssProvider::new();
-            css_provider.load_from_data(
-                b"scrollbar { background: transparent; } \
-                  scrollbar slider { background: alpha(white, 0.25); min-width: 6px; min-height: 6px; border-radius: 3px; } \
-                  scrollbar slider:hover { background: alpha(white, 0.4); } \
-                  scrollbar trough { background: transparent; }"
-            ).ok();
-            if let Some(screen) = gdk::Screen::default() {
-                gtk::StyleContext::add_provider_for_screen(
-                    &screen,
-                    &css_provider,
-                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 100,
-                );
-            }
-        }
     }
 
     // Read the configured HTTP port from settings (default 9000)
@@ -534,11 +507,6 @@ fn build_html(params: &WebViewParams) -> String {
 #input-container { padding: 2px 4px; }
 #output { -webkit-user-select: text; user-select: text; }
 #output * { -webkit-user-select: text; user-select: text; }
-*, #output-container, body { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.25) transparent !important; }
-::-webkit-scrollbar { width: 6px !important; background: transparent !important; }
-::-webkit-scrollbar-track { background: transparent !important; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.25) !important; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4) !important; }
 #nav-bar { display: none !important; }
 .wv-sel-overlay { position: absolute; background: rgba(50,120,220,0.35); pointer-events: none; z-index: 999; }
 .wv-ctx-menu {
