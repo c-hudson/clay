@@ -8285,11 +8285,11 @@
         // Font popup
         // Font close/cancel/save handled by unified settings buttons
         elements.fontWeightMinus.onclick = function() {
-            fontEditWeight = Math.max(100, fontEditWeight - 100);
+            fontEditWeight = Math.max(1, fontEditWeight - 50);
             updateFontPopupUI();
         };
         elements.fontWeightPlus.onclick = function() {
-            fontEditWeight = Math.min(900, fontEditWeight + 100);
+            fontEditWeight = Math.min(900, fontEditWeight + 50);
             updateFontPopupUI();
         };
         elements.fontPhoneMinus.onclick = function() {
