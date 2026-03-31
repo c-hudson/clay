@@ -3993,6 +3993,15 @@
 
         const world = worlds[currentWorldIndex];
 
+        // Debug: send render info to server so it appears in clay.debug.log
+        var _dbgLines = world ? (world.output_lines || []).length : -1;
+        var _dbgSplash = world ? world.showing_splash : 'noworld';
+        var _dbgName = world ? world.name : 'null';
+        send({ type: 'ReportSeqMismatch', world_index: currentWorldIndex,
+            expected_seq_gt: 0, actual_seq: 0,
+            line_text: 'RENDER_DEBUG: idx=' + currentWorldIndex + ' name=' + _dbgName + ' lines=' + _dbgLines + ' splash=' + _dbgSplash + ' webview=' + !!window.WEBVIEW_MODE,
+            source: 'render_debug' });
+
         // If no world selected (multiuser mode before connecting), show splash
         if (!world) {
             if (splashLines && splashLines.length > 0) {

@@ -7450,7 +7450,10 @@ impl App {
                 self.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
             }
             WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-                if is_debug_enabled() {
+                // Always log render_debug messages to clay.debug.log
+                if source == "render_debug" {
+                    debug_log(true, &format!("JS {}", line_text));
+                } else if is_debug_enabled() {
                     let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
                     output_debug_log(&format!("SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
                         source, world_name, expected_seq_gt, actual_seq,
