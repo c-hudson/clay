@@ -580,7 +580,13 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_line_indicator = settings.new_line_indicator;
+                let old_tts_mode = app.settings.tts_mode;
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
+                app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
+                // Auto-unmute when TTS is enabled from Off
+                if old_tts_mode == crate::tts::TtsMode::Off && app.settings.tts_mode != crate::tts::TtsMode::Off {
+                    app.settings.tts_muted = false;
+                }
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }
