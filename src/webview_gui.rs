@@ -142,10 +142,17 @@ pub fn run_master_webgui() -> io::Result<()> {
             ));
         }
 
-        // Force GTK dark theme for WebKitGTK widgets (scrollbars, etc.)
+        // Force GTK dark theme variant for WebKitGTK widgets (scrollbars, etc.)
         // WebKitGTK uses native GTK widgets that ignore CSS scrollbar styling.
-        if std::env::var("GTK_THEME").is_err() {
-            std::env::set_var("GTK_THEME", "Adwaita:dark");
+        // Setting prefer-dark-theme works across all GTK themes (Adwaita, XFCE, etc.)
+        #[cfg(feature = "webview-gui")]
+        {
+            // gtk::init is idempotent — safe to call multiple times
+            let _ = gtk::init();
+            if let Some(settings) = gtk::Settings::default() {
+                use gtk::prelude::{SettingsExt, ObjectExt};
+                settings.set_property("gtk-application-prefer-dark-theme", true);
+            }
         }
     }
 
