@@ -1174,6 +1174,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
+    if let Some(ref ak) = app.settings.websocket_auth_key {
+        writeln!(file, "websocket_auth_key={}|{}", encrypt_password(&ak.key), ak.created_at)?;
+    }
     if !app.settings.websocket_allow_list.is_empty() {
         writeln!(file, "websocket_allow_list={}", app.settings.websocket_allow_list)?;
     }
