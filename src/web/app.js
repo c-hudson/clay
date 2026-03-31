@@ -3523,6 +3523,9 @@
     // Switch world locally (does not affect console)
     function switchWorldLocal(index) {
         if (lockedWorld) return; // Don't switch worlds in locked windows
+        // DEBUG: always show what switchWorldLocal is doing
+        var dbgWorld = worlds[index];
+        elements.output.innerHTML = '<div style="color:#0f0;padding:4px;font-size:10px">DEBUG switchWorldLocal: idx=' + index + ' cur=' + currentWorldIndex + ' name=' + (dbgWorld ? dbgWorld.name : 'null') + ' lines=' + (dbgWorld && dbgWorld.output_lines ? dbgWorld.output_lines.length : 'null') + '</div>' + elements.output.innerHTML;
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
             // Clear new line indicators on the world we're LEAVING (matches console behavior)
