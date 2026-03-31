@@ -5621,7 +5621,8 @@ impl App {
         let key = self.generate_auth_key();
         self.settings.websocket_auth_key = Some(AuthKey::new(key.clone()));
         let _ = persistence::save_settings(self);
-        self.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+        // Broadcast to ALL clients so every web UI updates its displayed key
+        self.ws_broadcast(WsMessage::KeyGenerated { auth_key: key });
     }
 
     /// Handle WsKeyRevoke event — clear the single auth key.
