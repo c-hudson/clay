@@ -1342,6 +1342,8 @@ pub struct WorldSettings {
     pub notes: String,
     // GMCP packages to request (comma-separated, e.g. "Client.Media 1, Char.Vitals 1")
     pub gmcp_packages: String,
+    // Auto-reconnect delay in seconds (0 = disabled)
+    pub auto_reconnect_secs: u32,
 }
 
 impl Default for WorldSettings {
@@ -1367,6 +1369,7 @@ impl Default for WorldSettings {
             discord_dm_user: String::new(),
             notes: String::new(),
             gmcp_packages: "Client.Media 1".to_string(),
+            auto_reconnect_secs: 0,
         }
     }
 }
@@ -2076,6 +2079,7 @@ pub struct World {
     pub watchname_history: std::collections::VecDeque<String>, // Rolling window of first-words for /watchname
     fansi_detect_until: Option<std::time::Instant>,  // FANSI client detection window (2s after connect)
     fansi_login_pending: Option<String>,             // Deferred login command for FANSI worlds
+    pub reconnect_at: Option<std::time::Instant>,   // When to auto-reconnect (None = no reconnect scheduled)
 }
 
 impl World {
@@ -2154,6 +2158,7 @@ impl World {
             watchname_history: std::collections::VecDeque::new(),
             fansi_detect_until: None,
             fansi_login_pending: None,
+            reconnect_at: None,
         }
     }
 
@@ -3352,6 +3357,7 @@ impl App {
             keep_alive: keep_alive.to_string(),
             keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
+            auto_reconnect_secs: world.settings.auto_reconnect_secs.to_string(),
             slack_token: world.settings.slack_token.clone(),
             slack_channel: world.settings.slack_channel.clone(),
             slack_workspace: world.settings.slack_workspace.clone(),
@@ -5323,6 +5329,33 @@ impl App {
             flush: false, gagged: false,
         });
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+
+        // Schedule auto-reconnect if configured and world was previously connected
+        let secs = self.worlds[world_idx].settings.auto_reconnect_secs;
+        if secs > 0 && self.worlds[world_idx].was_connected {
+            self.worlds[world_idx].reconnect_at = Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+            );
+            let seq = self.worlds[world_idx].next_seq;
+            self.worlds[world_idx].next_seq += 1;
+            let msg = OutputLine::new_client(format!("Reconnecting in {} seconds...", secs), seq);
+            self.worlds[world_idx].output_lines.push(msg.clone());
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data: format!("Reconnecting in {} seconds...\n", secs),
+                is_viewed: true,
+                ts: msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                from_server: false,
+                seq,
+                marked_new: false,
+                flush: false, gagged: false,
+            });
+        }
+    }
+
+    /// Returns the earliest scheduled reconnect time across all worlds, if any.
+    fn next_reconnect_instant(&self) -> Option<std::time::Instant> {
+        self.worlds.iter().filter_map(|w| w.reconnect_at).min()
     }
 
     /// Handle TelnetDetected event.
@@ -6882,6 +6915,7 @@ impl App {
                         keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                         keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                         gmcp_packages: world.settings.gmcp_packages.clone(),
+                        auto_reconnect_secs: world.settings.auto_reconnect_secs,
                     },
                     last_send_secs: None,
                     last_recv_secs: None,
@@ -7068,7 +7102,7 @@ impl App {
                     }
                 }
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs } => {
                 // Update world settings from remote client
                 if world_index < self.worlds.len() {
                     self.worlds[world_index].name = name.clone();
@@ -7090,6 +7124,7 @@ impl App {
                     self.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                     self.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                     self.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
+                    self.worlds[world_index].settings.auto_reconnect_secs = auto_reconnect_secs;
                     // Save settings to persist changes
                     let _ = persistence::save_settings(self);
                     // Build settings message for broadcast (don't leak password)
@@ -7106,6 +7141,7 @@ impl App {
                         keep_alive_type,
                         keep_alive_cmd,
                         gmcp_packages,
+                        auto_reconnect_secs,
                     };
                     // Broadcast update to all clients
                     self.ws_broadcast(WsMessage::WorldSettingsUpdated {
@@ -7785,6 +7821,7 @@ impl App {
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
+                    auto_reconnect_secs: world.settings.auto_reconnect_secs,
                 },
                 last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
@@ -8730,6 +8767,7 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) keep_alive: String,
     pub(crate) keep_alive_cmd: String,
     pub(crate) gmcp_packages: String,
+    pub(crate) auto_reconnect_secs: u32,
     // Slack fields
     pub(crate) slack_token: String,
     pub(crate) slack_channel: String,
@@ -8799,7 +8837,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
-        WORLD_FIELD_GMCP_PACKAGES,
+        WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
         WORLD_BTN_SAVE, WORLD_BTN_CANCEL, WORLD_BTN_DELETE, WORLD_BTN_CONNECT,
@@ -9898,6 +9936,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     keep_alive: state.get_selected(WORLD_FIELD_KEEP_ALIVE).unwrap_or("nop").to_string(),
                     keep_alive_cmd: state.get_text(WORLD_FIELD_KEEP_ALIVE_CMD).unwrap_or("").to_string(),
                     gmcp_packages: state.get_text(WORLD_FIELD_GMCP_PACKAGES).unwrap_or("Client.Media 1").to_string(),
+                    auto_reconnect_secs: state.get_text(WORLD_FIELD_AUTO_RECONNECT).unwrap_or("0").parse().unwrap_or(0),
                     slack_token: state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
                     slack_channel: state.get_text(WORLD_FIELD_SLACK_CHANNEL).unwrap_or("").to_string(),
                     slack_workspace: state.get_text(WORLD_FIELD_SLACK_WORKSPACE).unwrap_or("").to_string(),
@@ -11095,6 +11134,10 @@ pub async fn run_app_headless(
     let pending_update_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(pending_update_sleep);
 
+    // Auto-reconnect timer — fires when a world is due for reconnection
+    let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(reconnect_sleep);
+
     // GUI reload check — polls atomic flag set by IPC handler (100ms interval)
     let mut gui_reload_check = tokio::time::interval(Duration::from_millis(100));
     gui_reload_check.tick().await; // consume first immediate tick
@@ -11237,6 +11280,10 @@ pub async fn run_app_headless(
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             if conn_id != app.worlds[world_idx].connection_id { continue; }
                             app.handle_disconnected(world_idx);
+                            if let Some(next) = app.next_reconnect_instant() {
+                                let dur = next.saturating_duration_since(std::time::Instant::now());
+                                reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                            }
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
@@ -11733,6 +11780,59 @@ pub async fn run_app_headless(
                     pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
                 } else {
                     pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
+            }
+
+            // Auto-reconnect timer
+            _ = &mut reconnect_sleep => {
+                let now = std::time::Instant::now();
+                let to_reconnect: Vec<String> = app.worlds.iter()
+                    .filter(|w| w.reconnect_at.map(|t| t <= now).unwrap_or(false))
+                    .map(|w| w.name.clone())
+                    .collect();
+                for world_name in to_reconnect {
+                    if let Some(idx) = app.find_world_index(&world_name) {
+                        app.worlds[idx].reconnect_at = None;
+                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
+                            let settings = app.worlds[idx].settings.clone();
+                            app.worlds[idx].connection_id += 1;
+                            let connection_id = app.worlds[idx].connection_id;
+                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+                            app.add_output_to_world(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
+                            // Pass skip_auto_login=true to connect_daemon_world so it doesn't
+                            // send auto-login; handle_connection_success handles that instead.
+                            match daemon::connect_daemon_world(
+                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true
+                            ).await {
+                                Some((cmd_tx, socket_fd, is_tls)) => {
+                                    app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
+                                    if let Some(new_idx) = app.find_world_index(&world_name) {
+                                        app.add_output_to_world(new_idx, "Connected!");
+                                    }
+                                }
+                                None => {
+                                    if let Some(current_idx) = app.find_world_index(&world_name) {
+                                        let secs = app.worlds[current_idx].settings.auto_reconnect_secs;
+                                        if secs > 0 {
+                                            app.worlds[current_idx].reconnect_at = Some(
+                                                std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                                            );
+                                            app.add_output_to_world(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
+                                        } else {
+                                            app.add_output_to_world(current_idx, "Connection failed.");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Re-arm timer for next scheduled reconnect
+                if let Some(next) = app.next_reconnect_instant() {
+                    let dur = next.saturating_duration_since(std::time::Instant::now());
+                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                } else {
+                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
                 }
             }
         }
@@ -12616,6 +12716,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     let pending_update_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(pending_update_sleep);
 
+    // Auto-reconnect timer — fires when a world is due for reconnection
+    let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(reconnect_sleep);
+
     // Set the app pointer for crash recovery
     // SAFETY: app lives for the duration of this function and the pointer is only used
     // in the panic hook which only runs while this function is on the stack
@@ -13186,6 +13290,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             if conn_id != app.worlds[world_idx].connection_id { continue; }
                             app.handle_disconnected(world_idx);
+                            if let Some(next) = app.next_reconnect_instant() {
+                                let dur = next.saturating_duration_since(std::time::Instant::now());
+                                reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                            }
                         }
                     }
                     AppEvent::TelnetDetected(ref world_name) => {
@@ -13899,6 +14007,59 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
                 }
             }
+
+            // Auto-reconnect timer
+            _ = &mut reconnect_sleep => {
+                let now = std::time::Instant::now();
+                let to_reconnect: Vec<String> = app.worlds.iter()
+                    .filter(|w| w.reconnect_at.map(|t| t <= now).unwrap_or(false))
+                    .map(|w| w.name.clone())
+                    .collect();
+                for world_name in to_reconnect {
+                    if let Some(idx) = app.find_world_index(&world_name) {
+                        app.worlds[idx].reconnect_at = None;
+                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
+                            let settings = app.worlds[idx].settings.clone();
+                            app.worlds[idx].connection_id += 1;
+                            let connection_id = app.worlds[idx].connection_id;
+                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+                            app.add_output_to_world(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
+                            // Pass skip_auto_login=true to connect_daemon_world so it doesn't
+                            // send auto-login; handle_connection_success handles that instead.
+                            match daemon::connect_daemon_world(
+                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true
+                            ).await {
+                                Some((cmd_tx, socket_fd, is_tls)) => {
+                                    app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
+                                    if let Some(new_idx) = app.find_world_index(&world_name) {
+                                        app.add_output_to_world(new_idx, "Connected!");
+                                    }
+                                }
+                                None => {
+                                    if let Some(current_idx) = app.find_world_index(&world_name) {
+                                        let secs = app.worlds[current_idx].settings.auto_reconnect_secs;
+                                        if secs > 0 {
+                                            app.worlds[current_idx].reconnect_at = Some(
+                                                std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                                            );
+                                            app.add_output_to_world(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
+                                        } else {
+                                            app.add_output_to_world(current_idx, "Connection failed.");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Re-arm timer for next scheduled reconnect
+                if let Some(next) = app.next_reconnect_instant() {
+                    let dur = next.saturating_duration_since(std::time::Instant::now());
+                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                } else {
+                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
+            }
         }
 
         // Process additional queued events with a time budget for UI responsiveness.
@@ -13968,6 +14129,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         if conn_id != app.worlds[world_idx].connection_id { continue; }
                         app.handle_disconnected(world_idx);
+                        if let Some(next) = app.next_reconnect_instant() {
+                            let dur = next.saturating_duration_since(std::time::Instant::now());
+                            if reconnect_sleep.deadline() > tokio::time::Instant::now() + dur {
+                                reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                            }
+                        }
                     }
                 }
                 AppEvent::TelnetDetected(ref world_name) => {
