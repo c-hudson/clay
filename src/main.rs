@@ -23,7 +23,6 @@ pub mod remote_client;
 pub mod tts;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
-const VERSION: &str = "1.0.1-beta";
 pub mod testserver;
 #[cfg(test)]
 pub mod testharness;
