@@ -196,6 +196,8 @@ pub enum WsMessage {
         keep_alive_cmd: String,
         #[serde(default)]
         gmcp_packages: String,
+        #[serde(default)]
+        auto_reconnect_secs: u32,
     },
     UpdateGlobalSettings {
         more_mode_enabled: bool,
@@ -444,6 +446,8 @@ pub struct WorldSettingsMsg {
     pub gmcp_packages: String,
     #[serde(default)]
     pub has_password: bool,  // True if a password is configured (password field is empty)
+    #[serde(default)]
+    pub auto_reconnect_secs: u32,
 }
 
 /// Global settings for WebSocket protocol

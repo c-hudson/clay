@@ -1404,6 +1404,7 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive);
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd.clone();
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages.clone();
+                    app.worlds[idx].settings.auto_reconnect_secs = settings.auto_reconnect_secs;
 
                     // Send UpdateWorldSettings to daemon
                     let _ = ws_tx.send(WsMessage::UpdateWorldSettings {
@@ -1420,6 +1421,7 @@ pub(crate) fn handle_remote_client_key(
                         keep_alive_type: settings.keep_alive,
                         keep_alive_cmd: settings.keep_alive_cmd,
                         gmcp_packages: settings.gmcp_packages,
+                        auto_reconnect_secs: settings.auto_reconnect_secs,
                     });
                 }
             }

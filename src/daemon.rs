@@ -1727,6 +1727,7 @@ pub async fn handle_daemon_ws_message(
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
+                    auto_reconnect_secs: world.settings.auto_reconnect_secs,
                 },
                 last_send_secs: None,
                 last_recv_secs: None,
@@ -1762,7 +1763,7 @@ pub async fn handle_daemon_ws_message(
                 let _ = persistence::save_settings(app);
             }
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs } => {
             if world_index < app.worlds.len() {
                 app.worlds[world_index].name = name.clone();
                 app.worlds[world_index].settings.hostname = hostname.clone();
@@ -1780,6 +1781,7 @@ pub async fn handle_daemon_ws_message(
                 app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                 app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                 app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
+                app.worlds[world_index].settings.auto_reconnect_secs = auto_reconnect_secs;
                 let _ = persistence::save_settings(app);
                 let settings_msg = WorldSettingsMsg {
                     hostname, port, user,
@@ -1788,6 +1790,7 @@ pub async fn handle_daemon_ws_message(
                     use_ssl, log_enabled, encoding,
                     auto_connect_type: auto_login,
                     keep_alive_type, keep_alive_cmd, gmcp_packages,
+                    auto_reconnect_secs,
                 };
                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
             }
@@ -2816,6 +2819,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
+                    auto_reconnect_secs: world.settings.auto_reconnect_secs,
                 },
                 last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),

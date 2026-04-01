@@ -848,6 +848,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     };
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages;
+                    app.worlds[idx].settings.auto_reconnect_secs = settings.auto_reconnect_secs;
 
                     // Update Slack settings
                     app.worlds[idx].settings.slack_token = settings.slack_token;

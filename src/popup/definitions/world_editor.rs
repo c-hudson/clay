@@ -22,6 +22,7 @@ pub const WORLD_FIELD_AUTO_CONNECT: FieldId = FieldId(17);
 pub const WORLD_FIELD_KEEP_ALIVE: FieldId = FieldId(18);
 pub const WORLD_FIELD_KEEP_ALIVE_CMD: FieldId = FieldId(19);
 pub const WORLD_FIELD_GMCP_PACKAGES: FieldId = FieldId(20);
+pub const WORLD_FIELD_AUTO_RECONNECT: FieldId = FieldId(21);
 // Field IDs - Slack
 pub const WORLD_FIELD_SLACK_TOKEN: FieldId = FieldId(30);
 pub const WORLD_FIELD_SLACK_CHANNEL: FieldId = FieldId(31);
@@ -119,6 +120,7 @@ pub struct WorldSettings {
     pub keep_alive: String,
     pub keep_alive_cmd: String,
     pub gmcp_packages: String,
+    pub auto_reconnect_secs: String,
     // Slack
     pub slack_token: String,
     pub slack_channel: String,
@@ -228,6 +230,11 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             "GMCP Packages",
             FieldKind::text(&settings.gmcp_packages),
         ))
+        .with_field(Field::new(
+            WORLD_FIELD_AUTO_RECONNECT,
+            "Auto Reconnect",
+            FieldKind::text(&settings.auto_reconnect_secs),
+        ))
         // Slack fields
         .with_field(Field::new(
             WORLD_FIELD_SLACK_TOKEN,
@@ -332,6 +339,10 @@ fn world_editor_help_text() -> Vec<String> {
         "",
         "GMCP Packages: Space-separated GMCP packages to",
         "  request from the server (e.g. Char.Items Room.Info).",
+        "",
+        "Auto Reconnect: Seconds to wait before reconnecting",
+        "  after a disconnect. 0 = disabled. Only reconnects if",
+        "  the world had been connected at least once.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -342,6 +353,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT, WORLD_FIELD_USER, WORLD_FIELD_PASSWORD,
         WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_ENCODING,
         WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
+        WORLD_FIELD_AUTO_RECONNECT,
     ];
 
     // Slack fields
