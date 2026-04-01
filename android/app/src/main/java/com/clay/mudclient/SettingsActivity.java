@@ -35,7 +35,7 @@ public class SettingsActivity extends AppCompatActivity {
     private TextView connectionStatus;
     private Button saveButton;
     private Button cancelButton;
-    private TextView authKeyValue;
+    private EditText authKeyValue;
     private boolean fromMenu;
 
     @Override
@@ -78,13 +78,9 @@ public class SettingsActivity extends AppCompatActivity {
         serverUsernameInput.setText(savedUsername);
         serverPasswordInput.setText(savedPassword);
 
-        // Display auth key
+        // Display auth key (editable so user can paste or clear it)
         if (authKey != null && !authKey.isEmpty()) {
             authKeyValue.setText(authKey);
-        } else {
-            authKeyValue.setText("none");
-            authKeyValue.setTextColor(0xFF484F58);  // dimmer color for "none"
-            authKeyValue.setTypeface(null, android.graphics.Typeface.ITALIC);
         }
 
         // Toggle advanced section visibility
@@ -167,6 +163,9 @@ public class SettingsActivity extends AppCompatActivity {
         editor.putString(KEY_REMOTE_HOSTNAME, remoteHostname);
         editor.putString(KEY_SAVED_USERNAME, username);
         editor.putString(KEY_SAVED_PASSWORD, password);
+        // Save auth key: persist whatever the user left in the field (empty = clear it)
+        String editedAuthKey = authKeyValue.getText().toString().trim();
+        editor.putString(KEY_AUTH_KEY, editedAuthKey);
         editor.apply();
 
         // Go back to MainActivity to attempt connection

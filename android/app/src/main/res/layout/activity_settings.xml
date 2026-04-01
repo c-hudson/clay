@@ -277,19 +277,19 @@
             android:textColor="#8b949e"
             android:layout_marginBottom="2dp" />
 
-        <TextView
+        <EditText
             android:id="@+id/authKeyValue"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="none"
+            android:hint="none"
             android:fontFamily="monospace"
             android:textSize="11sp"
-            android:textColor="#7d8590"
-            android:lineSpacingMultiplier="1.4"
-            android:breakStrategy="simple"
-            android:background="@drawable/auth_key_bg"
-            android:padding="6dp"
-            android:textIsSelectable="true" />
+            android:textColor="#e6edf3"
+            android:textColorHint="#484f58"
+            android:inputType="text"
+            android:backgroundTint="#3fb950"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp" />
     </LinearLayout>
 
     <!-- Connection status -->

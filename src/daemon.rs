@@ -370,6 +370,10 @@ pub async fn handle_daemon_ws_message(
     msg: WsMessage,
     event_tx: &mpsc::Sender<AppEvent>,
 ) {
+    // Log every incoming command for diagnostics
+    if let WsMessage::SendCommand { ref command, .. } = msg {
+        crate::debug_log(true, &format!("DAEMON_CMD: client_id={} command={:?}", client_id, command));
+    }
     match msg {
         WsMessage::SendCommand { world_index, command } => {
             // Use shared command parsing (same as console mode)
@@ -887,20 +891,15 @@ pub async fn handle_daemon_ws_message(
                     }
                 }
                 Command::TestMusic => {
-                    let test_notes = vec![
-                        ansi_music::MusicNote { frequency: 261.63, duration_ms: 250 },
-                        ansi_music::MusicNote { frequency: 293.66, duration_ms: 250 },
-                        ansi_music::MusicNote { frequency: 329.63, duration_ms: 250 },
-                        ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 },
-                        ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 },
-                    ];
+                    let test_notes = crate::generate_test_music_notes();
+                    crate::debug_log(true, &format!("TESTMUSIC: daemon path, client_id={}, notes={}", client_id, test_notes.len()));
                     app.ws_send_to_client(client_id, WsMessage::AnsiMusic {
                         world_index,
                         notes: test_notes,
                     });
                     app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
-                        data: "Playing test music (C-D-E-F-G)...".to_string(),
+                        data: "Playing test music (Super Mario Bros)...".to_string(),
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,

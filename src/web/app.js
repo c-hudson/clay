@@ -1385,7 +1385,7 @@
 
                 // Auto-authenticate for embedded WebView GUI (pre-hashed password)
                 if (window.AUTO_PASSWORD) {
-                    ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD }));
+                    ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false }));
                     return;
                 }
 
@@ -2872,7 +2872,8 @@
             type: 'AuthRequest',
             password_hash: '',  // Empty - using key instead
             auth_key: keyValue,
-            challenge_response: usesChallenge
+            challenge_response: usesChallenge,
+            request_key: false
         };
         if (currentWorldIndex !== undefined) {
             msg.current_world = currentWorldIndex;
@@ -2922,7 +2923,7 @@
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
             const challengeHash = serverChallenge ? await hashPassword(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: true, challenge_response: !!serverChallenge };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge };
             if (username) {
                 msg.username = username;
             }
@@ -2935,7 +2936,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             const challengeHash = serverChallenge ? sha256Fallback(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: true, challenge_response: !!serverChallenge };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge };
             if (username) {
                 msg.username = username;
             }
