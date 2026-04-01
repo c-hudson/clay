@@ -23,7 +23,7 @@ pub mod remote_client;
 pub mod tts;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
-#[cfg(test)]
+const VERSION: &str = "1.0.1-beta";
 pub mod testserver;
 #[cfg(test)]
 pub mod testharness;
@@ -5641,7 +5641,7 @@ impl App {
 
     /// Handle WsKeyRequest event — generate a new single auth key (replaces any existing).
     fn handle_ws_key_request(&mut self, client_id: u64) {
-        let key = self.generate_auth_key();
+        let key = App::generate_auth_key();
         self.settings.websocket_auth_key = Some(AuthKey::new(key.clone()));
         let _ = persistence::save_settings(self);
         // Broadcast to ALL clients so every web UI updates its displayed key
@@ -5655,7 +5655,7 @@ impl App {
     }
 
     /// Generate a new auth key string.
-    fn generate_auth_key(&self) -> String {
+    fn generate_auth_key() -> String {
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(std::time::SystemTime::now()
@@ -5667,7 +5667,14 @@ impl App {
         let mut random_bytes = [0u8; 16];
         let _ = getrandom::getrandom(&mut random_bytes);
         hasher.update(random_bytes);
-        hex::encode(hasher.finalize())
+        let key = hex::encode(hasher.finalize());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let now = util::local_time_now();
+        debug_log(true, &format!(
+            "AUTH KEY GENERATED {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n{}",
+            now.year, now.month, now.day, now.hour, now.minute, now.second, bt
+        ));
+        key
     }
 
     /// Handle initial WsClientMessage (AuthRequest) after authentication.
@@ -9242,16 +9249,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             return NewPopupAction::WebSaved(settings);
                         } else if state.is_button_focused(WEB_BTN_REGEN_KEY) {
                             // Generate a new auth key and update the field
-                            use sha2::{Sha256, Digest};
-                            let mut hasher = Sha256::new();
-                            hasher.update(std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default().as_nanos().to_le_bytes());
-                            hasher.update(std::process::id().to_le_bytes());
-                            let mut random_bytes = [0u8; 16];
-                            let _ = getrandom::getrandom(&mut random_bytes);
-                            hasher.update(random_bytes);
-                            let new_key = hex::encode(hasher.finalize());
+                            let new_key = App::generate_auth_key();
                             if let Some(field) = state.definition.fields.iter_mut()
                                 .find(|f| f.id == WEB_FIELD_AUTH_KEY)
                             {
@@ -10718,13 +10716,6 @@ pub async fn run_app_headless(
 
     app.ensure_has_world();
 
-    // Auto-generate auth key if none exists (fresh install or migration from multi-key)
-    if app.settings.websocket_auth_key.is_none() {
-        let key = app.generate_auth_key();
-        app.settings.websocket_auth_key = Some(AuthKey::new(key));
-        let _ = persistence::save_settings(&app);
-    }
-
     // Re-create spell checker with custom dictionary path if configured
     if !app.settings.dictionary_path.is_empty() {
         app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
@@ -11838,13 +11829,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     debug_log(is_debug_enabled(), "STARTUP: Ensuring has world...");
     app.ensure_has_world();
     debug_log(is_debug_enabled(), &format!("STARTUP: Have {} worlds", app.worlds.len()));
-
-    // Auto-generate auth key if none exists (fresh install or migration from multi-key)
-    if app.settings.websocket_auth_key.is_none() {
-        let key = app.generate_auth_key();
-        app.settings.websocket_auth_key = Some(AuthKey::new(key));
-        let _ = persistence::save_settings(&app);
-    }
 
     // Re-create spell checker with custom dictionary path if configured
     if !app.settings.dictionary_path.is_empty() {
