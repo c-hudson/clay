@@ -372,6 +372,7 @@
     let wsAllowList = '';
     let wsCertFile = '';
     let wsKeyFile = '';
+    let wsPassword = '';
     let tlsConfigured = false;  // True if server has TLS cert+key configured
     let serverAuthKey = '';  // Auth key from server (for display in web settings)
     // Temporary editing state for web popup (only saved on Save button)
@@ -1844,6 +1845,9 @@
                     if (msg.settings.auth_key !== undefined) {
                         serverAuthKey = msg.settings.auth_key;
                     }
+                    if (msg.settings.ws_password !== undefined) {
+                        wsPassword = msg.settings.ws_password;
+                    }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
                     }
@@ -2346,6 +2350,9 @@
                     }
                     if (msg.settings.auth_key !== undefined) {
                         serverAuthKey = msg.settings.auth_key;
+                    }
+                    if (msg.settings.ws_password !== undefined) {
+                        wsPassword = msg.settings.ws_password;
                     }
                     if (msg.settings.console_theme !== undefined) {
                         consoleTheme = msg.settings.console_theme;
@@ -5830,6 +5837,7 @@
             httpEnabled = editHttpEnabled;
             httpPort = parseInt(elements.webHttpPort.value) || 9000;
             wsAllowList = elements.webAllowList.value;
+            wsPassword = elements.webWsPassword ? elements.webWsPassword.value : wsPassword;
             wsCertFile = elements.webCertFile.value;
             wsKeyFile = elements.webKeyFile.value;
         }
@@ -5841,9 +5849,6 @@
         const msg = buildUpdateGlobalSettings();
         msg.input_height = setupInputHeightValue;
         send(msg);
-
-        // Clear password field after sending so it doesn't linger in the UI
-        if (elements.webWsPassword) elements.webWsPassword.value = '';
 
         closeSettingsPopup();
     }
@@ -5861,8 +5866,7 @@
         // Update input fields (from global state - text fields are read on save)
         elements.webHttpPort.value = httpPort;
         elements.webAllowList.value = wsAllowList;
-        // Password field is always blank on open — only filled when user wants to change it
-        if (elements.webWsPassword) elements.webWsPassword.value = '';
+        if (elements.webWsPassword) elements.webWsPassword.value = wsPassword;
         // Show placeholder if TLS configured but paths not sent from server
         if (tlsConfigured && !wsCertFile) {
             elements.webCertFile.value = '';

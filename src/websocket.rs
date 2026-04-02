@@ -521,6 +521,9 @@ pub struct GlobalSettingsMsg {
     /// Auth key value for display in web settings (only sent to authenticated clients)
     #[serde(default)]
     pub auth_key: String,
+    /// WebSocket password (plaintext, sent to authenticated clients for display in settings)
+    #[serde(default)]
+    pub ws_password: String,
 }
 
 fn default_gui_transparency() -> f32 {

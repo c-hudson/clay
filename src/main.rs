@@ -2949,6 +2949,7 @@ impl App {
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
+            ws_password: self.settings.websocket_password.clone(),
         }
     }
 
@@ -7183,12 +7184,10 @@ impl App {
                 if let Some(ref server) = self.ws_server {
                     server.update_allow_list(&ws_allow_list);
                 }
-                // Only update password if a new one was provided (empty = keep existing)
-                if !ws_password.is_empty() {
-                    self.settings.websocket_password = ws_password.clone();
-                    if let Some(ref server) = self.ws_server {
-                        server.update_password(&ws_password);
-                    }
+                // Update password (may be empty string to clear it)
+                self.settings.websocket_password = ws_password.clone();
+                if let Some(ref server) = self.ws_server {
+                    server.update_password(&ws_password);
                 }
                 // Update web settings
                 self.settings.web_secure = web_secure;
