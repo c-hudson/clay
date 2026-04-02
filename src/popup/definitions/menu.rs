@@ -22,8 +22,6 @@ pub enum MenuItem {
     Actions,
     WorldSelector,
     ConnectedWorlds,
-    ThemeEditor,
-    KeybindEditor,
 }
 
 impl MenuItem {
@@ -35,8 +33,6 @@ impl MenuItem {
             MenuItem::Actions,
             MenuItem::WorldSelector,
             MenuItem::ConnectedWorlds,
-            MenuItem::ThemeEditor,
-            MenuItem::KeybindEditor,
         ]
     }
 
@@ -48,8 +44,6 @@ impl MenuItem {
             MenuItem::Actions => "Actions",
             MenuItem::WorldSelector => "World Selector",
             MenuItem::ConnectedWorlds => "Connected Worlds",
-            MenuItem::ThemeEditor => "Theme Editor",
-            MenuItem::KeybindEditor => "Keybind Editor",
         }
     }
 
@@ -61,8 +55,6 @@ impl MenuItem {
             MenuItem::Actions => "/actions",
             MenuItem::WorldSelector => "/worlds",
             MenuItem::ConnectedWorlds => "/connections",
-            MenuItem::ThemeEditor => "/theme-editor",
-            MenuItem::KeybindEditor => "/keybind-editor",
         }
     }
 }
@@ -115,12 +107,9 @@ fn menu_help_text() -> Vec<String> {
         "  Actions          - Trigger and automation editor",
         "  World Selector   - Browse and connect to worlds",
         "  Connected Worlds - View active connections",
-        "  Theme Editor     - Customize colors (opens browser)",
-        "  Keybind Editor   - Configure keys (opens browser)",
         "",
         "You can also access these with commands:",
-        "  /help  /setup  /web  /actions  /worlds",
-        "  /connections  /theme-editor  /keybind-editor",
+        "  /help  /setup  /web  /actions  /worlds  /connections",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -140,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_menu_items() {
-        assert_eq!(MenuItem::all().len(), 8);
+        assert_eq!(MenuItem::all().len(), 6);
         assert_eq!(MenuItem::Help.label(), "Help");
         assert_eq!(MenuItem::Help.command(), "/help");
     }

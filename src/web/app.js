@@ -5651,13 +5651,19 @@
     }
 
     function openEditorPage(page) {
-        if (window.WEBVIEW_MODE && window.ipc) {
-            var wsProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
+        var url;
+        if (window.SERVER_URL) {
+            url = window.SERVER_URL + '/' + page;
+        } else {
+            var proto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
             var host = window.WS_HOST || window.location.hostname;
             var port = (window.WS_PORT && window.WS_PORT !== 0) ? window.WS_PORT : window.location.port;
-            window.ipc.postMessage('open-url:' + wsProto + '://' + host + ':' + port + '/' + page);
+            url = proto + '://' + host + ':' + port + '/' + page;
+        }
+        if (window.WEBVIEW_MODE && window.ipc) {
+            window.ipc.postMessage('open-url:' + url);
         } else {
-            window.open('/' + page, '_blank');
+            window.open(url, '_blank');
         }
     }
 
