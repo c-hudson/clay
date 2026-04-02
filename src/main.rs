@@ -5673,7 +5673,7 @@ impl App {
     }
 
     /// Handle WsKeyRequest event — generate a new single auth key (replaces any existing).
-    fn handle_ws_key_request(&mut self, client_id: u64) {
+    fn handle_ws_key_request(&mut self, _client_id: u64) {
         let key = App::generate_auth_key();
         self.settings.websocket_auth_key = Some(AuthKey::new(key.clone()));
         let _ = persistence::save_settings(self);

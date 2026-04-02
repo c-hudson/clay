@@ -99,8 +99,6 @@ pub struct TtsBackend {
     local_command: Option<String>,
     /// Handle to the currently running local TTS process (for stopping)
     current_process: Arc<Mutex<Option<std::process::Child>>>,
-    /// Tokio handle for spawning Edge TTS async tasks
-    tokio_handle: Option<tokio::runtime::Handle>,
     /// Queue for Edge TTS — ensures utterances play one at a time
     edge_queue_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
@@ -130,7 +128,6 @@ pub fn init_tts() -> TtsBackend {
     TtsBackend {
         local_command: detect_tts_command(),
         current_process: Arc::new(Mutex::new(None)),
-        tokio_handle,
         edge_queue_tx,
     }
 }
