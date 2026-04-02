@@ -5650,6 +5650,17 @@
         elements.settingsTitle.textContent = titles[tab] || tab;
     }
 
+    function openEditorPage(page) {
+        if (window.WEBVIEW_MODE && window.ipc) {
+            var wsProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
+            var host = window.WS_HOST || window.location.hostname;
+            var port = (window.WS_PORT && window.WS_PORT !== 0) ? window.WS_PORT : window.location.port;
+            window.ipc.postMessage('open-url:' + wsProto + '://' + host + ':' + port + '/' + page);
+        } else {
+            window.open('/' + page, '_blank');
+        }
+    }
+
     function openSettingsPopup(tab) {
         if (tab === 'web' && multiuserMode) {
             appendClientLine('Web settings are disabled in multiuser mode.', currentWorldIndex, 'system');
@@ -7156,10 +7167,10 @@
                 openSettingsPopup('font');
                 break;
             case 'theme-editor':
-                window.open('/theme-editor', '_blank');
+                openEditorPage('theme-editor');
                 break;
             case 'keybind-editor':
-                window.open('/keybind-editor', '_blank');
+                openEditorPage('keybind-editor');
                 break;
             case 'toggle-tags':
                 showTags = !showTags;
@@ -8280,10 +8291,10 @@
             };
         });
         document.getElementById('settings-theme-editor-btn').onclick = function() {
-            window.open('/theme-editor', '_blank');
+            openEditorPage('theme-editor');
         };
         document.getElementById('settings-keybind-editor-btn').onclick = function() {
-            window.open('/keybind-editor', '_blank');
+            openEditorPage('keybind-editor');
         };
         elements.setupMoreModeToggle.onclick = function() {
             setupMoreMode = !setupMoreMode;
