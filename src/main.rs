@@ -11347,6 +11347,26 @@ pub async fn run_app_headless(
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                         }
                     }
+                    AppEvent::TelnetDetected(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_telnet_detected(world_idx);
+                        }
+                    }
+                    AppEvent::WontEchoSeen(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_wont_echo_seen(world_idx);
+                        }
+                    }
+                    AppEvent::NawsRequested(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_naws_requested(world_idx);
+                        }
+                    }
+                    AppEvent::TtypeRequested(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_ttype_requested(world_idx);
+                        }
+                    }
                     AppEvent::GmcpNegotiated(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             app.handle_gmcp_negotiated(world_idx);

@@ -2624,8 +2624,29 @@ pub async fn connect_daemon_world(
                                 if !result.responses.is_empty() {
                                     let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                 }
+                                if result.telnet_detected {
+                                    let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name_read.clone())).await;
+                                }
                                 if let Some(ref charsets) = result.charset_request {
                                     let _ = event_tx_read.send(AppEvent::CharsetRequested(world_name_read.clone(), charsets.clone())).await;
+                                }
+                                if result.wont_echo_seen {
+                                    let _ = event_tx_read.send(AppEvent::WontEchoSeen(world_name_read.clone())).await;
+                                }
+                                if result.gmcp_negotiated {
+                                    let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name_read.clone())).await;
+                                }
+                                if result.msdp_negotiated {
+                                    let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name_read.clone())).await;
+                                }
+                                for (pkg, json) in &result.gmcp_data {
+                                    let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name_read.clone(), pkg.clone(), json.clone())).await;
+                                }
+                                for (var, val) in &result.msdp_data {
+                                    let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name_read.clone(), var.clone(), val.clone())).await;
+                                }
+                                if let Some(prompt_bytes) = result.prompt {
+                                    let _ = event_tx_read.send(AppEvent::Prompt(world_name_read.clone(), prompt_bytes)).await;
                                 }
                                 if !result.cleaned.is_empty() {
                                     let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
@@ -2669,8 +2690,35 @@ pub async fn connect_daemon_world(
                                     }
                                     mccp2 = Some(decomp);
                                 }
+                                if result.telnet_detected {
+                                    let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name_read.clone())).await;
+                                }
+                                if result.naws_requested {
+                                    let _ = event_tx_read.send(AppEvent::NawsRequested(world_name_read.clone())).await;
+                                }
+                                if result.ttype_requested {
+                                    let _ = event_tx_read.send(AppEvent::TtypeRequested(world_name_read.clone())).await;
+                                }
                                 if let Some(ref charsets) = result.charset_request {
                                     let _ = event_tx_read.send(AppEvent::CharsetRequested(world_name_read.clone(), charsets.clone())).await;
+                                }
+                                if result.wont_echo_seen {
+                                    let _ = event_tx_read.send(AppEvent::WontEchoSeen(world_name_read.clone())).await;
+                                }
+                                if result.gmcp_negotiated {
+                                    let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name_read.clone())).await;
+                                }
+                                if result.msdp_negotiated {
+                                    let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name_read.clone())).await;
+                                }
+                                for (pkg, json) in &result.gmcp_data {
+                                    let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name_read.clone(), pkg.clone(), json.clone())).await;
+                                }
+                                for (var, val) in &result.msdp_data {
+                                    let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name_read.clone(), var.clone(), val.clone())).await;
+                                }
+                                if let Some(prompt_bytes) = result.prompt {
+                                    let _ = event_tx_read.send(AppEvent::Prompt(world_name_read.clone(), prompt_bytes)).await;
                                 }
                                 if !result.cleaned.is_empty() {
                                     let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
