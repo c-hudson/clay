@@ -152,6 +152,7 @@
         webHttpEnabledSelect: document.getElementById('web-http-enabled-select'),
         webHttpPort: document.getElementById('web-http-port'),
         webAllowList: document.getElementById('web-allow-list'),
+        webWsPassword: document.getElementById('web-ws-password'),
         webCertFile: document.getElementById('web-cert-file'),
         webKeyFile: document.getElementById('web-key-file'),
         tlsCertField: document.getElementById('tls-cert-field'),
@@ -5789,6 +5790,7 @@
             ws_port: wsPort,
             ws_cert_file: wsCertFile,
             ws_key_file: wsKeyFile,
+            ws_password: (elements.webWsPassword ? elements.webWsPassword.value : ''),
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
             tts_mode: ttsMode,
@@ -5840,6 +5842,9 @@
         msg.input_height = setupInputHeightValue;
         send(msg);
 
+        // Clear password field after sending so it doesn't linger in the UI
+        if (elements.webWsPassword) elements.webWsPassword.value = '';
+
         closeSettingsPopup();
     }
 
@@ -5856,6 +5861,8 @@
         // Update input fields (from global state - text fields are read on save)
         elements.webHttpPort.value = httpPort;
         elements.webAllowList.value = wsAllowList;
+        // Password field is always blank on open — only filled when user wants to change it
+        if (elements.webWsPassword) elements.webWsPassword.value = '';
         // Show placeholder if TLS configured but paths not sent from server
         if (tlsConfigured && !wsCertFile) {
             elements.webCertFile.value = '';

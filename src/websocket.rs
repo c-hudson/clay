@@ -238,6 +238,8 @@ pub enum WsMessage {
         ws_port: u16,      // Legacy — ignored, kept for backward compat
         ws_cert_file: String,
         ws_key_file: String,
+        #[serde(default)]
+        ws_password: String,
         tls_proxy_enabled: bool,
         #[serde(default)]
         dictionary_path: String,

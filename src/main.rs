@@ -7151,7 +7151,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -7182,6 +7182,13 @@ impl App {
                 // Update the running WebSocket server's allow list
                 if let Some(ref server) = self.ws_server {
                     server.update_allow_list(&ws_allow_list);
+                }
+                // Only update password if a new one was provided (empty = keep existing)
+                if !ws_password.is_empty() {
+                    self.settings.websocket_password = ws_password.clone();
+                    if let Some(ref server) = self.ws_server {
+                        server.update_password(&ws_password);
+                    }
                 }
                 // Update web settings
                 self.settings.web_secure = web_secure;

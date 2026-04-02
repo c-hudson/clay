@@ -1188,6 +1188,7 @@ pub(crate) fn handle_remote_client_key(
                     ws_port: 0,        // Legacy
                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                     ws_key_file: app.settings.websocket_key_file.clone(),
+                    ws_password: String::new(),  // Never send existing password to remote clients
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
                     dictionary_path: app.settings.dictionary_path.clone(),
                     mouse_enabled: app.settings.mouse_enabled,
@@ -1923,6 +1924,7 @@ pub(crate) fn apply_remote_web_settings(
         ws_port: 0,         // Legacy
         ws_cert_file: app.settings.websocket_cert_file.clone(),
         ws_key_file: app.settings.websocket_key_file.clone(),
+        ws_password: String::new(),  // Never send existing password to remote clients
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
         dictionary_path: app.settings.dictionary_path.clone(),
         mouse_enabled: app.settings.mouse_enabled,
