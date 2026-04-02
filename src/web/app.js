@@ -4006,8 +4006,8 @@
             return;
         }
 
-        // WebView mode: show image splash instead of text splash (only if no output yet)
-        if (window.WEBVIEW_MODE && world.showing_splash && (!world.output_lines || world.output_lines.length === 0)) {
+        // WebView mode: show image splash instead of text splash
+        if (window.WEBVIEW_MODE && world.showing_splash) {
             // On Windows WebView2, custom protocol "clay://" is served as "http://clay.localhost/"
             const imgBase = window.location.origin || 'clay://localhost';
             elements.output.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:5px;">' +
