@@ -448,9 +448,7 @@
         { label: 'Font', command: '/font' },
         { label: 'Actions', command: '/actions' },
         { label: 'World Selector', command: '/worlds' },
-        { label: 'Connected Worlds', command: '/connections' },
-        { label: 'Theme Editor', command: '/theme-editor' },
-        { label: 'Keybind Editor', command: '/keybind-editor' }
+        { label: 'Connected Worlds', command: '/connections' }
     ];
 
     // Current theme values (synced from server)
@@ -3881,10 +3879,6 @@
     function selectMenuItem() {
         const cmd = menuItems[menuSelectedIndex].command;
         closeMenuPopup();
-        if (cmd === '/theme-editor' || cmd === '/keybind-editor') {
-            window.open(cmd.substring(1), '_blank');
-            return;
-        }
         elements.input.value = cmd;
         sendCommand();
     }
@@ -8280,10 +8274,17 @@
         // Tab switching
         document.querySelectorAll('.settings-tab-btn').forEach(function(btn) {
             btn.onclick = function() {
+                if (!btn.dataset.tab) return;
                 if (btn.dataset.tab === 'web' && multiuserMode) return;
                 switchSettingsTab(btn.dataset.tab);
             };
         });
+        document.getElementById('settings-theme-editor-btn').onclick = function() {
+            window.open('/theme-editor', '_blank');
+        };
+        document.getElementById('settings-keybind-editor-btn').onclick = function() {
+            window.open('/keybind-editor', '_blank');
+        };
         elements.setupMoreModeToggle.onclick = function() {
             setupMoreMode = !setupMoreMode;
             updateSetupPopupUI();
