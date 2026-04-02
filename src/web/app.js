@@ -6450,7 +6450,7 @@
             elements.worldEditSslToggle.classList.remove('active');
         }
 
-        const autoLogin = world.settings?.auto_login || 'Connect';
+        const autoLogin = world.settings?.auto_connect_type || world.settings?.auto_login || 'Connect';
         elements.worldEditAutoLoginSelect.value = autoLogin;
         updateCustomDropdown(elements.worldEditAutoLoginSelect);
 
@@ -6516,7 +6516,7 @@
         world.settings.use_ssl = elements.worldEditSslToggle.classList.contains('active');
         world.settings.log_enabled = elements.worldEditLoggingToggle.classList.contains('active');
         world.settings.encoding = elements.worldEditEncodingSelect.value;
-        world.settings.auto_login = elements.worldEditAutoLoginSelect.value;
+        world.settings.auto_connect_type = elements.worldEditAutoLoginSelect.value;
         world.settings.keep_alive_type = elements.worldEditKeepAliveSelect.value;
         world.settings.keep_alive_cmd = elements.worldEditKeepAliveCmd.value;
         if (elements.worldEditGmcpPackages) {

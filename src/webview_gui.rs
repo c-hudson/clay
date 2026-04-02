@@ -128,6 +128,25 @@ fn load_user_theme_css() -> String {
     theme_file.get(&gui_theme_name).to_css_vars()
 }
 
+/// Show a modal error dialog. On Windows this uses MessageBoxW; elsewhere prints to stderr.
+fn show_error_dialog(title: &str, message: &str) {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        extern "system" {
+            fn MessageBoxW(hwnd: *mut std::ffi::c_void, text: *const u16, caption: *const u16, utype: u32) -> i32;
+        }
+        let title_wide: Vec<u16> = OsStr::new(title).encode_wide().chain(std::iter::once(0)).collect();
+        let msg_wide: Vec<u16> = OsStr::new(message).encode_wide().chain(std::iter::once(0)).collect();
+        unsafe { MessageBoxW(std::ptr::null_mut(), msg_wide.as_ptr(), title_wide.as_ptr(), 0x10); }
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("{}: {}", title, message);
+    }
+}
+
 /// Master mode: run App headlessly with a local WebSocket, open WebView window
 pub fn run_master_webgui() -> io::Result<()> {
 
@@ -151,6 +170,25 @@ pub fn run_master_webgui() -> io::Result<()> {
         let _ = crate::persistence::load_settings(&mut tmp_app);
         tmp_app.settings.http_port
     };
+
+    // Detect duplicate instances: probe the port before spawning anything.
+    // Skip the probe during hot-reload (CLAY_HTTP_LISTENER means we inherited the socket).
+    let is_reload = std::env::var("CLAY_HTTP_LISTENER").is_ok();
+    if !is_reload {
+        if let Err(e) = std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
+            let msg = if e.kind() == io::ErrorKind::AddrInUse {
+                format!(
+                    "Clay is already running (port {} is in use).\n\nOnly one instance of Clay can run at a time.",
+                    port
+                )
+            } else {
+                format!("Clay failed to start: could not bind port {}.\n\n{}", port, e)
+            };
+            show_error_dialog("Clay", &msg);
+            return Err(e);
+        }
+        // Drop the test listener immediately — the real bind happens inside run_app_headless.
+    }
 
     // Generate a random password using time + pid as entropy
     let random_bytes: [u8; 32] = {

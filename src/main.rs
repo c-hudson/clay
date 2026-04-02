@@ -11464,6 +11464,11 @@ pub async fn run_app_headless(
                             }
                         }
                     }
+                    AppEvent::Prompt(ref world_name, ref prompt_bytes) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_prompt(world_idx, prompt_bytes);
+                        }
+                    }
                     _ => {}
                 }
             }
