@@ -8047,7 +8047,7 @@
                     }
                 } else if (e.key === 'Enter') {
                     e.preventDefault();
-                    switchToSelectedWorld();
+                    connectSelectedWorld();
                 }
                 return;
             }
