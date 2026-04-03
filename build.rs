@@ -8,9 +8,10 @@ fn main() {
     let mut files: BTreeSet<String> = BTreeSet::new();
     collect_source_files(Path::new("src"), &mut files);
 
-    // Also include build.rs itself and Cargo.toml
+    // Also include build.rs, Cargo.toml, and embedded assets
     files.insert("build.rs".to_string());
     files.insert("Cargo.toml".to_string());
+    files.insert("clay2.png".to_string());
 
     // Compute hash of all file contents and find most recent modification time
     let mut hasher = Sha256::new();
@@ -48,6 +49,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=clay2.png");
 
     // On Windows, embed the application icon into the executable
     #[cfg(target_os = "windows")]
