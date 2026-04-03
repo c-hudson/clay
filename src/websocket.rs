@@ -429,8 +429,8 @@ pub struct WorldStateMsg {
 }
 
 /// World settings for WebSocket protocol
-/// Password field is empty when sent from server; has_password indicates if one is configured.
-/// Client sends encrypted password only when user edits it.
+/// Password is sent as plaintext to authenticated clients (stored encrypted in .dat file).
+/// has_password mirrors whether the password field is non-empty.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorldSettingsMsg {
     pub hostname: String,

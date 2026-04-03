@@ -4,6 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Critical Rules
 
+**All UI changes must be reflected in ALL interfaces.** Any new field, option, or window added to one interface (console TUI, web, webview-GUI) must be added to all three. New world/settings fields must also be saved to `~/.clay.dat` in `persistence.rs` and loaded on startup and `/reload`.
+
+**World passwords are stored encrypted in `.clay.dat` but sent as plaintext to authenticated WebSocket clients and displayed as readable text in all UI editors.** Do not hide or mask world passwords in the world editor — the encryption is for at-rest storage only. The `has_password` field mirrors whether the password is non-empty.
+
 **NEVER write debug output to stdout or stderr (no `println!`, `eprintln!`, `dbg!`).** Debug output corrupts the TUI. Use instead:
 - `debug_log(true, msg)` for always-on logging (writes to `clay.debug.log`)
 - `debug_log(is_debug_enabled(), msg)` for user-toggled debug

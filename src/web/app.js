@@ -6446,14 +6446,8 @@
         elements.worldEditHostname.value = world.settings?.hostname || '';
         elements.worldEditPort.value = world.settings?.port || '';
         elements.worldEditUser.value = world.settings?.user || '';
-        // Show placeholder if password is configured but not sent (server sends empty + has_password)
-        if (world.settings?.has_password && !world.settings?.password) {
-            elements.worldEditPassword.value = '';
-            elements.worldEditPassword.placeholder = '••••••••';
-        } else {
-            elements.worldEditPassword.value = world.settings?.password || '';
-            elements.worldEditPassword.placeholder = '';
-        }
+        elements.worldEditPassword.value = world.settings?.password || '';
+        elements.worldEditPassword.placeholder = '';
         const logEnabled = world.settings?.log_enabled || false;
         if (logEnabled) {
             elements.worldEditLoggingToggle.classList.add('active');
