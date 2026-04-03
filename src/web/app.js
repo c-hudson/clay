@@ -142,6 +142,7 @@
         worldEditEncodingSelect: document.getElementById('world-edit-encoding-select'),
         worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
         worldEditGmcpPackages: document.getElementById('world-edit-gmcp-packages'),
+        worldEditAutoReconnect: document.getElementById('world-edit-auto-reconnect'),
         worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
         worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
@@ -6463,6 +6464,9 @@
         if (elements.worldEditGmcpPackages) {
             elements.worldEditGmcpPackages.value = world.settings?.gmcp_packages || '';
         }
+        if (elements.worldEditAutoReconnect) {
+            elements.worldEditAutoReconnect.value = world.settings?.auto_reconnect_secs ?? 0;
+        }
 
         // Set toggle and selects
         const useSsl = world.settings?.use_ssl || false;
@@ -6524,7 +6528,8 @@
             auto_login: elements.worldEditAutoLoginSelect.value,
             keep_alive_type: elements.worldEditKeepAliveSelect.value,
             keep_alive_cmd: elements.worldEditKeepAliveCmd.value,
-            gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : ''
+            gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : '',
+            auto_reconnect_secs: parseInt(elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value : '0', 10) || 0
         });
 
         // Update local state
@@ -6543,6 +6548,9 @@
         world.settings.keep_alive_cmd = elements.worldEditKeepAliveCmd.value;
         if (elements.worldEditGmcpPackages) {
             world.settings.gmcp_packages = elements.worldEditGmcpPackages.value;
+        }
+        if (elements.worldEditAutoReconnect) {
+            world.settings.auto_reconnect_secs = parseInt(elements.worldEditAutoReconnect.value, 10) || 0;
         }
 
         closeWorldEditorPopup();
