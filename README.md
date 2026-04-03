@@ -1,4 +1,8 @@
+<div align="center">
+<img src="clay2.png" width="200" alt="Clay">
+
 # Clay MUD Client
+</div>
 
 A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi-world support, ANSI color rendering, spell checking, tinyfugue compatibility and remote viewing with a web interface and android app.
 
