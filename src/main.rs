@@ -6907,7 +6907,10 @@ impl App {
                         hostname: world.settings.hostname.clone(),
                         port: world.settings.port.clone(),
                         user: world.settings.user.clone(),
-                        password: world.settings.password.clone(),
+                        password: {
+                            let p = persistence::decrypt_password(&world.settings.password);
+                            if p.starts_with("ENC:") { String::new() } else { p }
+                        },
                         has_password: !world.settings.password.is_empty(),
                         use_ssl: world.settings.use_ssl,
                         log_enabled: world.settings.log_enabled,
@@ -7110,8 +7113,8 @@ impl App {
                     self.worlds[world_index].settings.hostname = hostname.clone();
                     self.worlds[world_index].settings.port = port.clone();
                     self.worlds[world_index].settings.user = user.clone();
-                    // Only update password if client sent one (empty means "not changed")
-                    if !password.is_empty() {
+                    // Only update password if client sent a non-empty plaintext value
+                    if !password.is_empty() && !password.starts_with("ENC:") {
                         self.worlds[world_index].settings.password = password.clone();
                     }
                     self.worlds[world_index].settings.use_ssl = use_ssl;
@@ -7818,7 +7821,10 @@ impl App {
                     hostname: world.settings.hostname.clone(),
                     port: world.settings.port.clone(),
                     user: world.settings.user.clone(),
-                    password: world.settings.password.clone(),
+                    password: {
+                        let p = persistence::decrypt_password(&world.settings.password);
+                        if p.starts_with("ENC:") { String::new() } else { p }
+                    },
                     has_password: !world.settings.password.is_empty(),
                     use_ssl: world.settings.use_ssl,
                     log_enabled: world.settings.log_enabled,
