@@ -92,7 +92,7 @@ tao = { version = "0.34", optional = true }
 winres = "0.1"
 
 [features]
-default = ["rustls-backend"]
+default = ["rustls-backend", "native-audio"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
 native-audio = ["rodio"]
