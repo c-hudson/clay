@@ -85,8 +85,20 @@ fn embed_windows_icon() {
         println!("cargo:rerun-if-changed=clay_icon.png");
     }
 
-    if let Err(e) = res.compile() {
-        eprintln!("cargo:warning=Failed to compile Windows resource: {}", e);
+    match res.compile() {
+        Ok(()) => {
+            // Also directly pass resource.res to the linker for clay.exe specifically.
+            // wry/webview2 emit their own `resource.lib` which can shadow ours when the
+            // linker searches by name. Passing the full path bypasses the name collision.
+            let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
+            let res_path = Path::new(&out_dir).join("resource.res");
+            if res_path.exists() {
+                println!("cargo:rustc-link-arg-bins=clay={}", res_path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("cargo:warning=Failed to compile Windows resource: {}", e);
+        }
     }
 }
 
