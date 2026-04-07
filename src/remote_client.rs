@@ -1405,7 +1405,9 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive);
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd.clone();
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages.clone();
-                    app.worlds[idx].settings.auto_reconnect_secs = settings.auto_reconnect_secs;
+                    let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
+                    app.worlds[idx].settings.auto_reconnect_secs = ar_secs;
+                    app.worlds[idx].settings.auto_reconnect_on_web = ar_on_web;
 
                     // Send UpdateWorldSettings to daemon
                     let _ = ws_tx.send(WsMessage::UpdateWorldSettings {

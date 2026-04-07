@@ -227,12 +227,12 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
         ))
         .with_field(Field::new(
             WORLD_FIELD_GMCP_PACKAGES,
-            "GMCP Packages",
+            "GMCP",
             FieldKind::text(&settings.gmcp_packages),
         ))
         .with_field(Field::new(
             WORLD_FIELD_AUTO_RECONNECT,
-            "Auto Reconnect",
+            "Reconnect",
             FieldKind::text(&settings.auto_reconnect_secs),
         ))
         // Slack fields
@@ -337,12 +337,14 @@ fn world_editor_help_text() -> Vec<String> {
         "  Custom: Sends a custom command you specify.",
         "  Generic: Sends a generic keep-alive packet.",
         "",
-        "GMCP Packages: Space-separated GMCP packages to",
-        "  request from the server (e.g. Char.Items Room.Info).",
+        "GMCP: Space-separated GMCP packages to request from",
+        "  the server (e.g. Char.Items Room.Info).",
         "",
-        "Auto Reconnect: Seconds to wait before reconnecting",
-        "  after a disconnect. 0 = disabled. Only reconnects if",
-        "  the world had been connected at least once.",
+        "Reconnect: When/how to reconnect after disconnect.",
+        "  0 = disabled, 30 = reconnect after 30 seconds,",
+        "  web = reconnect when a web/Android client connects,",
+        "  web,30 = both. Only reconnects if the world had",
+        "  been connected at least once.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 

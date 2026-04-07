@@ -197,7 +197,7 @@ pub enum WsMessage {
         #[serde(default)]
         gmcp_packages: String,
         #[serde(default)]
-        auto_reconnect_secs: u32,
+        auto_reconnect_secs: String,
     },
     UpdateGlobalSettings {
         more_mode_enabled: bool,
@@ -449,7 +449,7 @@ pub struct WorldSettingsMsg {
     #[serde(default)]
     pub has_password: bool,  // True if a password is configured (password field is empty)
     #[serde(default)]
-    pub auto_reconnect_secs: u32,
+    pub auto_reconnect_secs: String,
 }
 
 /// Global settings for WebSocket protocol
@@ -1004,28 +1004,58 @@ pub fn hash_with_challenge(stored_hash: &str, challenge: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Check if an IP address is in the allow list (supports wildcards like 192.168.1.*)
-pub fn is_ip_in_allow_list(ip: &str, allow_list: &[String]) -> bool {
-    // Normalize localhost
+/// Returns true if an allow list pattern is a hostname pattern (e.g. "*.rd.shawcable.net")
+/// rather than an IP pattern (e.g. "192.168.1.*").
+pub fn is_hostname_pattern(pattern: &str) -> bool {
+    let p = pattern.trim();
+    if p == "*" || p == "localhost" || p == "127.0.0.1" || p == "::1" {
+        return false;
+    }
+    // Hostname wildcard prefix, or any alphabetic character (rules out pure IP patterns)
+    p.starts_with("*.") || p.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Match a resolved hostname against a hostname pattern (case-insensitive).
+/// Supports exact match and `*.suffix` wildcard (matches one or more subdomain labels).
+fn matches_hostname_pattern(hostname: &str, pattern: &str) -> bool {
+    let hn = hostname.trim().to_ascii_lowercase();
+    let pat = pattern.trim().to_ascii_lowercase();
+    if let Some(suffix) = pat.strip_prefix("*.") {
+        // *.example.com matches foo.example.com but not example.com itself
+        hn.ends_with(&format!(".{suffix}"))
+    } else {
+        hn == pat
+    }
+}
+
+/// Check if an IP or its resolved hostname is in the allow list.
+/// Handles both IP patterns (e.g. `192.168.1.*`) and hostname patterns (e.g. `*.example.com`).
+/// Pass `hostname` as the result of a reverse DNS lookup when hostname patterns are present.
+pub fn is_in_allow_list(ip: &str, hostname: Option<&str>, allow_list: &[String]) -> bool {
     let normalized_ip = if ip == "127.0.0.1" || ip == "::1" { "localhost" } else { ip };
 
     for pattern in allow_list {
         let trimmed = pattern.trim();
 
-        // Bare "*" matches all hosts
+        // Bare "*" matches everything
         if trimmed == "*" {
             return true;
         }
 
-        // Normalize pattern for localhost comparison
         let normalized_pattern = if trimmed == "127.0.0.1" || trimmed == "::1" { "localhost" } else { trimmed };
 
-        if let Some(prefix) = normalized_pattern.strip_suffix('*') {
-            // Reject overly broad wildcards (must have at least 4 chars before * and contain a dot)
+        if is_hostname_pattern(normalized_pattern) {
+            // Match against resolved hostname
+            if let Some(hn) = hostname {
+                if matches_hostname_pattern(hn, normalized_pattern) {
+                    return true;
+                }
+            }
+        } else if let Some(prefix) = normalized_pattern.strip_suffix('*') {
+            // IP wildcard: reject overly broad patterns (must have at least 4 chars and a dot)
             if prefix.len() < 4 || !prefix.contains('.') {
                 continue;
             }
-            // Wildcard match: check if IP starts with pattern prefix
             if normalized_ip.starts_with(prefix) {
                 return true;
             }
@@ -1034,6 +1064,68 @@ pub fn is_ip_in_allow_list(ip: &str, allow_list: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Check if an IP address is in the allow list (IP patterns only; no hostname lookup).
+pub fn is_ip_in_allow_list(ip: &str, allow_list: &[String]) -> bool {
+    is_in_allow_list(ip, None, allow_list)
+}
+
+/// Perform an async reverse DNS lookup on an IP address.
+/// Returns the resolved hostname, or None if lookup fails or no PTR record exists.
+pub async fn reverse_dns_lookup(ip: &str) -> Option<String> {
+    let ip_owned = ip.to_string();
+    tokio::task::spawn_blocking(move || reverse_dns_lookup_blocking(&ip_owned))
+        .await
+        .ok()
+        .flatten()
+}
+
+#[cfg(unix)]
+fn reverse_dns_lookup_blocking(ip: &str) -> Option<String> {
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    let addr = IpAddr::from_str(ip).ok()?;
+    let mut host_buf = vec![0u8; 256];
+
+    let ret = match addr {
+        IpAddr::V4(v4) => unsafe {
+            let mut sa: libc::sockaddr_in = std::mem::zeroed();
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
+            libc::getnameinfo(
+                &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                host_buf.as_mut_ptr() as *mut libc::c_char,
+                host_buf.len() as libc::socklen_t,
+                std::ptr::null_mut(), 0, 0,
+            )
+        },
+        IpAddr::V6(v6) => unsafe {
+            let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_addr.s6_addr = v6.octets();
+            libc::getnameinfo(
+                &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                host_buf.as_mut_ptr() as *mut libc::c_char,
+                host_buf.len() as libc::socklen_t,
+                std::ptr::null_mut(), 0, 0,
+            )
+        },
+    };
+
+    if ret != 0 { return None; }
+    let end = host_buf.iter().position(|&b| b == 0).unwrap_or(host_buf.len());
+    let hostname = String::from_utf8(host_buf[..end].to_vec()).ok()?;
+    // getnameinfo returns the IP string when no PTR record exists — filter it out
+    if hostname == ip || hostname.is_empty() { None } else { Some(hostname) }
+}
+
+#[cfg(not(unix))]
+fn reverse_dns_lookup_blocking(_ip: &str) -> Option<String> {
+    None
 }
 
 /// Check if any entry in a CSV allow list string contains a bare "*" wildcard.
@@ -1242,8 +1334,18 @@ where
     // Auth key validation happens later (after WS handshake) and always bypasses allow list.
     // Here we just check if the IP is eligible for password-based auth.
     let in_allow_list = is_localhost || {
+        // Determine if any hostname patterns require a reverse DNS lookup
+        let has_hostname_patterns = {
+            let allow_list_guard = allow_list.read().unwrap();
+            allow_list_guard.iter().any(|p| is_hostname_pattern(p.trim()))
+        };
+        let hostname = if has_hostname_patterns {
+            reverse_dns_lookup(&client_ip).await
+        } else {
+            None
+        };
         let allow_list_guard = allow_list.read().unwrap();
-        is_ip_in_allow_list(&client_ip, &allow_list_guard)
+        is_in_allow_list(&client_ip, hostname.as_deref(), &allow_list_guard)
     };
     let allow_list_empty = !is_localhost && {
         let allow_list_guard = allow_list.read().unwrap();

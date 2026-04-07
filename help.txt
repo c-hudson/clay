@@ -1,0 +1,1597 @@
+============================================================
+/help (no arguments)
+============================================================
+
+TinyFugue Commands (use / prefix)
+
+Variables:
+  /set [name [value]]  - Set/list global variables
+  /unset name          - Remove a variable
+  /let name value      - Set a local variable
+  /setenv name         - Export variable to environment
+  /listvar [pattern]   - List variables
+
+Expressions:
+  /expr expression     - Evaluate and display result
+  /test expression     - Evaluate expression, set %?
+  /eval expression     - Evaluate and execute as command
+  /not expression      - Negate expression, set %?
+  /return [expr]       - Return from macro, set %?
+
+Control Flow:
+  /if (expr) cmd       - Conditional execution
+  /if /elseif /else /endif - Multi-line conditional
+  /while (expr) /done  - While loop
+  /for var s e [step] /done - For loop
+  /break               - Exit loop
+
+Macros/Triggers:
+  /def [opts] name=body - Define macro (-t -m -p -F -1 -ag -h -b)
+  /undef name          - Remove macro
+  /list [pattern]      - List macros
+  /purge [pattern]     - Remove all macros
+  /trig pattern=body   - Create trigger (glob mode)
+  /trigp pri pat=body  - Trigger with priority
+  /trigc chance pat=body - Trigger with probability
+  /trigpc pri ch pat=body - Trigger with priority+chance
+  /untrig pattern      - Remove trigger by pattern
+
+Hooks & Keys:
+  /bind key=command    - Bind key to command
+  /unbind key          - Remove key binding
+  /dokey name          - Simulate named edit key
+
+Output:
+  /echo message        - Display message locally
+  /escape meta string  - Escape metacharacters in string
+  /send [-w world] text - Send text to MUD
+  /beep                - Terminal bell
+  /quote text          - Send without substitution
+  /hilite [pattern]    - Hilite matching lines (-ah trigger)
+  /nohilite [pattern]  - Remove hilite
+  /partial regexp      - Hilite matched portion (-Ph -F)
+  /gag [pattern]       - List gags, or suppress matching lines
+  /ungag pattern       - Remove gag
+  /recall [pattern]    - Search output history
+  /substitute text     - Replace current trigger line
+
+Variables:
+  /export variable     - Export variable to environment
+  /toggle var          - Toggle variable between 0 and 1
+
+String:
+  /replace old new str - Replace occurrences in string
+  /tr domain range str - Translate characters
+
+World Management:
+  /fg [name]           - Switch to or list worlds
+  /connect [world]     - Connect to a world
+  /addworld [opts] name [args] - Add/update world
+  /dc, /disconnect     - Disconnect current world
+  /unworld name        - Remove world
+
+Spam Detection:
+  /watchdog [off|on|n1 [n2]] - Suppress duplicate lines
+  /watchname [off|on|n1 [n2]] - Suppress repeated names
+
+File Operations:
+  /load [-q] filename  - Load TF script (-q = quiet)
+  /require [-q] file   - Load file if not already loaded
+  /loaded token        - Mark file as loaded (for /require)
+  /save filename       - Save macros to file
+  /lcd path            - Change local directory
+  /exit                - Abort loading file / quit
+
+Process:
+  /repeat [opts] count cmd - Repeat command on timer
+  /ps                  - List background processes
+  /kill id             - Kill background process
+
+Settings:
+  /histsize [-i] [n]   - Get/set history size
+  /localecho [on|off]  - Toggle local echo
+  /sub [off|on|full]   - Set substitution mode
+  /suspend             - Suspend process (Ctrl+Z)
+
+Misc:
+  /time                - Display current time
+  /sh command          - Execute shell command
+  /tfhelp [topic]      - Show this TF help
+  /version             - Show version info
+  /quit                - Exit Clay
+
+Use /tfhelp for TF version of /help.
+
+Variable Substitution:
+  %{varname}           - Variable value
+  %1-%9, %*            - Positional params from trigger
+  %L, %R               - Left/right of match
+  %%                   - Literal percent sign
+
+Use /tfhelp <command> for detailed help on specific commands.
+Use /tfhelp functions for list of expression functions.
+
+============================================================
+/help addworld
+============================================================
+
+/addworld [-xe] [-Ttype] name [char pass] host port
+
+Define a new world or update an existing world.
+
+Command form:
+  /addworld MyMUD mud.example.com 4000
+  /addworld -x SecureMUD secure.example.com 4443
+  /addworld MyMUD player password mud.example.com 4000
+
+Function form:
+  addworld(name, type, host, port, char, pass, file, flags)
+
+Options:
+  -x    Use SSL/TLS for connections
+  -e    Echo sent text (ignored)
+  -Ttype World type (ignored, defaults to MUD)
+  -p    No proxy (ignored)
+
+Function flags string:
+  "x" = use SSL
+
+Examples:
+  /addworld Cave cave.tcp.com 2283
+  /addworld -x Secure secure.tcp.com 4443
+  /test addworld("Cave", "", "cave.tcp.com", "2283")
+  /test addworld("Secure", "", "ssl.tcp.com", "4443", "", "", "", "x")
+
+============================================================
+/help bamf
+============================================================
+
+/bamf [off|on|old]
+
+Controls portal handling. A portal is text from a MUD server
+of the form:
+  #### Please reconnect to Name@addr (host) port NNN ####
+
+If bamf is OFF (default), portal lines have no effect.
+
+If bamf is ON, Clay will disconnect from the current world
+and connect to the new world specified in the portal.
+
+If bamf is OLD, Clay will connect to the new world without
+disconnecting from the current one.
+
+If %{login} is also set to 1, Clay will auto-login to the
+new world using the current world's username and password.
+
+Warning: On many servers, other users can spoof portal text
+to redirect your client. Enable with caution.
+
+Examples:
+  /bamf on           Enable portals (disconnect + reconnect)
+  /bamf old          Enable portals (keep old connection)
+  /bamf off          Disable portals
+  /set login=1       Enable auto-login on portal
+
+============================================================
+/help beep
+============================================================
+
+/beep [count]
+
+Sound the terminal bell.
+Optional count (default 1) specifies how many beeps.
+
+Example: /beep 3
+
+============================================================
+/help bind
+============================================================
+
+/bind key = command
+
+Bind a key to execute a command.
+Key names: F1-F12, ^A-^Z (Ctrl), @a-@z (Alt), PgUp, PgDn, Home, End, Insert, Delete
+Example: /bind F5 = cast heal
+
+============================================================
+/help cat
+============================================================
+
+/cat and /paste are not supported in Clay.
+Use bracketed paste instead (paste normally into the input area).
+
+============================================================
+/help changes
+============================================================
+
+/changes
+
+Show TF changelog. Not implemented in Clay.
+Use /version for version info.
+
+============================================================
+/help connections
+============================================================
+
+/listsockets or /connections
+
+List all connected worlds. Maps to Clay's /connections command.
+
+============================================================
+/help dc
+============================================================
+
+/dc or /disconnect
+
+Disconnect from the current world.
+
+============================================================
+/help def
+============================================================
+
+/def [options] name = body
+Define a macro. Options:
+  -t"pattern"   Trigger pattern (fires on matching MUD output)
+  -mtype        Match type: simple, glob (default), regexp
+  -p priority   Execution priority (higher = first)
+  -F            Fall-through (continue checking other triggers)
+  -1            One-shot (delete after firing once)
+  -n count      Fire only N times
+  -ag           Gag (suppress) matched line
+  -ah           Highlight matched line
+  -ab           Bold
+  -au           Underline
+  -E"expr"      Conditional (only fire if expression is true)
+  -c chance     Probability (0.0-1.0)
+  -w world      Restrict to specific world
+  -h event      Hook event (CONNECT, DISCONNECT, etc.)
+  -b"key"       Key binding
+
+Examples:
+  /def -t"You are hungry" eat = get food bag%; eat food
+  /def -t"^(\w+) tells you" -mregexp reply = tell %1 Got it!
+  /def -hCONNECT greet = look
+
+============================================================
+/help disconnect
+============================================================
+
+/dc or /disconnect
+
+Disconnect from the current world.
+
+============================================================
+/help dokey
+============================================================
+
+/dokey keyname
+
+Simulate pressing a named edit key.
+
+Key names:
+  BSPC/BACKSPACE  - Backspace
+  DCH/DELETE      - Delete character
+  DLINE           - Delete entire line
+  LEFT/RIGHT      - Move cursor
+  HOME/END        - Start/end of line
+  UP/RECALLB      - Previous history
+  DOWN/RECALLF    - Next history
+  WLEFT/WRIGHT    - Word left/right
+  NEWLINE/ENTER   - Submit input
+  HPAGE/PAGEUP    - Page up
+  PAGE/PAGEDN     - Page down
+  REFRESH         - Redraw screen
+
+============================================================
+/help echo
+============================================================
+
+/echo message
+
+Display a message locally (not sent to MUD).
+Variable substitution is performed on the message.
+Example: /echo Hello %{name}!
+
+============================================================
+/help edit
+============================================================
+
+/edit
+
+Open macro in external editor. Not implemented in Clay.
+
+============================================================
+/help escape
+============================================================
+
+/escape metacharacters string
+
+Echoes string with any metacharacters or '\' characters
+preceded by a '\' character.
+
+Function form: $[escape(metacharacters, string)]
+
+Example:
+  /def blue = /def -aCblue -t"$(/escape " %*)"
+  /blue * pages, "*"
+  => /def -aCblue -t"* pages, \"*\""
+
+============================================================
+/help eval
+============================================================
+
+/eval expression
+
+Evaluate expression and execute the result as a command.
+If the result starts with /, it is executed as a Clay command.
+Otherwise it is sent to the MUD.
+
+Example:
+  /set cmd=/echo hello
+  /eval cmd   - Executes /echo hello
+
+============================================================
+/help exit
+============================================================
+
+/exit
+
+Abort loading the current file early.
+
+When called during /load or /require, stops reading the
+current file immediately. Commands already executed are
+not undone.
+
+When called outside of file loading, /exit is equivalent
+to /quit (exits Clay).
+
+============================================================
+/help export
+============================================================
+
+/export variable
+
+Makes a global variable an environment variable,
+available to /sh and /quote commands.
+Local variables may not be exported.
+
+See also: /setenv
+
+============================================================
+/help expr
+============================================================
+
+/expr expression
+
+Evaluate expression and display result.
+Operators: + - * / % == != < > <= >= & | ! =~ !~ ?:
+Functions: strlen() substr() strcat() tolower() toupper() rand() time() abs() min() max()
+Example: /expr 2 + 2 * 3
+
+============================================================
+/help fg
+============================================================
+
+/fg [world]
+
+Switch to a world or list worlds.
+Without arguments, equivalent to /connections.
+
+Example: /fg MyMUD
+
+============================================================
+/help finger
+============================================================
+
+/telnet and /finger are not implemented.
+Use /sh to run system commands instead.
+
+Example: /sh telnet host port
+
+============================================================
+/help for
+============================================================
+
+/for variable start end [step] ... /done
+
+Loop from start to end.
+Example:
+  /for i 1 5 /echo Number %i /done
+
+============================================================
+/help func
+============================================================
+
+Expression Functions
+
+String Functions:
+  strlen(str)              - Length of string
+  substr(str, start [,len]) - Substring extraction
+  strcat(s1, s2, ...)      - Concatenate strings
+  strstr(str, substr)      - Find substring position (-1 if not found)
+  strchr(str, chars)       - Find first char from set (-1 if not found)
+  strrchr(str, chars)      - Find last char from set (-1 if not found)
+  strcmp(s, t)             - Compare strings (<0, 0, >0)
+  strncmp(s, t, n)         - Compare first n chars
+  strrep(str, n)           - Repeat string n times
+  tolower(str)             - Convert to lowercase
+  toupper(str)             - Convert to uppercase
+  escape(meta, str)        - Escape metacharacters in string
+  replace(str, old, new [,count]) - Replace occurrences
+  tr(domain, range, str)   - Translate characters
+  ascii(str)               - ASCII code of first character
+  char(code)               - Character from ASCII code
+  sprintf(fmt, args...)    - Formatted string (%s, %d, %c, %%)
+  pad(s, w, ...)           - Pad strings (+ = right-justify, - = left)
+
+Math Functions:
+  abs(n)                   - Absolute value
+  min(a, b, ...)           - Minimum value
+  max(a, b, ...)           - Maximum value
+  mod(i, j)                - Remainder of i / j
+  trunc(x)                 - Integer part of float
+  rand([max])              - Random number
+  rand(min, max)           - Random in range [min, max]
+  sin(x), cos(x), tan(x)   - Trigonometric (radians)
+  asin(x), acos(x), atan(x) - Inverse trig
+  exp(x)                   - e^x
+  pow(x, y)                - x^y
+  sqrt(x)                  - Square root
+  log(x)                   - Natural logarithm
+  log10(x)                 - Base-10 logarithm
+
+Pattern Matching:
+  regmatch(pattern, str)   - Regex match, sets %P0-%P9 captures
+
+World Functions:
+  fg_world()               - Current world name
+  world_info(field [,world]) - Get world info (name/host/port/character)
+  nactive()                - Count of connected worlds
+  nactive(world)           - Unseen lines in named world
+  nworlds()                - Total world count
+  is_connected([world])    - Check if world is connected
+  idle([world])            - Seconds since last receive
+  sidle([world])           - Seconds since last send
+
+Info Functions:
+  time()                   - Current Unix timestamp
+  ftime(fmt, time)         - Format timestamp (%Y %m %d %H %M %S)
+  columns()                - Screen width
+  lines()                  - Screen height
+  moresize()               - Lines queued at more prompt
+  getpid()                 - Process ID
+  systype()                - System type ("unix")
+  filename(path)           - Expand ~ in path
+
+Macro Functions:
+  ismacro(name)            - Check if macro exists
+  getopts(opts, args)      - Parse command options
+
+Command Functions:
+  echo(text [,attrs])      - Display local message (queues output)
+  send(text [,world [,f]])  - Send text to MUD (f=0/"off": no EOL)
+  substitute(text [,attrs]) - Replace trigger line with text
+  keycode(str)             - Key sequence for string (^X for ctrl)
+
+Keyboard Buffer:
+  kbhead()                 - Text before cursor
+  kbtail()                 - Text after cursor
+  kbpoint()                - Cursor position
+  kblen()                  - Input buffer length
+  kbgoto(pos)              - Move cursor to position
+  kbdel(count)             - Delete characters
+  kbmatch([pos])           - Find matching brace/paren
+  kbword()                 - Word at cursor
+  kbwordleft([pos])        - Position of word start left of pos
+  kbwordright([pos])       - Position past word end right of pos
+  input(text)              - Insert text at cursor
+
+File I/O:
+  tfopen(path, mode)       - Open file (r/w/a), returns handle
+  tfclose(handle)          - Close file
+  tfread(handle, var)      - Read line into variable
+  tfwrite(handle, text)    - Write text to file
+  tfflush(handle [,auto])  - Flush file buffer (auto: on/off)
+  tfeof(handle)            - Check for end of file
+  fwrite(file, text)       - Append text to file (simple)
+
+Macro/Builtin Call Syntax:
+  macroname(arg1, arg2)    - Call macro with positional params (%1, %2)
+  command(args)            - Call builtin as function (e.g. def("-t..."))
+
+Usage: $[function(args)] or in /expr//test
+
+============================================================
+/help funcs
+============================================================
+
+Expression Functions
+
+String Functions:
+  strlen(str)              - Length of string
+  substr(str, start [,len]) - Substring extraction
+  strcat(s1, s2, ...)      - Concatenate strings
+  strstr(str, substr)      - Find substring position (-1 if not found)
+  strchr(str, chars)       - Find first char from set (-1 if not found)
+  strrchr(str, chars)      - Find last char from set (-1 if not found)
+  strcmp(s, t)             - Compare strings (<0, 0, >0)
+  strncmp(s, t, n)         - Compare first n chars
+  strrep(str, n)           - Repeat string n times
+  tolower(str)             - Convert to lowercase
+  toupper(str)             - Convert to uppercase
+  escape(meta, str)        - Escape metacharacters in string
+  replace(str, old, new [,count]) - Replace occurrences
+  tr(domain, range, str)   - Translate characters
+  ascii(str)               - ASCII code of first character
+  char(code)               - Character from ASCII code
+  sprintf(fmt, args...)    - Formatted string (%s, %d, %c, %%)
+  pad(s, w, ...)           - Pad strings (+ = right-justify, - = left)
+
+Math Functions:
+  abs(n)                   - Absolute value
+  min(a, b, ...)           - Minimum value
+  max(a, b, ...)           - Maximum value
+  mod(i, j)                - Remainder of i / j
+  trunc(x)                 - Integer part of float
+  rand([max])              - Random number
+  rand(min, max)           - Random in range [min, max]
+  sin(x), cos(x), tan(x)   - Trigonometric (radians)
+  asin(x), acos(x), atan(x) - Inverse trig
+  exp(x)                   - e^x
+  pow(x, y)                - x^y
+  sqrt(x)                  - Square root
+  log(x)                   - Natural logarithm
+  log10(x)                 - Base-10 logarithm
+
+Pattern Matching:
+  regmatch(pattern, str)   - Regex match, sets %P0-%P9 captures
+
+World Functions:
+  fg_world()               - Current world name
+  world_info(field [,world]) - Get world info (name/host/port/character)
+  nactive()                - Count of connected worlds
+  nactive(world)           - Unseen lines in named world
+  nworlds()                - Total world count
+  is_connected([world])    - Check if world is connected
+  idle([world])            - Seconds since last receive
+  sidle([world])           - Seconds since last send
+
+Info Functions:
+  time()                   - Current Unix timestamp
+  ftime(fmt, time)         - Format timestamp (%Y %m %d %H %M %S)
+  columns()                - Screen width
+  lines()                  - Screen height
+  moresize()               - Lines queued at more prompt
+  getpid()                 - Process ID
+  systype()                - System type ("unix")
+  filename(path)           - Expand ~ in path
+
+Macro Functions:
+  ismacro(name)            - Check if macro exists
+  getopts(opts, args)      - Parse command options
+
+Command Functions:
+  echo(text [,attrs])      - Display local message (queues output)
+  send(text [,world [,f]])  - Send text to MUD (f=0/"off": no EOL)
+  substitute(text [,attrs]) - Replace trigger line with text
+  keycode(str)             - Key sequence for string (^X for ctrl)
+
+Keyboard Buffer:
+  kbhead()                 - Text before cursor
+  kbtail()                 - Text after cursor
+  kbpoint()                - Cursor position
+  kblen()                  - Input buffer length
+  kbgoto(pos)              - Move cursor to position
+  kbdel(count)             - Delete characters
+  kbmatch([pos])           - Find matching brace/paren
+  kbword()                 - Word at cursor
+  kbwordleft([pos])        - Position of word start left of pos
+  kbwordright([pos])       - Position past word end right of pos
+  input(text)              - Insert text at cursor
+
+File I/O:
+  tfopen(path, mode)       - Open file (r/w/a), returns handle
+  tfclose(handle)          - Close file
+  tfread(handle, var)      - Read line into variable
+  tfwrite(handle, text)    - Write text to file
+  tfflush(handle [,auto])  - Flush file buffer (auto: on/off)
+  tfeof(handle)            - Check for end of file
+  fwrite(file, text)       - Append text to file (simple)
+
+Macro/Builtin Call Syntax:
+  macroname(arg1, arg2)    - Call macro with positional params (%1, %2)
+  command(args)            - Call builtin as function (e.g. def("-t..."))
+
+Usage: $[function(args)] or in /expr//test
+
+============================================================
+/help functions
+============================================================
+
+Expression Functions
+
+String Functions:
+  strlen(str)              - Length of string
+  substr(str, start [,len]) - Substring extraction
+  strcat(s1, s2, ...)      - Concatenate strings
+  strstr(str, substr)      - Find substring position (-1 if not found)
+  strchr(str, chars)       - Find first char from set (-1 if not found)
+  strrchr(str, chars)      - Find last char from set (-1 if not found)
+  strcmp(s, t)             - Compare strings (<0, 0, >0)
+  strncmp(s, t, n)         - Compare first n chars
+  strrep(str, n)           - Repeat string n times
+  tolower(str)             - Convert to lowercase
+  toupper(str)             - Convert to uppercase
+  escape(meta, str)        - Escape metacharacters in string
+  replace(str, old, new [,count]) - Replace occurrences
+  tr(domain, range, str)   - Translate characters
+  ascii(str)               - ASCII code of first character
+  char(code)               - Character from ASCII code
+  sprintf(fmt, args...)    - Formatted string (%s, %d, %c, %%)
+  pad(s, w, ...)           - Pad strings (+ = right-justify, - = left)
+
+Math Functions:
+  abs(n)                   - Absolute value
+  min(a, b, ...)           - Minimum value
+  max(a, b, ...)           - Maximum value
+  mod(i, j)                - Remainder of i / j
+  trunc(x)                 - Integer part of float
+  rand([max])              - Random number
+  rand(min, max)           - Random in range [min, max]
+  sin(x), cos(x), tan(x)   - Trigonometric (radians)
+  asin(x), acos(x), atan(x) - Inverse trig
+  exp(x)                   - e^x
+  pow(x, y)                - x^y
+  sqrt(x)                  - Square root
+  log(x)                   - Natural logarithm
+  log10(x)                 - Base-10 logarithm
+
+Pattern Matching:
+  regmatch(pattern, str)   - Regex match, sets %P0-%P9 captures
+
+World Functions:
+  fg_world()               - Current world name
+  world_info(field [,world]) - Get world info (name/host/port/character)
+  nactive()                - Count of connected worlds
+  nactive(world)           - Unseen lines in named world
+  nworlds()                - Total world count
+  is_connected([world])    - Check if world is connected
+  idle([world])            - Seconds since last receive
+  sidle([world])           - Seconds since last send
+
+Info Functions:
+  time()                   - Current Unix timestamp
+  ftime(fmt, time)         - Format timestamp (%Y %m %d %H %M %S)
+  columns()                - Screen width
+  lines()                  - Screen height
+  moresize()               - Lines queued at more prompt
+  getpid()                 - Process ID
+  systype()                - System type ("unix")
+  filename(path)           - Expand ~ in path
+
+Macro Functions:
+  ismacro(name)            - Check if macro exists
+  getopts(opts, args)      - Parse command options
+
+Command Functions:
+  echo(text [,attrs])      - Display local message (queues output)
+  send(text [,world [,f]])  - Send text to MUD (f=0/"off": no EOL)
+  substitute(text [,attrs]) - Replace trigger line with text
+  keycode(str)             - Key sequence for string (^X for ctrl)
+
+Keyboard Buffer:
+  kbhead()                 - Text before cursor
+  kbtail()                 - Text after cursor
+  kbpoint()                - Cursor position
+  kblen()                  - Input buffer length
+  kbgoto(pos)              - Move cursor to position
+  kbdel(count)             - Delete characters
+  kbmatch([pos])           - Find matching brace/paren
+  kbword()                 - Word at cursor
+  kbwordleft([pos])        - Position of word start left of pos
+  kbwordright([pos])       - Position past word end right of pos
+  input(text)              - Insert text at cursor
+
+File I/O:
+  tfopen(path, mode)       - Open file (r/w/a), returns handle
+  tfclose(handle)          - Close file
+  tfread(handle, var)      - Read line into variable
+  tfwrite(handle, text)    - Write text to file
+  tfflush(handle [,auto])  - Flush file buffer (auto: on/off)
+  tfeof(handle)            - Check for end of file
+  fwrite(file, text)       - Append text to file (simple)
+
+Macro/Builtin Call Syntax:
+  macroname(arg1, arg2)    - Call macro with positional params (%1, %2)
+  command(args)            - Call builtin as function (e.g. def("-t..."))
+
+Usage: $[function(args)] or in /expr//test
+
+============================================================
+/help gag
+============================================================
+
+/gag [pattern]
+
+With no args: list all gag triggers.
+With a pattern: create a trigger that suppresses matching lines.
+Equivalent to: /def -ag -t"pattern"
+
+Example: /gag * has left the game.
+
+============================================================
+/help getfile
+============================================================
+
+/getfile and /putfile are not implemented.
+File transfer protocols are not supported.
+
+============================================================
+/help grab
+============================================================
+
+/grab text
+
+Replace the input buffer with the given text.
+If no text given, grab the last line of output.
+
+Example: /grab say 
+
+============================================================
+/help help
+============================================================
+
+/help [topic] or /tfhelp [topic]
+
+Show help on TF commands and features.
+
+Topics: set, echo, send, def, if, while, for, expr, test,
+  bind, hooks, repeat, load, recall, quote, gag, addworld,
+  watchdog, watchname, functions, and more.
+
+Example: /help def
+
+============================================================
+/help hilite
+============================================================
+
+/hilite [pattern [= response]]
+
+With no args: enables hilite (sets %{hilite} to 1).
+With args: creates a trigger that hilites matching lines.
+Equivalent to: /def -ah -t"pattern" [= response]
+
+Hilite style is set by %{hiliteattr} (default: B = bold).
+Example: /hilite {*} tried to kill you!
+
+============================================================
+/help histsize
+============================================================
+
+/histsize [-i] [size]
+
+Get or set the history buffer size.
+-i: Input history (default)
+
+Example: /histsize 500
+
+============================================================
+/help hook
+============================================================
+
+Hooks fire macros on events. Use /def -h<event> to register.
+
+Events:
+  CONNECT     - When connected to MUD
+  DISCONNECT  - When disconnected
+  LOGIN       - After login
+  PROMPT      - On prompt received
+  SEND        - Before sending command
+
+Example: /def -hCONNECT auto_look = look
+
+============================================================
+/help hooks
+============================================================
+
+Hooks fire macros on events. Use /def -h<event> to register.
+
+Events:
+  CONNECT     - When connected to MUD
+  DISCONNECT  - When disconnected
+  LOGIN       - After login
+  PROMPT      - On prompt received
+  SEND        - Before sending command
+
+Example: /def -hCONNECT auto_look = look
+
+============================================================
+/help if
+============================================================
+
+/if (expression) command
+/if (expr) ... /elseif (expr) ... /else ... /endif
+
+Conditional execution.
+Examples:
+  /if (hp < 50) cast heal
+  /if (%1 == "yes") /echo Confirmed /else /echo Cancelled /endif
+
+============================================================
+/help input
+============================================================
+
+/input text
+
+Insert text into the input buffer at the cursor position.
+
+Function form: $[input(text)]
+
+Example: /input say hello
+
+============================================================
+/help kill
+============================================================
+
+/kill pid
+
+Kill a background process by its PID.
+Use /ps to see running processes.
+
+============================================================
+/help lcd
+============================================================
+
+/lcd path
+
+Change the local working directory.
+Affects /sh, /load, and file operations.
+
+Example: /lcd ~/tf-scripts
+
+============================================================
+/help let
+============================================================
+
+/let name=value
+
+Set a local variable in the current scope.
+Local variables shadow globals and are removed when
+the macro finishes executing.
+
+Examples:
+  /let x=hello
+  /let count=0
+
+============================================================
+/help list
+============================================================
+
+/list [pattern]
+
+List macro definitions matching a pattern.
+Without a pattern, lists all macros.
+Glob patterns (* and ?) are supported.
+
+Example: /list auto_*
+
+============================================================
+/help listsockets
+============================================================
+
+/listsockets or /connections
+
+List all connected worlds. Maps to Clay's /connections command.
+
+============================================================
+/help liststreams
+============================================================
+
+/liststreams
+
+List active streams. Not implemented in Clay.
+
+============================================================
+/help listvar
+============================================================
+
+/listvar [pattern]
+
+List global variables matching a pattern.
+Without a pattern, lists all variables.
+Glob patterns (* and ?) are supported.
+
+Examples:
+  /listvar        - List all variables
+  /listvar foo*   - List variables starting with foo
+
+============================================================
+/help listworlds
+============================================================
+
+/listworlds
+
+List all defined worlds with their connection status.
+
+============================================================
+/help load
+============================================================
+
+/load [-q] filename
+
+Load and execute commands from a TF script file.
+
+Options:
+  -q  Quiet mode - don't echo "% Loading commands from..." message
+
+The file may contain:
+  - TF commands starting with / (e.g., /def, /set)
+  - Comments: lines starting with ; or single # followed by space
+  - Blank lines (ignored)
+
+Line continuation: End a line with \ to continue on next line.
+Use %\ for a literal backslash at end of line.
+
+File search order (for relative paths):
+  1. Current directory (from /lcd or actual cwd)
+  2. Directories in $TFPATH (colon-separated)
+  3. $TFLIBDIR
+
+Use /exit to abort loading early.
+
+Example:
+  /load ~/.tf/init.tf
+  /load -q mylib.tf
+
+============================================================
+/help loaded
+============================================================
+
+/loaded token
+
+Mark a file as loaded (for use with /require).
+
+Should be the first command in a file designed for /require.
+If the token has already been registered by a previous /loaded
+call, the current file load is aborted (returns success).
+
+Token should be unique - the file's full path is recommended.
+
+Example (in mylib.tf):
+  /loaded mylib.tf
+  ; Rest of file only executed once
+
+============================================================
+/help localecho
+============================================================
+
+/localecho [on|off]
+
+Get or set local echo mode.
+When on, typed commands are displayed locally.
+
+============================================================
+/help log
+============================================================
+
+/log [filename | off]
+
+Start or stop logging output to a file.
+/log filename - Start logging to file
+/log off      - Stop logging
+/log           - Show logging status
+
+Example: /log ~/mud.log
+
+============================================================
+/help nohilite
+============================================================
+
+/nohilite [pattern]
+
+With no args: disables hilite (sets %{hilite} to 0).
+With a pattern: removes hilite macros matching that pattern.
+
+============================================================
+/help not
+============================================================
+
+/not expression
+
+Negate the result of an expression.
+Sets %? to 1 if expression is false, 0 if true.
+
+Example: /not (connected)
+
+============================================================
+/help partial
+============================================================
+
+/partial regexp
+
+Hilites the matched portion of lines (not the whole line).
+Creates a fall-through trigger so multiple can match.
+Equivalent to: /def -Ph -F -tregexp
+
+Hilite style is set by %{hiliteattr} (default: B = bold).
+Example: /partial [Hh]awkeye
+
+============================================================
+/help paste
+============================================================
+
+/cat and /paste are not supported in Clay.
+Use bracketed paste instead (paste normally into the input area).
+
+============================================================
+/help ps
+============================================================
+
+/ps
+
+List all background processes (from /repeat).
+Shows PID, interval, remaining count, and command.
+
+============================================================
+/help purge
+============================================================
+
+/purge
+
+Remove all macro definitions.
+
+============================================================
+/help purgeworld
+============================================================
+
+/purgeworld and /saveworld are stubs.
+Use Clay's world management instead.
+
+============================================================
+/help putfile
+============================================================
+
+/getfile and /putfile are not implemented.
+File transfer protocols are not supported.
+
+============================================================
+/help quit
+============================================================
+
+/quit
+
+Exit Clay.
+
+============================================================
+/help quote
+============================================================
+
+/quote [-w world] [-S|-dC] [-0] [text | 'command | `command | !command]
+
+Send text or command output without variable substitution.
+
+Prefixes:
+  'command    Echo output locally
+  `command    Execute each line of output as TF command
+  !command    Run shell command, send output to MUD
+
+Options:
+  -w world   Send to specific world
+  -S         Use semicolons as newlines
+  -dC        Use character C as delimiter
+  -0         No newlines (NUL delimiter)
+
+Examples:
+  /quote Say %this literally    - Sends without expanding %this
+  /quote !/bin/date             - Sends date output to MUD
+  /quote '!cat file.txt         - Echoes file contents locally
+  /quote `!echo /set x=1        - Executes /set x=1
+
+============================================================
+/help recall
+============================================================
+
+/recall [options] [range] [pattern]
+
+Search output history.
+
+Options:
+  -w[world]   Search specific world (default: current)
+  -l          Search local (TF) output only
+  -g          Search all worlds + local
+  -i          Search input history
+  -t[format]  Show timestamps
+  -v          Invert match (show non-matching)
+  -q          Quiet (set %? but don't display)
+  -mtype      Match type: simple, glob (default), regexp
+  -ag         Include gagged lines
+  -An         Show n lines after each match
+  -Bn         Show n lines before each match
+  #           Show line numbers
+
+Range: N (last N), -N (Nth previous), N-M, N-
+
+Examples:
+  /recall 20                    - Last 20 lines
+  /recall -i /def               - Input history matching /def
+  /recall -mregexp \d{3}-\d{4}  - Regex match
+
+============================================================
+/help recordline
+============================================================
+
+/recordline
+
+Record a line to history. Not implemented in Clay.
+
+============================================================
+/help repeat
+============================================================
+
+/repeat [-w[world]] {[-time]|-S|-P} count command
+
+Repeat a command on a timer. First iteration runs immediately,
+then waits the interval before each subsequent iteration.
+
+Options:
+  -w[world]  Send to specific world (empty = current)
+  -S         Synchronous (execute all iterations now)
+  -P         Execute on prompt (not yet implemented)
+  -time      Interval: seconds, M:S, or H:M:S
+
+Count: integer or "i" for infinite
+
+Examples:
+  /repeat -30 5 /echo hi        - Now, then every 30s, 5 times total
+  /repeat -0:30 i /echo hi      - Now, then every 30s, infinite
+  /repeat -1:0:0 1 /echo hourly - Once now (1 hour interval unused)
+  /repeat -S 3 /echo sync       - 3 times immediately
+
+============================================================
+/help replace
+============================================================
+
+/replace old new string
+
+Replace all occurrences of 'old' with 'new' in string.
+Echoes the result.
+
+Function form: $[replace(str, old, new [,count])]
+
+Example: /replace foo bar "foo and foo"  => "bar and bar"
+
+============================================================
+/help require
+============================================================
+
+/require [-q] filename
+
+Load a file only if not already loaded via /loaded.
+
+Same as /load, but if the file has already registered a token
+via /loaded, the file will not be read again.
+
+Files designed for /require should have /loaded as their first
+command with a unique token (usually the file's full path).
+
+Example file (mylib.tf):
+  /loaded mylib.tf
+  /def myfunc = /echo Hello from mylib
+
+Usage:
+  /require mylib.tf   - Loads the file
+  /require mylib.tf   - Does nothing (already loaded)
+
+============================================================
+/help return
+============================================================
+
+/return [expression]
+
+Stop executing the current macro and return.
+If an expression is given, it is evaluated and %? is set to the result.
+Without an argument, %? is set to 1.
+
+Example:
+  /def check = /if (hp > 50) /return 1%; /echo Low HP!
+
+============================================================
+/help save
+============================================================
+
+/save filename
+
+Save all current macro definitions to a file.
+The file can be loaded later with /load.
+
+Example: /save ~/.tf/macros.tf
+
+============================================================
+/help saveworld
+============================================================
+
+/purgeworld and /saveworld are stubs.
+Use Clay's world management instead.
+
+============================================================
+/help send
+============================================================
+
+/send [-w world] text
+
+Send text to the MUD server.
+-w world: Send to specific world
+Example: /send say Hello everyone!
+
+============================================================
+/help set
+============================================================
+
+/set [name [value]]
+
+Set a global variable. Without arguments, lists all variables.
+Examples:
+  /set foo bar    - Set foo to "bar"
+  /set count 42   - Set count to 42
+  /set            - List all variables
+
+============================================================
+/help setenv
+============================================================
+
+/setenv name [value]
+
+Set or export a variable to the shell environment.
+If value is given, sets the variable first.
+The variable becomes available to /sh and child processes.
+
+Example: /setenv TERM vt100
+
+============================================================
+/help sh
+============================================================
+
+/sh command
+
+Execute a shell command and display the output.
+Environment variables set with /setenv or /export are available.
+
+Example: /sh ls -la
+
+============================================================
+/help shift
+============================================================
+
+/shift
+
+Shift positional parameters: %2 becomes %1, %3 becomes %2, etc.
+Used inside macros to iterate through arguments.
+
+Example:
+  /def showargs = /while ({1} !~ "") /echo %1%; /shift%; /done
+
+============================================================
+/help sub
+============================================================
+
+/sub [off|on|full]
+
+Get or set the substitution mode.
+  off  - No variable substitution
+  on   - Normal substitution (default)
+  full - Full substitution
+
+============================================================
+/help substitute
+============================================================
+
+/substitute text
+
+Replace the current trigger line with different text.
+Only works inside a trigger body.
+
+Function form: $[substitute(text [,attrs])]
+
+Example:
+  /def -t"* says *" colorize = /substitute [%1] %2
+
+============================================================
+/help suspend
+============================================================
+
+/suspend
+
+Suspend the process (equivalent to Ctrl+Z).
+
+============================================================
+/help telnet
+============================================================
+
+/telnet and /finger are not implemented.
+Use /sh to run system commands instead.
+
+Example: /sh telnet host port
+
+============================================================
+/help test
+============================================================
+
+/test expression
+
+Evaluate expression and return its value, setting %?.
+
+Evaluates the expression and returns its value (any type).
+Also sets the special variable %? to the result.
+Useful for evaluating expressions for side effects.
+
+Examples:
+  /test 2 + 2           - Returns 4, sets %? to 4
+  /test strlen("hello") - Returns 5, sets %? to 5
+  /test hp < 50         - Returns 1 or 0, sets %?
+
+Unlike /expr, /test does not display the result automatically.
+The result is stored in %? for later use.
+
+============================================================
+/help tfhelp
+============================================================
+
+/help [topic] or /tfhelp [topic]
+
+Show help on TF commands and features.
+
+Topics: set, echo, send, def, if, while, for, expr, test,
+  bind, hooks, repeat, load, recall, quote, gag, addworld,
+  watchdog, watchname, functions, and more.
+
+Example: /help def
+
+============================================================
+/help tick
+============================================================
+
+/tick
+
+Tick timer (for MUD combat rounds). Not implemented in Clay.
+Use /repeat for periodic timers instead.
+
+============================================================
+/help time
+============================================================
+
+/time [command]
+
+Without arguments, display the current date and time.
+With a command, execute it and display how long it took.
+
+Examples:
+  /time
+  /time /load big_script.tf
+
+============================================================
+/help toggle
+============================================================
+
+/toggle varname
+
+Toggle a variable between 0 and 1.
+If current value is 0, sets to 1; otherwise sets to 0.
+
+Example: /toggle gag
+
+============================================================
+/help tr
+============================================================
+
+/tr domain range string
+
+Translate characters: each character in 'domain' is replaced
+by the corresponding character in 'range'.
+
+Function form: $[tr(domain, range, string)]
+
+Example: /tr abc ABC "a big cat"  => "A Big CAt"
+
+============================================================
+/help trig
+============================================================
+
+/trig pattern = body
+
+Create an unnamed trigger (glob mode).
+Equivalent to: /def -t"pattern" = body
+
+See also: /trigp, /trigc, /trigpc, /untrig
+
+============================================================
+/help trigc
+============================================================
+
+/trigc chance pattern = body
+
+Create a trigger with specified probability (0.0-1.0).
+Equivalent to: /def -c<chance> -t"pattern" = body
+
+============================================================
+/help trigger
+============================================================
+
+/trigger [-d] pattern
+
+Test trigger matching against a pattern.
+-d: Delete matching triggers
+Without -d: show which macros would fire for this text.
+
+Example: /trigger You are hungry
+
+============================================================
+/help trigp
+============================================================
+
+/trigp priority pattern = body
+
+Create a trigger with specified priority.
+Equivalent to: /def -p<pri> -t"pattern" = body
+
+============================================================
+/help trigpc
+============================================================
+
+/trigpc priority chance pattern = body
+
+Create a trigger with both priority and probability.
+Equivalent to: /def -p<pri> -c<chance> -t"pattern" = body
+
+============================================================
+/help unbind
+============================================================
+
+/unbind key
+
+Remove a key binding.
+Key names: F1-F12, ^A-^Z (Ctrl), @a-@z (Alt)
+
+Example: /unbind F5
+
+============================================================
+/help undef
+============================================================
+
+/undef name
+
+Remove a macro by name.
+
+Example: /undef my_trigger
+
+============================================================
+/help undefn
+============================================================
+
+/undefn number
+
+Remove a macro by its sequence number.
+Use /list to see sequence numbers.
+
+Example: /undefn 42
+
+============================================================
+/help undeft
+============================================================
+
+/undeft pattern
+
+Remove all macros whose trigger matches the given pattern.
+
+Example: /undeft * tells you *
+
+============================================================
+/help ungag
+============================================================
+
+/ungag pattern
+
+Remove gag triggers matching the given pattern.
+
+Example: /ungag * has left the game.
+
+============================================================
+/help unhook
+============================================================
+
+/unhook macro_name
+
+Remove a hook by macro name.
+The macro is not deleted, only its hook association.
+
+Example: /unhook auto_look
+
+============================================================
+/help unset
+============================================================
+
+/unset name
+
+Remove a global variable.
+
+Example: /unset foo
+
+============================================================
+/help untrig
+============================================================
+
+/untrig [-a attrs] pattern
+
+Remove triggers matching the given pattern.
+
+Example: /untrig * says *
+
+============================================================
+/help unworld
+============================================================
+
+/unworld name
+
+Remove a world definition. Maps to /close in Clay.
+
+============================================================
+/help version
+============================================================
+
+/version
+
+Display Clay version information.
+
+============================================================
+/help watchdog
+============================================================
+
+/watchdog [off|on|n1 [n2]]
+
+Suppress duplicate lines from the MUD.
+If a line has appeared n1 times in the last n2 lines, it is gagged.
+
+Defaults: n1=2 (threshold), n2=5 (window size)
+
+Examples:
+  /watchdog on       - Enable with defaults
+  /watchdog 3 10     - Gag after 3 repeats in last 10 lines
+  /watchdog off      - Disable
+  /watchdog          - Show current settings
+
+============================================================
+/help watchname
+============================================================
+
+/watchname [off|on|n1 [n2]]
+
+Suppress spam from repeated character names.
+If the first word of a line has appeared as the first word
+of n1 of the last n2 lines, the line is gagged.
+
+Defaults: n1=4 (threshold), n2=5 (window size)
+
+Examples:
+  /watchname on      - Enable with defaults
+  /watchname 3 8     - Gag after name appears 3 times in last 8 lines
+  /watchname off     - Disable
+
+============================================================
+/help while
+============================================================
+
+/while (expression) ... /done
+
+Repeat commands while expression is true.
+Example:
+  /while (count < 10) /echo %count%; /set count $[count+1] /done
+
+============================================================
+/help world
+============================================================
+
+/world [name]
+
+Switch to a world by name.
+Without arguments, lists available worlds.
+
+Example: /world MyMUD

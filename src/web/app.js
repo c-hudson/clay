@@ -3771,7 +3771,7 @@
             '  NOP: Sends a telnet NOP (invisible to server).',
             '  Custom: Sends a custom command you specify.', '',
             'Encoding: UTF-8 (modern), Latin-1 (older MUDs), FANSI.', '',
-            'GMCP Packages: Space-separated GMCP packages to request.'
+            'GMCP: Space-separated GMCP packages to request.'
         ],
         worldSelector: [
             'World Selector - Browse and Connect', '',
@@ -6459,7 +6459,7 @@
             elements.worldEditGmcpPackages.value = world.settings?.gmcp_packages || '';
         }
         if (elements.worldEditAutoReconnect) {
-            elements.worldEditAutoReconnect.value = world.settings?.auto_reconnect_secs ?? 0;
+            elements.worldEditAutoReconnect.value = world.settings?.auto_reconnect_secs ?? '0';
         }
 
         // Set toggle and selects
@@ -6523,7 +6523,7 @@
             keep_alive_type: elements.worldEditKeepAliveSelect.value,
             keep_alive_cmd: elements.worldEditKeepAliveCmd.value,
             gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : '',
-            auto_reconnect_secs: parseInt(elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value : '0', 10) || 0
+            auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0'
         });
 
         // Update local state
@@ -6544,7 +6544,7 @@
             world.settings.gmcp_packages = elements.worldEditGmcpPackages.value;
         }
         if (elements.worldEditAutoReconnect) {
-            world.settings.auto_reconnect_secs = parseInt(elements.worldEditAutoReconnect.value, 10) || 0;
+            world.settings.auto_reconnect_secs = elements.worldEditAutoReconnect.value.trim();
         }
 
         closeWorldEditorPopup();

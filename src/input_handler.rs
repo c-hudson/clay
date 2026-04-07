@@ -848,7 +848,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     };
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd;
                     app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages;
-                    app.worlds[idx].settings.auto_reconnect_secs = settings.auto_reconnect_secs;
+                    let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
+                    app.worlds[idx].settings.auto_reconnect_secs = ar_secs;
+                    app.worlds[idx].settings.auto_reconnect_on_web = ar_on_web;
 
                     // Update Slack settings
                     app.worlds[idx].settings.slack_token = settings.slack_token;

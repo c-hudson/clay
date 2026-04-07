@@ -1,0 +1,23 @@
+﻿<b><center>Welcome to ASCII MUSH</center></b>
+
+<b>What is Ascii MUSH?</b>
+	ASCII is a throw back to an older time on the internet when MUDs were more in fashion. It's also a remembrance of friends, times, places and MUSHes that are long gone. Countless hours were spent creating and perfecting these online worlds. To honor these times, TinyMUD like servers will be imported into the MUSH so that people may remember them and their people. These Zombie MUSHes will live side by side with ASCII's normal operations. Right now there are two examples of such places: QuartzParadice and Ministry. If you have a database for a mush you feel is worth preserving, feel free to talk to me and see if its a good fit.
+
+	ASCII MUSH is also a development platform for TeenyMUSH. Its general philosophy has been to complete ignore the don't test in production rule. It prescribes to the idea that maybe, just maybe, a MUSH can survive a problems instead of crashing and burning. There has been a few stumbles here and there but it has also survived a freakishly large number of crashes. Hopefully this has helped in rapid turn around on ideas without alienating its users.
+
+	ASCII MUSH is run on a TeenyMUSH server. TeenyMUSH is a TinyMUSH clone. You can find out about TinyMUSH at the <a href=https://en.wikipedia.org/wiki/MUSH>TinyMUSH Wiki</a>. While TeenyMUSH strives to be like a TinyMUSH, it also strives to add features that could make MUSH more useful, more powerful and more maintainable. I've implemented many ideas that I'd love to see TinyMUSH adopt. Maybe, just maybe, someone will adopt them.
+
+<b>How do you fit in at ASCII MUSH?</b>
+	Are you bored? Maybe a little bit of an odd ball? Do you like to talk to people? Do you think the answer to everything is 42? Do you like to write mushcode or perl? Does the day of the week your in end with a Y? If you answered yes to any of these, maybe you should stop on by and take your shoes off and stay for a while. If you think this is a horrible idea? Stop on by anyways and state your case. 
+
+<b>How do you connect to ASCII MUSH?</b>
+	You can do it the old fashioned way and telnet to teenymush.dynu.net on port 4096. If you’d like to up your game, you can do it with a MUD client such as TinyFugue. The easiest way would be to click on the <a href=/wsclient_raw.html>Login</a> link on this page. This will connect you to the MUSH via a web based mud client.
+
+<b>What can you do at this website?</b>
+	This site is mostly to show off what can be done with TeenyMUSH with its own built in web server. The web pages contained with in this site are all created by actual MUSH code. Some pages are as simple as a @pemit. Standard MUSH commands, functions, and even $commands can be tied into a web page. This makes it rather simple to invoke standard MUSH functions like below. See the <a href=/example>example page</a> for more complex examples.
+
+	<b>Current Time</b>:
+		\[time()\] = [time()]
+
+	<b>Connected Players</b>:
+		\[iter(lwho(),name(##))\] = [iter(lwho(),name(##))]

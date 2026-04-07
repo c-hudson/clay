@@ -1511,6 +1511,33 @@
         assert!(!allow_list_has_wildcard("192.168.1.*"));
         assert!(!allow_list_has_wildcard(""));
         assert!(!allow_list_has_wildcard("192.168.1.1"));
+
+        // Hostname pattern detection
+        use crate::websocket::is_hostname_pattern;
+        assert!(is_hostname_pattern("*.rd.shawcable.net"));
+        assert!(is_hostname_pattern("host.example.com"));
+        assert!(!is_hostname_pattern("192.168.1.*"));
+        assert!(!is_hostname_pattern("192.168.1.100"));
+        assert!(!is_hostname_pattern("*"));
+        assert!(!is_hostname_pattern("localhost"));
+
+        // Hostname wildcard matching via is_in_allow_list
+        use crate::websocket::is_in_allow_list;
+        // Wildcard match
+        assert!(is_in_allow_list("96.43.12.34", Some("abc.rd.shawcable.net"), &["*.rd.shawcable.net".to_string()]));
+        assert!(is_in_allow_list("96.43.12.34", Some("xyz.rd.shawcable.net"), &["*.rd.shawcable.net".to_string()]));
+        // Wildcard does NOT match the bare domain itself
+        assert!(!is_in_allow_list("96.43.12.34", Some("rd.shawcable.net"), &["*.rd.shawcable.net".to_string()]));
+        // No hostname provided → hostname patterns don't match
+        assert!(!is_in_allow_list("96.43.12.34", None, &["*.rd.shawcable.net".to_string()]));
+        // Exact hostname match
+        assert!(is_in_allow_list("1.2.3.4", Some("myhost.example.com"), &["myhost.example.com".to_string()]));
+        assert!(!is_in_allow_list("1.2.3.4", Some("other.example.com"), &["myhost.example.com".to_string()]));
+        // Case-insensitive
+        assert!(is_in_allow_list("96.43.12.34", Some("ABC.RD.SHAWCABLE.NET"), &["*.rd.shawcable.net".to_string()]));
+        // IP patterns still work via is_in_allow_list
+        assert!(is_in_allow_list("192.168.1.100", None, &["192.168.1.*".to_string()]));
+        assert!(!is_in_allow_list("10.0.0.1", None, &["192.168.1.*".to_string()]));
     }
 
     /// Test: ServerHello is sent before auth (regression: needed for client UI)

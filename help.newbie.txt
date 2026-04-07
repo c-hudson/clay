@@ -1,0 +1,219 @@
+============================================================
+/help (no arguments)
+============================================================
+
+Clay MUD Client - Quick Start Guide
+
+Getting Started:
+  /setup               - Open settings (server, colors, etc.)
+  /connect host port   - Connect to a MUD server
+  /connect -x host port - Connect with SSL/TLS
+  /disconnect          - Disconnect from current world
+  /quit                - Exit Clay
+
+Switching Worlds:
+  Ctrl+Up / Ctrl+Down  - Next / previous world
+  /connections         - Show all connected worlds
+  /fg name             - Switch to a world by name
+
+Scrollback & Navigation:
+  PgUp / PgDn          - Scroll through output history
+  Home                 - Jump to top of scrollback
+  End                  - Jump to bottom (live output)
+  /recall [pattern]    - Search output history
+  /recall 50           - Show last 50 lines
+
+Input:
+  Up / Down            - Command history
+  Ctrl+A / Ctrl+E      - Jump to start / end of line
+  Ctrl+K               - Delete to end of line
+  Ctrl+W               - Delete word before cursor
+  Ctrl+Z               - Suspend Clay (fg to resume)
+
+Basic Configuration:
+  /setup               - General settings popup
+  /web                 - Web interface / remote access settings
+  /actions             - Manage triggers and actions
+  /keybinds            - Open keybinding editor (browser)
+
+Triggers (Auto-respond to MUD text):
+  /actions             - GUI trigger/action editor
+  /trig pattern = cmd  - Quick trigger from command line
+  /untrig pattern      - Remove a trigger
+  /gag pattern         - Suppress matching lines
+  /hilite pattern      - Highlight matching lines
+
+Useful Commands:
+  /echo message        - Display text locally (not sent to MUD)
+  /set name value      - Set a variable
+  /reload              - Hot-reload Clay (preserves connections)
+  /version             - Show version info
+
+For more help:
+  /help commands       - Full TF command reference
+  /help functions      - Expression functions reference
+  /help <command>      - Help on a specific command (e.g. /help def)
+
+============================================================
+/help setup
+============================================================
+
+/setup
+
+Open the settings popup. Lets you configure:
+  - Server hostname, port, SSL
+  - Username and password for auto-login
+  - Terminal colors and display options
+  - More mode (pause on large output)
+  - Keep-alive settings
+
+Keyboard shortcut: typically bound to a key via /keybinds.
+
+============================================================
+/help connect
+============================================================
+
+/connect [host] [port]
+/connect -x [host] [port]
+
+Connect to a MUD server. If no arguments given, reconnects
+to the current world.
+
+Options:
+  -x    Use SSL/TLS encryption
+
+You can also add worlds permanently via /setup or /addworld:
+  /addworld MyMUD mud.example.com 4000
+  /addworld -x SecureMUD secure.example.com 4443
+
+Then connect by name:
+  /connect MyMUD
+
+============================================================
+/help connections
+============================================================
+
+/connections or /l
+
+Show all connected worlds in a popup. Displays:
+  - World name
+  - Connection status
+  - Unseen line count
+
+Use Tab to cycle between worlds, or /fg name to switch.
+
+============================================================
+/help web
+============================================================
+
+/web
+
+Open the web interface settings popup. Configure:
+  - HTTP/HTTPS server (port, TLS certificates)
+  - Password for remote access
+  - Allow list for trusted IPs
+
+Once enabled, access Clay from a web browser or the
+Android app at https://your-host:port/
+
+============================================================
+/help actions
+============================================================
+
+/actions
+
+Open the trigger/action editor popup. Create and manage:
+  - Triggers (auto-respond to MUD text patterns)
+  - Highlights (colorize matching lines)
+  - Gags (suppress matching lines)
+
+Quick trigger shortcuts from the command line:
+  /trig * tells you * = /echo [Tell] %1: %2
+  /hilite * attacks you!
+  /gag * has left the game.
+
+============================================================
+/help recall
+============================================================
+
+/recall [options] [range] [pattern]
+
+Search output history.
+
+Options:
+  -w[world]   Search specific world (default: current)
+  -l          Search local (TF) output only
+  -g          Search all worlds + local
+  -i          Search input history
+  -t[format]  Show timestamps
+  -v          Invert match (show non-matching)
+  -q          Quiet (set %? but don't display)
+  -mtype      Match type: simple, glob (default), regexp
+  -ag         Include gagged lines
+  -An         Show n lines after each match
+  -Bn         Show n lines before each match
+  #           Show line numbers
+
+Range: N (last N), -N (Nth previous), N-M, N-
+
+Examples:
+  /recall 20                    - Last 20 lines
+  /recall -i /def               - Input history matching /def
+  /recall -mregexp \d{3}-\d{4}  - Regex match
+
+============================================================
+/help keys
+============================================================
+
+Keyboard Shortcuts:
+
+Navigation:
+  PgUp / PgDn        - Scroll output history
+  Home / End          - Top / bottom of scrollback
+  Tab                 - Release pending output (More mode)
+  Ctrl+Up / Ctrl+Down - Next / previous world
+
+Input Editing:
+  Up / Down           - Command history
+  Ctrl+A              - Start of line
+  Ctrl+E              - End of line
+  Ctrl+K              - Kill to end of line
+  Ctrl+U              - Kill entire line
+  Ctrl+W              - Delete word before cursor
+  Ctrl+Y              - Yank (paste killed text)
+  Alt+B / Alt+F       - Word left / word right
+  Alt+U / Alt+L       - Uppercase / lowercase word
+
+System:
+  Ctrl+Z              - Suspend Clay
+  Ctrl+C              - Cancel current input
+
+Customize keys with /keybinds or /bind:
+  /bind F5 = cast heal
+  /bind ^S = /save macros.tf
+
+============================================================
+/help disconnect
+============================================================
+
+/disconnect or /dc
+
+Disconnect from the current world.
+
+============================================================
+/help reload
+============================================================
+
+/reload
+
+Hot-reload the Clay binary without losing connections.
+Active MUD connections are preserved across the reload.
+TLS connections use a temporary proxy during reload.
+
+============================================================
+/help quit
+============================================================
+
+/quit
+
+Exit Clay. All connections will be closed.

@@ -1344,6 +1344,8 @@ pub struct WorldSettings {
     pub gmcp_packages: String,
     // Auto-reconnect delay in seconds (0 = disabled)
     pub auto_reconnect_secs: u32,
+    // Auto-reconnect when a web/Android client connects
+    pub auto_reconnect_on_web: bool,
 }
 
 impl Default for WorldSettings {
@@ -1370,6 +1372,7 @@ impl Default for WorldSettings {
             notes: String::new(),
             gmcp_packages: "Client.Media 1".to_string(),
             auto_reconnect_secs: 0,
+            auto_reconnect_on_web: false,
         }
     }
 }
@@ -1381,6 +1384,32 @@ impl WorldSettings {
             WorldType::Mud => !self.hostname.is_empty() && !self.port.is_empty(),
             WorldType::Slack => !self.slack_token.is_empty(),
             WorldType::Discord => !self.discord_token.is_empty(),
+        }
+    }
+
+    /// Parse an auto-reconnect string like "30", "web", "web,30", "30,web" into (secs, on_web).
+    /// Spaces are stripped. Unrecognized tokens are ignored.
+    fn parse_auto_reconnect(s: &str) -> (u32, bool) {
+        let mut secs = 0u32;
+        let mut on_web = false;
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.eq_ignore_ascii_case("web") {
+                on_web = true;
+            } else if let Ok(n) = part.parse::<u32>() {
+                secs = n;
+            }
+        }
+        (secs, on_web)
+    }
+
+    /// Reconstruct the display string from the two internal fields.
+    fn auto_reconnect_display(&self) -> String {
+        match (self.auto_reconnect_on_web, self.auto_reconnect_secs) {
+            (true, n) if n > 0 => format!("web,{}", n),
+            (true, _) => "web".to_string(),
+            (false, n) if n > 0 => n.to_string(),
+            _ => "0".to_string(),
         }
     }
 }
@@ -2744,6 +2773,10 @@ pub struct App {
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     pub is_master: bool,
+    /// Set to true after a web client authenticates, to trigger reconnects in the event loop.
+    pub web_reconnect_needed: bool,
+    /// Set to true when http_port/http_enabled/web_secure changes, to restart the HTTP server.
+    pub web_restart_needed: bool,
     /// True if this session started from a hot reload (suppress server startup messages)
     pub is_reload: bool,
     /// True if the output area needs to be redrawn (optimization to avoid unnecessary redraws)
@@ -2857,6 +2890,8 @@ impl App {
             popup_was_visible: false,
             ws_client_worlds: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
+            web_reconnect_needed: false,
+            web_restart_needed: false,
             is_reload: false, // Set to true in run_app if started from hot reload
             needs_output_redraw: true, // Start with true to ensure initial render
             needs_terminal_clear: false, // Set to true by Ctrl+L in --console mode
@@ -3358,7 +3393,7 @@ impl App {
             keep_alive: keep_alive.to_string(),
             keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
-            auto_reconnect_secs: world.settings.auto_reconnect_secs.to_string(),
+            auto_reconnect_secs: world.settings.auto_reconnect_display(),
             slack_token: world.settings.slack_token.clone(),
             slack_channel: world.settings.slack_channel.clone(),
             slack_workspace: world.settings.slack_workspace.clone(),
@@ -5359,6 +5394,25 @@ impl App {
         self.worlds.iter().filter_map(|w| w.reconnect_at).min()
     }
 
+    /// Schedule immediate reconnection for all worlds with auto_reconnect_on_web enabled
+    /// that are currently disconnected and have been connected before.
+    /// Returns true if any world was scheduled (caller should re-arm the reconnect timer).
+    fn trigger_web_reconnects(&mut self) -> bool {
+        let mut triggered = false;
+        for i in 0..self.worlds.len() {
+            if self.worlds[i].settings.auto_reconnect_on_web
+                && !self.worlds[i].connected
+                && self.worlds[i].settings.has_connection_settings()
+                && self.worlds[i].reconnect_at.is_none()
+            {
+                self.worlds[i].reconnect_at = Some(std::time::Instant::now());
+                self.add_output_to_world(i, "Web client connected - reconnecting...");
+                triggered = true;
+            }
+        }
+        triggered
+    }
+
     /// Handle TelnetDetected event.
     fn handle_telnet_detected(&mut self, world_idx: usize) {
         if !self.worlds[world_idx].telnet_mode {
@@ -5659,6 +5713,8 @@ impl App {
                     visible_columns: 0,
                     dimensions: None,
                 });
+                // Signal event loop to trigger web reconnects
+                self.web_reconnect_needed = true;
             } else {
                 crate::http::log_remote_event("WS-KEY-REJECT", client_ip, "no matching key");
                 self.ban_list.record_violation(client_ip, "WebSocket: failed auth key");
@@ -5743,6 +5799,8 @@ impl App {
         });
         // Broadcast activity count to new client
         self.broadcast_activity();
+        // Signal event loop to trigger web reconnects
+        self.web_reconnect_needed = true;
     }
 
     /// Handle ConnectionSuccess event (used in headless and console modes).
@@ -6919,7 +6977,7 @@ impl App {
                         keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                         keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                         gmcp_packages: world.settings.gmcp_packages.clone(),
-                        auto_reconnect_secs: world.settings.auto_reconnect_secs,
+                        auto_reconnect_secs: world.settings.auto_reconnect_display(),
                     },
                     last_send_secs: None,
                     last_recv_secs: None,
@@ -7128,7 +7186,9 @@ impl App {
                     self.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                     self.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                     self.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
-                    self.worlds[world_index].settings.auto_reconnect_secs = auto_reconnect_secs;
+                    let (ar_secs, ar_on_web) = WorldSettings::parse_auto_reconnect(&auto_reconnect_secs);
+                    self.worlds[world_index].settings.auto_reconnect_secs = ar_secs;
+                    self.worlds[world_index].settings.auto_reconnect_on_web = ar_on_web;
                     // Save settings to persist changes
                     let _ = persistence::save_settings(self);
                     // Build settings message for broadcast (don't leak password)
@@ -7192,10 +7252,14 @@ impl App {
                 if let Some(ref server) = self.ws_server {
                     server.update_password(&ws_password);
                 }
-                // Update web settings
+                // Update web settings — flag a restart if server-affecting settings changed
+                let web_changed = self.settings.web_secure != web_secure
+                    || self.settings.http_enabled != http_enabled
+                    || self.settings.http_port != http_port;
                 self.settings.web_secure = web_secure;
                 self.settings.http_enabled = http_enabled;
                 self.settings.http_port = http_port;
+                if web_changed { self.web_restart_needed = true; }
                 // ws_enabled and ws_port are legacy — ignored
                 // Only update cert/key if non-empty (remote clients send empty for security)
                 if !ws_cert_file.is_empty() {
@@ -7833,7 +7897,7 @@ impl App {
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
-                    auto_reconnect_secs: world.settings.auto_reconnect_secs,
+                    auto_reconnect_secs: world.settings.auto_reconnect_display(),
                 },
                 last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
@@ -8741,7 +8805,8 @@ pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
     let _ = persistence::save_settings(app);
 
     if port_changed || secure_changed || http_changed || cert_changed {
-        app.add_output("Web settings saved. Use /reload to apply server changes.");
+        app.web_restart_needed = true;
+        app.add_output("Web settings saved. Restarting web server...");
     } else {
         app.add_output("Web settings saved.");
     }
@@ -8779,7 +8844,7 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) keep_alive: String,
     pub(crate) keep_alive_cmd: String,
     pub(crate) gmcp_packages: String,
-    pub(crate) auto_reconnect_secs: u32,
+    pub(crate) auto_reconnect_secs: String,
     // Slack fields
     pub(crate) slack_token: String,
     pub(crate) slack_channel: String,
@@ -9948,7 +10013,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     keep_alive: state.get_selected(WORLD_FIELD_KEEP_ALIVE).unwrap_or("nop").to_string(),
                     keep_alive_cmd: state.get_text(WORLD_FIELD_KEEP_ALIVE_CMD).unwrap_or("").to_string(),
                     gmcp_packages: state.get_text(WORLD_FIELD_GMCP_PACKAGES).unwrap_or("Client.Media 1").to_string(),
-                    auto_reconnect_secs: state.get_text(WORLD_FIELD_AUTO_RECONNECT).unwrap_or("0").parse().unwrap_or(0),
+                    auto_reconnect_secs: state.get_text(WORLD_FIELD_AUTO_RECONNECT).unwrap_or("0").to_string(),
                     slack_token: state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
                     slack_channel: state.get_text(WORLD_FIELD_SLACK_CHANNEL).unwrap_or("").to_string(),
                     slack_workspace: state.get_text(WORLD_FIELD_SLACK_WORKSPACE).unwrap_or("").to_string(),
@@ -10680,6 +10745,68 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// Restart the HTTP/HTTPS web server after settings change (port, enabled, or secure mode).
+/// Shuts down the current server and starts a new one on the configured port.
+pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>) {
+    // Collect everything we need before any mutable borrows
+    let http_enabled = app.settings.http_enabled;
+    let http_port = app.settings.http_port;
+    let web_secure = app.settings.web_secure;
+    let cert_file = app.settings.websocket_cert_file.clone();
+    let key_file = app.settings.websocket_key_file.clone();
+    let ban_list = app.ban_list.clone();
+    let theme_css = app.gui_theme_colors().to_css_vars();
+    let ws_state = app.ws_server.as_ref().map(|server| {
+        std::sync::Arc::new(server.connection_state(event_tx.clone()))
+    });
+
+    // Shut down existing HTTP server
+    if let Some(ref mut server) = app.http_server {
+        if let Some(tx) = server.shutdown_tx.take() { let _ = tx.send(()); }
+    }
+    app.http_server = None;
+
+    // Shut down existing HTTPS server
+    #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
+    {
+        if let Some(ref mut server) = app.https_server {
+            if let Some(tx) = server.shutdown_tx.take() { let _ = tx.send(()); }
+        }
+        app.https_server = None;
+    }
+
+    if !http_enabled {
+        return;
+    }
+
+    if web_secure {
+        #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
+        {
+            let mut https_server = HttpsServer::new(http_port);
+            match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, ban_list, theme_css).await {
+                Ok(()) => {
+                    app.add_output(&format!("HTTPS web interface restarted on port {http_port}"));
+                    app.https_server = Some(https_server);
+                }
+                Err(e) => {
+                    app.add_output(&format!("Failed to start HTTPS server on port {http_port}: {e}"));
+                }
+            }
+        }
+    } else {
+        let mut http_server = HttpServer::new(http_port);
+        match start_http_server(&mut http_server, ws_state, ban_list, theme_css, None).await {
+            Ok(()) => {
+                app.add_output(&format!("HTTP web interface restarted on port {http_port}"));
+                app.http_server = Some(http_server);
+            }
+            Err(e) => {
+                app.add_output(&format!("Failed to start HTTP server on port {http_port}: {e}"));
+            }
+        }
+    }
+}
+
 /// Run the App headlessly (no terminal UI) for master GUI mode.
 /// The App communicates with the embedded GUI via channels.
 pub async fn run_app_headless(
@@ -11301,8 +11428,21 @@ pub async fn run_app_headless(
                     AppEvent::WsClientMessage(client_id, msg) => {
                         if let WsMessage::AuthRequest { current_world, .. } = &*msg {
                             app.handle_ws_auth_initial_state(client_id, *current_world);
+                            if app.web_reconnect_needed {
+                                app.web_reconnect_needed = false;
+                                if app.trigger_web_reconnects() {
+                                    if let Some(next) = app.next_reconnect_instant() {
+                                        let dur = next.saturating_duration_since(std::time::Instant::now());
+                                        reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                                    }
+                                }
+                            }
                         } else {
                             daemon::handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
+                            if app.web_restart_needed {
+                                app.web_restart_needed = false;
+                                restart_http_server(&mut app, event_tx.clone()).await;
+                            }
                         }
                     }
                     AppEvent::WsClientConnected(_client_id) => {}
@@ -11311,6 +11451,15 @@ pub async fn run_app_headless(
                     }
                     AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
                         app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
+                        if app.web_reconnect_needed {
+                            app.web_reconnect_needed = false;
+                            if app.trigger_web_reconnects() {
+                                if let Some(next) = app.next_reconnect_instant() {
+                                    let dur = next.saturating_duration_since(std::time::Instant::now());
+                                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                                }
+                            }
+                        }
                     }
                     AppEvent::WsKeyRequest(client_id) => {
                         app.handle_ws_key_request(client_id);
@@ -13249,6 +13398,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         KeyAction::None => {}
                     }
+                    if app.web_restart_needed {
+                        app.web_restart_needed = false;
+                        restart_http_server(&mut app, event_tx.clone()).await;
+                    }
                     app.check_word_ended();
                     app.check_temp_conversion();
 
@@ -13563,6 +13716,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
                         app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
+                        if app.web_reconnect_needed {
+                            app.web_reconnect_needed = false;
+                            if app.trigger_web_reconnects() {
+                                if let Some(next) = app.next_reconnect_instant() {
+                                    let dur = next.saturating_duration_since(std::time::Instant::now());
+                                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                                }
+                            }
+                        }
                     }
                     AppEvent::WsKeyRequest(client_id) => {
                         app.handle_ws_key_request(client_id);
@@ -13572,6 +13734,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         let op = app.handle_ws_client_msg(client_id, *msg, &event_tx);
+                        if app.web_reconnect_needed {
+                            app.web_reconnect_needed = false;
+                            if app.trigger_web_reconnects() {
+                                if let Some(next) = app.next_reconnect_instant() {
+                                    let dur = next.saturating_duration_since(std::time::Instant::now());
+                                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                                }
+                            }
+                        }
+                        if app.web_restart_needed {
+                            app.web_restart_needed = false;
+                            restart_http_server(&mut app, event_tx.clone()).await;
+                        }
                         match op {
                             WsAsyncAction::Connect { world_index, prev_index, broadcast } => {
                                 if handle_command("/__connect", &mut app, event_tx.clone()).await {
@@ -14354,6 +14529,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
                     app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
+                    if app.web_reconnect_needed {
+                        app.web_reconnect_needed = false;
+                        if app.trigger_web_reconnects() {
+                            if let Some(next) = app.next_reconnect_instant() {
+                                let dur = next.saturating_duration_since(std::time::Instant::now());
+                                reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                            }
+                        }
+                    }
                 }
                 AppEvent::WsKeyRequest(client_id) => {
                     app.handle_ws_key_request(client_id);
@@ -14363,6 +14547,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 AppEvent::WsClientMessage(client_id, msg) => {
                     let op = app.handle_ws_client_msg(client_id, *msg, &event_tx);
+                    if app.web_reconnect_needed {
+                        app.web_reconnect_needed = false;
+                        if app.trigger_web_reconnects() {
+                            if let Some(next) = app.next_reconnect_instant() {
+                                let dur = next.saturating_duration_since(std::time::Instant::now());
+                                reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                            }
+                        }
+                    }
+                    if app.web_restart_needed {
+                        app.web_restart_needed = false;
+                        restart_http_server(&mut app, event_tx.clone()).await;
+                    }
                     match op {
                         WsAsyncAction::Connect { world_index, prev_index, broadcast } => {
                             if handle_command("/__connect", &mut app, event_tx.clone()).await {

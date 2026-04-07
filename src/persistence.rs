@@ -232,8 +232,9 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
         if world.settings.gmcp_packages != "Client.Media 1" {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
         }
-        if world.settings.auto_reconnect_secs > 0 {
-            writeln!(file, "auto_reconnect_secs={}", world.settings.auto_reconnect_secs)?;
+        let ar = world.settings.auto_reconnect_display();
+        if ar != "0" {
+            writeln!(file, "auto_reconnect_secs={}", ar)?;
         }
         if world.settings.log_enabled {
             writeln!(file, "log_enabled=true")?;
@@ -718,7 +719,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                             world.settings.gmcp_packages = value.to_string();
                         }
                         "auto_reconnect_secs" => {
-                            world.settings.auto_reconnect_secs = value.parse().unwrap_or(0);
+                            let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
+                            world.settings.auto_reconnect_secs = secs;
+                            world.settings.auto_reconnect_on_web = on_web;
                         }
                         // Slack settings
                         "slack_token" => world.settings.slack_token = decrypt_password(value),
@@ -968,7 +971,9 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                             world.settings.gmcp_packages = value.to_string();
                         }
                         "auto_reconnect_secs" => {
-                            world.settings.auto_reconnect_secs = value.parse().unwrap_or(0);
+                            let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
+                            world.settings.auto_reconnect_secs = secs;
+                            world.settings.auto_reconnect_on_web = on_web;
                         }
                         _ => {}
                     }
@@ -1072,8 +1077,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             if world.settings.gmcp_packages != "Client.Media 1" {
                 writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
             }
-            if world.settings.auto_reconnect_secs > 0 {
-                writeln!(file, "auto_reconnect_secs={}", world.settings.auto_reconnect_secs)?;
+            let ar = world.settings.auto_reconnect_display();
+            if ar != "0" {
+                writeln!(file, "auto_reconnect_secs={}", ar)?;
             }
             // Slack settings
             if !world.settings.slack_token.is_empty() {
@@ -1280,8 +1286,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         if world.settings.gmcp_packages != "Client.Media 1" {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages.replace('=', "\\e"))?;
         }
-        if world.settings.auto_reconnect_secs > 0 {
-            writeln!(file, "auto_reconnect_secs={}", world.settings.auto_reconnect_secs)?;
+        let ar = world.settings.auto_reconnect_display();
+        if ar != "0" {
+            writeln!(file, "auto_reconnect_secs={}", ar)?;
         }
         // Save GMCP/MSDP runtime state
         if world.gmcp_enabled {
@@ -1926,7 +1933,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                                 tw.settings.gmcp_packages = unescape_string(value);
                             }
                             "auto_reconnect_secs" => {
-                                tw.settings.auto_reconnect_secs = value.parse().unwrap_or(0);
+                                let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
+                                tw.settings.auto_reconnect_secs = secs;
+                                tw.settings.auto_reconnect_on_web = on_web;
                             }
                             "gmcp_enabled" => {
                                 tw.gmcp_enabled = value == "true";
@@ -2148,6 +2157,7 @@ mod tests {
             notes: "test notes\nline two".to_string(),
             gmcp_packages: "Custom.Package 1".to_string(), // default: "Client.Media 1"
             auto_reconnect_secs: 30,                       // default: 0
+            auto_reconnect_on_web: true,                   // default: false
         }
     }
 
@@ -2224,6 +2234,7 @@ mod tests {
         assert_eq!(a.notes, b.notes, "{context}: notes");
         assert_eq!(a.gmcp_packages, b.gmcp_packages, "{context}: gmcp_packages");
         assert_eq!(a.auto_reconnect_secs, b.auto_reconnect_secs, "{context}: auto_reconnect_secs");
+        assert_eq!(a.auto_reconnect_on_web, b.auto_reconnect_on_web, "{context}: auto_reconnect_on_web");
     }
 
     #[test]
@@ -2336,5 +2347,6 @@ mod tests {
         assert_ne!(non_default.notes, default.notes, "notes should differ");
         assert_ne!(non_default.gmcp_packages, default.gmcp_packages, "gmcp_packages should differ");
         assert_ne!(non_default.auto_reconnect_secs, default.auto_reconnect_secs, "auto_reconnect_secs should differ");
+        assert_ne!(non_default.auto_reconnect_on_web, default.auto_reconnect_on_web, "auto_reconnect_on_web should differ");
     }
 }

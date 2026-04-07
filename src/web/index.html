@@ -90,7 +90,7 @@
         <div id="auth-modal" class="modal">
             <div class="modal-content">
                 <h2>Authentication Required</h2>
-                <p id="auth-prompt">Enter the WebSocket password to connect:</p>
+                <p id="auth-prompt">Enter the password to connect:</p>
                 <div id="auth-username-row" style="display: none;">
                     <input type="text" id="auth-username" placeholder="Username" autocomplete="off">
                 </div>
@@ -437,15 +437,15 @@
                         </div>
                     </div>
                     <div class="setting-row">
-                        <span class="setting-label">GMCP Packages</span>
+                        <span class="setting-label">GMCP</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-gmcp-packages" class="editor-input" autocomplete="off">
                         </div>
                     </div>
                     <div class="setting-row">
-                        <span class="setting-label">Auto Reconnect</span>
+                        <span class="setting-label">Reconnect</span>
                         <div class="setting-value">
-                            <input type="text" id="world-edit-auto-reconnect" class="editor-input" autocomplete="off" placeholder="0 = disabled">
+                            <input type="text" id="world-edit-auto-reconnect" class="editor-input" autocomplete="off" placeholder="0, 30, web, web,30">
                         </div>
                     </div>
                 </div>
@@ -639,7 +639,7 @@
                                 <div class="setting-row">
                                     <span class="setting-label">Allow List</span>
                                     <div class="setting-value">
-                                        <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="localhost, 192.168.*">
+                                        <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="192.168.*, *.example.com">
                                     </div>
                                 </div>
                                 <div class="setting-row">

@@ -1339,10 +1339,14 @@ pub async fn handle_daemon_ws_message(
             app.settings.web_font_line_height = web_font_line_height;
             app.settings.web_font_letter_spacing = web_font_letter_spacing;
             app.settings.web_font_word_spacing = web_font_word_spacing;
+            let web_changed = app.settings.web_secure != web_secure
+                || app.settings.http_enabled != http_enabled
+                || app.settings.http_port != http_port;
             app.settings.websocket_allow_list = ws_allow_list;
             app.settings.web_secure = web_secure;
             app.settings.http_enabled = http_enabled;
             app.settings.http_port = http_port;
+            if web_changed { app.web_restart_needed = true; }
             // Only update cert/key if non-empty (remote clients send empty for security)
             if !ws_cert_file.is_empty() {
                 app.settings.websocket_cert_file = ws_cert_file;
@@ -1727,7 +1731,7 @@ pub async fn handle_daemon_ws_message(
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
-                    auto_reconnect_secs: world.settings.auto_reconnect_secs,
+                    auto_reconnect_secs: world.settings.auto_reconnect_display(),
                 },
                 last_send_secs: None,
                 last_recv_secs: None,
@@ -1781,7 +1785,9 @@ pub async fn handle_daemon_ws_message(
                 app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                 app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                 app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
-                app.worlds[world_index].settings.auto_reconnect_secs = auto_reconnect_secs;
+                let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&auto_reconnect_secs);
+                app.worlds[world_index].settings.auto_reconnect_secs = ar_secs;
+                app.worlds[world_index].settings.auto_reconnect_on_web = ar_on_web;
                 let _ = persistence::save_settings(app);
                 let settings_msg = WorldSettingsMsg {
                     hostname, port, user,
@@ -2867,7 +2873,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
-                    auto_reconnect_secs: world.settings.auto_reconnect_secs,
+                    auto_reconnect_secs: world.settings.auto_reconnect_display(),
                 },
                 last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),
