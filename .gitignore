@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 /output/
+clay.exe
 
 # Claude Code local settings
 .claude/
