@@ -455,7 +455,7 @@ pub async fn handle_daemon_ws_message(
                                         tf::TfCommandResult::Recall(opts) => {
                                             if world_index < app.worlds.len() {
                                                 let output_lines = app.worlds[world_index].output_lines.clone();
-                                                let (matches, header) = execute_recall(&opts, &output_lines);
+                                                let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
                                                 let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                                                 let ts = current_timestamp_secs();
 
@@ -530,7 +530,7 @@ pub async fn handle_daemon_ws_message(
                             tf::TfCommandResult::Recall(opts) => {
                                 if world_index < app.worlds.len() {
                                     let output_lines = app.worlds[world_index].output_lines.clone();
-                                    let (matches, header) = execute_recall(&opts, &output_lines);
+                                    let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
                                     let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                                     let ts = current_timestamp_secs();
                                     if !opts.quiet {

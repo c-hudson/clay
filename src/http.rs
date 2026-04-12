@@ -314,12 +314,14 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if let Some(ws_state) = ws_state {
             let client_id = ws_state.next_client_id();
             let pw_hash = ws_state.password_hash.read().unwrap().clone();
+            let pw_enabled = *ws_state.password_enabled.read().unwrap();
             let prefixed = PrefixedStream::new(buf[..n].to_vec(), stream);
             let _ = crate::websocket::handle_ws_client(
                 prefixed,
                 client_id,
                 ws_state.clients.clone(),
                 pw_hash,
+                pw_enabled,
                 ws_state.allow_list.clone(),
                 ws_state.whitelisted_host.clone(),
                 client_addr,
@@ -362,6 +364,7 @@ pub struct WsConnectionState {
     pub clients: Arc<RwLock<HashMap<u64, crate::websocket::WsClientInfo>>>,
     pub next_client_id: Arc<std::sync::Mutex<u64>>,
     pub password_hash: Arc<std::sync::RwLock<String>>,
+    pub password_enabled: Arc<std::sync::RwLock<bool>>,
     pub allow_list: Arc<std::sync::RwLock<Vec<String>>>,
     pub whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
     pub event_tx: tokio::sync::mpsc::Sender<crate::AppEvent>,
@@ -778,6 +781,12 @@ impl BanList {
             .unwrap_or_default()
             .as_secs();
         self.temp_bans.write().unwrap().retain(|_, &mut expiry| expiry > now);
+    }
+
+    /// Clear violation history for an IP (called on successful auth to prevent
+    /// reconnect-loop bans where transient failures accumulate unfairly)
+    pub fn clear_violations(&self, ip: &str) {
+        self.violations.write().unwrap().remove(ip);
     }
 
     /// Remove a ban (both permanent and temporary) for an IP

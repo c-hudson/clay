@@ -44,6 +44,26 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_AUTH_KEY = "authKey";  // Device auth key for passwordless login
     private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
+    private static final String KEY_CACHED_THEME_CSS = "cachedThemeCss";
+
+    // Default dark theme CSS vars used on first launch before server provides real theme
+    private static final String DEFAULT_THEME_CSS =
+        "--theme-bg: #131926;\n--theme-bg-deep: #131926;\n--theme-bg-surface: #1c1722;\n" +
+        "--theme-bg-elevated: #1f1f1f;\n--theme-bg-hover: #2c2535;\n--theme-fg: #e8e4ec;\n" +
+        "--theme-fg-secondary: #a89fb4;\n--theme-fg-muted: #6e6479;\n--theme-fg-dim: #4a4255;\n" +
+        "--theme-accent: #2657ba;\n--theme-accent-dim: #004080;\n--theme-highlight: #e8c46a;\n" +
+        "--theme-success: #7ecf8b;\n--theme-error: #dc2626;\n--theme-error-dim: #5f0000;\n" +
+        "--theme-status-bar-bg: #284b63;\n--theme-menu-bar-bg: #152b3a;\n" +
+        "--theme-selection-bg: #004080;\n--theme-link: #8cb4e0;\n--theme-prompt: #d4845a;\n" +
+        "--theme-border-subtle: #221c2b;\n--theme-border-medium: #2e2738;\n" +
+        "--theme-button-selected-bg: #e8e4ec;\n--theme-button-selected-fg: #131926;\n" +
+        "--theme-more-indicator-bg: #5f0000;\n--theme-activity-bg: #f5f0d8;\n" +
+        "--theme-ansi-0: #000000;\n--theme-ansi-1: #aa0000;\n--theme-ansi-2: #44aa44;\n" +
+        "--theme-ansi-3: #aa5500;\n--theme-ansi-4: #0039aa;\n--theme-ansi-5: #aa22aa;\n" +
+        "--theme-ansi-6: #1a92aa;\n--theme-ansi-7: #e8e4ec;\n--theme-ansi-8: #777777;\n" +
+        "--theme-ansi-9: #ff8787;\n--theme-ansi-10: #4ce64c;\n--theme-ansi-11: #ded82c;\n" +
+        "--theme-ansi-12: #295fcc;\n--theme-ansi-13: #cc58cc;\n--theme-ansi-14: #4ccce6;\n" +
+        "--theme-ansi-15: #ffffff;\n";
 
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
     private static final String CHANNEL_ID_SERVICE = "clay_service";
@@ -322,6 +342,12 @@ public class MainActivity extends AppCompatActivity {
                    "\",\"port\":" + port +
                    ",\"advancedEnabled\":" + advancedEnabled +
                    ",\"useSecure\":" + useSecure + "}";
+        }
+
+        @JavascriptInterface
+        public void saveThemeCss(String cssVars) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_CACHED_THEME_CSS, cssVars).apply();
         }
 
         @JavascriptInterface
@@ -845,13 +871,20 @@ public class MainActivity extends AppCompatActivity {
      * For HTTP, loads directly in the WebView.
      */
     private void loadUrl(String url, boolean useSecure) {
-        if (useSecure) {
-            new Thread(() -> {
-                try {
-                    if (connectCancelled) return;
+        new Thread(() -> {
+            try {
+                if (connectCancelled) return;
+
+                // Fast path: load HTML/CSS/JS from APK assets (no network requests needed)
+                String html = loadHtmlFromAssets();
+
+                if (html != null) {
+                    html = inlineAssetsIntoHtml(html);
+                    html = substituteTemplateVars(html, useSecure);
+                } else if (useSecure) {
+                    // HTTPS fallback: fetch from server (assets not available in APK)
                     okhttp3.OkHttpClient client = createTrustAllClient();
 
-                    // Fetch HTML
                     okhttp3.Response htmlResp = client.newCall(
                         new okhttp3.Request.Builder().url(url).build()).execute();
                     if (connectCancelled) { htmlResp.close(); return; }
@@ -864,77 +897,119 @@ public class MainActivity extends AppCompatActivity {
                         });
                         return;
                     }
-                    String html = htmlResp.body().string();
+                    html = htmlResp.body().string();
                     htmlResp.close();
 
-                    // Fetch CSS
-                    String css = "";
                     try {
                         okhttp3.Response cssResp = client.newCall(
                             new okhttp3.Request.Builder().url(url + "/style.css").build()).execute();
                         if (cssResp.isSuccessful()) {
-                            css = cssResp.body().string();
+                            String css = cssResp.body().string();
+                            html = html.replace("<link rel=\"stylesheet\" href=\"style.css\">",
+                                               "<style>\n" + css + "\n</style>");
+                            html = html.replace("<link rel=\"stylesheet\" href=\"/style.css\">",
+                                               "<style>\n" + css + "\n</style>");
                         }
                         cssResp.close();
                     } catch (Exception e) { /* ignore */ }
 
-                    // Fetch JS
-                    String js = "";
                     try {
                         okhttp3.Response jsResp = client.newCall(
                             new okhttp3.Request.Builder().url(url + "/app.js").build()).execute();
                         if (jsResp.isSuccessful()) {
-                            js = jsResp.body().string();
+                            String js = jsResp.body().string();
+                            html = html.replace("<script src=\"app.js\"></script>",
+                                               "<script>\n" + js + "\n</script>");
+                            html = html.replace("<script src=\"/app.js\"></script>",
+                                               "<script>\n" + js + "\n</script>");
                         }
                         jsResp.close();
                     } catch (Exception e) { /* ignore */ }
-
-                    if (connectCancelled) return;
-
-                    // Inline CSS and JS into HTML
-                    if (!css.isEmpty()) {
-                        html = html.replace(
-                            "<link rel=\"stylesheet\" href=\"style.css\">",
-                            "<style>\n" + css + "\n</style>");
-                        html = html.replace(
-                            "<link rel=\"stylesheet\" href=\"/style.css\">",
-                            "<style>\n" + css + "\n</style>");
-                    }
-                    if (!js.isEmpty()) {
-                        html = html.replace(
-                            "<script src=\"app.js\"></script>",
-                            "<script>\n" + js + "\n</script>");
-                        html = html.replace(
-                            "<script src=\"/app.js\"></script>",
-                            "<script>\n" + js + "\n</script>");
-                    }
-
-                    final String finalHtml = html;
+                } else {
+                    // HTTP fallback: let WebView fetch normally
+                    final String loadUrl = url;
                     runOnUiThread(() -> {
-                        if (connectCancelled) return;
-                        webView.loadDataWithBaseURL(url, finalHtml, "text/html", "UTF-8", null);
+                        webView.loadUrl(loadUrl);
                         interfaceLoaded = true;
-                        loadedInterfaceUrl = url;
-                        hideConnectingOverlay();
+                        loadedInterfaceUrl = loadUrl;
+                        // WebViewClient.onPageFinished will hide the overlay
                     });
-                } catch (Exception e) {
-                    runOnUiThread(() -> {
-                        hideConnectingOverlay();
-                        openSettings("Failed to connect to " + url + ": " + e.getMessage());
-                    });
+                    return;
                 }
-            }).start();
-        } else {
-            webView.loadUrl(url);
-            interfaceLoaded = true;
-            loadedInterfaceUrl = url;
-            // For HTTP, WebView handles loading — hide overlay when page loads
-            // (WebViewClient.onPageFinished will hide it, or error handler will catch failures)
-        }
+
+                if (connectCancelled) return;
+                final String finalHtml = html;
+                runOnUiThread(() -> {
+                    if (connectCancelled) return;
+                    webView.loadDataWithBaseURL(url, finalHtml, "text/html", "UTF-8", null);
+                    interfaceLoaded = true;
+                    loadedInterfaceUrl = url;
+                    hideConnectingOverlay();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    hideConnectingOverlay();
+                    openSettings("Failed to connect to " + url + ": " + e.getMessage());
+                });
+            }
+        }).start();
     }
 
     private void loadWebInterface() {
         resolveHostnameAndLoad();
+    }
+
+    /** Read index.html from APK assets, or null if not available. */
+    private String loadHtmlFromAssets() {
+        try {
+            java.io.InputStream is = getAssets().open("web/index.html");
+            byte[] buffer = new byte[is.available()];
+            is.read(buffer);
+            is.close();
+            return new String(buffer, "UTF-8");
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    /** Inline style.css and app.js from APK assets into the HTML string. */
+    private String inlineAssetsIntoHtml(String html) {
+        try {
+            java.io.InputStream is = getAssets().open("web/style.css");
+            byte[] buffer = new byte[is.available()];
+            is.read(buffer);
+            is.close();
+            String css = new String(buffer, "UTF-8");
+            html = html.replace("<link rel=\"stylesheet\" href=\"style.css\">",
+                                "<style>\n" + css + "\n</style>");
+            html = html.replace("<link rel=\"stylesheet\" href=\"/style.css\">",
+                                "<style>\n" + css + "\n</style>");
+        } catch (java.io.IOException e) { /* fall back to linked CSS */ }
+
+        try {
+            java.io.InputStream is = getAssets().open("web/app.js");
+            byte[] buffer = new byte[is.available()];
+            is.read(buffer);
+            is.close();
+            String js = new String(buffer, "UTF-8");
+            html = html.replace("<script src=\"app.js\"></script>",
+                                "<script>\n" + js + "\n</script>");
+            html = html.replace("<script src=\"/app.js\"></script>",
+                                "<script>\n" + js + "\n</script>");
+        } catch (java.io.IOException e) { /* fall back to linked JS */ }
+
+        return html;
+    }
+
+    /** Substitute template variables in the HTML using locally-known values. */
+    private String substituteTemplateVars(String html, boolean useSecure) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String cachedTheme = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS);
+        return html
+            .replace("{{WS_HOST}}", "")   // JS falls back to window.location.hostname
+            .replace("{{WS_PORT}}", "0")  // sentinel: JS uses window.location.port
+            .replace("{{WS_PROTOCOL}}", useSecure ? "wss" : "ws")
+            .replace("{{THEME_CSS_VARS}}", cachedTheme);
     }
 
     /**

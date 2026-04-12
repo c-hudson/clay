@@ -982,6 +982,7 @@
                 1, // client_id
                 server_clients,
                 password_hash,
+                true, // password_enabled
                 allow_list,
                 whitelisted,
                 client_addr,
@@ -1055,7 +1056,7 @@
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, password_hash,
+                stream, 1, server_clients, password_hash, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 false, users, ban_list,
             ).await.ok();
@@ -1118,7 +1119,7 @@
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, password_hash,
+                stream, 1, server_clients, password_hash, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 false, users, ban_list,
             ).await.ok();
@@ -1210,7 +1211,7 @@
         let server_task1 = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, password_hash,
+                stream, 1, server_clients, password_hash, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 true, // multiuser mode
                 users, ban_list,
@@ -1225,7 +1226,7 @@
         let server_task2 = tokio::spawn(async move {
             let (stream, client_addr) = listener2.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 2, clients2, password_hash2,
+                stream, 2, clients2, password_hash2, true,
                 allow_list2, whitelisted2, client_addr, event_tx2,
                 true, users2, ban_list2,
             ).await.ok();
@@ -1435,7 +1436,7 @@
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, ph,
+                stream, 1, server_clients, ph, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 false, users, ban_list,
             ).await.ok();
@@ -1569,7 +1570,7 @@
         let server_task = tokio::spawn(async move {
             let (stream, client_addr) = listener.accept().await.unwrap();
             crate::websocket::handle_ws_client(
-                stream, 1, server_clients, ph,
+                stream, 1, server_clients, ph, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 false, users, ban_list,
             ).await.ok();

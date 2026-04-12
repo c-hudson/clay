@@ -254,6 +254,7 @@
     let deferredAutoLoginUsername = null;  // Saved username waiting for ServerHello
     let authKey = null;  // Device auth key for passwordless authentication
     let authKeyPending = false;  // True when trying key-based auth (to fall back to password on failure)
+    let keyAuthFailed = false;   // Set after key rejection so reconnect skips key auth and shows password prompt
     let serverChallenge = '';  // Challenge from ServerHello for challenge-response auth
     let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
@@ -1139,7 +1140,7 @@
                         }
                     }, 1000);
                 }
-            } else if (authKey) {
+            } else if (authKey && !keyAuthFailed) {
                 // Have auth key but no saved password - wait for ServerHello to try key auth
                 // Don't show auth modal yet; it will be shown if key auth fails
                 debugLog('onopen: no password but have auth key, waiting for ServerHello');
@@ -1326,6 +1327,31 @@
         window.Android.connectWebSocket(wsUrl);
     }
 
+    // Cleanly close any existing socket, nulling its handlers first to prevent stale
+    // onclose callbacks from corrupting reconnect state after an explicit close.
+    // Resets all fallback flags so we always start fresh on the primary host.
+    function forceReconnect() {
+        if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
+        if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
+        if (ws) {
+            ws.onclose = null;
+            ws.onerror = null;
+            ws.onopen = null;
+            ws.onmessage = null;
+            try { ws.close(); } catch (e) {}
+            ws = null;
+        }
+        connectionFailures = 0;
+        triedWsFallback = false;
+        usingWsFallback = false;
+        useNativeWebSocket = false;
+        usingNativeWebSocket = false;
+        alternateHost = null;
+        triedAlternateHost = false;
+        keyAuthFailed = false;  // Explicit reconnect resets this so key auth can be tried again
+        connect();
+    }
+
     function connect() {
         showConnecting(true);
 
@@ -1436,7 +1462,7 @@
                             }
                         }, 1000);
                     }
-                } else if (authKey) {
+                } else if (authKey && !keyAuthFailed) {
                     // Have auth key but no saved password - wait for ServerHello to try key auth
                     debugLog('ws.onopen: no password but have auth key, waiting for ServerHello');
                     // Safety timeout: if ServerHello doesn't arrive within 3s, show auth modal
@@ -1582,7 +1608,8 @@
                 // WebView auto-auth already sent from onopen; skip everything else
                 if (window.AUTO_PASSWORD) break;
                 // Try auth key first (if not multiuser mode - keys are single-user only)
-                if (!msg.multiuser_mode && authKey && tryAuthWithKey()) {
+                // Skip if keyAuthFailed: key was rejected this session, go straight to password
+                if (!msg.multiuser_mode && authKey && !keyAuthFailed && tryAuthWithKey()) {
                     // Key auth attempt sent, cancel any deferred password auth
                     deferredAutoLoginPassword = null;
                     break;
@@ -1612,6 +1639,7 @@
                 if (msg.success) {
                     authenticated = true;
                     authKeyPending = false;  // Clear key-based auth flag
+                    keyAuthFailed = false;   // Reset so key auth works on next fresh connect
                     reloadReconnect = false;
                     reloadReconnectAttempts = 0;
                     connectionFailures = 0;
@@ -1643,6 +1671,7 @@
                     if (authKeyPending) {
                         debugLog('Key-based auth failed, showing password prompt with failed key');
                         authKeyPending = false;
+                        keyAuthFailed = true;  // Prevent key retry on any auto-reconnect
                         // Don't clear the key - show it in the UI so user can see it failed
                         showAuthModal(true);
                         elements.authError.textContent = 'Auth key rejected - enter password';
@@ -1859,6 +1888,10 @@
                     }
                     if (msg.settings.theme_colors_json) {
                         applyThemeColors(msg.settings.theme_colors_json);
+                        if (window.Android && window.Android.saveThemeCss) {
+                            const el = document.getElementById('theme-vars');
+                            if (el) window.Android.saveThemeCss(el.textContent);
+                        }
                     }
                     if (msg.settings.color_offset_percent !== undefined) {
                         colorOffsetPercent = msg.settings.color_offset_percent;
@@ -2362,6 +2395,10 @@
                     }
                     if (msg.settings.theme_colors_json) {
                         applyThemeColors(msg.settings.theme_colors_json);
+                        if (window.Android && window.Android.saveThemeCss) {
+                            const el = document.getElementById('theme-vars');
+                            if (el) window.Android.saveThemeCss(el.textContent);
+                        }
                     }
                     if (msg.settings.color_offset_percent !== undefined) {
                         const oldOffset = colorOffsetPercent;
@@ -2913,7 +2950,19 @@
         }
 
         if (!password) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            // No live connection — defer the password and reconnect.
+            // After reconnect ServerHello will use deferredAutoLoginPassword directly,
+            // skipping key auth since keyAuthFailed is set.
+            deferredAutoLoginPassword = password;
+            deferredAutoLoginUsername = usernameOverride ||
+                (elements.authUsername && elements.authUsernameRow.style.display !== 'none'
+                    ? (elements.authUsername.value.trim() || null)
+                    : null);
+            keyAuthFailed = true;  // Don't try key auth on this reconnect
+            forceReconnect();
+            return;
+        }
 
         // Store password for saving on success (Android auto-login)
         pendingAuthPassword = password;
@@ -8136,14 +8185,7 @@
         // Connection error modal buttons
         elements.connectionRetryBtn.onclick = function() {
             hideConnectionErrorModal();
-            connectionFailures = 0;
-            // Keep using ws:// fallback if it worked, otherwise reset to try wss:// again
-            // (user can refresh page to fully reset)
-            triedWsFallback = false;
-            // Reset alternate host state so retry starts fresh
-            alternateHost = null;
-            triedAlternateHost = false;
-            connect();
+            forceReconnect();
         };
         elements.connectionCancelBtn.onclick = function() {
             hideConnectionErrorModal();
@@ -8157,12 +8199,7 @@
         // Reconnect modal buttons (shown when send fails due to disconnection)
         elements.reconnectBtn.onclick = function() {
             hideReconnectModal();
-            // Reconnect and resend the command after authentication
-            connectionFailures = 0;
-            triedWsFallback = false;
-            alternateHost = null;
-            triedAlternateHost = false;
-            connect();
+            forceReconnect();
         };
         elements.reconnectCancelBtn.onclick = function() {
             hideReconnectModal();
@@ -8561,38 +8598,26 @@
 
                 if (!ws || ws.readyState === WebSocket.CLOSED) {
                     // WebSocket is already closed, reconnect immediately
-                    connectionFailures = 0;
-                    connect();
+                    forceReconnect();
                 } else if (ws.readyState === WebSocket.CONNECTING) {
                     // Still connecting from before sleep - kill it and start fresh
-                    try { ws.close(); } catch (e) {}
-                    connectionFailures = 0;
-                    connect();
+                    forceReconnect();
                 } else if (ws.readyState === WebSocket.OPEN && !authenticated) {
                     // Socket open but not authenticated - stale from before sleep
-                    try { ws.close(); } catch (e) {}
-                    connectionFailures = 0;
-                    connect();
+                    forceReconnect();
                 } else if (ws.readyState === WebSocket.OPEN && authenticated) {
                     // Socket looks open - verify with a ping
                     try {
                         ws.send(JSON.stringify({ type: 'Ping' }));
                     } catch (e) {
                         // Send failed, connection is dead
-                        ws.close();
-                        connectionFailures = 0;
-                        connect();
+                        forceReconnect();
                         return;
                     }
                     // Wait up to 3 seconds for Pong response
                     wakePongTimeout = setTimeout(function() {
                         wakePongTimeout = null;
-                        // No pong received - connection is stale
-                        if (ws) {
-                            ws.close();
-                        }
-                        connectionFailures = 0;
-                        connect();
+                        forceReconnect();
                     }, 3000);
                 }
             }
@@ -8663,6 +8688,13 @@
         debugLog('Background timeout - connection closed by Android');
         authenticated = false;
         hasReceivedInitialState = false;
+        // Reset all fallback state so the next reconnect (on resume) starts fresh
+        connectionFailures = 0;
+        triedWsFallback = false;
+        usingWsFallback = false;
+        useNativeWebSocket = false;
+        alternateHost = null;
+        triedAlternateHost = false;
         // Don't auto-reconnect here - we're in the background and Android disconnected
         // to save power. Reconnection will happen when user returns (checkConnectionOnResume).
     };
@@ -8674,18 +8706,13 @@
         debugLog('checkConnectionOnResume: ws=' + (ws ? ws.readyState : 'null') + ' auth=' + authenticated);
         if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
             // Connection is dead, reconnect
-            connectionFailures = 0;
-            connect();
+            forceReconnect();
         } else if (ws.readyState === WebSocket.CONNECTING) {
             // Stale connecting attempt, kill and retry
-            try { ws.close(); } catch (e) {}
-            connectionFailures = 0;
-            connect();
+            forceReconnect();
         } else if (ws.readyState === WebSocket.OPEN && !authenticated) {
             // Socket open but not authenticated - stale
-            try { ws.close(); } catch (e) {}
-            connectionFailures = 0;
-            connect();
+            forceReconnect();
         } else if (ws.readyState === WebSocket.OPEN && authenticated) {
             // Looks connected - verify with ping (same as visibilitychange handler)
             if (wakePongTimeout) {
@@ -8695,16 +8722,12 @@
             try {
                 ws.send(JSON.stringify({ type: 'Ping' }));
             } catch (e) {
-                ws.close();
-                connectionFailures = 0;
-                connect();
+                forceReconnect();
                 return;
             }
             wakePongTimeout = setTimeout(function() {
                 wakePongTimeout = null;
-                if (ws) { ws.close(); }
-                connectionFailures = 0;
-                connect();
+                forceReconnect();
             }, 3000);
         }
     };

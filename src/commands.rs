@@ -2534,7 +2534,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                             }
                             tf::TfCommandResult::Recall(opts) => {
                                 let output_lines = app.current_world().output_lines.clone();
-                                let (matches, header) = execute_recall(&opts, &output_lines);
+                                let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
                                 let pattern_str = opts.pattern.as_deref().unwrap_or("*");
 
                                 if !opts.quiet {
@@ -2592,7 +2592,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     }
                     tf::TfCommandResult::Recall(opts) => {
                         let output_lines = app.current_world().output_lines.clone();
-                        let (matches, header) = execute_recall(&opts, &output_lines);
+                        let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
                         let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                         if !opts.quiet {
                             if let Some(h) = header {

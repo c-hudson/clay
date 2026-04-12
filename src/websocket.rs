@@ -598,6 +598,9 @@ pub struct WebSocketServer {
     pub clients: Arc<RwLock<HashMap<u64, WsClientInfo>>>,
     pub next_client_id: Arc<std::sync::Mutex<u64>>,
     pub password_hash: Arc<std::sync::RwLock<String>>,
+    /// True when a non-empty password is configured; false for auth-key-only mode.
+    /// When false, password-based authentication is rejected even if allow list matches.
+    pub password_enabled: Arc<std::sync::RwLock<bool>>,
     pub running: Arc<RwLock<bool>>,
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub port: u16,
@@ -632,6 +635,7 @@ impl WebSocketServer {
             clients: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(std::sync::Mutex::new(1)),
             password_hash: Arc::new(std::sync::RwLock::new(password_hash)),
+            password_enabled: Arc::new(std::sync::RwLock::new(!password.is_empty())),
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: None,
             port,
@@ -655,6 +659,7 @@ impl WebSocketServer {
             clients: self.clients.clone(),
             next_client_id: self.next_client_id.clone(),
             password_hash: self.password_hash.clone(),
+            password_enabled: self.password_enabled.clone(),
             allow_list: self.allow_list.clone(),
             whitelisted_host: self.whitelisted_host.clone(),
             event_tx,
@@ -980,6 +985,7 @@ impl WebSocketServer {
     /// Update the password hash on the running server (takes effect for new connections)
     pub fn update_password(&self, password: &str) {
         *self.password_hash.write().unwrap() = hash_password(password);
+        *self.password_enabled.write().unwrap() = !password.is_empty();
     }
 
     pub fn stop(&mut self) {
@@ -1147,6 +1153,7 @@ pub async fn start_websocket_server(
     let clients = Arc::clone(&server.clients);
     let next_client_id = Arc::clone(&server.next_client_id);
     let password_hash = server.password_hash.clone();
+    let password_enabled = server.password_enabled.clone();
     let allow_list = server.allow_list.clone();
     let whitelisted_host = server.whitelisted_host.clone();
     let running = Arc::clone(&server.running);
@@ -1191,6 +1198,7 @@ pub async fn start_websocket_server(
                             let multiuser_mode = multiuser_mode;
                             let users = users.clone();
                             let ban_list = ban_list.clone();
+                            let password_enabled = *password_enabled.read().unwrap();
                             #[cfg(feature = "native-tls-backend")]
                             let tls_acceptor = tls_acceptor.clone();
                             #[cfg(feature = "rustls-backend")]
@@ -1207,6 +1215,7 @@ pub async fn start_websocket_server(
                                                 client_id,
                                                 clients,
                                                 password_hash,
+                                                password_enabled,
                                                 allow_list,
                                                 whitelisted_host,
                                                 client_addr,
@@ -1227,6 +1236,7 @@ pub async fn start_websocket_server(
                                     client_id,
                                     clients,
                                     password_hash,
+                                    password_enabled,
                                     allow_list,
                                     whitelisted_host,
                                     client_addr,
@@ -1248,6 +1258,7 @@ pub async fn start_websocket_server(
                                                 client_id,
                                                 clients,
                                                 password_hash,
+                                                password_enabled,
                                                 allow_list,
                                                 whitelisted_host,
                                                 client_addr,
@@ -1270,6 +1281,7 @@ pub async fn start_websocket_server(
                                     client_id,
                                     clients,
                                     password_hash,
+                                    password_enabled,
                                     allow_list,
                                     whitelisted_host,
                                     client_addr,
@@ -1307,6 +1319,7 @@ pub async fn handle_ws_client<S>(
     client_id: u64,
     clients: Arc<RwLock<HashMap<u64, WsClientInfo>>>,
     password_hash: String,
+    password_enabled: bool,
     allow_list: Arc<std::sync::RwLock<Vec<String>>>,
     whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
     client_addr: std::net::SocketAddr,
@@ -1445,6 +1458,19 @@ where
                                 continue;
                             }
 
+                            // Password-based auth: reject if no password is configured
+                            if !password_enabled {
+                                crate::http::log_remote_event("WS-REJECT", &client_ip,
+                                    "no password configured, auth key required");
+                                let _ = tx.send(WsMessage::AuthResponse {
+                                    success: false,
+                                    error: Some("Password auth not available. Use an auth key.".to_string()),
+                                    username: None,
+                                    multiuser_mode,
+                                });
+                                continue;
+                            }
+
                             // Password-based auth: check allow list first.
                             // - Empty allow list: reject (only auth keys accepted)
                             // - Non-empty allow list: IP must be in list or whitelisted
@@ -1514,6 +1540,9 @@ where
                             if auth_success {
                                 // Log successful auth
                                 log_ws_auth(&client_ip, true, auth_username.as_deref());
+                                // Clear any accumulated violations so transient reconnect
+                                // failures don't result in a ban after a successful login
+                                ban_list.clear_violations(&client_ip);
 
                                 // Mark as authenticated and set username
                                 let mut clients_guard = clients.write().await;

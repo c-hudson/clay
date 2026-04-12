@@ -2,7 +2,7 @@ use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::tf;
-use crate::util::strip_ansi_codes;
+use crate::util::{strip_ansi_codes, strip_mud_tag};
 use crate::OutputLine;
 
 /// Match type for action patterns
@@ -266,7 +266,7 @@ pub fn wildcard_to_regex(pattern: &str) -> String {
 
 /// Execute recall command with options
 /// Returns (matches, header_message) - matches is the list of matching lines
-pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> (Vec<String>, Option<String>) {
+pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], show_tags: bool) -> (Vec<String>, Option<String>) {
     use tf::{RecallMatchStyle, RecallRange};
 
     // Build regex from pattern based on match style
@@ -370,7 +370,12 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> 
             }
         }
 
-        let plain = strip_ansi_codes(&line.text);
+        // Match against visible text only: when show_tags (F2) is off, strip MUD tags too
+        let plain = if show_tags {
+            strip_ansi_codes(&line.text)
+        } else {
+            strip_ansi_codes(&strip_mud_tag(&line.text))
+        };
         let is_match = match &regex {
             Some(Ok(re)) => {
                 let matched = re.is_match(&plain);
@@ -381,7 +386,11 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> 
         };
 
         if is_match {
-            let mut display_line = line.text.clone();
+            let mut display_line = if show_tags {
+                line.text.clone()
+            } else {
+                strip_mud_tag(&line.text)
+            };
 
             // Add timestamp if requested
             if opts.show_timestamps {

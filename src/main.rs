@@ -5694,6 +5694,8 @@ impl App {
             };
             if is_valid {
                 crate::http::log_remote_event("WS-KEY-OK", client_ip, "accepted");
+                // Clear any accumulated violations so reconnect failures don't ban the client
+                self.ban_list.clear_violations(client_ip);
                 self.ws_set_client_authenticated(client_id, true);
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: true,
@@ -5717,7 +5719,10 @@ impl App {
                 self.web_reconnect_needed = true;
             } else {
                 crate::http::log_remote_event("WS-KEY-REJECT", client_ip, "no matching key");
-                self.ban_list.record_violation(client_ip, "WebSocket: failed auth key");
+                // Don't record a ban violation for auth key failures — these come from known
+                // devices with stored keys. Reconnect races after a server restart would
+                // otherwise accumulate violations and ban the device unfairly.
+                // Password brute-force (handled in handle_ws_client) still triggers bans.
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
                     success: false,
                     error: Some("Invalid auth key".to_string()),
@@ -5950,7 +5955,7 @@ impl App {
                                     tf::TfCommandResult::Recall(opts) => {
                                         if world_index < self.worlds.len() {
                                             let output_lines = self.worlds[world_index].output_lines.clone();
-                                            let (matches, header) = execute_recall(&opts, &output_lines);
+                                            let (matches, header) = execute_recall(&opts, &output_lines, self.show_tags);
                                             let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                                             let ts = current_timestamp_secs();
 
@@ -6031,7 +6036,7 @@ impl App {
                         tf::TfCommandResult::Recall(opts) => {
                             if world_index < self.worlds.len() {
                                 let output_lines = self.worlds[world_index].output_lines.clone();
-                                let (matches, header) = execute_recall(&opts, &output_lines);
+                                let (matches, header) = execute_recall(&opts, &output_lines, self.show_tags);
                                 let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                                 let ts = current_timestamp_secs();
                                 if !opts.quiet {
@@ -6749,7 +6754,7 @@ impl App {
         if let Some((opts, recall_prefix)) = recall_opts {
             if world_index < self.worlds.len() {
                 let output_lines = self.worlds[world_index].output_lines.clone();
-                let (matches, _header) = execute_recall(&opts, &output_lines);
+                let (matches, _header) = execute_recall(&opts, &output_lines, self.show_tags);
                 *lines = matches.iter()
                     .map(|line| format!("{}{}", recall_prefix, line))
                     .collect();
@@ -11118,8 +11123,9 @@ pub async fn run_app_headless(
         app.settings.websocket_password = ws_password.clone();
     }
 
-    // Create WebSocket server state (for client management, no standalone listener)
-    let ws_state = if !app.settings.websocket_password.is_empty() {
+    // Create WebSocket server state (for client management, no standalone listener).
+    // Needed when a password is set OR when an auth key is set (auth-key-only mode).
+    let ws_state = if !app.settings.websocket_password.is_empty() || app.settings.websocket_auth_key.is_some() {
         let server = WebSocketServer::new(
             &app.settings.websocket_password,
             app.settings.http_port,
@@ -12710,8 +12716,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     debug_log(is_debug_enabled(), "STARTUP: Keepalives sent, starting servers...");
 
-    // Create WebSocket server state (for client management, no standalone listener)
-    let ws_state = if !app.settings.websocket_password.is_empty() {
+    // Create WebSocket server state (for client management, no standalone listener).
+    // Needed when a password is set OR when an auth key is set (auth-key-only mode).
+    let ws_state = if !app.settings.websocket_password.is_empty() || app.settings.websocket_auth_key.is_some() {
         let server = WebSocketServer::new(
             &app.settings.websocket_password,
             app.settings.http_port,
@@ -13161,7 +13168,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             match app.tf_engine.execute(&recall_cmd) {
                                                 tf::TfCommandResult::Recall(opts) => {
                                                     let output_lines = app.current_world().output_lines.clone();
-                                                    let (matches, header) = execute_recall(&opts, &output_lines);
+                                                    let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
                                                     let pattern_str = opts.pattern.as_deref().unwrap_or("*");
 
                                                     if !opts.quiet {
@@ -13230,7 +13237,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                     tf::TfCommandResult::Recall(opts) => {
                                         let output_lines = app.current_world().output_lines.clone();
-                                        let (matches, header) = execute_recall(&opts, &output_lines);
+                                        let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
                                         let pattern_str = opts.pattern.as_deref().unwrap_or("*");
 
                                         if !opts.quiet {
@@ -13261,7 +13268,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // If this is a /quote with backtick /recall, execute the recall now
                                         if let Some((opts, recall_prefix)) = recall_opts {
                                             let output_lines = app.current_world().output_lines.clone();
-                                            let (matches, _header) = execute_recall(&opts, &output_lines);
+                                            let (matches, _header) = execute_recall(&opts, &output_lines, app.show_tags);
                                             lines = matches.iter()
                                                 .map(|line| format!("{}{}", recall_prefix, line))
                                                 .collect();
