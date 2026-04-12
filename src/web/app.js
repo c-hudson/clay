@@ -5858,7 +5858,7 @@
             ws_port: wsPort,
             ws_cert_file: wsCertFile,
             ws_key_file: wsKeyFile,
-            ws_password: (elements.webWsPassword ? elements.webWsPassword.value : ''),
+            ws_password: wsPassword,
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
             tts_mode: ttsMode,
