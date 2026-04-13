@@ -2,6 +2,14 @@ plugins {
     id 'com.android.application'
 }
 
+// Copy web assets from Rust source into APK assets at build time
+task copyWebAssets(type: Copy) {
+    from '../../src/web'
+    into 'src/main/assets/web'
+    include 'index.html', 'app.js', 'style.css', 'theme-editor.html', 'keybind-editor.html'
+}
+preBuild.dependsOn copyWebAssets
+
 android {
     namespace 'com.clay.mudclient'
     compileSdk 34
@@ -10,7 +18,7 @@ android {
         applicationId "com.clay.mudclient"
         minSdk 26
         targetSdk 34
-        versionCode 57
+        versionCode 58
         versionName "1.0.1-beta"
     }
 
