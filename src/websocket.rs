@@ -1104,7 +1104,7 @@ fn reverse_dns_lookup_blocking(ip: &str) -> Option<String> {
                 &sa as *const libc::sockaddr_in as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                 host_buf.as_mut_ptr() as *mut libc::c_char,
-                host_buf.len() as libc::socklen_t,
+                host_buf.len() as _,
                 std::ptr::null_mut(), 0, 0,
             )
         },
@@ -1116,7 +1116,7 @@ fn reverse_dns_lookup_blocking(ip: &str) -> Option<String> {
                 &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
                 host_buf.as_mut_ptr() as *mut libc::c_char,
-                host_buf.len() as libc::socklen_t,
+                host_buf.len() as _,
                 std::ptr::null_mut(), 0, 0,
             )
         },
