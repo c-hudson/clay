@@ -5338,14 +5338,13 @@
 
     // Update UI based on Android app detection
     function updateAndroidUI() {
-        // Show Clay Server menu item only when running in Android app
         const isAndroid = typeof Android !== 'undefined' && Android.openServerSettings;
-        document.querySelectorAll('.menu-clay-server').forEach(el => {
-            el.style.display = isAndroid ? '' : 'none';
-        });
         // Show Clay Server settings tab button only in Android app
         const clayServerTabBtn = document.getElementById('settings-clay-server-btn');
         if (clayServerTabBtn) clayServerTabBtn.style.display = isAndroid ? '' : 'none';
+        // Show auth key Download button only in Android app
+        const dlBtn = document.getElementById('cs-auth-key-download');
+        if (dlBtn) dlBtn.style.display = isAndroid ? '' : 'none';
         // Show Reload menu item only in WebView GUI mode (not pure web)
         document.querySelectorAll('.menu-reload').forEach(el => {
             el.style.display = window.WEBVIEW_MODE ? '' : 'none';
@@ -8556,6 +8555,15 @@
             csAdvanced.onchange = function() {
                 var sec = document.getElementById('cs-advanced-section');
                 if (sec) sec.style.display = this.checked ? '' : 'none';
+            };
+        }
+        var csAuthKeyDl = document.getElementById('cs-auth-key-download');
+        if (csAuthKeyDl) {
+            csAuthKeyDl.onclick = function() {
+                var key = (document.getElementById('cs-auth-key') || {}).value || '';
+                if (key && window.Android && typeof window.Android.downloadAuthKey === 'function') {
+                    window.Android.downloadAuthKey(key);
+                }
             };
         }
         if (elements.fontLineheightMinus) {

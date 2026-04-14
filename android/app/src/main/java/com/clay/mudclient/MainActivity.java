@@ -354,6 +354,42 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public void downloadAuthKey(String key) {
+            if (key == null || key.isEmpty()) return;
+            String filename = "clay-auth-key.txt";
+            try {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    android.content.ContentValues values = new android.content.ContentValues();
+                    values.put(android.provider.MediaStore.Downloads.DISPLAY_NAME, filename);
+                    values.put(android.provider.MediaStore.Downloads.MIME_TYPE, "text/plain");
+                    values.put(android.provider.MediaStore.Downloads.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS);
+                    android.net.Uri uri = getContentResolver().insert(
+                        android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                    if (uri != null) {
+                        try (java.io.OutputStream os = getContentResolver().openOutputStream(uri)) {
+                            os.write(key.getBytes("UTF-8"));
+                        }
+                        runOnUiThread(() -> android.widget.Toast.makeText(MainActivity.this,
+                            "Auth key saved to Downloads/" + filename, android.widget.Toast.LENGTH_LONG).show());
+                    }
+                } else {
+                    java.io.File dir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS);
+                    dir.mkdirs();
+                    java.io.File file = new java.io.File(dir, filename);
+                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(file)) {
+                        fos.write(key.getBytes("UTF-8"));
+                    }
+                    runOnUiThread(() -> android.widget.Toast.makeText(MainActivity.this,
+                        "Auth key saved to Downloads/" + filename, android.widget.Toast.LENGTH_LONG).show());
+                }
+            } catch (Exception e) {
+                android.util.Log.e("Clay", "Failed to save auth key: " + e.getMessage());
+                runOnUiThread(() -> android.widget.Toast.makeText(MainActivity.this,
+                    "Failed to save auth key: " + e.getMessage(), android.widget.Toast.LENGTH_LONG).show());
+            }
+        }
+
+        @JavascriptInterface
         public void saveThemeCss(String cssVars) {
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString(KEY_CACHED_THEME_CSS, cssVars).apply();

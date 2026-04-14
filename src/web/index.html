@@ -81,7 +81,6 @@
             <div class="menu-item menu-reload" data-action="reload" style="display: none;">Reload<span class="shortcut">Ctrl+R</span></div>
             <div class="menu-item" data-action="new-window">New Window</div>
             <div class="menu-item menu-resync" data-action="resync">Resync</div>
-            <div class="menu-item menu-clay-server" data-action="clay-server" style="display: none;">Clay Server</div>
             <div class="menu-sep menu-logout-divider" style="display: none;"></div>
             <div class="menu-item menu-logout" data-action="logout" style="display: none;">Logout</div>
         </div>
@@ -804,8 +803,9 @@
                                 </div>
                                 <div class="setting-row">
                                     <span class="setting-label">Auth Key</span>
-                                    <div class="setting-value">
-                                        <input type="text" id="cs-auth-key" autocomplete="off" class="web-input" style="font-family:monospace;font-size:0.8em">
+                                    <div class="setting-value" style="display:flex;gap:4px;align-items:center">
+                                        <input type="text" id="cs-auth-key" autocomplete="off" class="web-input" style="font-family:monospace;font-size:0.8em;flex:1">
+                                        <button id="cs-auth-key-download" class="stepper-btn" title="Save to Downloads" style="padding:2px 8px;white-space:nowrap;display:none">Download</button>
                                     </div>
                                 </div>
                             </div>
