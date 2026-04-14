@@ -102,7 +102,7 @@ RUSTFLAGS="-L /system/lib64" cargo build --release --no-default-features --featu
 ```bash
 cd ~/clay.build
 git pull
-cargo build --release --no-default-features --features rustls-backend
+. ~/.cargo/env && cargo build --release --no-default-features --features rustls-backend
 ```
 - This build is only to verify the code compiles on this machine
 - The binary is NOT included in the release assets
