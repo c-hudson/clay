@@ -105,11 +105,9 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void openServerSettings() {
             runOnUiThread(() -> {
-                // Open settings activity with fromMenu flag (don't clear host/port)
-                Intent intent = new Intent(MainActivity.this, SettingsActivity.class);
-                intent.putExtra("errorMessage", "Change Clay server connection");
-                intent.putExtra("fromMenu", true);
-                startActivity(intent);
+                webView.evaluateJavascript(
+                    "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');",
+                    null);
             });
         }
 
@@ -336,12 +334,23 @@ public class MainActivity extends AppCompatActivity {
             String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
             int port = prefs.getInt(KEY_SERVER_PORT, 9000);
             boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
-            boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
             return "{\"localHost\":\"" + localHost.replace("\"", "") +
                    "\",\"remoteHost\":\"" + remoteHost.replace("\"", "") +
                    "\",\"port\":" + port +
-                   ",\"advancedEnabled\":" + advancedEnabled +
-                   ",\"useSecure\":" + useSecure + "}";
+                   ",\"advancedEnabled\":" + advancedEnabled + "}";
+        }
+
+        @JavascriptInterface
+        public void saveConnectionSettings(String host, String port,
+                                           boolean advancedEnabled, String remoteHostname) {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            SharedPreferences.Editor editor = prefs.edit();
+            editor.putString(KEY_SERVER_HOST, host != null ? host : "");
+            try { editor.putInt(KEY_SERVER_PORT, Integer.parseInt(port != null ? port.trim() : "9000")); }
+            catch (NumberFormatException e) { editor.putInt(KEY_SERVER_PORT, 9000); }
+            editor.putBoolean(KEY_ADVANCED_ENABLED, advancedEnabled);
+            editor.putString(KEY_REMOTE_HOSTNAME, remoteHostname != null ? remoteHostname : "");
+            editor.apply();
         }
 
         @JavascriptInterface
@@ -386,7 +395,9 @@ public class MainActivity extends AppCompatActivity {
         connectingCancelBtn.setOnClickListener(v -> {
             connectCancelled = true;
             hideConnectingOverlay();
-            openSettings("Connection cancelled");
+            webView.evaluateJavascript(
+                "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');",
+                null);
         });
         setupWebView();
 
@@ -463,18 +474,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void proceedAfterPermissions() {
-        // Check if we have saved server settings
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String host = prefs.getString(KEY_SERVER_HOST, null);
-        int port = prefs.getInt(KEY_SERVER_PORT, 0);
-
-        if (host == null || host.isEmpty() || port == 0) {
-            // No saved settings, open settings activity
-            openSettings(null);
-        } else {
-            // Load the web interface
-            loadWebInterface();
-        }
+        // Always load the web interface; JS will detect empty host and show server settings
+        loadWebInterface();
     }
 
     private void createNotificationChannel() {
@@ -730,7 +731,8 @@ public class MainActivity extends AppCompatActivity {
                     connectionFailed = true;
                     runOnUiThread(() -> {
                         hideConnectingOverlay();
-                        openSettings("Connection failed to " + request.getUrl().getHost() + ": " + error.getDescription());
+                        // Page failed to load from server — fall back to assets and show server settings
+                        loadUrl("");
                     });
                 }
             }
@@ -782,14 +784,6 @@ public class MainActivity extends AppCompatActivity {
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
-                // Check for WebSocket connection errors
-                String message = consoleMessage.message();
-                if (message != null && message.contains("WebSocket connection") &&
-                    (message.contains("failed") || message.contains("error"))) {
-                    runOnUiThread(() -> {
-                        openSettings("WebSocket connection failed to " + (loadedInterfaceUrl != null ? loadedInterfaceUrl : "server"));
-                    });
-                }
                 return super.onConsoleMessage(consoleMessage);
             }
         });
@@ -805,19 +799,23 @@ public class MainActivity extends AppCompatActivity {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String standardHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
         int port = prefs.getInt(KEY_SERVER_PORT, 9000);
-        boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
         boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
         String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
 
         connectionFailed = false;
         connectCancelled = false;
 
+        if (standardHost.isEmpty()) {
+            // No host configured — load assets directly; JS will open server settings
+            loadUrl("");
+            return;
+        }
+
         if (!advancedEnabled || remoteHostname.isEmpty()) {
             // No advanced mode — just connect to the standard host
-            String protocol = useSecure ? "https" : "http";
-            String url = protocol + "://" + standardHost + ":" + port;
+            String url = "http://" + standardHost + ":" + port;
             showConnectingOverlay(url);
-            loadUrl(url, useSecure);
+            loadUrl(url);
             return;
         }
 
@@ -840,15 +838,14 @@ public class MainActivity extends AppCompatActivity {
             if (connectCancelled) return;
 
             String host = localReachable ? standardHost : remoteHostname;
-            String protocol = useSecure ? "https" : "http";
-            String url = protocol + "://" + host + ":" + port;
+            String url = "http://" + host + ":" + port;
 
             android.util.Log.i("Clay", "Using hostname: " + host + (localReachable ? " (local)" : " (remote)"));
 
             runOnUiThread(() -> {
                 if (connectCancelled) return;
                 connectingUrl.setText(host);
-                loadUrl(url, useSecure);
+                loadUrl(url);
             });
         }).start();
     }
@@ -870,7 +867,7 @@ public class MainActivity extends AppCompatActivity {
      * For HTTPS, fetches resources via OkHttp and inlines them.
      * For HTTP, loads directly in the WebView.
      */
-    private void loadUrl(String url, boolean useSecure) {
+    private void loadUrl(String url) {
         new Thread(() -> {
             try {
                 if (connectCancelled) return;
@@ -880,51 +877,7 @@ public class MainActivity extends AppCompatActivity {
 
                 if (html != null) {
                     html = inlineAssetsIntoHtml(html);
-                    html = substituteTemplateVars(html, useSecure);
-                } else if (useSecure) {
-                    // HTTPS fallback: fetch from server (assets not available in APK)
-                    okhttp3.OkHttpClient client = createTrustAllClient();
-
-                    okhttp3.Response htmlResp = client.newCall(
-                        new okhttp3.Request.Builder().url(url).build()).execute();
-                    if (connectCancelled) { htmlResp.close(); return; }
-                    if (!htmlResp.isSuccessful()) {
-                        final int code = htmlResp.code();
-                        htmlResp.close();
-                        runOnUiThread(() -> {
-                            hideConnectingOverlay();
-                            openSettings("HTTP " + code + " loading " + url);
-                        });
-                        return;
-                    }
-                    html = htmlResp.body().string();
-                    htmlResp.close();
-
-                    try {
-                        okhttp3.Response cssResp = client.newCall(
-                            new okhttp3.Request.Builder().url(url + "/style.css").build()).execute();
-                        if (cssResp.isSuccessful()) {
-                            String css = cssResp.body().string();
-                            html = html.replace("<link rel=\"stylesheet\" href=\"style.css\">",
-                                               "<style>\n" + css + "\n</style>");
-                            html = html.replace("<link rel=\"stylesheet\" href=\"/style.css\">",
-                                               "<style>\n" + css + "\n</style>");
-                        }
-                        cssResp.close();
-                    } catch (Exception e) { /* ignore */ }
-
-                    try {
-                        okhttp3.Response jsResp = client.newCall(
-                            new okhttp3.Request.Builder().url(url + "/app.js").build()).execute();
-                        if (jsResp.isSuccessful()) {
-                            String js = jsResp.body().string();
-                            html = html.replace("<script src=\"app.js\"></script>",
-                                               "<script>\n" + js + "\n</script>");
-                            html = html.replace("<script src=\"/app.js\"></script>",
-                                               "<script>\n" + js + "\n</script>");
-                        }
-                        jsResp.close();
-                    } catch (Exception e) { /* ignore */ }
+                    html = substituteTemplateVars(html);
                 } else {
                     // HTTP fallback: let WebView fetch normally
                     final String loadUrl = url;
@@ -947,9 +900,11 @@ public class MainActivity extends AppCompatActivity {
                     hideConnectingOverlay();
                 });
             } catch (Exception e) {
+                android.util.Log.e("Clay", "Failed to load " + url + ": " + e.getMessage());
                 runOnUiThread(() -> {
                     hideConnectingOverlay();
-                    openSettings("Failed to connect to " + url + ": " + e.getMessage());
+                    // Fall back to assets and let JS show server settings
+                    loadUrl("");
                 });
             }
         }).start();
@@ -1002,13 +957,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** Substitute template variables in the HTML using locally-known values. */
-    private String substituteTemplateVars(String html, boolean useSecure) {
+    private String substituteTemplateVars(String html) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String cachedTheme = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS);
         return html
             .replace("{{WS_HOST}}", "")   // JS falls back to window.location.hostname
             .replace("{{WS_PORT}}", "0")  // sentinel: JS uses window.location.port
-            .replace("{{WS_PROTOCOL}}", useSecure ? "wss" : "ws")
+            .replace("{{WS_PROTOCOL}}", "wss")  // always try wss first; JS falls back to ws
             .replace("{{THEME_CSS_VARS}}", cachedTheme);
     }
 
@@ -1064,14 +1019,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void openSettings(String errorMessage) {
-        Intent intent = new Intent(this, SettingsActivity.class);
-        if (errorMessage != null) {
-            intent.putExtra("errorMessage", errorMessage);
-        }
-        startActivity(intent);
-    }
-
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
@@ -1106,7 +1053,6 @@ public class MainActivity extends AppCompatActivity {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, null);
         int port = prefs.getInt(KEY_SERVER_PORT, 0);
-        boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
 
         if (host != null && !host.isEmpty() && port > 0) {
             if (!interfaceLoaded) {

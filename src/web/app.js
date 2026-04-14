@@ -171,6 +171,7 @@
         settingsTitle: document.getElementById('settings-title'),
         settingsGeneralSection: document.getElementById('settings-general'),
         settingsWebSection: document.getElementById('settings-web'),
+        settingsClayServerSection: document.getElementById('settings-clay-server'),
         webAuthKey: document.getElementById('web-auth-key'),
         webAuthKeyRegen: document.getElementById('web-auth-key-regen'),
         // Setup fields (inside combined settings modal)
@@ -976,9 +977,19 @@
         updateAndroidUI();
         loadAuthKey();  // Load saved auth key for passwordless login
         applyTransparency(guiTransparency);  // Set initial #app background in webview mode
-        connect();
         updateTime();
         setInterval(updateTime, 1000);
+        // First run: if Android with no host configured, open server settings instead of connecting
+        if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
+            try {
+                var connInfo = JSON.parse(window.Android.getConnectionInfo());
+                if (!connInfo.localHost) {
+                    openSettingsPopup('clay-server');
+                    return;
+                }
+            } catch(e) {}
+        }
+        connect();
     }
 
     // Load auth key from storage (Android only)
@@ -5332,6 +5343,9 @@
         document.querySelectorAll('.menu-clay-server').forEach(el => {
             el.style.display = isAndroid ? '' : 'none';
         });
+        // Show Clay Server settings tab button only in Android app
+        const clayServerTabBtn = document.getElementById('settings-clay-server-btn');
+        if (clayServerTabBtn) clayServerTabBtn.style.display = isAndroid ? '' : 'none';
         // Show Reload menu item only in WebView GUI mode (not pure web)
         document.querySelectorAll('.menu-reload').forEach(el => {
             el.style.display = window.WEBVIEW_MODE ? '' : 'none';
@@ -5342,6 +5356,30 @@
                 el.style.display = 'none';
             });
         }
+    }
+
+    // Populate the Clay Server settings tab fields from Android SharedPreferences
+    function populateClayServerTab() {
+        if (!window.Android || typeof window.Android.getConnectionInfo !== 'function') return;
+        try {
+            var info = JSON.parse(window.Android.getConnectionInfo());
+            var hostEl = document.getElementById('cs-host');
+            var portEl = document.getElementById('cs-port');
+            var advEl = document.getElementById('cs-advanced');
+            var advSec = document.getElementById('cs-advanced-section');
+            var remoteEl = document.getElementById('cs-remote-host');
+            var userEl = document.getElementById('cs-username');
+            var passEl = document.getElementById('cs-password');
+            var keyEl = document.getElementById('cs-auth-key');
+            if (hostEl) hostEl.value = info.localHost || '';
+            if (portEl) portEl.value = info.port || 9000;
+            if (advEl) advEl.checked = !!info.advancedEnabled;
+            if (advSec) advSec.style.display = info.advancedEnabled ? '' : 'none';
+            if (remoteEl) remoteEl.value = info.remoteHost || '';
+            if (userEl) userEl.value = (typeof window.Android.getSavedUsername === 'function') ? window.Android.getSavedUsername() : '';
+            if (passEl) passEl.value = (typeof window.Android.getSavedPassword === 'function') ? window.Android.getSavedPassword() : '';
+            if (keyEl) keyEl.value = (typeof window.Android.getAuthKey === 'function') ? window.Android.getAuthKey() : '';
+        } catch(e) {}
     }
 
     // Update UI based on multiuser mode
@@ -5696,8 +5734,18 @@
         elements.settingsGeneralSection.classList.toggle('active', tab === 'general');
         elements.settingsWebSection.classList.toggle('active', tab === 'web');
         elements.settingsFontSection.classList.toggle('active', tab === 'font');
-        var titles = { general: 'General', web: 'Web', font: 'Font' };
+        if (elements.settingsClayServerSection) {
+            elements.settingsClayServerSection.classList.toggle('active', tab === 'clay-server');
+        }
+        var titles = { general: 'General', web: 'Web', font: 'Font', 'clay-server': 'Clay Server' };
         elements.settingsTitle.textContent = titles[tab] || tab;
+        // Rename Save button when on clay-server tab (will reconnect)
+        if (elements.settingsSaveBtn) {
+            elements.settingsSaveBtn.textContent = tab === 'clay-server' ? 'Save & Connect' : 'Save';
+        }
+        if (tab === 'clay-server') {
+            populateClayServerTab();
+        }
     }
 
     function openEditorPage(page) {
@@ -5871,6 +5919,40 @@
     }
 
     function saveSettingsAll() {
+        // Clay Server tab (Android only) — save to SharedPreferences and reload
+        if (settingsActiveTab === 'clay-server' && window.Android) {
+            var host = (document.getElementById('cs-host') || {}).value || '';
+            host = host.trim();
+            if (!host) {
+                var statusEl = document.getElementById('cs-host');
+                if (statusEl) { statusEl.focus(); statusEl.style.outline = '2px solid var(--theme-error)'; }
+                return;
+            }
+            var port = ((document.getElementById('cs-port') || {}).value || '9000').trim();
+            var advanced = !!(document.getElementById('cs-advanced') || {}).checked;
+            var remoteHost = ((document.getElementById('cs-remote-host') || {}).value || '').trim();
+            var username = ((document.getElementById('cs-username') || {}).value || '').trim();
+            var password = (document.getElementById('cs-password') || {}).value || '';
+            var authKey = ((document.getElementById('cs-auth-key') || {}).value || '').trim();
+            if (typeof window.Android.saveConnectionSettings === 'function') {
+                window.Android.saveConnectionSettings(host, port, advanced, remoteHost);
+            }
+            if (typeof window.Android.saveUsername === 'function') window.Android.saveUsername(username);
+            if (password) {
+                if (typeof window.Android.savePassword === 'function') window.Android.savePassword(password);
+            } else {
+                if (typeof window.Android.clearSavedPassword === 'function') window.Android.clearSavedPassword();
+            }
+            if (authKey) {
+                if (typeof window.Android.saveAuthKey === 'function') window.Android.saveAuthKey(authKey);
+            } else {
+                if (typeof window.Android.clearAuthKey === 'function') window.Android.clearAuthKey();
+            }
+            // Reload triggers a full reconnect with the new settings
+            if (typeof window.Android.reloadPage === 'function') window.Android.reloadPage();
+            return;
+        }
+
         // Save general settings
         if (setupInputHeightValue < 1) setupInputHeightValue = 1;
         if (setupInputHeightValue > 15) setupInputHeightValue = 15;
@@ -7275,12 +7357,8 @@
                 }
                 break;
             case 'clay-server':
-                // Open server settings (Android app) - don't close WebSocket
-                if (typeof Android !== 'undefined' && Android.openServerSettings) {
-                    Android.openServerSettings();
-                } else {
-                    appendClientLine('Clay Server settings only available in Android app.');
-                }
+                // Open clay server settings tab in the settings window
+                openSettingsPopup('clay-server');
                 break;
             case 'change-password':
                 // Open password change modal (multiuser mode only)
@@ -8471,6 +8549,13 @@
         if (elements.fontAdvancedToggle) {
             elements.fontAdvancedToggle.onchange = function() {
                 updateFontPopupUI();
+            };
+        }
+        var csAdvanced = document.getElementById('cs-advanced');
+        if (csAdvanced) {
+            csAdvanced.onchange = function() {
+                var sec = document.getElementById('cs-advanced-section');
+                if (sec) sec.style.display = this.checked ? '' : 'none';
             };
         }
         if (elements.fontLineheightMinus) {
