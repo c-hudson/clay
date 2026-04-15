@@ -5359,9 +5359,12 @@
         // Show Clay Server settings tab button only in Android app
         const clayServerTabBtn = document.getElementById('settings-clay-server-btn');
         if (clayServerTabBtn) clayServerTabBtn.style.display = isAndroid ? '' : 'none';
-        // Show auth key Download button only in Android app
+        // Show auth key Download button only in Android app (starts disabled until connected)
         const dlBtn = document.getElementById('cs-auth-key-download');
-        if (dlBtn) dlBtn.style.display = isAndroid ? '' : 'none';
+        if (dlBtn) {
+            dlBtn.style.display = isAndroid ? '' : 'none';
+            if (isAndroid) { dlBtn.disabled = true; dlBtn.style.opacity = '0.4'; }
+        }
         // Show Reload menu item only in WebView GUI mode (not pure web)
         document.querySelectorAll('.menu-reload').forEach(el => {
             el.style.display = window.WEBVIEW_MODE ? '' : 'none';
@@ -5390,7 +5393,17 @@
             if (remoteEl) remoteEl.value = info.remoteHost || '';
             if (userEl) userEl.value = (typeof window.Android.getSavedUsername === 'function') ? window.Android.getSavedUsername() : '';
             if (passEl) passEl.value = (typeof window.Android.getSavedPassword === 'function') ? window.Android.getSavedPassword() : '';
-            if (keyEl) keyEl.value = (typeof window.Android.getAuthKey === 'function') ? window.Android.getAuthKey() : '';
+            // Use live server key when connected, fall back to stored key otherwise
+            var currentKey = serverAuthKey || (typeof window.Android.getAuthKey === 'function' ? window.Android.getAuthKey() : '');
+            if (keyEl) keyEl.value = currentKey;
+            // Enable download button only when connected (have live key from server)
+            var dlBtn = document.getElementById('cs-auth-key-download');
+            if (dlBtn) {
+                var hasKey = !!serverAuthKey;
+                dlBtn.disabled = !hasKey;
+                dlBtn.style.opacity = hasKey ? '' : '0.4';
+                dlBtn.title = hasKey ? 'Save to Downloads' : 'Connect to server to download key';
+            }
         } catch(e) {}
     }
 
