@@ -3893,6 +3893,23 @@
             '  Actions        - Trigger and automation editor',
             '  World Selector - Browse and connect to worlds',
             '  Connected Worlds - View active connections'
+        ],
+        'clay-server': [
+            'Clay Server - Connection Settings', '',
+            'Host: The local IP or hostname of your Clay server',
+            '  (e.g. 192.168.1.100).', '',
+            'Remote Host: An optional WAN hostname or external IP',
+            '  for connecting when away from your local network',
+            '  (e.g. myhost.example.com).', '',
+            '  When Remote Host is set, Clay first attempts the',
+            '  local Host. If unreachable (2s timeout), it falls',
+            '  back to Remote Host automatically.', '',
+            '  Leave Remote Host empty to always use Host.', '',
+            'Port: The Clay web server port (default 9000).', '',
+            'Username / Password: Your Clay login credentials.', '',
+            'Auth Key: The authentication key from the Clay web',
+            '  settings. Paste it here or use Download to save',
+            '  it as clay-auth-key.txt in your Downloads folder.'
         ]
     };
 
@@ -5364,16 +5381,12 @@
             var info = JSON.parse(window.Android.getConnectionInfo());
             var hostEl = document.getElementById('cs-host');
             var portEl = document.getElementById('cs-port');
-            var advEl = document.getElementById('cs-advanced');
-            var advSec = document.getElementById('cs-advanced-section');
             var remoteEl = document.getElementById('cs-remote-host');
             var userEl = document.getElementById('cs-username');
             var passEl = document.getElementById('cs-password');
             var keyEl = document.getElementById('cs-auth-key');
             if (hostEl) hostEl.value = info.localHost || '';
             if (portEl) portEl.value = info.port || 9000;
-            if (advEl) advEl.checked = !!info.advancedEnabled;
-            if (advSec) advSec.style.display = info.advancedEnabled ? '' : 'none';
             if (remoteEl) remoteEl.value = info.remoteHost || '';
             if (userEl) userEl.value = (typeof window.Android.getSavedUsername === 'function') ? window.Android.getSavedUsername() : '';
             if (passEl) passEl.value = (typeof window.Android.getSavedPassword === 'function') ? window.Android.getSavedPassword() : '';
@@ -5928,13 +5941,12 @@
                 return;
             }
             var port = ((document.getElementById('cs-port') || {}).value || '9000').trim();
-            var advanced = !!(document.getElementById('cs-advanced') || {}).checked;
             var remoteHost = ((document.getElementById('cs-remote-host') || {}).value || '').trim();
             var username = ((document.getElementById('cs-username') || {}).value || '').trim();
             var password = (document.getElementById('cs-password') || {}).value || '';
             var authKey = ((document.getElementById('cs-auth-key') || {}).value || '').trim();
             if (typeof window.Android.saveConnectionSettings === 'function') {
-                window.Android.saveConnectionSettings(host, port, advanced, remoteHost);
+                window.Android.saveConnectionSettings(host, port, remoteHost);
             }
             if (typeof window.Android.saveUsername === 'function') window.Android.saveUsername(username);
             if (password) {
@@ -8550,13 +8562,6 @@
                 updateFontPopupUI();
             };
         }
-        var csAdvanced = document.getElementById('cs-advanced');
-        if (csAdvanced) {
-            csAdvanced.onchange = function() {
-                var sec = document.getElementById('cs-advanced-section');
-                if (sec) sec.style.display = this.checked ? '' : 'none';
-            };
-        }
         var csAuthKeyDl = document.getElementById('cs-auth-key-download');
         if (csAuthKeyDl) {
             csAuthKeyDl.onclick = function() {
@@ -8607,7 +8612,9 @@
         elements.popupHelpCloseBtn.onclick = closePopupHelp;
         elements.popupHelpOkBtn.onclick = closePopupHelp;
         if (elements.settingsHelpBtn) elements.settingsHelpBtn.onclick = function() {
-            var helpTab = settingsActiveTab === 'web' ? 'web' : settingsActiveTab === 'font' ? 'font' : 'setup';
+            var helpTab = settingsActiveTab === 'web' ? 'web' :
+                          settingsActiveTab === 'font' ? 'font' :
+                          settingsActiveTab === 'clay-server' ? 'clay-server' : 'setup';
             openPopupHelp(helpTab);
         };
         if (elements.worldEditHelpBtn) elements.worldEditHelpBtn.onclick = function() { openPopupHelp('worldEditor'); };

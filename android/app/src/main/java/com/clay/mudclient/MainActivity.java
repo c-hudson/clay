@@ -333,23 +333,21 @@ public class MainActivity extends AppCompatActivity {
             String localHost = prefs.getString(KEY_SERVER_HOST, "");
             String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
             int port = prefs.getInt(KEY_SERVER_PORT, 9000);
-            boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
             return "{\"localHost\":\"" + localHost.replace("\"", "") +
                    "\",\"remoteHost\":\"" + remoteHost.replace("\"", "") +
-                   "\",\"port\":" + port +
-                   ",\"advancedEnabled\":" + advancedEnabled + "}";
+                   "\",\"port\":" + port + "}";
         }
 
         @JavascriptInterface
-        public void saveConnectionSettings(String host, String port,
-                                           boolean advancedEnabled, String remoteHostname) {
+        public void saveConnectionSettings(String host, String port, String remoteHostname) {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             SharedPreferences.Editor editor = prefs.edit();
             editor.putString(KEY_SERVER_HOST, host != null ? host : "");
             try { editor.putInt(KEY_SERVER_PORT, Integer.parseInt(port != null ? port.trim() : "9000")); }
             catch (NumberFormatException e) { editor.putInt(KEY_SERVER_PORT, 9000); }
-            editor.putBoolean(KEY_ADVANCED_ENABLED, advancedEnabled);
-            editor.putString(KEY_REMOTE_HOSTNAME, remoteHostname != null ? remoteHostname : "");
+            String remote = remoteHostname != null ? remoteHostname.trim() : "";
+            editor.putString(KEY_REMOTE_HOSTNAME, remote);
+            editor.putBoolean(KEY_ADVANCED_ENABLED, !remote.isEmpty());
             editor.apply();
         }
 
