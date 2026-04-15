@@ -1080,12 +1080,10 @@
         console.log('[Clay Debug] ' + msg);
     }
 
-    // Check if native Android WebSocket is available
+    // Check if native Android WebSocket is available (checks capability, not current state)
     function hasNativeWebSocket() {
         try {
-            return window.Android &&
-                   typeof window.Android.hasNativeWebSocket === 'function' &&
-                   window.Android.hasNativeWebSocket();
+            return !!(window.Android && typeof window.Android.connectWebSocket === 'function');
         } catch (e) {
             return false;
         }
@@ -1236,6 +1234,18 @@
                 window.Android.stopBackgroundService();
             }
 
+            // If wss:// NativeWebSocket failed, fall back to ws://
+            if (window.WS_PROTOCOL === 'wss' && !triedWsFallback && !usingWsFallback) {
+                console.log('Native wss:// failed, trying ws:// fallback...');
+                triedWsFallback = true;
+                usingWsFallback = true;
+                usingNativeWebSocket = false;
+                useNativeWebSocket = false;
+                connectionFailures = 0;
+                setTimeout(connect, 500);
+                return;
+            }
+
             // Try alternate host (Android advanced mode) before giving up
             if (connectionFailures >= 2 && !triedAlternateHost) {
                 triedAlternateHost = true;
@@ -1270,7 +1280,7 @@
 
         window.onNativeWebSocketError = function(error) {
             debugLog('Native WS ERROR: ' + error);
-            showConnecting(false);
+            window.onNativeWebSocketClose(1006, error);
         };
     }
 
