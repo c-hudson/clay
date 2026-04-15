@@ -3907,9 +3907,10 @@
             '  Leave Remote Host empty to always use Host.', '',
             'Port: The Clay web server port (default 9000).', '',
             'Username / Password: Your Clay login credentials.', '',
-            'Auth Key: The authentication key from the Clay web',
-            '  settings. Paste it here or use Download to save',
-            '  it as clay-auth-key.txt in your Downloads folder.'
+            'Auth Key: Used for passwordless login to Clay.',
+            '  Paste a key here manually, or tap Download when',
+            '  connected to fetch the key from the server and',
+            '  store it in the app for future logins.'
         ]
     };
 
@@ -5393,16 +5394,15 @@
             if (remoteEl) remoteEl.value = info.remoteHost || '';
             if (userEl) userEl.value = (typeof window.Android.getSavedUsername === 'function') ? window.Android.getSavedUsername() : '';
             if (passEl) passEl.value = (typeof window.Android.getSavedPassword === 'function') ? window.Android.getSavedPassword() : '';
-            // Use live server key when connected, fall back to stored key otherwise
-            var currentKey = serverAuthKey || (typeof window.Android.getAuthKey === 'function' ? window.Android.getAuthKey() : '');
-            if (keyEl) keyEl.value = currentKey;
-            // Enable download button only when connected (have live key from server)
+            if (keyEl) keyEl.value = '';  // never pre-populate; user clicks Download to store it
+            // Enable download button only when connected (live key available from server)
             var dlBtn = document.getElementById('cs-auth-key-download');
             if (dlBtn) {
                 var hasKey = !!serverAuthKey;
                 dlBtn.disabled = !hasKey;
                 dlBtn.style.opacity = hasKey ? '' : '0.4';
-                dlBtn.title = hasKey ? 'Save to Downloads' : 'Connect to server to download key';
+                dlBtn.title = hasKey ? 'Save key from server into app' : 'Connect to server first';
+                dlBtn.textContent = 'Download';
             }
         } catch(e) {}
     }
@@ -8578,9 +8578,16 @@
         var csAuthKeyDl = document.getElementById('cs-auth-key-download');
         if (csAuthKeyDl) {
             csAuthKeyDl.onclick = function() {
-                var key = (document.getElementById('cs-auth-key') || {}).value || '';
-                if (key && window.Android && typeof window.Android.downloadAuthKey === 'function') {
-                    window.Android.downloadAuthKey(key);
+                if (!serverAuthKey || !window.Android) return;
+                if (typeof window.Android.saveAuthKey === 'function') {
+                    window.Android.saveAuthKey(serverAuthKey);
+                    // Brief confirmation feedback on the button
+                    csAuthKeyDl.textContent = '✓ Saved';
+                    csAuthKeyDl.disabled = true;
+                    setTimeout(function() {
+                        csAuthKeyDl.textContent = 'Download';
+                        csAuthKeyDl.disabled = false;
+                    }, 2000);
                 }
             };
         }
