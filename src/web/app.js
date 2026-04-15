@@ -5395,10 +5395,10 @@
             if (userEl) userEl.value = (typeof window.Android.getSavedUsername === 'function') ? window.Android.getSavedUsername() : '';
             if (passEl) passEl.value = (typeof window.Android.getSavedPassword === 'function') ? window.Android.getSavedPassword() : '';
             if (keyEl) keyEl.value = '';  // never pre-populate; user clicks Download to store it
-            // Enable download button only when connected (live key available from server)
+            // Enable download button when any key is available (server key or in-memory key)
             var dlBtn = document.getElementById('cs-auth-key-download');
             if (dlBtn) {
-                var hasKey = !!serverAuthKey;
+                var hasKey = !!(serverAuthKey || authKey);
                 dlBtn.disabled = !hasKey;
                 dlBtn.style.opacity = hasKey ? '' : '0.4';
                 dlBtn.title = hasKey ? 'Save key from server into app' : 'Connect to server first';
@@ -8578,17 +8578,19 @@
         var csAuthKeyDl = document.getElementById('cs-auth-key-download');
         if (csAuthKeyDl) {
             csAuthKeyDl.onclick = function() {
-                if (!serverAuthKey || !window.Android) return;
-                if (typeof window.Android.saveAuthKey === 'function') {
-                    window.Android.saveAuthKey(serverAuthKey);
-                    // Brief confirmation feedback on the button
-                    csAuthKeyDl.textContent = '✓ Saved';
-                    csAuthKeyDl.disabled = true;
-                    setTimeout(function() {
-                        csAuthKeyDl.textContent = 'Download';
-                        csAuthKeyDl.disabled = false;
-                    }, 2000);
-                }
+                var keyToSave = serverAuthKey || authKey;
+                if (!keyToSave || !window.Android) return;
+                saveAuthKey(keyToSave);  // updates JS authKey var AND persists to Android storage
+                // Show the saved key in the field so user can confirm it was stored
+                var keyEl = document.getElementById('cs-auth-key');
+                if (keyEl) keyEl.value = keyToSave;
+                // Brief confirmation feedback on the button
+                csAuthKeyDl.textContent = '✓ Saved';
+                csAuthKeyDl.disabled = true;
+                setTimeout(function() {
+                    csAuthKeyDl.textContent = 'Download';
+                    csAuthKeyDl.disabled = false;
+                }, 2000);
             };
         }
         if (elements.fontLineheightMinus) {
