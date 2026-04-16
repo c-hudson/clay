@@ -678,153 +678,92 @@ pub async fn start_https_server(
 // Ban List for HTTP/WebSocket security
 // ============================================================================
 
-/// Tracks violations and bans for IP addresses
+/// Tracks violations and bans for IP addresses.
+/// Bans are in-memory only and last until server restart.
 #[derive(Clone)]
 pub struct BanList {
-    /// Permanently banned IPs (saved to .dat file)
-    permanent_bans: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// Temporary bans: IP -> expiration time (Unix timestamp)
-    temp_bans: Arc<std::sync::RwLock<HashMap<String, u64>>>,
-    /// Violation tracking: IP -> list of violation timestamps
-    violations: Arc<std::sync::RwLock<HashMap<String, Vec<u64>>>>,
-    /// Ban reasons: IP -> last URL/reason that caused the ban
+    /// Banned IPs — in-memory only, cleared on restart
+    banned: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Violation count per IP (reset when banned)
+    violations: Arc<std::sync::RwLock<HashMap<String, u32>>>,
+    /// Last URL/reason that triggered the ban
     ban_reasons: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl BanList {
     pub fn new() -> Self {
         Self {
-            permanent_bans: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            temp_bans: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            banned: Arc::new(std::sync::RwLock::new(HashSet::new())),
             violations: Arc::new(std::sync::RwLock::new(HashMap::new())),
             ban_reasons: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
-    /// Check if an IP is currently banned (permanent or temporary)
+    /// Check if an IP is currently banned
     pub fn is_banned(&self, ip: &str) -> bool {
-        // Check permanent bans
-        if self.permanent_bans.read().unwrap().contains(ip) {
-            return true;
-        }
-        // Check temporary bans
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Some(&expiry) = self.temp_bans.read().unwrap().get(ip) {
-            if now < expiry {
-                return true;
-            }
-        }
-        false
+        self.banned.read().unwrap().contains(ip)
     }
 
-    /// Record a violation for an IP address with a reason (URL or description)
-    /// Returns true if the IP should be banned (5+ violations in 1 hour = permanent)
+    /// Record a violation for an IP. Bans after 2 violations. Returns true if banned.
     pub fn record_violation(&self, ip: &str, reason: &str) -> bool {
         // Never ban localhost
         if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
             return false;
         }
+        // Already banned — no need to track further
+        if self.banned.read().unwrap().contains(ip) {
+            return true;
+        }
 
-        // Store the reason for this violation
         self.ban_reasons.write().unwrap().insert(ip.to_string(), reason.to_string());
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let one_hour_ago = now.saturating_sub(3600);
+        let count = {
+            let mut violations = self.violations.write().unwrap();
+            let entry = violations.entry(ip.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
 
-        let mut violations = self.violations.write().unwrap();
-        let ip_violations = violations.entry(ip.to_string()).or_default();
-
-        // Remove old violations (older than 1 hour)
-        ip_violations.retain(|&ts| ts > one_hour_ago);
-
-        // Add new violation
-        ip_violations.push(now);
-
-        let violation_count = ip_violations.len();
-
-        if violation_count >= 5 {
-            // Permanent ban
-            self.permanent_bans.write().unwrap().insert(ip.to_string());
-            log_ban(ip, "PERMANENT", reason);
-            violations.remove(ip); // Clear violations since permanently banned
-            true
-        } else if violation_count >= 3 {
-            // Temporary ban (5 minutes) after 3+ violations
-            self.temp_bans.write().unwrap().insert(ip.to_string(), now + 300);
-            log_ban(ip, "TEMPORARY", reason);
+        if count >= 2 {
+            self.banned.write().unwrap().insert(ip.to_string());
+            self.violations.write().unwrap().remove(ip);
+            log_ban(ip, "BANNED", reason);
             true
         } else {
             false
         }
     }
 
-    /// Add a permanent ban directly
-    pub fn add_permanent_ban(&self, ip: &str) {
-        self.permanent_bans.write().unwrap().insert(ip.to_string());
+    /// Add a ban directly (e.g. from persistence load — no-op, bans are not persisted)
+    pub fn add_permanent_ban(&self, _ip: &str) {
+        // Bans are in-memory only and not loaded from disk
     }
 
-    /// Get all permanent bans (for saving to .dat file)
+    /// Get all banned IPs (no-op return — bans are not persisted)
     pub fn get_permanent_bans(&self) -> Vec<String> {
-        self.permanent_bans.read().unwrap().iter().cloned().collect()
+        Vec::new()
     }
 
-    /// Clean up expired temporary bans
-    pub fn cleanup_expired(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.temp_bans.write().unwrap().retain(|_, &mut expiry| expiry > now);
-    }
-
-    /// Clear violation history for an IP (called on successful auth to prevent
-    /// reconnect-loop bans where transient failures accumulate unfairly)
+    /// Clear violation history for an IP (called on successful auth)
     pub fn clear_violations(&self, ip: &str) {
         self.violations.write().unwrap().remove(ip);
     }
 
-    /// Remove a ban (both permanent and temporary) for an IP
-    /// Returns true if a ban was removed
+    /// Remove a ban for an IP. Returns true if a ban was removed.
     pub fn remove_ban(&self, ip: &str) -> bool {
-        let removed_perm = self.permanent_bans.write().unwrap().remove(ip);
-        let removed_temp = self.temp_bans.write().unwrap().remove(ip).is_some();
-        // Also clear violations and reason
+        let removed = self.banned.write().unwrap().remove(ip);
         self.violations.write().unwrap().remove(ip);
         self.ban_reasons.write().unwrap().remove(ip);
-        removed_perm || removed_temp
+        removed
     }
 
-    /// Get all current bans with their reasons
-    /// Returns Vec of (ip, ban_type, reason) where ban_type is "permanent" or "temporary"
+    /// Get all current bans with reasons. Returns Vec of (ip, ban_type, reason).
     pub fn get_ban_info(&self) -> Vec<(String, String, String)> {
-        let mut result = Vec::new();
         let reasons = self.ban_reasons.read().unwrap();
-
-        // Get permanent bans
-        for ip in self.permanent_bans.read().unwrap().iter() {
+        self.banned.read().unwrap().iter().map(|ip| {
             let reason = reasons.get(ip).cloned().unwrap_or_default();
-            result.push((ip.clone(), "permanent".to_string(), reason));
-        }
-
-        // Get active temporary bans
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        for (ip, expiry) in self.temp_bans.read().unwrap().iter() {
-            if *expiry > now {
-                let reason = reasons.get(ip).cloned().unwrap_or_default();
-                result.push((ip.clone(), "temporary".to_string(), reason));
-            }
-        }
-
-        result
+            (ip.clone(), "banned".to_string(), reason)
+        }).collect()
     }
 }
 
@@ -926,10 +865,10 @@ pub async fn start_http_server(
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((mut stream, addr)) => {
+                        Ok((stream, addr)) => {
                             let client_ip = addr.ip().to_string();
                             if ban_list.is_banned(&client_ip) {
-                                let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;
+                                drop(stream);
                                 continue;
                             }
                             let _ = stream.set_nodelay(true);

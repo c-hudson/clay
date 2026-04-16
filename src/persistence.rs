@@ -307,15 +307,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
         }
     }
 
-    // Save permanent bans
-    let permanent_bans = app.ban_list.get_permanent_bans();
-    if !permanent_bans.is_empty() {
-        writeln!(file)?;
-        writeln!(file, "[banned_hosts]")?;
-        for ip in permanent_bans {
-            writeln!(file, "ip={}", ip)?;
-        }
-    }
+    // Note: bans are in-memory only and not persisted
 
     // Save TF global variables
     if !app.tf_engine.global_vars.is_empty() {
@@ -436,11 +428,8 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
             let key = &line[..eq_pos];
             let value = &line[eq_pos + 1..];
 
-            // Check for banned hosts section
+            // Bans are in-memory only — skip any [banned_hosts] entries in old files
             if in_banned_hosts {
-                if key == "ip" && !value.is_empty() {
-                    app.ban_list.add_permanent_ban(value);
-                }
                 continue;
             }
 
@@ -906,11 +895,8 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
             let key = &line[..eq_pos];
             let value = &line[eq_pos + 1..];
 
-            // Banned hosts section
+            // Bans are in-memory only — skip any [banned_hosts] entries in old files
             if in_banned_hosts {
-                if key == "ip" && !value.is_empty() {
-                    app.ban_list.add_permanent_ban(value);
-                }
                 continue;
             }
 
@@ -1148,15 +1134,7 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
         }
     }
 
-    // [banned_hosts] section
-    let permanent_bans = app.ban_list.get_permanent_bans();
-    if !permanent_bans.is_empty() {
-        writeln!(file)?;
-        writeln!(file, "[banned_hosts]")?;
-        for ip in permanent_bans {
-            writeln!(file, "ip={}", ip)?;
-        }
-    }
+    // Note: bans are in-memory only and not persisted
 
     Ok(())
 }

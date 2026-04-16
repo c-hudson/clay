@@ -2140,12 +2140,12 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             } else {
                 app.add_output("");
                 app.add_output("Banned Hosts:");
-                app.add_output("─".repeat(70).as_str());
-                app.add_output(&format!("{:<20} {:<12} {}", "Host", "Type", "Last URL/Reason"));
-                app.add_output("─".repeat(70).as_str());
-                for (ip, ban_type, reason) in bans {
+                app.add_output("─".repeat(55).as_str());
+                app.add_output(&format!("{:<20} {}", "Host", "Last URL/Reason"));
+                app.add_output("─".repeat(55).as_str());
+                for (ip, _, reason) in bans {
                     let reason_display = if reason.is_empty() { "(unknown)" } else { &reason };
-                    app.add_output(&format!("{:<20} {:<12} {}", ip, ban_type, reason_display));
+                    app.add_output(&format!("{:<20} {}", ip, reason_display));
                 }
                 app.add_output("─".repeat(70).as_str());
                 app.add_output("Use /unban <host> to remove a ban.");
@@ -2156,14 +2156,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         Command::Unban { host } => {
             if app.ban_list.remove_ban(&host) {
                 app.add_output(&format!("Removed ban for: {}", host));
-                // Save settings to persist the change
-                if app.multiuser_mode {
-                    if let Err(e) = persistence::save_multiuser_settings(app) {
-                        app.add_output(&format!("Warning: Failed to save settings: {}", e));
-                    }
-                } else if let Err(e) = persistence::save_settings(app) {
-                    app.add_output(&format!("Warning: Failed to save settings: {}", e));
-                }
                 // Broadcast updated ban list to remote clients
                 app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
                 app.ws_broadcast(WsMessage::UnbanResult { success: true, host: host.clone(), error: None });
