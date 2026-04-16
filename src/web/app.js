@@ -1083,7 +1083,13 @@
     // Check if native Android WebSocket is available (checks capability, not current state)
     function hasNativeWebSocket() {
         try {
-            return !!(window.Android && typeof window.Android.connectWebSocket === 'function');
+            if (!window.Android) return false;
+            // Use the Java bridge method (always returns true on Android)
+            if (typeof window.Android.hasNativeWebSocket === 'function') {
+                return window.Android.hasNativeWebSocket();
+            }
+            // Fallback: check capability
+            return !!(window.Android.connectWebSocket);
         } catch (e) {
             return false;
         }
@@ -5404,7 +5410,7 @@
             if (remoteEl) remoteEl.value = info.remoteHost || '';
             if (userEl) userEl.value = (typeof window.Android.getSavedUsername === 'function') ? window.Android.getSavedUsername() : '';
             if (passEl) passEl.value = (typeof window.Android.getSavedPassword === 'function') ? window.Android.getSavedPassword() : '';
-            if (keyEl) keyEl.value = '';  // never pre-populate; user clicks Download to store it
+            if (keyEl) keyEl.value = authKey || '';  // show saved key if one has been downloaded
             // Enable download button when any key is available (server key or in-memory key)
             var dlBtn = document.getElementById('cs-auth-key-download');
             if (dlBtn) {
