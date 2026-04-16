@@ -1240,18 +1240,6 @@
                 window.Android.stopBackgroundService();
             }
 
-            // If wss:// NativeWebSocket failed, fall back to ws://
-            if (window.WS_PROTOCOL === 'wss' && !triedWsFallback && !usingWsFallback) {
-                console.log('Native wss:// failed, trying ws:// fallback...');
-                triedWsFallback = true;
-                usingWsFallback = true;
-                usingNativeWebSocket = false;
-                useNativeWebSocket = false;
-                connectionFailures = 0;
-                setTimeout(connect, 500);
-                return;
-            }
-
             // Try alternate host (Android advanced mode) before giving up
             if (connectionFailures >= 2 && !triedAlternateHost) {
                 triedAlternateHost = true;
@@ -1286,7 +1274,36 @@
 
         window.onNativeWebSocketError = function(error) {
             debugLog('Native WS ERROR: ' + error);
-            window.onNativeWebSocketClose(1006, error);
+            // Connection attempt failed (TLS error, refused, etc.) — not a session disconnect.
+            // Handle wss->ws fallback here rather than delegating to onNativeWebSocketClose,
+            // which fires for both failures and normal session ends.
+            if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
+            if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
+            if (ws) ws.readyState = WebSocket.CLOSED;
+            authenticated = false;
+            hasReceivedInitialState = false;
+            showConnecting(false);
+            connectionFailures++;
+            if (window.Android && window.Android.stopBackgroundService) {
+                window.Android.stopBackgroundService();
+            }
+            // wss:// failed to connect — fall back to ws://
+            if (window.WS_PROTOCOL === 'wss' && !triedWsFallback && !usingWsFallback) {
+                console.log('Native wss:// failed, trying ws:// fallback...');
+                triedWsFallback = true;
+                usingWsFallback = true;
+                usingNativeWebSocket = false;
+                useNativeWebSocket = false;
+                connectionFailures = 0;
+                setTimeout(connect, 500);
+                return;
+            }
+            const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
+            if (connectionFailures >= maxFailures) {
+                showConnectionErrorModal();
+            } else {
+                setTimeout(connect, 2000);
+            }
         };
     }
 
