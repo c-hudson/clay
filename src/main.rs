@@ -11098,18 +11098,19 @@ pub async fn run_app_headless(
                     let proxy_pid = world.proxy_pid.unwrap();
                     let pipe_path = world.proxy_socket_path.clone();
 
-                    if !crate::platform::is_process_alive(proxy_pid) {
+                    let alive = crate::platform::is_process_alive(proxy_pid);
+                    debug_log(true, &format!("HEADLESS RELOAD: proxy pid={} alive={} path={:?}", proxy_pid, alive, pipe_path));
+
+                    if !alive {
                         app.worlds[world_idx].clear_connection_state(false, false);
+                        let seq = app.worlds[world_idx].next_seq;
+                        app.worlds[world_idx].next_seq += 1;
+                        app.worlds[world_idx].output_lines.push(OutputLine::new_client(
+                            "TLS proxy terminated during reload. Use /worlds to reconnect.".to_string(), seq
+                        ));
                     } else if let Some(ref path) = pipe_path {
-                        use tokio::net::windows::named_pipe::ClientOptions;
-                        let pipe_name = path.to_str().unwrap_or("").to_string();
-                        let mut client_opt = None;
-                        for _ in 0..20 {
-                            match ClientOptions::new().open(&pipe_name) {
-                                Ok(c) => { client_opt = Some(c); break; }
-                                Err(_) => tokio::time::sleep(tokio::time::Duration::from_millis(100)).await,
-                            }
-                        }
+                        let client_opt = crate::platform::connect_to_proxy_pipe(path, 5).await;
+                        debug_log(true, &format!("HEADLESS RELOAD: pipe connect result: {}", client_opt.is_some()));
                         match client_opt {
                             Some(pipe_client) => {
                                 let (r, w) = tokio::io::split(pipe_client);
@@ -11161,8 +11162,13 @@ pub async fn run_app_headless(
                                 });
                             }
                             None => {
-                                debug_log(is_debug_enabled(), &format!("HEADLESS: Failed to reconnect Windows proxy for {}", app.worlds[world_idx].name));
+                                debug_log(true, &format!("HEADLESS RELOAD: failed to reconnect Windows proxy for '{}'", app.worlds[world_idx].name));
                                 app.worlds[world_idx].clear_connection_state(false, false);
+                                let seq = app.worlds[world_idx].next_seq;
+                                app.worlds[world_idx].next_seq += 1;
+                                app.worlds[world_idx].output_lines.push(OutputLine::new_client(
+                                    "TLS proxy pipe unavailable after reload. Use /worlds to reconnect.".to_string(), seq
+                                ));
                             }
                         }
                     }
@@ -12715,7 +12721,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let proxy_pid = world.proxy_pid.unwrap();
                 let pipe_path = world.proxy_socket_path.clone();
 
-                if !is_process_alive(proxy_pid) {
+                let alive = is_process_alive(proxy_pid);
+                debug_log(true, &format!("CONSOLE RELOAD: proxy pid={} alive={} path={:?}", proxy_pid, alive, pipe_path));
+
+                if !alive {
                     app.worlds[world_idx].clear_connection_state(false, false);
                     let seq = app.worlds[world_idx].next_seq;
                     app.worlds[world_idx].next_seq += 1;
@@ -12725,20 +12734,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     continue;
                 }
 
-                let client_opt: Option<tokio::net::windows::named_pipe::NamedPipeClient> = if let Some(ref path) = pipe_path {
-                    use tokio::net::windows::named_pipe::ClientOptions;
-                    let pipe_name = path.to_str().unwrap_or("").to_string();
-                    let mut result = None;
-                    for attempt in 0..20 {
-                        match ClientOptions::new().open(&pipe_name) {
-                            Ok(c) => { result = Some(c); break; }
-                            Err(_) => {
-                                if attempt < 19 {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                }
-                            }
-                        }
-                    }
+                let client_opt = if let Some(ref path) = pipe_path {
+                    let result = crate::platform::connect_to_proxy_pipe(path, 5).await;
+                    debug_log(true, &format!("CONSOLE RELOAD: pipe connect result: {}", result.is_some()));
                     result
                 } else {
                     None

@@ -808,10 +808,12 @@ pub(crate) fn spawn_tls_proxy(
 pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &PathBuf) {
     use tokio::net::windows::named_pipe::{ServerOptions, PipeMode};
 
+    debug_log(true, &format!("TLS-PROXY: starting for {}:{} pipe={}", host, port, pipe_path.display()));
+
     // Step 1: Connect to the MUD server with TLS
     let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => { debug_log(true, &format!("TLS-PROXY: TCP connect failed: {}", e)); return; }
     };
 
     enable_tcp_keepalive(&tcp_stream);
@@ -871,6 +873,8 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path
         return;
     }
 
+    debug_log(true, "TLS-PROXY: TLS handshake complete");
+
     let pipe_name = match pipe_path.to_str() {
         Some(s) => s.to_string(),
         None => return,
@@ -891,8 +895,8 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path
                 opts.first_pipe_instance(true);
             }
             match opts.create(&pipe_name) {
-                Ok(s) => s,
-                Err(_) => break,
+                Ok(s) => { debug_log(true, &format!("TLS-PROXY: pipe server instance created (first={})", first_instance)); s }
+                Err(e) => { debug_log(true, &format!("TLS-PROXY: pipe create failed: {}", e)); break; }
             }
         };
         first_instance = false;
@@ -963,6 +967,37 @@ pub(crate) fn kill_proxy_process(pid: u32) {
             CloseHandle(handle);
         }
     }
+}
+
+/// Windows: async helper that waits up to `timeout_secs` for the proxy's Named Pipe
+/// to become available and then connects to it.  Uses WaitNamedPipeA with
+/// NMPWAIT_NOWAIT between async sleeps so the tokio thread is never blocked.
+#[cfg(windows)]
+pub(crate) async fn connect_to_proxy_pipe(
+    pipe_path: &std::path::Path,
+    timeout_secs: u64,
+) -> Option<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    extern "system" {
+        fn WaitNamedPipeA(lpNamedPipeName: *const u8, nTimeOut: u32) -> i32;
+    }
+    const NMPWAIT_NOWAIT: u32 = 1;
+
+    let pipe_name = pipe_path.to_str().unwrap_or("").to_string();
+    let pipe_cstr = format!("{}\0", pipe_name);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    while std::time::Instant::now() < deadline {
+        let pipe_available = unsafe { WaitNamedPipeA(pipe_cstr.as_ptr(), NMPWAIT_NOWAIT) } != 0;
+        if pipe_available {
+            match ClientOptions::new().open(&pipe_name) {
+                Ok(client) => return Some(client),
+                Err(_) => {} // Pipe became busy between wait and open — retry
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    None
 }
 
 /// Strip " (deleted)" suffix from a path string if present.
