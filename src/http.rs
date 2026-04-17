@@ -299,6 +299,7 @@ fn handle_http_routes(
 /// Route an incoming connection: detect WebSocket upgrades vs HTTP requests.
 /// If ws_state is provided and the request is a WebSocket upgrade, hands off to the WS handler.
 /// Otherwise, serves static HTTP content.
+#[allow(clippy::too_many_arguments)]
 async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     ws_state: Option<Arc<WsConnectionState>>,
