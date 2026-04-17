@@ -5411,6 +5411,22 @@
         }
     }
 
+    // Update the auth key download button enabled state.
+    // Requires both a key (from server or cached) AND a non-empty password field.
+    function updateDownloadButtonState() {
+        var dlBtn = document.getElementById('cs-auth-key-download');
+        if (!dlBtn || dlBtn.style.display === 'none') return;
+        var hasKey = !!(serverAuthKey || authKey);
+        var passEl = document.getElementById('cs-password');
+        var hasPassword = !!(passEl && passEl.value.trim());
+        var canDownload = hasKey && hasPassword;
+        dlBtn.disabled = !canDownload;
+        dlBtn.style.opacity = canDownload ? '' : '0.4';
+        dlBtn.title = !hasKey ? 'Connect to server first'
+            : !hasPassword ? 'Enter password to enable download'
+            : 'Save auth key to device';
+    }
+
     // Populate the Clay Server settings tab fields from Android SharedPreferences
     function populateClayServerTab() {
         if (!window.Android || typeof window.Android.getConnectionInfo !== 'function') return;
@@ -5428,15 +5444,11 @@
             if (userEl) userEl.value = (typeof window.Android.getSavedUsername === 'function') ? window.Android.getSavedUsername() : '';
             if (passEl) passEl.value = (typeof window.Android.getSavedPassword === 'function') ? window.Android.getSavedPassword() : '';
             if (keyEl) keyEl.value = authKey || '';  // show saved key if one has been downloaded
-            // Enable download button when any key is available (server key or in-memory key)
             var dlBtn = document.getElementById('cs-auth-key-download');
-            if (dlBtn) {
-                var hasKey = !!(serverAuthKey || authKey);
-                dlBtn.disabled = !hasKey;
-                dlBtn.style.opacity = hasKey ? '' : '0.4';
-                dlBtn.title = hasKey ? 'Save key from server into app' : 'Connect to server first';
-                dlBtn.textContent = 'Download';
-            }
+            if (dlBtn) dlBtn.textContent = 'Download';
+            var errEl = document.getElementById('cs-auth-key-error');
+            if (errEl) errEl.style.display = 'none';
+            updateDownloadButtonState();
         } catch(e) {}
     }
 
@@ -8613,6 +8625,19 @@
             csAuthKeyDl.onclick = function() {
                 var keyToSave = serverAuthKey || authKey;
                 if (!keyToSave || !window.Android) return;
+                var passEl = document.getElementById('cs-password');
+                var enteredPassword = (passEl ? passEl.value : '').trim();
+                var errEl = document.getElementById('cs-auth-key-error');
+                // Verify the entered password matches the server password
+                if (!wsPassword) {
+                    if (errEl) { errEl.textContent = 'Not connected — connect to server first'; errEl.style.display = ''; }
+                    return;
+                }
+                if (enteredPassword !== wsPassword) {
+                    if (errEl) { errEl.textContent = 'Incorrect password'; errEl.style.display = ''; }
+                    return;
+                }
+                if (errEl) errEl.style.display = 'none';
                 saveAuthKey(keyToSave);  // updates JS authKey var AND persists to Android storage
                 // Show the saved key in the field so user can confirm it was stored
                 var keyEl = document.getElementById('cs-auth-key');
@@ -8622,8 +8647,16 @@
                 csAuthKeyDl.disabled = true;
                 setTimeout(function() {
                     csAuthKeyDl.textContent = 'Download';
-                    csAuthKeyDl.disabled = false;
+                    updateDownloadButtonState();
                 }, 2000);
+            };
+        }
+        var csPassEl = document.getElementById('cs-password');
+        if (csPassEl) {
+            csPassEl.oninput = function() {
+                updateDownloadButtonState();
+                var errEl = document.getElementById('cs-auth-key-error');
+                if (errEl) errEl.style.display = 'none';
             };
         }
         if (elements.fontLineheightMinus) {

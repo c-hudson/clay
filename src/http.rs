@@ -122,6 +122,15 @@ const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
 /// Embedded keybind editor HTML
 const WEB_KEYBIND_EDITOR_HTML: &str = include_str!("web/keybind-editor.html");
 
+/// Seconds to wait for first bytes of an HTTP request before dropping the connection.
+const READ_TIMEOUT_SECS: u64 = 10;
+/// Seconds to wait for a TLS handshake to complete before recording a violation and dropping.
+const TLS_TIMEOUT_SECS: u64 = 10;
+/// Maximum simultaneous HTTP/HTTPS connections allowed per IP address.
+const MAX_HTTP_CONNECTIONS_PER_IP: usize = 10;
+/// Maximum simultaneous WebSocket connections allowed per IP address.
+const MAX_WS_CONNECTIONS_PER_IP: usize = 20;
+
 /// Handle a plain HTTP connection on the HTTPS port by sending a redirect to HTTPS.
 /// Reads the HTTP request, extracts Host and path, and responds with 301.
 async fn redirect_http_to_https<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, port: u16) {
@@ -298,24 +307,47 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     client_addr: std::net::SocketAddr,
     ban_list: &BanList,
     is_https: bool,
+    http_guard: ConnectionGuard,
+    ws_counter: &ConnectionCounter,
 ) {
     let client_ip = client_addr.ip().to_string();
 
     let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
+    let n = match tokio::time::timeout(
+        std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+        stream.read(&mut buf),
+    ).await {
+        Ok(Ok(n)) if n > 0 => n,
         _ => return,
     };
+    // Buffer completely filled — likely oversized/malicious payload
+    if n == buf.len() {
+        ban_list.record_violation(&client_ip, "oversized-request");
+        return;
+    }
 
     let request = String::from_utf8_lossy(&buf[..n]);
 
     // Check for WebSocket upgrade
     if is_websocket_upgrade(&request) {
         if let Some(ws_state) = ws_state {
+            // Acquire a WebSocket slot before starting the session
+            let ws_guard = match ws_counter.try_acquire(&client_ip, MAX_WS_CONNECTIONS_PER_IP) {
+                Some(g) => g,
+                None => {
+                    log_remote_event("WS-LIMIT", &client_ip, "websocket connection limit reached");
+                    let response = build_http_response(503, "Service Unavailable", "text/plain", "Too many connections", is_https);
+                    let _ = stream.write_all(&response).await;
+                    return;
+                }
+            };
+            // Release the HTTP slot — the WS session is tracked separately
+            drop(http_guard);
             let client_id = ws_state.next_client_id();
             let pw_hash = ws_state.password_hash.read().unwrap().clone();
             let pw_enabled = *ws_state.password_enabled.read().unwrap();
             let prefixed = PrefixedStream::new(buf[..n].to_vec(), stream);
+            let _ws_guard = ws_guard;
             let _ = crate::websocket::handle_ws_client(
                 prefixed,
                 client_id,
@@ -461,6 +493,8 @@ pub async fn start_https_server(
     *running.write().await = true;
 
     let theme_css_vars = Arc::new(theme_css_vars);
+    let conn_counter = ConnectionCounter::new();
+    let ws_counter = ConnectionCounter::new();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -471,11 +505,19 @@ pub async fn start_https_server(
                             if ban_list.is_banned(&client_ip) {
                                 continue;
                             }
+                            let guard = match conn_counter.try_acquire(&client_ip, MAX_HTTP_CONNECTIONS_PER_IP) {
+                                Some(g) => g,
+                                None => {
+                                    log_remote_event("CONN-LIMIT", &client_ip, "connection limit reached");
+                                    continue;
+                                }
+                            };
                             let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
                             let ban_list = ban_list.clone();
+                            let ws_counter = ws_counter.clone();
                             tokio::spawn(async move {
                                 // Peek first byte to detect plain HTTP vs TLS
                                 let mut peek = [0u8; 1];
@@ -488,12 +530,19 @@ pub async fn start_https_server(
                                     Ok(0) | Err(_) => return,
                                     _ => {}
                                 }
-                                match tls_acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, &ban_list, true).await;
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(TLS_TIMEOUT_SECS),
+                                    tls_acceptor.accept(stream),
+                                ).await {
+                                    Ok(Ok(tls_stream)) => {
+                                        route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, &ban_list, true, guard, &ws_counter).await;
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
+                                    }
+                                    Err(_) => {
+                                        log_remote_event("TLS-TIMEOUT", &client_ip, "handshake timeout");
+                                        ban_list.record_violation(&client_ip, "tls-timeout");
                                     }
                                 }
                             });
@@ -623,6 +672,8 @@ pub async fn start_https_server(
     *running.write().await = true;
 
     let theme_css_vars = Arc::new(theme_css_vars);
+    let conn_counter = ConnectionCounter::new();
+    let ws_counter = ConnectionCounter::new();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -633,11 +684,19 @@ pub async fn start_https_server(
                             if ban_list.is_banned(&client_ip) {
                                 continue;
                             }
+                            let guard = match conn_counter.try_acquire(&client_ip, MAX_HTTP_CONNECTIONS_PER_IP) {
+                                Some(g) => g,
+                                None => {
+                                    log_remote_event("CONN-LIMIT", &client_ip, "connection limit reached");
+                                    continue;
+                                }
+                            };
                             let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
                             let ban_list = ban_list.clone();
+                            let ws_counter = ws_counter.clone();
                             tokio::spawn(async move {
                                 // Peek first byte to detect plain HTTP vs TLS
                                 let mut peek = [0u8; 1];
@@ -650,12 +709,19 @@ pub async fn start_https_server(
                                     Ok(0) | Err(_) => return,
                                     _ => {}
                                 }
-                                match tls_acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, &ban_list, true).await;
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(TLS_TIMEOUT_SECS),
+                                    tls_acceptor.accept(stream),
+                                ).await {
+                                    Ok(Ok(tls_stream)) => {
+                                        route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, &ban_list, true, guard, &ws_counter).await;
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
+                                    }
+                                    Err(_) => {
+                                        log_remote_event("TLS-TIMEOUT", &client_ip, "handshake timeout");
+                                        ban_list.record_violation(&client_ip, "tls-timeout");
                                     }
                                 }
                             });
@@ -774,6 +840,62 @@ impl Default for BanList {
 }
 
 // ============================================================================
+// Connection Counter — per-IP connection limiter
+// ============================================================================
+
+/// Tracks active connections per IP with a per-IP limit.
+/// Localhost connections (127.0.0.1, ::1) are never counted or limited.
+#[derive(Clone, Default)]
+pub struct ConnectionCounter {
+    counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+}
+
+impl ConnectionCounter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Try to acquire a connection slot for the given IP up to `limit`.
+    /// Returns `None` if the limit is reached; otherwise returns a guard
+    /// that releases the slot when dropped.
+    pub fn try_acquire(&self, ip: &str, limit: usize) -> Option<ConnectionGuard> {
+        if ip == "127.0.0.1" || ip == "::1" {
+            return Some(ConnectionGuard { counter: None, ip: String::new() });
+        }
+        let mut counts = self.counts.lock().unwrap();
+        let count = counts.entry(ip.to_string()).or_insert(0);
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(ConnectionGuard {
+            counter: Some(self.counts.clone()),
+            ip: ip.to_string(),
+        })
+    }
+}
+
+/// RAII guard — releases a connection slot on drop.
+pub struct ConnectionGuard {
+    counter: Option<Arc<std::sync::Mutex<HashMap<String, usize>>>>,
+    ip: String,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(counts) = &self.counter {
+            let mut counts = counts.lock().unwrap();
+            if let Some(n) = counts.get_mut(&self.ip) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    counts.remove(&self.ip);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // HTTP Web Interface Server (no TLS)
 // ============================================================================
 
@@ -858,6 +980,8 @@ pub async fn start_http_server(
     *running.write().await = true;
 
     let theme_css_vars = Arc::new(theme_css_vars);
+    let conn_counter = ConnectionCounter::new();
+    let ws_counter = ConnectionCounter::new();
     tokio::spawn(async move {
         // Signal ready INSIDE the spawned task — ensures the accept loop is actually running
         crate::GUI_HTTP_READY.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -871,12 +995,20 @@ pub async fn start_http_server(
                                 drop(stream);
                                 continue;
                             }
+                            let guard = match conn_counter.try_acquire(&client_ip, MAX_HTTP_CONNECTIONS_PER_IP) {
+                                Some(g) => g,
+                                None => {
+                                    log_remote_event("CONN-LIMIT", &client_ip, "connection limit reached");
+                                    continue;
+                                }
+                            };
                             let _ = stream.set_nodelay(true);
                             let ban_list_clone = ban_list.clone();
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
+                            let ws_counter = ws_counter.clone();
                             tokio::spawn(async move {
-                                route_connection(stream, ws_state, false, &theme_css_vars, addr, &ban_list_clone, false).await;
+                                route_connection(stream, ws_state, false, &theme_css_vars, addr, &ban_list_clone, false, guard, &ws_counter).await;
                             });
                         }
                         Err(_) => break,
