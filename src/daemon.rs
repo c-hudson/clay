@@ -2557,7 +2557,6 @@ pub async fn connect_daemon_world(
     // Named Pipes on Windows.
     #[cfg(all(unix, not(target_os = "android")))]
     if use_ssl && tls_proxy_enabled {
-        use crate::platform::spawn_tls_proxy;
         if let Ok((proxy_pid, socket_path)) = spawn_tls_proxy(&world_name, host, port) {
             let mut connected = false;
             for attempt in 0..20 {
@@ -2642,7 +2641,6 @@ pub async fn connect_daemon_world(
 
     #[cfg(windows)]
     if use_ssl && tls_proxy_enabled {
-        use crate::platform::{spawn_tls_proxy, connect_to_proxy_pipe, kill_proxy_process};
         if let Ok((proxy_pid, pipe_path)) = spawn_tls_proxy(&world_name, host, port) {
             match connect_to_proxy_pipe(&pipe_path, 10).await {
                 Some(pipe_client) => {
