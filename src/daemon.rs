@@ -1115,13 +1115,14 @@ pub async fn handle_daemon_ws_message(
 
                             app.worlds[world_index].connection_id += 1;
                             let skip_login = app.worlds[world_index].skip_auto_login;
-                            if let Some((cmd_tx, socket_fd, is_tls)) = connect_daemon_world(
+                            if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
                                 world_index,
                                 world_name.clone(),
                                 &settings,
                                 event_tx.clone(),
                                 app.worlds[world_index].connection_id,
                                 skip_login,
+                                app.settings.tls_proxy_enabled,
                             ).await {
                                 app.worlds[world_index].connected = true;
                                 app.worlds[world_index].command_tx = Some(cmd_tx);
@@ -1129,6 +1130,8 @@ pub async fn handle_daemon_ws_message(
                                 app.worlds[world_index].skip_auto_login = false;
                                 app.worlds[world_index].socket_fd = socket_fd;
                                 app.worlds[world_index].is_tls = is_tls;
+                                app.worlds[world_index].proxy_pid = proxy_pid;
+                                app.worlds[world_index].proxy_socket_path = proxy_socket_path;
                                 let now = std::time::Instant::now();
                                 app.worlds[world_index].last_send_time = Some(now);
                                 app.worlds[world_index].last_receive_time = Some(now);
@@ -1190,13 +1193,14 @@ pub async fn handle_daemon_ws_message(
 
                             app.worlds[idx].connection_id += 1;
                             let skip_login = app.worlds[idx].skip_auto_login;
-                            if let Some((cmd_tx, socket_fd, is_tls)) = connect_daemon_world(
+                            if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
                                 idx,
                                 world_name.clone(),
                                 &settings,
                                 event_tx.clone(),
                                 app.worlds[idx].connection_id,
                                 skip_login,
+                                app.settings.tls_proxy_enabled,
                             ).await {
                                 app.worlds[idx].connected = true;
                                 app.worlds[idx].command_tx = Some(cmd_tx);
@@ -1204,6 +1208,8 @@ pub async fn handle_daemon_ws_message(
                                 app.worlds[idx].skip_auto_login = false;
                                 app.worlds[idx].socket_fd = socket_fd;
                                 app.worlds[idx].is_tls = is_tls;
+                                app.worlds[idx].proxy_pid = proxy_pid;
+                                app.worlds[idx].proxy_socket_path = proxy_socket_path;
                                 let now = std::time::Instant::now();
                                 app.worlds[idx].last_send_time = Some(now);
                                 app.worlds[idx].last_receive_time = Some(now);
@@ -1272,13 +1278,14 @@ pub async fn handle_daemon_ws_message(
                 // Attempt connection
                 app.worlds[world_index].connection_id += 1;
                 let skip_login = app.worlds[world_index].skip_auto_login;
-                if let Some((cmd_tx, socket_fd, is_tls)) = connect_daemon_world(
+                if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
                     world_index,
                     world_name.clone(),
                     &settings,
                     event_tx.clone(),
                     app.worlds[world_index].connection_id,
                     skip_login,
+                    app.settings.tls_proxy_enabled,
                 ).await {
                     // Connection succeeded
                     app.worlds[world_index].connected = true;
@@ -1287,6 +1294,8 @@ pub async fn handle_daemon_ws_message(
                     app.worlds[world_index].skip_auto_login = false;
                     app.worlds[world_index].socket_fd = socket_fd;
                     app.worlds[world_index].is_tls = is_tls;
+                    app.worlds[world_index].proxy_pid = proxy_pid;
+                    app.worlds[world_index].proxy_socket_path = proxy_socket_path;
                     let now = std::time::Instant::now();
                     app.worlds[world_index].last_send_time = Some(now);
                     app.worlds[world_index].last_receive_time = Some(now);
@@ -2491,7 +2500,7 @@ pub async fn connect_multiuser_world(
 }
 
 /// Connect a world in daemon mode (non-multiuser)
-/// Returns a command sender if connection succeeds
+/// Returns (cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path) on success
 pub async fn connect_daemon_world(
     _world_index: usize,
     world_name: String,
@@ -2499,13 +2508,208 @@ pub async fn connect_daemon_world(
     event_tx: mpsc::Sender<AppEvent>,
     connection_id: u64,
     skip_auto_login: bool,
-) -> Option<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool)> {
+    tls_proxy_enabled: bool,
+) -> Option<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool, Option<u32>, Option<std::path::PathBuf>)> {
     let host = &settings.hostname;
     let port = &settings.port;
     let use_ssl = settings.use_ssl;
 
     if host.is_empty() || port.is_empty() {
         return None;
+    }
+
+    // TLS proxy path — spawn a separate proxy process that holds the TLS connection
+    // so it survives hot reload. Platform-specific IPC: Unix sockets on Unix,
+    // Named Pipes on Windows.
+    #[cfg(all(unix, not(target_os = "android")))]
+    if use_ssl && tls_proxy_enabled {
+        use crate::platform::spawn_tls_proxy;
+        if let Ok((proxy_pid, socket_path)) = spawn_tls_proxy(&world_name, host, port) {
+            let mut connected = false;
+            for attempt in 0..20 {
+                match tokio::net::UnixStream::connect(&socket_path).await {
+                    Ok(unix_stream) => {
+                        let (r, w) = unix_stream.into_split();
+                        let mut read_half = StreamReader::Proxy(r);
+                        let mut write_half = StreamWriter::Proxy(w);
+                        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                        if !skip_auto_login {
+                            let user = settings.user.clone();
+                            let password = settings.password.clone();
+                            let auto_connect_type = settings.auto_connect_type;
+                            if !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                let tx = cmd_tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    let _ = tx.send(WriteCommand::Text(format!("connect {} {}", user, password))).await;
+                                });
+                            }
+                        }
+                        let telnet_tx = cmd_tx.clone();
+                        let event_tx_read = event_tx.clone();
+                        let world_name_read = world_name.clone();
+                        let reader_conn_id = connection_id;
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let mut line_buffer: Vec<u8> = Vec::new();
+                            loop {
+                                match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                                    Ok(0) => {
+                                        if !line_buffer.is_empty() {
+                                            let result = process_telnet(&line_buffer);
+                                            if !result.responses.is_empty() { let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await; }
+                                            if !result.cleaned.is_empty() { let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await; }
+                                        }
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read, reader_conn_id)).await;
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        line_buffer.extend_from_slice(&buf[..n]);
+                                        let split_at = find_safe_split_point(&line_buffer);
+                                        let to_send = if split_at > 0 { line_buffer.drain(..split_at).collect() } else { std::mem::take(&mut line_buffer) };
+                                        if !to_send.is_empty() {
+                                            let result = process_telnet(&to_send);
+                                            if !result.responses.is_empty() { let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await; }
+                                            if result.telnet_detected { let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name_read.clone())).await; }
+                                            if result.naws_requested { let _ = event_tx_read.send(AppEvent::NawsRequested(world_name_read.clone())).await; }
+                                            if result.gmcp_negotiated { let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name_read.clone())).await; }
+                                            if result.msdp_negotiated { let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name_read.clone())).await; }
+                                            for (pkg, json) in &result.gmcp_data { let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name_read.clone(), pkg.clone(), json.clone())).await; }
+                                            for (var, val) in &result.msdp_data { let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name_read.clone(), var.clone(), val.clone())).await; }
+                                            if let Some(prompt_bytes) = result.prompt { let _ = event_tx_read.send(AppEvent::Prompt(world_name_read.clone(), prompt_bytes)).await; }
+                                            if !result.cleaned.is_empty() { let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await; }
+                                        }
+                                    }
+                                    Err(_) => { let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read, reader_conn_id)).await; break; }
+                                }
+                            }
+                        });
+                        tokio::spawn(async move {
+                            while let Some(cmd) = cmd_rx.recv().await {
+                                let bytes = match &cmd { WriteCommand::Text(t) => { let mut b = t.as_bytes().to_vec(); b.extend_from_slice(b"\r\n"); b } WriteCommand::Raw(r) => r.clone(), WriteCommand::Shutdown => break };
+                                if tokio::io::AsyncWriteExt::write_all(&mut write_half, &bytes).await.is_err() { break; }
+                            }
+                        });
+                        return Some((cmd_tx, None, true, Some(proxy_pid), Some(socket_path)));
+                    }
+                    Err(_) => {
+                        if attempt < 19 { tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; }
+                        connected = false;
+                    }
+                }
+                if connected { break; }
+            }
+            if !connected {
+                unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+            }
+        }
+        // Fall through to direct TLS if proxy failed
+    }
+
+    #[cfg(windows)]
+    if use_ssl && tls_proxy_enabled {
+        use crate::platform::{spawn_tls_proxy, connect_to_proxy_pipe, kill_proxy_process};
+        if let Ok((proxy_pid, pipe_path)) = spawn_tls_proxy(&world_name, host, port) {
+            match connect_to_proxy_pipe(&pipe_path, 10).await {
+                Some(pipe_client) => {
+                    let (r, w) = tokio::io::split(pipe_client);
+                    let mut read_half = StreamReader::NamedPipeProxy(r);
+                    let mut write_half = StreamWriter::NamedPipeProxy(w);
+                        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                        if !skip_auto_login {
+                            let user = settings.user.clone();
+                            let password = settings.password.clone();
+                            let auto_connect_type = settings.auto_connect_type;
+                            if !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                let tx = cmd_tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    let _ = tx.send(WriteCommand::Text(format!("connect {} {}", user, password))).await;
+                                });
+                            }
+                        }
+                        let telnet_tx = cmd_tx.clone();
+                        let event_tx_read = event_tx.clone();
+                        let world_name_read = world_name.clone();
+                        let reader_conn_id = connection_id;
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let mut line_buffer: Vec<u8> = Vec::new();
+                            loop {
+                                match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                                    Ok(0) => {
+                                        if !line_buffer.is_empty() {
+                                            let result = process_telnet(&line_buffer);
+                                            if !result.responses.is_empty() {
+                                                let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                            }
+                                            if !result.cleaned.is_empty() {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
+                                            }
+                                        }
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read, reader_conn_id)).await;
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        line_buffer.extend_from_slice(&buf[..n]);
+                                        let split_at = find_safe_split_point(&line_buffer);
+                                        let to_send = if split_at > 0 { line_buffer.drain(..split_at).collect() } else { std::mem::take(&mut line_buffer) };
+                                        if !to_send.is_empty() {
+                                            let result = process_telnet(&to_send);
+                                            if !result.responses.is_empty() {
+                                                let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                            }
+                                            if result.telnet_detected {
+                                                let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name_read.clone())).await;
+                                            }
+                                            if result.naws_requested {
+                                                let _ = event_tx_read.send(AppEvent::NawsRequested(world_name_read.clone())).await;
+                                            }
+                                            if result.gmcp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name_read.clone())).await;
+                                            }
+                                            if result.msdp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name_read.clone())).await;
+                                            }
+                                            for (pkg, json) in &result.gmcp_data {
+                                                let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name_read.clone(), pkg.clone(), json.clone())).await;
+                                            }
+                                            for (var, val) in &result.msdp_data {
+                                                let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name_read.clone(), var.clone(), val.clone())).await;
+                                            }
+                                            if let Some(prompt_bytes) = result.prompt {
+                                                let _ = event_tx_read.send(AppEvent::Prompt(world_name_read.clone(), prompt_bytes)).await;
+                                            }
+                                            if !result.cleaned.is_empty() {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read, reader_conn_id)).await;
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        tokio::spawn(async move {
+                            while let Some(cmd) = cmd_rx.recv().await {
+                                let bytes = match &cmd {
+                                    WriteCommand::Text(t) => { let mut b = t.as_bytes().to_vec(); b.extend_from_slice(b"\r\n"); b }
+                                    WriteCommand::Raw(r) => r.clone(),
+                                    WriteCommand::Shutdown => break,
+                                };
+                                if tokio::io::AsyncWriteExt::write_all(&mut write_half, &bytes).await.is_err() { break; }
+                            }
+                        });
+                        return Some((cmd_tx, None, true, Some(proxy_pid), Some(pipe_path)));
+                }
+                None => {
+                    kill_proxy_process(proxy_pid);
+                }
+            }
+        }
+        // Fall through to direct TLS
     }
 
     match TcpStream::connect(format!("{}:{}", host, port)).await {
@@ -2770,7 +2974,7 @@ pub async fn connect_daemon_world(
                 }
             });
 
-            Some((cmd_tx, final_socket_fd, is_tls))
+            Some((cmd_tx, final_socket_fd, is_tls, None, None))
         }
         Err(_) => None,
     }

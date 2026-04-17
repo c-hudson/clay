@@ -12084,11 +12084,14 @@ pub async fn run_app_headless(
                             // Pass skip_auto_login=true to connect_daemon_world so it doesn't
                             // send auto-login; handle_connection_success handles that instead.
                             match daemon::connect_daemon_world(
-                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true
+                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
+                                app.settings.tls_proxy_enabled,
                             ).await {
-                                Some((cmd_tx, socket_fd, is_tls)) => {
+                                Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) => {
                                     app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
                                     if let Some(new_idx) = app.find_world_index(&world_name) {
+                                        app.worlds[new_idx].proxy_pid = proxy_pid;
+                                        app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
                                         app.add_output_to_world(new_idx, "Connected!");
                                     }
                                 }
@@ -14519,11 +14522,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Pass skip_auto_login=true to connect_daemon_world so it doesn't
                             // send auto-login; handle_connection_success handles that instead.
                             match daemon::connect_daemon_world(
-                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true
+                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
+                                app.settings.tls_proxy_enabled,
                             ).await {
-                                Some((cmd_tx, socket_fd, is_tls)) => {
+                                Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) => {
                                     app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
                                     if let Some(new_idx) = app.find_world_index(&world_name) {
+                                        app.worlds[new_idx].proxy_pid = proxy_pid;
+                                        app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
                                         app.add_output_to_world(new_idx, "Connected!");
                                     }
                                 }
