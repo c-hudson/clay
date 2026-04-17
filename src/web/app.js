@@ -2627,6 +2627,10 @@
                 }
                 break;
 
+            case 'ConnectionsListResponse':
+                addRawOutputLines(msg.lines || [], currentWorldIndex);
+                break;
+
             case 'BanListResponse':
                 // Ban list received - output is already sent via ServerData
                 // This message can be used for future UI enhancements
@@ -3535,7 +3539,7 @@
 
             case '/connections':
             case '/l':
-                outputWorldsList();
+                ws.send(JSON.stringify({ type: 'RequestConnectionsList' }));
                 break;
 
             case '/worlds':
@@ -6238,86 +6242,6 @@
         }
     }
 
-    // Format worlds list for /l command (text output)
-    // Only shows connected worlds
-    function formatWorldsList() {
-        const KEEPALIVE_SECS = 5 * 60;
-        const GRAY = '\x1b[90m';
-        const YELLOW = '\x1b[33m';
-        const CYAN = '\x1b[36m';
-        const RESET = '\x1b[0m';
-
-        // Filter to connected worlds only
-        const connectedWorlds = worlds
-            .map((world, idx) => ({ world, idx }))
-            .filter(({ world }) => world.connected);
-
-        if (connectedWorlds.length === 0) {
-            return ['No worlds connected.'];
-        }
-
-        const lines = [];
-
-        // Header line
-        lines.push(padRight('World', 20) + padLeft('Unseen', 6) + '  ' +
-            padLeft('Last', 9) + '  ' + padLeft('KA', 9) + '  ' +
-            padLeft('Buffer', 7));
-
-        connectedWorlds.forEach(({ world, idx }) => {
-            // Current marker
-            const currentMarker = idx === currentWorldIndex ?
-                CYAN + '*' + RESET :
-                ' ';
-
-            // Unseen count
-            const unseen = world.unseen_lines || 0;
-            const unseenStr = unseen > 0 ?
-                YELLOW + padLeft(unseen.toString(), 6) + RESET :
-                GRAY + padLeft('—', 6) + RESET;
-
-            // Last (recv/send combined)
-            const lastSend = formatDurationShort(world.last_send_secs);
-            const lastRecv = formatDurationShort(world.last_recv_secs);
-            const last = lastRecv + '/' + lastSend;
-
-            // KA (lastNOP/nextNOP combined)
-            const lastNop = formatDurationShort(world.last_nop_secs);
-            const lastSendVal = world.last_send_secs !== null && world.last_send_secs !== undefined ? world.last_send_secs : KEEPALIVE_SECS;
-            const lastRecvVal = world.last_recv_secs !== null && world.last_recv_secs !== undefined ? world.last_recv_secs : KEEPALIVE_SECS;
-            const lastActivity = Math.min(lastSendVal, lastRecvVal);
-            const remaining = Math.max(0, KEEPALIVE_SECS - lastActivity);
-            const nextNop = formatDurationShort(remaining);
-            const ka = lastNop + '/' + nextNop;
-
-            // Buffer size
-            const bufferSize = (world.output_lines || []).length;
-
-            // Truncate world name
-            const name = world.name || '';
-            const nameDisplay = name.length > 18 ? name.substring(0, 15) + '...' : name;
-
-            lines.push(currentMarker + ' ' + padRight(nameDisplay, 18) + ' ' + unseenStr + '  ' +
-                padLeft(last, 9) + '  ' + padLeft(ka, 9) + '  ' +
-                padLeft(bufferSize.toString(), 7));
-        });
-
-        return lines;
-    }
-
-    // Helper: pad string to the right
-    function padRight(str, len) {
-        str = String(str);
-        while (str.length < len) str += ' ';
-        return str;
-    }
-
-    // Helper: pad string to the left
-    function padLeft(str, len) {
-        str = String(str);
-        while (str.length < len) str = ' ' + str;
-        return str;
-    }
-
     // Add raw output lines (without %% prefix)
     function addRawOutputLines(lines, worldIndex) {
         const ts = Math.floor(Date.now() / 1000);
@@ -6330,12 +6254,6 @@
                 }
             });
         }
-    }
-
-    // Output worlds list as text (/l command)
-    function outputWorldsList() {
-        const lines = formatWorldsList();
-        addRawOutputLines(lines, currentWorldIndex);
     }
 
     // Calculate next keepalive time
@@ -7356,7 +7274,7 @@
                 openHelpPopup();
                 break;
             case 'worlds':
-                outputWorldsList();
+                ws.send(JSON.stringify({ type: 'RequestConnectionsList' }));
                 focusInputWithKeyboard();
                 break;
             case 'world-selector':
