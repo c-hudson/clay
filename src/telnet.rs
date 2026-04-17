@@ -65,6 +65,8 @@ pub enum StreamReader {
     Tls(ReadHalf<TlsStream<TcpStream>>),
     #[cfg(unix)]
     Proxy(tokio::net::unix::OwnedReadHalf),  // Unix socket for TLS proxy
+    #[cfg(windows)]
+    NamedPipeProxy(tokio::io::ReadHalf<tokio::net::windows::named_pipe::NamedPipeClient>),
 }
 
 pub enum StreamWriter {
@@ -72,6 +74,8 @@ pub enum StreamWriter {
     Tls(WriteHalf<TlsStream<TcpStream>>),
     #[cfg(unix)]
     Proxy(tokio::net::unix::OwnedWriteHalf),  // Unix socket for TLS proxy
+    #[cfg(windows)]
+    NamedPipeProxy(tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeClient>),
 }
 
 impl AsyncRead for StreamReader {
@@ -85,6 +89,8 @@ impl AsyncRead for StreamReader {
             StreamReader::Tls(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(unix)]
             StreamReader::Proxy(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(windows)]
+            StreamReader::NamedPipeProxy(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -100,6 +106,8 @@ impl AsyncWrite for StreamWriter {
             StreamWriter::Tls(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(unix)]
             StreamWriter::Proxy(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(windows)]
+            StreamWriter::NamedPipeProxy(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -109,6 +117,8 @@ impl AsyncWrite for StreamWriter {
             StreamWriter::Tls(s) => Pin::new(s).poll_flush(cx),
             #[cfg(unix)]
             StreamWriter::Proxy(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(windows)]
+            StreamWriter::NamedPipeProxy(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -118,6 +128,8 @@ impl AsyncWrite for StreamWriter {
             StreamWriter::Tls(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(unix)]
             StreamWriter::Proxy(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(windows)]
+            StreamWriter::NamedPipeProxy(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }

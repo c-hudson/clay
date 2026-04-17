@@ -39,9 +39,9 @@ use crate::platform::{
     spawn_tls_proxy,
 };
 #[cfg(windows)]
-#[allow(unused_imports)]
 use crate::platform::{
     get_executable_path, exec_reload, check_and_download_update,
+    spawn_tls_proxy, kill_proxy_process,
 };
 
 pub(crate) async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
@@ -1208,6 +1208,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 if let Some(proxy_pid) = world.proxy_pid {
                     unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                 }
+                #[cfg(windows)]
+                if let Some(proxy_pid) = world.proxy_pid {
+                    kill_proxy_process(proxy_pid);
+                }
                 if let Some(ref socket_path) = world.proxy_socket_path {
                     let _ = std::fs::remove_file(socket_path);
                 }
@@ -1364,9 +1368,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
 
             // Check if using TLS proxy for connection preservation
             // TLS proxy not available on Android
-            #[cfg(all(unix, not(target_os = "android")))]
+            #[cfg(not(target_os = "android"))]
             let use_tls_proxy = use_ssl && app.settings.tls_proxy_enabled;
-            #[cfg(any(target_os = "android", not(unix)))]
+            #[cfg(target_os = "android")]
             let use_tls_proxy = false;
 
             let ssl_msg = if use_ssl {
@@ -1377,7 +1381,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output("");
 
             // Handle TLS proxy case separately (proxy does its own TCP connect)
-            // TLS proxy only available on Unix (not Android or Windows)
+            // TLS proxy only available on Unix and Windows (not Android)
             #[cfg(all(unix, not(target_os = "android")))]
             if use_tls_proxy {
                 let world_name = app.current_world().name.clone();
@@ -1578,7 +1582,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                             }
                             Err(e) => {
                                 app.add_output(&format!("Failed to connect to TLS proxy: {}", e));
-                                // Kill the proxy process
                                 #[cfg(unix)]
                                 unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                                 return false;
@@ -1589,6 +1592,202 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         app.add_output(&format!("Failed to spawn TLS proxy: {}", e));
                         app.add_output("Falling back to direct TLS connection...");
                         // Fall through to direct TLS connection below
+                    }
+                }
+            }
+
+            // Handle TLS proxy on Windows via Named Pipe
+            #[cfg(windows)]
+            if use_tls_proxy {
+                let world_name = app.current_world().name.clone();
+                match spawn_tls_proxy(&world_name, &host, &port) {
+                    Ok((proxy_pid, pipe_path)) => {
+                        use tokio::net::windows::named_pipe::ClientOptions;
+                        match ClientOptions::new().open(&pipe_path) {
+                            Ok(pipe_client) => {
+                                app.current_world_mut().socket_fd = None;
+                                app.current_world_mut().is_tls = true;
+                                app.current_world_mut().proxy_pid = Some(proxy_pid);
+                                app.current_world_mut().proxy_socket_path = Some(pipe_path);
+
+                                let (r, w) = tokio::io::split(pipe_client);
+                                let mut read_half = StreamReader::NamedPipeProxy(r);
+                                let mut write_half = StreamWriter::NamedPipeProxy(w);
+
+                                app.current_world_mut().connected = true;
+                                app.current_world_mut().was_connected = true;
+                                app.current_world_mut().prompt_count = 0;
+                                let now = std::time::Instant::now();
+                                app.current_world_mut().last_send_time = Some(now);
+                                app.current_world_mut().last_receive_time = Some(now);
+                                app.current_world_mut().is_initial_world = false;
+                                app.discard_initial_world();
+
+                                let world_name = app.current_world().name.clone();
+
+                                if app.current_world().settings.log_enabled {
+                                    if app.current_world_mut().open_log_file() {
+                                        let log_path = app.current_world().get_log_path();
+                                        app.add_output(&format!("Logging to: {}", log_path.display()));
+                                    } else {
+                                        app.add_output("Warning: Could not open log file");
+                                    }
+                                }
+
+                                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                                app.current_world_mut().command_tx = Some(cmd_tx.clone());
+
+                                let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
+                                for cmd in hook_result.send_commands {
+                                    let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
+                                }
+                                for cmd in hook_result.clay_commands {
+                                    let _ = app.tf_engine.execute(&cmd);
+                                }
+
+                                let skip_login = app.current_world().skip_auto_login;
+                                let auto_connect_type = app.current_world().settings.auto_connect_type;
+                                if auto_connect_type == AutoConnectType::Connect {
+                                    app.current_world_mut().skip_auto_login = false;
+                                }
+                                let user = app.current_world().settings.user.clone();
+                                let password = app.current_world().settings.password.clone();
+                                if app.current_world().settings.encoding == Encoding::Fansi {
+                                    app.current_world_mut().fansi_detect_until = Some(std::time::Instant::now() + Duration::from_secs(2));
+                                    if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                        let connect_cmd = format!("connect {} {}", user, password);
+                                        app.current_world_mut().fansi_login_pending = Some(connect_cmd);
+                                    }
+                                } else if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                    let connect_cmd = format!("connect {} {}", user, password);
+                                    let _ = cmd_tx.send(WriteCommand::Text(connect_cmd)).await;
+                                }
+
+                                app.current_world_mut().connection_id += 1;
+                                let reader_conn_id = app.current_world().connection_id;
+                                let event_tx_read = event_tx.clone();
+                                let read_world_name = world_name.clone();
+                                let telnet_tx = cmd_tx;
+                                tokio::spawn(async move {
+                                    let mut buf = [0u8; 4096];
+                                    let mut line_buffer = Vec::new();
+                                    loop {
+                                        match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                                            Ok(0) => {
+                                                if !line_buffer.is_empty() {
+                                                    let result = process_telnet(&line_buffer);
+                                                    if !result.responses.is_empty() {
+                                                        let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                                    }
+                                                    if result.telnet_detected {
+                                                        let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
+                                                    }
+                                                    if result.gmcp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    if result.msdp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    for (pkg, json) in &result.gmcp_data {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpReceived(read_world_name.clone(), pkg.clone(), json.clone())).await;
+                                                    }
+                                                    for (var, val) in &result.msdp_data {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpReceived(read_world_name.clone(), var.clone(), val.clone())).await;
+                                                    }
+                                                    if let Some(prompt_bytes) = result.prompt {
+                                                        let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
+                                                    }
+                                                    if !result.cleaned.is_empty() {
+                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), result.cleaned)).await;
+                                                    }
+                                                }
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone(), reader_conn_id)).await;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                line_buffer.extend_from_slice(&buf[..n]);
+                                                let split_at = find_safe_split_point(&line_buffer);
+                                                let to_send = if split_at > 0 {
+                                                    line_buffer.drain(..split_at).collect()
+                                                } else if !line_buffer.is_empty() {
+                                                    std::mem::take(&mut line_buffer)
+                                                } else {
+                                                    Vec::new()
+                                                };
+                                                if !to_send.is_empty() {
+                                                    let result = process_telnet(&to_send);
+                                                    if !result.responses.is_empty() {
+                                                        let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                                    }
+                                                    if result.telnet_detected {
+                                                        let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
+                                                    }
+                                                    if result.naws_requested {
+                                                        let _ = event_tx_read.send(AppEvent::NawsRequested(read_world_name.clone())).await;
+                                                    }
+                                                    if result.ttype_requested {
+                                                        let _ = event_tx_read.send(AppEvent::TtypeRequested(read_world_name.clone())).await;
+                                                    }
+                                                    if let Some(ref charsets) = result.charset_request {
+                                                        let _ = event_tx_read.send(AppEvent::CharsetRequested(read_world_name.clone(), charsets.clone())).await;
+                                                    }
+                                                    if result.gmcp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    if result.msdp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    for (pkg, json) in &result.gmcp_data {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpReceived(read_world_name.clone(), pkg.clone(), json.clone())).await;
+                                                    }
+                                                    for (var, val) in &result.msdp_data {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpReceived(read_world_name.clone(), var.clone(), val.clone())).await;
+                                                    }
+                                                    if let Some(prompt_bytes) = result.prompt {
+                                                        let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
+                                                    }
+                                                    if !result.cleaned.is_empty() {
+                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), result.cleaned)).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone(), reader_conn_id)).await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+
+                                tokio::spawn(async move {
+                                    while let Some(cmd) = cmd_rx.recv().await {
+                                        let bytes = match &cmd {
+                                            WriteCommand::Text(text) => {
+                                                let mut b = text.as_bytes().to_vec();
+                                                b.extend_from_slice(b"\r\n");
+                                                b
+                                            }
+                                            WriteCommand::Raw(raw) => raw.clone(),
+                                            WriteCommand::Shutdown => break,
+                                        };
+                                        if tokio::io::AsyncWriteExt::write_all(&mut write_half, &bytes).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+
+                                return false;
+                            }
+                            Err(e) => {
+                                app.add_output(&format!("Failed to connect to TLS proxy: {}", e));
+                                crate::platform::kill_proxy_process(proxy_pid);
+                                return false;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.add_output(&format!("Failed to spawn TLS proxy: {}", e));
+                        app.add_output("Falling back to direct TLS connection...");
                     }
                 }
             }
@@ -1933,6 +2132,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 #[cfg(unix)]
                 if let Some(proxy_pid) = app.current_world().proxy_pid {
                     unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+                }
+                #[cfg(windows)]
+                if let Some(proxy_pid) = app.current_world().proxy_pid {
+                    kill_proxy_process(proxy_pid);
                 }
                 app.current_world_mut().clear_connection_state(true, true);
                 app.add_output("Disconnected.");

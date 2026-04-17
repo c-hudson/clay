@@ -738,6 +738,10 @@ pub async fn handle_daemon_ws_message(
                         if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
                             unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                         }
+                        #[cfg(windows)]
+                        if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
+                            crate::platform::kill_proxy_process(proxy_pid);
+                        }
                         if let Some(ref socket_path) = app.worlds[world_index].proxy_socket_path {
                             let _ = std::fs::remove_file(socket_path);
                         }

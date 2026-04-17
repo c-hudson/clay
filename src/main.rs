@@ -6181,6 +6181,10 @@ impl App {
                     if let Some(proxy_pid) = self.worlds[world_index].proxy_pid {
                         unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                     }
+                    #[cfg(windows)]
+                    if let Some(proxy_pid) = self.worlds[world_index].proxy_pid {
+                        crate::platform::kill_proxy_process(proxy_pid);
+                    }
                     self.worlds[world_index].clear_connection_state(true, true);
                     self.ws_broadcast(WsMessage::ServerData {
                         world_index,
@@ -10530,7 +10534,7 @@ async fn main() -> io::Result<()> {
     }
 
     // Handle --tls-proxy (internal, used when spawning TLS proxy processes)
-    #[cfg(all(unix, not(target_os = "android")))]
+    #[cfg(not(target_os = "android"))]
     if let Some(ref config_path) = tls_proxy_config {
         if let Ok(contents) = std::fs::read_to_string(config_path) {
             let lines: Vec<&str> = contents.lines().collect();
@@ -11026,6 +11030,7 @@ pub async fn run_app_headless(
                                 let (r, w) = unix_stream.into_split();
                                 let mut read_half = StreamReader::Proxy(r);
                                 let mut write_half = StreamWriter::Proxy(w);
+
                                 let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
                                 app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                                 app.worlds[world_idx].skip_auto_login = true;
@@ -11078,6 +11083,85 @@ pub async fn run_app_headless(
                             }
                             Err(e) => {
                                 debug_log(is_debug_enabled(), &format!("HEADLESS: Failed to reconnect proxy for {}: {}", app.worlds[world_idx].name, e));
+                                app.worlds[world_idx].clear_connection_state(false, false);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Reconstruct TLS proxy connections on Windows via Named Pipe
+            #[cfg(windows)]
+            {
+                let world = &app.worlds[world_idx];
+                if world.connected && world.is_tls && world.proxy_pid.is_some() {
+                    let proxy_pid = world.proxy_pid.unwrap();
+                    let pipe_path = world.proxy_socket_path.clone();
+
+                    if !crate::platform::is_process_alive(proxy_pid) {
+                        app.worlds[world_idx].clear_connection_state(false, false);
+                    } else if let Some(ref path) = pipe_path {
+                        use tokio::net::windows::named_pipe::ClientOptions;
+                        let pipe_name = path.to_str().unwrap_or("").to_string();
+                        let mut client_opt = None;
+                        for _ in 0..20 {
+                            match ClientOptions::new().open(&pipe_name) {
+                                Ok(c) => { client_opt = Some(c); break; }
+                                Err(_) => tokio::time::sleep(tokio::time::Duration::from_millis(100)).await,
+                            }
+                        }
+                        match client_opt {
+                            Some(pipe_client) => {
+                                let (r, w) = tokio::io::split(pipe_client);
+                                let mut read_half = StreamReader::NamedPipeProxy(r);
+                                let mut write_half = StreamWriter::NamedPipeProxy(w);
+                                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                                app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+                                app.worlds[world_idx].skip_auto_login = true;
+                                app.worlds[world_idx].open_log_file();
+                                let world_name = app.worlds[world_idx].name.clone();
+                                app.worlds[world_idx].connection_id += 1;
+                                app.worlds[world_idx].reader_name = Some(world_name.clone());
+
+                                let reader_tx = event_tx.clone();
+                                let reader_world_name = world_name.clone();
+                                let reader_conn_id = app.worlds[world_idx].connection_id;
+                                tokio::spawn(async move {
+                                    let mut buf = vec![0u8; 4096];
+                                    loop {
+                                        match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                                            Ok(0) => {
+                                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name, reader_conn_id)).await;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                let data = buf[..n].to_vec();
+                                                let _ = reader_tx.send(AppEvent::ServerData(reader_world_name.clone(), data)).await;
+                                            }
+                                            Err(_) => {
+                                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name, reader_conn_id)).await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                                tokio::spawn(async move {
+                                    while let Some(cmd) = cmd_rx.recv().await {
+                                        match cmd {
+                                            WriteCommand::Text(text) => {
+                                                let data = format!("{}\r\n", text);
+                                                if tokio::io::AsyncWriteExt::write_all(&mut write_half, data.as_bytes()).await.is_err() { break; }
+                                            }
+                                            WriteCommand::Raw(data) => {
+                                                if tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await.is_err() { break; }
+                                            }
+                                            WriteCommand::Shutdown => break,
+                                        }
+                                    }
+                                });
+                            }
+                            None => {
+                                debug_log(is_debug_enabled(), &format!("HEADLESS: Failed to reconnect Windows proxy for {}", app.worlds[world_idx].name));
                                 app.worlds[world_idx].clear_connection_state(false, false);
                             }
                         }
@@ -12405,10 +12489,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        // Third pass: restore TLS proxy connections (Unix only - TLS Proxy uses Unix sockets)
-        // The proxy is designed to accept reconnections - when exec() happens, the old
-        // client connection closes and the proxy waits for a new connection on its listener.
-        // We reconnect via the Unix socket path rather than trying to preserve FDs.
+        // Third pass: restore TLS proxy connections.
+        // The proxy is designed to accept reconnections - when the old process exits,
+        // the client connection closes and the proxy waits for a new connection on its listener.
+        // We reconnect via the IPC path (Unix socket or Windows Named Pipe).
         #[cfg(all(unix, not(target_os = "android")))]
         for world_idx in 0..app.worlds.len() {
             let world = &app.worlds[world_idx];
@@ -12612,6 +12696,197 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     None => {
                         // Failed to reconnect
+                        app.worlds[world_idx].clear_connection_state(false, false);
+                        let seq = app.worlds[world_idx].next_seq;
+                        app.worlds[world_idx].next_seq += 1;
+                        app.worlds[world_idx].output_lines.push(OutputLine::new(
+                            "Failed to reconnect to TLS proxy. Use /worlds to reconnect.".to_string(), seq
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Windows: restore TLS proxy connections via Named Pipe
+        #[cfg(windows)]
+        for world_idx in 0..app.worlds.len() {
+            let world = &app.worlds[world_idx];
+            if world.connected && world.is_tls && world.proxy_pid.is_some() {
+                let proxy_pid = world.proxy_pid.unwrap();
+                let pipe_path = world.proxy_socket_path.clone();
+
+                if !is_process_alive(proxy_pid) {
+                    app.worlds[world_idx].clear_connection_state(false, false);
+                    let seq = app.worlds[world_idx].next_seq;
+                    app.worlds[world_idx].next_seq += 1;
+                    app.worlds[world_idx].output_lines.push(OutputLine::new(
+                        "TLS proxy terminated during reload. Use /worlds to reconnect.".to_string(), seq
+                    ));
+                    continue;
+                }
+
+                let client_opt: Option<tokio::net::windows::named_pipe::NamedPipeClient> = if let Some(ref path) = pipe_path {
+                    use tokio::net::windows::named_pipe::ClientOptions;
+                    let pipe_name = path.to_str().unwrap_or("").to_string();
+                    let mut result = None;
+                    for attempt in 0..20 {
+                        match ClientOptions::new().open(&pipe_name) {
+                            Ok(c) => { result = Some(c); break; }
+                            Err(_) => {
+                                if attempt < 19 {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                }
+                            }
+                        }
+                    }
+                    result
+                } else {
+                    None
+                };
+
+                match client_opt {
+                    Some(pipe_client) => {
+                        let (r, w) = tokio::io::split(pipe_client);
+                        let mut read_half = StreamReader::NamedPipeProxy(r);
+                        let mut write_half = StreamWriter::NamedPipeProxy(w);
+
+                        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                        app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+                        app.worlds[world_idx].skip_auto_login = true;
+                        app.worlds[world_idx].open_log_file();
+
+                        let world_name = app.worlds[world_idx].name.clone();
+                        app.worlds[world_idx].connection_id += 1;
+                        app.worlds[world_idx].reader_name = Some(world_name.clone());
+                        let reader_conn_id = app.worlds[world_idx].connection_id;
+
+                        let event_tx_read = event_tx.clone();
+                        let telnet_tx = cmd_tx.clone();
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            let mut line_buffer = Vec::new();
+                            let mut mccp2: Option<flate2::Decompress> = None;
+                            loop {
+                                match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                                    Ok(0) => {
+                                        if !line_buffer.is_empty() {
+                                            let result = process_telnet(&line_buffer);
+                                            if !result.responses.is_empty() {
+                                                let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                            }
+                                            if result.telnet_detected {
+                                                let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
+                                            }
+                                            if result.gmcp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name.clone())).await;
+                                            }
+                                            if result.msdp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name.clone())).await;
+                                            }
+                                            for (pkg, json) in &result.gmcp_data {
+                                                let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name.clone(), pkg.clone(), json.clone())).await;
+                                            }
+                                            for (var, val) in &result.msdp_data {
+                                                let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name.clone(), var.clone(), val.clone())).await;
+                                            }
+                                            if let Some(prompt_bytes) = result.prompt {
+                                                let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
+                                            }
+                                            if !result.cleaned.is_empty() {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), result.cleaned)).await;
+                                            }
+                                        }
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        if let Some(ref mut decomp) = mccp2 {
+                                            let decompressed = telnet::mccp2_decompress(decomp, &buf[..n]);
+                                            line_buffer.extend_from_slice(&decompressed);
+                                        } else {
+                                            line_buffer.extend_from_slice(&buf[..n]);
+                                        }
+                                        let split_at = find_safe_split_point(&line_buffer);
+                                        let to_send: Vec<u8> = if split_at > 0 {
+                                            line_buffer.drain(..split_at).collect()
+                                        } else if !line_buffer.is_empty() {
+                                            std::mem::take(&mut line_buffer)
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        if !to_send.is_empty() {
+                                            let result = process_telnet(&to_send);
+                                            if !result.responses.is_empty() {
+                                                let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                            }
+                                            if result.mccp2_activated {
+                                                let mut decomp = flate2::Decompress::new(true);
+                                                if result.mccp2_offset < to_send.len() {
+                                                    let tail = telnet::mccp2_decompress(&mut decomp, &to_send[result.mccp2_offset..]);
+                                                    let mut new_buf = tail;
+                                                    new_buf.append(&mut line_buffer);
+                                                    line_buffer = new_buf;
+                                                }
+                                                mccp2 = Some(decomp);
+                                            }
+                                            if result.telnet_detected {
+                                                let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
+                                            }
+                                            if result.naws_requested {
+                                                let _ = event_tx_read.send(AppEvent::NawsRequested(world_name.clone())).await;
+                                            }
+                                            if result.ttype_requested {
+                                                let _ = event_tx_read.send(AppEvent::TtypeRequested(world_name.clone())).await;
+                                            }
+                                            if let Some(ref charsets) = result.charset_request {
+                                                let _ = event_tx_read.send(AppEvent::CharsetRequested(world_name.clone(), charsets.clone())).await;
+                                            }
+                                            if result.gmcp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name.clone())).await;
+                                            }
+                                            if result.msdp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name.clone())).await;
+                                            }
+                                            for (pkg, json) in &result.gmcp_data {
+                                                let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name.clone(), pkg.clone(), json.clone())).await;
+                                            }
+                                            for (var, val) in &result.msdp_data {
+                                                let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name.clone(), var.clone(), val.clone())).await;
+                                            }
+                                            if let Some(prompt_bytes) = result.prompt {
+                                                let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
+                                            }
+                                            if !result.cleaned.is_empty() {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), result.cleaned)).await;
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        tokio::spawn(async move {
+                            while let Some(cmd) = cmd_rx.recv().await {
+                                let bytes = match &cmd {
+                                    WriteCommand::Text(text) => {
+                                        let mut b = text.as_bytes().to_vec();
+                                        b.extend_from_slice(b"\r\n");
+                                        b
+                                    }
+                                    WriteCommand::Raw(raw) => raw.clone(),
+                                    WriteCommand::Shutdown => break,
+                                };
+                                if tokio::io::AsyncWriteExt::write_all(&mut write_half, &bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    None => {
                         app.worlds[world_idx].clear_connection_state(false, false);
                         let seq = app.worlds[world_idx].next_seq;
                         app.worlds[world_idx].next_seq += 1;

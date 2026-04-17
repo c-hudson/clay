@@ -331,10 +331,32 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-/// Stub for Android/Windows - TLS proxy processes don't exist on these platforms
-#[cfg(any(target_os = "android", not(unix)))]
+/// Stub for Android — TLS proxy not supported on Android
+#[cfg(target_os = "android")]
 pub(crate) fn is_process_alive(_pid: u32) -> bool {
-    false  // Always return false since we never spawn proxy processes on this platform
+    false
+}
+
+/// Windows implementation using OpenProcess + GetExitCodeProcess
+#[cfg(windows)]
+pub(crate) fn is_process_alive(pid: u32) -> bool {
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn GetExitCodeProcess(hProcess: isize, lpExitCode: *mut u32) -> i32;
+        fn CloseHandle(hObject: isize) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let result = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        result != 0 && exit_code == STILL_ACTIVE
+    }
 }
 
 /// Reap any zombie child processes to prevent defunct processes from accumulating.
@@ -660,6 +682,269 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &Pa
 
     // Clean up socket file
     let _ = std::fs::remove_file(socket_path);
+}
+
+/// Windows: generate a Named Pipe path for the TLS proxy.
+/// Format: \\.\pipe\clay-tls-<pid>-<sanitized_worldname>
+#[cfg(windows)]
+pub(crate) fn get_proxy_socket_path(world_name: &str) -> PathBuf {
+    let sanitized_name = world_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>();
+    PathBuf::from(format!(r"\\.\pipe\clay-tls-{}-{}", std::process::id(), sanitized_name))
+}
+
+/// Windows: get config file path for a TLS proxy (stored in %TEMP%).
+#[cfg(windows)]
+pub(crate) fn get_proxy_config_path(pipe_path: &Path) -> PathBuf {
+    let pipe_file = pipe_path
+        .components()
+        .last()
+        .and_then(|c| c.as_os_str().to_str())
+        .unwrap_or("clay-tls-proxy");
+    let temp_dir = std::env::var("TEMP")
+        .or_else(|_| std::env::var("TMP"))
+        .unwrap_or_else(|_| "C:\\Temp".to_string());
+    PathBuf::from(format!("{}\\{}.conf", temp_dir, pipe_file))
+}
+
+/// Windows: spawn a TLS proxy process and wait for its Named Pipe to become available.
+/// Returns (proxy_pid, pipe_path) on success.
+#[cfg(windows)]
+pub(crate) fn spawn_tls_proxy(
+    world_name: &str,
+    host: &str,
+    port: &str,
+) -> io::Result<(u32, PathBuf)> {
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+
+    let pipe_path = get_proxy_socket_path(world_name);
+    let config_path = get_proxy_config_path(&pipe_path);
+
+    let _ = std::fs::remove_file(&config_path);
+
+    {
+        let mut file = std::fs::File::create(&config_path)?;
+        writeln!(file, "{}:{}", host, port)?;
+        writeln!(file, "{}", pipe_path.display())?;
+    }
+
+    let exe_path = std::env::current_exe()?;
+    let proxy_arg = format!("--tls-proxy={}", config_path.display());
+
+    let child = Command::new(&exe_path)
+        .arg(&proxy_arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let child_pid = child.id();
+
+    // Wait up to 10 seconds for the named pipe to become connectable
+    let pipe_str = pipe_path.to_str().unwrap_or("").to_string();
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(10);
+
+    while start.elapsed() < timeout {
+        // Try to open the named pipe as a client — succeeds once the server is listening
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pipe_str)
+            .is_ok()
+        {
+            return Ok((child_pid, pipe_path));
+        }
+
+        if !is_process_alive(child_pid) {
+            return Err(io::Error::other("TLS proxy process exited unexpectedly"));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Timeout — kill the proxy and report error
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
+        fn CloseHandle(hObject: isize) -> i32;
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, child_pid);
+        if handle != 0 {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::TimedOut, "TLS proxy named pipe not ready in time"))
+}
+
+/// Windows: async TLS proxy main loop. Connects to the MUD server with TLS,
+/// then accepts Named Pipe clients (one at a time) and relays data.
+/// Survives hot reload because it is a separate process.
+#[cfg(windows)]
+pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &PathBuf) {
+    use tokio::net::windows::named_pipe::{ServerOptions, PipeMode};
+
+    // Step 1: Connect to the MUD server with TLS
+    let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    enable_tcp_keepalive(&tcp_stream);
+
+    // Establish TLS connection (same backends as Unix version)
+    #[cfg(feature = "rustls-backend")]
+    let tls_stream = {
+        use rustls::RootCertStore;
+        use tokio_rustls::TlsConnector;
+        use rustls::pki_types::ServerName;
+
+        let mut root_store = RootCertStore::empty();
+        root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+            rustls::pki_types::TrustAnchor {
+                subject: ta.subject.into(),
+                subject_public_key_info: ta.spki.into(),
+                name_constraints: ta.name_constraints.map(|nc| nc.into()),
+            }
+        }).collect();
+
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = match ServerName::try_from(host.to_string()) {
+            Ok(sn) => sn,
+            Err(_) => return,
+        };
+
+        match connector.connect(server_name, tcp_stream).await {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+
+    #[cfg(feature = "native-tls-backend")]
+    let tls_stream = {
+        let connector = match native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let connector = tokio_native_tls::TlsConnector::from(connector);
+
+        match connector.connect(host, tcp_stream).await {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+
+    #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
+    {
+        return;
+    }
+
+    let pipe_name = match pipe_path.to_str() {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+
+    // Step 2: Named Pipe server loop — accept one client at a time, relay data
+    let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
+    let mut first_instance = true;
+
+    loop {
+        // Create a new server instance for each client connection
+        let server = {
+            let mut opts = ServerOptions::new();
+            opts.pipe_mode(PipeMode::Byte)
+                .in_buffer_size(8192)
+                .out_buffer_size(8192);
+            if first_instance {
+                opts.first_pipe_instance(true);
+            }
+            match opts.create(&pipe_name) {
+                Ok(s) => s,
+                Err(_) => break,
+            }
+        };
+        first_instance = false;
+
+        // Wait for a client to connect (60s timeout for reconnection after hot reload)
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.connect(),
+        ).await {
+            Ok(Ok(())) => {}
+            _ => break,
+        }
+
+        let (mut client_read, mut client_write) = tokio::io::split(server);
+        let mut tls_server_disconnected = false;
+
+        let mut client_buf = [0u8; 8192];
+        let mut tls_buf = [0u8; 8192];
+
+        loop {
+            tokio::select! {
+                result = tokio::io::AsyncReadExt::read(&mut client_read, &mut client_buf) => {
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tokio::io::AsyncWriteExt::write_all(&mut tls_write, &client_buf[..n]).await.is_err() {
+                                tls_server_disconnected = true;
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                result = tokio::io::AsyncReadExt::read(&mut tls_read, &mut tls_buf) => {
+                    match result {
+                        Ok(0) => { tls_server_disconnected = true; break; }
+                        Ok(n) => {
+                            if tokio::io::AsyncWriteExt::write_all(&mut client_write, &tls_buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => { tls_server_disconnected = true; break; }
+                    }
+                }
+            }
+        }
+
+        if tls_server_disconnected {
+            break;
+        }
+        // Client disconnected (hot reload) — loop to accept new client
+    }
+}
+
+/// Windows: terminate a proxy process by PID.
+#[cfg(windows)]
+pub(crate) fn kill_proxy_process(pid: u32) {
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
+        fn CloseHandle(hObject: isize) -> i32;
+    }
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle != 0 {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
 }
 
 /// Strip " (deleted)" suffix from a path string if present.
