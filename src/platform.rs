@@ -739,13 +739,14 @@ pub(crate) fn spawn_tls_proxy(
     // Fall back to normal spawn if the job doesn't permit breakaway.
     use std::os::windows::process::CommandExt;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     let child = Command::new(&exe_path)
         .arg(&proxy_arg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+        .creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW)
         .spawn()
         .or_else(|_| {
             Command::new(&exe_path)
@@ -753,6 +754,7 @@ pub(crate) fn spawn_tls_proxy(
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
         })?;
 
