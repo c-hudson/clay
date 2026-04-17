@@ -40,7 +40,7 @@ use crate::platform::{
 };
 #[cfg(windows)]
 use crate::platform::{
-    get_executable_path, exec_reload, check_and_download_update,
+    get_executable_path, exec_reload,
     spawn_tls_proxy, kill_proxy_process,
 };
 

@@ -4,12 +4,12 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(any(all(unix, not(target_os = "android")), windows))]
 use std::path::Path;
 
 use tokio::net::TcpStream;
@@ -701,7 +701,7 @@ pub(crate) fn get_proxy_config_path(pipe_path: &Path) -> PathBuf {
     let pipe_file = pipe_path
         .components()
         .last()
-        .and_then(|c| c.as_os_str().to_str())
+        .and_then(|c: std::path::Component| c.as_os_str().to_str())
         .unwrap_or("clay-tls-proxy");
     let temp_dir = std::env::var("TEMP")
         .or_else(|_| std::env::var("TMP"))
