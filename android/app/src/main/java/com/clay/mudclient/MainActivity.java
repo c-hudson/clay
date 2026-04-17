@@ -45,6 +45,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
     private static final String KEY_CACHED_THEME_CSS = "cachedThemeCss";
+    private static final String KEY_HAS_LAUNCHED = "hasLaunched";
 
     // Default dark theme CSS vars used on first launch before server provides real theme
     private static final String DEFAULT_THEME_CSS =
@@ -86,6 +87,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean notificationPermissionDone = false;
     private boolean batteryOptimizationDone = false;
     private boolean interfaceLoaded = false;
+    private boolean openSettingsOnLoad = false;
     private String loadedInterfaceUrl = null;
     // Removed duplicate screenOffWakeLock - ClayForegroundService already holds one
     private Handler keepaliveHandler;
@@ -330,8 +332,8 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public String getConnectionInfo() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            String localHost = prefs.getString(KEY_SERVER_HOST, "");
-            String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
+            String localHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
+            String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "teenymush.dynu.net");
             int port = prefs.getInt(KEY_SERVER_PORT, 9000);
             return "{\"localHost\":\"" + localHost.replace("\"", "") +
                    "\",\"remoteHost\":\"" + remoteHost.replace("\"", "") +
@@ -749,6 +751,12 @@ public class MainActivity extends AppCompatActivity {
                 connectionFailed = false;
                 hideConnectingOverlay();
                 android.util.Log.i("Clay", "Page loaded: " + url);
+                if (openSettingsOnLoad) {
+                    openSettingsOnLoad = false;
+                    view.postDelayed(() -> view.evaluateJavascript(
+                        "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');",
+                        null), 300);
+                }
             }
 
             @Override
@@ -795,7 +803,8 @@ public class MainActivity extends AppCompatActivity {
      */
     private void resolveHostnameAndLoad() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String standardHost = prefs.getString(KEY_SERVER_HOST, "");
+        boolean hasLaunched = prefs.getBoolean(KEY_HAS_LAUNCHED, false);
+        String standardHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
         int port = prefs.getInt(KEY_SERVER_PORT, 9000);
         boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
         String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
@@ -803,8 +812,10 @@ public class MainActivity extends AppCompatActivity {
         connectionFailed = false;
         connectCancelled = false;
 
-        if (standardHost.isEmpty()) {
-            // No host configured — load assets directly; JS will open server settings
+        // First launch or no host configured — load UI then open server settings popup
+        if (!hasLaunched || standardHost.isEmpty()) {
+            prefs.edit().putBoolean(KEY_HAS_LAUNCHED, true).apply();
+            openSettingsOnLoad = true;
             loadUrl("");
             return;
         }
