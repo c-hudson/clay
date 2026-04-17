@@ -1414,6 +1414,40 @@ pub async fn handle_daemon_ws_message(
                 }
             }
         }
+        WsMessage::RequestConnectionsList => {
+            let current_idx = app.current_world_index;
+            const KEEPALIVE_SECS: u64 = 5 * 60;
+            let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
+                let now = std::time::Instant::now();
+                let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
+                    (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
+                    (Some(s), None) => Some(s.elapsed().as_secs()),
+                    (None, Some(r)) => Some(r.elapsed().as_secs()),
+                    (None, None) => None,
+                };
+                let next_nop = if world.connected {
+                    last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
+                } else {
+                    None
+                };
+                util::WorldListInfo {
+                    name: world.name.clone(),
+                    connected: world.connected,
+                    is_current: idx == current_idx,
+                    is_ssl: world.is_tls,
+                    is_proxy: world.proxy_pid.is_some(),
+                    unseen_lines: world.unseen_lines,
+                    last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
+                    last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
+                    last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
+                    next_nop_secs: next_nop,
+                    buffer_size: world.output_lines.len() + world.pending_lines.len(),
+                }
+            }).collect();
+            let output = util::format_worlds_list(&worlds_info);
+            let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
+            app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
+        }
         WsMessage::Ping => {
             app.ws_send_to_client(client_id, WsMessage::Pong);
         }
