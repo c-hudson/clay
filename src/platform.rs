@@ -734,28 +734,46 @@ pub(crate) fn spawn_tls_proxy(
     let exe_path = std::env::current_exe()?;
     let proxy_arg = format!("--tls-proxy={}", config_path.display());
 
+    // Spawn with CREATE_BREAKAWAY_FROM_JOB so the proxy survives when the parent
+    // process exits during hot reload (prevents job-object-based termination).
+    // Fall back to normal spawn if the job doesn't permit breakaway.
+    use std::os::windows::process::CommandExt;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
     let child = Command::new(&exe_path)
         .arg(&proxy_arg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+        .or_else(|_| {
+            Command::new(&exe_path)
+                .arg(&proxy_arg)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        })?;
 
     let child_pid = child.id();
 
-    // Wait up to 10 seconds for the named pipe to become connectable
+    // Wait up to 10 seconds for the named pipe server to start listening.
+    // Use WaitNamedPipeA which checks availability WITHOUT connecting — using
+    // OpenOptions::open would consume the server's pending connection slot and
+    // cause a race where the subsequent real connection attempt fails.
+    extern "system" {
+        fn WaitNamedPipeA(lpNamedPipeName: *const u8, nTimeOut: u32) -> i32;
+    }
+    const NMPWAIT_NOWAIT: u32 = 1;
+
     let pipe_str = pipe_path.to_str().unwrap_or("").to_string();
+    let pipe_cstr = format!("{}\0", pipe_str);
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(10);
 
     while start.elapsed() < timeout {
-        // Try to open the named pipe as a client — succeeds once the server is listening
-        if std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&pipe_str)
-            .is_ok()
-        {
+        if unsafe { WaitNamedPipeA(pipe_cstr.as_ptr(), NMPWAIT_NOWAIT) } != 0 {
             return Ok((child_pid, pipe_path));
         }
 
