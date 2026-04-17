@@ -1070,6 +1070,8 @@
     let usingNativeWebSocket = false;
     // Track if we should use native WebSocket (only after browser WebSocket fails)
     let useNativeWebSocket = false;
+    // Count of pending native close callbacks to ignore (from explicit forceReconnect closes)
+    let nativeCloseIgnoreCount = 0;
 
     // Track alternate host for Android advanced mode (local/remote fallback)
     let alternateHost = null;
@@ -1209,6 +1211,13 @@
 
         window.onNativeWebSocketClose = function(code, reason) {
             debugLog('Native WS CLOSE: ' + code + ' ' + reason);
+            // Ignore closes that were triggered by forceReconnect — they fire asynchronously
+            // and would corrupt the already-started new connection's state.
+            if (nativeCloseIgnoreCount > 0) {
+                nativeCloseIgnoreCount--;
+                debugLog('Ignoring stale native close from forceReconnect');
+                return;
+            }
             if (connectionTimeout) {
                 clearTimeout(connectionTimeout);
                 connectionTimeout = null;
@@ -1382,6 +1391,9 @@
             ws.onerror = null;
             ws.onopen = null;
             ws.onmessage = null;
+            // If using native WebSocket, the close fires asynchronously via onNativeWebSocketClose.
+            // Suppress it so the stale callback doesn't corrupt the new connection's state.
+            if (usingNativeWebSocket) nativeCloseIgnoreCount++;
             try { ws.close(); } catch (e) {}
             ws = null;
         }
@@ -8825,6 +8837,12 @@
     // silent TCP death, etc.) and the visibilitychange event may not fire.
     window.checkConnectionOnResume = function() {
         debugLog('checkConnectionOnResume: ws=' + (ws ? ws.readyState : 'null') + ' auth=' + authenticated);
+        // visibilitychange may have already handled the reconnect — skip if a reconnect
+        // is already in progress (new socket CONNECTING) to avoid a double-trigger.
+        if (ws && ws.readyState === WebSocket.CONNECTING) {
+            debugLog('checkConnectionOnResume: reconnect already in progress, skipping');
+            return;
+        }
         if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
             // Connection is dead, reconnect
             forceReconnect();
