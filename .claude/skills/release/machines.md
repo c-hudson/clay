@@ -48,7 +48,7 @@ cd android && ./gradlew assembleRelease
 # Align
 zipalign -v -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk android/clay-android-aligned.apk
 # Sign
-apksigner sign --ks android/clay-release.keystore --ks-pass file:$HOME/.clay-keystore-pass --out android/clay-android.apk android/clay-android-aligned.apk
+~/Android/Sdk/build-tools/35.0.0/apksigner sign --ks android/clay-release.keystore --ks-pass file:$HOME/.clay-keystore-pass --out android/clay-android.apk android/clay-android-aligned.apk
 ```
 
 ## Mac (192.168.2.12)
