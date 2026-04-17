@@ -3516,16 +3516,13 @@
         }
     }
 
-    // Re-display the current world's MUD prompt inline in the output buffer.
-    // Called after internal commands that don't go to the server, so the user
-    // can see the current prompt after the command output.
+    // Restore the current world's MUD prompt to the prompt display area.
+    // sendCommand() clears elements.prompt on every submit; this restores it
+    // after internal commands that don't cause the server to send a new prompt.
     function redisplayCurrentPrompt() {
         const world = worlds[currentWorldIndex];
         if (!world || !world.prompt) return;
-        const ts = Math.floor(Date.now() / 1000);
-        const lineIndex = world.output_lines.length;
-        world.output_lines.push({ text: world.prompt, ts: ts, from_server: true });
-        appendNewLine(world.prompt, ts, currentWorldIndex, lineIndex);
+        elements.prompt.innerHTML = sanitizeHtml(parseAnsi(world.prompt));
     }
 
     // Execute a command locally (called from server via ExecuteLocalCommand message).
