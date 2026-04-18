@@ -1072,6 +1072,8 @@
     let useNativeWebSocket = false;
     // Count of pending native close callbacks to ignore (from explicit forceReconnect closes)
     let nativeCloseIgnoreCount = 0;
+    // Prevent two concurrent connect() calls (visibilitychange + checkConnectionOnResume race)
+    let connectInProgress = false;
 
     // Track alternate host for Android advanced mode (local/remote fallback)
     let alternateHost = null;
@@ -1100,6 +1102,7 @@
     // Set up native WebSocket callbacks (called once)
     function setupNativeWebSocketCallbacks() {
         window.onNativeWebSocketOpen = function() {
+            connectInProgress = false;
             debugLog('Native WS OPEN');
             if (connectionTimeout) {
                 clearTimeout(connectionTimeout);
@@ -1218,6 +1221,7 @@
                 debugLog('Ignoring stale native close from forceReconnect');
                 return;
             }
+            connectInProgress = false;
             if (connectionTimeout) {
                 clearTimeout(connectionTimeout);
                 connectionTimeout = null;
@@ -1405,10 +1409,16 @@
         alternateHost = null;
         triedAlternateHost = false;
         keyAuthFailed = false;  // Explicit reconnect resets this so key auth can be tried again
+        connectInProgress = false;  // Allow the new connect() call to proceed
         connect();
     }
 
     function connect() {
+        if (connectInProgress) {
+            debugLog('connect(): already in progress, skipping duplicate call');
+            return;
+        }
+        connectInProgress = true;
         showConnecting(true);
 
         // Use alternate host if we're in fallback mode, otherwise use WS_HOST
@@ -1456,6 +1466,7 @@
             }, 5000);
 
             ws.onopen = function() {
+                connectInProgress = false;
                 if (connectionTimeout) {
                     clearTimeout(connectionTimeout);
                     connectionTimeout = null;
@@ -1543,6 +1554,7 @@
             };
 
             ws.onclose = function() {
+                connectInProgress = false;
                 if (connectionTimeout) {
                     clearTimeout(connectionTimeout);
                     connectionTimeout = null;
@@ -8733,8 +8745,9 @@
                     // WebSocket is already closed, reconnect immediately
                     forceReconnect();
                 } else if (ws.readyState === WebSocket.CONNECTING) {
-                    // Still connecting from before sleep - kill it and start fresh
-                    forceReconnect();
+                    // Already connecting (may have been started by checkConnectionOnResume) — let it complete.
+                    // The 5-second connection timeout in connect() handles truly stale CONNECTING sockets.
+                    debugLog('visibilitychange: already connecting, skipping');
                 } else if (ws.readyState === WebSocket.OPEN && !authenticated) {
                     // Socket open but not authenticated - stale from before sleep
                     forceReconnect();
