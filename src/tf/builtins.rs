@@ -420,19 +420,28 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
         }
         '!' => {
             // Shell command source
-            match Command::new("sh")
-                .arg("-c")
-                .arg(&source_value)
+            let mut cmd_builder = Command::new("sh");
+            cmd_builder.arg("-c").arg(&source_value)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-            {
+                .stderr(Stdio::piped());
+            if let Some(ref dir) = engine.current_dir {
+                cmd_builder.current_dir(dir);
+            }
+            match cmd_builder.output() {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    stdout
+                    let lines: Vec<String> = stdout
                         .lines()
                         .map(|line| format!("{}{}{}", prefix, line, suffix))
-                        .collect()
+                        .collect();
+                    if lines.is_empty() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stderr_trimmed = stderr.trim();
+                        if !stderr_trimmed.is_empty() {
+                            return TfCommandResult::Error(format!("(no output) stderr: {}", stderr_trimmed));
+                        }
+                    }
+                    lines
                 }
                 Err(e) => return TfCommandResult::Error(format!("Cannot execute shell command '{}': {}", source_value, e)),
             }
@@ -461,7 +470,12 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     };
 
     if lines.is_empty() {
-        return TfCommandResult::Success(Some("(no output)".to_string()));
+        let detail = if source_char == '!' {
+            format!(" [cmd: {}]", source_value)
+        } else {
+            String::new()
+        };
+        return TfCommandResult::Success(Some(format!("(no output){}", detail)));
     }
 
     // If the user didn't explicitly set -d and the prefix starts with /,

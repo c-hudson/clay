@@ -1274,6 +1274,24 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 app.add_output(&format!("World '{}' not found.", name));
             }
         }
+        Command::WorldConnectBackground { name } => {
+            // /worlds -b <name> - connect to world without switching to it
+            if let Some(idx) = app.find_world(&name) {
+                if app.worlds[idx].connected {
+                    app.add_output(&format!("World '{}' is already connected.", name));
+                } else if !app.worlds[idx].settings.has_connection_settings() {
+                    app.add_output(&format!("World '{}' has no connection settings.", name));
+                } else {
+                    let saved_idx = app.current_world_index;
+                    app.current_world_index = idx;
+                    let result = Box::pin(handle_command("/__connect", app, event_tx)).await;
+                    app.current_world_index = saved_idx;
+                    return result;
+                }
+            } else {
+                app.add_output(&format!("World '{}' not found.", name));
+            }
+        }
         Command::WorldsList => {
             // Output connected worlds list as text
             let current_idx = app.current_world_index;

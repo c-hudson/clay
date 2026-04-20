@@ -851,6 +851,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&settings.auto_reconnect_secs);
                     app.worlds[idx].settings.auto_reconnect_secs = ar_secs;
                     app.worlds[idx].settings.auto_reconnect_on_web = ar_on_web;
+                    if ar_secs == 0 {
+                        app.worlds[idx].reconnect_at = None;
+                    }
 
                     // Update Slack settings
                     app.worlds[idx].settings.slack_token = settings.slack_token;
@@ -976,6 +979,72 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.filter_popup.cursor += 1;
                 let output_lines = app.current_world().output_lines.clone();
                 app.filter_popup.update_filter(&output_lines);
+                app.needs_output_redraw = true;
+            }
+            _ => {}
+        }
+        return KeyAction::None;
+    }
+
+    // Handle search popup (F5) input
+    if app.search_popup.visible {
+        match key.code {
+            KeyCode::Esc | KeyCode::F(5) => {
+                app.search_popup.close();
+                app.needs_output_redraw = true;
+            }
+            KeyCode::Enter => {
+                let output_lines = app.current_world().output_lines.clone();
+                // Re-update in case lines changed
+                app.search_popup.update_search(&output_lines);
+                if let Some(line_idx) = app.search_popup.advance() {
+                    app.current_world_mut().scroll_offset = line_idx;
+                    app.needs_output_redraw = true;
+                }
+            }
+            KeyCode::Backspace => {
+                if app.search_popup.cursor > 0 {
+                    app.search_popup.cursor -= 1;
+                    app.search_popup.search_text.remove(app.search_popup.cursor);
+                    let output_lines = app.current_world().output_lines.clone();
+                    app.search_popup.update_search(&output_lines);
+                    if let Some(line_idx) = app.search_popup.current_match_line() {
+                        app.current_world_mut().scroll_offset = line_idx;
+                    }
+                    app.needs_output_redraw = true;
+                }
+            }
+            KeyCode::Delete => {
+                if app.search_popup.cursor < app.search_popup.search_text.len() {
+                    app.search_popup.search_text.remove(app.search_popup.cursor);
+                    let output_lines = app.current_world().output_lines.clone();
+                    app.search_popup.update_search(&output_lines);
+                    if let Some(line_idx) = app.search_popup.current_match_line() {
+                        app.current_world_mut().scroll_offset = line_idx;
+                    }
+                    app.needs_output_redraw = true;
+                }
+            }
+            KeyCode::Left => {
+                if app.search_popup.cursor > 0 {
+                    app.search_popup.cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if app.search_popup.cursor < app.search_popup.search_text.len() {
+                    app.search_popup.cursor += 1;
+                }
+            }
+            KeyCode::Home => { app.search_popup.cursor = 0; }
+            KeyCode::End => { app.search_popup.cursor = app.search_popup.search_text.len(); }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.search_popup.search_text.insert(app.search_popup.cursor, c);
+                app.search_popup.cursor += 1;
+                let output_lines = app.current_world().output_lines.clone();
+                app.search_popup.update_search(&output_lines);
+                if let Some(line_idx) = app.search_popup.current_match_line() {
+                    app.current_world_mut().scroll_offset = line_idx;
+                }
                 app.needs_output_redraw = true;
             }
             _ => {}
@@ -1625,6 +1694,13 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
             app.filter_popup.open();
             let output_lines = app.current_world().output_lines.clone();
             app.filter_popup.update_filter(&output_lines);
+            app.needs_output_redraw = true;
+            KeyAction::None
+        }
+        "search_popup" => {
+            app.search_popup.open();
+            let output_lines = app.current_world().output_lines.clone();
+            app.search_popup.update_search(&output_lines);
             app.needs_output_redraw = true;
             KeyAction::None
         }

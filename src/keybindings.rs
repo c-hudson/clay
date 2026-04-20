@@ -83,6 +83,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     // Clay Extensions
     ActionInfo { id: "toggle_tags", name: "Toggle Tags (F2)", category: "Clay" },
     ActionInfo { id: "filter_popup", name: "Find (F4)", category: "Clay" },
+    ActionInfo { id: "search_popup", name: "Search History (F5)", category: "Clay" },
     ActionInfo { id: "toggle_action_highlight", name: "Toggle Highlights (F8)", category: "Clay" },
     ActionInfo { id: "toggle_gmcp_media", name: "Toggle GMCP Media (F9)", category: "Clay" },
     ActionInfo { id: "input_grow", name: "Grow Input Area", category: "Clay" },
@@ -167,6 +168,7 @@ impl KeyBindings {
         // Clay Extensions
         b.insert("F2".into(), "toggle_tags".into());
         b.insert("F4".into(), "filter_popup".into());
+        b.insert("F5".into(), "search_popup".into());
         b.insert("F8".into(), "toggle_action_highlight".into());
         b.insert("F9".into(), "toggle_gmcp_media".into());
         b.insert("Alt-Up".into(), "input_grow".into());

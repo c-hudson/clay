@@ -76,6 +76,7 @@
             <div class="menu-sep"></div>
             <div class="menu-item" data-action="toggle-tags">Toggle Tags<span class="shortcut">F2</span></div>
             <div class="menu-item" data-action="filter">Find<span class="shortcut">F4</span></div>
+            <div class="menu-item" data-action="search">Search History<span class="shortcut">F5</span></div>
             <div class="menu-sep"></div>
             <div class="menu-item menu-change-password" data-action="change-password" style="display: none;">Change Password</div>
             <div class="menu-item menu-reload" data-action="reload" style="display: none;">Reload<span class="shortcut">Ctrl+R</span></div>
@@ -108,6 +109,7 @@
             <div class="overlay-content">
                 <div class="spinner"></div>
                 <p>Connecting...</p>
+                <p id="connecting-url" style="font-size:0.75em;opacity:0.6;word-break:break-all;margin-top:4px;"></p>
             </div>
         </div>
 
@@ -141,6 +143,16 @@
             <div class="filter-popup-content">
                 <span>Filter: </span>
                 <input type="text" id="filter-input" autocomplete="off">
+            </div>
+        </div>
+
+        <!-- Search popup (F5) -->
+        <div id="search-popup" class="filter-popup" style="display: none;">
+            <div class="filter-popup-header">Search History [Enter=older, Esc to close]</div>
+            <div class="filter-popup-content">
+                <span>Search: </span>
+                <input type="text" id="search-input" autocomplete="off">
+                <span id="search-match-info" style="margin-left:6px;opacity:0.6;"></span>
             </div>
         </div>
 

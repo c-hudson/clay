@@ -357,6 +357,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     // Render popups if visible (confirm dialog last so it's on top)
     render_confirm_dialog(f, app);
     render_filter_popup(f, app);
+    render_search_popup(f, app);
     // New unified popup system - renders on top of old popups
     render_new_popup(f, app);
 }
@@ -930,6 +931,41 @@ pub(crate) fn render_output_crossterm(app: &App) {
         let _ = stdout.queue(Print(format!("\x1b[36m│\x1b[0m{}{}{}\x1b[36m│\x1b[0m", label, display_text, " ".repeat(padding))));
 
         // Draw border bottom
+        let _ = stdout.queue(cursor::MoveTo(x, 2));
+        let border_bottom = format!("\x1b[36m└{}┘\x1b[0m", "─".repeat(popup_width.saturating_sub(2)));
+        let _ = stdout.queue(Print(border_bottom));
+    }
+
+    // Render search popup if visible (must be after output so it's on top)
+    if app.search_popup.visible {
+        let popup_width = 44usize.min(term_width);
+        let x = term_width.saturating_sub(popup_width) as u16;
+        let title = " History [Enter=older, Esc] ";
+        let dashes_needed = popup_width.saturating_sub(title.len() + 2);
+
+        let _ = stdout.queue(cursor::MoveTo(x, 0));
+        let border_top = format!("\x1b[36m┌{}{}{}\x1b[0m", title, "─".repeat(dashes_needed), "┐");
+        let _ = stdout.queue(Print(border_top));
+
+        let _ = stdout.queue(cursor::MoveTo(x, 1));
+        let mut display_text = app.search_popup.search_text.clone();
+        display_text.insert(app.search_popup.cursor, '▏');
+        let match_info = if app.search_popup.search_text.is_empty() {
+            String::new()
+        } else if app.search_popup.match_indices.is_empty() {
+            " (no matches)".to_string()
+        } else {
+            format!(" ({}/{})", app.search_popup.current_pos + 1, app.search_popup.match_indices.len())
+        };
+        let label = "Search: ";
+        let content_width = label.len() + display_text.chars().count() + match_info.len();
+        let inner_width = popup_width.saturating_sub(2);
+        let padding = inner_width.saturating_sub(content_width);
+        let _ = stdout.queue(Print(format!(
+            "\x1b[36m│\x1b[0m{}{}\x1b[2m{}\x1b[0m{}\x1b[36m│\x1b[0m",
+            label, display_text, match_info, " ".repeat(padding)
+        )));
+
         let _ = stdout.queue(cursor::MoveTo(x, 2));
         let border_bottom = format!("\x1b[36m└{}┘\x1b[0m", "─".repeat(popup_width.saturating_sub(2)));
         let _ = stdout.queue(Print(border_bottom));
@@ -2094,6 +2130,53 @@ pub(crate) fn render_filter_popup(f: &mut Frame, app: &App) {
 
     let popup_text = Paragraph::new(lines).block(popup_block);
 
+    f.render_widget(popup_text, popup_area);
+}
+
+pub(crate) fn render_search_popup(f: &mut Frame, app: &App) {
+    if !app.search_popup.visible {
+        return;
+    }
+
+    let area = f.size();
+    let search = &app.search_popup;
+    let theme = app.settings.theme;
+
+    let popup_width = 44u16.min(area.width);
+    let popup_height = 3u16;
+    let x = area.width.saturating_sub(popup_width);
+    let y = 0;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(ratatui::widgets::Clear, popup_area);
+
+    let mut display_text = search.search_text.clone();
+    display_text.insert(search.cursor, '|');
+
+    let match_info = if search.search_text.is_empty() {
+        String::new()
+    } else if search.match_indices.is_empty() {
+        " (no matches)".to_string()
+    } else {
+        format!(" ({}/{})", search.current_pos + 1, search.match_indices.len())
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(theme.fg_accent())),
+            Span::styled(display_text, Style::default().fg(theme.fg())),
+            Span::styled(match_info, Style::default().fg(theme.fg_dim())),
+        ]),
+    ];
+
+    let title = " History [Enter=older, Esc] ";
+    let popup_block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.popup_border()))
+        .style(Style::default().bg(theme.popup_bg()));
+
+    let popup_text = Paragraph::new(lines).block(popup_block);
     f.render_widget(popup_text, popup_area);
 }
 

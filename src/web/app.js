@@ -197,6 +197,10 @@
         // Filter popup (F4)
         filterPopup: document.getElementById('filter-popup'),
         filterInput: document.getElementById('filter-input'),
+        // Search popup (F5)
+        searchPopup: document.getElementById('search-popup'),
+        searchInput: document.getElementById('search-input'),
+        searchMatchInfo: document.getElementById('search-match-info'),
         // Help popup (/help)
         helpModal: document.getElementById('help-modal'),
         helpContent: document.getElementById('help-content'),
@@ -404,6 +408,12 @@
     // Filter popup state (F4)
     let filterPopupOpen = false;
     let filterText = '';
+
+    // Search popup state (F5)
+    let searchPopupOpen = false;
+    let searchText = '';
+    let searchMatchIndices = [];  // indices into output_lines that match
+    let searchCurrentPos = -1;    // which match is currently shown at bottom
 
     // Font popup state (/font)
     // fontPopupOpen removed — merged into settingsPopupOpen
@@ -1287,9 +1297,17 @@
 
         window.onNativeWebSocketError = function(error) {
             debugLog('Native WS ERROR: ' + error);
+            // Ignore errors from sockets closed by forceReconnect — they fire asynchronously
+            // (via onFailure on a dead TCP connection) and would corrupt the new connection's state.
+            if (nativeCloseIgnoreCount > 0) {
+                nativeCloseIgnoreCount--;
+                debugLog('Ignoring stale native error from forceReconnect');
+                return;
+            }
             // Connection attempt failed (TLS error, refused, etc.) — not a session disconnect.
             // Handle wss->ws fallback here rather than delegating to onNativeWebSocketClose,
             // which fires for both failures and normal session ends.
+            connectInProgress = false;
             if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
             if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
             if (ws) ws.readyState = WebSocket.CLOSED;
@@ -1429,6 +1447,10 @@
         const port = (window.WS_PORT && window.WS_PORT !== 0)
             ? window.WS_PORT : (window.location.port || (protocol === 'wss' ? '443' : '80'));
         const wsUrl = `${protocol}://${host}:${port}`;
+
+        // Show URL in connecting overlay so the user knows what's being attempted
+        var urlEl = document.getElementById('connecting-url');
+        if (urlEl) urlEl.textContent = wsUrl;
 
         debugLog('connect() protocol=' + protocol + ' hasNative=' + hasNativeWebSocket());
 
@@ -3729,6 +3751,76 @@
         renderOutput();
     }
 
+    // Search popup functions (F5)
+    function openSearchPopup() {
+        searchPopupOpen = true;
+        searchText = '';
+        searchMatchIndices = [];
+        searchCurrentPos = -1;
+        elements.searchPopup.style.display = 'block';
+        elements.searchInput.value = '';
+        if (elements.searchMatchInfo) elements.searchMatchInfo.textContent = '';
+        elements.searchInput.focus();
+    }
+
+    function closeSearchPopup() {
+        searchPopupOpen = false;
+        searchText = '';
+        searchMatchIndices = [];
+        searchCurrentPos = -1;
+        elements.searchPopup.style.display = 'none';
+        elements.input.focus();
+        renderOutput();
+    }
+
+    function computeSearchMatches() {
+        const world = worlds[currentWorldIndex];
+        if (!world) { searchMatchIndices = []; return; }
+        const lines = world.output_lines || [];
+        if (!searchText) { searchMatchIndices = []; return; }
+        searchMatchIndices = [];
+        for (let i = 0; i < lines.length; i++) {
+            const lineObj = lines[i];
+            if (!lineObj) continue;
+            const rawLine = typeof lineObj === 'string' ? lineObj : lineObj.text;
+            const plain = stripAnsiForFilter(String(rawLine).replace(/[\r\n]+/g, ''));
+            if (matchesFilter(plain, searchText)) {
+                searchMatchIndices.push(i);
+            }
+        }
+        // Start at most recent match
+        searchCurrentPos = searchMatchIndices.length > 0 ? searchMatchIndices.length - 1 : -1;
+    }
+
+    function updateSearchMatchInfo() {
+        if (!elements.searchMatchInfo) return;
+        if (!searchText) {
+            elements.searchMatchInfo.textContent = '';
+        } else if (searchMatchIndices.length === 0) {
+            elements.searchMatchInfo.textContent = '(no matches)';
+        } else {
+            elements.searchMatchInfo.textContent = '(' + (searchCurrentPos + 1) + '/' + searchMatchIndices.length + ')';
+        }
+    }
+
+    function updateSearch() {
+        searchText = elements.searchInput.value;
+        computeSearchMatches();
+        updateSearchMatchInfo();
+        renderOutput();
+    }
+
+    function advanceSearch() {
+        if (searchMatchIndices.length === 0) return;
+        if (searchCurrentPos > 0) {
+            searchCurrentPos--;
+        } else {
+            searchCurrentPos = searchMatchIndices.length - 1;
+        }
+        updateSearchMatchInfo();
+        renderOutput();
+    }
+
     // Help popup functions (/help)
     // Help content as structured sections: [heading, [left, right], ...]
     // Empty right = continuation line; null right = section heading
@@ -3807,6 +3899,7 @@
             { l: 'F1', r: 'Show this help' },
             { l: 'F2', r: 'Toggle MUD tag display' },
             { l: 'F4', r: 'Filter output' },
+            { l: 'F5', r: 'Search history' },
             { l: 'F8', r: 'Highlight action matches' },
             { l: 'F9', r: 'Toggle GMCP media audio' },
         ]},
@@ -4175,14 +4268,21 @@
 
         const lines = world.output_lines || [];
 
+        // When search popup is active and has a match, truncate output at the match line
+        // so the matched line appears at the bottom of the output area
+        let searchEndIdx = lines.length;
+        if (searchPopupOpen && searchCurrentPos >= 0 && searchCurrentPos < searchMatchIndices.length) {
+            searchEndIdx = searchMatchIndices[searchCurrentPos] + 1;
+        }
+
         // Limit initial render to last 500 lines to avoid overwhelming WebKitGTK
         // Full scrollback is available via PageUp which triggers a re-render
         const maxRenderLines = 500;
-        const startIdx = Math.max(0, lines.length - maxRenderLines);
+        const startIdx = Math.max(0, searchEndIdx - maxRenderLines);
 
         // Build lines as HTML with explicit <br> line breaks
         const htmlParts = [];
-        for (let i = startIdx; i < lines.length; i++) {
+        for (let i = startIdx; i < searchEndIdx; i++) {
             const lineObj = lines[i];
             if (lineObj === undefined || lineObj === null) continue;
 
@@ -7274,6 +7374,9 @@
             case 'filter_popup':
                 if (filterPopupOpen) closeFilterPopup(); else openFilterPopup();
                 return true;
+            case 'search_popup':
+                if (searchPopupOpen) closeSearchPopup(); else openSearchPopup();
+                return true;
             case 'toggle_action_highlight':
                 highlightActions = !highlightActions;
                 renderOutput();
@@ -7350,6 +7453,9 @@
                 break;
             case 'filter':
                 openFilterPopup();
+                break;
+            case 'search':
+                openSearchPopup();
                 break;
             case 'reload':
                 // Local only — never restart the remote server
@@ -7956,6 +8062,21 @@
             }
         });
 
+        // Search input handler
+        elements.searchInput.addEventListener('input', updateSearch);
+        elements.searchInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                closeSearchPopup();
+            } else if (e.key === 'F5') {
+                e.preventDefault();
+                closeSearchPopup();
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                advanceSearch();
+            }
+        });
+
         // Help popup button handlers
         if (elements.helpCloseBtn) {
             elements.helpCloseBtn.addEventListener('click', closeHelpPopup);
@@ -7996,6 +8117,7 @@
                 const keyName = keyEventToName(e);
                 const action = lookupBinding(keyName);
                 if (action === 'help' || action === 'toggle_tags' || action === 'filter_popup' ||
+                    action === 'search_popup' ||
                     action === 'toggle_action_highlight' || action === 'toggle_gmcp_media') {
                     e.preventDefault();
                     e.stopPropagation();

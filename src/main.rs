@@ -258,6 +258,97 @@ impl FilterPopup {
     }
 }
 
+/// F5 history search popup state
+pub struct SearchPopup {
+    pub visible: bool,
+    pub search_text: String,
+    pub cursor: usize,
+    pub match_indices: Vec<usize>,  // output_lines indices that match (ascending)
+    pub current_pos: usize,         // index into match_indices currently shown at bottom
+}
+
+impl SearchPopup {
+    fn new() -> Self {
+        Self {
+            visible: false,
+            search_text: String::new(),
+            cursor: 0,
+            match_indices: Vec::new(),
+            current_pos: 0,
+        }
+    }
+
+    pub fn open(&mut self) {
+        self.visible = true;
+        self.search_text.clear();
+        self.cursor = 0;
+        self.match_indices.clear();
+        self.current_pos = 0;
+    }
+
+    pub fn close(&mut self) {
+        self.visible = false;
+        self.search_text.clear();
+        self.match_indices.clear();
+    }
+
+    pub fn update_search(&mut self, output_lines: &[OutputLine]) {
+        if self.search_text.is_empty() {
+            self.match_indices.clear();
+            self.current_pos = 0;
+            return;
+        }
+        let has_wildcards = self.search_text.contains('*') || self.search_text.contains('?');
+        if has_wildcards {
+            if let Some(regex) = filter_wildcard_to_regex(&self.search_text) {
+                self.match_indices = output_lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        let plain = strip_ansi_codes(&line.text);
+                        regex.is_match(&plain)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+            } else {
+                self.match_indices.clear();
+            }
+        } else {
+            let search_lower = self.search_text.to_lowercase();
+            self.match_indices = output_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let plain = strip_ansi_codes(&line.text);
+                    plain.to_lowercase().contains(&search_lower)
+                })
+                .map(|(i, _)| i)
+                .collect();
+        }
+        // Start at the most recent (highest index) match
+        self.current_pos = self.match_indices.len().saturating_sub(1);
+    }
+
+    /// Returns the output_lines index of the current match, if any.
+    pub fn current_match_line(&self) -> Option<usize> {
+        self.match_indices.get(self.current_pos).copied()
+    }
+
+    /// Advance to the next older match. Returns the new match line index.
+    pub fn advance(&mut self) -> Option<usize> {
+        if self.match_indices.is_empty() {
+            return None;
+        }
+        if self.current_pos > 0 {
+            self.current_pos -= 1;
+        } else {
+            // Wrap to most recent
+            self.current_pos = self.match_indices.len() - 1;
+        }
+        self.current_match_line()
+    }
+}
+
 /// Which side of the screen the editor appears on
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum EditorSide {
@@ -1478,6 +1569,8 @@ pub enum Command {
     WorldEdit { name: Option<String> },
     /// /worlds -l <name> - connect without auto-login
     WorldConnectNoLogin { name: String },
+    /// /worlds -b <name> - connect to world in background (no switch)
+    WorldConnectBackground { name: String },
     /// /worlds <name> - switch to or connect to named world
     WorldSwitch { name: String },
     /// /connect [host port [ssl]] - connect to server (internal use by buttons/TF)
@@ -1722,6 +1815,14 @@ fn parse_world_command(args: &[&str]) -> Command {
                 Command::WorldConnectNoLogin { name: args[1..].join(" ") }
             } else {
                 Command::Unknown { cmd: "/worlds -l".to_string() }
+            }
+        }
+        "-b" => {
+            // /worlds -b <name> - connect in background without switching
+            if args.len() > 1 {
+                Command::WorldConnectBackground { name: args[1..].join(" ") }
+            } else {
+                Command::Unknown { cmd: "/worlds -b".to_string() }
             }
         }
         _ => {
@@ -2747,6 +2848,7 @@ pub struct App {
     pub settings: Settings,
     pub confirm_dialog: ConfirmDialog,
     pub filter_popup: FilterPopup,
+    pub search_popup: SearchPopup,
     /// Split-screen text editor for notes and files
     pub editor: EditorState,
     /// New unified popup manager (gradual migration from old popup types)
@@ -2874,6 +2976,7 @@ impl App {
             settings: Settings::default(),
             confirm_dialog: ConfirmDialog::new(),
             filter_popup: FilterPopup::new(),
+            search_popup: SearchPopup::new(),
             editor: EditorState::new(),
             popup_manager: popup::PopupManager::new(),
             last_ctrl_c: None,
@@ -6618,6 +6721,26 @@ impl App {
                     }
                 }
             }
+            Command::WorldConnectBackground { ref name } => {
+                if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                    if !self.worlds[idx].connected && self.worlds[idx].settings.has_connection_settings() {
+                        let prev_index = self.current_world_index;
+                        self.current_world_index = idx;
+                        return WsAsyncAction::Connect { world_index: idx, prev_index, broadcast: false };
+                    }
+                } else {
+                    self.ws_send_to_client(client_id, WsMessage::ServerData {
+                        world_index,
+                        data: format!("World '{}' not found.", name),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                        seq: 0,
+                        marked_new: false,
+                        flush: false, gagged: false,
+                    });
+                }
+            }
             // WorldSwitch and WorldConnectNoLogin need proper handling
             Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                 if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
@@ -7198,6 +7321,9 @@ impl App {
                     let (ar_secs, ar_on_web) = WorldSettings::parse_auto_reconnect(&auto_reconnect_secs);
                     self.worlds[world_index].settings.auto_reconnect_secs = ar_secs;
                     self.worlds[world_index].settings.auto_reconnect_on_web = ar_on_web;
+                    if ar_secs == 0 {
+                        self.worlds[world_index].reconnect_at = None;
+                    }
                     // Save settings to persist changes
                     let _ = persistence::save_settings(self);
                     // Build settings message for broadcast (don't leak password)
@@ -11602,6 +11728,13 @@ pub async fn run_app_headless(
                     AppEvent::ConnectionFailed(world_name, error) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
+                            let secs = app.worlds[world_idx].settings.auto_reconnect_secs;
+                            if secs > 0 {
+                                app.worlds[world_idx].reconnect_at = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                                );
+                                app.add_output_to_world(world_idx, &format!("Reconnecting in {} seconds...", secs));
+                            }
                         }
                     }
                     AppEvent::TelnetDetected(ref world_name) => {
@@ -14089,6 +14222,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::ConnectionFailed(world_name, error) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
+                            let secs = app.worlds[world_idx].settings.auto_reconnect_secs;
+                            if secs > 0 {
+                                app.worlds[world_idx].reconnect_at = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                                );
+                                app.add_output_to_world(world_idx, &format!("Reconnecting in {} seconds...", secs));
+                            }
                         }
                     }
                     AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
@@ -14971,6 +15111,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Check if any popup is now visible
             let any_popup_visible = app.confirm_dialog.visible
                 || app.filter_popup.visible
+                || app.search_popup.visible
                 || app.has_new_popup();
 
             // When transitioning to popup: terminal.clear() resets ratatui's buffers so

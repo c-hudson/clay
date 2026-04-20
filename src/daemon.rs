@@ -1163,6 +1163,31 @@ pub async fn handle_daemon_ws_message(
                         }
                     }
                 }
+                Command::WorldConnectBackground { ref name } => {
+                    if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
+                            let settings = app.worlds[idx].settings.clone();
+                            let world_name = app.worlds[idx].name.clone();
+                            app.worlds[idx].connection_id += 1;
+                            if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
+                                idx, world_name.clone(), &settings, event_tx.clone(),
+                                app.worlds[idx].connection_id, false, app.settings.tls_proxy_enabled,
+                            ).await {
+                                app.worlds[idx].connected = true;
+                                app.worlds[idx].command_tx = Some(cmd_tx);
+                                app.worlds[idx].was_connected = true;
+                                app.worlds[idx].socket_fd = socket_fd;
+                                app.worlds[idx].is_tls = is_tls;
+                                app.worlds[idx].proxy_pid = proxy_pid;
+                                app.worlds[idx].proxy_socket_path = proxy_socket_path;
+                                let now = std::time::Instant::now();
+                                app.worlds[idx].last_send_time = Some(now);
+                                app.worlds[idx].last_receive_time = Some(now);
+                                app.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name: world_name });
+                            }
+                        }
+                    }
+                }
                 Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                         app.switch_world(idx);
