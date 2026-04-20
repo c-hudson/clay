@@ -5446,6 +5446,12 @@
         document.querySelectorAll('.menu-reload').forEach(el => {
             el.style.display = window.WEBVIEW_MODE ? '' : 'none';
         });
+        // Hide New Window on Android (can't open browser tabs from the app)
+        if (isAndroid) {
+            document.querySelectorAll('[data-action="new-window"]').forEach(el => {
+                el.style.display = 'none';
+            });
+        }
         // Hide Resync for master WebView GUI (it IS the master, resync is meaningless)
         if (window.WEBVIEW_MODE && window.AUTO_PASSWORD) {
             document.querySelectorAll('.menu-resync').forEach(el => {

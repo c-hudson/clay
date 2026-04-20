@@ -2748,6 +2748,30 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                     app.add_output("================= Recall end =================");
                                 }
                             }
+                            tf::TfCommandResult::Quote { lines, disposition, .. } => {
+                                match disposition {
+                                    tf::QuoteDisposition::Send => {
+                                        if let Some(tx) = &app.current_world().command_tx {
+                                            for line in lines {
+                                                let _ = tx.try_send(WriteCommand::Text(line));
+                                            }
+                                            sent_to_server = true;
+                                        } else {
+                                            app.add_output("Not connected.");
+                                        }
+                                    }
+                                    tf::QuoteDisposition::Echo => {
+                                        for line in lines {
+                                            app.add_output(&line);
+                                        }
+                                    }
+                                    tf::QuoteDisposition::Exec => {
+                                        for line in lines {
+                                            Box::pin(handle_command(&line, app, event_tx.clone())).await;
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     } else {
@@ -2807,6 +2831,30 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     }
                     tf::TfCommandResult::RepeatProcess(process) => {
                         app.tf_engine.processes.push(process);
+                    }
+                    tf::TfCommandResult::Quote { lines, disposition, .. } => {
+                        match disposition {
+                            tf::QuoteDisposition::Send => {
+                                if let Some(tx) = &app.current_world().command_tx {
+                                    for line in lines {
+                                        let _ = tx.try_send(WriteCommand::Text(line));
+                                    }
+                                    app.current_world_mut().last_send_time = Some(std::time::Instant::now());
+                                } else {
+                                    app.add_output("Not connected.");
+                                }
+                            }
+                            tf::QuoteDisposition::Echo => {
+                                for line in lines {
+                                    app.add_output(&line);
+                                }
+                            }
+                            tf::QuoteDisposition::Exec => {
+                                for line in lines {
+                                    Box::pin(handle_command(&line, app, event_tx.clone())).await;
+                                }
+                            }
+                        }
                     }
                     _ => {
                         app.add_output(&format!("Unknown command: /{}", name));

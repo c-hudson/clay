@@ -13980,6 +13980,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         tf::TfCommandResult::RepeatProcess(process) => {
                                             app.tf_engine.processes.push(process);
                                         }
+                                        tf::TfCommandResult::Quote { lines, disposition, .. } => {
+                                            match disposition {
+                                                tf::QuoteDisposition::Send => {
+                                                    if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                                        for line in lines {
+                                                            let _ = tx.try_send(WriteCommand::Text(line));
+                                                        }
+                                                    }
+                                                }
+                                                tf::QuoteDisposition::Echo => {
+                                                    for line in lines {
+                                                        app.add_output(&line);
+                                                    }
+                                                }
+                                                tf::QuoteDisposition::Exec => {
+                                                    for line in lines {
+                                                        handle_command(&line, &mut app, event_tx.clone()).await;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 } else if let Some(tx) = &app.worlds[world_idx].command_tx {

@@ -332,8 +332,8 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public String getConnectionInfo() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            String localHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
-            String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "teenymush.dynu.net");
+            String localHost = prefs.contains(KEY_SERVER_HOST) ? prefs.getString(KEY_SERVER_HOST, "") : "";
+            String remoteHost = prefs.contains(KEY_REMOTE_HOSTNAME) ? prefs.getString(KEY_REMOTE_HOSTNAME, "") : "";
             int port = prefs.getInt(KEY_SERVER_PORT, 9000);
             return "{\"localHost\":\"" + localHost.replace("\"", "") +
                    "\",\"remoteHost\":\"" + remoteHost.replace("\"", "") +
