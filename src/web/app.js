@@ -1433,6 +1433,11 @@
             return;
         }
 
+        // Don't connect during first launch — Java opens settings via onPageFinished
+        if (window.Android && typeof window.Android.isFirstLaunch === 'function' && window.Android.isFirstLaunch()) {
+            return;
+        }
+
         // Guard: never connect with an empty hostname on Android — open settings instead
         if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
             try {
