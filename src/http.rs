@@ -260,7 +260,6 @@ fn handle_http_routes(
                 .replace("{{WS_HOST}}", &sanitized_host)
                 .replace("{{WS_PORT}}", "0")
                 .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
-                .replace("{{SKIP_CONNECT}}", "false")
                 .replace("{{THEME_CSS_VARS}}", theme_css_vars);
             RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
         }
