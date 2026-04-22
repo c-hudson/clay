@@ -986,8 +986,8 @@
         applyTransparency(guiTransparency);  // Set initial #app background in webview mode
         updateTime();
         setInterval(updateTime, 1000);
-        // First run: skip connect() — Java will open server settings via onPageFinished
-        if (window.Android && typeof window.Android.isFirstLaunch === 'function' && window.Android.isFirstLaunch()) {
+        // First run: skip connect() if settings have never been saved
+        if (window.Android && typeof window.Android.isSettingsConfigured === 'function' && !window.Android.isSettingsConfigured()) {
             return;
         }
         connect();
@@ -1433,8 +1433,8 @@
             return;
         }
 
-        // Don't connect during first launch — Java opens settings via onPageFinished
-        if (window.Android && typeof window.Android.isFirstLaunch === 'function' && window.Android.isFirstLaunch()) {
+        // Guard: never connect if settings have never been saved (first launch)
+        if (window.Android && typeof window.Android.isSettingsConfigured === 'function' && !window.Android.isSettingsConfigured()) {
             return;
         }
 

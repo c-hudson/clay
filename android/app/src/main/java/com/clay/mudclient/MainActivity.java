@@ -335,6 +335,12 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public boolean isSettingsConfigured() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.contains(KEY_SERVER_HOST);
+        }
+
+        @JavascriptInterface
         public String getConnectionInfo() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             String localHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
