@@ -987,7 +987,7 @@ public class MainActivity extends AppCompatActivity {
             .replace("{{WS_PROTOCOL}}", "wss")  // always try wss first; JS falls back to ws
             .replace("{{THEME_CSS_VARS}}", cachedTheme);
         if (!settingsConfigured) {
-            html = html.replace("</body>", "<script>window.SKIP_CONNECT=true;</script></body>");
+            html = html.replace("</head>", "<script>window.SKIP_CONNECT=true;</script></head>");
         }
         return html;
     }
