@@ -986,8 +986,8 @@
         applyTransparency(guiTransparency);  // Set initial #app background in webview mode
         updateTime();
         setInterval(updateTime, 1000);
-        // First run: skip connect() if settings have never been saved
-        if (window.Android && typeof window.Android.isSettingsConfigured === 'function' && !window.Android.isSettingsConfigured()) {
+        // First run: skip connect() until Android settings have been saved at least once
+        if (window.SKIP_CONNECT) {
             return;
         }
         connect();
@@ -1433,8 +1433,8 @@
             return;
         }
 
-        // Guard: never connect if settings have never been saved (first launch)
-        if (window.Android && typeof window.Android.isSettingsConfigured === 'function' && !window.Android.isSettingsConfigured()) {
+        // Guard: skip connect until Android settings have been saved at least once
+        if (window.SKIP_CONNECT) {
             return;
         }
 
@@ -6181,6 +6181,7 @@
             var authKey = ((document.getElementById('cs-auth-key') || {}).value || '').trim();
             if (typeof window.Android.saveConnectionSettings === 'function') {
                 window.Android.saveConnectionSettings(host, port, remoteHost);
+                window.SKIP_CONNECT = false;
             }
             if (typeof window.Android.saveUsername === 'function') window.Android.saveUsername(username);
             if (password) {

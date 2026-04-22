@@ -980,10 +980,12 @@ public class MainActivity extends AppCompatActivity {
     private String substituteTemplateVars(String html) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String cachedTheme = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS);
+        boolean settingsConfigured = prefs.contains(KEY_SERVER_HOST);
         return html
             .replace("{{WS_HOST}}", "")   // JS falls back to window.location.hostname
             .replace("{{WS_PORT}}", "0")  // sentinel: JS uses window.location.port
             .replace("{{WS_PROTOCOL}}", "wss")  // always try wss first; JS falls back to ws
+            .replace("{{SKIP_CONNECT}}", settingsConfigured ? "false" : "true")
             .replace("{{THEME_CSS_VARS}}", cachedTheme);
     }
 
