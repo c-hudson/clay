@@ -986,15 +986,9 @@
         applyTransparency(guiTransparency);  // Set initial #app background in webview mode
         updateTime();
         setInterval(updateTime, 1000);
-        // First run: if Android with no host configured, open server settings instead of connecting
-        if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
-            try {
-                var connInfo = JSON.parse(window.Android.getConnectionInfo());
-                if (!connInfo.localHost) {
-                    openSettingsPopup('clay-server');
-                    return;
-                }
-            } catch(e) {}
+        // First run: skip connect() — Java will open server settings via onPageFinished
+        if (window.Android && typeof window.Android.isFirstLaunch === 'function' && window.Android.isFirstLaunch()) {
+            return;
         }
         connect();
     }
@@ -1438,6 +1432,18 @@
             debugLog('connect(): already in progress, skipping duplicate call');
             return;
         }
+
+        // Guard: never connect with an empty hostname on Android — open settings instead
+        if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
+            try {
+                const _info = JSON.parse(window.Android.getConnectionInfo());
+                if (!_info.localHost) {
+                    openSettingsPopup('clay-server');
+                    return;
+                }
+            } catch(e) {}
+        }
+
         connectInProgress = true;
 
         // Use alternate host if we're in fallback mode, otherwise use WS_HOST

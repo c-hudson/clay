@@ -330,6 +330,11 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public boolean isFirstLaunch() {
+            return openSettingsOnLoad;
+        }
+
+        @JavascriptInterface
         public String getConnectionInfo() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             String localHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
