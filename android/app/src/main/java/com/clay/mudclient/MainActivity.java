@@ -827,7 +827,7 @@ public class MainActivity extends AppCompatActivity {
         if (!hasLaunched) {
             prefs.edit().putBoolean(KEY_HAS_LAUNCHED, true).apply();
             openSettingsOnLoad = true;
-            loadUrl("");
+            loadUrl("file:///android_asset/");
             return;
         }
 
@@ -924,7 +924,7 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     hideConnectingOverlay();
                     // Fall back to assets and let JS show server settings
-                    loadUrl("");
+                    loadUrl("file:///android_asset/");
                 });
             }
         }).start();
