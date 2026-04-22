@@ -104,23 +104,14 @@
             </div>
         </div>
 
-        <!-- Connection status overlay -->
-        <div id="connecting-overlay" class="overlay">
-            <div class="overlay-content">
-                <div class="spinner"></div>
-                <p>Connecting...</p>
-                <p id="connecting-url" style="font-size:0.75em;opacity:0.6;word-break:break-all;margin-top:4px;"></p>
-            </div>
-        </div>
-
-        <!-- Connection error modal -->
-        <div id="connection-error-modal" class="modal">
-            <div class="modal-content">
-                <h2>Connection Failed</h2>
-                <p id="connection-error-text">Unable to connect to the server after multiple attempts.</p>
+        <!-- Connection log modal -->
+        <div id="connection-log-modal" class="modal" style="display:none;">
+            <div class="modal-content connection-log-content">
+                <h2>Connecting to Clay Server</h2>
+                <div id="connection-log-list"></div>
                 <div class="modal-buttons">
-                    <button id="connection-retry-btn">Retry</button>
-                    <button id="connection-cancel-btn">Cancel</button>
+                    <button id="connection-log-retry-btn" disabled>Retry</button>
+                    <button id="connection-log-cancel-btn">Settings</button>
                 </div>
             </div>
         </div>

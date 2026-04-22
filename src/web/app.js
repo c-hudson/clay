@@ -40,11 +40,9 @@
         authKeyInput: document.getElementById('auth-key'),
         authError: document.getElementById('auth-error'),
         authSubmit: document.getElementById('auth-submit'),
-        // Connection error modal
-        connectionErrorModal: document.getElementById('connection-error-modal'),
-        connectionErrorText: document.getElementById('connection-error-text'),
-        connectionRetryBtn: document.getElementById('connection-retry-btn'),
-        connectionCancelBtn: document.getElementById('connection-cancel-btn'),
+        // Connection log modal
+        connectionLogRetryBtn: document.getElementById('connection-log-retry-btn'),
+        connectionLogCancelBtn: document.getElementById('connection-log-cancel-btn'),
         // Reconnect modal (shown when send fails)
         reconnectModal: document.getElementById('reconnect-modal'),
         reconnectText: document.getElementById('reconnect-text'),
@@ -61,7 +59,6 @@
         passwordError: document.getElementById('password-error'),
         passwordSaveBtn: document.getElementById('password-save-btn'),
         passwordCancelBtn: document.getElementById('password-cancel-btn'),
-        connectingOverlay: document.getElementById('connecting-overlay'),
         // Menu
         menuBtn: document.getElementById('menu-btn'),
         menuDropdown: document.getElementById('menu-dropdown'),
@@ -1123,7 +1120,8 @@
             triedWsFallback = false;
             triedAlternateHost = false;
             hideCertWarning();
-            showConnecting(false);
+            resolveLastAttempt(true);
+            setTimeout(hideConnectionLog, 800);
 
             // Check for saved credentials (Android auto-login)
             let savedPassword = null;
@@ -1256,7 +1254,7 @@
                 return;
             }
 
-            showConnecting(false);
+            resolveLastAttempt(false);
             connectionFailures++;
 
             if (window.Android && window.Android.stopBackgroundService) {
@@ -1269,7 +1267,7 @@
                 if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
                     try {
                         const info = JSON.parse(window.Android.getConnectionInfo());
-                        if (info.advancedEnabled && info.remoteHost) {
+                        if (info.remoteHost) {
                             const currentHost = alternateHost || window.WS_HOST || window.location.hostname;
                             const altHost = (currentHost === info.remoteHost) ? info.localHost : info.remoteHost;
                             if (altHost && altHost !== currentHost) {
@@ -1289,7 +1287,7 @@
             // WebView mode: allow more retries (server may still be starting after reload)
             const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
             if (connectionFailures >= maxFailures) {
-                showConnectionErrorModal();
+                enableConnectionLogRetry();
             } else {
                 setTimeout(connect, 2000);
             }
@@ -1313,7 +1311,7 @@
             if (ws) ws.readyState = WebSocket.CLOSED;
             authenticated = false;
             hasReceivedInitialState = false;
-            showConnecting(false);
+            resolveLastAttempt(false);
             connectionFailures++;
             if (window.Android && window.Android.stopBackgroundService) {
                 window.Android.stopBackgroundService();
@@ -1331,7 +1329,7 @@
             }
             const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
             if (connectionFailures >= maxFailures) {
-                showConnectionErrorModal();
+                enableConnectionLogRetry();
             } else {
                 setTimeout(connect, 2000);
             }
@@ -1428,6 +1426,10 @@
         triedAlternateHost = false;
         keyAuthFailed = false;  // Explicit reconnect resets this so key auth can be tried again
         connectInProgress = false;  // Allow the new connect() call to proceed
+        var logList = document.getElementById('connection-log-list');
+        if (logList) logList.innerHTML = '';
+        var logRetryBtn = document.getElementById('connection-log-retry-btn');
+        if (logRetryBtn) logRetryBtn.disabled = true;
         connect();
     }
 
@@ -1437,7 +1439,6 @@
             return;
         }
         connectInProgress = true;
-        showConnecting(true);
 
         // Use alternate host if we're in fallback mode, otherwise use WS_HOST
         const host = alternateHost || window.WS_HOST || window.location.hostname;
@@ -1448,9 +1449,8 @@
             ? window.WS_PORT : (window.location.port || (protocol === 'wss' ? '443' : '80'));
         const wsUrl = `${protocol}://${host}:${port}`;
 
-        // Show URL in connecting overlay so the user knows what's being attempted
-        var urlEl = document.getElementById('connecting-url');
-        if (urlEl) urlEl.textContent = wsUrl;
+        showConnectionLog();
+        addConnectionAttempt(wsUrl);
 
         debugLog('connect() protocol=' + protocol + ' hasNative=' + hasNativeWebSocket());
 
@@ -1497,7 +1497,8 @@
                 triedWsFallback = false; // Reset for future reconnects
                 triedAlternateHost = false;
                 hideCertWarning();
-                showConnecting(false);
+                resolveLastAttempt(true);
+                setTimeout(hideConnectionLog, 800);
 
                 // Auto-authenticate for embedded WebView GUI (pre-hashed password)
                 if (window.AUTO_PASSWORD) {
@@ -1600,7 +1601,7 @@
                     return;
                 }
 
-                showConnecting(false);
+                resolveLastAttempt(false);
                 connectionFailures++;
                 // Stop Android foreground service when disconnected
                 if (window.Android && window.Android.stopBackgroundService) {
@@ -1621,7 +1622,7 @@
                     console.log('wss:// connection failed, trying ws:// fallback...');
                     triedWsFallback = true;
                     usingWsFallback = true;
-                    connectionFailures = 0; // Reset failures for fallback attempt
+                    connectionFailures = 0;
                     setTimeout(connect, 500);
                     return;
                 }
@@ -1629,13 +1630,11 @@
                 // After 2 failures, try alternate host (Android advanced mode) before giving up
                 if (connectionFailures >= 2 && !triedAlternateHost) {
                     triedAlternateHost = true;
-                    // Get alternate host from Android bridge
                     if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
                         try {
                             const info = JSON.parse(window.Android.getConnectionInfo());
-                            if (info.advancedEnabled && info.remoteHost) {
+                            if (info.remoteHost) {
                                 const currentHost = window.WS_HOST || window.location.hostname;
-                                // Switch to whichever host we're NOT currently using
                                 const altHost = (currentHost === info.remoteHost) ? info.localHost : info.remoteHost;
                                 if (altHost && altHost !== currentHost) {
                                     console.log('Connection failed on ' + currentHost + ', trying alternate: ' + altHost);
@@ -1655,19 +1654,17 @@
                 }
 
                 if (connectionFailures >= 2) {
-                    // If using wss://, show certificate warning
                     if (window.WS_PROTOCOL === 'wss' && !usingWsFallback && !usingNativeWebSocket) {
                         showCertWarning();
                     }
-                    showConnectionErrorModal();
+                    enableConnectionLogRetry();
                 } else {
-                    // First failure - try once more after 3 seconds
                     setTimeout(connect, 3000);
                 }
             };
 
             ws.onerror = function(e) {
-                showConnecting(false);
+                resolveLastAttempt(false);
             };
 
             ws.onmessage = function(event) {
@@ -1679,7 +1676,7 @@
                 }
             };
         } catch (e) {
-            showConnecting(false);
+            resolveLastAttempt(false);
             console.error('Failed to connect:', e);
             setTimeout(connect, 3000);
         }
@@ -1735,7 +1732,7 @@
                     connectionFailures = 0;
                     multiuserMode = msg.multiuser_mode || false;
                     showAuthModal(false);
-                    hideConnectionErrorModal();
+                    hideConnectionLog();
                     hideReconnectModal();
                     elements.authError.textContent = '';
                     elements.input.focus();
@@ -5448,23 +5445,42 @@
         void element.offsetHeight;
     }
 
-    // Show/hide connecting overlay
-    function showConnecting(show) {
-        elements.connectingOverlay.className = 'overlay' + (show ? ' visible' : '');
-        forceRepaint(elements.connectingOverlay);
+    // Connection log modal — persistent window showing each attempt with ✓/✗
+    function showConnectionLog() {
+        var modal = document.getElementById('connection-log-modal');
+        if (modal) modal.style.display = 'flex';
     }
 
-    // Show/hide connection error modal
-    function showConnectionErrorModal() {
-        elements.connectionErrorText.textContent = 'Unable to connect to the server.';
-        elements.connectionErrorModal.className = 'modal visible';
-        elements.connectionErrorModal.style.display = 'flex';
-        forceRepaint(elements.connectionErrorModal);
+    function hideConnectionLog() {
+        var modal = document.getElementById('connection-log-modal');
+        if (modal) modal.style.display = 'none';
     }
 
-    function hideConnectionErrorModal() {
-        elements.connectionErrorModal.className = 'modal';
-        elements.connectionErrorModal.style.display = 'none';
+    function addConnectionAttempt(url) {
+        var list = document.getElementById('connection-log-list');
+        if (!list) return;
+        var row = document.createElement('div');
+        row.className = 'conn-attempt pending';
+        row.innerHTML = '<span class="conn-icon">⟳</span><span class="conn-url">' + url + '</span>';
+        list.appendChild(row);
+        list.scrollTop = list.scrollHeight;
+    }
+
+    function resolveLastAttempt(success) {
+        var list = document.getElementById('connection-log-list');
+        if (!list) return;
+        var rows = list.querySelectorAll('.conn-attempt.pending');
+        var row = rows[rows.length - 1];
+        if (!row) return;
+        row.classList.remove('pending');
+        row.classList.add(success ? 'success' : 'failed');
+        var icon = row.querySelector('.conn-icon');
+        if (icon) icon.textContent = success ? '✓' : '✗';
+    }
+
+    function enableConnectionLogRetry() {
+        var btn = document.getElementById('connection-log-retry-btn');
+        if (btn) btn.disabled = false;
     }
 
     // Show/hide reconnect modal
@@ -8414,18 +8430,18 @@
             };
         }
 
-        // Connection error modal buttons
-        elements.connectionRetryBtn.onclick = function() {
-            hideConnectionErrorModal();
+        // Connection log modal buttons
+        elements.connectionLogRetryBtn.onclick = function() {
+            var list = document.getElementById('connection-log-list');
+            if (list) list.innerHTML = '';
+            elements.connectionLogRetryBtn.disabled = true;
             forceReconnect();
         };
-        elements.connectionCancelBtn.onclick = function() {
-            hideConnectionErrorModal();
-            // On Android, open server settings to allow changing connection details
+        elements.connectionLogCancelBtn.onclick = function() {
+            hideConnectionLog();
             if (typeof Android !== 'undefined' && Android.openServerSettings) {
                 Android.openServerSettings();
             }
-            // In browser, just leave it disconnected - user can refresh to try again
         };
 
         // Reconnect modal buttons (shown when send fails due to disconnection)

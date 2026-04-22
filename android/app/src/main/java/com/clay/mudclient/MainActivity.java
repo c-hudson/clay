@@ -332,8 +332,8 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public String getConnectionInfo() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            String localHost = prefs.contains(KEY_SERVER_HOST) ? prefs.getString(KEY_SERVER_HOST, "") : "";
-            String remoteHost = prefs.contains(KEY_REMOTE_HOSTNAME) ? prefs.getString(KEY_REMOTE_HOSTNAME, "") : "";
+            String localHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
+            String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "teenymush.dynu.net");
             int port = prefs.getInt(KEY_SERVER_PORT, 9000);
             return "{\"localHost\":\"" + localHost.replace("\"", "") +
                    "\",\"remoteHost\":\"" + remoteHost.replace("\"", "") +
@@ -806,14 +806,14 @@ public class MainActivity extends AppCompatActivity {
         boolean hasLaunched = prefs.getBoolean(KEY_HAS_LAUNCHED, false);
         String standardHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
         int port = prefs.getInt(KEY_SERVER_PORT, 9000);
-        boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
-        String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
+        String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "teenymush.dynu.net");
+        boolean advancedEnabled = !remoteHostname.isEmpty();
 
         connectionFailed = false;
         connectCancelled = false;
 
-        // First launch or no host configured — load UI then open server settings popup
-        if (!hasLaunched || standardHost.isEmpty()) {
+        // First launch — load UI from assets and open server settings so the user can confirm/change
+        if (!hasLaunched) {
             prefs.edit().putBoolean(KEY_HAS_LAUNCHED, true).apply();
             openSettingsOnLoad = true;
             loadUrl("");

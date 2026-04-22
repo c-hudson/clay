@@ -721,6 +721,35 @@ body.device-phone #output-container { padding: 6px 10px; }
     to { transform: rotate(360deg); }
 }
 
+/* Connection log modal */
+.connection-log-content { min-width: 280px; max-width: 90vw; }
+#connection-log-list {
+    font-family: monospace;
+    font-size: 13px;
+    max-height: 220px;
+    overflow-y: auto;
+    margin: 12px 0;
+    text-align: left;
+}
+.conn-attempt {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--theme-border-subtle);
+}
+.conn-attempt:last-child { border-bottom: none; }
+.conn-icon {
+    font-size: 15px;
+    width: 16px;
+    flex-shrink: 0;
+    text-align: center;
+}
+.conn-attempt.pending .conn-icon { animation: spin 1s linear infinite; display: inline-block; }
+.conn-attempt.success .conn-icon { color: var(--theme-success); }
+.conn-attempt.failed  .conn-icon { color: var(--theme-error); }
+.conn-url { opacity: 0.85; word-break: break-all; }
+
 /* ─── Popup shared styles ─── */
 .popup-header {
     display: flex;
