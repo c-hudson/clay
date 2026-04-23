@@ -47,6 +47,67 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_CACHED_THEME_CSS = "cachedThemeCss";
     private static final String KEY_HAS_LAUNCHED = "hasLaunched";
 
+    // Minimal first-launch setup page — no app.js, no auto-connect possible
+    private static final String FIRST_LAUNCH_HTML =
+        "<!DOCTYPE html><html><head>" +
+        "<meta charset='UTF-8'>" +
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+        "<style>" +
+        "*{box-sizing:border-box;margin:0;padding:0}" +
+        "body{font-family:sans-serif;background:#131926;color:#e8e4ec;" +
+        "display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}" +
+        ".card{background:#1c1722;border:1px solid #2e2738;border-radius:12px;" +
+        "padding:28px 24px;width:100%;max-width:400px}" +
+        "h2{font-size:20px;margin-bottom:6px}" +
+        "p{color:#a89fb4;font-size:14px;margin-bottom:24px;line-height:1.5}" +
+        "label{display:block;color:#a89fb4;font-size:13px;margin-bottom:4px}" +
+        "input{display:block;width:100%;padding:10px 12px;margin-bottom:16px;" +
+        "background:#2c2535;border:1px solid #2e2738;border-radius:6px;" +
+        "color:#e8e4ec;font-size:16px;outline:none}" +
+        "input:focus{border-color:#2657ba}" +
+        ".row{display:flex;gap:12px}" +
+        ".row .f{flex:1}" +
+        ".row .p{width:90px}" +
+        "button{width:100%;padding:12px;background:#2657ba;color:#fff;" +
+        "border:none;border-radius:6px;font-size:16px;font-weight:600;cursor:pointer;margin-top:4px}" +
+        ".err{color:#dc2626;font-size:13px;margin:-12px 0 12px;display:none}" +
+        ".adv-toggle{color:#a89fb4;font-size:13px;cursor:pointer;margin-bottom:12px;display:inline-block}" +
+        ".adv{display:none;margin-top:4px}" +
+        "</style></head><body>" +
+        "<div class='card'>" +
+        "<h2>Clay Server Setup</h2>" +
+        "<p>Enter your Clay server address to get started. You can change these settings later.</p>" +
+        "<div class='row'>" +
+        "<div class='f'><label>Server Host</label>" +
+        "<input id='host' type='text' placeholder='192.168.1.10' autocomplete='off' autocorrect='off' autocapitalize='none' spellcheck='false'></div>" +
+        "<div class='p'><label>Port</label>" +
+        "<input id='port' type='number' value='9000'></div>" +
+        "</div>" +
+        "<div class='err' id='err'>Please enter a server address.</div>" +
+        "<span class='adv-toggle' onclick='toggleAdv()'>&#9654; Remote/external hostname (optional)</span>" +
+        "<div class='adv' id='adv'>" +
+        "<label>Remote Hostname</label>" +
+        "<input id='remote' type='text' placeholder='myserver.example.com' autocomplete='off' autocorrect='off' autocapitalize='none' spellcheck='false'>" +
+        "</div>" +
+        "<button onclick='save()'>Connect</button>" +
+        "</div>" +
+        "<script>" +
+        "document.getElementById('host').focus();" +
+        "function toggleAdv(){var d=document.getElementById('adv');" +
+        "var t=document.querySelector('.adv-toggle');" +
+        "if(d.style.display==='block'){d.style.display='none';t.innerHTML='&#9654; Remote/external hostname (optional)';}" +
+        "else{d.style.display='block';t.innerHTML='&#9660; Remote/external hostname (optional)';}}" +
+        "function save(){" +
+        "var h=document.getElementById('host').value.trim();" +
+        "var p=document.getElementById('port').value.trim()||'9000';" +
+        "var r=document.getElementById('remote').value.trim();" +
+        "if(!h){document.getElementById('err').style.display='block';document.getElementById('host').focus();return;}" +
+        "Android.saveConnectionSettings(h,p,r);" +
+        "Android.reloadPage();}" +
+        "document.getElementById('host').addEventListener('keydown',function(e){if(e.key==='Enter')document.getElementById('port').focus();});" +
+        "document.getElementById('port').addEventListener('keydown',function(e){if(e.key==='Enter')save();});" +
+        "</script></body></html>";
+
     // Default dark theme CSS vars used on first launch before server provides real theme
     private static final String DEFAULT_THEME_CSS =
         "--theme-bg: #131926;\n--theme-bg-deep: #131926;\n--theme-bg-surface: #1c1722;\n" +
@@ -814,22 +875,21 @@ public class MainActivity extends AppCompatActivity {
      */
     private void resolveHostnameAndLoad() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        boolean hasLaunched = prefs.getBoolean(KEY_HAS_LAUNCHED, false);
-        String standardHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
+
+        // First launch — show minimal setup page (no app.js, no auto-connect possible)
+        if (!prefs.contains(KEY_SERVER_HOST)) {
+            runOnUiThread(() -> webView.loadDataWithBaseURL(
+                "file:///android_asset/", FIRST_LAUNCH_HTML, "text/html", "UTF-8", null));
+            return;
+        }
+
+        String standardHost = prefs.getString(KEY_SERVER_HOST, "");
         int port = prefs.getInt(KEY_SERVER_PORT, 9000);
-        String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "teenymush.dynu.net");
+        String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
         boolean advancedEnabled = !remoteHostname.isEmpty();
 
         connectionFailed = false;
         connectCancelled = false;
-
-        // First launch — load UI from assets and open server settings so the user can confirm/change
-        if (!hasLaunched) {
-            prefs.edit().putBoolean(KEY_HAS_LAUNCHED, true).apply();
-            openSettingsOnLoad = true;
-            loadUrl("file:///android_asset/");
-            return;
-        }
 
         if (!advancedEnabled || remoteHostname.isEmpty()) {
             // No advanced mode — just connect to the standard host
