@@ -8453,8 +8453,10 @@
         };
         elements.connectionLogCancelBtn.onclick = function() {
             hideConnectionLog();
-            if (typeof Android !== 'undefined' && Android.openServerSettings) {
-                Android.openServerSettings();
+            if (typeof Android !== 'undefined' && Android.showFirstLaunchSetup) {
+                Android.showFirstLaunchSetup();
+            } else {
+                openSettingsPopup('clay-server');
             }
         };
 
