@@ -986,8 +986,12 @@
         applyTransparency(guiTransparency);  // Set initial #app background in webview mode
         updateTime();
         setInterval(updateTime, 1000);
-        // First run: skip connect() until Android settings have been saved at least once
-        if (window.SKIP_CONNECT) {
+        // On Android, block connections until settings have been saved at least once
+        if (window.Android && typeof window.Android.isSettingsConfigured === 'function') {
+            if (!window.Android.isSettingsConfigured()) {
+                return;  // Java's openSettingsOnLoad will open the settings popup
+            }
+        } else if (window.SKIP_CONNECT) {
             return;
         }
         connect();
@@ -1433,20 +1437,14 @@
             return;
         }
 
-        // Guard: skip connect until Android settings have been saved at least once
-        if (window.SKIP_CONNECT) {
+        // On Android, block connections until settings have been saved at least once
+        if (window.Android && typeof window.Android.isSettingsConfigured === 'function') {
+            if (!window.Android.isSettingsConfigured()) {
+                openSettingsPopup('clay-server');
+                return;
+            }
+        } else if (window.SKIP_CONNECT) {
             return;
-        }
-
-        // Guard: never connect with an empty hostname on Android — open settings instead
-        if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
-            try {
-                const _info = JSON.parse(window.Android.getConnectionInfo());
-                if (!_info.localHost) {
-                    openSettingsPopup('clay-server');
-                    return;
-                }
-            } catch(e) {}
         }
 
         connectInProgress = true;
