@@ -893,6 +893,11 @@ public class MainActivity extends AppCompatActivity {
      */
     private void resolveHostnameAndLoad() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String diagHost = prefs.getString(KEY_SERVER_HOST, null);
+        android.widget.Toast.makeText(this,
+            "DIAG: host=" + (diagHost != null ? "'" + diagHost + "'" : "NOT SET") +
+            " contains=" + prefs.contains(KEY_SERVER_HOST),
+            android.widget.Toast.LENGTH_LONG).show();
 
         // First launch — show minimal setup page (no app.js, no auto-connect possible)
         if (!prefs.contains(KEY_SERVER_HOST)) {
