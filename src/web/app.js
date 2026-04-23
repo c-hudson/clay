@@ -986,15 +986,11 @@
         applyTransparency(guiTransparency);  // Set initial #app background in webview mode
         updateTime();
         setInterval(updateTime, 1000);
-        // On Android, block connections until settings have been saved at least once
-        if (window.Android && typeof window.Android.isSettingsConfigured === 'function') {
-            if (!window.Android.isSettingsConfigured()) {
-                return;  // Java's openSettingsOnLoad will open the settings popup
-            }
-        } else if (window.SKIP_CONNECT) {
-            return;
+        // On Android, never auto-connect from init() — Java calls connect() via
+        // evaluateJavascript in onPageFinished() after verifying settings exist.
+        if (!window.Android) {
+            connect();
         }
-        connect();
     }
 
     // Load auth key from storage (Android only)

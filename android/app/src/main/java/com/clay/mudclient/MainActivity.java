@@ -464,8 +464,6 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        android.widget.Toast.makeText(this, "DIAG: onCreate running v106", android.widget.Toast.LENGTH_LONG).show();
-
         // getNoBackupFilesDir() is never included in any backup (Auto Backup, ADB, OEM).
         // If this flag is absent it is a true fresh install — clear any restored prefs so
         // the first-launch setup page always appears when no real configuration has been done.
@@ -474,7 +472,6 @@ public class MainActivity extends AppCompatActivity {
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().clear().apply();
             try { installFlag.createNewFile(); } catch (java.io.IOException ignored) {}
         }
-        android.widget.Toast.makeText(this, "DIAG: flag=" + installFlag.exists() + " host=" + getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_SERVER_HOST, "NOT_SET"), android.widget.Toast.LENGTH_LONG).show();
 
         // Create notification channels first
         createNotificationChannel();
@@ -844,12 +841,13 @@ public class MainActivity extends AppCompatActivity {
                 connectionFailed = false;
                 hideConnectingOverlay();
                 android.util.Log.i("Clay", "Page loaded: " + url);
-                if (openSettingsOnLoad) {
-                    openSettingsOnLoad = false;
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                if (prefs.contains(KEY_SERVER_HOST)) {
+                    // Settings configured — Java triggers connect (init() skips auto-connect on Android)
                     view.postDelayed(() -> view.evaluateJavascript(
-                        "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');",
-                        null), 300);
+                        "if (typeof connect === 'function') connect();", null), 300);
                 }
+                // No settings: FIRST_LAUNCH_HTML setup page is already showing — do nothing
             }
 
             @Override
