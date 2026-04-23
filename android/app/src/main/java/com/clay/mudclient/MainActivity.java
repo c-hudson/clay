@@ -455,6 +455,15 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // getNoBackupFilesDir() is never included in any backup (Auto Backup, ADB, OEM).
+        // If this flag is absent it is a true fresh install — clear any restored prefs so
+        // the first-launch setup page always appears when no real configuration has been done.
+        java.io.File installFlag = new java.io.File(getNoBackupFilesDir(), "installed.v1");
+        if (!installFlag.exists()) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().clear().apply();
+            try { installFlag.createNewFile(); } catch (java.io.IOException ignored) {}
+        }
+
         // Create notification channels first
         createNotificationChannel();
         createServiceNotificationChannel();
