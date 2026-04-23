@@ -1452,11 +1452,10 @@
         // Use alternate host if we're in fallback mode, otherwise use WS_HOST
         const host = alternateHost || window.WS_HOST || window.location.hostname;
 
-        // Guard: empty hostname means the page loaded from assets with no configured server.
-        // Open settings instead of attempting a connection to a meaningless URL.
+        // Guard: empty hostname means no server is configured — open settings instead.
         if (!host) {
             connectInProgress = false;
-            if (window.Android) openSettingsPopup('clay-server');
+            openSettingsPopup('clay-server');
             return;
         }
 

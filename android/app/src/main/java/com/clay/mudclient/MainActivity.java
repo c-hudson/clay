@@ -304,6 +304,15 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void connectWebSocket(String url) {
             runOnUiThread(() -> {
+                // Block connections until the user has configured a server
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                if (!prefs.contains(KEY_SERVER_HOST)) {
+                    webView.evaluateJavascript(
+                        "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');",
+                        null);
+                    return;
+                }
+
                 // Close any existing connection
                 if (nativeWebSocket != null) {
                     nativeWebSocket.close();
