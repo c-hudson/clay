@@ -1451,6 +1451,15 @@
 
         // Use alternate host if we're in fallback mode, otherwise use WS_HOST
         const host = alternateHost || window.WS_HOST || window.location.hostname;
+
+        // Guard: empty hostname means the page loaded from assets with no configured server.
+        // Open settings instead of attempting a connection to a meaningless URL.
+        if (!host) {
+            connectInProgress = false;
+            if (window.Android) openSettingsPopup('clay-server');
+            return;
+        }
+
         // Use ws:// fallback if we've already failed with wss://
         const protocol = usingWsFallback ? 'ws' : window.WS_PROTOCOL;
         // WS_PORT=0 means WS shares the HTTP port (unified server)
