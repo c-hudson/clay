@@ -163,11 +163,13 @@ pub fn run_master_webgui() -> io::Result<()> {
     }
 
     // Termux:X11 has no DRI3/EGL hardware acceleration; force software rendering
-    // so WebKit2GTK doesn't show a blank window.
+    // so WebKit2GTK doesn't show a blank window. Disable the WebKit sandbox so
+    // the web process can reach ws://127.0.0.1 from the clay:// custom scheme.
     #[cfg(target_os = "android")]
     {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
     }
 
     // Read the configured HTTP port from settings (default 9000)
@@ -299,11 +301,13 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
     }
 
     // Termux:X11 has no DRI3/EGL hardware acceleration; force software rendering
-    // so WebKit2GTK doesn't show a blank window.
+    // so WebKit2GTK doesn't show a blank window. Disable the WebKit sandbox so
+    // the web process can reach the remote WebSocket from the clay:// custom scheme.
     #[cfg(target_os = "android")]
     {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
     }
 
     // Strip protocol prefix if provided
@@ -802,7 +806,7 @@ fn build_webview(
         })
         .with_url("clay://localhost/index.html")
         .with_clipboard(true)
-        .with_devtools(cfg!(debug_assertions))
+        .with_devtools(cfg!(debug_assertions) || cfg!(target_os = "android"))
         .with_ipc_handler({
             let is_master = params.auto_password.is_some();
             let proxy = proxy.clone();
