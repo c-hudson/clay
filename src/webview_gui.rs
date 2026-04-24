@@ -162,6 +162,14 @@ pub fn run_master_webgui() -> io::Result<()> {
         }
     }
 
+    // Termux:X11 has no DRI3/EGL hardware acceleration; force software rendering
+    // so WebKit2GTK doesn't show a blank window.
+    #[cfg(target_os = "android")]
+    {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+    }
+
     // Read the configured HTTP port from settings (default 9000)
     // The GUI uses the same port as the web interface
     let port = {
@@ -288,6 +296,14 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
             eprintln!("clay: start Termux:X11 and run:  DISPLAY=:0 clay --gui");
             std::process::exit(1);
         }
+    }
+
+    // Termux:X11 has no DRI3/EGL hardware acceleration; force software rendering
+    // so WebKit2GTK doesn't show a blank window.
+    #[cfg(target_os = "android")]
+    {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
     }
 
     // Strip protocol prefix if provided
