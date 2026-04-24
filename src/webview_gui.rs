@@ -169,7 +169,7 @@ pub fn run_master_webgui() -> io::Result<()> {
     {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
-        std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
+        std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
     }
 
     // Read the configured HTTP port from settings (default 9000)
@@ -307,7 +307,7 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
     {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
-        std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
+        std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
     }
 
     // Strip protocol prefix if provided
