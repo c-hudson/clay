@@ -125,6 +125,16 @@ check_webview() {
                 return 1
             fi
             if [ -f "tao-0.34.5-patched/.patched" ] && [ -f "wry-0.48.1-patched/.patched" ]; then
+                # Patched dirs exist but [patch.crates-io] may be missing after git stash/pull
+                if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then
+                    echo "  [?] Re-adding [patch.crates-io] to Cargo.toml..."
+                    cat >> Cargo.toml <<'PATCH'
+
+[patch.crates-io]
+tao = { path = "tao-0.34.5-patched" }
+wry = { path = "wry-0.48.1-patched" }
+PATCH
+                fi
                 return 0
             elif [ -f "patches/apply-patches.sh" ]; then
                 echo "  [?] WebView patches not applied, applying now..."
