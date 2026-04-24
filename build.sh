@@ -130,6 +130,8 @@ check_webview() {
                 echo "  [?] WebView patches not applied, applying now..."
                 if ./patches/apply-patches.sh; then
                     return 0
+                else
+                    echo "  [!] apply-patches.sh failed — webview-gui disabled"
                 fi
             fi
             return 1
@@ -290,13 +292,18 @@ fi
 
 # --- Termux: reorder RUNPATH so system libandroid.so wins over Termux stub ---
 if $BUILD_OK && $IS_TERMUX && $HAS_WEBVIEW; then
+    if ! command -v patchelf &>/dev/null; then
+        echo "  [+] Installing patchelf (required for Termux webview)..."
+        pkg install patchelf -y &>/dev/null || true
+    fi
     if command -v patchelf &>/dev/null; then
         patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/release/clay \
             && echo "  [+] RUNPATH reordered (system libandroid.so takes priority)" \
             || echo "  [!] patchelf failed — binary may not run (CANNOT LINK EXECUTABLE)"
     else
-        echo "  [!] patchelf not found — install with: pkg install patchelf"
-        echo "      Without it, ./clay --gui will fail with 'CANNOT LINK EXECUTABLE'."
+        echo "  [!] patchelf not found and could not be installed."
+        echo "      Install manually: pkg install patchelf"
+        echo "      Then run: patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/release/clay"
     fi
 fi
 
