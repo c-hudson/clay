@@ -47,6 +47,17 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_CACHED_THEME_CSS = "cachedThemeCss";
     private static final String KEY_SETUP_COMPLETE = "setupComplete";
 
+    // Minimal first-launch page — loads instantly, immediately hands off to the full app
+    private static final String FIRST_LAUNCH_HTML =
+        "<!DOCTYPE html><html><head>" +
+        "<meta charset='UTF-8'>" +
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+        "<style>*{margin:0;padding:0}body{background:#131926;display:flex;" +
+        "align-items:center;justify-content:center;min-height:100vh}</style>" +
+        "</head><body>" +
+        "<script>if(window.Android&&typeof Android.loadFullApp==='function')Android.loadFullApp();</script>" +
+        "</body></html>";
+
     // Default dark theme CSS vars used on first launch before server provides real theme
     private static final String DEFAULT_THEME_CSS =
         "--theme-bg: #131926;\n--theme-bg-deep: #131926;\n--theme-bg-surface: #1c1722;\n" +
@@ -117,6 +128,14 @@ public class MainActivity extends AppCompatActivity {
         public void showFirstLaunchSetup() {
             runOnUiThread(() -> webView.evaluateJavascript(
                 "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');", null));
+        }
+
+        @JavascriptInterface
+        public void loadFullApp() {
+            runOnUiThread(() -> {
+                openSettingsOnLoad = true;
+                loadUrl("file:///android_asset/");
+            });
         }
 
         @JavascriptInterface
@@ -802,8 +821,9 @@ public class MainActivity extends AppCompatActivity {
                     // Settings configured — Java triggers connect (init() skips auto-connect on Android)
                     view.postDelayed(() -> view.evaluateJavascript(
                         "if (typeof connect === 'function') connect();", null), 300);
-                } else {
-                    // Not configured — open the Clay Server settings tab for first-time setup
+                } else if (openSettingsOnLoad) {
+                    // Full app loaded after first-launch handoff — open clay-server settings tab
+                    openSettingsOnLoad = false;
                     view.postDelayed(() -> view.evaluateJavascript(
                         "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');", null), 300);
                 }
@@ -854,9 +874,11 @@ public class MainActivity extends AppCompatActivity {
     private void resolveHostnameAndLoad() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
 
-        // First launch — load full app from assets; onPageFinished will open clay-server settings
+        // First launch — load minimal page synchronously; it calls loadFullApp() which loads the
+        // full web app and onPageFinished opens the clay-server settings tab via openSettingsOnLoad
         if (!prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
-            loadUrl("file:///android_asset/");
+            runOnUiThread(() -> webView.loadDataWithBaseURL(
+                "file:///android_asset/", FIRST_LAUNCH_HTML, "text/html", "UTF-8", null));
             return;
         }
 
