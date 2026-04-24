@@ -158,9 +158,8 @@ pub fn run_master_webgui() -> io::Result<()> {
         if !has_display {
             eprintln!("clay: no display server found.");
             eprintln!("clay: start Termux:X11 and run:  DISPLAY=:0 clay --gui");
-            return Err(io::Error::other("No display server found"));
+            std::process::exit(1);
         }
-
     }
 
     // Read the configured HTTP port from settings (default 9000)
@@ -287,7 +286,7 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
         if !has_display {
             eprintln!("clay: no display server found.");
             eprintln!("clay: start Termux:X11 and run:  DISPLAY=:0 clay --gui");
-            return Err(io::Error::other("No display server found"));
+            std::process::exit(1);
         }
     }
 

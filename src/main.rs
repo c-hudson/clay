@@ -10716,13 +10716,14 @@ async fn main() -> io::Result<()> {
         (default_gui, None)
     };
 
-    // Fall back to console if webview-gui feature not available
+    // Exit immediately if --gui was requested but webview-gui feature not compiled in
     let use_gui = use_gui && cfg!(feature = "webview-gui");
     if has_gui_flag && !use_gui {
         #[cfg(not(feature = "webview-gui"))]
         {
-            eprintln!("Warning: --gui requires the 'webview-gui' feature. Falling back to console.");
-            eprintln!("Rebuild with: cargo build --features webview-gui");
+            eprintln!("clay: --gui requires the 'webview-gui' feature.");
+            eprintln!("clay: rebuild with: cargo build --features webview-gui");
+            std::process::exit(1);
         }
     }
 
