@@ -98,7 +98,6 @@ public class MainActivity extends AppCompatActivity {
     private boolean notificationPermissionDone = false;
     private boolean batteryOptimizationDone = false;
     private boolean interfaceLoaded = false;
-    private boolean openSettingsOnLoad = false;
     private String loadedInterfaceUrl = null;
     // Removed duplicate screenOffWakeLock - ClayForegroundService already holds one
     private Handler keepaliveHandler;
@@ -132,10 +131,7 @@ public class MainActivity extends AppCompatActivity {
 
         @JavascriptInterface
         public void loadFullApp() {
-            runOnUiThread(() -> {
-                openSettingsOnLoad = true;
-                loadUrl("file:///android_asset/");
-            });
+            runOnUiThread(() -> loadUrl("file:///android_asset/"));
         }
 
         @JavascriptInterface
@@ -364,11 +360,6 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
-        public boolean isFirstLaunch() {
-            return openSettingsOnLoad;
-        }
-
-        @JavascriptInterface
         public boolean isSettingsConfigured() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             return prefs.getBoolean(KEY_SETUP_COMPLETE, false);
@@ -377,8 +368,8 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public String getConnectionInfo() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            String localHost = prefs.getString(KEY_SERVER_HOST, "");
-            String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
+            String localHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
+            String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "teenymush.dynu.net");
             int port = prefs.getInt(KEY_SERVER_PORT, 9000);
             return "{\"localHost\":\"" + localHost.replace("\"", "") +
                    "\",\"remoteHost\":\"" + remoteHost.replace("\"", "") +
@@ -816,17 +807,10 @@ public class MainActivity extends AppCompatActivity {
                 connectionFailed = false;
                 hideConnectingOverlay();
                 android.util.Log.i("Clay", "Page loaded: " + url);
-                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-                if (prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
-                    // Settings configured — Java triggers connect (init() skips auto-connect on Android)
-                    view.postDelayed(() -> view.evaluateJavascript(
-                        "if (typeof connect === 'function') connect();", null), 300);
-                } else if (openSettingsOnLoad) {
-                    // Full app loaded after first-launch handoff — open clay-server settings tab
-                    openSettingsOnLoad = false;
-                    view.postDelayed(() -> view.evaluateJavascript(
-                        "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');", null), 300);
-                }
+                // Always call connect() — when settings aren't configured yet, connect() in app.js
+                // detects this via Android.isSettingsConfigured() and opens the clay-server tab.
+                view.postDelayed(() -> view.evaluateJavascript(
+                    "if (typeof connect === 'function') connect();", null), 300);
             }
 
             @Override
@@ -875,7 +859,7 @@ public class MainActivity extends AppCompatActivity {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
 
         // First launch — load minimal page synchronously; it calls loadFullApp() which loads the
-        // full web app and onPageFinished opens the clay-server settings tab via openSettingsOnLoad
+        // full web app, then connect() in app.js opens the clay-server settings tab when not configured.
         if (!prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
             runOnUiThread(() -> webView.loadDataWithBaseURL(
                 "file:///android_asset/", FIRST_LAUNCH_HTML, "text/html", "UTF-8", null));
