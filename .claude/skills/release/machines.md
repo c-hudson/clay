@@ -85,7 +85,8 @@ lipo -create \
 cd ~/clay
 git pull
 ./patches/apply-patches.sh
-RUSTFLAGS="-L /system/lib64" cargo build --release --no-default-features --features rustls-backend,webview-gui
+PKG_CONFIG_PATH=/data/data/com.termux/files/usr/lib/pkgconfig RUSTFLAGS="-L /system/lib64 -C link-arg=-Wl,-rpath,/system/lib64" cargo build --release --no-default-features --features rustls-backend,webview-gui
+patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/release/clay
 ```
 - Binary: `~/clay/target/release/clay`
 - Release asset name: `clay-termux-aarch64`

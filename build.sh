@@ -117,7 +117,13 @@ check_webview() {
             return 0
             ;;
         termux)
-            # Need patched tao/wry + Termux:X11
+            # Need patched tao/wry, webkit2gtk-4.1, and xorgproto
+            local pkgcfg_path="/data/data/com.termux/files/usr/lib/pkgconfig"
+            if ! PKG_CONFIG_PATH="$pkgcfg_path" pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+                MISSING_DEPS="$MISSING_DEPS webkit2gtk-4.1"
+                echo "      Install: pkg install webkit2gtk-4.1 xorgproto"
+                return 1
+            fi
             if [ -f "tao-0.34.5-patched/.patched" ] && [ -f "wry-0.48.1-patched/.patched" ]; then
                 return 0
             elif [ -f "patches/apply-patches.sh" ]; then
@@ -184,14 +190,17 @@ fi
 
 # --- Termux-specific setup ---
 if $IS_TERMUX; then
-    # Need -L /system/lib64 for libandroid.so (ndk crate)
+    # Need -L /system/lib64 for libandroid.so (ndk crate) + rpath so the
+    # system libandroid.so (versioned) is found before Termux's stub.
     if [ -f "/system/lib64/libandroid.so" ]; then
-        EXTRA_RUSTFLAGS="-L /system/lib64"
+        EXTRA_RUSTFLAGS="-L /system/lib64 -C link-arg=-Wl,-rpath,/system/lib64"
         echo "  [+] Android system libraries found"
     elif [ -f "/system/lib/libandroid.so" ]; then
-        EXTRA_RUSTFLAGS="-L /system/lib"
+        EXTRA_RUSTFLAGS="-L /system/lib -C link-arg=-Wl,-rpath,/system/lib"
         echo "  [+] Android system libraries found (32-bit)"
     fi
+    # webkit2gtk-4.1 pkg-config files live under Termux prefix
+    export PKG_CONFIG_PATH="/data/data/com.termux/files/usr/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 fi
 
 # --- Determine build target ---
@@ -276,6 +285,18 @@ if ! $BUILD_OK; then
     if build_with_fallback "rustls-backend" "--no-default-features" "" "minimal (rustls-backend only)"; then
         BUILD_OK=true
         FEATURES="rustls-backend"
+    fi
+fi
+
+# --- Termux: reorder RUNPATH so system libandroid.so wins over Termux stub ---
+if $BUILD_OK && $IS_TERMUX && $HAS_WEBVIEW; then
+    if command -v patchelf &>/dev/null; then
+        patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/release/clay \
+            && echo "  [+] RUNPATH reordered (system libandroid.so takes priority)" \
+            || echo "  [!] patchelf failed — binary may not run (CANNOT LINK EXECUTABLE)"
+    else
+        echo "  [!] patchelf not found — install with: pkg install patchelf"
+        echo "      Without it, ./clay --gui will fail with 'CANNOT LINK EXECUTABLE'."
     fi
 fi
 

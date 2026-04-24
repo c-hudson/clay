@@ -156,9 +156,9 @@ pub fn run_master_webgui() -> io::Result<()> {
         let has_display = std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
             || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
         if !has_display {
-            return Err(io::Error::other(
-                "No display server found. Set DISPLAY (X11) or WAYLAND_DISPLAY environment variable."
-            ));
+            eprintln!("clay: no display server found.");
+            eprintln!("clay: start Termux:X11 and run:  DISPLAY=:0 clay --gui");
+            return Err(io::Error::other("No display server found"));
         }
 
     }
@@ -285,9 +285,9 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
         let has_display = std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
             || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
         if !has_display {
-            return Err(io::Error::other(
-                "No display server found. Set DISPLAY (X11) or WAYLAND_DISPLAY environment variable."
-            ));
+            eprintln!("clay: no display server found.");
+            eprintln!("clay: start Termux:X11 and run:  DISPLAY=:0 clay --gui");
+            return Err(io::Error::other("No display server found"));
         }
     }
 

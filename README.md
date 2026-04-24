@@ -43,6 +43,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **Themes** - Customizable color themes for GUI/web via `~/clay.theme.dat` with browser-based theme editor
 - **Context Help** - Press `?` in any popup for beginner-friendly help
 - **Notes Editor** - Per-world split-screen notes editor (`/edit`)
+- **Text-to-Speech** - Speak MUD output aloud via local engines or Microsoft Edge neural TTS (`/say`)
 - **Termux Support** - Runs on Android via Termux
 - **Android App** - WebSocket client with push notifications via `/notify`
 - **Grep Mode** - Search world output history or follow live output (`--grep`, `/window --grep`)
@@ -165,6 +166,8 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 | `/worlds` | Open world selector popup |
 | `/worlds <name>` | Connect to or switch to a world |
 | `/worlds -e [name]` | Edit world settings |
+| `/worlds -l <name>` | Connect to world without running auto-login |
+| `/worlds -b <name>` | Connect to world in background without switching to it |
 | `/addworld <name> [host port]` | Add/update a world (TF-compatible) |
 | `/connections` or `/l` | List connected worlds |
 | `/connect [host port [ssl]]` | Connect to a server |
@@ -185,6 +188,7 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 | `/edit -l` | Open notes list popup |
 | `/font` | Font settings popup (web/GUI only) |
 | `/tag` | Toggle MUD tag display with timestamps (same as F2) |
+| `/say <text>` | Speak text via TTS (uses configured TTS mode) |
 
 **Lookup & Utility:**
 
@@ -307,6 +311,7 @@ All keybindings are configurable via `~/.clay.key.dat`. Defaults follow TinyFugu
 | `F2` | Toggle MUD tag display with timestamps |
 | `F4` | Filter/search output |
 | `F8` | Toggle action highlighting |
+| `F5` | Search command history (web/GUI) |
 | `F9` | Toggle GMCP media audio |
 | `Ctrl+C` (x2) | Quit |
 
@@ -364,6 +369,16 @@ Clay supports customizable color themes for the GUI and web interfaces:
 - Select themes in `/setup` (GUI Theme setting)
 - Console uses separate dark/light theme toggle
 
+## Text-to-Speech
+
+Clay can speak incoming MUD output and text aloud. Configure TTS mode in `/setup`:
+
+- **Off** — TTS disabled (default)
+- **Local** — Uses system TTS: `espeak` on Linux, `say` on macOS, PowerShell on Windows
+- **Edge** — Microsoft neural TTS via cloud API; higher quality, requires internet
+
+Use `/say <text>` to speak text immediately regardless of TTS mode. A per-world speaker whitelist controls which character names trigger automatic TTS. Web and Android clients use the browser's built-in Web Speech API.
+
 ## Keybindings
 
 All keyboard shortcuts are configurable via `~/.clay.key.dat` (INI format). Only non-default bindings need to be saved — defaults follow TinyFugue conventions.
@@ -387,6 +402,7 @@ Settings are stored in `~/.clay.dat`. Per-world settings include:
 - Auto-login type (Connect, Prompt, MOO_prompt)
 - Keepalive type (NOP, Custom, Generic)
 - Log file path
+- TTS mode (Off, Local, Edge) and speaker whitelist
 
 ## License
 
