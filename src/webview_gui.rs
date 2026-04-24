@@ -936,18 +936,16 @@ fn build_webview(
         builder.with_browser_accelerator_keys(false)
     };
 
-    // On Linux/GTK, must use build_gtk() to properly embed WebView in tao's GTK container.
-    // build(&window) silently produces a non-visible webview on Linux.
-    // On Android/Termux (patched tao), use regular build() — no GTK available.
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-        ),
-        not(target_os = "android"),
+    // On Linux/GTK (including Android/Termux with patched tao), must use build_gtk() to
+    // properly embed the WebView in tao's GTK container. build(&window) produces an
+    // invisible WebView on GTK-backed windows.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
     ))]
     let webview = {
         use tao::platform::unix::WindowExtUnix;
@@ -959,16 +957,15 @@ fn build_webview(
     };
 
     // On macOS, Windows, and Android/Termux (patched tao): use regular build()
-    #[cfg(any(
+    // macOS and Windows: use regular build()
+    #[cfg(not(any(
+        target_os = "linux",
         target_os = "android",
-        not(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-        )),
-    ))]
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    )))]
     let webview = builder.build(window)
         .map_err(|e| io::Error::other(format!("Failed to create WebView: {}", e)))?;
 
