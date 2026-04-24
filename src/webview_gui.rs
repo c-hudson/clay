@@ -952,11 +952,24 @@ fn build_webview(
         use wry::WebViewBuilderExtUnix;
         let vbox = window.default_vbox()
             .ok_or_else(|| io::Error::other("Failed to get GTK vbox from window"))?;
-        builder.build_gtk(vbox)
-            .map_err(|e| io::Error::other(format!("Failed to create WebView: {}", e)))?
+        let wv = builder.build_gtk(vbox)
+            .map_err(|e| io::Error::other(format!("Failed to create WebView: {}", e)))?;
+        // Register clay:// as a local, CORS-enabled scheme so WebKit2GTK allows
+        // WebSocket connections to ws://127.0.0.1 from pages loaded via clay://
+        {
+            use wry::WebViewExtUnix;
+            use webkit2gtk::{WebViewExt, WebContextExt, SecurityManagerExt};
+            let wk_view = wv.webview();
+            if let Some(ctx) = wk_view.context() {
+                if let Some(sm) = ctx.security_manager() {
+                    sm.register_uri_scheme_as_local("clay");
+                    sm.register_uri_scheme_as_cors_enabled("clay");
+                }
+            }
+        }
+        wv
     };
 
-    // On macOS, Windows, and Android/Termux (patched tao): use regular build()
     // macOS and Windows: use regular build()
     #[cfg(not(any(
         target_os = "linux",
