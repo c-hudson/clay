@@ -964,11 +964,6 @@ fn create_webview_window(
     params: &WebViewParams,
     reload_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
 ) -> io::Result<()> {
-    // Suppress WebKit/JSC stderr noise during init (WebKit/JSC overrides SIGUSR1 handler
-    // for GC signaling — this is why we use a channel for reload instead of SIGUSR1)
-    #[cfg(unix)]
-    let _stderr_guard = StderrSuppress::new();
-
     let event_loop = EventLoopBuilder::<WvEvent>::with_user_event().build();
     let proxy: EventLoopProxy<WvEvent> = event_loop.create_proxy();
 
@@ -1003,8 +998,16 @@ fn create_webview_window(
     // Read initial world lock from env var (set by CLAY_WINDOW_WORLD for backward compat)
     let initial_world_lock: Option<String> = std::env::var("CLAY_WINDOW_WORLD").ok();
 
+    // Suppress WebKit/JSC stderr noise during WebView init only.
+    // Must not wrap EventLoopBuilder or WindowBuilder — GTK/tao panics there would be swallowed.
+    #[cfg(unix)]
+    let _stderr_guard = StderrSuppress::new();
+
     // Build the first webview (initial_world_lock is handled inside build_html via env var)
     let webview = build_webview(&window, params, &proxy, &reload_tx, None, None)?;
+
+    #[cfg(unix)]
+    drop(_stderr_guard);
 
     // Store windows and webviews in HashMaps keyed by WindowId for multi-window support
     let mut windows: HashMap<WindowId, tao::window::Window> = HashMap::new();
@@ -1019,9 +1022,6 @@ fn create_webview_window(
 
     // Clone params for use inside the event loop closure (needed for creating new windows)
     let params = params.clone();
-
-    #[cfg(unix)]
-    drop(_stderr_guard);
 
     event_loop.run(move |event, event_loop_target, control_flow| {
         *control_flow = ControlFlow::Wait;
