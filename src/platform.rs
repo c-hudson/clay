@@ -810,12 +810,12 @@ pub(crate) fn spawn_tls_proxy(
 pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &PathBuf) {
     use tokio::net::windows::named_pipe::{ServerOptions, PipeMode};
 
-    debug_log(true, &format!("TLS-PROXY: starting for {}:{} pipe={}", host, port, pipe_path.display()));
+    debug_log(is_debug_enabled(), &format!("TLS-PROXY: starting for {}:{} pipe={}", host, port, pipe_path.display()));
 
     // Step 1: Connect to the MUD server with TLS
     let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
         Ok(s) => s,
-        Err(e) => { debug_log(true, &format!("TLS-PROXY: TCP connect failed: {}", e)); return; }
+        Err(e) => { debug_log(is_debug_enabled(), &format!("TLS-PROXY: TCP connect failed: {}", e)); return; }
     };
 
     enable_tcp_keepalive(&tcp_stream);
@@ -875,7 +875,7 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path
         return;
     }
 
-    debug_log(true, "TLS-PROXY: TLS handshake complete");
+    debug_log(is_debug_enabled(), "TLS-PROXY: TLS handshake complete");
 
     let pipe_name = match pipe_path.to_str() {
         Some(s) => s.to_string(),
@@ -897,8 +897,8 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path
                 opts.first_pipe_instance(true);
             }
             match opts.create(&pipe_name) {
-                Ok(s) => { debug_log(true, &format!("TLS-PROXY: pipe server instance created (first={})", first_instance)); s }
-                Err(e) => { debug_log(true, &format!("TLS-PROXY: pipe create failed: {}", e)); break; }
+                Ok(s) => { debug_log(is_debug_enabled(), &format!("TLS-PROXY: pipe server instance created (first={})", first_instance)); s }
+                Err(e) => { debug_log(is_debug_enabled(), &format!("TLS-PROXY: pipe create failed: {}", e)); break; }
             }
         };
         first_instance = false;
@@ -1232,12 +1232,12 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
 #[cfg(all(unix, not(target_os = "android")))]
 pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // Always log reload (not gated by debug flag) so we can trace issues
-    debug_log(true, "RELOAD: Starting exec_reload");
+    debug_log(is_debug_enabled(), "RELOAD: Starting exec_reload");
 
     // Save the current state
-    debug_log(true, "RELOAD: Saving state...");
+    debug_log(is_debug_enabled(), "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
-    debug_log(true, "RELOAD: State saved successfully");
+    debug_log(is_debug_enabled(), "RELOAD: State saved successfully");
 
     // Collect socket fds that need to survive exec (plain TCP only)
     // TLS proxy connections reconnect via Unix socket path after reload
@@ -1251,11 +1251,11 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             // If clear_cloexec fails, the FD is stale - just skip it
         }
     }
-    debug_log(true, &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));
+    debug_log(is_debug_enabled(), &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));
 
     // Get the executable path with debug info
     let (exe, debug_info) = get_executable_path()?;
-    debug_log(true, &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
+    debug_log(is_debug_enabled(), &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
 
     // Verify the executable exists
     if !exe.exists() {
@@ -1279,7 +1279,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--reload" && a != "--crash").collect();
     args.push("--reload".to_string());
-    debug_log(true, &format!("RELOAD: About to exec {} with args={:?} fds={}", exe.display(), args, fds_str));
+    debug_log(is_debug_enabled(), &format!("RELOAD: About to exec {} with args={:?} fds={}", exe.display(), args, fds_str));
     let err = std::process::Command::new(&exe)
         .args(&args)
         .exec();
@@ -1303,7 +1303,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
         fn CloseHandle(hObject: isize) -> i32;
     }
 
-    debug_log(true, "RELOAD: Starting exec_reload (Windows)");
+    debug_log(is_debug_enabled(), "RELOAD: Starting exec_reload (Windows)");
 
     // Shut down HTTP/HTTPS servers to release the port before spawning new process
     if let Some(ref mut server) = app.http_server {
@@ -1323,9 +1323,9 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             let _ = tx.send(());
         }
     }
-    debug_log(true, "RELOAD: Saving state...");
+    debug_log(is_debug_enabled(), "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;
-    debug_log(true, "RELOAD: State saved successfully");
+    debug_log(is_debug_enabled(), "RELOAD: State saved successfully");
 
     // Make socket handles inheritable so they survive into the child process
     let mut handles_to_keep: Vec<i64> = Vec::new();
@@ -1336,10 +1336,10 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             }
         }
     }
-    debug_log(true, &format!("RELOAD: Keeping {} handles", handles_to_keep.len()));
+    debug_log(is_debug_enabled(), &format!("RELOAD: Keeping {} handles", handles_to_keep.len()));
 
     let (exe, debug_info) = get_executable_path()?;
-    debug_log(true, &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
+    debug_log(is_debug_enabled(), &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
 
     if !exe.exists() {
         return Err(io::Error::other(format!(
@@ -1382,7 +1382,7 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     if is_headless && !args.iter().any(|a| a == "--gui" || a.starts_with("--gui=")) {
         args.push("--gui".to_string());
     }
-    debug_log(true, &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
+    debug_log(is_debug_enabled(), &format!("RELOAD: About to spawn {} with args={:?} handles={}", exe.display(), args, fds_str));
 
     // On Windows, disable raw mode and leave alternate screen BEFORE spawning
     let _ = crossterm::terminal::disable_raw_mode();

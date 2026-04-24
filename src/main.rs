@@ -5867,7 +5867,7 @@ impl App {
         let key = hex::encode(hasher.finalize());
         let bt = std::backtrace::Backtrace::force_capture();
         let now = util::local_time_now();
-        debug_log(true, &format!(
+        debug_log(is_debug_enabled(), &format!(
             "AUTH KEY GENERATED {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n{}",
             now.year, now.month, now.day, now.hour, now.minute, now.second, bt
         ));
@@ -5880,14 +5880,14 @@ impl App {
         let cw = self.current_world_index;
         if cw < self.worlds.len() {
             let world = &self.worlds[cw];
-            debug_log(true, &format!(
+            debug_log(is_debug_enabled(), &format!(
                 "AUTH_INITIAL_STATE: current_world={} '{}' showing_splash={} output_lines={} is_reload={}",
                 cw, world.name, world.showing_splash, world.output_lines.len(), self.is_reload
             ));
             // Log last 3 lines of output to verify reload message is present
             let start = world.output_lines.len().saturating_sub(3);
             for (i, line) in world.output_lines[start..].iter().enumerate() {
-                debug_log(true, &format!(
+                debug_log(is_debug_enabled(), &format!(
                     "AUTH_INITIAL_STATE: output_line[{}] from_server={} text='{}'",
                     start + i, line.from_server, line.text.trim()
                 ));
@@ -8798,6 +8798,9 @@ fn debug_log(debug_enabled: bool, message: &str) {
 
 /// Write a debug message to clay.output.debug (output/seq debugging)
 pub(crate) fn output_debug_log(message: &str) {
+    if !is_debug_enabled() {
+        return;
+    }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -10601,7 +10604,7 @@ async fn main() -> io::Result<()> {
     OUTPUT_DEBUG_HEADER_WRITTEN.store(false, Ordering::Relaxed);
 
     // Always log startup (not gated by debug flag) for reload/crash diagnostics
-    debug_log(true, &format!("STARTUP: {} (reload={}, crash={}, gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg));
+    debug_log(is_debug_enabled(), &format!("STARTUP: {} (reload={}, crash={}, gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg));
 
     // Parse --grep extra args
     let mut grep_world_filter: Option<String> = None;
@@ -10967,25 +10970,25 @@ pub async fn run_app_headless(
     let should_load_state = is_reload || is_crash;
 
     if should_load_state {
-        debug_log(true, "HEADLESS STARTUP: Loading reload state...");
+        debug_log(is_debug_enabled(), "HEADLESS STARTUP: Loading reload state...");
         match persistence::load_reload_state(&mut app) {
             Ok(true) => {
-                debug_log(true, "HEADLESS STARTUP: Reload state loaded successfully");
+                debug_log(is_debug_enabled(), "HEADLESS STARTUP: Reload state loaded successfully");
                 for (idx, world) in app.worlds.iter().enumerate() {
-                    debug_log(true, &format!(
+                    debug_log(is_debug_enabled(), &format!(
                         "HEADLESS RELOAD STATE: World[{}] '{}' showing_splash={} output_lines={} connected={}",
                         idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
                     ));
                 }
             }
             Ok(false) => {
-                debug_log(true, "HEADLESS STARTUP: No reload state found");
+                debug_log(is_debug_enabled(), "HEADLESS STARTUP: No reload state found");
                 if let Err(e) = persistence::load_settings(&mut app) {
                     eprintln!("Warning: Could not load settings: {}", e);
                 }
             }
             Err(e) => {
-                debug_log(true, &format!("HEADLESS STARTUP: Failed to load reload state: {}", e));
+                debug_log(is_debug_enabled(), &format!("HEADLESS STARTUP: Failed to load reload state: {}", e));
                 if let Err(e) = persistence::load_settings(&mut app) {
                     eprintln!("Warning: Could not load settings: {}", e);
                 }
@@ -11042,13 +11045,13 @@ pub async fn run_app_headless(
         // Log world state for debugging (always-on)
         for (idx, world) in app.worlds.iter().enumerate() {
             if world.connected || world.socket_fd.is_some() {
-                debug_log(true, &format!(
+                debug_log(is_debug_enabled(), &format!(
                     "HEADLESS RELOAD: World[{}] '{}' connected={} is_tls={} socket_fd={:?} proxy_pid={:?}",
                     idx, world.name, world.connected, world.is_tls, world.socket_fd, world.proxy_pid
                 ));
             }
         }
-        debug_log(true, "HEADLESS STARTUP: Reconstructing connections...");
+        debug_log(is_debug_enabled(), "HEADLESS STARTUP: Reconstructing connections...");
         // First pass: disconnect TLS worlds without proxy
         let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
         for (world_idx, world) in app.worlds.iter().enumerate() {
@@ -11081,7 +11084,7 @@ pub async fn run_app_headless(
             let world = &app.worlds[world_idx];
             if world.connected && world.socket_fd.is_some() && !world.is_tls {
                 let fd = world.socket_fd.unwrap();
-                debug_log(true, &format!("HEADLESS RELOAD: Reconstructing plain TCP for '{}' fd={}", world.name, fd));
+                debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: Reconstructing plain TCP for '{}' fd={}", world.name, fd));
                 #[cfg(unix)]
                 let tcp_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
                 #[cfg(windows)]
@@ -11225,7 +11228,7 @@ pub async fn run_app_headless(
                     let pipe_path = world.proxy_socket_path.clone();
 
                     let alive = crate::platform::is_process_alive(proxy_pid);
-                    debug_log(true, &format!("HEADLESS RELOAD: proxy pid={} alive={} path={:?}", proxy_pid, alive, pipe_path));
+                    debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: proxy pid={} alive={} path={:?}", proxy_pid, alive, pipe_path));
 
                     if !alive {
                         app.worlds[world_idx].clear_connection_state(false, false);
@@ -11236,7 +11239,7 @@ pub async fn run_app_headless(
                         ));
                     } else if let Some(ref path) = pipe_path {
                         let client_opt = crate::platform::connect_to_proxy_pipe(path, 5).await;
-                        debug_log(true, &format!("HEADLESS RELOAD: pipe connect result: {}", client_opt.is_some()));
+                        debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: pipe connect result: {}", client_opt.is_some()));
                         match client_opt {
                             Some(pipe_client) => {
                                 let (r, w) = tokio::io::split(pipe_client);
@@ -11288,7 +11291,7 @@ pub async fn run_app_headless(
                                 });
                             }
                             None => {
-                                debug_log(true, &format!("HEADLESS RELOAD: failed to reconnect Windows proxy for '{}'", app.worlds[world_idx].name));
+                                debug_log(is_debug_enabled(), &format!("HEADLESS RELOAD: failed to reconnect Windows proxy for '{}'", app.worlds[world_idx].name));
                                 app.worlds[world_idx].clear_connection_state(false, false);
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
@@ -11305,7 +11308,7 @@ pub async fn run_app_headless(
         // Cleanup: mark disconnected worlds that claim to be connected but have no command channel
         for world in &mut app.worlds {
             if world.connected && world.command_tx.is_none() {
-                debug_log(true, &format!(
+                debug_log(is_debug_enabled(), &format!(
                     "HEADLESS RELOAD CLEANUP: World '{}' connected but no command_tx — marking disconnected (socket_fd={:?})",
                     world.name, world.socket_fd
                 ));
@@ -11547,7 +11550,7 @@ pub async fn run_app_headless(
         }
     }
 
-    debug_log(true, "HEADLESS: Entering main event loop");
+    debug_log(is_debug_enabled(), "HEADLESS: Entering main event loop");
 
     // Main event loop
     loop {
@@ -11710,9 +11713,9 @@ pub async fn run_app_headless(
                         #[cfg(not(target_os = "android"))]
                         {
                             // Always log reload trigger (not gated by debug flag)
-                            debug_log(true, "HEADLESS: Reload triggered, calling exec_reload");
+                            debug_log(is_debug_enabled(), "HEADLESS: Reload triggered, calling exec_reload");
                             for (idx, world) in app.worlds.iter().enumerate() {
-                                debug_log(true, &format!(
+                                debug_log(is_debug_enabled(), &format!(
                                     "HEADLESS PRE-RELOAD: World[{}] '{}' showing_splash={} output_lines={} connected={}",
                                     idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
                                 ));
@@ -12144,9 +12147,9 @@ pub async fn run_app_headless(
                 if GUI_RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
                     #[cfg(not(target_os = "android"))]
                     {
-                        debug_log(true, "HEADLESS: GUI reload flag detected, calling exec_reload");
+                        debug_log(is_debug_enabled(), "HEADLESS: GUI reload flag detected, calling exec_reload");
                         for (idx, world) in app.worlds.iter().enumerate() {
-                            debug_log(true, &format!(
+                            debug_log(is_debug_enabled(), &format!(
                                 "HEADLESS GUI-RELOAD: World[{}] '{}' showing_splash={} output_lines={} connected={}",
                                 idx, world.name, world.showing_splash, world.output_lines.len(), world.connected
                             ));
@@ -12858,7 +12861,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let pipe_path = world.proxy_socket_path.clone();
 
                 let alive = is_process_alive(proxy_pid);
-                debug_log(true, &format!("CONSOLE RELOAD: proxy pid={} alive={} path={:?}", proxy_pid, alive, pipe_path));
+                debug_log(is_debug_enabled(), &format!("CONSOLE RELOAD: proxy pid={} alive={} path={:?}", proxy_pid, alive, pipe_path));
 
                 if !alive {
                     app.worlds[world_idx].clear_connection_state(false, false);
@@ -12872,7 +12875,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                 let client_opt = if let Some(ref path) = pipe_path {
                     let result = crate::platform::connect_to_proxy_pipe(path, 5).await;
-                    debug_log(true, &format!("CONSOLE RELOAD: pipe connect result: {}", result.is_some()));
+                    debug_log(is_debug_enabled(), &format!("CONSOLE RELOAD: pipe connect result: {}", result.is_some()));
                     result
                 } else {
                     None

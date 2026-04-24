@@ -372,7 +372,7 @@ pub async fn handle_daemon_ws_message(
 ) {
     // Log every incoming command for diagnostics
     if let WsMessage::SendCommand { ref command, .. } = msg {
-        crate::debug_log(true, &format!("DAEMON_CMD: client_id={} command={:?}", client_id, command));
+        crate::debug_log(is_debug_enabled(), &format!("DAEMON_CMD: client_id={} command={:?}", client_id, command));
     }
     match msg {
         WsMessage::SendCommand { world_index, command } => {
@@ -896,7 +896,7 @@ pub async fn handle_daemon_ws_message(
                 }
                 Command::TestMusic => {
                     let test_notes = crate::generate_test_music_notes();
-                    crate::debug_log(true, &format!("TESTMUSIC: daemon path, client_id={}, notes={}", client_id, test_notes.len()));
+                    crate::debug_log(is_debug_enabled(), &format!("TESTMUSIC: daemon path, client_id={}, notes={}", client_id, test_notes.len()));
                     app.ws_send_to_client(client_id, WsMessage::AnsiMusic {
                         world_index,
                         notes: test_notes,
@@ -1018,7 +1018,7 @@ pub async fn handle_daemon_ws_message(
                 }
                 Command::Reload => {
                     // Signal the event loop to perform reload
-                    crate::debug_log(true, "DAEMON: Received /reload command, sending Sigusr1Received event");
+                    crate::debug_log(is_debug_enabled(), "DAEMON: Received /reload command, sending Sigusr1Received event");
                     let _ = event_tx.send(AppEvent::Sigusr1Received).await;
                 }
                 // Commands that execute locally on the client

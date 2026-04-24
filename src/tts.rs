@@ -116,7 +116,7 @@ pub fn init_tts() -> TtsBackend {
         handle.spawn(async move {
             while let Some(text) = rx.recv().await {
                 if let Err(e) = edge_tts_speak(&text).await {
-                    crate::debug_log(true, &format!("Edge TTS error: {}", e));
+                    crate::debug_log(crate::is_debug_enabled(), &format!("Edge TTS error: {}", e));
                 }
             }
         });
