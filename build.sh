@@ -348,39 +348,11 @@ echo ""
 echo "Binary:   $BINARY_PATH ($SIZE)"
 echo "Features: $FEATURES"
 echo ""
-
-# Prompt for install location
-DEFAULT_DEST="$HOME"
-read -p "Install location [$DEFAULT_DEST]: " DEST
-
-if [ -z "$DEST" ]; then
-    DEST="$DEFAULT_DEST"
-fi
-
-# Expand ~ if used
-DEST="${DEST/#\~/$HOME}"
-
-if [ -d "$DEST" ]; then
-    DEST="$DEST/clay"
-fi
-
-echo ""
-echo "Installing to $DEST..."
-cp "$BINARY_PATH" "$DEST"
-chmod +x "$DEST"
-
-echo ""
-echo "=============================================="
-echo "  Installation complete!"
-echo "=============================================="
-echo ""
-echo "Binary: $DEST"
-echo ""
 echo "Run Clay:"
-echo "  $DEST"
+echo "  ./$BINARY_PATH"
 if echo "$FEATURES" | grep -q "webview-gui"; then
     echo ""
     echo "Run as GUI client (connects to running instance):"
-    echo "  $DEST --gui=hostname:port"
+    echo "  ./$BINARY_PATH --gui=hostname:port"
 fi
 echo ""
