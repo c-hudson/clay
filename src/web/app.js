@@ -8979,6 +8979,10 @@
     // Heartbeat ack function for Android to verify WebView responsiveness
     window.heartbeatAck = function() { return "ok"; };
 
+    // Expose for Android Java calls via WebView.evaluateJavascript (which runs in window scope)
+    window.connect = connect;
+    window.openSettingsPopup = openSettingsPopup;
+
     // Called by native WebView GUI to show update status messages
     window.showUpdateStatus = function(msg) {
         appendClientLine(msg);
