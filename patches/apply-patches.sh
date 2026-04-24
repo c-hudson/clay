@@ -33,6 +33,16 @@ for i in "${!CRATE_NAMES[@]}"; do
 done
 
 if $all_done; then
+    # Patched dirs exist, but Cargo.toml may have lost [patch.crates-io] (e.g., after git stash)
+    if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then
+        echo "Re-adding [patch.crates-io] to Cargo.toml..."
+        cat >> Cargo.toml <<'PATCH'
+
+[patch.crates-io]
+tao = { path = "tao-0.34.5-patched" }
+wry = { path = "wry-0.48.1-patched" }
+PATCH
+    fi
     echo "All patches already applied."
     exit 0
 fi
