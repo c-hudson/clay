@@ -3,6 +3,14 @@
 (function() {
     'use strict';
 
+    // Safe IPC wrapper: window.ipc on WebKit2GTK uses window.webkit.messageHandlers
+    // which may not be available on all platforms (e.g. Termux). Wrap calls so a
+    // missing message handler never crashes init().
+    function sendIpc(msg) {
+        if (!window.ipc) return;
+        try { window.ipc.postMessage(msg); } catch (e) { /* IPC unavailable */ }
+    }
+
     // Maximum line length to prevent performance issues with extremely long lines
     const MAX_LINE_LENGTH = 10000;
 
@@ -548,8 +556,8 @@
     let guiTransparency = 1.0;
     function applyTransparency(alpha) {
         guiTransparency = alpha;
-        if (!window.WEBVIEW_MODE || !window.ipc) return;
-        window.ipc.postMessage('opacity:' + alpha);
+        if (!window.WEBVIEW_MODE) return;
+        sendIpc('opacity:' + alpha);
     }
 
     // Apply font family to the interface
@@ -3265,8 +3273,8 @@
                 var grepWorld = grepWorldMatch ? grepWorldMatch[1] : null;
                 var grepRegexp = winArgs.includes('--regexp');
 
-                if (window.ipc && window.ipc.postMessage) {
-                    window.ipc.postMessage('grep-window:' + JSON.stringify({
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('grep-window:' + JSON.stringify({
                         pattern: grepPattern,
                         world: grepWorld,
                         regex: grepRegexp
@@ -3300,8 +3308,8 @@
                 winUrl = winProto + '://' + winHost + ':' + winPort + '/' + winParam;
             }
             // In WebView mode, use IPC to spawn a new WebView window (not system browser)
-            if (window.ipc && window.ipc.postMessage) {
-                window.ipc.postMessage('new-window:' + (winWorld || ''));
+            if (window.WEBVIEW_MODE) {
+                sendIpc('new-window:' + (winWorld || ''));
             } else {
                 window.open(winUrl, '_blank');
             }
@@ -3313,7 +3321,7 @@
         if (window.WEBVIEW_MODE && !window.AUTO_PASSWORD &&
             (cmdTrimmed === '/reload' || cmdTrimmed.startsWith('/reload '))) {
             elements.input.value = '';
-            window.ipc.postMessage('reload');
+            sendIpc('reload');
             return;
         }
 
@@ -3657,8 +3665,8 @@
 
             case '/quit':
                 // Close the window — use IPC for WebView GUI, window.close() for browser
-                if (window.ipc && window.ipc.postMessage) {
-                    window.ipc.postMessage('quit');
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('quit');
                 } else {
                     window.close();
                 }
@@ -3666,8 +3674,8 @@
 
             case '/reload':
                 // Hot reload — local only, never restart the remote server
-                if (window.ipc && window.ipc.postMessage) {
-                    window.ipc.postMessage('reload');
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('reload');
                 } else {
                     window.location.reload();
                 }
@@ -3675,10 +3683,10 @@
 
             case '/update':
                 // Update the local client binary
-                if (window.ipc && window.ipc.postMessage) {
+                if (window.WEBVIEW_MODE) {
                     // WebView GUI: delegate to native side via IPC
                     const forceFlag = args.length > 0 && (args[0] === '-f' || args[0] === '--force');
-                    window.ipc.postMessage(forceFlag ? 'update-force' : 'update');
+                    sendIpc(forceFlag ? 'update-force' : 'update');
                     appendClientLine('Checking for updates...');
                 } else {
                     // Browser: can't update
@@ -6006,8 +6014,8 @@
             var port = (window.WS_PORT && window.WS_PORT !== 0) ? window.WS_PORT : window.location.port;
             url = proto + '://' + host + ':' + port + '/' + page;
         }
-        if (window.WEBVIEW_MODE && window.ipc) {
-            window.ipc.postMessage('open-url:' + url);
+        if (window.WEBVIEW_MODE) {
+            sendIpc('open-url:' + url);
         } else {
             window.open(url, '_blank');
         }
@@ -7377,8 +7385,8 @@
                 return true;
             case 'reload':
                 // Local only — never restart the remote server
-                if (window.ipc && window.ipc.postMessage) {
-                    window.ipc.postMessage('reload');
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('reload');
                 } else {
                     window.location.reload();
                 }
@@ -7489,8 +7497,8 @@
                 break;
             case 'reload':
                 // Local only — never restart the remote server
-                if (window.ipc && window.ipc.postMessage) {
-                    window.ipc.postMessage('reload');
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('reload');
                 } else {
                     window.location.reload();
                 }
