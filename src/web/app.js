@@ -3,12 +3,20 @@
 (function() {
     'use strict';
 
-    // Safe IPC wrapper: window.ipc on WebKit2GTK uses window.webkit.messageHandlers
-    // which may not be available on all platforms (e.g. Termux). Wrap calls so a
-    // missing message handler never crashes init().
+    // IPC: send a message to the native Rust side.
+    // Primary path: window.ipc.postMessage (wry-injected, uses webkit.messageHandlers).
+    // Fallback: POST to clay://localhost/ipc — used when webkit.messageHandlers is
+    // unavailable (e.g. Termux WebKit2GTK). Rust handles /ipc in the custom protocol handler.
     function sendIpc(msg) {
-        if (!window.ipc) return;
-        try { window.ipc.postMessage(msg); } catch (e) { /* IPC unavailable */ }
+        if (window.ipc) {
+            try {
+                window.ipc.postMessage(msg);
+                return;
+            } catch (e) { /* fall through to protocol fallback */ }
+        }
+        if (window.WEBVIEW_MODE) {
+            fetch('clay://localhost/ipc', { method: 'POST', body: msg }).catch(function() {});
+        }
     }
 
     // Maximum line length to prevent performance issues with extremely long lines

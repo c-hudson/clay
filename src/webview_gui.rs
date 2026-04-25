@@ -757,6 +757,98 @@ document.addEventListener('DOMContentLoaded', function() {
 
 /// Build a WebView for a given window, returning the WebView.
 /// Extracts WebView construction so it can be reused for new windows.
+/// Handle an IPC message from the JS side (either via window.webkit.messageHandlers
+/// or via the clay://localhost/ipc protocol fallback used on Termux/WebKit2GTK).
+fn dispatch_ipc_message(
+    body: &str,
+    is_master: bool,
+    proxy: &EventLoopProxy<WvEvent>,
+    reload_tx: &Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
+) {
+    if body.starts_with("open-url:") {
+        open_url_in_browser(&body[9..]);
+    } else if body.starts_with("new-window:") {
+        let world_name = body[11..].trim().to_string();
+        let world = if world_name.is_empty() { None } else { Some(world_name) };
+        let _ = proxy.send_event(WvEvent::NewWindow(world));
+    } else if body.starts_with("grep-window:") {
+        let json_str = &body[12..];
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let pattern = v["pattern"].as_str().unwrap_or("").to_string();
+            let world = v["world"].as_str().map(|s| s.to_string());
+            let use_regex = v["regex"].as_bool().unwrap_or(false);
+            if !pattern.is_empty() {
+                let _ = proxy.send_event(WvEvent::GrepWindow { pattern, world, use_regex });
+            }
+        }
+    } else if body == "quit" {
+        let _ = proxy.send_event(WvEvent::Quit);
+    } else if body == "update" || body == "update-force" {
+        #[cfg(not(target_os = "android"))]
+        {
+            let force = body == "update-force";
+            let proxy_clone = proxy.clone();
+            let reload_tx_clone = reload_tx.clone();
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = proxy_clone.send_event(WvEvent::UpdateStatus(
+                            format!("Failed to start update: {}", e)
+                        ));
+                        return;
+                    }
+                };
+                let result = rt.block_on(crate::platform::check_and_download_update(force));
+                match result {
+                    Ok(success) => {
+                        let msg = install_update(&success.temp_path, &success.version);
+                        let is_success = msg.starts_with("Updated to");
+                        let _ = proxy_clone.send_event(WvEvent::UpdateStatus(msg));
+                        if is_success {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            if is_master {
+                                crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                                if let Some(ref tx) = reload_tx_clone {
+                                    let _ = tx.send(crate::WsMessage::SendCommand {
+                                        world_index: 0,
+                                        command: "/reload".to_string(),
+                                    });
+                                }
+                            } else {
+                                let _ = proxy_clone.send_event(WvEvent::Reload);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = proxy_clone.send_event(WvEvent::UpdateStatus(e));
+                    }
+                }
+            });
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = proxy.send_event(WvEvent::UpdateStatus("Update not available on Android".to_string()));
+        }
+    } else if body == "reload" {
+        if is_master {
+            crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(ref tx) = reload_tx {
+                let _ = tx.send(crate::WsMessage::SendCommand {
+                    world_index: 0,
+                    command: "/reload".to_string(),
+                });
+            }
+        } else {
+            let _ = proxy.send_event(WvEvent::Reload);
+        }
+    } else if let Some(rest) = body.strip_prefix("opacity:") {
+        if let Ok(opacity) = rest.parse::<f64>() {
+            let _ = proxy.send_event(WvEvent::SetOpacity(opacity));
+        }
+    }
+}
+
 fn build_webview(
     window: &tao::window::Window,
     params: &WebViewParams,
@@ -788,9 +880,29 @@ fn build_webview(
     let css_content = WEB_STYLE_CSS.to_string();
     let js_content = WEB_APP_JS.to_string();
 
+    let is_master = params.auto_password.is_some();
+
+    // Clone proxy/reload_tx for the protocol IPC fallback (used when
+    // window.webkit.messageHandlers is unavailable, e.g. on Termux WebKit2GTK)
+    let proxy_for_protocol = proxy.clone();
+    let reload_tx_for_protocol = reload_tx.clone();
+
     let builder = WebViewBuilder::new()
         .with_custom_protocol("clay".into(), move |_id, request| {
             let path = request.uri().path();
+
+            // IPC fallback: JS posts to clay://localhost/ipc when native
+            // window.webkit.messageHandlers is unavailable (e.g. Termux WebKit2GTK).
+            if path == "/ipc" {
+                let msg = String::from_utf8_lossy(request.body()).to_string();
+                dispatch_ipc_message(&msg, is_master, &proxy_for_protocol, &reload_tx_for_protocol);
+                return wry::http::Response::builder()
+                    .header("Content-Type", "text/plain")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Cow::Borrowed(b"ok" as &[u8]))
+                    .unwrap();
+            }
+
             let (content_type, body): (&str, Cow<'static, [u8]>) = match path {
                 "/" | "/index.html" => ("text/html", Cow::Owned(html_content.as_bytes().to_vec())),
                 "/style.css" => ("text/css", Cow::Owned(css_content.as_bytes().to_vec())),
@@ -808,104 +920,12 @@ fn build_webview(
         .with_clipboard(true)
         .with_devtools(cfg!(debug_assertions) || cfg!(target_os = "android"))
         .with_ipc_handler({
-            let is_master = params.auto_password.is_some();
             let proxy = proxy.clone();
             let reload_tx = reload_tx.clone();
             move |req| {
-            let body = req.body();
-            if body.starts_with("open-url:") {
-                let url = &body[9..];
-                open_url_in_browser(url);
-            } else if body.starts_with("new-window:") {
-                // Open a new WebView window in-process (optionally locked to a world)
-                let world_name = body[11..].trim().to_string();
-                let world = if world_name.is_empty() { None } else { Some(world_name) };
-                let _ = proxy.send_event(WvEvent::NewWindow(world));
-            } else if body.starts_with("grep-window:") {
-                // Open a grep results window (half height, filtered output)
-                let json_str = &body[12..];
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    let pattern = v["pattern"].as_str().unwrap_or("").to_string();
-                    let world = v["world"].as_str().map(|s| s.to_string());
-                    let use_regex = v["regex"].as_bool().unwrap_or(false);
-                    if !pattern.is_empty() {
-                        let _ = proxy.send_event(WvEvent::GrepWindow { pattern, world, use_regex });
-                    }
-                }
-            } else if body == "quit" {
-                let _ = proxy.send_event(WvEvent::Quit);
-            } else if body == "update" || body == "update-force" {
-                #[cfg(not(target_os = "android"))]
-                {
-                    let force = body == "update-force";
-                    let proxy_clone = proxy.clone();
-                    let is_master_clone = is_master;
-                    let reload_tx_clone = reload_tx.clone();
-                    std::thread::spawn(move || {
-                        let rt = match tokio::runtime::Runtime::new() {
-                            Ok(rt) => rt,
-                            Err(e) => {
-                                let _ = proxy_clone.send_event(WvEvent::UpdateStatus(
-                                    format!("Failed to start update: {}", e)
-                                ));
-                                return;
-                            }
-                        };
-                        let result = rt.block_on(crate::platform::check_and_download_update(force));
-                        match result {
-                            Ok(success) => {
-                                let msg = install_update(&success.temp_path, &success.version);
-                                let is_success = msg.starts_with("Updated to");
-                                let _ = proxy_clone.send_event(WvEvent::UpdateStatus(msg));
-                                if is_success {
-                                    std::thread::sleep(std::time::Duration::from_millis(500));
-                                    if is_master_clone {
-                                        crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-                                        if let Some(ref tx) = reload_tx_clone {
-                                            let _ = tx.send(crate::WsMessage::SendCommand {
-                                                world_index: 0,
-                                                command: "/reload".to_string(),
-                                            });
-                                        }
-                                    } else {
-                                        let _ = proxy_clone.send_event(WvEvent::Reload);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = proxy_clone.send_event(WvEvent::UpdateStatus(e));
-                            }
-                        }
-                    });
-                }
-                #[cfg(target_os = "android")]
-                {
-                    let _ = proxy.send_event(WvEvent::UpdateStatus("Update not available on Android".to_string()));
-                }
-            } else if body == "reload" {
-                // Hot reload: master mode uses both atomic flag AND channel for reliability
-                // (can't use SIGUSR1 because WebKit/JSC overrides the signal handler),
-                // remote mode sends WvEvent to exec a new binary.
-                if is_master {
-                    // Set atomic flag (checked by headless event loop on 100ms timer)
-                    crate::GUI_RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // Also try channel as backup path
-                    if let Some(ref tx) = reload_tx {
-                        let _ = tx.send(crate::WsMessage::SendCommand {
-                            world_index: 0,
-                            command: "/reload".to_string(),
-                        });
-                    }
-                } else {
-                    // Remote mode: restart the GUI binary
-                    let _ = proxy.send_event(WvEvent::Reload);
-                }
-            } else if let Some(rest) = body.strip_prefix("opacity:") {
-                if let Ok(opacity) = rest.parse::<f64>() {
-                    let _ = proxy.send_event(WvEvent::SetOpacity(opacity));
-                }
+                dispatch_ipc_message(req.body(), is_master, &proxy, &reload_tx);
             }
-        }})
+        })
         // Open external links in the system browser instead of navigating the WebView.
         // Links use target="_blank", which triggers new_window_req_handler.
         .with_new_window_req_handler(|url| {
