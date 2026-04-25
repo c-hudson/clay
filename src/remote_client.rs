@@ -1,6 +1,7 @@
 //! Remote client support: console client mode and grep client mode.
 //! These functions handle connecting to a Clay daemon via WebSocket and
 //! providing a TUI interface or command-line grep for remote sessions.
+#![allow(unused_imports, unused_variables)]
 
 use std::io::{self, Write as IoWrite};
 use std::sync::Arc;

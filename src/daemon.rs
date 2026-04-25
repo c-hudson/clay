@@ -2569,6 +2569,8 @@ pub async fn connect_daemon_world(
     skip_auto_login: bool,
     tls_proxy_enabled: bool,
 ) -> Option<(mpsc::Sender<WriteCommand>, Option<SocketFd>, bool, Option<u32>, Option<std::path::PathBuf>)> {
+    #[cfg(target_os = "android")]
+    let _ = tls_proxy_enabled;
     let host = &settings.hostname;
     let port = &settings.port;
     let use_ssl = settings.use_ssl;

@@ -1,5 +1,6 @@
 //! Platform-specific and system-level functions extracted from main.rs
 //! Includes: crash recovery, hot reload, TLS proxy, update checker, FD handling.
+#![allow(unused_imports, unused_variables)]
 
 use std::io;
 use std::path::PathBuf;
