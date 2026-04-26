@@ -1078,6 +1078,7 @@
     // Connect to WebSocket server
     let connectionTimeout = null;
     let wakePongTimeout = null;  // Timeout for wake-from-background health check
+    let wakeStateCleared = false;  // True when world connected states were cleared before a wake Ping
 
     // Track if we should try ws:// fallback (for self-signed cert issues)
     let triedWsFallback = false;
@@ -1326,16 +1327,22 @@
             if (window.Android && window.Android.stopBackgroundService) {
                 window.Android.stopBackgroundService();
             }
-            // wss:// failed to connect — fall back to ws://
+            // wss:// failed to connect — fall back to ws:// (unless secure mode)
             if (window.WS_PROTOCOL === 'wss' && !triedWsFallback && !usingWsFallback) {
-                console.log('Native wss:// failed, trying ws:// fallback...');
-                triedWsFallback = true;
-                usingWsFallback = true;
-                usingNativeWebSocket = false;
-                useNativeWebSocket = false;
-                connectionFailures = 0;
-                setTimeout(connect, 500);
-                return;
+                var nativeErrMode = 'auto';
+                if (window.Android && typeof Android.getConnectionMode === 'function') {
+                    try { nativeErrMode = Android.getConnectionMode() || 'auto'; } catch(e) {}
+                }
+                if (nativeErrMode !== 'secure') {
+                    console.log('Native wss:// failed, trying ws:// fallback...');
+                    triedWsFallback = true;
+                    usingWsFallback = true;
+                    usingNativeWebSocket = false;
+                    useNativeWebSocket = false;
+                    connectionFailures = 0;
+                    setTimeout(connect, 500);
+                    return;
+                }
             }
             const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
             if (connectionFailures >= maxFailures) {
@@ -1436,6 +1443,21 @@
         triedAlternateHost = false;
         keyAuthFailed = false;  // Explicit reconnect resets this so key auth can be tried again
         connectInProgress = false;  // Allow the new connect() call to proceed
+        // Clear stale world connected states and auth so the status bar shows disconnected
+        // immediately rather than showing the previous session's green dot
+        authenticated = false;
+        wakeStateCleared = false;
+        Object.keys(worlds).forEach(function(k) {
+            if (worlds[k]) worlds[k].connected = false;
+        });
+        updateStatusBar();
+        // Reset WS_HOST to local host so reconnect probes localhost first (not last-used remote)
+        if (window.Android && typeof Android.getConnectionInfo === 'function') {
+            try {
+                var info = JSON.parse(Android.getConnectionInfo());
+                if (info.localHost) window.WS_HOST = info.localHost;
+            } catch(e) {}
+        }
         var logList = document.getElementById('connection-log-list');
         if (logList) logList.innerHTML = '';
         var logRetryBtn = document.getElementById('connection-log-retry-btn');
@@ -1447,6 +1469,16 @@
         if (connectInProgress) {
             debugLog('connect(): already in progress, skipping duplicate call');
             return;
+        }
+
+        // Read connection mode setting (Android only); 'auto' = current behavior
+        var connectionMode = 'auto';
+        if (window.Android && typeof Android.getConnectionMode === 'function') {
+            try { connectionMode = Android.getConnectionMode() || 'auto'; } catch(e) {}
+        }
+        // Non-secure mode: force ws:// by acting as if ws fallback is already selected
+        if (connectionMode === 'non_secure' && !usingWsFallback) {
+            usingWsFallback = true;
         }
 
         // On Android, block connections until settings have been saved at least once
@@ -1647,13 +1679,15 @@
                         setTimeout(connect, 500);
                         return;
                     }
-                    // Otherwise try ws:// fallback
-                    console.log('wss:// connection failed, trying ws:// fallback...');
-                    triedWsFallback = true;
-                    usingWsFallback = true;
-                    connectionFailures = 0;
-                    setTimeout(connect, 500);
-                    return;
+                    // Skip ws:// fallback if user has chosen Secure mode
+                    if (connectionMode !== 'secure') {
+                        console.log('wss:// connection failed, trying ws:// fallback...');
+                        triedWsFallback = true;
+                        usingWsFallback = true;
+                        connectionFailures = 0;
+                        setTimeout(connect, 500);
+                        return;
+                    }
                 }
 
                 // After 2 failures, try alternate host (Android advanced mode) before giving up
@@ -2576,8 +2610,15 @@
                 if (wakePongTimeout) {
                     clearTimeout(wakePongTimeout);
                     wakePongTimeout = null;
-                    // Connection is alive - no resync needed, just update view state
-                    sendViewStateIfChanged();
+                    if (wakeStateCleared) {
+                        // We cleared world states before the ping — connection is alive,
+                        // restore auth and request fresh world state from the server
+                        wakeStateCleared = false;
+                        authenticated = true;
+                        ws.send(JSON.stringify({ type: 'RequestState' }));
+                    } else {
+                        sendViewStateIfChanged();
+                    }
                 }
                 break;
 
@@ -5638,6 +5679,10 @@
             if (userEl) userEl.value = (typeof window.Android.getSavedUsername === 'function') ? window.Android.getSavedUsername() : '';
             if (passEl) passEl.value = (typeof window.Android.getSavedPassword === 'function') ? window.Android.getSavedPassword() : '';
             if (keyEl) keyEl.value = authKey || '';  // show saved key if one has been downloaded
+            var modeEl = document.getElementById('cs-connection-mode');
+            if (modeEl && typeof window.Android.getConnectionMode === 'function') {
+                modeEl.value = window.Android.getConnectionMode() || 'auto';
+            }
             var dlBtn = document.getElementById('cs-auth-key-download');
             if (dlBtn) dlBtn.textContent = 'Download';
             var errEl = document.getElementById('cs-auth-key-error');
@@ -6212,6 +6257,8 @@
             } else {
                 if (typeof window.Android.clearAuthKey === 'function') window.Android.clearAuthKey();
             }
+            var connectionMode = ((document.getElementById('cs-connection-mode') || {}).value || 'auto').trim();
+            if (typeof window.Android.saveConnectionMode === 'function') window.Android.saveConnectionMode(connectionMode);
             // Reload triggers a full reconnect with the new settings
             if (typeof window.Android.reloadPage === 'function') window.Android.reloadPage();
             return;
@@ -9051,14 +9098,24 @@
                 clearTimeout(wakePongTimeout);
                 wakePongTimeout = null;
             }
+            // Clear stale visual state immediately so the UI shows disconnected while
+            // we verify — avoids showing a false green dot during the ping timeout
+            Object.keys(worlds).forEach(function(k) {
+                if (worlds[k]) worlds[k].connected = false;
+            });
+            authenticated = false;
+            wakeStateCleared = true;
+            updateStatusBar();
             try {
                 ws.send(JSON.stringify({ type: 'Ping' }));
             } catch (e) {
+                wakeStateCleared = false;
                 forceReconnect();
                 return;
             }
             wakePongTimeout = setTimeout(function() {
                 wakePongTimeout = null;
+                wakeStateCleared = false;
                 forceReconnect();
             }, 3000);
         }

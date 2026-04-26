@@ -255,6 +255,18 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public String getConnectionMode() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString("connectionMode", "auto");
+        }
+
+        @JavascriptInterface
+        public void saveConnectionMode(String mode) {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().putString("connectionMode", mode).apply();
+        }
+
+        @JavascriptInterface
         public void showToast(String message) {
             runOnUiThread(() -> {
                 Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
