@@ -8991,43 +8991,47 @@
         // When page becomes visible, ping the server to verify the connection is alive.
         // If pong arrives in time, resync. If not, reconnect.
         document.addEventListener('visibilitychange', function() {
-            if (document.visibilityState === 'visible') {
-                // Clear any previous wake check
-                if (wakePongTimeout) {
-                    clearTimeout(wakePongTimeout);
-                    wakePongTimeout = null;
-                }
+            if (document.visibilityState !== 'visible') return;
 
-                if (!ws || ws.readyState === WebSocket.CLOSED) {
-                    // WebSocket is already closed, reconnect immediately
+            // If checkConnectionOnResume already started a wake check (or visibilitychange
+            // itself fired earlier and one is still in flight), bail out — let the existing
+            // wake check resolve via Pong or its 3s timeout. Prevents the resume race that
+            // was tearing down healthy connections.
+            if (wakeStateCleared) {
+                debugLog('visibilitychange: wake check in progress, skipping');
+                return;
+            }
+
+            if (!ws || ws.readyState === WebSocket.CLOSED) {
+                forceReconnect();
+            } else if (ws.readyState === WebSocket.CONNECTING) {
+                // Already connecting — let it complete. The 5-second connection timeout
+                // in connect() handles truly stale CONNECTING sockets.
+                debugLog('visibilitychange: already connecting, skipping');
+            } else if (ws.readyState === WebSocket.OPEN && !authenticated) {
+                // Socket open but not authenticated — stale from before sleep
+                forceReconnect();
+            } else if (ws.readyState === WebSocket.OPEN && authenticated) {
+                // Verify with a Ping. Use wakeStateCleared as a mutex so a follow-up
+                // visibilitychange or checkConnectionOnResume call won't double-trigger.
+                wakeStateCleared = true;
+                try {
+                    ws.send(JSON.stringify({ type: 'Ping' }));
+                } catch (e) {
+                    wakeStateCleared = false;
                     forceReconnect();
-                } else if (ws.readyState === WebSocket.CONNECTING) {
-                    // Already connecting (may have been started by checkConnectionOnResume) — let it complete.
-                    // The 5-second connection timeout in connect() handles truly stale CONNECTING sockets.
-                    debugLog('visibilitychange: already connecting, skipping');
-                } else if (ws.readyState === WebSocket.OPEN && !authenticated) {
-                    // If checkConnectionOnResume already cleared auth and sent a Ping, let it run.
-                    if (wakeStateCleared) {
-                        debugLog('visibilitychange: wake check in progress, skipping');
-                        return;
-                    }
-                    // Socket open but not authenticated - stale from before sleep
-                    forceReconnect();
-                } else if (ws.readyState === WebSocket.OPEN && authenticated) {
-                    // Socket looks open - verify with a ping
-                    try {
-                        ws.send(JSON.stringify({ type: 'Ping' }));
-                    } catch (e) {
-                        // Send failed, connection is dead
-                        forceReconnect();
-                        return;
-                    }
-                    // Wait up to 3 seconds for Pong response
-                    wakePongTimeout = setTimeout(function() {
-                        wakePongTimeout = null;
-                        forceReconnect();
-                    }, 3000);
+                    return;
                 }
+                wakePongTimeout = setTimeout(function() {
+                    wakePongTimeout = null;
+                    wakeStateCleared = false;
+                    authenticated = false;
+                    Object.keys(worlds).forEach(function(k) {
+                        if (worlds[k]) worlds[k].connected = false;
+                    });
+                    updateStatusBar();
+                    forceReconnect();
+                }, 3000);
             }
         });
     }
@@ -9116,7 +9120,13 @@
     // This handles cases where the connection died in the background (timeout,
     // silent TCP death, etc.) and the visibilitychange event may not fire.
     window.checkConnectionOnResume = function() {
-        debugLog('checkConnectionOnResume: ws=' + (ws ? ws.readyState : 'null') + ' auth=' + authenticated);
+        debugLog('checkConnectionOnResume: ws=' + (ws ? ws.readyState : 'null') + ' auth=' + authenticated + ' wakeStateCleared=' + wakeStateCleared);
+        // If visibilitychange (or an earlier checkConnectionOnResume call) already started
+        // a wake check, defer — let it resolve. wakeStateCleared acts as the mutex.
+        if (wakeStateCleared) {
+            debugLog('checkConnectionOnResume: wake check already in progress, skipping');
+            return;
+        }
         // visibilitychange may have already handled the reconnect — skip if a reconnect
         // is already in progress (new socket CONNECTING) to avoid a double-trigger.
         if (ws && ws.readyState === WebSocket.CONNECTING) {
