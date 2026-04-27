@@ -285,8 +285,11 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
-                // Close any existing connection
+                // Close any existing connection, clearing its callback first so
+                // async onClose/onError events from the old socket don't reach JS
+                // and corrupt the new connection's state.
                 if (nativeWebSocket != null) {
+                    nativeWebSocket.clearCallback();
                     nativeWebSocket.close();
                 }
 
@@ -361,6 +364,7 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void closeWebSocket() {
             if (nativeWebSocket != null) {
+                nativeWebSocket.clearCallback(); // suppress async close/error from reaching JS
                 nativeWebSocket.close();
                 nativeWebSocket = null;
             }

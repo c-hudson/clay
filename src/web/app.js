@@ -1462,7 +1462,10 @@
             ws.onmessage = null;
             // If using native WebSocket, the close fires asynchronously via onNativeWebSocketClose.
             // Suppress it so the stale callback doesn't corrupt the new connection's state.
-            if (usingNativeWebSocket) nativeCloseIgnoreCount += 2; // native may fire both onError + onClose
+            // Safety net: only suppress if socket is still live (OPEN/CONNECTING).
+            // Dead sockets (CLOSED) won't fire events; over-counting suppresses the new socket.
+            // Java's clearCallback() prevents most stale events; this absorbs any that race through.
+            if (usingNativeWebSocket && ws.readyState !== WebSocket.CLOSED) nativeCloseIgnoreCount++;
             try { ws.close(); } catch (e) {}
             ws = null;
         }

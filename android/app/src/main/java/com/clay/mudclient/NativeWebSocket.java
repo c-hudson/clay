@@ -159,6 +159,12 @@ public class NativeWebSocket {
         }
     }
 
+    // Null the callback so subsequent async close/error events don't reach JS.
+    // Call this before close() when replacing an old socket with a new one.
+    public void clearCallback() {
+        this.callback = null;
+    }
+
     public void send(String message) {
         if (webSocket != null && isConnected) {
             webSocket.send(message);
