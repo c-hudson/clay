@@ -1096,6 +1096,9 @@
     // Track alternate host for Android advanced mode (local/remote fallback)
     let alternateHost = null;
     let triedAlternateHost = false;
+    let hostAttemptRound = 0;  // increments each time we switch hosts; allows round-robin
+    const MAX_HOST_ROUNDS = 4; // 2 rounds each = local × 2 + remote × 2 before giving up
+    let lastForceReconnectAt = 0; // debounce guard against double-trigger on resume
 
     // Debug logging - console only (no Toast)
     function debugLog(msg) {
@@ -1130,6 +1133,7 @@
             connectionFailures = 0;
             triedWsFallback = false;
             triedAlternateHost = false;
+            hostAttemptRound = 0;
             hideCertWarning();
             resolveLastAttempt(true);
             setTimeout(hideConnectionLog, 800);
@@ -1273,8 +1277,8 @@
             }
 
             // Try alternate host (Android advanced mode) before giving up
-            if (connectionFailures >= 2 && !triedAlternateHost) {
-                triedAlternateHost = true;
+            if (connectionFailures >= 2 && hostAttemptRound < MAX_HOST_ROUNDS) {
+                hostAttemptRound++;
                 if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
                     try {
                         const info = JSON.parse(window.Android.getConnectionInfo());
@@ -1342,6 +1346,28 @@
                     connectionFailures = 0;
                     setTimeout(connect, 500);
                     return;
+                }
+            }
+            // In secure mode (or after wss/ws fallbacks exhausted), try alternate host
+            if (connectionFailures >= 2 && hostAttemptRound < MAX_HOST_ROUNDS) {
+                hostAttemptRound++;
+                if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
+                    try {
+                        const info = JSON.parse(window.Android.getConnectionInfo());
+                        if (info.remoteHost) {
+                            const currentHost = alternateHost || window.WS_HOST || window.location.hostname;
+                            const altHost = (currentHost === info.remoteHost) ? info.localHost : info.remoteHost;
+                            if (altHost && altHost !== currentHost) {
+                                console.log('Native WS error on ' + currentHost + ', trying alternate: ' + altHost);
+                                alternateHost = altHost;
+                                connectionFailures = 0;
+                                setTimeout(connect, 500);
+                                return;
+                            }
+                        }
+                    } catch (e) {
+                        console.log('getConnectionInfo error: ' + e);
+                    }
                 }
             }
             const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
@@ -1421,6 +1447,12 @@
     // onclose callbacks from corrupting reconnect state after an explicit close.
     // Resets all fallback flags so we always start fresh on the primary host.
     function forceReconnect() {
+        var now = Date.now();
+        if (now - lastForceReconnectAt < 1000) {
+            debugLog('forceReconnect: debounced (' + (now - lastForceReconnectAt) + 'ms since last)');
+            return;
+        }
+        lastForceReconnectAt = now;
         if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
         if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
         if (ws) {
@@ -1430,7 +1462,7 @@
             ws.onmessage = null;
             // If using native WebSocket, the close fires asynchronously via onNativeWebSocketClose.
             // Suppress it so the stale callback doesn't corrupt the new connection's state.
-            if (usingNativeWebSocket) nativeCloseIgnoreCount++;
+            if (usingNativeWebSocket) nativeCloseIgnoreCount += 2; // native may fire both onError + onClose
             try { ws.close(); } catch (e) {}
             ws = null;
         }
@@ -1441,6 +1473,7 @@
         usingNativeWebSocket = false;
         alternateHost = null;
         triedAlternateHost = false;
+        hostAttemptRound = 0;
         keyAuthFailed = false;  // Explicit reconnect resets this so key auth can be tried again
         connectInProgress = false;  // Allow the new connect() call to proceed
         // Clear stale world connected states and auth so the status bar shows disconnected
@@ -1557,6 +1590,7 @@
                 connectionFailures = 0;
                 triedWsFallback = false; // Reset for future reconnects
                 triedAlternateHost = false;
+                hostAttemptRound = 0;
                 hideCertWarning();
                 resolveLastAttempt(true);
                 setTimeout(hideConnectionLog, 800);
@@ -1691,8 +1725,8 @@
                 }
 
                 // After 2 failures, try alternate host (Android advanced mode) before giving up
-                if (connectionFailures >= 2 && !triedAlternateHost) {
-                    triedAlternateHost = true;
+                if (connectionFailures >= 2 && hostAttemptRound < MAX_HOST_ROUNDS) {
+                    hostAttemptRound++;
                     if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
                         try {
                             const info = JSON.parse(window.Android.getConnectionInfo());
@@ -8972,6 +9006,11 @@
                     // The 5-second connection timeout in connect() handles truly stale CONNECTING sockets.
                     debugLog('visibilitychange: already connecting, skipping');
                 } else if (ws.readyState === WebSocket.OPEN && !authenticated) {
+                    // If checkConnectionOnResume already cleared auth and sent a Ping, let it run.
+                    if (wakeStateCleared) {
+                        debugLog('visibilitychange: wake check in progress, skipping');
+                        return;
+                    }
                     // Socket open but not authenticated - stale from before sleep
                     forceReconnect();
                 } else if (ws.readyState === WebSocket.OPEN && authenticated) {
@@ -9068,6 +9107,7 @@
         useNativeWebSocket = false;
         alternateHost = null;
         triedAlternateHost = false;
+        hostAttemptRound = 0;
         // Don't auto-reconnect here - we're in the background and Android disconnected
         // to save power. Reconnection will happen when user returns (checkConnectionOnResume).
     };
@@ -9093,19 +9133,13 @@
             // Socket open but not authenticated - stale
             forceReconnect();
         } else if (ws.readyState === WebSocket.OPEN && authenticated) {
-            // Looks connected - verify with ping (same as visibilitychange handler)
+            // Looks connected — verify with Ping. Set wakeStateCleared so visibilitychange
+            // (which may fire in the same resume event) skips its own forceReconnect.
             if (wakePongTimeout) {
                 clearTimeout(wakePongTimeout);
                 wakePongTimeout = null;
             }
-            // Clear stale visual state immediately so the UI shows disconnected while
-            // we verify — avoids showing a false green dot during the ping timeout
-            Object.keys(worlds).forEach(function(k) {
-                if (worlds[k]) worlds[k].connected = false;
-            });
-            authenticated = false;
             wakeStateCleared = true;
-            updateStatusBar();
             try {
                 ws.send(JSON.stringify({ type: 'Ping' }));
             } catch (e) {
@@ -9116,6 +9150,12 @@
             wakePongTimeout = setTimeout(function() {
                 wakePongTimeout = null;
                 wakeStateCleared = false;
+                // Pong never arrived — connection is stale; clear visual state then reconnect
+                authenticated = false;
+                Object.keys(worlds).forEach(function(k) {
+                    if (worlds[k]) worlds[k].connected = false;
+                });
+                updateStatusBar();
                 forceReconnect();
             }, 3000);
         }
