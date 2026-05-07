@@ -1533,6 +1533,8 @@ pub struct ClientViewState {
     pub visible_columns: usize,
     /// Client's output area dimensions (width, height) for NAWS
     pub dimensions: Option<(u16, u16)>,
+    /// Mirrors WsClientInfo.paused — cached here for lock-free reads in output path
+    pub paused: bool,
 }
 
 // ============================================================================
@@ -1589,6 +1591,8 @@ pub enum Command {
     Remote,
     /// /remote --kill <id> - disconnect a remote client
     RemoteKill { client_id: u64 },
+    /// /remote --pause <id> - toggle pause state on a remote client
+    RemotePause { client_id: u64 },
     /// /ban - show banned hosts
     BanList,
     /// /unban <host> - remove ban for host
@@ -1696,6 +1700,12 @@ pub fn parse_command(input: &str) -> Command {
             if args.len() >= 2 && args[0] == "--kill" {
                 if let Ok(id) = args[1].parse::<u64>() {
                     Command::RemoteKill { client_id: id }
+                } else {
+                    Command::Unknown { cmd: trimmed.to_string() }
+                }
+            } else if args.len() >= 2 && args[0] == "--pause" {
+                if let Ok(id) = args[1].parse::<u64>() {
+                    Command::RemotePause { client_id: id }
                 } else {
                     Command::Unknown { cmd: trimmed.to_string() }
                 }
@@ -4410,7 +4420,9 @@ impl App {
             if let Ok(clients_guard) = server.clients.try_read() {
                 for client in clients_guard.values() {
                     if client.authenticated {
-                        let count = self.activity_count_excluding(client.current_world);
+                        // Paused clients get full activity count (their world is no longer excluded)
+                        let exclude = if client.paused { None } else { client.current_world };
+                        let count = self.activity_count_excluding(exclude);
                         let _ = client.tx.send(WsMessage::ActivityUpdate { count });
                     }
                 }
@@ -4865,6 +4877,34 @@ impl App {
         }
     }
 
+    /// Toggle the paused state for a WebSocket client.
+    /// Updates both WsClientInfo (in ws_server) and ClientViewState (in ws_client_worlds).
+    /// Returns (new_paused, ip_address) if the client was found.
+    fn ws_toggle_client_paused(&mut self, client_id: u64) -> Option<(bool, String)> {
+        let (was_paused, ip, current_world) = if let Some(ref server) = self.ws_server {
+            server.clients.try_read().ok()
+                .and_then(|g| g.get(&client_id).map(|c| (c.paused, c.ip_address.clone(), c.current_world)))?
+        } else {
+            return None;
+        };
+        let new_paused = !was_paused;
+        if let Some(ref server) = self.ws_server {
+            server.set_client_paused(client_id, new_paused);
+        }
+        if let Some(state) = self.ws_client_worlds.get_mut(&client_id) {
+            state.paused = new_paused;
+        } else if let Some(wi) = current_world {
+            self.ws_client_worlds.insert(client_id, ClientViewState {
+                world_index: wi,
+                visible_lines: 0,
+                visible_columns: 0,
+                dimensions: None,
+                paused: new_paused,
+            });
+        }
+        Some((new_paused, ip))
+    }
+
     /// Set the authenticated status for a WebSocket client
     fn ws_set_client_authenticated(&self, client_id: u64, authenticated: bool) {
         if let Some(ref server) = self.ws_server {
@@ -4903,9 +4943,10 @@ impl App {
         }
     }
 
-    /// Check if any WS client is currently viewing a specific world
+    /// Check if any non-paused WS client is currently viewing a specific world.
+    /// Paused clients don't suppress activity notices for their world.
     fn ws_client_viewing(&self, world_index: usize) -> bool {
-        self.ws_client_worlds.values().any(|v| v.world_index == world_index)
+        self.ws_client_worlds.values().any(|v| v.world_index == world_index && !v.paused)
     }
 
     /// Get the minimum visible lines among all viewers of a world (for more-mode threshold)
@@ -5817,6 +5858,7 @@ impl App {
                     visible_lines: 0,
                     visible_columns: 0,
                     dimensions: None,
+                    paused: false,
                 });
                 // Signal event loop to trigger web reconnects
                 self.web_reconnect_needed = true;
@@ -5904,6 +5946,7 @@ impl App {
             visible_lines: 0,
             visible_columns: 0,
             dimensions: None,
+            paused: false,
         });
         // Broadcast activity count to new client
         self.broadcast_activity();
@@ -6364,6 +6407,25 @@ impl App {
                     });
                 }
             }
+            Command::RemotePause { client_id: pause_id } => {
+                let msg = match self.ws_toggle_client_paused(pause_id) {
+                    Some((new_paused, ip)) => {
+                        self.ws_send_to_client(pause_id, WsMessage::PausedState { paused: new_paused });
+                        self.broadcast_activity();
+                        if new_paused {
+                            format!("Paused remote client {} ({}) — activity now visible on other sessions.", pause_id, ip)
+                        } else {
+                            format!("Resumed remote client {} ({}).", pause_id, ip)
+                        }
+                    }
+                    None => format!("No client with ID {}.", pause_id),
+                };
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index, data: msg, is_viewed: false,
+                    ts: current_timestamp_secs(), from_server: false,
+                    seq: 0, marked_new: false, flush: false, gagged: false,
+                });
+            }
             Command::BanList => {
                 // Send current ban list
                 let bans = self.ban_list.get_ban_info();
@@ -6749,7 +6811,8 @@ impl App {
                     let dimensions = prev.and_then(|s| s.dimensions);
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, visible_columns, dimensions });
+                    let paused = prev.map(|v| v.paused).unwrap_or(false);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, visible_columns, dimensions, paused });
                     self.ws_set_client_world(client_id, Some(idx));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                     // Also send ExecuteLocalCommand so web clients can switch their local view
@@ -7000,6 +7063,27 @@ impl App {
     /// that require async follow-up (connect/disconnect).
     #[allow(clippy::too_many_lines)]
     fn handle_ws_client_msg(&mut self, client_id: u64, msg: WsMessage, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
+        // Auto-resume a paused session when the user interacts (mirrors "exit more mode by acting")
+        let is_user_action = matches!(msg,
+            WsMessage::SendCommand { .. } | WsMessage::SwitchWorld { .. } |
+            WsMessage::ReleasePending { .. } | WsMessage::SelectiveFlush { .. } |
+            WsMessage::MarkWorldSeen { .. } | WsMessage::ConnectWorld { .. } |
+            WsMessage::DisconnectWorld { .. }
+        );
+        if is_user_action {
+            let was_paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
+            if was_paused {
+                if let Some(ref server) = self.ws_server {
+                    server.set_client_paused(client_id, false);
+                }
+                if let Some(state) = self.ws_client_worlds.get_mut(&client_id) {
+                    state.paused = false;
+                }
+                self.ws_send_to_client(client_id, WsMessage::PausedState { paused: false });
+                self.broadcast_activity();
+            }
+        }
+
         let auth_current_world = if let WsMessage::AuthRequest { ref current_world, .. } = msg {
             *current_world
         } else {
@@ -7024,7 +7108,8 @@ impl App {
                     let dimensions = prev.and_then(|s| s.dimensions);
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions });
+                    let paused = prev.map(|v| v.paused).unwrap_or(false);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused });
                     self.ws_set_client_world(client_id, Some(world_index));
                 }
 
@@ -7037,7 +7122,8 @@ impl App {
                     let dimensions = prev.and_then(|s| s.dimensions);
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions });
+                    let paused = prev.map(|v| v.paused).unwrap_or(false);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused });
                     self.ws_set_client_world(client_id, Some(world_index));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                     // Send active media for the new world
@@ -7173,7 +7259,8 @@ impl App {
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let dimensions = prev.and_then(|s| s.dimensions);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions });
+                    let paused = prev.map(|v| v.paused).unwrap_or(false);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused });
                     // Update client's world in WebSocket server (async state)
                     self.ws_set_client_world(client_id, Some(world_index));
 
@@ -7192,10 +7279,11 @@ impl App {
             WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
                 // A remote client is reporting its view state (for more-mode threshold calculation)
                 if world_index < self.worlds.len() {
-                    // Preserve existing dimensions when updating view state
+                    // Preserve existing dimensions and paused state when updating view state
                     let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
                     let vc = visible_columns.unwrap_or_else(|| self.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions });
+                    let paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused });
                     // Update client's world in WebSocket server so broadcast_to_world_viewers works
                     self.ws_set_client_world(client_id, Some(world_index));
                 }
@@ -7516,10 +7604,14 @@ impl App {
                 self.ws_send_initial_state_and_mark(client_id, initial_state);
                 // Set client's initial world so broadcast_to_world_viewers works immediately
                 self.ws_set_client_world(client_id, Some(self.current_world_index));
-                // Also send current activity count
+                // Also send current activity count and pause state
                 self.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                     count: self.activity_count(),
                 });
+                let is_paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
+                if is_paused {
+                    self.ws_send_to_client(client_id, WsMessage::PausedState { paused: true });
+                }
             }
             WsMessage::RequestWorldState { world_index } => {
                 // Client switched to a world and needs current state
@@ -7758,11 +7850,13 @@ impl App {
                     let visible_lines = prev.map(|s| s.visible_lines).unwrap_or(24);
                     let visible_columns = prev.map(|s| s.visible_columns).unwrap_or(0);
                     let dimensions = prev.and_then(|s| s.dimensions);
+                    let paused = prev.map(|s| s.paused).unwrap_or(false);
                     self.ws_client_worlds.insert(client_id, ClientViewState {
                         world_index: idx,
                         visible_lines,
                         visible_columns,
                         dimensions,
+                        paused,
                     });
                     // Update client's world in WebSocket server (async state)
                     self.ws_set_client_world(client_id, Some(idx));
@@ -13460,13 +13554,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 if let Event::Paste(ref text) = event {
                     // Bracketed paste: entire pasted text arrives as one event.
-                    // Insert all characters directly into the input buffer.
-                    for c in text.chars() {
-                        if c == '\n' || c == '\r' {
-                            // Pastes may contain newlines — insert literal newline
-                            app.input.insert_char('\n');
-                        } else if !c.is_control() {
-                            app.input.insert_char(c);
+                    if app.has_new_popup() {
+                        // Route paste into the active popup field via synthetic key events.
+                        for c in text.chars() {
+                            if !c.is_control() {
+                                let synthetic = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+                                handle_new_popup_key(&mut app, synthetic);
+                            }
+                        }
+                    } else {
+                        for c in text.chars() {
+                            if c == '\n' || c == '\r' {
+                                // Pastes may contain newlines — insert literal newline
+                                app.input.insert_char('\n');
+                            } else if !c.is_control() {
+                                app.input.insert_char(c);
+                            }
                         }
                     }
                     app.last_input_was_delete = false;
