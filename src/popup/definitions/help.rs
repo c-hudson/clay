@@ -213,10 +213,14 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         "remote" => vec![
             "/remote                    List connected clients",
             "/remote --kill <id>        Disconnect a client",
+            "/remote --pause <id>       Toggle pause on a client",
             "",
             "Lists all connected WebSocket clients with their ID,",
-            "address, client type, and ping liveness status.",
+            "address, client type, ping liveness, and pause status.",
             "Use --kill <id> to forcibly disconnect a client.",
+            "Use --pause <id> to pause/resume a client. While paused,",
+            "activity on that session's world is visible to other",
+            "sessions. The client resumes automatically on next input.",
         ],
         "font" => vec![
             "/font                      Font settings (web/GUI)",
@@ -235,6 +239,22 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "Create a new world (TF-compatible).",
             "Also: /addworld name [char pass] host port",
             "  -x  Use SSL/TLS for connection",
+        ],
+        "window" => vec![
+            "/window [world]            Open a new browser window/tab",
+            "/window --grep [pattern]   Open a grep/filter window",
+            "",
+            "Opens a new web/GUI window. Optionally locks it to a",
+            "specific world by name. The --grep form opens a half-",
+            "height window with a live filter — type a regex to show",
+            "only matching lines from the current world.",
+        ],
+        "say" => vec![
+            "/say <text>                Speak text aloud (TTS)",
+            "",
+            "Uses text-to-speech to read <text> aloud on the client.",
+            "Web/GUI clients use the browser Web Speech API.",
+            "Console clients use espeak (Linux) or say (macOS).",
         ],
         _ => return None,
     };

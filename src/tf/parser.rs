@@ -1758,7 +1758,14 @@ Examples:
 
 See also: /def, /list, /undef"#.to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nUse /help for a list of all commands.", topic))),
+            _ => {
+                // Try Clay's help topics before giving up
+                if let Some(lines) = crate::popup::definitions::help::get_topic_help(topic.as_str()) {
+                    TfCommandResult::Success(Some(lines.join("\n")))
+                } else {
+                    TfCommandResult::Success(Some(format!("No help available for '{}'\nUse /help for a list of all commands.", topic)))
+                }
+            }
         }
     }
 }

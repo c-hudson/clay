@@ -231,6 +231,24 @@ body {
     border-radius: 0 3px 3px 0;
 }
 
+.status-session-paused {
+    display: flex;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 700;
+    flex-shrink: 0;
+}
+
+.status-session-paused .session-paused-label {
+    color: #fff;
+    background: var(--theme-muted-fg, #888);
+    padding: 2px 7px;
+    border-radius: 3px;
+    letter-spacing: 0.4px;
+    opacity: 0.85;
+}
+
 .status-spacer { flex: 1; }
 
 .status-activity {

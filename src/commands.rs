@@ -1087,6 +1087,7 @@ pub(crate) struct RemoteClientSnapshot {
     connected: String,
     idle: String,
     world: String,
+    paused: bool,
 }
 
 /// Start an async /remote ping check: send PingCheck to all clients, wait 2s, build output.
@@ -1122,6 +1123,7 @@ pub(crate) fn spawn_remote_ping_check(
                     connected: format_duration_short(client.connected_at.elapsed()),
                     idle: format_duration_short(client.last_activity.elapsed()),
                     world: world_name,
+                    paused: client.paused,
                 });
             }
             // Send PingCheck to each authenticated client
@@ -1141,10 +1143,10 @@ pub(crate) fn spawn_remote_ping_check(
         // No remote clients — still show console line
         app.remote_ping_responses = None;
         let lines = vec![
-            format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
-                "ID", "IP", "Type", "Conn", "Idle", "Live", "World"),
-            format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
-                "-", "localhost", "Console", "-", "-", "Yes", console_world),
+            format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
+                "ID", "IP", "Type", "Conn", "Idle", "Live", "Paused", "World"),
+            format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
+                "-", "localhost", "Console", "-", "-", "Yes", "No", console_world),
         ];
         let event_tx_clone = event_tx.clone();
         tokio::spawn(async move {
@@ -1159,14 +1161,15 @@ pub(crate) fn spawn_remote_ping_check(
         let responded = responses.lock().unwrap().clone();
 
         let mut lines = Vec::new();
-        lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
-            "ID", "IP", "Type", "Conn", "Idle", "Live", "World"));
-        lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
-            "-", "localhost", "Console", "-", "-", "Yes", console_world));
+        lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
+            "ID", "IP", "Type", "Conn", "Idle", "Live", "Paused", "World"));
+        lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
+            "-", "localhost", "Console", "-", "-", "Yes", "No", console_world));
         for snap in &snapshots {
             let alive = if responded.contains(&snap.id) { "Yes" } else { "No" };
-            lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {}",
-                snap.id, snap.ip, snap.ctype, snap.connected, snap.idle, alive, snap.world));
+            let paused = if snap.paused { "Yes" } else { "No" };
+            lines.push(format!("{:<5} {:<15} {:<7} {:<6} {:<5} {:<5} {:<6} {}",
+                snap.id, snap.ip, snap.ctype, snap.connected, snap.idle, alive, paused, snap.world));
         }
 
         let _ = event_tx.send(AppEvent::RemoteListResult(requesting_client_id, world_index, lines)).await;
@@ -2350,6 +2353,21 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 }
             } else {
                 "WebSocket server is not running.".to_string()
+            };
+            app.add_output(&msg);
+        }
+        Command::RemotePause { client_id } => {
+            let msg = match app.ws_toggle_client_paused(client_id) {
+                Some((new_paused, ip)) => {
+                    app.ws_send_to_client(client_id, WsMessage::PausedState { paused: new_paused });
+                    app.broadcast_activity();
+                    if new_paused {
+                        format!("Paused remote client {} ({}) — activity now visible on other sessions.", client_id, ip)
+                    } else {
+                        format!("Resumed remote client {} ({}).", client_id, ip)
+                    }
+                }
+                None => format!("No client with ID {}.", client_id),
             };
             app.add_output(&msg);
         }

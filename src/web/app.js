@@ -2700,6 +2700,12 @@
                 updateStatusBar();
                 break;
 
+            case 'PausedState': {
+                const el = document.getElementById('session-paused-indicator');
+                if (el) el.style.display = msg.paused ? 'flex' : 'none';
+                break;
+            }
+
             case 'ShowTagsChanged':
                 // Server toggled show_tags (F2 or /tag command)
                 showTags = msg.show_tags;

@@ -113,6 +113,8 @@ pub enum WsMessage {
     UnseenUpdate { world_index: usize, count: usize },
     /// Broadcast server's activity count (number of worlds with activity)
     ActivityUpdate { count: usize },
+    /// Sent to a specific client when its server-side pause state changes
+    PausedState { paused: bool },
     /// Broadcast when show_tags setting changes (F2 or /tag command)
     ShowTagsChanged { show_tags: bool },
     /// Server is about to reload - clients should auto-reconnect
@@ -585,6 +587,9 @@ pub struct WsClientInfo {
     pub connected_at: std::time::Instant,
     /// When the client last sent a message
     pub last_activity: std::time::Instant,
+    /// True when this session has been paused via /remote --pause.
+    /// Paused sessions don't suppress activity notices for their world.
+    pub paused: bool,
 }
 
 /// User credential for multiuser authentication
@@ -809,6 +814,18 @@ impl WebSocketServer {
                 client.current_world = world_index;
             }
         }
+    }
+
+    /// Set the paused state for a connected client. Returns (was_paused, ip_address, current_world).
+    pub fn set_client_paused(&self, client_id: u64, paused: bool) -> Option<(bool, String, Option<usize>)> {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                let was_paused = client.paused;
+                client.paused = paused;
+                return Some((was_paused, client.ip_address.clone(), client.current_world));
+            }
+        }
+        None
     }
 
     /// Set the authenticated status for a connected client
@@ -1400,6 +1417,7 @@ where
             ip_address: client_ip.clone(),
             connected_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),
+            paused: false,
         });
     }
 

@@ -826,6 +826,25 @@ pub async fn handle_daemon_ws_message(
                         });
                     }
                 }
+                Command::RemotePause { client_id: pause_id } => {
+                    let msg = match app.ws_toggle_client_paused(pause_id) {
+                        Some((new_paused, ip)) => {
+                            app.ws_send_to_client(pause_id, WsMessage::PausedState { paused: new_paused });
+                            app.broadcast_activity();
+                            if new_paused {
+                                format!("Paused remote client {} ({}) — activity now visible on other sessions.", pause_id, ip)
+                            } else {
+                                format!("Resumed remote client {} ({}).", pause_id, ip)
+                            }
+                        }
+                        None => format!("No client with ID {}.", pause_id),
+                    };
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index, data: msg, is_viewed: false,
+                        ts: current_timestamp_secs(), from_server: false,
+                        seq: 0, marked_new: false, flush: false, gagged: false,
+                    });
+                }
                 Command::BanList => {
                     let bans = app.ban_list.get_ban_info();
                     if bans.is_empty() {
@@ -1481,7 +1500,8 @@ pub async fn handle_daemon_ws_message(
             if world_index < app.worlds.len() {
                 let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
                 let vc = visible_columns.unwrap_or_else(|| app.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
-                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions });
+                let paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
+                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused });
             }
         }
         WsMessage::MarkWorldSeen { world_index } => {
@@ -1638,11 +1658,13 @@ pub async fn handle_daemon_ws_message(
                 let visible_lines = prev.map(|s| s.visible_lines).unwrap_or(24);
                 let visible_columns = prev.map(|s| s.visible_columns).unwrap_or(0);
                 let dimensions = prev.and_then(|s| s.dimensions);
+                let paused = prev.map(|s| s.paused).unwrap_or(false);
                 app.ws_client_worlds.insert(client_id, ClientViewState {
                     world_index: idx,
                     visible_lines,
                     visible_columns,
                     dimensions,
+                    paused,
                 });
                 // Update client's world in WebSocket server (async state)
                 app.ws_set_client_world(client_id, Some(idx));
