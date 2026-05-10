@@ -898,35 +898,44 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // Advanced mode: try local first, fall back to remote
-        showConnectingOverlay(standardHost + " ...");
+        // Advanced mode: race both hosts simultaneously, use whichever responds first
+        showConnectingOverlay("Connecting...");
 
-        new Thread(() -> {
-            // Quick TCP probe to the local address (2 second timeout)
-            boolean localReachable = false;
-            try {
-                java.net.Socket socket = new java.net.Socket();
-                socket.connect(new java.net.InetSocketAddress(standardHost, port), 2000);
-                socket.close();
-                localReachable = true;
-                android.util.Log.i("Clay", "Local host " + standardHost + ":" + port + " is reachable");
-            } catch (Exception e) {
-                android.util.Log.i("Clay", "Local host " + standardHost + ":" + port + " unreachable: " + e.getMessage());
-            }
+        java.util.concurrent.atomic.AtomicBoolean winnerChosen =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.atomic.AtomicInteger failureCount =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+        String[] candidates = { standardHost, remoteHostname };
 
-            if (connectCancelled) return;
-
-            String host = localReachable ? standardHost : remoteHostname;
-            String url = "http://" + host + ":" + port;
-
-            android.util.Log.i("Clay", "Using hostname: " + host + (localReachable ? " (local)" : " (remote)"));
-
-            runOnUiThread(() -> {
-                if (connectCancelled) return;
-                connectingUrl.setText(host);
-                loadUrl(url);
-            });
-        }).start();
+        for (String candidate : candidates) {
+            new Thread(() -> {
+                try {
+                    java.net.Socket socket = new java.net.Socket();
+                    socket.connect(new java.net.InetSocketAddress(candidate, port), 3000);
+                    socket.close();
+                    if (connectCancelled) return;
+                    // First thread to succeed claims the connection
+                    if (winnerChosen.compareAndSet(false, true)) {
+                        android.util.Log.i("Clay", "Race winner: " + candidate);
+                        runOnUiThread(() -> {
+                            if (connectCancelled) return;
+                            connectingUrl.setText(candidate);
+                            loadUrl("http://" + candidate + ":" + port);
+                        });
+                    }
+                } catch (Exception e) {
+                    android.util.Log.i("Clay", "Host " + candidate + " failed: " + e.getMessage());
+                    // Both hosts failed — load remote anyway and let JS handle retries
+                    if (failureCount.incrementAndGet() == candidates.length && !winnerChosen.get()) {
+                        runOnUiThread(() -> {
+                            if (connectCancelled) return;
+                            connectingUrl.setText(remoteHostname);
+                            loadUrl("http://" + remoteHostname + ":" + port);
+                        });
+                    }
+                }
+            }).start();
+        }
     }
 
     private void showConnectingOverlay(String urlText) {
