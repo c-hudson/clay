@@ -90,6 +90,8 @@ public class MainActivity extends AppCompatActivity {
     private android.widget.TextView connectingUrl;
     private android.widget.Button connectingCancelBtn;
     private volatile boolean connectCancelled = false;
+    private volatile String lastRaceWinner = null;
+    private volatile long lastRaceWinnerMs = -1;
     private boolean connectionFailed = false;
     private int notificationId = 1000;
     private boolean isConnected = false;
@@ -264,6 +266,18 @@ public class MainActivity extends AppCompatActivity {
         public void saveConnectionMode(String mode) {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             prefs.edit().putString("connectionMode", mode).apply();
+        }
+
+        @JavascriptInterface
+        public String getLastRaceResult() {
+            String winner = lastRaceWinner;
+            long ms = lastRaceWinnerMs;
+            if (winner == null) return "null";
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            String local = prefs.getString(KEY_SERVER_HOST, "");
+            String remote = prefs.getString(KEY_REMOTE_HOSTNAME, "");
+            String loser = winner.equals(local) ? remote : local;
+            return "{\"winner\":\"" + winner + "\",\"loser\":\"" + loser + "\",\"ms\":" + ms + "}";
         }
 
         @JavascriptInterface
@@ -900,12 +914,15 @@ public class MainActivity extends AppCompatActivity {
 
         // Advanced mode: race both hosts simultaneously, use whichever responds first
         showConnectingOverlay("Connecting...");
+        lastRaceWinner = null;
+        lastRaceWinnerMs = -1;
 
         java.util.concurrent.atomic.AtomicBoolean winnerChosen =
             new java.util.concurrent.atomic.AtomicBoolean(false);
         java.util.concurrent.atomic.AtomicInteger failureCount =
             new java.util.concurrent.atomic.AtomicInteger(0);
         String[] candidates = { standardHost, remoteHostname };
+        final long raceStartMs = System.currentTimeMillis();
 
         for (String candidate : candidates) {
             new Thread(() -> {
@@ -916,7 +933,9 @@ public class MainActivity extends AppCompatActivity {
                     if (connectCancelled) return;
                     // First thread to succeed claims the connection
                     if (winnerChosen.compareAndSet(false, true)) {
-                        android.util.Log.i("Clay", "Race winner: " + candidate);
+                        lastRaceWinner = candidate;
+                        lastRaceWinnerMs = System.currentTimeMillis() - raceStartMs;
+                        android.util.Log.i("Clay", "Race winner: " + candidate + " (" + lastRaceWinnerMs + " ms)");
                         runOnUiThread(() -> {
                             if (connectCancelled) return;
                             connectingUrl.setText(candidate);

@@ -1099,6 +1099,7 @@
     let hostAttemptRound = 0;  // increments each time we switch hosts; allows round-robin
     const MAX_HOST_ROUNDS = 4; // 2 rounds each = local × 2 + remote × 2 before giving up
     let lastForceReconnectAt = 0; // debounce guard against double-trigger on resume
+    let raceResultShown = false; // show Java TCP race result once per session
 
     // Debug logging - console only (no Toast)
     function debugLog(msg) {
@@ -1547,6 +1548,29 @@
         const wsUrl = `${protocol}://${host}:${port}`;
 
         showConnectionLog();
+
+        // Show Java TCP race result once per session (Android advanced mode only)
+        if (!raceResultShown && window.Android && typeof window.Android.getLastRaceResult === 'function') {
+            raceResultShown = true;
+            try {
+                var raceJson = window.Android.getLastRaceResult();
+                if (raceJson && raceJson !== 'null') {
+                    var race = JSON.parse(raceJson);
+                    if (race && race.winner) {
+                        var list = document.getElementById('connection-log-list');
+                        if (list) {
+                            var row = document.createElement('div');
+                            row.className = 'conn-info';
+                            var loserText = race.loser ? ' beat ' + race.loser : '';
+                            row.innerHTML = '<span class="conn-icon">⚡</span><span class="conn-url">' +
+                                race.winner + ' (' + race.ms + ' ms)' + loserText + '</span>';
+                            list.appendChild(row);
+                        }
+                    }
+                }
+            } catch(e) {}
+        }
+
         addConnectionAttempt(wsUrl);
 
         debugLog('connect() protocol=' + protocol + ' hasNative=' + hasNativeWebSocket());
