@@ -90,8 +90,6 @@ public class MainActivity extends AppCompatActivity {
     private android.widget.TextView connectingUrl;
     private android.widget.Button connectingCancelBtn;
     private volatile boolean connectCancelled = false;
-    private volatile String lastRaceWinner = null;
-    private volatile long lastRaceWinnerMs = -1;
     private boolean connectionFailed = false;
     private int notificationId = 1000;
     private boolean isConnected = false;
@@ -106,9 +104,8 @@ public class MainActivity extends AppCompatActivity {
     private Runnable keepaliveRunnable;
     private Handler backgroundShutdownHandler;
     private Runnable backgroundShutdownRunnable;
-    private NativeWebSocket nativeWebSocket;
-    private int nativeWsFailures = 0;
-    private long lastWsConnectTime = 0;
+    private final java.util.concurrent.ConcurrentHashMap<Integer, NativeWebSocket> nativeWebSockets =
+        new java.util.concurrent.ConcurrentHashMap<>();
     private Handler heartbeatHandler;
     private Runnable heartbeatRunnable;
     private int missedHeartbeats = 0;
@@ -133,7 +130,7 @@ public class MainActivity extends AppCompatActivity {
 
         @JavascriptInterface
         public void loadFullApp() {
-            runOnUiThread(() -> loadUrl("file:///android_asset/"));
+            runOnUiThread(() -> loadInterface());
         }
 
         @JavascriptInterface
@@ -269,18 +266,6 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
-        public String getLastRaceResult() {
-            String winner = lastRaceWinner;
-            long ms = lastRaceWinnerMs;
-            if (winner == null) return "null";
-            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-            String local = prefs.getString(KEY_SERVER_HOST, "");
-            String remote = prefs.getString(KEY_REMOTE_HOSTNAME, "");
-            String loser = winner.equals(local) ? remote : local;
-            return "{\"winner\":\"" + winner + "\",\"loser\":\"" + loser + "\",\"ms\":" + ms + "}";
-        }
-
-        @JavascriptInterface
         public void showToast(String message) {
             runOnUiThread(() -> {
                 Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
@@ -288,7 +273,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
-        public void connectWebSocket(String url) {
+        public void connectWebSocket(int id, String url) {
             runOnUiThread(() -> {
                 // Block connections until the user has configured a server
                 SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -299,35 +284,24 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
-                // Close any existing connection, clearing its callback first so
-                // async onClose/onError events from the old socket don't reach JS
-                // and corrupt the new connection's state.
-                if (nativeWebSocket != null) {
-                    nativeWebSocket.clearCallback();
-                    nativeWebSocket.close();
-                }
-
-                nativeWebSocket = new NativeWebSocket(new NativeWebSocket.WebSocketCallback() {
+                NativeWebSocket ws = new NativeWebSocket(new NativeWebSocket.WebSocketCallback() {
                     @Override
                     public void onOpen() {
-                        nativeWsFailures = 0;
-                        lastWsConnectTime = System.currentTimeMillis();
                         runOnUiThread(() -> {
-                            webView.evaluateJavascript("if (typeof onNativeWebSocketOpen === 'function') onNativeWebSocketOpen();", null);
+                            webView.evaluateJavascript(
+                                "if (typeof onNativeWebSocketOpen === 'function') onNativeWebSocketOpen(" + id + ");", null);
                         });
                     }
 
                     @Override
                     public void onMessage(String message) {
                         runOnUiThread(() -> {
-                            // Use Base64 encoding to safely pass message to JavaScript
-                            // This handles all special characters without escaping issues
                             String base64 = android.util.Base64.encodeToString(
                                 message.getBytes(java.nio.charset.StandardCharsets.UTF_8),
                                 android.util.Base64.NO_WRAP
                             );
                             webView.evaluateJavascript(
-                                "if (typeof onNativeWebSocketMessageBase64 === 'function') onNativeWebSocketMessageBase64(\"" + base64 + "\");",
+                                "if (typeof onNativeWebSocketMessageBase64 === 'function') onNativeWebSocketMessageBase64(" + id + ", \"" + base64 + "\");",
                                 null
                             );
                         });
@@ -335,23 +309,10 @@ public class MainActivity extends AppCompatActivity {
 
                     @Override
                     public void onClose(int code, String reason) {
-                        nativeWsFailures++;
-                        // If we've failed 4+ times and the last successful connect was >30s ago
-                        // (or never), the current host is likely unreachable — reload with
-                        // host resolution to try the alternate address (local↔remote fallback)
-                        boolean staleConnection = lastWsConnectTime == 0
-                            || (System.currentTimeMillis() - lastWsConnectTime) > 30000;
-                        if (nativeWsFailures >= 4 && staleConnection) {
-                            nativeWsFailures = 0;
-                            android.util.Log.i("Clay", "Multiple WS failures, reloading with host resolution");
-                            runOnUiThread(() -> {
-                                resolveHostnameAndLoad();
-                            });
-                            return;
-                        }
                         runOnUiThread(() -> {
                             String escaped = reason != null ? reason.replace("\"", "\\\"") : "";
-                            webView.evaluateJavascript("if (typeof onNativeWebSocketClose === 'function') onNativeWebSocketClose(" + code + ", \"" + escaped + "\");", null);
+                            webView.evaluateJavascript(
+                                "if (typeof onNativeWebSocketClose === 'function') onNativeWebSocketClose(" + id + ", " + code + ", \"" + escaped + "\");", null);
                         });
                     }
 
@@ -359,29 +320,44 @@ public class MainActivity extends AppCompatActivity {
                     public void onError(String error) {
                         runOnUiThread(() -> {
                             String escaped = error != null ? error.replace("\"", "\\\"") : "Unknown error";
-                            webView.evaluateJavascript("if (typeof onNativeWebSocketError === 'function') onNativeWebSocketError(\"" + escaped + "\");", null);
+                            webView.evaluateJavascript(
+                                "if (typeof onNativeWebSocketError === 'function') onNativeWebSocketError(" + id + ", \"" + escaped + "\");", null);
                         });
                     }
                 });
 
-                nativeWebSocket.connect(url);
+                nativeWebSockets.put(id, ws);
+                ws.connect(url);
+                android.util.Log.i("Clay", "connectWebSocket [" + id + "] " + url);
             });
         }
 
         @JavascriptInterface
-        public void sendWebSocketMessage(String message) {
-            if (nativeWebSocket != null) {
-                nativeWebSocket.send(message);
+        public void sendWebSocketMessage(int id, String message) {
+            NativeWebSocket ws = nativeWebSockets.get(id);
+            if (ws != null) ws.send(message);
+        }
+
+        @JavascriptInterface
+        public void closeWebSocket(int id) {
+            NativeWebSocket ws = nativeWebSockets.remove(id);
+            if (ws != null) {
+                ws.clearCallback();
+                ws.close();
+                android.util.Log.i("Clay", "closeWebSocket [" + id + "]");
             }
         }
 
         @JavascriptInterface
-        public void closeWebSocket() {
-            if (nativeWebSocket != null) {
-                nativeWebSocket.clearCallback(); // suppress async close/error from reaching JS
-                nativeWebSocket.close();
-                nativeWebSocket = null;
+        public void closeOtherWebSockets(int winnerId) {
+            for (java.util.Map.Entry<Integer, NativeWebSocket> entry : nativeWebSockets.entrySet()) {
+                if (entry.getKey() != winnerId) {
+                    entry.getValue().clearCallback();
+                    entry.getValue().close();
+                    android.util.Log.i("Clay", "closeWebSocket [" + entry.getKey() + "] (lost race to " + winnerId + ")");
+                }
             }
+            nativeWebSockets.entrySet().removeIf(e -> e.getKey() != winnerId);
         }
 
         @JavascriptInterface
@@ -429,18 +405,16 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void reloadPage() {
             runOnUiThread(() -> {
-                // Close WebSocket connection
-                if (nativeWebSocket != null) {
-                    nativeWebSocket.close();
-                    nativeWebSocket = null;
-                }
+                // Close all WebSocket connections
+                for (NativeWebSocket ws : nativeWebSockets.values()) { ws.clearCallback(); ws.close(); }
+                nativeWebSockets.clear();
                 // Clear cache for a true hard refresh
                 webView.clearCache(true);
                 // Reset interface loaded flag
                 interfaceLoaded = false;
                 loadedInterfaceUrl = null;
-                // Reload from server
-                loadWebInterface();
+                // Reload interface
+                loadInterface();
             });
         }
     }
@@ -560,8 +534,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void proceedAfterPermissions() {
-        // Always load the web interface; JS will detect empty host and show server settings
-        loadWebInterface();
+        loadInterface();
     }
 
     private void createNotificationChannel() {
@@ -696,11 +669,9 @@ public class MainActivity extends AppCompatActivity {
                     Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                     stopService(serviceIntent);
 
-                    // Close WebSocket
-                    if (nativeWebSocket != null) {
-                        nativeWebSocket.close();
-                        nativeWebSocket = null;
-                    }
+                    // Close all WebSocket connections
+                    for (NativeWebSocket ws : nativeWebSockets.values()) { ws.clearCallback(); ws.close(); }
+                    nativeWebSockets.clear();
 
                     // Notify JavaScript that we disconnected due to timeout
                     if (webView != null) {
@@ -817,8 +788,7 @@ public class MainActivity extends AppCompatActivity {
                     connectionFailed = true;
                     runOnUiThread(() -> {
                         hideConnectingOverlay();
-                        // Page failed to load from server — fall back to assets and show server settings
-                        loadUrl("");
+                        loadInterface();
                     });
                 }
             }
@@ -879,82 +849,37 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /**
-     * Resolves which hostname to use.
-     * If advanced mode is enabled, tries the local (standard) hostname first with a fast
-     * TCP probe. If that fails, falls back to the remote hostname.
-     * This avoids unreliable IP/netmask matching and handles NAT hairpinning issues.
-     */
-    private void resolveHostnameAndLoad() {
+    /** Load the web interface from bundled APK assets, injecting host/port template vars. */
+    private void loadInterface() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
 
-        // First launch — load minimal page synchronously; it calls loadFullApp() which loads the
-        // full web app, then connect() in app.js opens the clay-server settings tab when not configured.
         if (!prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
             runOnUiThread(() -> webView.loadDataWithBaseURL(
                 "file:///android_asset/", FIRST_LAUNCH_HTML, "text/html", "UTF-8", null));
             return;
         }
 
-        String standardHost = prefs.getString(KEY_SERVER_HOST, "");
-        int port = prefs.getInt(KEY_SERVER_PORT, 9000);
-        String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
-        boolean advancedEnabled = !remoteHostname.isEmpty();
-
         connectionFailed = false;
-        connectCancelled = false;
-
-        if (!advancedEnabled || remoteHostname.isEmpty()) {
-            // No advanced mode — just connect to the standard host
-            String url = "http://" + standardHost + ":" + port;
-            showConnectingOverlay(url);
-            loadUrl(url);
-            return;
-        }
-
-        // Advanced mode: race both hosts simultaneously, use whichever responds first
         showConnectingOverlay("Connecting...");
-        lastRaceWinner = null;
-        lastRaceWinnerMs = -1;
 
-        java.util.concurrent.atomic.AtomicBoolean winnerChosen =
-            new java.util.concurrent.atomic.AtomicBoolean(false);
-        java.util.concurrent.atomic.AtomicInteger failureCount =
-            new java.util.concurrent.atomic.AtomicInteger(0);
-        String[] candidates = { standardHost, remoteHostname };
-        final long raceStartMs = System.currentTimeMillis();
-
-        for (String candidate : candidates) {
-            new Thread(() -> {
-                try {
-                    java.net.Socket socket = new java.net.Socket();
-                    socket.connect(new java.net.InetSocketAddress(candidate, port), 3000);
-                    socket.close();
-                    if (connectCancelled) return;
-                    // First thread to succeed claims the connection
-                    if (winnerChosen.compareAndSet(false, true)) {
-                        lastRaceWinner = candidate;
-                        lastRaceWinnerMs = System.currentTimeMillis() - raceStartMs;
-                        android.util.Log.i("Clay", "Race winner: " + candidate + " (" + lastRaceWinnerMs + " ms)");
-                        runOnUiThread(() -> {
-                            if (connectCancelled) return;
-                            connectingUrl.setText(candidate);
-                            loadUrl("http://" + candidate + ":" + port);
-                        });
-                    }
-                } catch (Exception e) {
-                    android.util.Log.i("Clay", "Host " + candidate + " failed: " + e.getMessage());
-                    // Both hosts failed — load remote anyway and let JS handle retries
-                    if (failureCount.incrementAndGet() == candidates.length && !winnerChosen.get()) {
-                        runOnUiThread(() -> {
-                            if (connectCancelled) return;
-                            connectingUrl.setText(remoteHostname);
-                            loadUrl("http://" + remoteHostname + ":" + port);
-                        });
-                    }
-                }
-            }).start();
-        }
+        new Thread(() -> {
+            String html = loadHtmlFromAssets();
+            if (html == null) {
+                // Assets not bundled — should never happen in a release build
+                android.util.Log.e("Clay", "loadInterface: APK assets not found");
+                runOnUiThread(this::hideConnectingOverlay);
+                return;
+            }
+            html = inlineAssetsIntoHtml(html);
+            html = substituteTemplateVars(html);
+            final String finalHtml = html;
+            runOnUiThread(() -> {
+                webView.loadDataWithBaseURL("file:///android_asset/", finalHtml, "text/html", "UTF-8", null);
+                interfaceLoaded = true;
+                loadedInterfaceUrl = "file:///android_asset/";
+                hideConnectingOverlay();
+            });
+        }).start();
     }
 
     private void showConnectingOverlay(String urlText) {
@@ -967,58 +892,6 @@ public class MainActivity extends AppCompatActivity {
     private void hideConnectingOverlay() {
         connectingOverlay.setVisibility(android.view.View.GONE);
         webView.setVisibility(android.view.View.VISIBLE);
-    }
-
-    /**
-     * Load the web interface from a resolved URL.
-     * For HTTPS, fetches resources via OkHttp and inlines them.
-     * For HTTP, loads directly in the WebView.
-     */
-    private void loadUrl(String url) {
-        new Thread(() -> {
-            try {
-                if (connectCancelled) return;
-
-                // Fast path: load HTML/CSS/JS from APK assets (no network requests needed)
-                String html = loadHtmlFromAssets();
-
-                if (html != null) {
-                    html = inlineAssetsIntoHtml(html);
-                    html = substituteTemplateVars(html);
-                } else {
-                    // HTTP fallback: let WebView fetch normally
-                    final String loadUrl = url;
-                    runOnUiThread(() -> {
-                        webView.loadUrl(loadUrl);
-                        interfaceLoaded = true;
-                        loadedInterfaceUrl = loadUrl;
-                        // WebViewClient.onPageFinished will hide the overlay
-                    });
-                    return;
-                }
-
-                if (connectCancelled) return;
-                final String finalHtml = html;
-                runOnUiThread(() -> {
-                    if (connectCancelled) return;
-                    webView.loadDataWithBaseURL(url, finalHtml, "text/html", "UTF-8", null);
-                    interfaceLoaded = true;
-                    loadedInterfaceUrl = url;
-                    hideConnectingOverlay();
-                });
-            } catch (Exception e) {
-                android.util.Log.e("Clay", "Failed to load " + url + ": " + e.getMessage());
-                runOnUiThread(() -> {
-                    hideConnectingOverlay();
-                    // Fall back to assets and let JS show server settings
-                    loadUrl("file:///android_asset/");
-                });
-            }
-        }).start();
-    }
-
-    private void loadWebInterface() {
-        resolveHostnameAndLoad();
     }
 
     /** Read index.html from APK assets, or null if not available. */
@@ -1068,10 +941,17 @@ public class MainActivity extends AppCompatActivity {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String cachedTheme = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS);
         boolean settingsConfigured = prefs.getBoolean(KEY_SETUP_COMPLETE, false);
+        String localHost = prefs.getString(KEY_SERVER_HOST, "");
+        String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
+        int port = prefs.getInt(KEY_SERVER_PORT, 9000);
+        String connectionMode = prefs.getString("connectionMode", "auto");
         html = html
-            .replace("{{WS_HOST}}", "")   // JS falls back to window.location.hostname
-            .replace("{{WS_PORT}}", "0")  // sentinel: JS uses window.location.port
-            .replace("{{WS_PROTOCOL}}", "wss")  // always try wss first; JS falls back to ws
+            .replace("{{WS_HOST}}", localHost)
+            .replace("{{WS_LOCAL_HOST}}", localHost)
+            .replace("{{WS_REMOTE_HOST}}", remoteHost)
+            .replace("{{WS_PORT}}", String.valueOf(port))
+            .replace("{{WS_PROTOCOL}}", "wss")  // kept for backward compat; buildCandidates() ignores it
+            .replace("{{CONNECTION_MODE}}", connectionMode)
             .replace("{{THEME_CSS_VARS}}", cachedTheme);
         if (!settingsConfigured) {
             html = html.replace("</head>", "<script>window.SKIP_CONNECT=true;</script></head>");
@@ -1166,7 +1046,7 @@ public class MainActivity extends AppCompatActivity {
         if (prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
             if (!interfaceLoaded) {
                 android.util.Log.i("Clay", "Loading interface: not yet loaded");
-                loadWebInterface();
+                loadInterface();
             } else if (webView != null) {
                 // Interface loaded - always verify connection health on resume.
                 // Java's isConnected flag can be stale if the WS died silently,

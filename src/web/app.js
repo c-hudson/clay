@@ -1080,26 +1080,13 @@
     let wakePongTimeout = null;  // Timeout for wake-from-background health check
     let wakeStateCleared = false;  // True when world connected states were cleared before a wake Ping
 
-    // Track if we should try ws:// fallback (for self-signed cert issues)
-    let triedWsFallback = false;
-    let usingWsFallback = false;
-
-    // Track if we're using native Android WebSocket
-    let usingNativeWebSocket = false;
-    // Track if we should use native WebSocket (only after browser WebSocket fails)
-    let useNativeWebSocket = false;
-    // Count of pending native close callbacks to ignore (from explicit forceReconnect closes)
-    let nativeCloseIgnoreCount = 0;
+    // Parallel connection attempt tracking
+    let pendingAttempts = new Map();  // id → { url, proto, isNative, socket, timeout }
+    let winnerAttemptId = null;       // id of the winning attempt (null = no winner yet)
+    let nextAttemptId = 0;            // monotonic counter for attempt ids
     // Prevent two concurrent connect() calls (visibilitychange + checkConnectionOnResume race)
     let connectInProgress = false;
-
-    // Track alternate host for Android advanced mode (local/remote fallback)
-    let alternateHost = null;
-    let triedAlternateHost = false;
-    let hostAttemptRound = 0;  // increments each time we switch hosts; allows round-robin
-    const MAX_HOST_ROUNDS = 4; // 2 rounds each = local × 2 + remote × 2 before giving up
     let lastForceReconnectAt = 0; // debounce guard against double-trigger on resume
-    let raceResultShown = false; // show Java TCP race result once per session
 
     // Debug logging - console only (no Toast)
     function debugLog(msg) {
@@ -1121,95 +1108,222 @@
         }
     }
 
-    // Set up native WebSocket callbacks (called once)
-    function setupNativeWebSocketCallbacks() {
-        window.onNativeWebSocketOpen = function() {
-            connectInProgress = false;
-            debugLog('Native WS OPEN');
-            if (connectionTimeout) {
-                clearTimeout(connectionTimeout);
-                connectionTimeout = null;
-            }
-            if (ws) ws.readyState = WebSocket.OPEN;
-            connectionFailures = 0;
-            triedWsFallback = false;
-            triedAlternateHost = false;
-            hostAttemptRound = 0;
-            hideCertWarning();
-            resolveLastAttempt(true);
-            setTimeout(hideConnectionLog, 800);
+    // Build list of WebSocket candidates for this connect cycle.
+    function buildCandidates() {
+        const local = window.WS_LOCAL_HOST || window.WS_HOST || window.location.hostname;
+        const remote = window.WS_REMOTE_HOST || '';
+        const port = (window.WS_PORT && window.WS_PORT !== 0)
+            ? window.WS_PORT
+            : (window.location.port || '443');
+        let protos;
+        if (window.CONNECTION_MODE) {
+            const mode = window.CONNECTION_MODE;
+            protos = mode === 'secure' ? ['wss']
+                   : mode === 'non_secure' ? ['ws']
+                   : ['wss', 'ws'];
+        } else {
+            protos = (window.WS_PROTOCOL === 'ws') ? ['ws'] : ['wss', 'ws'];
+        }
+        const hosts = (remote && remote !== local) ? [local, remote] : [local];
+        return hosts.flatMap(h => protos.map(p => ({
+            proto: p,
+            host: h,
+            url: p + '://' + h + ':' + port
+        })));
+    }
 
-            // Check for saved credentials (Android auto-login)
-            let savedPassword = null;
-            let savedUsername = null;
-            try {
-                if (window.Android && typeof window.Android.getSavedPassword === 'function') {
-                    savedPassword = window.Android.getSavedPassword();
-                    if (typeof savedPassword !== 'string' || savedPassword.trim() === '') {
-                        savedPassword = null;
-                    }
-                }
-                if (window.Android && typeof window.Android.getSavedUsername === 'function') {
-                    savedUsername = window.Android.getSavedUsername();
-                    if (typeof savedUsername !== 'string' || savedUsername.trim() === '') {
-                        savedUsername = null;
-                    }
-                }
-            } catch (e) {
-                console.error('Error getting saved credentials:', e);
-                savedPassword = null;
-                savedUsername = null;
-            }
+    // Post-open logic shared by native and browser WebSocket winners.
+    function handleSocketOpen() {
+        if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
+        connectionFailures = 0;
+        hideCertWarning();
+        setTimeout(hideConnectionLog, 800);
 
-            if (savedPassword) {
-                // If we have both username and password, authenticate immediately
-                // (user clearly expects multiuser mode)
-                if (savedUsername) {
-                    enableMultiuserAuthUI();
-                    if (elements.authUsername) {
-                        elements.authUsername.value = savedUsername;
-                    }
-                    authenticate(savedPassword, savedUsername);
-                } else {
-                    // Only password saved - defer until ServerHello tells us if username is needed
-                    deferredAutoLoginPassword = savedPassword;
-                    deferredAutoLoginUsername = null;
-                    // Set a timeout in case ServerHello doesn't arrive
-                    setTimeout(function() {
-                        if (deferredAutoLoginPassword) {
-                            // ServerHello didn't arrive, try auth without username
-                            const pwd = deferredAutoLoginPassword;
-                            deferredAutoLoginPassword = null;
-                            authenticate(pwd, null);
-                        }
-                    }, 1000);
-                }
-            } else if (authKey && !keyAuthFailed) {
-                // Have auth key but no saved password - wait for ServerHello to try key auth
-                // Don't show auth modal yet; it will be shown if key auth fails
-                debugLog('onopen: no password but have auth key, waiting for ServerHello');
-                // Safety timeout: if ServerHello doesn't arrive within 3s, show auth modal
-                setTimeout(function() {
-                    if (!authenticated && !authKeyPending) {
-                        debugLog('ServerHello timeout, showing auth modal');
-                        showAuthModal(true);
-                        elements.authPassword.focus();
-                    }
-                }, 3000);
+        if (window.AUTO_PASSWORD) {
+            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false }));
+            return;
+        }
+
+        let savedPassword = null;
+        let savedUsername = null;
+        try {
+            if (window.Android && typeof window.Android.getSavedPassword === 'function') {
+                savedPassword = window.Android.getSavedPassword();
+                if (typeof savedPassword !== 'string' || savedPassword.trim() === '') savedPassword = null;
+            }
+            if (window.Android && typeof window.Android.getSavedUsername === 'function') {
+                savedUsername = window.Android.getSavedUsername();
+                if (typeof savedUsername !== 'string' || savedUsername.trim() === '') savedUsername = null;
+            }
+        } catch (e) {
+            console.error('Error getting saved credentials:', e);
+            savedPassword = null;
+            savedUsername = null;
+        }
+
+        if (savedPassword) {
+            if (savedUsername) {
+                enableMultiuserAuthUI();
+                if (elements.authUsername) elements.authUsername.value = savedUsername;
+                authenticate(savedPassword, savedUsername);
             } else {
-                showAuthModal(true);
-                // Pre-fill username if saved (for multiuser mode)
-                if (savedUsername && elements.authUsername) {
-                    enableMultiuserAuthUI();
-                    elements.authUsername.value = savedUsername;
-                    elements.authPassword.focus();
-                } else {
+                deferredAutoLoginPassword = savedPassword;
+                deferredAutoLoginUsername = null;
+                setTimeout(function() {
+                    if (deferredAutoLoginPassword) {
+                        const pwd = deferredAutoLoginPassword;
+                        deferredAutoLoginPassword = null;
+                        authenticate(pwd, null);
+                    }
+                }, 1000);
+            }
+        } else if (authKey && !keyAuthFailed) {
+            debugLog('handleSocketOpen: waiting for ServerHello to try key auth');
+            setTimeout(function() {
+                if (!authenticated && !authKeyPending) {
+                    debugLog('ServerHello timeout, showing auth modal');
+                    showAuthModal(true);
                     elements.authPassword.focus();
                 }
+            }, 3000);
+        } else {
+            showAuthModal(true);
+            if (savedUsername && elements.authUsername) {
+                enableMultiuserAuthUI();
+                elements.authUsername.value = savedUsername;
+                elements.authPassword.focus();
+            } else {
+                elements.authPassword.focus();
             }
+        }
+    }
+
+    // Called when an attempt's onopen fires — claims winner or closes late loser.
+    function handleAttemptWin(id) {
+        if (winnerAttemptId !== null) {
+            const attempt = pendingAttempts.get(id);
+            if (attempt) {
+                if (attempt.timeout) clearTimeout(attempt.timeout);
+                if (attempt.isNative) {
+                    if (window.Android) try { window.Android.closeWebSocket(id); } catch(e) {}
+                } else if (attempt.socket) {
+                    attempt.socket.onclose = null; attempt.socket.onerror = null;
+                    attempt.socket.onopen = null; attempt.socket.onmessage = null;
+                    try { attempt.socket.close(); } catch(e) {}
+                }
+                pendingAttempts.delete(id);
+                resolveAttempt(id, false, '(lost)');
+            }
+            return;
+        }
+
+        winnerAttemptId = id;
+        connectInProgress = false;
+
+        const attempt = pendingAttempts.get(id);
+        if (attempt && attempt.timeout) clearTimeout(attempt.timeout);
+
+        if (attempt && attempt.isNative) {
+            const winId = id;
+            ws = {
+                readyState: WebSocket.OPEN,
+                send: function(data) {
+                    if (window.Android) window.Android.sendWebSocketMessage(winId, data);
+                },
+                close: function() {
+                    if (window.Android) try { window.Android.closeWebSocket(winId); } catch(e) {}
+                    this.readyState = WebSocket.CLOSED;
+                }
+            };
+        } else if (attempt && attempt.socket) {
+            ws = attempt.socket;
+        }
+
+        pendingAttempts.forEach(function(a, aid) {
+            if (aid === id) return;
+            if (a.timeout) clearTimeout(a.timeout);
+            if (!a.isNative && a.socket) {
+                a.socket.onclose = null; a.socket.onerror = null;
+                a.socket.onopen = null; a.socket.onmessage = null;
+                try { a.socket.close(); } catch(e) {}
+            }
+            resolveAttempt(aid, false, '(canceled)');
+        });
+        pendingAttempts.clear();
+
+        if (window.Android && typeof window.Android.closeOtherWebSockets === 'function') {
+            try { window.Android.closeOtherWebSockets(id); } catch(e) {}
+        }
+
+        resolveAttempt(id, true, '');
+        setTimeout(hideConnectionLog, 800);
+        handleSocketOpen();
+    }
+
+    // Called when a pending attempt fails (before winning the race).
+    function handleAttemptFailure(id) {
+        const attempt = pendingAttempts.get(id);
+        if (!attempt) return;
+        if (attempt.timeout) clearTimeout(attempt.timeout);
+        pendingAttempts.delete(id);
+        resolveAttempt(id, false, '');
+
+        if (pendingAttempts.size === 0 && winnerAttemptId === null) {
+            connectInProgress = false;
+            connectionFailures++;
+            if (window.Android && window.Android.stopBackgroundService) {
+                window.Android.stopBackgroundService();
+            }
+            const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
+            if (connectionFailures >= maxFailures) {
+                enableConnectionLogRetry();
+            } else {
+                setTimeout(connect, 2000);
+            }
+        }
+    }
+
+    // Called when the winner socket closes (session disconnect after auth).
+    function handleSessionDisconnect(code, reason) {
+        debugLog('Session disconnect: ' + code + ' ' + reason);
+        if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
+        if (ws) ws.readyState = WebSocket.CLOSED;
+        authenticated = false;
+        hasReceivedInitialState = false;
+        winnerAttemptId = null;
+
+        if (reloadReconnect) {
+            reloadReconnectAttempts++;
+            if (reloadReconnectAttempts <= 5) {
+                var delay = reloadReconnectAttempts === 1 ? 2000 : 1000;
+                setTimeout(connect, delay);
+            } else {
+                reloadReconnect = false;
+            }
+            return;
+        }
+
+        connectionFailures++;
+        if (window.Android && window.Android.stopBackgroundService) {
+            window.Android.stopBackgroundService();
+        }
+        const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
+        if (connectionFailures >= maxFailures) {
+            enableConnectionLogRetry();
+        } else {
+            setTimeout(connect, 2000);
+        }
+    }
+
+    // Set up native WebSocket callbacks (id-scoped for parallel racing)
+    function setupNativeWebSocketCallbacks() {
+        window.onNativeWebSocketOpen = function(id) {
+            debugLog('Native WS OPEN [' + id + ']');
+            handleAttemptWin(id);
         };
 
-        window.onNativeWebSocketMessage = function(data) {
+        window.onNativeWebSocketMessage = function(id, data) {
+            if (id !== winnerAttemptId) return;
             try {
                 const msg = JSON.parse(data);
                 handleMessage(msg);
@@ -1218,16 +1332,12 @@
             }
         };
 
-        // Base64 encoded version for safer message passing from Java
-        window.onNativeWebSocketMessageBase64 = function(base64Data) {
+        window.onNativeWebSocketMessageBase64 = function(id, base64Data) {
+            if (id !== winnerAttemptId) return;
             try {
-                // Decode Base64 to string
                 const data = atob(base64Data);
-                // Convert from UTF-8 bytes to string
                 const bytes = new Uint8Array(data.length);
-                for (let i = 0; i < data.length; i++) {
-                    bytes[i] = data.charCodeAt(i);
-                }
+                for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i);
                 const decoded = new TextDecoder('utf-8').decode(bytes);
                 const msg = JSON.parse(decoded);
                 handleMessage(msg);
@@ -1236,146 +1346,21 @@
             }
         };
 
-        window.onNativeWebSocketClose = function(code, reason) {
-            debugLog('Native WS CLOSE: ' + code + ' ' + reason);
-            // Ignore closes that were triggered by forceReconnect — they fire asynchronously
-            // and would corrupt the already-started new connection's state.
-            if (nativeCloseIgnoreCount > 0) {
-                nativeCloseIgnoreCount--;
-                debugLog('Ignoring stale native close from forceReconnect');
-                return;
-            }
-            connectInProgress = false;
-            if (connectionTimeout) {
-                clearTimeout(connectionTimeout);
-                connectionTimeout = null;
-            }
-            if (wakePongTimeout) {
-                clearTimeout(wakePongTimeout);
-                wakePongTimeout = null;
-            }
-            if (ws) ws.readyState = WebSocket.CLOSED;
-            authenticated = false;
-            hasReceivedInitialState = false;
-
-            // Server reload - auto-reconnect with retry
-            if (reloadReconnect) {
-                reloadReconnectAttempts++;
-                if (reloadReconnectAttempts <= 5) {
-                    var delay = reloadReconnectAttempts === 1 ? 2000 : 1000;
-                    setTimeout(connect, delay);
-                } else {
-                    reloadReconnect = false;
-                }
-                return;
-            }
-
-            resolveLastAttempt(false);
-            connectionFailures++;
-
-            if (window.Android && window.Android.stopBackgroundService) {
-                window.Android.stopBackgroundService();
-            }
-
-            // Try alternate host (Android advanced mode) before giving up
-            if (connectionFailures >= 2 && hostAttemptRound < MAX_HOST_ROUNDS) {
-                hostAttemptRound++;
-                if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
-                    try {
-                        const info = JSON.parse(window.Android.getConnectionInfo());
-                        if (info.remoteHost) {
-                            const currentHost = alternateHost || window.WS_HOST || window.location.hostname;
-                            const altHost = (currentHost === info.remoteHost) ? info.localHost : info.remoteHost;
-                            if (altHost && altHost !== currentHost) {
-                                console.log('Native WS failed on ' + currentHost + ', trying alternate: ' + altHost);
-                                alternateHost = altHost;
-                                connectionFailures = 0;
-                                setTimeout(connect, 500);
-                                return;
-                            }
-                        }
-                    } catch (e) {
-                        console.log('getConnectionInfo error: ' + e);
-                    }
-                }
-            }
-
-            // WebView mode: allow more retries (server may still be starting after reload)
-            const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
-            if (connectionFailures >= maxFailures) {
-                enableConnectionLogRetry();
-            } else {
-                setTimeout(connect, 2000);
+        window.onNativeWebSocketClose = function(id, code, reason) {
+            debugLog('Native WS CLOSE [' + id + ']: ' + code + ' ' + reason);
+            if (id === winnerAttemptId) {
+                handleSessionDisconnect(code, reason);
+            } else if (pendingAttempts.has(id)) {
+                handleAttemptFailure(id);
             }
         };
 
-        window.onNativeWebSocketError = function(error) {
-            debugLog('Native WS ERROR: ' + error);
-            // Ignore errors from sockets closed by forceReconnect — they fire asynchronously
-            // (via onFailure on a dead TCP connection) and would corrupt the new connection's state.
-            if (nativeCloseIgnoreCount > 0) {
-                nativeCloseIgnoreCount--;
-                debugLog('Ignoring stale native error from forceReconnect');
-                return;
-            }
-            // Connection attempt failed (TLS error, refused, etc.) — not a session disconnect.
-            // Handle wss->ws fallback here rather than delegating to onNativeWebSocketClose,
-            // which fires for both failures and normal session ends.
-            connectInProgress = false;
-            if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
-            if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
-            if (ws) ws.readyState = WebSocket.CLOSED;
-            authenticated = false;
-            hasReceivedInitialState = false;
-            resolveLastAttempt(false);
-            connectionFailures++;
-            if (window.Android && window.Android.stopBackgroundService) {
-                window.Android.stopBackgroundService();
-            }
-            // wss:// failed to connect — fall back to ws:// (unless secure mode)
-            if (window.WS_PROTOCOL === 'wss' && !triedWsFallback && !usingWsFallback) {
-                var nativeErrMode = 'auto';
-                if (window.Android && typeof Android.getConnectionMode === 'function') {
-                    try { nativeErrMode = Android.getConnectionMode() || 'auto'; } catch(e) {}
-                }
-                if (nativeErrMode !== 'secure') {
-                    console.log('Native wss:// failed, trying ws:// fallback...');
-                    triedWsFallback = true;
-                    usingWsFallback = true;
-                    usingNativeWebSocket = false;
-                    useNativeWebSocket = false;
-                    connectionFailures = 0;
-                    setTimeout(connect, 500);
-                    return;
-                }
-            }
-            // In secure mode (or after wss/ws fallbacks exhausted), try alternate host
-            if (connectionFailures >= 2 && hostAttemptRound < MAX_HOST_ROUNDS) {
-                hostAttemptRound++;
-                if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
-                    try {
-                        const info = JSON.parse(window.Android.getConnectionInfo());
-                        if (info.remoteHost) {
-                            const currentHost = alternateHost || window.WS_HOST || window.location.hostname;
-                            const altHost = (currentHost === info.remoteHost) ? info.localHost : info.remoteHost;
-                            if (altHost && altHost !== currentHost) {
-                                console.log('Native WS error on ' + currentHost + ', trying alternate: ' + altHost);
-                                alternateHost = altHost;
-                                connectionFailures = 0;
-                                setTimeout(connect, 500);
-                                return;
-                            }
-                        }
-                    } catch (e) {
-                        console.log('getConnectionInfo error: ' + e);
-                    }
-                }
-            }
-            const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
-            if (connectionFailures >= maxFailures) {
-                enableConnectionLogRetry();
-            } else {
-                setTimeout(connect, 2000);
+        window.onNativeWebSocketError = function(id, error) {
+            debugLog('Native WS ERROR [' + id + ']: ' + error);
+            if (id === winnerAttemptId) {
+                handleSessionDisconnect(1006, error);
+            } else if (pendingAttempts.has(id)) {
+                handleAttemptFailure(id);
             }
         };
     }
@@ -1384,69 +1369,97 @@
     if (hasNativeWebSocket()) {
         setupNativeWebSocketCallbacks();
 
-        // Clean up native WebSocket on page unload/reload
         window.addEventListener('beforeunload', function() {
-            if (window.Android && window.Android.closeWebSocket) {
-                window.Android.closeWebSocket();
+            if (!window.Android) return;
+            if (winnerAttemptId !== null) {
+                try { window.Android.closeWebSocket(winnerAttemptId); } catch(e) {}
             }
+            pendingAttempts.forEach(function(a, id) {
+                if (a.isNative) try { window.Android.closeWebSocket(id); } catch(e) {}
+            });
         });
 
-        // Also handle pagehide for mobile browsers
         window.addEventListener('pagehide', function() {
-            if (window.Android && window.Android.closeWebSocket) {
-                window.Android.closeWebSocket();
+            if (!window.Android) return;
+            if (winnerAttemptId !== null) {
+                try { window.Android.closeWebSocket(winnerAttemptId); } catch(e) {}
             }
+            pendingAttempts.forEach(function(a, id) {
+                if (a.isNative) try { window.Android.closeWebSocket(id); } catch(e) {}
+            });
         });
     }
 
-    function connectWithNativeWebSocket(wsUrl) {
-        debugLog('Native WS connecting: ' + wsUrl);
-        usingNativeWebSocket = true;
-
-        // Close any existing native WebSocket first
-        if (window.Android && window.Android.closeWebSocket) {
-            try {
-                window.Android.closeWebSocket();
-            } catch (e) {
-                debugLog('Error closing prev WS: ' + e);
+    function connectWithNativeWebSocket(id, url) {
+        debugLog('Native WS connecting [' + id + ']: ' + url);
+        const timeout = setTimeout(function() {
+            if (pendingAttempts.has(id)) {
+                console.log('Native WebSocket [' + id + '] timeout');
+                if (window.Android) try { window.Android.closeWebSocket(id); } catch(e) {}
+                handleAttemptFailure(id);
             }
+        }, 5000);
+        pendingAttempts.set(id, { url: url, proto: 'wss', isNative: true, timeout: timeout });
+        try {
+            window.Android.connectWebSocket(id, url);
+        } catch (e) {
+            console.error('connectWebSocket error:', e);
+            handleAttemptFailure(id);
+        }
+    }
+
+    function connectWithBrowserWebSocket(id, url) {
+        debugLog('Browser WS connecting [' + id + ']: ' + url);
+        let socket;
+        try {
+            socket = new WebSocket(url);
+        } catch (e) {
+            console.error('Failed to create WebSocket for ' + url + ': ' + e);
+            setTimeout(function() { handleAttemptFailure(id); }, 0);
+            return;
         }
 
-        // Create a fake WebSocket object that bridges to native
-        ws = {
-            readyState: WebSocket.CONNECTING,
-            send: function(data) {
-                if (window.Android && window.Android.sendWebSocketMessage) {
-                    window.Android.sendWebSocketMessage(data);
-                }
-            },
-            close: function() {
-                if (window.Android && window.Android.closeWebSocket) {
-                    window.Android.closeWebSocket();
-                }
-                this.readyState = WebSocket.CLOSED;
-            }
-        };
-
-        // Set a 5-second timeout for connection
-        connectionTimeout = setTimeout(function() {
-            if (ws && ws.readyState === WebSocket.CONNECTING) {
-                console.log('Native WebSocket connection timeout');
-                if (window.Android && window.Android.closeWebSocket) {
-                    window.Android.closeWebSocket();
-                }
-                ws.readyState = WebSocket.CLOSED;
-                window.onNativeWebSocketClose(1006, 'Connection timeout');
+        const timeout = setTimeout(function() {
+            if (pendingAttempts.has(id)) {
+                socket.onclose = null; socket.onerror = null; socket.onopen = null;
+                try { socket.close(); } catch(e) {}
+                handleAttemptFailure(id);
             }
         }, 5000);
 
-        // Initiate native WebSocket connection
-        window.Android.connectWebSocket(wsUrl);
+        pendingAttempts.set(id, { url: url, proto: url.startsWith('wss') ? 'wss' : 'ws', isNative: false, socket: socket, timeout: timeout });
+
+        socket.onopen = function() {
+            if (!pendingAttempts.has(id)) return;
+            const a = pendingAttempts.get(id);
+            if (a && a.timeout) clearTimeout(a.timeout);
+            handleAttemptWin(id);
+        };
+
+        socket.onclose = function(event) {
+            if (id === winnerAttemptId) {
+                handleSessionDisconnect(event.code, event.reason);
+            } else if (pendingAttempts.has(id)) {
+                handleAttemptFailure(id);
+            }
+        };
+
+        socket.onerror = function() {
+            // onclose will follow; let that drive the failure logic
+        };
+
+        socket.onmessage = function(event) {
+            if (id !== winnerAttemptId) return;
+            try {
+                const msg = JSON.parse(event.data);
+                handleMessage(msg);
+            } catch (e) {
+                console.error('Failed to parse message:', e);
+            }
+        };
     }
 
-    // Cleanly close any existing socket, nulling its handlers first to prevent stale
-    // onclose callbacks from corrupting reconnect state after an explicit close.
-    // Resets all fallback flags so we always start fresh on the primary host.
+    // Cleanly close all pending attempts and the winner, then reconnect.
     function forceReconnect() {
         var now = Date.now();
         if (now - lastForceReconnectAt < 1000) {
@@ -1456,49 +1469,46 @@
         lastForceReconnectAt = now;
         if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
         if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
+
+        pendingAttempts.forEach(function(attempt, id) {
+            if (attempt.timeout) clearTimeout(attempt.timeout);
+            if (attempt.isNative) {
+                if (window.Android) try { window.Android.closeWebSocket(id); } catch(e) {}
+            } else if (attempt.socket) {
+                attempt.socket.onclose = null; attempt.socket.onerror = null;
+                attempt.socket.onopen = null; attempt.socket.onmessage = null;
+                try { attempt.socket.close(); } catch(e) {}
+            }
+        });
+        pendingAttempts.clear();
+
         if (ws) {
-            ws.onclose = null;
-            ws.onerror = null;
-            ws.onopen = null;
-            ws.onmessage = null;
-            // If using native WebSocket, the close fires asynchronously via onNativeWebSocketClose.
-            // Suppress it so the stale callback doesn't corrupt the new connection's state.
-            // Safety net: only suppress if socket is still live (OPEN/CONNECTING).
-            // Dead sockets (CLOSED) won't fire events; over-counting suppresses the new socket.
-            // Java's clearCallback() prevents most stale events; this absorbs any that race through.
-            if (usingNativeWebSocket && ws.readyState !== WebSocket.CLOSED) nativeCloseIgnoreCount++;
-            try { ws.close(); } catch (e) {}
+            ws.onclose = null; ws.onerror = null;
+            ws.onopen = null; ws.onmessage = null;
+            if (winnerAttemptId !== null && window.Android) {
+                try { window.Android.closeWebSocket(winnerAttemptId); } catch(e) {}
+            }
+            try { ws.close(); } catch(e) {}
             ws = null;
         }
+
+        winnerAttemptId = null;
         connectionFailures = 0;
-        triedWsFallback = false;
-        usingWsFallback = false;
-        useNativeWebSocket = false;
-        usingNativeWebSocket = false;
-        alternateHost = null;
-        triedAlternateHost = false;
-        hostAttemptRound = 0;
-        keyAuthFailed = false;  // Explicit reconnect resets this so key auth can be tried again
-        connectInProgress = false;  // Allow the new connect() call to proceed
-        // Clear stale world connected states and auth so the status bar shows disconnected
-        // immediately rather than showing the previous session's green dot
+        keyAuthFailed = false;
+        connectInProgress = false;
         authenticated = false;
         wakeStateCleared = false;
+
         Object.keys(worlds).forEach(function(k) {
             if (worlds[k]) worlds[k].connected = false;
         });
         updateStatusBar();
-        // Reset WS_HOST to local host so reconnect probes localhost first (not last-used remote)
-        if (window.Android && typeof Android.getConnectionInfo === 'function') {
-            try {
-                var info = JSON.parse(Android.getConnectionInfo());
-                if (info.localHost) window.WS_HOST = info.localHost;
-            } catch(e) {}
-        }
+
         var logList = document.getElementById('connection-log-list');
         if (logList) logList.innerHTML = '';
         var logRetryBtn = document.getElementById('connection-log-retry-btn');
         if (logRetryBtn) logRetryBtn.disabled = true;
+
         connect();
     }
 
@@ -1508,17 +1518,6 @@
             return;
         }
 
-        // Read connection mode setting (Android only); 'auto' = current behavior
-        var connectionMode = 'auto';
-        if (window.Android && typeof Android.getConnectionMode === 'function') {
-            try { connectionMode = Android.getConnectionMode() || 'auto'; } catch(e) {}
-        }
-        // Non-secure mode: force ws:// by acting as if ws fallback is already selected
-        if (connectionMode === 'non_secure' && !usingWsFallback) {
-            usingWsFallback = true;
-        }
-
-        // On Android, block connections until settings have been saved at least once
         if (window.Android && typeof window.Android.isSettingsConfigured === 'function') {
             if (!window.Android.isSettingsConfigured()) {
                 openSettingsPopup('clay-server');
@@ -1528,282 +1527,24 @@
             return;
         }
 
-        connectInProgress = true;
-
-        // Use alternate host if we're in fallback mode, otherwise use WS_HOST
-        const host = alternateHost || window.WS_HOST || window.location.hostname;
-
-        // Guard: empty hostname means no server is configured — open settings instead.
-        if (!host) {
-            connectInProgress = false;
+        const candidates = buildCandidates();
+        if (!candidates.length || !candidates[0].host) {
             openSettingsPopup('clay-server');
             return;
         }
 
-        // Use ws:// fallback if we've already failed with wss://
-        const protocol = usingWsFallback ? 'ws' : window.WS_PROTOCOL;
-        // WS_PORT=0 means WS shares the HTTP port (unified server)
-        const port = (window.WS_PORT && window.WS_PORT !== 0)
-            ? window.WS_PORT : (window.location.port || (protocol === 'wss' ? '443' : '80'));
-        const wsUrl = `${protocol}://${host}:${port}`;
-
+        connectInProgress = true;
         showConnectionLog();
 
-        // Show Java TCP race result once per session (Android advanced mode only)
-        if (!raceResultShown && window.Android && typeof window.Android.getLastRaceResult === 'function') {
-            raceResultShown = true;
-            try {
-                var raceJson = window.Android.getLastRaceResult();
-                if (raceJson && raceJson !== 'null') {
-                    var race = JSON.parse(raceJson);
-                    if (race && race.winner) {
-                        var list = document.getElementById('connection-log-list');
-                        if (list) {
-                            var row = document.createElement('div');
-                            row.className = 'conn-info';
-                            var loserText = race.loser ? ' beat ' + race.loser : '';
-                            row.innerHTML = '<span class="conn-icon">⚡</span><span class="conn-url">' +
-                                race.winner + ' (' + race.ms + ' ms)' + loserText + '</span>';
-                            list.appendChild(row);
-                        }
-                    }
-                }
-            } catch(e) {}
-        }
-
-        addConnectionAttempt(wsUrl);
-
-        debugLog('connect() protocol=' + protocol + ' hasNative=' + hasNativeWebSocket());
-
-        // Clear any existing timeout
-        if (connectionTimeout) {
-            clearTimeout(connectionTimeout);
-            connectionTimeout = null;
-        }
-
-        // If we've determined we need native WebSocket, use it directly
-        if (useNativeWebSocket && hasNativeWebSocket()) {
-            debugLog('Using native WS (fallback mode)');
-            connectWithNativeWebSocket(wsUrl);
-            return;
-        }
-
-        // On Android with wss://, use native WebSocket directly (handles self-signed certs)
-        if (hasNativeWebSocket() && protocol === 'wss') {
-            debugLog('Using native WS for wss://');
-            connectWithNativeWebSocket(wsUrl);
-            return;
-        }
-
-        // Standard browser WebSocket
-        debugLog('Using browser WebSocket');
-        usingNativeWebSocket = false;
-        try {
-            ws = new WebSocket(wsUrl);
-
-            // Set a 5-second timeout for connection
-            connectionTimeout = setTimeout(function() {
-                if (ws && ws.readyState === WebSocket.CONNECTING) {
-                    ws.close();
-                }
-            }, 5000);
-
-            ws.onopen = function() {
-                connectInProgress = false;
-                if (connectionTimeout) {
-                    clearTimeout(connectionTimeout);
-                    connectionTimeout = null;
-                }
-                connectionFailures = 0;
-                triedWsFallback = false; // Reset for future reconnects
-                triedAlternateHost = false;
-                hostAttemptRound = 0;
-                hideCertWarning();
-                resolveLastAttempt(true);
-                setTimeout(hideConnectionLog, 800);
-
-                // Auto-authenticate for embedded WebView GUI (pre-hashed password)
-                if (window.AUTO_PASSWORD) {
-                    ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false }));
-                    return;
-                }
-
-                // Check for saved credentials (Android auto-login)
-                let savedPassword = null;
-                let savedUsername = null;
-                try {
-                    if (window.Android && typeof window.Android.getSavedPassword === 'function') {
-                        savedPassword = window.Android.getSavedPassword();
-                        // Ensure it's a non-empty string
-                        if (typeof savedPassword !== 'string' || savedPassword.trim() === '') {
-                            savedPassword = null;
-                        }
-                    }
-                    if (window.Android && typeof window.Android.getSavedUsername === 'function') {
-                        savedUsername = window.Android.getSavedUsername();
-                        if (typeof savedUsername !== 'string' || savedUsername.trim() === '') {
-                            savedUsername = null;
-                        }
-                    }
-                } catch (e) {
-                    console.error('Error getting saved credentials:', e);
-                    savedPassword = null;
-                    savedUsername = null;
-                }
-
-                if (savedPassword) {
-                    // If we have both username and password, authenticate immediately
-                    // (user clearly expects multiuser mode)
-                    if (savedUsername) {
-                        enableMultiuserAuthUI();
-                        if (elements.authUsername) {
-                            elements.authUsername.value = savedUsername;
-                        }
-                        authenticate(savedPassword, savedUsername);
-                    } else {
-                        // Only password saved - defer until ServerHello tells us if username is needed
-                        deferredAutoLoginPassword = savedPassword;
-                        deferredAutoLoginUsername = null;
-                        // Set a timeout in case ServerHello doesn't arrive
-                        setTimeout(function() {
-                            if (deferredAutoLoginPassword) {
-                                // ServerHello didn't arrive, try auth without username
-                                const pwd = deferredAutoLoginPassword;
-                                deferredAutoLoginPassword = null;
-                                authenticate(pwd, null);
-                            }
-                        }, 1000);
-                    }
-                } else if (authKey && !keyAuthFailed) {
-                    // Have auth key but no saved password - wait for ServerHello to try key auth
-                    debugLog('ws.onopen: no password but have auth key, waiting for ServerHello');
-                    // Safety timeout: if ServerHello doesn't arrive within 3s, show auth modal
-                    setTimeout(function() {
-                        if (!authenticated && !authKeyPending) {
-                            debugLog('ServerHello timeout, showing auth modal');
-                            showAuthModal(true);
-                            elements.authPassword.focus();
-                        }
-                    }, 3000);
-                } else {
-                    showAuthModal(true);
-                    // Pre-fill username if saved (for multiuser mode)
-                    if (savedUsername && elements.authUsername) {
-                        enableMultiuserAuthUI();
-                        elements.authUsername.value = savedUsername;
-                        elements.authPassword.focus();
-                    } else {
-                        elements.authPassword.focus();
-                    }
-                }
-            };
-
-            ws.onclose = function() {
-                connectInProgress = false;
-                if (connectionTimeout) {
-                    clearTimeout(connectionTimeout);
-                    connectionTimeout = null;
-                }
-                if (wakePongTimeout) {
-                    clearTimeout(wakePongTimeout);
-                    wakePongTimeout = null;
-                }
-                authenticated = false;
-                hasReceivedInitialState = false;  // Reset so we use server's world on reconnect
-
-                // Server reload - auto-reconnect with retry
-                if (reloadReconnect) {
-                    reloadReconnectAttempts++;
-                    if (reloadReconnectAttempts <= 5) {
-                        var delay = reloadReconnectAttempts === 1 ? 2000 : 1000;
-                        setTimeout(connect, delay);
-                    } else {
-                        reloadReconnect = false;
-                    }
-                    return;
-                }
-
-                resolveLastAttempt(false);
-                connectionFailures++;
-                // Stop Android foreground service when disconnected
-                if (window.Android && window.Android.stopBackgroundService) {
-                    window.Android.stopBackgroundService();
-                }
-
-                // If wss:// failed, try native WebSocket (Android) or ws:// fallback
-                if (window.WS_PROTOCOL === 'wss' && !triedWsFallback && !usingWsFallback) {
-                    // On Android with native WebSocket, try that first (handles self-signed certs)
-                    if (hasNativeWebSocket() && !useNativeWebSocket) {
-                        console.log('wss:// connection failed, trying native Android WebSocket...');
-                        useNativeWebSocket = true;
-                        connectionFailures = 0;
-                        setTimeout(connect, 500);
-                        return;
-                    }
-                    // Skip ws:// fallback if user has chosen Secure mode
-                    if (connectionMode !== 'secure') {
-                        console.log('wss:// connection failed, trying ws:// fallback...');
-                        triedWsFallback = true;
-                        usingWsFallback = true;
-                        connectionFailures = 0;
-                        setTimeout(connect, 500);
-                        return;
-                    }
-                }
-
-                // After 2 failures, try alternate host (Android advanced mode) before giving up
-                if (connectionFailures >= 2 && hostAttemptRound < MAX_HOST_ROUNDS) {
-                    hostAttemptRound++;
-                    if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
-                        try {
-                            const info = JSON.parse(window.Android.getConnectionInfo());
-                            if (info.remoteHost) {
-                                const currentHost = window.WS_HOST || window.location.hostname;
-                                const altHost = (currentHost === info.remoteHost) ? info.localHost : info.remoteHost;
-                                if (altHost && altHost !== currentHost) {
-                                    console.log('Connection failed on ' + currentHost + ', trying alternate: ' + altHost);
-                                    alternateHost = altHost;
-                                    connectionFailures = 0;
-                                    triedWsFallback = false;
-                                    usingWsFallback = false;
-                                    useNativeWebSocket = false;
-                                    setTimeout(connect, 500);
-                                    return;
-                                }
-                            }
-                        } catch (e) {
-                            console.log('getConnectionInfo error: ' + e);
-                        }
-                    }
-                }
-
-                if (connectionFailures >= 2) {
-                    if (window.WS_PROTOCOL === 'wss' && !usingWsFallback && !usingNativeWebSocket) {
-                        showCertWarning();
-                    }
-                    enableConnectionLogRetry();
-                } else {
-                    setTimeout(connect, 3000);
-                }
-            };
-
-            ws.onerror = function(e) {
-                resolveLastAttempt(false);
-            };
-
-            ws.onmessage = function(event) {
-                try {
-                    const msg = JSON.parse(event.data);
-                    handleMessage(msg);
-                } catch (e) {
-                    console.error('Failed to parse message:', e);
-                }
-            };
-        } catch (e) {
-            resolveLastAttempt(false);
-            console.error('Failed to connect:', e);
-            setTimeout(connect, 3000);
-        }
+        candidates.forEach(function(candidate) {
+            const id = nextAttemptId++;
+            addConnectionAttempt(candidate.url, id);
+            if (candidate.proto === 'wss' && hasNativeWebSocket()) {
+                connectWithNativeWebSocket(id, candidate.url);
+            } else {
+                connectWithBrowserWebSocket(id, candidate.url);
+            }
+        });
     }
 
     // Handle incoming messages
@@ -5593,26 +5334,30 @@
         if (modal) modal.style.display = 'none';
     }
 
-    function addConnectionAttempt(url) {
+    function addConnectionAttempt(url, id) {
         var list = document.getElementById('connection-log-list');
         if (!list) return;
         var row = document.createElement('div');
         row.className = 'conn-attempt pending';
+        row.dataset.attemptId = id;
         row.innerHTML = '<span class="conn-icon">⟳</span><span class="conn-url">' + url + '</span>';
         list.appendChild(row);
         list.scrollTop = list.scrollHeight;
     }
 
-    function resolveLastAttempt(success) {
+    function resolveAttempt(id, success, suffix) {
         var list = document.getElementById('connection-log-list');
         if (!list) return;
-        var rows = list.querySelectorAll('.conn-attempt.pending');
-        var row = rows[rows.length - 1];
+        var row = list.querySelector('[data-attempt-id="' + id + '"]');
         if (!row) return;
         row.classList.remove('pending');
         row.classList.add(success ? 'success' : 'failed');
         var icon = row.querySelector('.conn-icon');
         if (icon) icon.textContent = success ? '✓' : '✗';
+        if (suffix) {
+            var urlSpan = row.querySelector('.conn-url');
+            if (urlSpan) urlSpan.textContent += ' ' + suffix;
+        }
     }
 
     function enableConnectionLogRetry() {
@@ -9129,7 +8874,7 @@
 
     // Expose native WebSocket check for debugging
     window.isUsingNativeWebSocket = function() {
-        return usingNativeWebSocket;
+        return winnerAttemptId !== null;
     };
 
     // Called by Android when the 1-hour background shutdown timer fires
@@ -9137,14 +8882,9 @@
         debugLog('Background timeout - connection closed by Android');
         authenticated = false;
         hasReceivedInitialState = false;
-        // Reset all fallback state so the next reconnect (on resume) starts fresh
         connectionFailures = 0;
-        triedWsFallback = false;
-        usingWsFallback = false;
-        useNativeWebSocket = false;
-        alternateHost = null;
-        triedAlternateHost = false;
-        hostAttemptRound = 0;
+        winnerAttemptId = null;
+        pendingAttempts.clear();
         // Don't auto-reconnect here - we're in the background and Android disconnected
         // to save power. Reconnection will happen when user returns (checkConnectionOnResume).
     };
@@ -9160,8 +8900,11 @@
             debugLog('checkConnectionOnResume: wake check already in progress, skipping');
             return;
         }
-        // visibilitychange may have already handled the reconnect — skip if a reconnect
-        // is already in progress (new socket CONNECTING) to avoid a double-trigger.
+        // If parallel candidates are in flight, ws is still null — connectInProgress guards this.
+        if (connectInProgress) {
+            debugLog('checkConnectionOnResume: connect in progress, skipping');
+            return;
+        }
         if (ws && ws.readyState === WebSocket.CONNECTING) {
             debugLog('checkConnectionOnResume: reconnect already in progress, skipping');
             return;
