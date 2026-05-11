@@ -894,12 +894,19 @@ public class MainActivity extends AppCompatActivity {
         webView.setVisibility(android.view.View.VISIBLE);
     }
 
+    private static byte[] readFullStream(java.io.InputStream is) throws java.io.IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = is.read(buf)) != -1) out.write(buf, 0, n);
+        return out.toByteArray();
+    }
+
     /** Read index.html from APK assets, or null if not available. */
     private String loadHtmlFromAssets() {
         try {
             java.io.InputStream is = getAssets().open("web/index.html");
-            byte[] buffer = new byte[is.available()];
-            is.read(buffer);
+            byte[] buffer = readFullStream(is);
             is.close();
             return new String(buffer, "UTF-8");
         } catch (java.io.IOException e) {
@@ -911,8 +918,7 @@ public class MainActivity extends AppCompatActivity {
     private String inlineAssetsIntoHtml(String html) {
         try {
             java.io.InputStream is = getAssets().open("web/style.css");
-            byte[] buffer = new byte[is.available()];
-            is.read(buffer);
+            byte[] buffer = readFullStream(is);
             is.close();
             String css = new String(buffer, "UTF-8");
             html = html.replace("<link rel=\"stylesheet\" href=\"style.css\">",
@@ -923,8 +929,7 @@ public class MainActivity extends AppCompatActivity {
 
         try {
             java.io.InputStream is = getAssets().open("web/app.js");
-            byte[] buffer = new byte[is.available()];
-            is.read(buffer);
+            byte[] buffer = readFullStream(is);
             is.close();
             String js = new String(buffer, "UTF-8");
             html = html.replace("<script src=\"app.js\"></script>",

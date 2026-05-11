@@ -1125,11 +1125,13 @@
             protos = (window.WS_PROTOCOL === 'ws') ? ['ws'] : ['wss', 'ws'];
         }
         const hosts = (remote && remote !== local) ? [local, remote] : [local];
-        return hosts.flatMap(h => protos.map(p => ({
-            proto: p,
-            host: h,
-            url: p + '://' + h + ':' + port
-        })));
+        const result = [];
+        hosts.forEach(function(h) {
+            protos.forEach(function(p) {
+                result.push({ proto: p, host: h, url: p + '://' + h + ':' + port });
+            });
+        });
+        return result;
     }
 
     // Post-open logic shared by native and browser WebSocket winners.
