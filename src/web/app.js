@@ -3,6 +3,24 @@
 (function() {
     'use strict';
 
+    // DIAGNOSTIC: surface uncaught errors on-screen (blank-screen debugging)
+    function __clayShowError(msg) {
+        try { if (window.Android && window.Android.showErrorBanner) window.Android.showErrorBanner(msg); } catch(_) {}
+        try {
+            var d = document.createElement('div');
+            d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#a00;color:#fff;font:14px monospace;padding:8px;white-space:pre-wrap;word-break:break-all;max-height:60vh;overflow:auto;';
+            d.textContent = 'CLAY JS ERROR\n' + msg;
+            (document.body || document.documentElement).appendChild(d);
+        } catch(_) {}
+    }
+    window.addEventListener('error', function(e) {
+        __clayShowError((e.message || 'error') + '\n@ ' + (e.filename || '?') + ':' + (e.lineno || '?') + ':' + (e.colno || '?') + (e.error && e.error.stack ? '\n' + e.error.stack : ''));
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+        var r = e.reason;
+        __clayShowError('unhandled rejection: ' + (r && r.message ? r.message : String(r)) + (r && r.stack ? '\n' + r.stack : ''));
+    });
+
     // IPC: send a message to the native Rust side.
     // Primary path: window.ipc.postMessage (wry-injected, uses webkit.messageHandlers).
     // Fallback: POST to clay://localhost/ipc — used when webkit.messageHandlers is
@@ -8950,5 +8968,5 @@
     };
 
     // Start the app
-    init();
+    try { init(); } catch (e) { __clayShowError('init() threw: ' + (e && e.stack ? e.stack : e)); }
 })();

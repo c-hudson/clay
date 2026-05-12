@@ -273,6 +273,13 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public void showErrorBanner(String message) {
+            runOnUiThread(() -> {
+                Toast.makeText(MainActivity.this, "JS ERROR: " + message, Toast.LENGTH_LONG).show();
+            });
+        }
+
+        @JavascriptInterface
         public void connectWebSocket(int id, String url) {
             runOnUiThread(() -> {
                 // Block connections until the user has configured a server
@@ -843,8 +850,13 @@ public class MainActivity extends AppCompatActivity {
 
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
-            public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
-                return super.onConsoleMessage(consoleMessage);
+            public boolean onConsoleMessage(ConsoleMessage cm) {
+                if (cm.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                        "JS: " + cm.message() + " @ " + cm.sourceId() + ":" + cm.lineNumber(),
+                        Toast.LENGTH_LONG).show());
+                }
+                return true;
             }
         });
     }
