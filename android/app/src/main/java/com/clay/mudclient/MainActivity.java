@@ -877,18 +877,29 @@ public class MainActivity extends AppCompatActivity {
         new Thread(() -> {
             String html = loadHtmlFromAssets();
             if (html == null) {
-                // Assets not bundled — should never happen in a release build
                 android.util.Log.e("Clay", "loadInterface: APK assets not found");
-                runOnUiThread(this::hideConnectingOverlay);
+                runOnUiThread(() -> {
+                    Toast.makeText(MainActivity.this, "Error: APK assets not found", Toast.LENGTH_LONG).show();
+                    hideConnectingOverlay();
+                });
                 return;
             }
-            html = inlineAssetsIntoHtml(html);
-            html = substituteTemplateVars(html);
+            try {
+                html = substituteTemplateVars(html);
+            } catch (Exception e) {
+                android.util.Log.e("Clay", "loadInterface: substituteTemplateVars threw: " + e);
+                runOnUiThread(() -> {
+                    Toast.makeText(MainActivity.this, "Error loading interface: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    hideConnectingOverlay();
+                });
+                return;
+            }
             final String finalHtml = html;
             runOnUiThread(() -> {
-                webView.loadDataWithBaseURL("file:///android_asset/", finalHtml, "text/html", "UTF-8", null);
+                // Base URL set to web asset dir so relative paths (app.js, style.css) resolve correctly
+                webView.loadDataWithBaseURL("file:///android_asset/web/", finalHtml, "text/html", "UTF-8", null);
                 interfaceLoaded = true;
-                loadedInterfaceUrl = "file:///android_asset/";
+                loadedInterfaceUrl = "file:///android_asset/web/";
                 hideConnectingOverlay();
             });
         }).start();
@@ -924,33 +935,6 @@ public class MainActivity extends AppCompatActivity {
         } catch (java.io.IOException e) {
             return null;
         }
-    }
-
-    /** Inline style.css and app.js from APK assets into the HTML string. */
-    private String inlineAssetsIntoHtml(String html) {
-        try {
-            java.io.InputStream is = getAssets().open("web/style.css");
-            byte[] buffer = readFullStream(is);
-            is.close();
-            String css = new String(buffer, "UTF-8");
-            html = html.replace("<link rel=\"stylesheet\" href=\"style.css\">",
-                                "<style>\n" + css + "\n</style>");
-            html = html.replace("<link rel=\"stylesheet\" href=\"/style.css\">",
-                                "<style>\n" + css + "\n</style>");
-        } catch (java.io.IOException e) { /* fall back to linked CSS */ }
-
-        try {
-            java.io.InputStream is = getAssets().open("web/app.js");
-            byte[] buffer = readFullStream(is);
-            is.close();
-            String js = new String(buffer, "UTF-8");
-            html = html.replace("<script src=\"app.js\"></script>",
-                                "<script>\n" + js + "\n</script>");
-            html = html.replace("<script src=\"/app.js\"></script>",
-                                "<script>\n" + js + "\n</script>");
-        } catch (java.io.IOException e) { /* fall back to linked JS */ }
-
-        return html;
     }
 
     /** Substitute template variables in the HTML using locally-known values. */
