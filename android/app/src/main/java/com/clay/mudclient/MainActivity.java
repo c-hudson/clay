@@ -719,8 +719,11 @@ public class MainActivity extends AppCompatActivity {
             public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
 
-                // Intercept HTTPS requests to handle certificate issues
-                if (url.startsWith("https://")) {
+                // Intercept HTTPS requests to handle certificate issues.
+                // Skip well-known CDNs (fonts, etc.) — let WebView handle them natively.
+                if (url.startsWith("https://") &&
+                    !url.contains("fonts.googleapis.com") &&
+                    !url.contains("fonts.gstatic.com")) {
                     Exception lastException = null;
                     // Retry up to 3 times for transient connection failures
                     for (int attempt = 1; attempt <= 3; attempt++) {

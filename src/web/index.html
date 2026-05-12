@@ -891,7 +891,7 @@
     <script>
         // WebSocket configuration injected by server
         window.WS_HOST = '{{WS_HOST}}';
-        window.WS_PORT = {{WS_PORT}};
+        window.WS_PORT = parseInt('{{WS_PORT}}') || 0;
         window.WS_PROTOCOL = '{{WS_PROTOCOL}}';
         window.WS_LOCAL_HOST = '{{WS_LOCAL_HOST}}';
         window.WS_REMOTE_HOST = '{{WS_REMOTE_HOST}}';
