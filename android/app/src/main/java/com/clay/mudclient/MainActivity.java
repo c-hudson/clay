@@ -814,10 +814,13 @@ public class MainActivity extends AppCompatActivity {
                 connectionFailed = false;
                 hideConnectingOverlay();
                 android.util.Log.i("Clay", "Page loaded: " + url);
-                // Always call connect() — when settings aren't configured yet, connect() in app.js
-                // detects this via Android.isSettingsConfigured() and opens the clay-server tab.
-                view.postDelayed(() -> view.evaluateJavascript(
-                    "if (typeof connect === 'function') connect();", null), 300);
+                // Inject template variables that were NOT substituted at load time (loadUrl path)
+                String varScript = buildVarInjectionScript();
+                view.evaluateJavascript(varScript, unused -> {
+                    // connect() AFTER vars are injected so buildCandidates() sees them
+                    view.postDelayed(() -> view.evaluateJavascript(
+                        "if (typeof connect === 'function') connect();", null), 300);
+                });
             }
 
             @Override
@@ -861,48 +864,40 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /** Load the web interface from bundled APK assets, injecting host/port template vars. */
+    /** Load the web interface from bundled APK assets. Template vars injected via JS in onPageFinished. */
     private void loadInterface() {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-
-        if (!prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
-            runOnUiThread(() -> webView.loadDataWithBaseURL(
-                "file:///android_asset/", FIRST_LAUNCH_HTML, "text/html", "UTF-8", null));
-            return;
-        }
-
         connectionFailed = false;
-        showConnectingOverlay("Connecting...");
+        runOnUiThread(() -> {
+            webView.loadUrl("file:///android_asset/web/index.html");
+            interfaceLoaded = true;
+            loadedInterfaceUrl = "file:///android_asset/web/index.html";
+        });
+    }
 
-        new Thread(() -> {
-            String html = loadHtmlFromAssets();
-            if (html == null) {
-                android.util.Log.e("Clay", "loadInterface: APK assets not found");
-                runOnUiThread(() -> {
-                    Toast.makeText(MainActivity.this, "Error: APK assets not found", Toast.LENGTH_LONG).show();
-                    hideConnectingOverlay();
-                });
-                return;
-            }
-            try {
-                html = substituteTemplateVars(html);
-            } catch (Exception e) {
-                android.util.Log.e("Clay", "loadInterface: substituteTemplateVars threw: " + e);
-                runOnUiThread(() -> {
-                    Toast.makeText(MainActivity.this, "Error loading interface: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                    hideConnectingOverlay();
-                });
-                return;
-            }
-            final String finalHtml = html;
-            runOnUiThread(() -> {
-                // Base URL set to web asset dir so relative paths (app.js, style.css) resolve correctly
-                webView.loadDataWithBaseURL("file:///android_asset/web/", finalHtml, "text/html", "UTF-8", null);
-                interfaceLoaded = true;
-                loadedInterfaceUrl = "file:///android_asset/web/";
-                hideConnectingOverlay();
-            });
-        }).start();
+    /** Build a JS snippet that sets window.WS_* vars and applies the saved theme. */
+    private String buildVarInjectionScript() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String localHost  = jsStr(prefs.getString(KEY_SERVER_HOST, ""));
+        String remoteHost = jsStr(prefs.getString(KEY_REMOTE_HOSTNAME, ""));
+        int    port       = prefs.getInt(KEY_SERVER_PORT, 9000);
+        String mode       = jsStr(prefs.getString("connectionMode", "auto"));
+        String theme      = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS)
+                                 .replace("\\", "\\\\").replace("'", "\\'")
+                                 .replace("\r", "").replace("\n", " ");
+        return "window.WS_HOST=" + localHost + ";" +
+               "window.WS_LOCAL_HOST=" + localHost + ";" +
+               "window.WS_REMOTE_HOST=" + remoteHost + ";" +
+               "window.WS_PORT=" + port + ";" +
+               "window.WS_PROTOCOL='wss';" +
+               "window.CONNECTION_MODE=" + mode + ";" +
+               "(function(){var s=document.getElementById('theme-vars');" +
+               "if(s)s.textContent=':root{" + theme + "}';}());";
+    }
+
+    /** Wrap a string as a JS single-quoted literal with minimal escaping. */
+    private static String jsStr(String s) {
+        if (s == null) s = "";
+        return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'";
     }
 
     private void showConnectingOverlay(String urlText) {
@@ -915,49 +910,6 @@ public class MainActivity extends AppCompatActivity {
     private void hideConnectingOverlay() {
         connectingOverlay.setVisibility(android.view.View.GONE);
         webView.setVisibility(android.view.View.VISIBLE);
-    }
-
-    private static byte[] readFullStream(java.io.InputStream is) throws java.io.IOException {
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        byte[] buf = new byte[8192];
-        int n;
-        while ((n = is.read(buf)) != -1) out.write(buf, 0, n);
-        return out.toByteArray();
-    }
-
-    /** Read index.html from APK assets, or null if not available. */
-    private String loadHtmlFromAssets() {
-        try {
-            java.io.InputStream is = getAssets().open("web/index.html");
-            byte[] buffer = readFullStream(is);
-            is.close();
-            return new String(buffer, "UTF-8");
-        } catch (java.io.IOException e) {
-            return null;
-        }
-    }
-
-    /** Substitute template variables in the HTML using locally-known values. */
-    private String substituteTemplateVars(String html) {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String cachedTheme = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS);
-        boolean settingsConfigured = prefs.getBoolean(KEY_SETUP_COMPLETE, false);
-        String localHost = prefs.getString(KEY_SERVER_HOST, "");
-        String remoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
-        int port = prefs.getInt(KEY_SERVER_PORT, 9000);
-        String connectionMode = prefs.getString("connectionMode", "auto");
-        html = html
-            .replace("{{WS_HOST}}", localHost)
-            .replace("{{WS_LOCAL_HOST}}", localHost)
-            .replace("{{WS_REMOTE_HOST}}", remoteHost)
-            .replace("{{WS_PORT}}", String.valueOf(port))
-            .replace("{{WS_PROTOCOL}}", "wss")  // kept for backward compat; buildCandidates() ignores it
-            .replace("{{CONNECTION_MODE}}", connectionMode)
-            .replace("{{THEME_CSS_VARS}}", cachedTheme);
-        if (!settingsConfigured) {
-            html = html.replace("</head>", "<script>window.SKIP_CONNECT=true;</script></head>");
-        }
-        return html;
     }
 
     /**
@@ -1042,23 +994,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void checkAndLoadInterface() {
-        // Check if setup is complete and the interface needs loading
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        if (prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
-            if (!interfaceLoaded) {
-                android.util.Log.i("Clay", "Loading interface: not yet loaded");
-                loadInterface();
-            } else if (webView != null) {
-                // Interface loaded - always verify connection health on resume.
-                // Java's isConnected flag can be stale if the WS died silently,
-                // so let JS check the actual socket state and reconnect if needed.
-                // This also handles the visibilitychange event not firing on some Android versions.
-                missedHeartbeats = 0;
-                webView.evaluateJavascript(
-                    "if (typeof checkConnectionOnResume === 'function') checkConnectionOnResume();",
-                    null
-                );
-            }
+        if (!interfaceLoaded) {
+            android.util.Log.i("Clay", "Loading interface: not yet loaded");
+            loadInterface();
+        } else if (webView != null) {
+            // Interface loaded - always verify connection health on resume.
+            missedHeartbeats = 0;
+            webView.evaluateJavascript(
+                "if (typeof checkConnectionOnResume === 'function') checkConnectionOnResume();",
+                null
+            );
         }
     }
 
