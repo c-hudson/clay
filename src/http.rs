@@ -122,6 +122,10 @@ const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
 /// Embedded keybind editor HTML
 const WEB_KEYBIND_EDITOR_HTML: &str = include_str!("web/keybind-editor.html");
 
+/// Bundled fonts (latin subset, variable weight)
+const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("web/fonts/jetbrains-mono-latin-400.woff2");
+const FONT_NUNITO: &[u8] = include_bytes!("web/fonts/nunito-latin-400.woff2");
+
 /// Seconds to wait for first bytes of an HTTP request before dropping the connection.
 const READ_TIMEOUT_SECS: u64 = 10;
 /// Seconds to wait for a TLS handshake to complete before recording a violation and dropping.
@@ -189,6 +193,25 @@ fn get_host_from_request(request: &str) -> String {
 }
 
 /// Build an HTTP response with the given status, content type, and body
+fn build_binary_http_response(status: u16, status_text: &str, content_type: &str, body: &[u8], is_https: bool) -> Vec<u8> {
+    let mut headers = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: max-age=31536000, immutable\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         Connection: close\r\n",
+        status, status_text, content_type, body.len()
+    );
+    if is_https {
+        headers.push_str("Strict-Transport-Security: max-age=31536000\r\n");
+    }
+    headers.push_str("\r\n");
+    let mut response = headers.into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
 fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str, is_https: bool) -> Vec<u8> {
     let mut headers = format!(
         "HTTP/1.1 {} {}\r\n\
@@ -285,6 +308,12 @@ fn handle_http_routes(
                 .replace("{{WS_PORT}}", "0")
                 .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
             RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
+        }
+        "/fonts/jetbrains-mono-latin-400.woff2" => {
+            RouteResult::Ok(build_binary_http_response(200, "OK", "font/woff2", FONT_JETBRAINS_MONO, is_https))
+        }
+        "/fonts/nunito-latin-400.woff2" => {
+            RouteResult::Ok(build_binary_http_response(200, "OK", "font/woff2", FONT_NUNITO, is_https))
         }
         "/favicon.ico" => {
             RouteResult::Ok(build_http_response(204, "No Content", "image/x-icon", "", is_https))

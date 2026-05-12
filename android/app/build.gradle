@@ -6,7 +6,7 @@ plugins {
 task copyWebAssets(type: Copy) {
     from '../../src/web'
     into 'src/main/assets/web'
-    include 'index.html', 'app.js', 'style.css', 'theme-editor.html', 'keybind-editor.html'
+    include 'index.html', 'app.js', 'style.css', 'theme-editor.html', 'keybind-editor.html', 'fonts/**'
 }
 preBuild.dependsOn copyWebAssets
 
@@ -18,7 +18,7 @@ android {
         applicationId "com.clay.mudclient"
         minSdk 26
         targetSdk 34
-        versionCode 131
+        versionCode 132
         versionName "1.0.3"
     }
 
