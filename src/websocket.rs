@@ -12,6 +12,13 @@ use crate::{AppEvent, Action, BanList};
 use crate::ansi_music::MusicNote;
 use crate::http::log_ws_auth;
 
+/// Seconds an unauthenticated WebSocket client has to complete authentication before being dropped.
+const WS_AUTH_TIMEOUT_SECS: u64 = 30;
+/// Seconds of inactivity after which an authenticated client receives a keepalive Ping.
+const WS_KEEPALIVE_INTERVAL_SECS: u64 = 60;
+/// Seconds to wait for a Pong response before treating the connection as dead and dropping it.
+const WS_PONG_TIMEOUT_SECS: u64 = 20;
+
 // ============================================================================
 // WebSocket Protocol Types
 // ============================================================================
@@ -1441,23 +1448,43 @@ where
         let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false }))).await;
     }
 
-    // Spawn task to send messages from rx to WebSocket
-    let clients_for_sender = Arc::clone(&clients);
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_sink.send(WsRawMessage::Text(json)).await.is_err() {
-                    break;
+    // Combined receive/send/keepalive loop.
+    // Auth deadline: absolute — unauthenticated clients have WS_AUTH_TIMEOUT_SECS to authenticate.
+    // Keepalive: idle authenticated clients receive a protocol-level Ping every
+    // WS_KEEPALIVE_INTERVAL_SECS; no Pong within WS_PONG_TIMEOUT_SECS = dead peer, disconnect.
+    let auth_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WS_AUTH_TIMEOUT_SECS);
+    let mut awaiting_pong = false;
+
+    loop {
+        let authed = {
+            let clients_guard = clients.read().await;
+            clients_guard.get(&client_id).map(|c| c.authenticated).unwrap_or(false)
+        };
+
+        let sleep_dur = if !authed {
+            let remaining = auth_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                crate::http::log_remote_event("WS-AUTH-TIMEOUT", &client_ip, "unauthenticated grace period expired");
+                break;
+            }
+            remaining
+        } else if awaiting_pong {
+            std::time::Duration::from_secs(WS_PONG_TIMEOUT_SECS)
+        } else {
+            std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS)
+        };
+
+        tokio::select! {
+            Some(msg) = rx.recv() => {
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    if ws_sink.send(WsRawMessage::Text(json)).await.is_err() {
+                        break;
+                    }
                 }
             }
-        }
-        let _ = clients_for_sender.write().await.remove(&client_id);
-    });
-
-    // Process incoming messages
-    while let Some(msg_result) = ws_source.next().await {
-        match msg_result {
-            Ok(WsRawMessage::Text(text)) => {
+            msg_result = ws_source.next() => {
+            match msg_result {
+            Some(Ok(WsRawMessage::Text(text))) => {
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match &ws_msg {
                         WsMessage::AuthRequest { username, password_hash: client_hash, auth_key, request_key, challenge_response: uses_challenge, .. } => {
@@ -1645,27 +1672,37 @@ where
                     break;
                 }
             }
-            Ok(WsRawMessage::Close(_)) => {
-                break;
+            Some(Ok(WsRawMessage::Pong(_))) => {
+                // Response to our keepalive ping — peer is alive
+                awaiting_pong = false;
             }
-            Ok(WsRawMessage::Ping(data)) => {
-                // Pong is handled automatically by tungstenite
-                let _ = data;
+            Some(Ok(WsRawMessage::Close(_))) => break,
+            Some(Ok(WsRawMessage::Ping(_))) => {
+                // Tungstenite auto-handles the protocol-level Pong reply
             }
-            Ok(WsRawMessage::Binary(_)) => {
-                // Binary messages not supported - disconnect but don't ban
-                break;
-            }
-            Err(_) => {
-                // Protocol error - disconnect but don't ban (could be network issues)
-                break;
-            }
+            Some(Ok(WsRawMessage::Binary(_))) => break,
+            Some(Err(_)) | None => break,
             _ => {}
+        }
+            }
+            _ = tokio::time::sleep(sleep_dur) => {
+                if !authed {
+                    crate::http::log_remote_event("WS-AUTH-TIMEOUT", &client_ip, "unauthenticated grace period expired");
+                    break;
+                } else if awaiting_pong {
+                    crate::http::log_remote_event("WS-DEAD", &client_ip, "no pong response to keepalive");
+                    break;
+                } else {
+                    if ws_sink.send(WsRawMessage::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                    awaiting_pong = true;
+                }
+            }
         }
     }
 
     // Clean up
-    send_task.abort();
     {
         let mut clients_guard = clients.write().await;
         clients_guard.remove(&client_id);

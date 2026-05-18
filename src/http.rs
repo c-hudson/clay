@@ -139,8 +139,11 @@ const MAX_WS_CONNECTIONS_PER_IP: usize = 20;
 /// Reads the HTTP request, extracts Host and path, and responds with 301.
 async fn redirect_http_to_https<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, port: u16) {
     let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
+    let n = match tokio::time::timeout(
+        std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+        stream.read(&mut buf),
+    ).await {
+        Ok(Ok(n)) if n > 0 => n,
         _ => return,
     };
     let request = String::from_utf8_lossy(&buf[..n]);
@@ -554,13 +557,16 @@ pub async fn start_https_server(
                             tokio::spawn(async move {
                                 // Peek first byte to detect plain HTTP vs TLS
                                 let mut peek = [0u8; 1];
-                                match stream.peek(&mut peek).await {
-                                    Ok(1) if peek[0] != 0x16 => {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+                                    stream.peek(&mut peek),
+                                ).await {
+                                    Ok(Ok(1)) if peek[0] != 0x16 => {
                                         // Not a TLS ClientHello — redirect HTTP to HTTPS
                                         redirect_http_to_https(stream, server_port).await;
                                         return;
                                     }
-                                    Ok(0) | Err(_) => return,
+                                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
                                     _ => {}
                                 }
                                 match tokio::time::timeout(
@@ -733,13 +739,16 @@ pub async fn start_https_server(
                             tokio::spawn(async move {
                                 // Peek first byte to detect plain HTTP vs TLS
                                 let mut peek = [0u8; 1];
-                                match stream.peek(&mut peek).await {
-                                    Ok(1) if peek[0] != 0x16 => {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+                                    stream.peek(&mut peek),
+                                ).await {
+                                    Ok(Ok(1)) if peek[0] != 0x16 => {
                                         // Not a TLS ClientHello — redirect HTTP to HTTPS
                                         redirect_http_to_https(stream, server_port).await;
                                         return;
                                     }
-                                    Ok(0) | Err(_) => return,
+                                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
                                     _ => {}
                                 }
                                 match tokio::time::timeout(
