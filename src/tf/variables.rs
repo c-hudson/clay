@@ -85,10 +85,8 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                             if let Some(value) = get_special_var(engine, &var_name) {
                                 result.push_str(&value);
                             } else if let Some(value) = engine.get_var(&var_name) {
-                                // Escape backslashes so they survive subsequent substitute_commands
-                                // processing which converts \\ -> \
                                 let val = value.to_string_value();
-                                result.push_str(&val.replace('\\', "\\\\"));
+                                result.push_str(&val);
                             } else {
                                 // Fall back to simple macros (no trigger, no hook)
                                 if let Some(macro_def) = engine.macros.iter().find(|m|
@@ -121,7 +119,7 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                         }
                         i += 2;
                     }
-                    // %L, %R - special positional parameters
+                    // %L, %R - special positional parameters (must precede the alphabetic arm)
                     'L' | 'R' => {
                         let var_name = chars[i + 1].to_string();
                         if let Some(value) = engine.get_var(&var_name) {
@@ -129,14 +127,57 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                         }
                         i += 2;
                     }
+                    // %P forms for capture groups (%P0-%P9, %PL, %PR, %P*).
+                    // Must precede the general alphabetic arm so that %P2x is parsed as
+                    // %P2 (capture) + x, not as variable name "P2x".
+                    'P' if i + 2 < len => {
+                        match chars[i + 2] {
+                            c @ '0'..='9' => {
+                                let idx = (c as usize) - ('0' as usize);
+                                if idx < engine.regex_captures.len() {
+                                    result.push_str(&engine.regex_captures[idx]);
+                                } else if let Some(value) = engine.get_var(&format!("P{}", c)) {
+                                    // Trigger captures stored as locals by execute_macro
+                                    result.push_str(&value.to_string_value());
+                                }
+                                i += 3;
+                            }
+                            'L' => {
+                                if let Some(value) = engine.get_var("PL") {
+                                    result.push_str(&value.to_string_value());
+                                }
+                                i += 3;
+                            }
+                            'R' => {
+                                if let Some(value) = engine.get_var("PR") {
+                                    result.push_str(&value.to_string_value());
+                                }
+                                i += 3;
+                            }
+                            '*' => {
+                                // All captures joined
+                                if !engine.regex_captures.is_empty() {
+                                    result.push_str(&engine.regex_captures[1..].join(" "));
+                                }
+                                i += 3;
+                            }
+                            _ => {
+                                // Not a special %Pn form — fall through to general variable lookup.
+                                // e.g. %Pfoo looks up variable "Pfoo".
+                                let (var_name, end_idx) = extract_simple_var(&chars, i + 1);
+                                if let Some(value) = engine.get_var(&var_name) {
+                                    result.push_str(&value.to_string_value());
+                                }
+                                i = end_idx;
+                            }
+                        }
+                    }
                     // %varname form - variable name is alphanumeric + underscore
                     c if c.is_alphabetic() || c == '_' => {
                         let (var_name, end_idx) = extract_simple_var(&chars, i + 1);
                         if let Some(value) = engine.get_var(&var_name) {
-                            // Escape backslashes so they survive subsequent substitute_commands
-                            // processing which converts \\ -> \
                             let val = value.to_string_value();
-                            result.push_str(&val.replace('\\', "\\\\"));
+                            result.push_str(&val);
                         }
                         // If variable not found, substitute empty string
                         i = end_idx;
@@ -149,26 +190,6 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                         }
                         // If not found, substitute empty string (TF behavior)
                         i += 2;
-                    }
-                    // %P forms for capture groups from regmatch()
-                    'P' if i + 2 < len => {
-                        match chars[i + 2] {
-                            c @ '0'..='9' => {
-                                let idx = (c as usize) - ('0' as usize);
-                                if idx < engine.regex_captures.len() {
-                                    result.push_str(&engine.regex_captures[idx]);
-                                }
-                                i += 3;
-                            }
-                            _ => {
-                                result.push('%');
-                                i += 1;
-                            }
-                        }
-                    }
-                    'P' => {
-                        result.push('%');
-                        i += 1;
                     }
                     // Unknown, keep literal
                     _ => {
@@ -363,38 +384,57 @@ pub fn substitute_captures(text: &str, full_match: &str, captures: &[&str], left
     result
 }
 
-/// Process command substitution $(...) and expression substitution $[...]
-/// Also handles \$ escape to produce literal $
+/// Unified substitution pass: processes `%var`, `$()`, `$[]`, `${}`  in one walk.
+///
+/// This is the single entry point for all substitution.  Callers must NOT run
+/// `substitute_variables` separately before calling this — that would expand
+/// `%P2` (and other captured text) into the syntax stream before `$()` delimiters
+/// are parsed, allowing user data with unbalanced parens to corrupt extraction.
+///
+/// Invariants:
+/// 1. Variables inside `$(...)` are expanded *only* after `extract_balanced` has
+///    delimited the region from the raw input, so capture content never interferes
+///    with paren counting.
+/// 2. The output of any `$(...)` is final — appended directly to the result and
+///    never seen by another substitution pass.
 pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
+    // Plain-text buffer: accumulated between protected regions, flushed through
+    // substitute_variables just before each region (and at end of input).
+    let mut plain = String::new();
     let mut i = 0;
 
     while i < len {
         if chars[i] == '\\' && i + 1 < len {
             match chars[i + 1] {
-                // \$ handling: \$( and \$[ output literal backslash AND allow substitution
+                // \$( or \$[ -> emit backslash to plain, then let $(/$[ be processed next
                 '$' => {
                     if i + 2 < len && (chars[i + 2] == '(' || chars[i + 2] == '[') {
-                        // \$( or \$[ -> output the backslash, then let $( or $[ be processed
-                        // This allows macros like "\\$[char(92)]" to output "\" + result of char(92)
-                        result.push('\\');
-                        i += 1; // Move past backslash, $ will be processed next iteration
+                        plain.push('\\');
+                        i += 1;
                     } else {
-                        // \$ followed by anything else -> literal $
+                        // \$ followed by anything else -> literal $, bypass plain buffer
+                        if !plain.is_empty() {
+                            result.push_str(&substitute_variables(engine, &plain));
+                            plain.clear();
+                        }
                         result.push('$');
                         i += 2;
                     }
                 }
-                // \\ -> literal \
+                // \\ -> literal \, bypass plain buffer so it's never re-processed
                 '\\' => {
+                    if !plain.is_empty() {
+                        result.push_str(&substitute_variables(engine, &plain));
+                        plain.clear();
+                    }
                     result.push('\\');
                     i += 2;
                 }
-                // Other escapes - keep as-is for now
                 _ => {
-                    result.push(chars[i]);
+                    plain.push('\\');
                     i += 1;
                 }
             }
@@ -403,27 +443,36 @@ pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
                 // $(...) - command substitution
                 '(' => {
                     if let Some((cmd, end_idx)) = extract_balanced(&chars, i + 2, '(', ')') {
-                        // Execute the command and capture output
+                        // Flush plain text before the $() region
+                        if !plain.is_empty() {
+                            result.push_str(&substitute_variables(engine, &plain));
+                            plain.clear();
+                        }
+                        // Expand %vars in the extracted content now, after safe extraction
+                        let cmd = substitute_variables(engine, &cmd);
+                        // Execute and append output as final literal — never re-substituted
                         let output = execute_for_substitution(engine, &cmd);
                         result.push_str(&output);
                         i = end_idx + 1;
                     } else {
-                        result.push('$');
+                        plain.push('$');
                         i += 1;
                     }
                 }
                 // $[...] - expression substitution
                 '[' => {
                     if let Some((expr, end_idx)) = extract_balanced(&chars, i + 2, '[', ']') {
-                        // First substitute any ${varname} inside the expression
+                        if !plain.is_empty() {
+                            result.push_str(&substitute_variables(engine, &plain));
+                            plain.clear();
+                        }
                         let expr = substitute_dollar_braces(engine, &expr);
-                        // Evaluate the expression
                         if let Ok(value) = super::expressions::evaluate(engine, &expr) {
                             result.push_str(&value.to_string_value());
                         }
                         i = end_idx + 1;
                     } else {
-                        result.push('$');
+                        plain.push('$');
                         i += 1;
                     }
                 }
@@ -431,33 +480,37 @@ pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
                 // Also checks simple macros (macros with no trigger/hook act like variables)
                 '{' => {
                     if let Some((var_name, end_idx)) = extract_balanced(&chars, i + 2, '{', '}') {
-                        // First check variables
+                        if !plain.is_empty() {
+                            result.push_str(&substitute_variables(engine, &plain));
+                            plain.clear();
+                        }
                         if let Some(value) = engine.get_var(&var_name) {
                             result.push_str(&value.to_string_value());
-                        } else {
-                            // Fall back to simple macros (no trigger, no hook)
-                            if let Some(macro_def) = engine.macros.iter().find(|m|
-                                m.name == var_name && m.trigger.is_none() && m.hook.is_none()
-                            ) {
-                                result.push_str(&macro_def.body);
-                            }
-                            // If neither found, substitute empty string
+                        } else if let Some(macro_def) = engine.macros.iter().find(|m|
+                            m.name == var_name && m.trigger.is_none() && m.hook.is_none()
+                        ) {
+                            result.push_str(&macro_def.body);
                         }
                         i = end_idx + 1;
                     } else {
-                        result.push('$');
+                        plain.push('$');
                         i += 1;
                     }
                 }
                 _ => {
-                    result.push(chars[i]);
+                    plain.push(chars[i]);
                     i += 1;
                 }
             }
         } else {
-            result.push(chars[i]);
+            plain.push(chars[i]);
             i += 1;
         }
+    }
+
+    // Flush any remaining plain text
+    if !plain.is_empty() {
+        result.push_str(&substitute_variables(engine, &plain));
     }
 
     result
@@ -669,5 +722,48 @@ mod tests {
         let mut engine = TfEngine::new();
         // Nested parentheses should work
         assert_eq!(substitute_commands(&mut engine, "$[max(1, min(5, 3))]"), "3");
+    }
+
+    #[test]
+    fn test_plain_text_var_substitution() {
+        let mut engine = TfEngine::new();
+        engine.set_global("foo", TfValue::String("VAL".to_string()));
+        // %var in plain text is expanded by the plain-buffer flush path
+        let out = substitute_commands(&mut engine, "before %foo $[1+1] after");
+        assert_eq!(out, "before VAL 2 after");
+    }
+
+    #[test]
+    fn test_dollar_paren_output_is_literal() {
+        let mut engine = TfEngine::new();
+        engine.set_global("foo", TfValue::String("VAL".to_string()));
+        // Macro emits literal "%foo". After $() resolves, that text must NOT be
+        // expanded again to "VAL" — $() output is final.
+        super::super::parser::execute_command(&mut engine, "/def emitpct = /echo -- %%foo");
+        let out = substitute_commands(&mut engine, "$(/emitpct)");
+        assert_eq!(out, "%foo");
+    }
+
+    #[test]
+    fn test_dollar_paren_capture_with_unbalanced_paren() {
+        let mut engine = TfEngine::new();
+        // Simulate a trigger capture containing unbalanced '(' — the core crypt.tf bug.
+        // %P2 must be expanded AFTER $() extraction so its parens don't confuse
+        // extract_balanced.
+        engine.set_global("P2", TfValue::String("(_data'".to_string()));
+        super::super::parser::execute_command(&mut engine, "/def echoback = /echo -- got:%*");
+        let out = substitute_commands(&mut engine, "$(/echoback x%P2x)");
+        assert_eq!(out, "got:x(_data'x");
+    }
+
+    #[test]
+    fn test_let_via_dollar_paren_with_paren_in_arg() {
+        let mut engine = TfEngine::new();
+        super::super::parser::execute_command(&mut engine, "/def myid = /echo -- %*");
+        engine.set_global("P2", TfValue::String("a(b".to_string()));
+        // Full pipeline: /let result=$(/myid x%P2x) with unbalanced ( in P2
+        super::super::parser::execute_command(&mut engine, "/let result=$(/myid x%P2x)");
+        let val = engine.get_var("result").unwrap().to_string_value();
+        assert_eq!(val, "xa(bx");
     }
 }

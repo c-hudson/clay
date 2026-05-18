@@ -2108,6 +2108,11 @@ mod tests {
             zwj_enabled: true,                 // default: false
             new_line_indicator: true,             // default: false
             tts_mode: crate::tts::TtsMode::Edge,  // default: Off
+            tts_speak_mode: crate::tts::TtsSpeakMode::All, // default: All
+            tts_muted: true,                   // default: false
+            web_font_letter_spacing: 1.5,      // default: 0.0
+            web_font_line_height: 1.8,         // default: 1.2
+            web_font_word_spacing: 2.0,        // default: 0.0
         }
     }
 

@@ -857,11 +857,8 @@ public class MainActivity extends AppCompatActivity {
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onConsoleMessage(ConsoleMessage cm) {
-                if (cm.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
-                    runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                        "JS: " + cm.message() + " @ " + cm.sourceId() + ":" + cm.lineNumber(),
-                        Toast.LENGTH_LONG).show());
-                }
+                android.util.Log.i("ClayJS",
+                    cm.message() + " @ " + cm.sourceId() + ":" + cm.lineNumber());
                 return true;
             }
         });

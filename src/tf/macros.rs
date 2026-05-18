@@ -595,14 +595,13 @@ pub fn execute_macro(
 
     // Execute body - positional params are resolved at runtime from local scope
     // (not pre-substituted) so that /shift works correctly
-    let mut body = macro_def.body.clone();
+    let body = macro_def.body.clone();
 
-    // Substitute capture groups if from trigger
+    // Set capture groups as locals for $() inner expansion and expression access.
+    // Do NOT do an eager pre-pass on the body — that would expand %P2 etc. into
+    // the syntax stream before $() delimiters are parsed, breaking extraction when
+    // captured text contains unbalanced parens (e.g. crypt.tf ciphertext).
     if let Some(tm) = trigger_match {
-        let capture_refs: Vec<&str> = tm.captures.to_vec();
-        body = variables::substitute_captures(&body, tm.full_match, &capture_refs, tm.left, tm.right);
-
-        // Set capture groups as local variables for expression access ({P0}, {P1}, etc.)
         engine.set_local("P0", TfValue::String(tm.full_match.to_string()));
         for (i, cap) in tm.captures.iter().enumerate() {
             engine.set_local(&format!("P{}", i + 1), TfValue::String(cap.to_string()));
@@ -632,12 +631,10 @@ pub fn execute_macro(
             // Pass control flow blocks directly without substitution
             cmd.to_string()
         } else {
-            // First substitute %variables, then process $[...] expressions
-            // Order matters: %tmppwd$[char(x)] must become VALUE$[char(x)] first,
-            // otherwise $[char(x)] evaluates to "F" giving %tmppwdF which is wrong
-            let cmd = engine.substitute_vars(cmd);
-            
-            variables::substitute_commands(engine, &cmd)
+            // substitute_commands is the unified pass: expands %vars in plain text
+            // and $() / $[] / ${} regions with correct ordering (vars inside $()
+            // are expanded only after extraction, never before).
+            variables::substitute_commands(engine, cmd)
         };
         let cmd = cmd.trim();
 

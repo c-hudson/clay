@@ -225,19 +225,16 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         if let Some(eq_pos) = rest_check.find('=') {
             let before_eq = &rest_check[..eq_pos];
             let after_eq = &rest_check[eq_pos..];
-            let substituted_before = engine.substitute_vars(before_eq);
-            let substituted_before = super::variables::substitute_commands(engine, &substituted_before);
+            let substituted_before = super::variables::substitute_commands(engine, before_eq);
             substituted = format!("{}{}", substituted_before, after_eq);
             substituted.trim()
         } else {
             // No body (just /def or /def with options but no =), substitute normally
-            let s = engine.substitute_vars(rest_check);
-            substituted = super::variables::substitute_commands(engine, &s);
+            substituted = super::variables::substitute_commands(engine, rest_check);
             substituted.trim()
         }
     } else {
-        let s = engine.substitute_vars(rest_check);
-        substituted = super::variables::substitute_commands(engine, &s);
+        substituted = super::variables::substitute_commands(engine, rest_check);
         substituted.trim()
     };
 

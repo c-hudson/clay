@@ -883,13 +883,14 @@
         // Visible text should preserve ZWSP for word breaking
         assert!(result.contains("/\u{200B}path/\u{200B}to/\u{200B}page"));
 
-        // URL followed by ANSI color code should stop at ESC, not include the code in URL
+        // URL followed by ANSI color code — the code skips CSI sequences so they don't
+        // truncate the URL. Clean URL parameter has no ANSI; visible text keeps it.
         let url_with_ansi = "https://example.com\x1b[0;37m rest";
         let result = wrap_urls_with_osc8(url_with_ansi);
-        // URL should end at the ESC, not include the ANSI code
+        // Clean URL in OSC 8 parameter should not include the ANSI code
         assert!(result.contains("\x1b]8;;https://example.com\x07"));
-        // The ANSI code should be preserved after the OSC 8 closing sequence
-        assert!(result.contains("\x1b]8;;\x07\x1b[0;37m"));
+        // ANSI code is part of the visible text inside the OSC 8 link
+        assert!(result.contains("https://example.com\x1b[0;37m\x1b]8;;\x07"));
     }
 
     #[test]

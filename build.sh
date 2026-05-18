@@ -68,6 +68,7 @@ HAS_AUDIO=false
 HAS_MUSL=false
 EXTRA_RUSTFLAGS=""
 MISSING_DEPS=""
+AUDIO_MISSING_DEPS=""
 BUILD_TARGET=""
 
 echo ""
@@ -179,7 +180,7 @@ check_audio() {
             if command -v pkg-config &> /dev/null && pkg-config --exists alsa 2>/dev/null; then
                 return 0
             fi
-            MISSING_DEPS="$MISSING_DEPS libasound2-dev"
+            AUDIO_MISSING_DEPS="$AUDIO_MISSING_DEPS libasound2-dev"
             return 1
             ;;
         macos|windows)
@@ -198,6 +199,14 @@ if check_audio; then
     echo "  [+] native-audio (sound playback)"
 else
     echo "  [-] native-audio (not available)"
+    if [ -n "$AUDIO_MISSING_DEPS" ]; then
+        echo "      Missing:$AUDIO_MISSING_DEPS"
+        case "$OS" in
+            linux)
+                echo "      Install: sudo apt install$AUDIO_MISSING_DEPS"
+                ;;
+        esac
+    fi
 fi
 
 # --- Termux-specific setup ---

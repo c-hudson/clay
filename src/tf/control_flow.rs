@@ -547,10 +547,7 @@ pub fn execute_single_if(engine: &mut TfEngine, condition: &str, command: &str) 
     match expressions::evaluate(engine, condition) {
         Ok(value) => {
             if value.to_bool() {
-                // Substitute variables first, then expressions
-                let command = engine.substitute_vars(command);
-                let command = super::variables::substitute_commands(engine, &command);
-                // Execute the command (already substituted)
+                let command = super::variables::substitute_commands(engine, command);
                 execute_body_line(engine, &command)
             } else {
                 TfCommandResult::Success(None)
@@ -600,8 +597,6 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                                 {
                                     results.push(super::parser::execute_command(engine, &cmd));
                                 } else {
-                                    // Substitute variables first, then expressions
-                                    let cmd = engine.substitute_vars(&cmd);
                                     let cmd = super::variables::substitute_commands(engine, &cmd);
                                     results.push(execute_body_line(engine, &cmd));
                                 }
@@ -799,9 +794,7 @@ fn execute_while_loop(engine: &mut TfEngine, condition: &str, body: &[String]) -
                 // Pass control flow blocks directly without substitution
                 line.clone()
             } else {
-                // Substitute variables first, then expressions (order matters!)
-                let line = engine.substitute_vars(line);
-                super::variables::substitute_commands(engine, &line)
+                super::variables::substitute_commands(engine, line)
             };
 
             let result = execute_body_line(engine, &line);
@@ -981,9 +974,7 @@ fn execute_for_loop(
                 // Pass control flow blocks directly without substitution
                 line.clone()
             } else {
-                // Substitute variables first, then expressions (order matters!)
-                let line = engine.substitute_vars(line);
-                super::variables::substitute_commands(engine, &line)
+                super::variables::substitute_commands(engine, line)
             };
 
             let result = execute_body_line(engine, &line);
@@ -1199,9 +1190,7 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
                             let line = if is_control_flow {
                                 line.to_string()
                             } else {
-                                // Substitute variables first, then expressions
-                                let line = engine.substitute_vars(line);
-                                super::variables::substitute_commands(engine, &line)
+                                                super::variables::substitute_commands(engine, line)
                             };
 
                             results.push(execute_body_line(engine, &line));
@@ -1235,9 +1224,7 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
             let line = if is_control_flow {
                 line.to_string()
             } else {
-                // Substitute variables first, then expressions
-                let line = engine.substitute_vars(line);
-                super::variables::substitute_commands(engine, &line)
+                super::variables::substitute_commands(engine, line)
             };
 
             results.push(execute_body_line(engine, &line));
@@ -1318,9 +1305,7 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
                 should_break = true;
                 break;
             }
-            // Substitute variables first, then expressions
-            let line = engine.substitute_vars(line);
-            let line = super::variables::substitute_commands(engine, &line);
+            let line = super::variables::substitute_commands(engine, line);
             let result = execute_body_line(engine, &line);
             // Check for break in nested execution
             if let TfCommandResult::Error(ref e) = result {
@@ -1438,9 +1423,7 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
                 should_break = true;
                 break;
             }
-            // Substitute variables first, then expressions
-            let line = engine.substitute_vars(line);
-            let line = super::variables::substitute_commands(engine, &line);
+            let line = super::variables::substitute_commands(engine, line);
             let result = execute_body_line(engine, &line);
             if let TfCommandResult::Error(ref e) = result {
                 if e == "__break__" {

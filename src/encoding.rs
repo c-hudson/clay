@@ -1,4 +1,5 @@
 use ratatui::style::Color;
+use crate::util::strip_ansi_codes;
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Encoding {
@@ -699,12 +700,29 @@ pub fn wrap_urls_with_osc8(s: &str) -> String {
             let url_start = i;
             let mut url_end = i;
 
-            // URL can contain most characters, ends at whitespace or certain delimiters
+            // URL can contain most characters, ends at whitespace or certain delimiters.
+            // ANSI CSI sequences (ESC [ ... <final>) embedded by color highlighting are
+            // skipped so they don't truncate the URL — they stay in the visible text but
+            // are stripped from the clean URL used in the OSC 8 parameter.
             while url_end < chars.len() {
                 let c = chars[url_end];
-                // End URL at whitespace, ANSI escape, or common text delimiters
-                // ESC (0x1B) must be a delimiter to avoid including ANSI color codes in URLs
-                if c.is_whitespace() || c == '\x1b' || c == '"' || c == '\'' || c == '<' || c == '>'
+                if c == '\x1b' {
+                    // CSI sequence: ESC [ <params> <final 0x40-0x7E> — skip it entirely
+                    if url_end + 1 < chars.len() && chars[url_end + 1] == '[' {
+                        url_end += 2; // skip ESC [
+                        while url_end < chars.len() {
+                            let sc = chars[url_end];
+                            url_end += 1;
+                            if ('\x40'..='\x7e').contains(&sc) {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    // Any other ESC sequence terminates the URL
+                    break;
+                }
+                if c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>'
                    || c == '[' || c == ']' || c == '(' || c == ')' || c == '{' || c == '}'
                    || c == '\u{201C}' || c == '\u{201D}' || c == '\u{2018}' || c == '\u{2019}' {
                     break;
@@ -724,9 +742,9 @@ pub fn wrap_urls_with_osc8(s: &str) -> String {
 
             if url_end > url_start {
                 let url: String = chars[url_start..url_end].iter().collect();
-                // Clean URL for OSC 8 parameter - strip zero-width spaces that may have
-                // been inserted for word breaking
-                let clean_url = url.replace('\u{200B}', "");
+                // Strip ANSI sequences and zero-width spaces for the OSC 8 parameter so
+                // the browser receives a clean URL. The visible text keeps them intact.
+                let clean_url = strip_ansi_codes(&url).replace('\u{200B}', "");
                 // OSC 8 format: \x1b]8;;URL\x07VISIBLE_TEXT\x1b]8;;\x07
                 // Using BEL (0x07) as terminator for better terminal compatibility
                 // URL parameter uses clean URL, visible text preserves original (may have ZWSP for breaking)
