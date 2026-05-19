@@ -1307,7 +1307,7 @@
     function handleSessionDisconnect(code, reason) {
         debugLog('Session disconnect: ' + code + ' ' + reason);
         if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
-        if (ws) ws.readyState = WebSocket.CLOSED;
+        if (ws && !(ws instanceof WebSocket)) ws.readyState = WebSocket.CLOSED;
         authenticated = false;
         hasReceivedInitialState = false;
         winnerAttemptId = null;
