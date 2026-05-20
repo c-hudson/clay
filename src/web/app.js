@@ -288,6 +288,8 @@
     let pendingAuthUsername = null;  // Username being authenticated (saved on success for Android auto-login)
     let deferredAutoLoginPassword = null;  // Saved password waiting for ServerHello
     let deferredAutoLoginUsername = null;  // Saved username waiting for ServerHello
+    let lastGoodPassword = null;  // Last password that succeeded; kept in memory for silent re-auth across reconnects (not persisted to storage)
+    let lastGoodUsername = null;  // Matching username for lastGoodPassword (multiuser mode)
     let authKey = null;  // Device auth key for passwordless authentication
     let authKeyPending = false;  // True when trying key-based auth (to fall back to password on failure)
     let keyAuthFailed = false;   // Set after key rejection so reconnect skips key auth and shows password prompt
@@ -1197,6 +1199,12 @@
                     }
                 }, 1000);
             }
+        } else if (lastGoodPassword) {
+            // Browser silent re-auth after disconnect/hot-reload.
+            // Queue password for the ServerHello handler (need the fresh challenge first).
+            deferredAutoLoginPassword = lastGoodPassword;
+            deferredAutoLoginUsername = lastGoodUsername;
+            keyAuthFailed = true;  // Skip key-auth path; go straight to password re-auth
         } else if (authKey && !keyAuthFailed) {
             debugLog('handleSocketOpen: waiting for ServerHello to try key auth');
             setTimeout(function() {
@@ -1327,6 +1335,20 @@
         if (window.Android && window.Android.stopBackgroundService) {
             window.Android.stopBackgroundService();
         }
+
+        // If there is no usable credential and the auth modal is already open,
+        // stop auto-reconnecting. The user will trigger a fresh connection by
+        // submitting the form (authenticate() calls forceReconnect() when WS is closed).
+        // This prevents the 30 s idle-drop flash loop when the user sits at the prompt.
+        const canSilentReauth = !!(window.AUTO_PASSWORD || lastGoodPassword ||
+            deferredAutoLoginPassword || (authKey && !keyAuthFailed));
+        const modalVisible = elements.authModal &&
+            elements.authModal.classList.contains('visible');
+        if (!canSilentReauth && modalVisible) {
+            debugLog('Session disconnect with auth modal open and no credential — not auto-reconnecting');
+            return;
+        }
+
         const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
         if (connectionFailures >= maxFailures) {
             enableConnectionLogRetry();
@@ -1632,6 +1654,12 @@
                     if (window.Android && window.Android.saveUsername && pendingAuthUsername) {
                         window.Android.saveUsername(pendingAuthUsername);
                     }
+                    // Retain in memory for silent re-auth across reconnects (not persisted to storage).
+                    // Only capture when we actually used a password (not a key-auth reconnect).
+                    if (pendingAuthPassword) {
+                        lastGoodPassword = pendingAuthPassword;
+                        lastGoodUsername = pendingAuthUsername;
+                    }
                     pendingAuthPassword = null;
                     pendingAuthUsername = null;
                     // Start Android foreground service to keep connection alive
@@ -1654,6 +1682,9 @@
                     elements.authPassword.value = '';
                     pendingAuthPassword = null;
                     pendingAuthUsername = null;
+                    // Password changed or invalid — clear cached credential so we don't loop.
+                    lastGoodPassword = null;
+                    lastGoodUsername = null;
                     // Clear saved credentials on auth failure (they may be outdated)
                     if (window.Android && window.Android.clearSavedPassword) {
                         window.Android.clearSavedPassword();
@@ -7440,6 +7471,8 @@
 
     // Perform logout in multiuser mode
     function performLogout() {
+        lastGoodPassword = null;
+        lastGoodUsername = null;
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'Logout' }));
         }
