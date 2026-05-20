@@ -1654,12 +1654,6 @@
                     if (window.Android && window.Android.saveUsername && pendingAuthUsername) {
                         window.Android.saveUsername(pendingAuthUsername);
                     }
-                    // Retain in memory for silent re-auth across reconnects (not persisted to storage).
-                    // Only capture when we actually used a password (not a key-auth reconnect).
-                    if (pendingAuthPassword) {
-                        lastGoodPassword = pendingAuthPassword;
-                        lastGoodUsername = pendingAuthUsername;
-                    }
                     pendingAuthPassword = null;
                     pendingAuthUsername = null;
                     // Start Android foreground service to keep connection alive
@@ -2995,6 +2989,13 @@
         }
         // Store username for saving on success (Android auto-login)
         pendingAuthUsername = username;
+
+        // Store for silent re-auth on reconnect/hot-reload (browser clients only —
+        // Android uses window.Android.savePassword, WebView uses AUTO_PASSWORD).
+        if (!window.Android && !window.AUTO_PASSWORD) {
+            lastGoodPassword = password;
+            lastGoodUsername = username;
+        }
 
         // Hash password with SHA-256, then apply challenge-response
         hashPassword(password).then(async hash => {
