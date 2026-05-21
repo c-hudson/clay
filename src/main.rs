@@ -2658,6 +2658,23 @@ impl World {
         }
     }
 
+    /// Push a pre-built client OutputLine honoring more-mode: queued into pending_lines
+    /// when paused so it appears after already-queued output; otherwise shown immediately.
+    fn push_line_respecting_pending(&mut self, line: OutputLine, more_mode_enabled: bool) {
+        if self.paused && more_mode_enabled {
+            if self.pending_lines.is_empty() {
+                self.pending_since = Some(std::time::Instant::now());
+                if self.first_unseen_at.is_none() {
+                    self.first_unseen_at = Some(std::time::Instant::now());
+                }
+            }
+            self.pending_lines.push(line);
+        } else {
+            self.output_lines.push(line);
+            self.scroll_to_bottom();
+        }
+    }
+
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = self.output_lines.len().saturating_sub(1);
         self.visual_line_offset = 0;
@@ -5469,20 +5486,20 @@ impl App {
             let _ = self.tf_engine.execute(&cmd);
         }
 
+        let more_mode = self.settings.more_mode_enabled;
         // Push prompt to output before clearing
         if !self.worlds[world_idx].prompt.is_empty() {
             let prompt_text = self.worlds[world_idx].prompt.trim().to_string();
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
-            self.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
+            self.worlds[world_idx].push_line_respecting_pending(OutputLine::new(prompt_text, seq), more_mode);
         }
         self.worlds[world_idx].clear_connection_state(true, true);
         // Show disconnection message
         let seq = self.worlds[world_idx].next_seq;
         self.worlds[world_idx].next_seq += 1;
         let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
-        self.worlds[world_idx].output_lines.push(disconnect_msg.clone());
-        self.worlds[world_idx].scroll_to_bottom();
+        self.worlds[world_idx].push_line_respecting_pending(disconnect_msg.clone(), more_mode);
 
         // If this is not the current world, increment unseen_lines for activity indicator
         if world_idx != self.current_world_index {
@@ -5519,7 +5536,7 @@ impl App {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             let msg = OutputLine::new_client(format!("Reconnecting in {} seconds...", secs), seq);
-            self.worlds[world_idx].output_lines.push(msg.clone());
+            self.worlds[world_idx].push_line_respecting_pending(msg.clone(), more_mode);
             self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                 world_index: world_idx,
                 data: format!("Reconnecting in {} seconds...\n", secs),
