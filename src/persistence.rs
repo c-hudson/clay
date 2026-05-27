@@ -1198,6 +1198,19 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
 
+    // Save watchdog state
+    writeln!(file, "watchdog_enabled={}", app.tf_engine.watchdog_enabled)?;
+    writeln!(file, "watchdog_n1={}", app.tf_engine.watchdog_n1)?;
+    writeln!(file, "watchdog_n2={}", app.tf_engine.watchdog_n2)?;
+    let mut wd_overrides: Vec<(&String, &tf::WatchdogConfig)> = app.tf_engine.watchdog_overrides.iter().collect();
+    wd_overrides.sort_by_key(|(k, _)| *k);
+    writeln!(file, "watchdog_override_count={}", wd_overrides.len())?;
+    for (i, (world, cfg)) in wd_overrides.iter().enumerate() {
+        let escaped_world = world.replace('\\', "\\\\").replace('=', "\\e");
+        let status = if cfg.enabled { "on" } else { "off" };
+        writeln!(file, "watchdog_override_{}={}|{}|{}|{}", i, escaped_world, status, cfg.n1, cfg.n2)?;
+    }
+
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
     for (i, hist) in app.input.history.iter().enumerate() {
@@ -1844,11 +1857,31 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
-                    "history_count" | "world_count" => {
+                    "history_count" | "world_count" | "watchdog_override_count" => {
                         // These are informational, not needed for parsing
+                    }
+                    "watchdog_enabled" => {
+                        app.tf_engine.watchdog_enabled = value == "true";
+                    }
+                    "watchdog_n1" => {
+                        if let Ok(n) = value.parse::<usize>() { app.tf_engine.watchdog_n1 = n; }
+                    }
+                    "watchdog_n2" => {
+                        if let Ok(n) = value.parse::<usize>() { app.tf_engine.watchdog_n2 = n; }
                     }
                     k if k.starts_with("history_") => {
                         app.input.history.push(unescape_string(value));
+                    }
+                    k if k.starts_with("watchdog_override_") => {
+                        // value: escaped_worldname|on|n1|n2
+                        let parts: Vec<&str> = value.splitn(4, '|').collect();
+                        if parts.len() == 4 {
+                            let world = unescape_string(parts[0]);
+                            let enabled = parts[1] == "on";
+                            if let (Ok(n1), Ok(n2)) = (parts[2].parse::<usize>(), parts[3].parse::<usize>()) {
+                                app.tf_engine.watchdog_overrides.insert(world, tf::WatchdogConfig { enabled, n1, n2 });
+                            }
+                        }
                     }
                     _ => {}
                 }
