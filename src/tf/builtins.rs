@@ -2195,16 +2195,23 @@ pub fn cmd_watchdog(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         // Global operation (original behavior)
         if args.is_empty() {
             let status = if engine.watchdog_enabled { "on" } else { "off" };
-            let override_count = engine.watchdog_overrides.len();
-            let override_note = if override_count > 0 {
-                format!(" ({} world override{})", override_count, if override_count == 1 { "" } else { "s" })
-            } else {
-                String::new()
-            };
-            return TfCommandResult::Success(Some(format!(
-                "watchdog={} (threshold={}, window={}){}",
-                status, engine.watchdog_n1, engine.watchdog_n2, override_note
-            )));
+            let mut msg = format!(
+                "watchdog={} (threshold={}, window={})",
+                status, engine.watchdog_n1, engine.watchdog_n2
+            );
+            if !engine.watchdog_overrides.is_empty() {
+                let mut worlds: Vec<&String> = engine.watchdog_overrides.keys().collect();
+                worlds.sort();
+                for world in worlds {
+                    let cfg = &engine.watchdog_overrides[world];
+                    let ws = if cfg.enabled { "on" } else { "off" };
+                    msg.push_str(&format!(
+                        "\n  {}: {} (threshold={}, window={})",
+                        world, ws, cfg.n1, cfg.n2
+                    ));
+                }
+            }
+            return TfCommandResult::Success(Some(msg));
         }
 
         match args.to_lowercase().as_str() {
