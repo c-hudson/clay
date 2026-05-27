@@ -314,6 +314,14 @@ pub struct TfMacro {
     pub sequence_number: u32,       // Sequential definition number (TF-compatible)
 }
 
+/// Per-world watchdog configuration override
+#[derive(Debug, Clone)]
+pub struct WatchdogConfig {
+    pub enabled: bool,
+    pub n1: usize,
+    pub n2: usize,
+}
+
 /// The TinyFugue scripting engine
 #[derive(Debug, Default)]
 pub struct TfEngine {
@@ -371,6 +379,7 @@ pub struct TfEngine {
     pub watchdog_enabled: bool,
     pub watchdog_n1: usize,  // occurrence threshold (default 2)
     pub watchdog_n2: usize,  // window size (default 5)
+    pub watchdog_overrides: HashMap<String, WatchdogConfig>,  // per-world overrides
     /// Watchname: suppress spam from repeated character names
     pub watchname_enabled: bool,
     pub watchname_n1: usize,  // occurrence threshold (default 4)

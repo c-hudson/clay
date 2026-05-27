@@ -2114,44 +2114,125 @@ pub fn cmd_unworld(args: &str) -> TfCommandResult {
 // Tier 4: Spam detection
 // =============================================================================
 
-/// /watchdog [off|on|n1 [n2]] - Suppress duplicate lines
+/// /watchdog [-w<world>] [off|on|n1 [n2]] - Suppress duplicate lines
 pub fn cmd_watchdog(engine: &mut TfEngine, args: &str) -> TfCommandResult {
-    let args = args.trim();
+    let mut args = args.trim();
 
-    if args.is_empty() {
-        let status = if engine.watchdog_enabled { "on" } else { "off" };
-        return TfCommandResult::Success(Some(format!(
-            "watchdog={} (threshold={}, window={})",
-            status, engine.watchdog_n1, engine.watchdog_n2
-        )));
+    // Parse optional -w<world> flag
+    let mut target_world: Option<String> = None;
+    if args.starts_with("-w") {
+        let rest = &args[2..];
+        if rest.is_empty() {
+            return TfCommandResult::Error("Usage: /watchdog [-w<world>] [off|on|n1 [n2]]".to_string());
+        }
+        // -w<world> (no space) or -w <world> (with space)
+        let (world_name, remainder) = if let Some(sp) = rest.find(char::is_whitespace) {
+            (rest[..sp].trim(), rest[sp..].trim())
+        } else {
+            (rest.trim(), "")
+        };
+        if world_name.is_empty() {
+            return TfCommandResult::Error("Usage: /watchdog [-w<world>] [off|on|n1 [n2]]".to_string());
+        }
+        target_world = Some(world_name.to_string());
+        args = remainder;
     }
 
-    match args.to_lowercase().as_str() {
-        "on" => {
-            engine.watchdog_enabled = true;
-            TfCommandResult::Success(Some("watchdog=on".to_string()))
+    if let Some(world) = target_world {
+        // Per-world operation
+        if args.is_empty() {
+            // Report resolved config for this world
+            let (status, n1, n2, source) = match engine.watchdog_overrides.get(&world) {
+                Some(cfg) => (if cfg.enabled { "on" } else { "off" }, cfg.n1, cfg.n2, "(override)"),
+                None => (
+                    if engine.watchdog_enabled { "on" } else { "off" },
+                    engine.watchdog_n1, engine.watchdog_n2, "(global)"
+                ),
+            };
+            return TfCommandResult::Success(Some(format!(
+                "watchdog[{}]={} (threshold={}, window={}) {}",
+                world, status, n1, n2, source
+            )));
         }
-        "off" => {
-            engine.watchdog_enabled = false;
-            TfCommandResult::Success(Some("watchdog=off".to_string()))
-        }
-        _ => {
-            // Parse n1 [n2]
-            let parts: Vec<&str> = args.split_whitespace().collect();
-            if let Ok(n1) = parts[0].parse::<usize>() {
-                engine.watchdog_n1 = n1;
-                if parts.len() > 1 {
-                    if let Ok(n2) = parts[1].parse::<usize>() {
-                        engine.watchdog_n2 = n2;
-                    }
+
+        match args.to_lowercase().as_str() {
+            "on" => {
+                let (n1, n2) = match engine.watchdog_overrides.get(&world) {
+                    Some(cfg) => (cfg.n1, cfg.n2),
+                    None => (engine.watchdog_n1, engine.watchdog_n2),
+                };
+                engine.watchdog_overrides.insert(world.clone(), super::WatchdogConfig { enabled: true, n1, n2 });
+                TfCommandResult::Success(Some(format!("watchdog[{}]=on", world)))
+            }
+            "off" => {
+                let (n1, n2) = match engine.watchdog_overrides.get(&world) {
+                    Some(cfg) => (cfg.n1, cfg.n2),
+                    None => (engine.watchdog_n1, engine.watchdog_n2),
+                };
+                engine.watchdog_overrides.insert(world.clone(), super::WatchdogConfig { enabled: false, n1, n2 });
+                TfCommandResult::Success(Some(format!("watchdog[{}]=off", world)))
+            }
+            _ => {
+                let parts: Vec<&str> = args.split_whitespace().collect();
+                if let Ok(n1) = parts[0].parse::<usize>() {
+                    let n2 = if parts.len() > 1 {
+                        parts[1].parse::<usize>().unwrap_or_else(|_| {
+                            engine.watchdog_overrides.get(&world).map(|c| c.n2).unwrap_or(engine.watchdog_n2)
+                        })
+                    } else {
+                        engine.watchdog_overrides.get(&world).map(|c| c.n2).unwrap_or(engine.watchdog_n2)
+                    };
+                    engine.watchdog_overrides.insert(world.clone(), super::WatchdogConfig { enabled: true, n1, n2 });
+                    TfCommandResult::Success(Some(format!(
+                        "watchdog[{}]=on (threshold={}, window={})", world, n1, n2
+                    )))
+                } else {
+                    TfCommandResult::Error("Usage: /watchdog [-w<world>] [off|on|n1 [n2]]".to_string())
                 }
-                engine.watchdog_enabled = true;
-                TfCommandResult::Success(Some(format!(
-                    "watchdog=on (threshold={}, window={})",
-                    engine.watchdog_n1, engine.watchdog_n2
-                )))
+            }
+        }
+    } else {
+        // Global operation (original behavior)
+        if args.is_empty() {
+            let status = if engine.watchdog_enabled { "on" } else { "off" };
+            let override_count = engine.watchdog_overrides.len();
+            let override_note = if override_count > 0 {
+                format!(" ({} world override{})", override_count, if override_count == 1 { "" } else { "s" })
             } else {
-                TfCommandResult::Error("Usage: /watchdog [off|on|n1 [n2]]".to_string())
+                String::new()
+            };
+            return TfCommandResult::Success(Some(format!(
+                "watchdog={} (threshold={}, window={}){}",
+                status, engine.watchdog_n1, engine.watchdog_n2, override_note
+            )));
+        }
+
+        match args.to_lowercase().as_str() {
+            "on" => {
+                engine.watchdog_enabled = true;
+                TfCommandResult::Success(Some("watchdog=on".to_string()))
+            }
+            "off" => {
+                engine.watchdog_enabled = false;
+                TfCommandResult::Success(Some("watchdog=off".to_string()))
+            }
+            _ => {
+                let parts: Vec<&str> = args.split_whitespace().collect();
+                if let Ok(n1) = parts[0].parse::<usize>() {
+                    engine.watchdog_n1 = n1;
+                    if parts.len() > 1 {
+                        if let Ok(n2) = parts[1].parse::<usize>() {
+                            engine.watchdog_n2 = n2;
+                        }
+                    }
+                    engine.watchdog_enabled = true;
+                    TfCommandResult::Success(Some(format!(
+                        "watchdog=on (threshold={}, window={})",
+                        engine.watchdog_n1, engine.watchdog_n2
+                    )))
+                } else {
+                    TfCommandResult::Error("Usage: /watchdog [-w<world>] [off|on|n1 [n2]]".to_string())
+                }
             }
         }
     }

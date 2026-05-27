@@ -5109,17 +5109,19 @@ impl App {
                 // Watchdog/watchname spam detection (before triggers)
                 let mut watchdog_gagged = false;
                 let stripped = strip_ansi_for_watchdog(line);
-                if self.tf_engine.watchdog_enabled {
-                    let n1 = self.tf_engine.watchdog_n1;
-                    let n2 = self.tf_engine.watchdog_n2;
+                let (wd_enabled, wd_n1, wd_n2) = match self.tf_engine.watchdog_overrides.get(&world_name_for_triggers) {
+                    Some(cfg) => (cfg.enabled, cfg.n1, cfg.n2),
+                    None => (self.tf_engine.watchdog_enabled, self.tf_engine.watchdog_n1, self.tf_engine.watchdog_n2),
+                };
+                if wd_enabled {
                     let count = self.worlds[world_idx].watchdog_history.iter()
                         .filter(|h| *h == &stripped)
                         .count();
-                    if count >= n1 {
+                    if count >= wd_n1 {
                         watchdog_gagged = true;
                     }
                     self.worlds[world_idx].watchdog_history.push_back(stripped.clone());
-                    while self.worlds[world_idx].watchdog_history.len() > n2 {
+                    while self.worlds[world_idx].watchdog_history.len() > wd_n2 {
                         self.worlds[world_idx].watchdog_history.pop_front();
                     }
                 }
