@@ -2764,24 +2764,28 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 Box::pin(handle_command(&clay_cmd, app, event_tx.clone())).await;
                             }
                             tf::TfCommandResult::Recall(opts) => {
-                                let output_lines = app.current_world().output_lines.clone();
-                                let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-
-                                if !opts.quiet {
-                                    if let Some(h) = header {
-                                        app.add_output(&h);
+                                let fallback = app.current_world_index;
+                                match app.recall_source_lines(&opts, fallback) {
+                                    Ok(output_lines) => {
+                                        let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
+                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                        if !opts.quiet {
+                                            if let Some(h) = header {
+                                                app.add_output(&h);
+                                            }
+                                        }
+                                        if matches.is_empty() {
+                                            app.add_output(&format!("No matches for '{}'", pattern_str));
+                                        } else {
+                                            for m in matches {
+                                                app.add_output(&m);
+                                            }
+                                        }
+                                        if !opts.quiet {
+                                            app.add_output("================= Recall end =================");
+                                        }
                                     }
-                                }
-                                if matches.is_empty() {
-                                    app.add_output(&format!("No matches for '{}'", pattern_str));
-                                } else {
-                                    for m in matches {
-                                        app.add_output(&m);
-                                    }
-                                }
-                                if !opts.quiet {
-                                    app.add_output("================= Recall end =================");
+                                    Err(e) => app.add_output(&format!("✨ {}", e)),
                                 }
                             }
                             tf::TfCommandResult::Quote { lines, disposition, .. } => {
@@ -2846,23 +2850,28 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         app.add_output(&format!("Unknown command: /{}", name));
                     }
                     tf::TfCommandResult::Recall(opts) => {
-                        let output_lines = app.current_world().output_lines.clone();
-                        let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                        if !opts.quiet {
-                            if let Some(h) = header {
-                                app.add_output(&h);
+                        let fallback = app.current_world_index;
+                        match app.recall_source_lines(&opts, fallback) {
+                            Ok(output_lines) => {
+                                let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
+                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                if !opts.quiet {
+                                    if let Some(h) = header {
+                                        app.add_output(&h);
+                                    }
+                                }
+                                if matches.is_empty() {
+                                    app.add_output(&format!("No matches for '{}'", pattern_str));
+                                } else {
+                                    for m in &matches {
+                                        app.add_output(m);
+                                    }
+                                }
+                                if !opts.quiet {
+                                    app.add_output("================= Recall end =================");
+                                }
                             }
-                        }
-                        if matches.is_empty() {
-                            app.add_output(&format!("No matches for '{}'", pattern_str));
-                        } else {
-                            for m in &matches {
-                                app.add_output(m);
-                            }
-                        }
-                        if !opts.quiet {
-                            app.add_output("================= Recall end =================");
+                            Err(e) => app.add_output(&format!("✨ {}", e)),
                         }
                     }
                     tf::TfCommandResult::RepeatProcess(process) => {

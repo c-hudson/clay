@@ -454,25 +454,30 @@ pub async fn handle_daemon_ws_message(
                                         }
                                         tf::TfCommandResult::Recall(opts) => {
                                             if world_index < app.worlds.len() {
-                                                let output_lines = app.worlds[world_index].output_lines.clone();
-                                                let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                                                 let ts = current_timestamp_secs();
-
-                                                if !opts.quiet {
-                                                    if let Some(h) = header {
-                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                match app.recall_source_lines(&opts, world_index) {
+                                                    Ok(output_lines) => {
+                                                        let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
+                                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                        if !opts.quiet {
+                                                            if let Some(h) = header {
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                            }
+                                                        }
+                                                        if matches.is_empty() {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                        } else {
+                                                            for m in matches {
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                            }
+                                                        }
+                                                        if !opts.quiet {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                        }
                                                     }
-                                                }
-                                                if matches.is_empty() {
-                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                } else {
-                                                    for m in matches {
-                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                    Err(e) => {
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} {}", e), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                                     }
-                                                }
-                                                if !opts.quiet {
-                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                                 }
                                             }
                                         }
@@ -529,24 +534,30 @@ pub async fn handle_daemon_ws_message(
                             }
                             tf::TfCommandResult::Recall(opts) => {
                                 if world_index < app.worlds.len() {
-                                    let output_lines = app.worlds[world_index].output_lines.clone();
-                                    let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                                     let ts = current_timestamp_secs();
-                                    if !opts.quiet {
-                                        if let Some(h) = header {
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                    match app.recall_source_lines(&opts, world_index) {
+                                        Ok(output_lines) => {
+                                            let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
+                                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                            if !opts.quiet {
+                                                if let Some(h) = header {
+                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                }
+                                            }
+                                            if matches.is_empty() {
+                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                            } else {
+                                                for m in matches {
+                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                }
+                                            }
+                                            if !opts.quiet {
+                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                            }
                                         }
-                                    }
-                                    if matches.is_empty() {
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                    } else {
-                                        for m in matches {
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                        Err(e) => {
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} {}", e), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                         }
-                                    }
-                                    if !opts.quiet {
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                     }
                                 }
                             }

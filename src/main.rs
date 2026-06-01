@@ -4192,6 +4192,25 @@ impl App {
         })
     }
 
+    /// Resolve the output buffer a /recall should read from.
+    /// For `-w<world>`, looks the world up by name (case-insensitive, matches
+    /// reader_name too). For every other source, uses `fallback_idx` (the
+    /// current or arriving world). Returns an error string if the named world
+    /// does not exist.
+    pub fn recall_source_lines(
+        &self,
+        opts: &tf::RecallOptions,
+        fallback_idx: usize,
+    ) -> Result<Vec<OutputLine>, String> {
+        let idx = match &opts.source {
+            tf::RecallSource::World(name) => self
+                .find_world_index(name)
+                .ok_or_else(|| format!("No world named '{}'", name))?,
+            _ => fallback_idx,
+        };
+        Ok(self.worlds[idx].output_lines.clone())
+    }
+
     pub fn switch_world(&mut self, index: usize) {
         if index < self.worlds.len() && index != self.current_world_index {
             // Stop media for old world (audio only plays for current world)
@@ -6119,25 +6138,30 @@ impl App {
                                     }
                                     tf::TfCommandResult::Recall(opts) => {
                                         if world_index < self.worlds.len() {
-                                            let output_lines = self.worlds[world_index].output_lines.clone();
-                                            let (matches, header) = execute_recall(&opts, &output_lines, self.show_tags);
-                                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                                             let ts = current_timestamp_secs();
-
-                                            if !opts.quiet {
-                                                if let Some(h) = header {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                            match self.recall_source_lines(&opts, world_index) {
+                                                Ok(output_lines) => {
+                                                    let (matches, header) = execute_recall(&opts, &output_lines, self.show_tags);
+                                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                    if !opts.quiet {
+                                                        if let Some(h) = header {
+                                                            self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                        }
+                                                    }
+                                                    if matches.is_empty() {
+                                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                    } else {
+                                                        for m in matches {
+                                                            self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                        }
+                                                    }
+                                                    if !opts.quiet {
+                                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                    }
                                                 }
-                                            }
-                                            if matches.is_empty() {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                            } else {
-                                                for m in matches {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                                Err(e) => {
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} {}", e), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                                 }
-                                            }
-                                            if !opts.quiet {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                             }
                                         }
                                     }
@@ -6200,24 +6224,30 @@ impl App {
                         }
                         tf::TfCommandResult::Recall(opts) => {
                             if world_index < self.worlds.len() {
-                                let output_lines = self.worlds[world_index].output_lines.clone();
-                                let (matches, header) = execute_recall(&opts, &output_lines, self.show_tags);
-                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
                                 let ts = current_timestamp_secs();
-                                if !opts.quiet {
-                                    if let Some(h) = header {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                match self.recall_source_lines(&opts, world_index) {
+                                    Ok(output_lines) => {
+                                        let (matches, header) = execute_recall(&opts, &output_lines, self.show_tags);
+                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                        if !opts.quiet {
+                                            if let Some(h) = header {
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                            }
+                                        }
+                                        if matches.is_empty() {
+                                            self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                        } else {
+                                            for m in matches {
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                            }
+                                        }
+                                        if !opts.quiet {
+                                            self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                        }
                                     }
-                                }
-                                if matches.is_empty() {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                } else {
-                                    for m in matches {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
+                                    Err(e) => {
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} {}", e), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                     }
-                                }
-                                if !opts.quiet {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
                                 }
                             }
                         }
@@ -6962,18 +6992,28 @@ impl App {
         // If this is a /quote with backtick /recall, execute the recall now
         if let Some((opts, recall_prefix)) = recall_opts {
             if world_index < self.worlds.len() {
-                let output_lines = self.worlds[world_index].output_lines.clone();
-                let (matches, _header) = execute_recall(&opts, &output_lines, self.show_tags);
-                *lines = matches.iter()
-                    .map(|line| format!("{}{}", recall_prefix, line))
-                    .collect();
-                if lines.is_empty() {
-                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                    self.ws_broadcast(WsMessage::ServerData {
-                        world_index, data: format!("(no recall matches for '{}')", pattern_str),
-                        is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false, gagged: false,
-                    });
+                match self.recall_source_lines(&opts, world_index) {
+                    Ok(output_lines) => {
+                        let (matches, _header) = execute_recall(&opts, &output_lines, self.show_tags);
+                        *lines = matches.iter()
+                            .map(|line| format!("{}{}", recall_prefix, line))
+                            .collect();
+                        if lines.is_empty() {
+                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                            self.ws_broadcast(WsMessage::ServerData {
+                                world_index, data: format!("(no recall matches for '{}')", pattern_str),
+                                is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+                                flush: false, gagged: false,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        self.ws_broadcast(WsMessage::ServerData {
+                            world_index, data: format!("\u{2728} {}", e),
+                            is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+                            flush: false, gagged: false,
+                        });
+                    }
                 }
             }
         }
@@ -13702,24 +13742,28 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             let recall_cmd = format!("/recall /{} {}", num_part, pattern);
                                             match app.tf_engine.execute(&recall_cmd) {
                                                 tf::TfCommandResult::Recall(opts) => {
-                                                    let output_lines = app.current_world().output_lines.clone();
-                                                    let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-
-                                                    if !opts.quiet {
-                                                        if let Some(h) = header {
-                                                            app.add_tf_output(&h);
+                                                    let fallback = app.current_world_index;
+                                                    match app.recall_source_lines(&opts, fallback) {
+                                                        Ok(output_lines) => {
+                                                            let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
+                                                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                            if !opts.quiet {
+                                                                if let Some(h) = header {
+                                                                    app.add_tf_output(&h);
+                                                                }
+                                                            }
+                                                            if matches.is_empty() {
+                                                                app.add_tf_output(&format!("No matches for '{}'", pattern_str));
+                                                            } else {
+                                                                for m in &matches {
+                                                                    app.add_tf_output(m);
+                                                                }
+                                                            }
+                                                            if !opts.quiet {
+                                                                app.add_tf_output("================= Recall end =================");
+                                                            }
                                                         }
-                                                    }
-                                                    if matches.is_empty() {
-                                                        app.add_tf_output(&format!("No matches for '{}'", pattern_str));
-                                                    } else {
-                                                        for m in &matches {
-                                                            app.add_tf_output(m);
-                                                        }
-                                                    }
-                                                    if !opts.quiet {
-                                                        app.add_tf_output("================= Recall end =================");
+                                                        Err(e) => app.add_tf_output(&format!("✨ {}", e)),
                                                     }
                                                 }
                                                 tf::TfCommandResult::Error(err) => {
@@ -13771,24 +13815,28 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     tf::TfCommandResult::Recall(opts) => {
-                                        let output_lines = app.current_world().output_lines.clone();
-                                        let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-
-                                        if !opts.quiet {
-                                            if let Some(h) = header {
-                                                app.add_output(&h);
+                                        let fallback = app.current_world_index;
+                                        match app.recall_source_lines(&opts, fallback) {
+                                            Ok(output_lines) => {
+                                                let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
+                                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                if !opts.quiet {
+                                                    if let Some(h) = header {
+                                                        app.add_output(&h);
+                                                    }
+                                                }
+                                                if matches.is_empty() {
+                                                    app.add_output(&format!("No matches for '{}'", pattern_str));
+                                                } else {
+                                                    for m in &matches {
+                                                        app.add_output(m);
+                                                    }
+                                                }
+                                                if !opts.quiet {
+                                                    app.add_output("================= Recall end =================");
+                                                }
                                             }
-                                        }
-                                        if matches.is_empty() {
-                                            app.add_output(&format!("No matches for '{}'", pattern_str));
-                                        } else {
-                                            for m in &matches {
-                                                app.add_output(m);
-                                            }
-                                        }
-                                        if !opts.quiet {
-                                            app.add_output("================= Recall end =================");
+                                            Err(e) => app.add_output(&format!("✨ {}", e)),
                                         }
                                     }
                                     tf::TfCommandResult::RepeatProcess(process) => {
@@ -13802,14 +13850,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
                                         // If this is a /quote with backtick /recall, execute the recall now
                                         if let Some((opts, recall_prefix)) = recall_opts {
-                                            let output_lines = app.current_world().output_lines.clone();
-                                            let (matches, _header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                            lines = matches.iter()
-                                                .map(|line| format!("{}{}", recall_prefix, line))
-                                                .collect();
-                                            if lines.is_empty() {
-                                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                app.add_tf_output(&format!("(no recall matches for '{}')", pattern_str));
+                                            let fallback = app.current_world_index;
+                                            match app.recall_source_lines(&opts, fallback) {
+                                                Ok(output_lines) => {
+                                                    let (matches, _header) = execute_recall(&opts, &output_lines, app.show_tags);
+                                                    lines = matches.iter()
+                                                        .map(|line| format!("{}{}", recall_prefix, line))
+                                                        .collect();
+                                                    if lines.is_empty() {
+                                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                        app.add_tf_output(&format!("(no recall matches for '{}')", pattern_str));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    app.add_tf_output(&format!("✨ {}", e));
+                                                }
                                             }
                                         }
 
