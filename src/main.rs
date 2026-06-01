@@ -6168,8 +6168,8 @@ impl App {
                                     tf::TfCommandResult::RepeatProcess(process) => {
                                         self.tf_engine.processes.push(process);
                                     }
-                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
-                                        self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts);
+                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
+                                        self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts, strip_ansi);
                                         if disposition == tf::QuoteDisposition::Send && !lines.is_empty() {
                                             sent_to_server = true;
                                         }
@@ -6254,8 +6254,8 @@ impl App {
                         tf::TfCommandResult::RepeatProcess(process) => {
                             self.tf_engine.processes.push(process);
                         }
-                        tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
-                            self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts);
+                        tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
+                            self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts, strip_ansi);
                         }
                         _ => {
                             self.ws_broadcast(WsMessage::ServerData {
@@ -6988,6 +6988,7 @@ impl App {
         world: &Option<String>,
         delay_secs: f64,
         recall_opts: Option<(tf::RecallOptions, String)>,
+        strip_ansi: bool,
     ) {
         // If this is a /quote with backtick /recall, execute the recall now
         if let Some((opts, recall_prefix)) = recall_opts {
@@ -6996,7 +6997,10 @@ impl App {
                     Ok(output_lines) => {
                         let (matches, _header) = execute_recall(&opts, &output_lines, self.show_tags);
                         *lines = matches.iter()
-                            .map(|line| format!("{}{}", recall_prefix, line))
+                            .map(|line| {
+                                let raw = format!("{}{}", recall_prefix, line);
+                                if strip_ansi { strip_ansi_codes(&raw) } else { raw }
+                            })
                             .collect();
                         if lines.is_empty() {
                             let pattern_str = opts.pattern.as_deref().unwrap_or("*");
@@ -13847,7 +13851,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.tf_engine.processes.push(process);
                                         app.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
                                     }
-                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
+                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
                                         // If this is a /quote with backtick /recall, execute the recall now
                                         if let Some((opts, recall_prefix)) = recall_opts {
                                             let fallback = app.current_world_index;
@@ -13855,7 +13859,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 Ok(output_lines) => {
                                                     let (matches, _header) = execute_recall(&opts, &output_lines, app.show_tags);
                                                     lines = matches.iter()
-                                                        .map(|line| format!("{}{}", recall_prefix, line))
+                                                        .map(|line| {
+                                                            let raw = format!("{}{}", recall_prefix, line);
+                                                            if strip_ansi { strip_ansi_codes(&raw) } else { raw }
+                                                        })
                                                         .collect();
                                                     if lines.is_empty() {
                                                         let pattern_str = opts.pattern.as_deref().unwrap_or("*");

@@ -148,6 +148,7 @@ pub fn cmd_sh(args: &str) -> TfCommandResult {
 }
 
 /// /quote [options] [prefix] source [suffix] - Generate text from file, command, or literal
+/// Options: -dsend|echo|exec  -wworld  -<delay>  -S  -P  -A (keep ANSI sequences)
 ///
 /// Sources:
 ///   '"file"     - Read lines from a file
@@ -174,7 +175,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     use std::process::{Command, Stdio};
 
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: /quote [options] [prefix] source [suffix]".to_string());
+        return TfCommandResult::Error("Usage: /quote [-dsend|echo|exec] [-wworld] [-A] [prefix] source [suffix]".to_string());
     }
 
     let mut input = args.trim();
@@ -184,6 +185,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     let mut _synchronous = false;
     let mut _on_prompt = false;  // -P flag: run on prompt (not yet implemented)
     let mut delay_secs: f64 = 0.0;  // Timing between lines
+    let mut strip_ansi = true;  // Strip ANSI/escape sequences by default; -A disables
 
     // Helper to parse time string: "seconds", "min:sec", or "hour:min:sec"
     fn parse_time_spec(s: &str) -> Option<f64> {
@@ -241,6 +243,8 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                 _synchronous = true;
             } else if opt == "-P" {
                 _on_prompt = true;
+            } else if opt == "-A" {
+                strip_ansi = false;
             } else if opt.len() >= 2 && is_time_spec(&opt[1..]) {
                 // Timing option: -0, -1, -0.5, -1:30, -1:30:00, etc.
                 let time_str = &opt[1..];
@@ -259,7 +263,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
             }
         } else {
             // Option at end with no more args - check if it's a valid option
-            if input.starts_with("-d") || input.starts_with("-w") || input == "-S" || input == "-P" {
+            if input.starts_with("-d") || input.starts_with("-w") || input == "-S" || input == "-P" || input == "-A" {
                 return TfCommandResult::Error("No source specified after options".to_string());
             }
             // Check for timing option at end
@@ -301,12 +305,18 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     let source_start = match source_pos {
         Some(pos) => pos,
         None => {
+            let literal = if strip_ansi {
+                crate::util::strip_ansi_codes(input)
+            } else {
+                input.to_string()
+            };
             return TfCommandResult::Quote {
-                lines: vec![input.to_string()],
+                lines: vec![literal],
                 disposition,
                 world,
                 delay_secs,
                 recall_opts: None,
+                strip_ansi,
             };
         }
     };
@@ -410,6 +420,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                         world,
                         delay_secs,
                         recall_opts: Some((opts, prefix.to_string())),
+                        strip_ansi,
                     };
                 }
                 _ => {
@@ -488,12 +499,19 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
         }
     }
 
+    let lines = if strip_ansi {
+        lines.into_iter().map(|l| crate::util::strip_ansi_codes(&l)).collect()
+    } else {
+        lines
+    };
+
     TfCommandResult::Quote {
         lines,
         disposition,
         world,
         delay_secs,
         recall_opts: None,
+        strip_ansi,
     }
 }
 
@@ -2384,6 +2402,44 @@ mod tests {
             }
             _ => panic!("Expected Quote result, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn test_cmd_quote_ansi_stripping() {
+        let mut engine = TfEngine::new();
+
+        // Default: ANSI stripped from shell source
+        let result = cmd_quote(&mut engine, "!printf '\\033[31mred\\033[0m'");
+        match result {
+            TfCommandResult::Quote { lines, strip_ansi, .. } => {
+                assert!(strip_ansi, "strip_ansi should default to true");
+                assert_eq!(lines, vec!["red"], "ANSI should be stripped by default");
+            }
+            _ => panic!("Expected Quote result"),
+        }
+
+        // -A: ANSI preserved from shell source
+        let result = cmd_quote(&mut engine, "-A !printf '\\033[31mred\\033[0m'");
+        match result {
+            TfCommandResult::Quote { lines, strip_ansi, .. } => {
+                assert!(!strip_ansi, "strip_ansi should be false with -A");
+                assert!(lines[0].contains('\x1b'), "ANSI sequences should be preserved with -A");
+            }
+            _ => panic!("Expected Quote result"),
+        }
+
+        // Default: ANSI stripped from literal text
+        let result = cmd_quote(&mut engine, "\x1b[31mhello\x1b[0m");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert_eq!(lines, vec!["hello"], "ANSI stripped from literal text by default");
+            }
+            _ => panic!("Expected Quote result"),
+        }
+
+        // -A trailing with no source: error
+        let result = cmd_quote(&mut engine, "-A");
+        assert!(matches!(result, TfCommandResult::Error(_)), "bare -A with no source should error");
     }
 
     #[test]

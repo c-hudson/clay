@@ -198,6 +198,8 @@ pub enum TfCommandResult {
         delay_secs: f64,  // Delay between lines (0 = immediate)
         /// When backtick source is /recall, pass opts to caller for execution
         recall_opts: Option<(RecallOptions, String)>,  // (opts, prefix)
+        /// Strip ANSI/escape sequences from lines (default true; -A disables)
+        strip_ansi: bool,
     },
     /// Return from macro execution with optional value for %?
     Return(String),
