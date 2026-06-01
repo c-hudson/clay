@@ -6980,6 +6980,7 @@ impl App {
 
     /// Handle TfCommandResult::Quote from a WebSocket client command.
     /// Mirrors the console Quote handling but uses synchronous ws_broadcast/try_send.
+    #[allow(clippy::too_many_arguments)]
     fn handle_ws_quote_result(
         &mut self,
         world_index: usize,
