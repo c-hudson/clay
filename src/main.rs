@@ -3692,7 +3692,7 @@ impl App {
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, marked_new, flush, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, marked_new, flush, gagged, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Flush: clear output buffer before appending new lines
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
@@ -3739,6 +3739,7 @@ impl App {
                                 OutputLine::new_client(line.to_string(), seq)
                             };
                             output_line.marked_new = marked_new;
+                            output_line.gagged = gagged;
                             if marked_new && world.first_marked_new_index.is_none() {
                                 world.first_marked_new_index = Some(world.output_lines.len());
                             }
@@ -4043,6 +4044,11 @@ impl App {
                 self.apply_global_settings(&settings);
                 self.needs_output_redraw = true;
             }
+            WsMessage::ActionsUpdated { actions } => {
+                // Master or another client updated the action list - sync our local copy
+                self.settings.actions = actions;
+                compile_all_action_regexes(&mut self.settings.actions);
+            }
             WsMessage::PingCheck { nonce } => {
                 // Server liveness check for /remote command - respond immediately
                 if let Some(ref tx) = self.ws_client_tx {
@@ -4060,6 +4066,7 @@ impl App {
         current_world_index: usize,
         settings: GlobalSettingsMsg,
         splash_lines: Vec<String>,
+        actions: Vec<Action>,
     ) {
         self.worlds = worlds.into_iter().map(|w| {
             let mut world = World::new(&w.name);
@@ -4127,6 +4134,8 @@ impl App {
         self.current_world_index = current_world_index;
         self.apply_global_settings(&settings);
         self.is_master = false; // Remote client is never master
+        self.settings.actions = actions;
+        compile_all_action_regexes(&mut self.settings.actions);
 
         // If current world has no output, add splash screen
         if !splash_lines.is_empty() {

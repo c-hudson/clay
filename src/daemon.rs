@@ -3188,9 +3188,9 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
             }
         }).collect();
 
-    // Filter actions owned by this user
+    // Include actions owned by this user and un-owned (global/master-created) actions
     let actions: Vec<Action> = app.settings.actions.iter()
-        .filter(|a| a.owner.as_deref() == Some(username))
+        .filter(|a| a.owner.as_deref() == Some(username) || a.owner.is_none())
         .cloned()
         .collect();
 

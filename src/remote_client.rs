@@ -650,13 +650,13 @@ pub(crate) async fn run_console_client(addr: &str) -> io::Result<()> {
                         }
                         // Auth success - continue waiting for InitialState
                     }
-                    WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, .. } => {
+                    WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, .. } => {
                         // Save world totals for backfill before consuming worlds vec
                         let world_totals: Vec<(usize, usize)> = worlds.iter()
                             .map(|w| (w.index, w.total_output_lines))
                             .collect();
                         // Initialize app state from server
-                        app.init_from_initial_state(worlds, current_world_index, settings, splash_lines);
+                        app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
                         // Initialize backfill queue
                         app.init_backfill(&world_totals);
                         // Declare client type to server (RemoteConsole for TUI clients)
