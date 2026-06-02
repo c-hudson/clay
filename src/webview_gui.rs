@@ -768,14 +768,13 @@ fn dispatch_ipc_message(
     proxy: &EventLoopProxy<WvEvent>,
     reload_tx: &Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
 ) {
-    if body.starts_with("open-url:") {
-        open_url_in_browser(&body[9..]);
-    } else if body.starts_with("new-window:") {
-        let world_name = body[11..].trim().to_string();
+    if let Some(url) = body.strip_prefix("open-url:") {
+        open_url_in_browser(url);
+    } else if let Some(rest) = body.strip_prefix("new-window:") {
+        let world_name = rest.trim().to_string();
         let world = if world_name.is_empty() { None } else { Some(world_name) };
         let _ = proxy.send_event(WvEvent::NewWindow(world));
-    } else if body.starts_with("grep-window:") {
-        let json_str = &body[12..];
+    } else if let Some(json_str) = body.strip_prefix("grep-window:") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
             let pattern = v["pattern"].as_str().unwrap_or("").to_string();
             let world = v["world"].as_str().map(|s| s.to_string());
@@ -1242,13 +1241,10 @@ fn create_webview_window(
                     escaped_pattern, use_regex
                 );
                 let world_lock = world.as_deref();
-                match build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, Some(&grep_js)) {
-                    Ok(wv) => {
-                        let id = new_window.id();
-                        windows.insert(id, new_window);
-                        webviews.insert(id, wv);
-                    }
-                    Err(_) => {}
+                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, Some(&grep_js)) {
+                    let id = new_window.id();
+                    windows.insert(id, new_window);
+                    webviews.insert(id, wv);
                 }
             }
             _ => {}
