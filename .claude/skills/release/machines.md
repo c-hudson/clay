@@ -38,8 +38,9 @@ cargo build --release --features webview-gui,native-audio
 
 ### Android APK
 ```bash
-cd android && ./gradlew assembleRelease
+cd android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleRelease
 ```
+**Note:** The system default JDK (Java 25) is too new for Gradle 8.2 — always force Java 21 via `JAVA_HOME`.
 - Unsigned APK: `android/app/build/outputs/apk/release/app-release-unsigned.apk`
 - After signing, the release asset name: `clay-android.apk`
 
@@ -103,8 +104,8 @@ patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/
 ```bash
 cd ~/clay.build
 git pull
-. ~/.cargo/env && cargo build --release --no-default-features --features rustls-backend
+. ~/.cargo/env && cargo build --release --features webview-gui,native-audio
 ```
-- This build is only to verify the code compiles on this machine
+- This build is only to verify the code compiles on this machine (including GUI)
 - The binary is NOT included in the release assets
 - Report pass/fail in the summary

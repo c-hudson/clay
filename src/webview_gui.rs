@@ -527,6 +527,9 @@ fn build_html(params: &WebViewParams) -> String {
         .replace("{{WS_HOST}}", &params.ws_host)
         .replace("{{WS_PORT}}", &params.ws_port.to_string())
         .replace("{{WS_PROTOCOL}}", &params.ws_protocol)
+        .replace("{{WS_LOCAL_HOST}}", &params.ws_host)
+        .replace("{{WS_REMOTE_HOST}}", "")
+        .replace("{{CONNECTION_MODE}}", "auto")
         .replace("{{THEME_CSS_VARS}}", &params.theme_css);
 
     // Inject world lock from env var (set by parent when spawning /window <world>)
