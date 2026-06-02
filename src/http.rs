@@ -289,6 +289,7 @@ fn handle_http_routes(
                 .replace("{{WS_LOCAL_HOST}}", &sanitized_host)
                 .replace("{{WS_REMOTE_HOST}}", "")
                 .replace("{{CONNECTION_MODE}}", "auto")
+                .replace("{{SHOW_CONNECTION_WINDOW}}", "false")
                 .replace("{{THEME_CSS_VARS}}", theme_css_vars);
             RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
         }

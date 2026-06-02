@@ -890,6 +890,7 @@ public class MainActivity extends AppCompatActivity {
                "window.WS_PORT=" + port + ";" +
                "window.WS_PROTOCOL='wss';" +
                "window.CONNECTION_MODE=" + mode + ";" +
+               "window.SHOW_CONNECTION_WINDOW=true;" +
                "(function(){var s=document.getElementById('theme-vars');" +
                "if(s)s.textContent=':root{" + theme + "}';}());";
     }

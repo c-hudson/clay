@@ -530,6 +530,7 @@ fn build_html(params: &WebViewParams) -> String {
         .replace("{{WS_LOCAL_HOST}}", &params.ws_host)
         .replace("{{WS_REMOTE_HOST}}", "")
         .replace("{{CONNECTION_MODE}}", "auto")
+        .replace("{{SHOW_CONNECTION_WINDOW}}", if params.server_host.is_some() { "true" } else { "false" })
         .replace("{{THEME_CSS_VARS}}", &params.theme_css);
 
     // Inject world lock from env var (set by parent when spawning /window <world>)

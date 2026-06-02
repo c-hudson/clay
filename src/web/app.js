@@ -1304,6 +1304,7 @@
             }
             const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
             if (connectionFailures >= maxFailures) {
+                showConnectionLog();
                 enableConnectionLogRetry();
             } else {
                 setTimeout(connect, 2000);
@@ -1351,6 +1352,7 @@
 
         const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
         if (connectionFailures >= maxFailures) {
+            showConnectionLog();
             enableConnectionLogRetry();
         } else {
             setTimeout(connect, 2000);
@@ -1576,7 +1578,7 @@
         }
 
         connectInProgress = true;
-        showConnectionLog();
+        if (shouldShowConnectionWindow()) showConnectionLog();
 
         candidates.forEach(function(candidate) {
             const id = nextAttemptId++;
@@ -5376,6 +5378,11 @@
     }
 
     // Connection log modal — persistent window showing each attempt with ✓/✗
+    function shouldShowConnectionWindow() {
+        return window.SHOW_CONNECTION_WINDOW === true ||
+               window.SHOW_CONNECTION_WINDOW === 'true';
+    }
+
     function showConnectionLog() {
         var modal = document.getElementById('connection-log-modal');
         if (modal) modal.style.display = 'flex';
