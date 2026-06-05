@@ -25,6 +25,7 @@ pub const SETUP_FIELD_ANSI_MUSIC: FieldId = FieldId(14);
 pub const SETUP_FIELD_NEW_LINE_INDICATOR: FieldId = FieldId(17);
 pub const SETUP_FIELD_TTS: FieldId = FieldId(18);
 pub const SETUP_FIELD_TTS_SPEAK_MODE: FieldId = FieldId(19);
+pub const SETUP_FIELD_SCROLLBACK: FieldId = FieldId(20);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -90,6 +91,7 @@ pub fn create_setup_popup(
     new_line_indicator: bool,
     tts_mode: &str,
     tts_speak_mode: &str,
+    scrollback: bool,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -182,6 +184,11 @@ pub fn create_setup_popup(
             "Speak Mode",
             FieldKind::select(tts_speak_mode_options(), tts_speak_mode_idx),
         ))
+        .with_field(Field::new(
+            SETUP_FIELD_SCROLLBACK,
+            "Archive Output",
+            FieldKind::toggle(scrollback),
+        ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
@@ -219,7 +226,7 @@ fn setup_help_text() -> Vec<String> {
         "  'Unseen First' prioritizes worlds with new activity.",
         "  'Alphabetical' cycles worlds in name order.",
         "",
-        "Debug: Enables debug logging to clay.debug.log.",
+        "Debug: Enables debug logging to ~/.clay/debug.log.",
         "",
         "Input Height: Number of input lines visible (1-10).",
         "",
@@ -250,6 +257,12 @@ fn setup_help_text() -> Vec<String> {
         "  Edge: Microsoft Edge neural TTS (needs internet).",
         "  Web/Android always use the browser's Speech API.",
         "  Use /say <text> to speak manually when TTS is off.",
+        "",
+        "Archive Output: Saves all world output to",
+        "  ~/.clay/scrollback.db for permanent storage.",
+        "  Enables /recall -D <pattern> to search the archive",
+        "  and pg-up past the top of the scrollback buffer.",
+        "  Changes take effect on next restart or /reload.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -263,13 +276,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words",
+            false, "off", "words", false,
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 16);
+        assert_eq!(state.definition.fields.len(), 17);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -278,7 +291,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, "edge", "sentences",
+            false, "edge", "sentences", true,
         );
         let state = PopupState::new(def);
 

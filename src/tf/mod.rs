@@ -146,6 +146,7 @@ pub struct RecallOptions {
     pub show_gagged: bool,          // -ag
     pub context_before: usize,      // -Bn
     pub context_after: usize,       // -An
+    pub archive: bool,              // -D (search disk archive)
 }
 
 /// A background repeat process

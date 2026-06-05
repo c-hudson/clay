@@ -587,6 +587,12 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 if old_tts_mode == crate::tts::TtsMode::Off && app.settings.tts_mode != crate::tts::TtsMode::Off {
                     app.settings.tts_muted = false;
                 }
+                // Update scrollback setting; reinitialize DB if toggled on
+                let scrollback_changed = app.settings.scrollback_enabled != settings.scrollback;
+                app.settings.scrollback_enabled = settings.scrollback;
+                if scrollback_changed {
+                    app.init_scrollback();
+                }
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }

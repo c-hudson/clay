@@ -214,6 +214,7 @@
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupDebugToggle: document.getElementById('setup-debug-toggle'),
+        setupArchiveToggle: document.getElementById('setup-archive-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
         setupHeightMinus: document.getElementById('setup-height-minus'),
@@ -433,6 +434,7 @@
     let setupTtsMode = 'Off';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
+    let setupArchive = false;
     let setupDebug = false;
     let setupInputHeightValue = 1;
     let setupGuiTheme = 'dark';
@@ -540,6 +542,7 @@
     let tempConvertEnabled = false;  // Temperature conversion (32F -> 32F(0C))
     let mouseEnabled = true;  // Console mouse support
     let debugEnabled = false;  // Debug logging
+    let scrollbackEnabled = false;  // Long-term archive output
     let dictionaryPath = '';  // Custom dictionary path
     let spellCheckEnabled = true;  // Spell checking
     let prevInputLen = 0;  // Track previous input length for temp conversion
@@ -1835,6 +1838,9 @@
                     if (msg.settings.debug_enabled !== undefined) {
                         debugEnabled = msg.settings.debug_enabled;
                     }
+                    if (msg.settings.scrollback_enabled !== undefined) {
+                        scrollbackEnabled = msg.settings.scrollback_enabled;
+                    }
                     if (msg.settings.dictionary_path !== undefined) {
                         dictionaryPath = msg.settings.dictionary_path;
                     }
@@ -2341,6 +2347,9 @@
                     }
                     if (msg.settings.debug_enabled !== undefined) {
                         debugEnabled = msg.settings.debug_enabled;
+                    }
+                    if (msg.settings.scrollback_enabled !== undefined) {
+                        scrollbackEnabled = msg.settings.scrollback_enabled;
                     }
                     if (msg.settings.dictionary_path !== undefined) {
                         dictionaryPath = msg.settings.dictionary_path;
@@ -3893,7 +3902,7 @@
             '  arrives. Keeps you from missing important text.', '',
             'TLS Proxy: Keeps a proxy alive during hot reload', '  so TLS connections survive.', '',
             'New Indicator: Show a marker on new lines arriving', '  while scrolled up in the output buffer.', '',
-            'Debug: Enables debug logging to clay.debug.log.', '',
+            'Debug: Enables debug logging to ~/.clay/debug.log.', '',
             'ANSI Music: Play ANSI music sequences from MUDs.', '',
             'ZWJ Sequence: For terminals that support combined',
             '  emoji (ZWJ). If unsupported, shows two separate',
@@ -5960,6 +5969,7 @@
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupDebug = debugEnabled;
+        setupArchive = scrollbackEnabled;
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
         setupColorOffset = colorOffsetPercent;
@@ -6036,6 +6046,11 @@
         } else {
             elements.setupDebugToggle.classList.remove('active');
         }
+        if (setupArchive) {
+            elements.setupArchiveToggle.classList.add('active');
+        } else {
+            elements.setupArchiveToggle.classList.remove('active');
+        }
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
         updateCustomDropdown(elements.setupWorldSwitchSelect);
@@ -6094,7 +6109,8 @@
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
-            dictionary_path: dictionaryPath
+            dictionary_path: dictionaryPath,
+            scrollback_enabled: scrollbackEnabled
         };
     }
 
@@ -6149,6 +6165,7 @@
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         debugEnabled = setupDebug;
+        scrollbackEnabled = setupArchive;
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
         applyTheme(guiTheme);
@@ -6365,14 +6382,11 @@
         }
     }
 
-    // Calculate next keepalive time
+    // Calculate next keepalive time (based only on last send time)
     function formatNextKA(lastSendSecs, lastRecvSecs) {
         const KEEPALIVE_SECS = 5 * 60; // 5 minutes
-        const lastActivity = Math.min(
-            lastSendSecs !== null && lastSendSecs !== undefined ? lastSendSecs : KEEPALIVE_SECS,
-            lastRecvSecs !== null && lastRecvSecs !== undefined ? lastRecvSecs : KEEPALIVE_SECS
-        );
-        const remaining = Math.max(0, KEEPALIVE_SECS - lastActivity);
+        const elapsed = lastSendSecs !== null && lastSendSecs !== undefined ? lastSendSecs : KEEPALIVE_SECS;
+        const remaining = Math.max(0, KEEPALIVE_SECS - elapsed);
         if (remaining < 60) return remaining + 's';
         return Math.floor(remaining / 60) + 'm';
     }
@@ -8572,6 +8586,10 @@
         };
         elements.setupDebugToggle.onclick = function() {
             setupDebug = !setupDebug;
+            updateSetupPopupUI();
+        };
+        elements.setupArchiveToggle.onclick = function() {
+            setupArchive = !setupArchive;
             updateSetupPopupUI();
         };
         elements.setupWorldSwitchSelect.onchange = function() {

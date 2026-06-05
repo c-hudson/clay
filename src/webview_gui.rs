@@ -95,13 +95,12 @@ struct WebViewParams {
     server_secure: bool,
 }
 
-/// Read the gui_theme name from ~/.clay.dat (defaults to "dark").
+/// Read the gui_theme name from ~/.clay/settings.dat (defaults to "dark").
 fn load_gui_theme_name() -> String {
-    let home = crate::get_home_dir();
-    if home == "." {
+    let settings_path = crate::clay_config_path("settings.dat");
+    if !settings_path.exists() {
         return "dark".to_string();
     }
-    let settings_path = format!("{}/{}", home, crate::clay_filename("clay.dat"));
     std::fs::read_to_string(&settings_path)
         .ok()
         .and_then(|content| {
@@ -113,18 +112,13 @@ fn load_gui_theme_name() -> String {
 }
 
 /// Load the user's GUI theme CSS vars for initial HTML rendering.
-/// Reads gui_theme name from ~/.clay.dat and theme colors from ~/.clay.theme.dat.
+/// Reads gui_theme name from ~/.clay/settings.dat and theme colors from ~/.clay/theme.dat.
 fn load_user_theme_css() -> String {
-    let home = crate::get_home_dir();
     let gui_theme_name = load_gui_theme_name();
 
-    if home == "." {
-        return ThemeColors::dark_default().to_css_vars();
-    }
-
-    // Load theme colors from ~/.clay.theme.dat
-    let theme_path = format!("{}/{}", home, crate::clay_filename("clay.theme.dat"));
-    let theme_file = ThemeFile::load(std::path::Path::new(&theme_path));
+    // Load theme colors from ~/.clay/theme.dat
+    let theme_path = crate::clay_config_path("theme.dat");
+    let theme_file = ThemeFile::load(&theme_path);
     theme_file.get(&gui_theme_name).to_css_vars()
 }
 

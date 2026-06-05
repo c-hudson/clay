@@ -19,7 +19,7 @@ use crate::{
 /// Legacy encryption key — only used for decrypting old .clay.dat files
 const LEGACY_ENCRYPTION_KEY: &[u8; 32] = b"nonsupersecretpassword#\0\0\0\0\0\0\0\0\0";
 
-/// Per-machine encryption key, loaded from ~/.clay.key (generated on first run)
+/// Per-machine encryption key, loaded from ~/.clay/secure.key (generated on first run)
 static MACHINE_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
 fn machine_key() -> &'static [u8; 32] {
@@ -29,8 +29,7 @@ fn machine_key() -> &'static [u8; 32] {
 }
 
 fn key_file_path() -> PathBuf {
-    let home = crate::get_home_dir();
-    PathBuf::from(home).join(crate::clay_filename("clay.key"))
+    crate::clay_config_path("secure.key")
 }
 
 fn load_or_generate_key() -> [u8; 32] {
@@ -205,6 +204,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
+    writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -671,6 +671,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                             app.settings.tts_mode = crate::tts::TtsMode::Local;
                         }
                     }
+                    "scrollback_enabled" => {
+                        app.settings.scrollback_enabled = value == "true";
+                    }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
@@ -733,7 +736,7 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
     Ok(())
 }
 
-/// Load settings for multiuser mode from ~/.clay.multiuser.dat
+/// Load settings for multiuser mode from ~/.clay/multiuser.dat
 pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
     let path = get_multiuser_settings_path();
     if !path.exists() {
@@ -990,7 +993,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
     Ok(())
 }
 
-/// Save settings for multiuser mode to ~/.clay.multiuser.dat
+/// Save settings for multiuser mode to ~/.clay/multiuser.dat
 pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
     let path = get_multiuser_settings_path();
     let mut file = std::fs::File::create(&path)?;
@@ -1197,6 +1200,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
+    writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
 
     // Save watchdog state
     writeln!(file, "watchdog_enabled={}", app.tf_engine.watchdog_enabled)?;
@@ -1854,6 +1858,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             app.settings.tts_mode = crate::tts::TtsMode::Local;
                         }
                     }
+                    "scrollback_enabled" => {
+                        app.settings.scrollback_enabled = value == "true";
+                    }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
@@ -2044,7 +2051,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         app.current_world_index = 0;
     }
 
-    // Load auth key from ~/.clay.dat (it's not in the reload state file)
+    // Load auth key from ~/.clay/settings.dat (it's not in the reload state file)
     let settings_path = get_settings_path();
     if settings_path.exists() {
         if let Ok(settings_content) = std::fs::read_to_string(&settings_path) {
@@ -2146,6 +2153,7 @@ mod tests {
             web_font_letter_spacing: 1.5,      // default: 0.0
             web_font_line_height: 1.8,         // default: 1.2
             web_font_word_spacing: 2.0,        // default: 0.0
+            scrollback_enabled: true,          // default: false
         }
     }
 
@@ -2225,6 +2233,7 @@ mod tests {
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
         assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
         assert_eq!(a.tts_mode, b.tts_mode, "{context}: tts_mode");
+        assert_eq!(a.scrollback_enabled, b.scrollback_enabled, "{context}: scrollback_enabled");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -2336,6 +2345,7 @@ mod tests {
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
         assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
         assert_ne!(non_default.tts_mode, default.tts_mode, "tts_mode should differ");
+        assert_ne!(non_default.scrollback_enabled, default.scrollback_enabled, "scrollback_enabled should differ");
     }
 
     #[test]

@@ -24,7 +24,6 @@ use crate::{
     format_duration_short, current_timestamp_secs,
     generate_test_music_notes,
     process_telnet, find_safe_split_point,
-    get_home_dir, clay_filename,
     local_time_from_epoch,
     VERSION, BUILD_DATE, BUILD_HASH,
     tf, persistence, telnet, util,
@@ -1301,16 +1300,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             const KEEPALIVE_SECS: u64 = 5 * 60;
             let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
                 let now = std::time::Instant::now();
-                // Compute next NOP using same logic as the actual keepalive timer:
-                // max(last_send_time, last_receive_time) determines when activity last happened
-                let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
-                    (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
-                    (Some(s), None) => Some(s.elapsed().as_secs()),
-                    (None, Some(r)) => Some(r.elapsed().as_secs()),
-                    (None, None) => None,
-                };
                 let next_nop = if world.connected {
-                    last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
+                    world.last_send_time.map(|t| KEEPALIVE_SECS.saturating_sub(t.elapsed().as_secs()))
                 } else {
                     None
                 };
@@ -2502,11 +2493,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output("  Example: /url https://github.com/c-hudson/clay");
         }
         Command::Dump => {
-            // Dump comprehensive debug state to ~/.clay.dmp.log
+            // Dump comprehensive debug state to ~/.clay/dump.log
             use std::io::Write;
 
-            let home = get_home_dir();
-            let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
+            let dump_path = crate::clay_config_path("dump.log");
 
             match std::fs::File::create(&dump_path) {
                 Ok(mut file) => {

@@ -15,7 +15,6 @@ use crate::{
     ClientViewState, Command, OutputLine,
     get_multiuser_settings_path,
     enable_tcp_keepalive, parse_command, current_timestamp_secs,
-    get_home_dir, clay_filename,
 };
 use crate::actions::{split_action_commands, substitute_action_args, execute_recall};
 use crate::util::local_time_from_epoch;
@@ -109,7 +108,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
     // Check if any servers are running
     if app.http_server.is_none() && app.https_server.is_none() {
         eprintln!("Error: No servers started. Enable HTTP in settings.");
-        eprintln!("Use /web command to configure, or edit ~/.clay.dat");
+        eprintln!("Use /web command to configure, or edit ~/.clay/settings.dat");
         return Ok(());
     }
 
@@ -985,8 +984,7 @@ pub async fn handle_daemon_ws_message(
                 Command::Dump => {
                     use std::io::Write;
                     let ts = current_timestamp_secs();
-                    let home = get_home_dir();
-                    let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
+                    let dump_path = crate::clay_config_path("dump.log");
 
                     match std::fs::File::create(&dump_path) {
                         Ok(mut file) => {
@@ -1023,7 +1021,7 @@ pub async fn handle_daemon_ws_message(
                             }
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index,
-                                data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path),
+                                data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path.display()),
                                 is_viewed: false,
                                 ts,
                                 from_server: false,
@@ -1385,7 +1383,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled: _ } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1474,14 +1472,8 @@ pub async fn handle_daemon_ws_message(
             const KEEPALIVE_SECS: u64 = 5 * 60;
             let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
                 let now = std::time::Instant::now();
-                let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
-                    (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
-                    (Some(s), None) => Some(s.elapsed().as_secs()),
-                    (None, Some(r)) => Some(r.elapsed().as_secs()),
-                    (None, None) => None,
-                };
                 let next_nop = if world.connected {
-                    last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
+                    world.last_send_time.map(|t| KEEPALIVE_SECS.saturating_sub(t.elapsed().as_secs()))
                 } else {
                     None
                 };

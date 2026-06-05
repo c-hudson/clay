@@ -1157,6 +1157,7 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_line_indicator = settings.new_line_indicator;
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
+                app.settings.scrollback_enabled = settings.scrollback;
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -1197,6 +1198,7 @@ pub(crate) fn handle_remote_client_key(
                     new_line_indicator: app.settings.new_line_indicator,
                     tts_mode: app.settings.tts_mode.name().to_string(),
                     tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
+                    scrollback_enabled: app.settings.scrollback_enabled,
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -1935,6 +1937,7 @@ pub(crate) fn apply_remote_web_settings(
         new_line_indicator: app.settings.new_line_indicator,
         tts_mode: app.settings.tts_mode.name().to_string(),
         tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
+        scrollback_enabled: app.settings.scrollback_enabled,
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {

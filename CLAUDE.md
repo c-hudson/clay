@@ -4,19 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Critical Rules
 
-**All UI changes must be reflected in ALL interfaces.** Any new field, option, or window added to one interface (console TUI, web, webview-GUI) must be added to all three. New world/settings fields must also be saved to `~/.clay.dat` in `persistence.rs` and loaded on startup and `/reload`.
+**All UI changes must be reflected in ALL interfaces.** Any new field, option, or window added to one interface (console TUI, web, webview-GUI) must be added to all three. New world/settings fields must also be saved to `~/.clay/settings.dat` in `persistence.rs` and loaded on startup and `/reload`.
 
-**World passwords are stored encrypted in `.clay.dat` but sent as plaintext to authenticated WebSocket clients and displayed as readable text in all UI editors.** Do not hide or mask world passwords in the world editor — the encryption is for at-rest storage only. The `has_password` field mirrors whether the password is non-empty.
+**World passwords are stored encrypted in `~/.clay/settings.dat` but sent as plaintext to authenticated WebSocket clients and displayed as readable text in all UI editors.** Do not hide or mask world passwords in the world editor — the encryption is for at-rest storage only. The `has_password` field mirrors whether the password is non-empty.
 
 **NEVER write debug output to stdout or stderr (no `println!`, `eprintln!`, `dbg!`).** Debug output corrupts the TUI. Use instead:
-- `debug_log(true, msg)` for always-on logging (writes to `clay.debug.log`)
+- `debug_log(true, msg)` for always-on logging (writes to `~/.clay/debug.log`)
 - `debug_log(is_debug_enabled(), msg)` for user-toggled debug
-- `output_debug_log(msg)` for output/seq debugging (writes to `clay.output.debug`)
+- `output_debug_log(msg)` for output/seq debugging (writes to `~/.clay/output.debug.log`)
 - `add_tf_output()` to display messages in the output area
 
 Debug output interferes with the TUI and corrupts the terminal display. Instead:
-- Use `debug_log(true, msg)` for always-on logging or `debug_log(is_debug_enabled(), msg)` for user-toggled debug (writes to `clay.debug.log`)
-- Use `output_debug_log(msg)` for output/seq debugging (writes to `clay.output.debug`)
+- Use `debug_log(true, msg)` for always-on logging or `debug_log(is_debug_enabled(), msg)` for user-toggled debug (writes to `~/.clay/debug.log`)
+- Use `output_debug_log(msg)` for output/seq debugging (writes to `~/.clay/output.debug.log`)
 - Display messages in the output area using `add_tf_output()` or `add_output()`
 
 ## Build Commands
@@ -60,16 +60,16 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 - `src/input.rs` - Input area with viewport scrolling, cursor positioning, display width helpers
 - `src/actions.rs` - Action/trigger system (pattern matching, command execution, capture groups)
 - `src/telnet.rs` - Telnet protocol negotiation and option handling
-- `src/persistence.rs` - Settings save/load (`~/.clay.dat` INI format)
+- `src/persistence.rs` - Settings save/load (`~/.clay/settings.dat` INI format)
 - `src/daemon.rs` - Daemon/headless mode, background connection logic
-- `src/keybindings.rs` - Configurable keyboard bindings, load/save `~/.clay.key.dat`
+- `src/keybindings.rs` - Configurable keyboard bindings, load/save `~/.clay/keybindings.dat`
 
 **Networking:**
 - `src/websocket.rs` - WebSocket server, message types, client management
 - `src/http.rs` - HTTP/HTTPS web server (3 handler implementations: native-tls, rustls, plain)
 
 **Theme:**
-- `src/theme.rs` - ThemeColors (42 customizable color vars), ThemeFile for `~/clay.theme.dat`. GUI/web only; console uses Theme enum from encoding.rs.
+- `src/theme.rs` - ThemeColors (42 customizable color vars), ThemeFile for `~/.clay/theme.dat`. GUI/web only; console uses Theme enum from encoding.rs.
 
 **Popup System:**
 - `src/popup/mod.rs` - Unified popup system (PopupManager, field types, layout)
@@ -94,10 +94,20 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 - `src/web/theme-editor.html` - Browser-based theme editor
 - `src/web/keybind-editor.html` - Browser-based keybind editor
 
-**Data Files:**
-- `~/.clay.dat` - Settings file (INI format with `[global]` and `[world:name]` sections)
-- `~/clay.theme.dat` - Theme file (INI format with `[theme:name]` sections)
-- `~/.clay.key.dat` - Keyboard bindings (INI, only non-default bindings saved)
+**Data Files** (all inside `~/.clay/` on Unix, `~/clay/` on Windows):
+- `settings.dat` - Main settings (INI format with `[global]` and `[world:name]` sections)
+- `secure.key` - Per-machine AES-256 encryption key (binary, 0600 permissions)
+- `theme.dat` - Theme colors (INI format with `[theme:name]` sections)
+- `keybindings.dat` - Keyboard bindings (INI, only non-default bindings saved)
+- `multiuser.dat` - Multiuser server settings
+- `scrollback.db` - SQLite long-term scrollback archive
+- `cert.pem` / `key.pem` - Auto-generated TLS cert/key for `web_secure` mode
+- `debug.log` - Debug logging (via `debug_log()`)
+- `output.debug.log` - Output/seq debugging (via `output_debug_log()`)
+- `remote.log` - Remote connection events (HTTP 404s, WebSocket auth attempts)
+- `dump.log` - `/dump` debug state output
+- `logs/<WorldName>.<YYYY-MM-DD>.log` - Per-world session logs (when log_enabled)
+- `media/` - Downloaded media cache
 
 ### Key Design Patterns
 

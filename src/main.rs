@@ -21,6 +21,7 @@ pub mod platform;
 pub mod commands;
 pub mod remote_client;
 pub mod tts;
+pub mod scrollback;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
 pub mod testserver;
@@ -40,9 +41,9 @@ static CUSTOM_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// Global debug flag — set from settings, checked by debug_log and file writes
 pub(crate) static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Tracks whether the startup header has been written to clay.debug.log
+/// Tracks whether the startup header has been written to ~/.clay/debug.log
 static DEBUG_LOG_HEADER_WRITTEN: AtomicBool = AtomicBool::new(false);
-/// Tracks whether the startup header has been written to clay.output.debug
+/// Tracks whether the startup header has been written to ~/.clay/output.debug.log
 static OUTPUT_DEBUG_HEADER_WRITTEN: AtomicBool = AtomicBool::new(false);
 /// Startup time stored as Unix timestamp (seconds since epoch)
 static STARTUP_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1173,6 +1174,96 @@ pub fn clay_filename(name: &str) -> String {
     { name.to_string() }
 }
 
+/// Returns the path to the `~/.clay/` config directory, creating it if needed.
+/// On Windows the directory is `~/clay/` (no dot prefix).
+pub fn clay_config_dir() -> PathBuf {
+    let home = get_home_dir();
+    let dir = PathBuf::from(home).join(clay_filename("clay"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Returns the path to a named file inside the `~/.clay/` config directory.
+/// e.g. `clay_config_path("settings.dat")` → `~/.clay/settings.dat`
+pub fn clay_config_path(name: &str) -> PathBuf {
+    clay_config_dir().join(name)
+}
+
+/// One-time migration: move legacy `~/.clay.*` dotfiles into `~/.clay/` config dir.
+/// Safe to call repeatedly — skips files that already exist at the new location.
+/// Must be called at startup before any config is loaded.
+pub fn migrate_legacy_config_files() {
+    let home = get_home_dir();
+    let home_path = std::path::Path::new(&home);
+    let config_dir = clay_config_dir();
+
+    // (legacy name passed through clay_filename, new name inside config_dir)
+    let migrations: &[(&str, &str)] = &[
+        ("clay.key",           "secure.key"),
+        ("clay.dat",           "settings.dat"),
+        ("clay.multiuser.dat", "multiuser.dat"),
+        ("clay.key.dat",       "keybindings.dat"),
+        ("clay.theme.dat",     "theme.dat"),
+        ("clay.scrollback.db", "scrollback.db"),
+        ("clay.dmp.log",       "dump.log"),
+        ("clay.cert.pem",      "cert.pem"),
+        ("clay.key.pem",       "key.pem"),
+    ];
+
+    for (legacy_name, new_name) in migrations {
+        let legacy = home_path.join(clay_filename(legacy_name));
+        let new_path = config_dir.join(new_name);
+        if legacy.exists() && !new_path.exists() {
+            let _ = std::fs::rename(&legacy, &new_path);
+        }
+    }
+
+    // Scrollback SQLite sidecars (-wal, -shm)
+    for sidecar in &["-wal", "-shm"] {
+        let legacy = home_path.join(clay_filename(&format!("clay.scrollback.db{}", sidecar)));
+        let new_path = config_dir.join(format!("scrollback.db{}", sidecar));
+        if legacy.exists() && !new_path.exists() {
+            let _ = std::fs::rename(&legacy, &new_path);
+        }
+    }
+
+    // Reload state files (.clay.reload.<pid>) — enumerate and migrate any present
+    if let Ok(entries) = std::fs::read_dir(home_path) {
+        let prefix = clay_filename("clay.reload.");
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy().into_owned();
+            if fname_str.starts_with(&prefix) {
+                let suffix = &fname_str[prefix.len()..];
+                let new_name = format!("reload.{}", suffix);
+                let new_path = config_dir.join(&new_name);
+                if !new_path.exists() {
+                    let _ = std::fs::rename(entry.path(), &new_path);
+                }
+            }
+        }
+    }
+
+    // Debug log: ~/clay.debug.log (no dot — never used clay_filename)
+    {
+        let legacy = home_path.join("clay.debug.log");
+        let new_path = config_dir.join("debug.log");
+        if legacy.exists() && !new_path.exists() {
+            let _ = std::fs::rename(&legacy, &new_path);
+        }
+    }
+
+    // Oldest theme file migration: ~/clay.theme.dat (no dot) → theme.dat
+    {
+        let legacy = home_path.join("clay.theme.dat");
+        let new_path = config_dir.join("theme.dat");
+        if legacy.exists() && !new_path.exists() {
+            let _ = std::fs::rename(&legacy, &new_path);
+        }
+    }
+    // Note: clay.output.debug and clay.remote.log were CWD-relative so no migration needed
+}
+
 /// Generate a WAV file from ANSI music notes (square wave, matching web client's oscillator)
 fn generate_wav_from_notes(notes: &[crate::ansi_music::MusicNote]) -> Vec<u8> {
     let sample_rate: u32 = 22050;
@@ -1283,7 +1374,7 @@ pub struct Settings {
     spell_check_enabled: bool,
     temp_convert_enabled: bool,  // Temperature conversion (e.g., 32F -> 32F (0C))
     world_switch_mode: WorldSwitchMode,
-    debug_enabled: bool,    // Debug logging to clay.debug.log
+    debug_enabled: bool,    // Debug logging to ~/.clay/debug.log
     ansi_music_enabled: bool, // Enable ANSI music playback (web/GUI only)
     theme: Theme,           // Console theme
     gui_theme: Theme,       // GUI theme (separate from console)
@@ -1330,6 +1421,7 @@ pub struct Settings {
     pub tts_mode: tts::TtsMode,
     pub tts_speak_mode: tts::TtsSpeakMode,
     pub tts_muted: bool,  // Runtime-only, toggled by F9
+    pub scrollback_enabled: bool,
 }
 
 impl Default for Settings {
@@ -1374,6 +1466,7 @@ impl Default for Settings {
             tts_mode: tts::TtsMode::Off,
             tts_speak_mode: tts::TtsSpeakMode::All,
             tts_muted: false,
+            scrollback_enabled: false,
         }
     }
 }
@@ -1599,7 +1692,7 @@ pub enum Command {
     Unban { host: String },
     /// /testmusic - play a test ANSI music sequence
     TestMusic,
-    /// /dump - dump all scrollback buffers to ~/.clay.dmp.log
+    /// /dump - dump all scrollback buffers to ~/.clay/dump.log
     Dump,
     /// /notify <message> - send notification to mobile clients
     Notify { message: String },
@@ -2010,13 +2103,12 @@ fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
 }
 
 pub(crate) fn get_reload_state_path() -> PathBuf {
-    let home = get_home_dir();
     // Use PID from env (set by old process during reload) or current PID
     let pid = std::env::var("CLAY_RELOAD_PID")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(std::process::id());
-    PathBuf::from(home).join(clay_filename(&format!("clay.reload.{}", pid)))
+    clay_config_path(&format!("reload.{}", pid))
 }
 
 /// Get current time as seconds since Unix epoch (for WebSocket timestamps)
@@ -2163,6 +2255,7 @@ pub struct World {
     pub settings: WorldSettings,
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
+    pub scrollback_tx: Option<std::sync::mpsc::SyncSender<scrollback::ArchiveEntry>>,
     #[cfg(unix)]
     socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only)
     #[cfg(not(unix))]
@@ -2248,6 +2341,7 @@ impl World {
             settings: WorldSettings::default(),
             log_handle: None,
             log_date: None,
+            scrollback_tx: None,
             socket_fd: None,
             proxy_socket_fd: None,
             is_tls: false,
@@ -2302,16 +2396,15 @@ impl World {
         }
     }
 
-    /// Get the current date as MMDDYY string for log file naming
+    /// Get the current date as YYYY-MM-DD string for log file naming
     fn get_current_date_string() -> String {
         let lt = local_time_now();
-        format!("{:02}{:02}{:02}", lt.month, lt.day, lt.year % 100)
+        format!("{:04}-{:02}-{:02}", lt.year, lt.month, lt.day)
     }
 
     /// Get the path to the logs directory, creating it if needed
     fn get_logs_dir() -> std::path::PathBuf {
-        let home = get_home_dir();
-        let logs_dir = std::path::PathBuf::from(home).join(clay_filename("clay")).join("logs");
+        let logs_dir = clay_config_dir().join("logs");
         if !logs_dir.exists() {
             let _ = std::fs::create_dir_all(&logs_dir);
         }
@@ -2552,6 +2645,16 @@ impl World {
             // Write to log file if enabled (only for complete lines)
             if !is_partial {
                 self.write_log_line(line);
+                // Archive server lines to long-term scrollback
+                if from_server {
+                    if let Some(ref tx) = self.scrollback_tx {
+                        let ts_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let _ = tx.try_send((self.name.clone(), ts_ms, line.to_string()));
+                    }
+                }
             }
 
             // Use wrap_ansi_line for accurate visual line count — visual_line_count uses
@@ -2924,9 +3027,9 @@ pub struct App {
     pub user_connections: std::collections::HashMap<(usize, String), UserConnection>,
     /// TinyFugue scripting engine
     pub tf_engine: tf::TfEngine,
-    /// Loaded theme colors from ~/.clay.theme.dat
+    /// Loaded theme colors from ~/.clay/theme.dat
     pub theme_file: theme::ThemeFile,
-    /// Configurable keyboard bindings (TF defaults + user customizations from ~/.clay.key.dat)
+    /// Configurable keyboard bindings (TF defaults + user customizations from ~/.clay/keybindings.dat)
     pub keybindings: keybindings::KeyBindings,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
@@ -2965,6 +3068,8 @@ pub struct App {
     pub remote_ping_nonce: u64,
     /// Text-to-speech backend (console: espeak/say subprocess, web: ServerSpeak WS message)
     pub tts_backend: tts::TtsBackend,
+    /// Long-term scrollback archive (SQLite). Present only when scrollback_enabled.
+    pub scrollback: Option<scrollback::ScrollbackDb>,
     /// Test-only: log of all messages passed to ws_broadcast() and ws_broadcast_to_world()
     #[cfg(test)]
     pub ws_broadcast_log: std::sync::Arc<std::sync::Mutex<Vec<WsMessage>>>,
@@ -3042,10 +3147,7 @@ impl App {
             gui_tx: None, // Set when running in master GUI mode (--gui)
             gui_repaint: None,
             audio_backend: audio::AudioBackend::None, // Lazy init on first use
-            media_cache_dir: {
-                let home = get_home_dir();
-                PathBuf::from(home).join(clay_filename("clay")).join("media")
-            },
+            media_cache_dir: clay_config_dir().join("media"),
             media_processes: std::collections::HashMap::new(),
             media_music_key: None,
             event_tx: None,
@@ -3054,11 +3156,35 @@ impl App {
             remote_ping_responses: None,
             remote_ping_nonce: 0,
             tts_backend: tts::init_tts(),
+            scrollback: None,
             #[cfg(test)]
             ws_broadcast_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
         // Note: No initial world created here - it will be created after persistence::load_settings()
         // if no worlds are configured
+    }
+
+    /// Open (or close) the scrollback DB based on the current setting.
+    /// Also updates all worlds' scrollback_tx accordingly.
+    pub fn init_scrollback(&mut self) {
+        if self.settings.scrollback_enabled {
+            if self.scrollback.is_none() {
+                let path = clay_config_path("scrollback.db");
+                match scrollback::ScrollbackDb::open(&path) {
+                    Ok(db) => self.scrollback = Some(db),
+                    Err(e) => {
+                        debug_log(true, &format!("scrollback: failed to open {:?}: {}", path, e));
+                    }
+                }
+            }
+        } else {
+            self.scrollback = None;
+        }
+        // Push/clear sender on all worlds
+        let sender = self.scrollback.as_ref().map(|db| db.sender());
+        for world in &mut self.worlds {
+            world.scrollback_tx = sender.clone();
+        }
     }
 
     /// Get theme colors for the current console theme
@@ -3111,6 +3237,7 @@ impl App {
             new_line_indicator: self.settings.new_line_indicator,
             tts_mode: self.settings.tts_mode.name().to_string(),
             tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
+            scrollback_enabled: self.settings.scrollback_enabled,
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
@@ -3168,6 +3295,7 @@ impl App {
         if old_tts_mode == tts::TtsMode::Off && self.settings.tts_mode != tts::TtsMode::Off {
             self.settings.tts_muted = false;
         }
+        self.settings.scrollback_enabled = settings.scrollback_enabled;
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
             self.keybindings = keybindings::KeyBindings::from_json(&settings.keybindings_json);
@@ -3180,6 +3308,7 @@ impl App {
         if self.worlds.is_empty() {
             let mut initial_world = World::new_with_splash(&get_binary_name(), true);
             initial_world.is_initial_world = true;
+            initial_world.scrollback_tx = self.scrollback.as_ref().map(|db| db.sender());
             self.worlds.push(initial_world);
         } else {
             // Add splash to current world if it has no output yet
@@ -3450,6 +3579,7 @@ impl App {
             self.settings.new_line_indicator,
             self.settings.tts_mode.name(),
             self.settings.tts_speak_mode.name(),
+            self.settings.scrollback_enabled,
         );
         self.popup_manager.open(def);
 
@@ -4068,8 +4198,10 @@ impl App {
         splash_lines: Vec<String>,
         actions: Vec<Action>,
     ) {
+        let scrollback_sender = self.scrollback.as_ref().map(|db| db.sender());
         self.worlds = worlds.into_iter().map(|w| {
             let mut world = World::new(&w.name);
+            world.scrollback_tx = scrollback_sender.clone();
             world.connected = w.connected;
             world.was_connected = w.was_connected;
             // Set proxy_pid sentinel if server reports proxy (actual PID not needed for display)
@@ -4211,6 +4343,42 @@ impl App {
         opts: &tf::RecallOptions,
         fallback_idx: usize,
     ) -> Result<Vec<OutputLine>, String> {
+        if opts.archive {
+            if !self.settings.scrollback_enabled {
+                return Err("Archive is off — enable \"Archive Output\" in Setup first".to_string());
+            }
+            let world_name = match &opts.source {
+                tf::RecallSource::World(name) => Some(name.as_str()),
+                _ => {
+                    if fallback_idx < self.worlds.len() {
+                        Some(self.worlds[fallback_idx].name.as_str())
+                    } else {
+                        None
+                    }
+                }
+            };
+            let db_path = clay_config_path("scrollback.db");
+            if !db_path.exists() {
+                return Err("Archive database not found — connect to a world with archiving enabled first".to_string());
+            }
+            let pattern = opts.pattern.as_deref().unwrap_or("*");
+            let use_regex = matches!(opts.match_style, tf::RecallMatchStyle::Regexp);
+            let results = scrollback::ScrollbackDb::search(
+                &db_path,
+                world_name,
+                pattern,
+                None,
+                None,
+                10_000,
+                use_regex,
+            );
+            let lines: Vec<OutputLine> = results.into_iter().enumerate().map(|(i, sl)| {
+                let ts = std::time::UNIX_EPOCH + std::time::Duration::from_millis(sl.ts_ms as u64);
+                OutputLine::new_with_timestamp(sl.text, ts, i as u64)
+            }).collect();
+            return Ok(lines);
+        }
+
         let idx = match &opts.source {
             tf::RecallSource::World(name) => self
                 .find_world_index(name)
@@ -4403,7 +4571,10 @@ impl App {
         if let Some(idx) = self.find_world(name) {
             idx
         } else {
-            self.worlds.push(World::new(name));
+            let sender = self.scrollback.as_ref().map(|db| db.sender());
+            let mut world = World::new(name);
+            world.scrollback_tx = sender;
+            self.worlds.push(world);
             self.worlds.len() - 1
         }
     }
@@ -6615,12 +6786,11 @@ impl App {
                 });
             }
             Command::Dump => {
-                // Dump comprehensive debug state to ~/.clay.dmp.log
+                // Dump comprehensive debug state to ~/.clay/dump.log
                 use std::io::Write;
                 let ts = current_timestamp_secs();
 
-                let home = get_home_dir();
-                let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
+                let dump_path = clay_config_path("dump.log");
 
                 match std::fs::File::create(&dump_path) {
                     Ok(mut file) => {
@@ -7511,7 +7681,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -7573,6 +7743,11 @@ impl App {
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
                     self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
+                }
+                let scrollback_changed = self.settings.scrollback_enabled != scrollback_enabled;
+                self.settings.scrollback_enabled = scrollback_enabled;
+                if scrollback_changed {
+                    self.init_scrollback();
                 }
                 // Save settings to persist changes
                 let _ = persistence::save_settings(self);
@@ -7798,7 +7973,7 @@ impl App {
             }
             WsMessage::SaveThemeFile => {
                 let content = self.theme_file.generate_file_content();
-                let path = std::path::Path::new(&get_home_dir()).join(clay_filename("clay.theme.dat"));
+                let path = clay_config_path("theme.dat");
                 match std::fs::write(&path, &content) {
                     Ok(_) => {
                         self.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: true, error: None });
@@ -7826,7 +8001,7 @@ impl App {
                 });
             }
             WsMessage::SaveKeybindFile => {
-                let path = std::path::Path::new(&get_home_dir()).join(clay_filename("clay.key.dat"));
+                let path = clay_config_path("keybindings.dat");
                 match self.keybindings.save(&path) {
                     Ok(_) => {
                         self.ws_send_to_client(client_id, WsMessage::KeybindFileSaved { success: true, error: None });
@@ -7856,14 +8031,8 @@ impl App {
                 const KEEPALIVE_SECS: u64 = 5 * 60;
                 let worlds_info: Vec<util::WorldListInfo> = self.worlds.iter().enumerate().map(|(idx, world)| {
                     let now = std::time::Instant::now();
-                    let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
-                        (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
-                        (Some(s), None) => Some(s.elapsed().as_secs()),
-                        (None, Some(r)) => Some(r.elapsed().as_secs()),
-                        (None, None) => None,
-                    };
                     let next_nop = if world.connected {
-                        last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
+                        world.last_send_time.map(|t| KEEPALIVE_SECS.saturating_sub(t.elapsed().as_secs()))
                     } else {
                         None
                     };
@@ -8554,38 +8723,115 @@ impl App {
         misspelled
     }
 
+    /// Load older lines from the archive and prepend them to the world's output buffer.
+    /// Returns the number of lines prepended (0 if nothing loaded or archive disabled).
+    fn try_load_archive_lines(&mut self, world_idx: usize) -> usize {
+        if world_idx >= self.worlds.len() {
+            return 0;
+        }
+
+        // Need oldest timestamp from this world's buffer
+        let (world_name, oldest_ts_ms) = {
+            let world = &self.worlds[world_idx];
+            let ts = world.output_lines.first().map(|l| {
+                l.timestamp
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            }).unwrap_or(0);
+            (world.name.clone(), ts)
+        };
+
+        let db_path = clay_config_path("scrollback.db");
+
+        if !db_path.exists() {
+            return 0;
+        }
+
+        let archive_lines = scrollback::load_before_path(&db_path, &world_name, oldest_ts_ms, 500);
+        if archive_lines.is_empty() {
+            return 0;
+        }
+
+        let count = archive_lines.len();
+        let seq_start = {
+            let world = &self.worlds[world_idx];
+            world.output_lines.first().map(|l| l.seq).unwrap_or(0).saturating_sub(count as u64)
+        };
+
+        // Build separator then archive OutputLines (oldest first)
+        let mut prepend: Vec<OutputLine> = Vec::with_capacity(count + 1);
+        let sep_seq = seq_start.saturating_sub(1);
+        prepend.push(OutputLine::new_client(
+            format!("\x1b[2m{}\x1b[0m", "─".repeat(30) + " archive " + &"─".repeat(30)),
+            sep_seq,
+        ));
+        for (i, al) in archive_lines.into_iter().enumerate() {
+            let ts = std::time::UNIX_EPOCH + std::time::Duration::from_millis(al.ts_ms as u64);
+            let mut line = OutputLine::new_with_timestamp(al.text, ts, seq_start + i as u64);
+            line.from_server = true;
+            prepend.push(line);
+        }
+
+        // Prepend to world buffer and adjust scroll_offset
+        {
+            let world = &mut self.worlds[world_idx];
+            let inserted = prepend.len();
+            world.output_lines.splice(0..0, prepend);
+            world.scroll_offset += inserted;
+
+            // Cap buffer size: keep the newest 10_000 lines to avoid unbounded growth
+            const MAX_LINES: usize = 10_000;
+            if world.output_lines.len() > MAX_LINES {
+                let excess = world.output_lines.len() - MAX_LINES;
+                world.output_lines.drain(world.output_lines.len() - excess..);
+            }
+        }
+
+        self.needs_output_redraw = true;
+        count
+    }
+
     fn scroll_output_up(&mut self) {
         let more_mode = self.settings.more_mode_enabled;
         let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
         let visible_height = (self.output_height as usize).max(1);
         let width = (self.output_width as usize).max(1);
-        let world = self.current_world_mut();
-        world.visual_line_offset = 0;
+        let world_idx = self.current_world_index;
 
-        // Calculate the minimum scroll_offset where line 0 is at the top
-        // This is where all content from line 0 to scroll_offset fits in visible_height
-        let mut min_offset = 0usize;
-        let mut visual_lines = 0usize;
-        for (idx, line) in world.output_lines.iter().enumerate() {
-            visual_lines += visual_line_count(&line.text, width);
-            if visual_lines >= visible_height {
-                min_offset = idx;
-                break;
+        self.worlds[world_idx].visual_line_offset = 0;
+
+        let calc_min_offset = |output_lines: &[OutputLine]| -> usize {
+            let mut min = 0usize;
+            let mut vlines = 0usize;
+            for (idx, line) in output_lines.iter().enumerate() {
+                vlines += visual_line_count(&line.text, width);
+                if vlines >= visible_height {
+                    min = idx;
+                    break;
+                }
+                min = idx;
             }
-            min_offset = idx;
+            min
+        };
+
+        let min_offset = calc_min_offset(&self.worlds[world_idx].output_lines);
+
+        if self.worlds[world_idx].scroll_offset <= min_offset {
+            // At the top — try loading older lines from the archive
+            let loaded = self.try_load_archive_lines(world_idx);
+            if loaded == 0 {
+                if more_mode && !self.worlds[world_idx].paused {
+                    self.worlds[world_idx].paused = true;
+                }
+                return;
+            }
+            // Archive lines were prepended; recalculate min_offset for new buffer
         }
 
-        // If already at or past the minimum, don't scroll further
-        if world.scroll_offset <= min_offset {
-            // Still enable pause mode if more_mode is on
-            if more_mode && !world.paused {
-                world.paused = true;
-            }
-            return;
-        }
+        let min_offset = calc_min_offset(&self.worlds[world_idx].output_lines);
+        let world = &mut self.worlds[world_idx];
 
-        // Count lines being scrolled off (from scroll_offset going backwards)
-        // These are the lines that will disappear from the bottom
         let mut visual_lines_moved = 0;
         let mut new_offset = world.scroll_offset;
 
@@ -8597,12 +8843,10 @@ impl App {
             new_offset -= 1;
         }
 
-        // Clamp to minimum offset
         world.scroll_offset = new_offset.max(min_offset);
         if more_mode && !world.paused {
             world.paused = true;
         }
-        // Mark output for redraw
         self.needs_output_redraw = true;
     }
 
@@ -8610,26 +8854,38 @@ impl App {
         let more_mode = self.settings.more_mode_enabled;
         let visible_height = (self.output_height as usize).max(1);
         let width = (self.output_width as usize).max(1);
-        let world = self.current_world_mut();
-        world.visual_line_offset = 0;
+        let world_idx = self.current_world_index;
 
-        let mut min_offset = 0usize;
-        let mut visual_lines = 0usize;
-        for (idx, line) in world.output_lines.iter().enumerate() {
-            visual_lines += visual_line_count(&line.text, width);
-            if visual_lines >= visible_height {
-                min_offset = idx;
-                break;
+        self.worlds[world_idx].visual_line_offset = 0;
+
+        let calc_min_offset = |output_lines: &[OutputLine]| -> usize {
+            let mut min = 0usize;
+            let mut vlines = 0usize;
+            for (idx, line) in output_lines.iter().enumerate() {
+                vlines += visual_line_count(&line.text, width);
+                if vlines >= visible_height {
+                    min = idx;
+                    break;
+                }
+                min = idx;
             }
-            min_offset = idx;
+            min
+        };
+
+        let min_offset = calc_min_offset(&self.worlds[world_idx].output_lines);
+
+        if self.worlds[world_idx].scroll_offset <= min_offset {
+            let loaded = self.try_load_archive_lines(world_idx);
+            if loaded == 0 {
+                if more_mode && !self.worlds[world_idx].paused {
+                    self.worlds[world_idx].paused = true;
+                }
+                return;
+            }
         }
 
-        if world.scroll_offset <= min_offset {
-            if more_mode && !world.paused {
-                world.paused = true;
-            }
-            return;
-        }
+        let min_offset = calc_min_offset(&self.worlds[world_idx].output_lines);
+        let world = &mut self.worlds[world_idx];
 
         let mut visual_lines_moved = 0;
         let mut new_offset = world.scroll_offset;
@@ -8903,18 +9159,15 @@ pub fn get_settings_path() -> PathBuf {
     if let Some(custom_path) = get_custom_config_path() {
         return custom_path.clone();
     }
-    let home = get_home_dir();
-    PathBuf::from(home).join(clay_filename("clay.dat"))
+    clay_config_path("settings.dat")
 }
 
 pub fn get_multiuser_settings_path() -> PathBuf {
-    let home = get_home_dir();
-    PathBuf::from(home).join(clay_filename("clay.multiuser.dat"))
+    clay_config_path("multiuser.dat")
 }
 
 fn get_debug_log_path() -> PathBuf {
-    let home = get_home_dir();
-    PathBuf::from(home).join("clay.debug.log")
+    clay_config_path("debug.log")
 }
 
 /// Write a session startup header to a debug log file.
@@ -8932,7 +9185,7 @@ fn write_debug_header(file: &mut std::fs::File) {
     let _ = writeln!(file, "=== {} — started {} ===", get_version_string(), startup_ts);
 }
 
-/// Write a debug message to clay.debug.log if debug is enabled
+/// Write a debug message to ~/.clay/debug.log if debug is enabled
 fn debug_log(debug_enabled: bool, message: &str) {
     if !debug_enabled {
         return;
@@ -8963,7 +9216,7 @@ fn debug_log(debug_enabled: bool, message: &str) {
     }
 }
 
-/// Write a debug message to clay.output.debug (output/seq debugging)
+/// Write a debug message to ~/.clay/output.debug.log (output/seq debugging)
 pub(crate) fn output_debug_log(message: &str) {
     if !is_debug_enabled() {
         return;
@@ -8972,7 +9225,7 @@ pub(crate) fn output_debug_log(message: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("clay.output.debug")
+        .open(clay_config_path("output.debug.log"))
     {
         // Write session header on first log entry
         if !OUTPUT_DEBUG_HEADER_WRITTEN.swap(true, Ordering::Relaxed) {
@@ -8982,18 +9235,10 @@ pub(crate) fn output_debug_log(message: &str) {
     }
 }
 
-/// Load theme file from ~/.clay.theme.dat into app.theme_file
+/// Load theme file from ~/.clay/theme.dat into app.theme_file
 /// If the file doesn't exist, generates a default one and loads defaults
 fn load_theme_file(app: &mut App) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let theme_path = std::path::Path::new(&home).join(clay_filename("clay.theme.dat"));
-    // Migrate old ~/clay.theme.dat → ~/.clay.theme.dat
-    if !theme_path.exists() {
-        let old_path = std::path::Path::new(&home).join("clay.theme.dat");
-        if old_path.exists() {
-            let _ = std::fs::rename(&old_path, &theme_path);
-        }
-    }
+    let theme_path = clay_config_path("theme.dat");
     if !theme_path.exists() {
         // Generate default theme file
         let content = theme::ThemeFile::generate_default_file();
@@ -9061,6 +9306,7 @@ pub(crate) struct SetupSettings {
     pub(crate) new_line_indicator: bool,
     pub(crate) tts_mode: String,
     pub(crate) tts_speak_mode: String,
+    pub(crate) scrollback: bool,
 }
 
 /// Settings from the web popup
@@ -9199,6 +9445,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
+        SETUP_FIELD_SCROLLBACK,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -9446,6 +9693,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
                     tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
                     tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
+                    scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
                 }
             };
 
@@ -10670,12 +10918,18 @@ async fn main() -> io::Result<()> {
     let mut gui_arg: Option<Option<String>> = None;
     let mut grep_arg: Option<String> = None;
     let mut grep_extra_args: Vec<String> = Vec::new();
+    let mut grep_archive_mode = false;
 
     #[allow(unused_assignments)]
     {
         let mut i = 0;
         while i < args.len() {
             let arg = &args[i];
+            if arg == "--grep-archive" {
+                grep_archive_mode = true;
+                grep_extra_args = args[i + 1..].to_vec();
+                break;
+            }
             if let Some(stripped) = arg.strip_prefix("--grep=") {
                 let mut addr = stripped.to_string();
                 // Default to port 9000 if no port specified
@@ -10722,13 +10976,17 @@ async fn main() -> io::Result<()> {
         println!("    --gui=host[:port]    Connect to a Clay server via GUI (default port: 9000)");
         println!("    -D                   Run as headless daemon server");
         println!("    --multiuser          Run as multiuser server");
-        println!("    --conf=<path>        Use custom config file (default: ~/.clay.dat)");
+        println!("    --conf=<path>        Use custom config file (default: ~/.clay/settings.dat)");
         println!("    --grep=host[:port] <pattern>  Search world output (default port: 9000)");
         println!("      -w <world>              Limit to specific world");
         println!("      --regexp                Use regex (default: glob with * and ? wildcards)");
         println!("      --noesc                 Strip ANSI color codes from output");
         println!("      -f                      Follow mode (match new output, runs until Ctrl+C)");
         println!("      Password via CLAY_PASSWORD environment variable");
+        println!("    --grep-archive <pattern>  Search long-term archive (~/.clay/scrollback.db)");
+        println!("      -w <world>              Limit to specific world");
+        println!("      --regexp                Use regex (default: glob with * and ? wildcards)");
+        println!("      --noesc                 Strip ANSI color codes from output");
         println!("    -v, --version        Show version and build information");
         println!("    -h, --help           Show this help message");
         println!();
@@ -10770,16 +11028,19 @@ async fn main() -> io::Result<()> {
     DEBUG_LOG_HEADER_WRITTEN.store(false, Ordering::Relaxed);
     OUTPUT_DEBUG_HEADER_WRITTEN.store(false, Ordering::Relaxed);
 
+    // Migrate legacy ~/.clay.* dotfiles into ~/.clay/ before any config is loaded
+    migrate_legacy_config_files();
+
     // Always log startup (not gated by debug flag) for reload/crash diagnostics
     debug_log(is_debug_enabled(), &format!("STARTUP: {} (reload={}, crash={}, gui={:?})", get_version_string(), is_reload_arg, is_crash_arg, gui_arg));
 
-    // Parse --grep extra args
+    // Parse --grep / --grep-archive extra args
     let mut grep_world_filter: Option<String> = None;
     let mut grep_use_regex = false;
     let mut grep_strip_ansi = false;
     let mut grep_follow_mode = false;
     let mut grep_pattern: Option<String> = None;
-    if grep_arg.is_some() {
+    if grep_arg.is_some() || grep_archive_mode {
         let mut gi = 0;
         while gi < grep_extra_args.len() {
             match grep_extra_args[gi].as_str() {
@@ -10810,7 +11071,11 @@ async fn main() -> io::Result<()> {
             gi += 1;
         }
         if grep_pattern.is_none() {
-            eprintln!("Error: Missing search pattern. Usage: clay --grep=host:port [OPTIONS] <pattern>");
+            if grep_archive_mode {
+                eprintln!("Error: Missing search pattern. Usage: clay --grep-archive [OPTIONS] <pattern>");
+            } else {
+                eprintln!("Error: Missing search pattern. Usage: clay --grep=host:port [OPTIONS] <pattern>");
+            }
             std::process::exit(1);
         }
     }
@@ -10826,6 +11091,10 @@ async fn main() -> io::Result<()> {
     }
     if grep_arg.is_some() && (console_arg.is_some() || gui_arg.is_some() || daemon_mode || multiuser_mode) {
         eprintln!("Error: --grep cannot be combined with --console/--gui/-D/--multiuser.");
+        std::process::exit(1);
+    }
+    if grep_archive_mode && (grep_arg.is_some() || console_arg.is_some() || gui_arg.is_some() || daemon_mode || multiuser_mode) {
+        eprintln!("Error: --grep-archive cannot be combined with other modes.");
         std::process::exit(1);
     }
 
@@ -10844,6 +11113,40 @@ async fn main() -> io::Result<()> {
                     run_tls_proxy_async(host, port, &socket_path).await;
                 }
             }
+        }
+        return Ok(());
+    }
+
+    // Handle --grep-archive (offline archive search, no server needed)
+    if grep_archive_mode {
+        let db_path = clay_config_path("scrollback.db");
+        if !db_path.exists() {
+            eprintln!("Error: Archive database not found at {}. Enable \"Archive Output\" in Clay Setup first.", db_path.display());
+            std::process::exit(1);
+        }
+        let pattern = grep_pattern.as_deref().unwrap_or("*");
+        let results = scrollback::ScrollbackDb::search(
+            &db_path,
+            grep_world_filter.as_deref(),
+            pattern,
+            None,
+            None,
+            100_000,
+            grep_use_regex,
+        );
+        if results.is_empty() {
+            eprintln!("No matches found.");
+        }
+        for line in &results {
+            let ts_secs = (line.ts_ms / 1000) as i64;
+            let lt = local_time_from_epoch(ts_secs);
+            let ts_str = format!("{:02}/{:02} {:02}:{:02}", lt.month, lt.day, lt.hour, lt.minute);
+            let text = if grep_strip_ansi {
+                util::strip_ansi_codes(&line.text)
+            } else {
+                line.text.clone()
+            };
+            println!("{} [{}] {}", ts_str, line.world, text);
         }
         return Ok(());
     }
@@ -11187,13 +11490,12 @@ pub async fn run_app_headless(
     // Pre-compile action regexes after loading settings or reload state
     compile_all_action_regexes(&mut app.settings.actions);
 
-    // Load theme file (~/.clay.theme.dat)
+    // Load theme file (~/.clay/theme.dat)
     load_theme_file(&mut app);
 
-    // Load keyboard bindings (~/.clay.key.dat)
+    // Load keyboard bindings (~/.clay/keybindings.dat)
     {
-        let home = get_home_dir();
-        let key_path = std::path::Path::new(&home).join(clay_filename("clay.key.dat"));
+        let key_path = clay_config_path("keybindings.dat");
         app.keybindings = keybindings::KeyBindings::load(&key_path);
     }
 
@@ -11203,6 +11505,9 @@ pub async fn run_app_headless(
     if !app.settings.dictionary_path.is_empty() {
         app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
     }
+
+    // Open scrollback archive if enabled
+    app.init_scrollback();
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
     app.event_tx = Some(event_tx.clone());
@@ -11532,9 +11837,8 @@ pub async fn run_app_headless(
     if app.settings.web_secure
         && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
     {
-        let home = get_home_dir();
-        let cert_path = std::path::PathBuf::from(&home).join(clay_filename("clay.cert.pem"));
-        let key_path = std::path::PathBuf::from(&home).join(clay_filename("clay.key.pem"));
+        let cert_path = clay_config_path("cert.pem");
+        let key_path = clay_config_path("key.pem");
 
         let needs_gen = !cert_path.exists() || !key_path.exists();
         let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
@@ -12064,13 +12368,8 @@ pub async fn run_app_headless(
             _ = keepalive_interval.tick() => {
                 for world in &mut app.worlds {
                     if world.connected {
-                        let last_activity = match (world.last_send_time, world.last_receive_time) {
-                            (Some(s), Some(r)) => Some(s.max(r)),
-                            (Some(s), None) => Some(s),
-                            (None, Some(r)) => Some(r),
-                            (None, None) => None,
-                        };
-                        let should_send = match last_activity {
+                        // Only check last_send_time: server kicks us when WE go idle.
+                        let should_send = match world.last_send_time {
                             Some(t) => t.elapsed() >= KEEPALIVE_INTERVAL,
                             None => true,
                         };
@@ -12503,13 +12802,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Pre-compile action regexes after loading settings or reload state
     compile_all_action_regexes(&mut app.settings.actions);
 
-    // Load theme file (~/.clay.theme.dat)
+    // Load theme file (~/.clay/theme.dat)
     load_theme_file(&mut app);
 
-    // Load keyboard bindings (~/.clay.key.dat)
+    // Load keyboard bindings (~/.clay/keybindings.dat)
     {
-        let home = get_home_dir();
-        let key_path = std::path::Path::new(&home).join(clay_filename("clay.key.dat"));
+        let key_path = clay_config_path("keybindings.dat");
         app.keybindings = keybindings::KeyBindings::load(&key_path);
     }
 
@@ -12522,6 +12820,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     if !app.settings.dictionary_path.is_empty() {
         app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
     }
+
+    // Open scrollback archive if enabled
+    app.init_scrollback();
 
     // Note: pending_lines and paused state are preserved across reload
     // so that more-mode continues seamlessly. Disconnected worlds have their
@@ -13320,9 +13621,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         if app.settings.web_secure
             && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
         {
-            let home = get_home_dir();
-            let cert_path = std::path::PathBuf::from(&home).join(clay_filename("clay.cert.pem"));
-            let key_path = std::path::PathBuf::from(&home).join(clay_filename("clay.key.pem"));
+            let cert_path = clay_config_path("cert.pem");
+            let key_path = clay_config_path("key.pem");
 
             let needs_gen = !cert_path.exists() || !key_path.exists();
             let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
@@ -14555,14 +14855,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Check keepalive for all connected worlds (send NOP if no activity in 5 min)
                 for world in &mut app.worlds {
                     if world.connected {
-                        // Check last activity time (either send or receive)
-                        let last_activity = match (world.last_send_time, world.last_receive_time) {
-                            (Some(s), Some(r)) => Some(s.max(r)),
-                            (Some(s), None) => Some(s),
-                            (None, Some(r)) => Some(r),
-                            (None, None) => None,
-                        };
-                        let should_send = match last_activity {
+                        // Only check last_send_time: server kicks us when WE go idle,
+                        // server-side data doesn't reset the server's idle timer for our side.
+                        let should_send = match world.last_send_time {
                             Some(t) => t.elapsed() >= KEEPALIVE_INTERVAL,
                             None => true,
                         };

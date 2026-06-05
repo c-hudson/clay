@@ -1613,6 +1613,7 @@ Options:
   -l          Search local (TF) output only
   -g          Search all worlds + local
   -i          Search input history
+  -D          Search long-term archive (~/.clay/scrollback.db)
   -t[format]  Show timestamps
   -v          Invert match (show non-matching)
   -q          Quiet (set %? but don't display)
@@ -1625,9 +1626,11 @@ Options:
 Range: N (last N), -N (Nth previous), N-M, N-
 
 Examples:
-  /recall 20                    - Last 20 lines
-  /recall -i /def               - Input history matching /def
-  /recall -mregexp \d{3}-\d{4}  - Regex match"#.to_string()
+  /recall 20                       - Last 20 lines
+  /recall -i /def                  - Input history matching /def
+  /recall -mregexp \d{3}-\d{4}     - Regex match
+  /recall -D dragon                - Search archive for "dragon"
+  /recall -D -wmud.example.com *   - All archived lines for a world"#.to_string()
             )),
             "gag" => TfCommandResult::Success(Some(
                 "/gag [pattern]\n\nWith no args: list all gag triggers.\nWith a pattern: create a trigger that suppresses matching lines.\nEquivalent to: /def -ag -t\"pattern\"\n\nExample: /gag * has left the game.".to_string()

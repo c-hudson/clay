@@ -45,15 +45,10 @@ pub fn format_elapsed(secs: Option<u64>) -> String {
     }
 }
 
-/// Format time until next NOP
-pub fn format_next_nop(last_send_secs: Option<u64>, last_recv_secs: Option<u64>) -> String {
+/// Format time until next NOP (based only on last send time)
+pub fn format_next_nop(last_send_secs: Option<u64>, _last_recv_secs: Option<u64>) -> String {
     const KEEPALIVE_SECS: u64 = 5 * 60;
-    let elapsed = match (last_send_secs, last_recv_secs) {
-        (Some(s), Some(r)) => s.min(r),
-        (Some(s), None) => s,
-        (None, Some(r)) => r,
-        (None, None) => KEEPALIVE_SECS,
-    };
+    let elapsed = last_send_secs.unwrap_or(KEEPALIVE_SECS);
     let remaining = KEEPALIVE_SECS.saturating_sub(elapsed);
     if remaining < 60 {
         format!("{}s", remaining)

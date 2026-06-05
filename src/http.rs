@@ -63,7 +63,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 // Remote Connection Logging
 // ============================================================================
 
-/// Log a remote connection event to clay.remote.log
+/// Log a remote connection event to ~/.clay/remote.log
 pub fn log_remote_event(event_type: &str, ip: &str, details: &str) {
     use std::io::Write;
     let timestamp = crate::util::local_time_now();
@@ -76,7 +76,7 @@ pub fn log_remote_event(event_type: &str, ip: &str, details: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("clay.remote.log")
+        .open(crate::clay_config_path("remote.log"))
     {
         let _ = file.write_all(log_line.as_bytes());
     }

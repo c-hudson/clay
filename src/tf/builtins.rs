@@ -694,6 +694,10 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
                         i += 1;
                     }
                 }
+                'D' => {
+                    opts.archive = true;
+                    i += 1;
+                }
                 _ => {
                     // Unknown option or might be a negative range
                     // Check if rest looks like a number (negative range like -4)
