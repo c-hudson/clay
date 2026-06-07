@@ -29,7 +29,7 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-const VERSION: &str = "1.0.3";
+const VERSION: &str = "1.0.4";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
@@ -5289,6 +5289,11 @@ impl App {
             );
             if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
                 just_filtered_idler = true;
+                // Don't drop the idler echo — gag it so F2 (show_tags) can reveal it like
+                // any other gagged line, on console/web/GUI.
+                if !is_partial {
+                    processed_lines.push((line, true, None));
+                }
                 continue;
             }
 
