@@ -1,9 +1,9 @@
-/// Long-term output archive backed by SQLite.
-///
-/// Lines are written via an unbounded channel to a background thread that
-/// batches inserts (every 500 ms or 100 lines) inside a single transaction.
-/// Search and scrollback-load open short-lived read-only connections so they
-/// never block the writer.
+//! Long-term output archive backed by SQLite.
+//!
+//! Lines are written via an unbounded channel to a background thread that
+//! batches inserts (every 500 ms or 100 lines) inside a single transaction.
+//! Search and scrollback-load open short-lived read-only connections so they
+//! never block the writer.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -16,8 +16,8 @@ pub struct ScrollbackLine {
     pub text: String,
 }
 
-/// (world_name, ts_ms_unix, ansi_text)
-pub type ArchiveEntry = (String, i64, String);
+/// (world_name, ts_ms_unix, ansi_text, gagged)
+pub type ArchiveEntry = (String, i64, String, bool);
 
 pub struct ScrollbackDb {
     tx: mpsc::SyncSender<ArchiveEntry>,
@@ -42,7 +42,8 @@ impl ScrollbackDb {
                 ts_ms     INTEGER NOT NULL,
                 world     TEXT NOT NULL,
                 line_raw  TEXT NOT NULL,
-                line_text TEXT NOT NULL
+                line_text TEXT NOT NULL,
+                gagged    INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_world_ts ON output_log(world, ts_ms);
             CREATE VIRTUAL TABLE IF NOT EXISTS output_fts USING fts5(
@@ -51,6 +52,12 @@ impl ScrollbackDb {
                 content_rowid='id'
             );
         ")?;
+        // Migration: add gagged column to existing databases that predate this field.
+        // Silently ignore "duplicate column name" errors — the column already exists.
+        let _ = conn.execute(
+            "ALTER TABLE output_log ADD COLUMN gagged INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         drop(conn);
 
         let db_path = path.to_path_buf();
@@ -65,14 +72,14 @@ impl ScrollbackDb {
                     Ok(c) => c,
                     Err(_) => return,
                 };
-                let mut batch: Vec<(String, i64, String, String)> = Vec::new();
+                let mut batch: Vec<(String, i64, String, String, bool)> = Vec::new();
                 let mut last_flush = Instant::now();
 
                 loop {
                     match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok((world, ts_ms, text)) => {
+                        Ok((world, ts_ms, text, gagged)) => {
                             let line_text = crate::util::strip_ansi_codes(&text);
-                            batch.push((world, ts_ms, text, line_text));
+                            batch.push((world, ts_ms, text, line_text, gagged));
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             flush_batch(&conn, &mut batch);
@@ -96,8 +103,8 @@ impl ScrollbackDb {
     }
 
     /// Queue a line for archiving. Non-blocking (drops if channel is full).
-    pub fn append(&self, world: &str, ts_ms: i64, text: &str) {
-        let _ = self.tx.try_send((world.to_string(), ts_ms, text.to_string()));
+    pub fn append(&self, world: &str, ts_ms: i64, text: &str, gagged: bool) {
+        let _ = self.tx.try_send((world.to_string(), ts_ms, text.to_string(), gagged));
     }
 
     /// Load up to `count` lines that precede `before_ts_ms` for the given world.
@@ -227,7 +234,7 @@ pub fn load_before_path(path: &Path, world: &str, before_ts_ms: i64, count: usiz
     lines
 }
 
-fn flush_batch(conn: &Connection, batch: &mut Vec<(String, i64, String, String)>) {
+fn flush_batch(conn: &Connection, batch: &mut Vec<(String, i64, String, String, bool)>) {
     if batch.is_empty() {
         return;
     }
@@ -235,11 +242,99 @@ fn flush_batch(conn: &Connection, batch: &mut Vec<(String, i64, String, String)>
         Ok(t) => t,
         Err(_) => { batch.clear(); return; }
     };
-    for (world, ts_ms, line_raw, line_text) in batch.drain(..) {
+    for (world, ts_ms, line_raw, line_text, gagged) in batch.drain(..) {
         let _ = tx.execute(
-            "INSERT INTO output_log (ts_ms, world, line_raw, line_text) VALUES (?1, ?2, ?3, ?4)",
-            params![ts_ms, world, line_raw, line_text],
+            "INSERT INTO output_log (ts_ms, world, line_raw, line_text, gagged) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ts_ms, world, line_raw, line_text, gagged as i32],
         );
     }
     let _ = tx.commit();
+}
+
+/// Export the entire archive to a CSV file.  Returns the number of data rows written.
+///
+/// Columns: id, world, datetime_local, ts_epoch_ms, gagged, text, raw
+/// Rows sorted by world ascending then timestamp ascending.
+/// Returns `Err(String)` with a human-readable message on failure.
+pub fn export_csv(db_path: &Path, out_path: &Path) -> Result<usize, String> {
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("cannot open database: {}", e))?;
+
+    // Check whether the gagged column exists (absent in DBs before this migration).
+    let has_gagged: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(output_log)")
+            .map_err(|e| format!("PRAGMA table_info failed: {}", e))?;
+        let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("query_map failed: {}", e))?
+            .flatten()
+            .collect();
+        cols.iter().any(|c| c == "gagged")
+    };
+
+    let sql = if has_gagged {
+        "SELECT id, ts_ms, world, line_raw, line_text, gagged \
+         FROM output_log ORDER BY world ASC, ts_ms ASC"
+    } else {
+        "SELECT id, ts_ms, world, line_raw, line_text, 0 \
+         FROM output_log ORDER BY world ASC, ts_ms ASC"
+    };
+
+    let mut stmt = conn.prepare(sql)
+        .map_err(|e| format!("prepare failed: {}", e))?;
+
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(out_path)
+        .map_err(|e| format!("cannot create {}: {}", out_path.display(), e))?;
+
+    // Header row
+    writeln!(file, "id,world,datetime_local,ts_epoch_ms,gagged,text,raw")
+        .map_err(|e| format!("write error: {}", e))?;
+
+    let mut count = 0usize;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,    // id
+            row.get::<_, i64>(1)?,    // ts_ms
+            row.get::<_, String>(2)?, // world
+            row.get::<_, String>(3)?, // line_raw
+            row.get::<_, String>(4)?, // line_text
+            row.get::<_, i32>(5)?,    // gagged
+        ))
+    }).map_err(|e| format!("query failed: {}", e))?;
+
+    for row in rows.flatten() {
+        let (id, ts_ms, world, line_raw, line_text, gagged_int) = row;
+        let ts_secs = ts_ms / 1000;
+        let lt = crate::util::local_time_from_epoch(ts_secs);
+        let datetime_str = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second
+        );
+        let gagged_str = if gagged_int != 0 { "true" } else { "false" };
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{}",
+            id,
+            csv_escape(&world),
+            csv_escape(&datetime_str),
+            ts_ms,
+            gagged_str,
+            csv_escape(&line_text),
+            csv_escape(&line_raw),
+        ).map_err(|e| format!("write error: {}", e))?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Escape a CSV field value: wrap in double-quotes if the value contains a comma,
+/// double-quote, newline, or carriage return; double any embedded double-quotes.
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{}\"", escaped)
+    } else {
+        s.to_string()
+    }
 }

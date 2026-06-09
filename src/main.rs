@@ -2652,7 +2652,7 @@ impl World {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
-                        let _ = tx.try_send((self.name.clone(), ts_ms, line.to_string()));
+                        let _ = tx.try_send((self.name.clone(), ts_ms, line.to_string(), false));
                     }
                 }
             }
@@ -5646,6 +5646,15 @@ impl App {
             let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
             output_line.highlight_color = highlight;
             self.worlds[world_idx].output_lines.push(output_line);
+            // Archive gagged server lines to long-term scrollback (with gagged=true)
+            if let Some(ref tx) = self.worlds[world_idx].scrollback_tx {
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let world_name = self.worlds[world_idx].name.clone();
+                let _ = tx.try_send((world_name, ts_ms, line.to_string(), true));
+            }
             // Broadcast gagged line to WebSocket clients
             let ws_data = line.to_string().replace('\r', "") + "\n";
             self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
@@ -10924,6 +10933,8 @@ async fn main() -> io::Result<()> {
     let mut grep_arg: Option<String> = None;
     let mut grep_extra_args: Vec<String> = Vec::new();
     let mut grep_archive_mode = false;
+    let mut dump_mode = false;
+    let mut dump_out_dir: Option<String> = None;
 
     #[allow(unused_assignments)]
     {
@@ -10955,6 +10966,8 @@ async fn main() -> io::Result<()> {
                 "--crash" => is_crash_arg = true,
                 "--console" => console_arg = Some(None),
                 "--gui" => gui_arg = Some(None),
+                "--dump" => dump_mode = true,
+                _ if arg.starts_with("--dump=") => { dump_mode = true; dump_out_dir = Some(arg[7..].to_string()); },
                 _ if arg.starts_with("--conf=") => conf_path = Some(arg[7..].to_string()),
                 _ if arg.starts_with("--console=") => console_arg = Some(Some(arg[10..].to_string())),
                 _ if arg.starts_with("--gui=") => gui_arg = Some(Some(arg[6..].to_string())),
@@ -10992,6 +11005,8 @@ async fn main() -> io::Result<()> {
         println!("      -w <world>              Limit to specific world");
         println!("      --regexp                Use regex (default: glob with * and ? wildcards)");
         println!("      --noesc                 Strip ANSI color codes from output");
+        println!("    --dump[=<dir>]       Export the offline scrollback archive to scrollback_dump.csv");
+        println!("                         Default output directory: current working directory");
         println!("    -v, --version        Show version and build information");
         println!("    -h, --help           Show this help message");
         println!();
@@ -11102,6 +11117,10 @@ async fn main() -> io::Result<()> {
         eprintln!("Error: --grep-archive cannot be combined with other modes.");
         std::process::exit(1);
     }
+    if dump_mode && (grep_arg.is_some() || grep_archive_mode || console_arg.is_some() || gui_arg.is_some() || daemon_mode || multiuser_mode) {
+        eprintln!("Error: --dump cannot be combined with other modes.");
+        std::process::exit(1);
+    }
 
     // Handle --tls-proxy (internal, used when spawning TLS proxy processes)
     #[cfg(not(target_os = "android"))]
@@ -11143,7 +11162,7 @@ async fn main() -> io::Result<()> {
             eprintln!("No matches found.");
         }
         for line in &results {
-            let ts_secs = (line.ts_ms / 1000) as i64;
+            let ts_secs = line.ts_ms / 1000;
             let lt = local_time_from_epoch(ts_secs);
             let ts_str = format!("{:02}/{:02} {:02}:{:02}", lt.month, lt.day, lt.hour, lt.minute);
             let text = if grep_strip_ansi {
@@ -11152,6 +11171,31 @@ async fn main() -> io::Result<()> {
                 line.text.clone()
             };
             println!("{} [{}] {}", ts_str, line.world, text);
+        }
+        return Ok(());
+    }
+
+    // Handle --dump (offline CSV export of the scrollback archive)
+    if dump_mode {
+        let db_path = clay_config_path("scrollback.db");
+        if !db_path.exists() {
+            eprintln!("Error: Archive database not found at {}. Enable \"Archive Output\" in Clay Setup first.", db_path.display());
+            std::process::exit(1);
+        }
+        let out_dir = match dump_out_dir {
+            Some(ref d) => std::path::PathBuf::from(d),
+            None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        };
+        let out_path = out_dir.join("scrollback_dump.csv");
+        match scrollback::export_csv(&db_path, &out_path) {
+            Ok(count) => {
+                let abs = out_path.canonicalize().unwrap_or(out_path);
+                println!("Exported {} rows to {}", count, abs.display());
+            }
+            Err(e) => {
+                eprintln!("Error: failed to export CSV: {}", e);
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }
