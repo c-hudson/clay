@@ -63,7 +63,7 @@ enum WvEvent {
     GrepWindow { pattern: String, world: Option<String>, use_regex: bool },
 }
 
-use crate::theme::{ThemeColors, ThemeFile};
+use crate::theme::ThemeFile;
 use crate::websocket::hash_password;
 
 /// Open a URL in the system's default browser (platform-specific).
