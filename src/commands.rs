@@ -913,13 +913,12 @@ pub fn normalize_language_code(lang: &str) -> String {
     }
 }
 
-/// Shorten a URL using is.gd (direct redirect, no landing page)
-pub async fn lookup_tinyurl(url: &str) -> Result<String, String> {
-    let encoded: String = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("format", "simple")
-        .append_pair("url", url)
-        .finish();
-    let api_url = format!("https://is.gd/create.php?{}", encoded);
+/// Shorten a URL using the selected service.
+/// Validates that the response body is actually a URL (starts with "http") so
+/// plain-text error bodies like "Error, database insert failed" are returned as
+/// Err rather than being silently accepted as a result.
+pub async fn lookup_tinyurl(url: &str, service: crate::encoding::UrlShortener) -> Result<String, String> {
+    let api_url = service.build_request_url(url);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -940,8 +939,12 @@ pub async fn lookup_tinyurl(url: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
     let trimmed = body.trim().to_string();
-    if trimmed.is_empty() {
-        return Err("Empty response from is.gd".to_string());
+    if trimmed.is_empty() || !trimmed.to_lowercase().starts_with("http") {
+        return Err(if trimmed.is_empty() {
+            "empty response".to_string()
+        } else {
+            trimmed
+        });
     }
 
     Ok(trimmed)
@@ -1027,6 +1030,7 @@ pub fn spawn_api_lookup(
     client_id: u64,
     world_index: usize,
     command: Command,
+    url_shortener: crate::encoding::UrlShortener,
 ) {
     match command {
         Command::Dict { word } => {
@@ -1067,9 +1071,9 @@ pub fn spawn_api_lookup(
         }
         Command::TinyUrl { url } => {
             tokio::spawn(async move {
-                let result = match lookup_tinyurl(&url).await {
+                let result = match lookup_tinyurl(&url, url_shortener).await {
                     Ok(short) => Ok(short),
-                    Err(e) => Err(format!("TinyURL failed: {}", e)),
+                    Err(e) => Err(format!("URL shortening failed: {}", e)),
                 };
                 let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result, true)).await;
             });
@@ -2477,7 +2481,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output("  Example: /tr es Hello");
         }
         Command::TinyUrl { url } => {
-            match lookup_tinyurl(&url).await {
+            let service = app.settings.url_shortener_service;
+            match lookup_tinyurl(&url, service).await {
                 Ok(short) => {
                     app.input.buffer = short;
                     app.input.cursor_position = 0;
@@ -2489,7 +2494,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::TinyUrlUsage => {
             app.add_output("Usage: /url <url>");
-            app.add_output("  Shortens <url> via is.gd and places the result in the input buffer.");
+            app.add_output(&format!("  Shortens <url> via {} and places the result in the input buffer.", app.settings.url_shortener_service.name()));
             app.add_output("  Example: /url https://github.com/c-hudson/clay");
         }
         Command::Dump => {

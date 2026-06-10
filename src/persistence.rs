@@ -205,6 +205,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
+    writeln!(file, "url_shortener={}", app.settings.url_shortener_service.name())?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -673,6 +674,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     }
                     "scrollback_enabled" => {
                         app.settings.scrollback_enabled = value == "true";
+                    }
+                    "url_shortener" => {
+                        app.settings.url_shortener_service = crate::encoding::UrlShortener::from_name(value);
                     }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
@@ -1201,6 +1205,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
+    writeln!(file, "url_shortener={}", app.settings.url_shortener_service.name())?;
 
     // Save watchdog state
     writeln!(file, "watchdog_enabled={}", app.tf_engine.watchdog_enabled)?;
@@ -1860,6 +1865,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     }
                     "scrollback_enabled" => {
                         app.settings.scrollback_enabled = value == "true";
+                    }
+                    "url_shortener" => {
+                        app.settings.url_shortener_service = crate::encoding::UrlShortener::from_name(value);
                     }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)

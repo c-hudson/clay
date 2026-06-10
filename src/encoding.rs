@@ -388,6 +388,72 @@ impl WorldSwitchMode {
     }
 }
 
+/// URL shortening service selection
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum UrlShortener {
+    #[default]
+    IsGd,
+    VGd,
+    TinyUrl,
+    DaGd,
+}
+
+impl UrlShortener {
+    pub fn name(&self) -> &'static str {
+        match self {
+            UrlShortener::IsGd    => "is.gd",
+            UrlShortener::VGd     => "v.gd",
+            UrlShortener::TinyUrl => "tinyurl",
+            UrlShortener::DaGd    => "da.gd",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "v.gd"    => UrlShortener::VGd,
+            "tinyurl" => UrlShortener::TinyUrl,
+            "da.gd"   => UrlShortener::DaGd,
+            _         => UrlShortener::IsGd,
+        }
+    }
+
+    /// Build the full API request URL for the given long URL.
+    pub fn build_request_url(&self, long_url: &str) -> String {
+        match self {
+            UrlShortener::IsGd | UrlShortener::VGd => {
+                let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("format", "simple")
+                    .append_pair("url", long_url)
+                    .finish();
+                let host = if matches!(self, UrlShortener::VGd) { "v.gd" } else { "is.gd" };
+                format!("https://{}/create.php?{}", host, encoded)
+            }
+            UrlShortener::TinyUrl => {
+                let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("url", long_url)
+                    .finish();
+                format!("https://tinyurl.com/api-create.php?{}", encoded)
+            }
+            UrlShortener::DaGd => {
+                let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("url", long_url)
+                    .finish();
+                format!("https://da.gd/s?{}", encoded)
+            }
+        }
+    }
+
+    /// Human-readable label for the service (shown in UI).
+    pub fn label(&self) -> &'static str {
+        match self {
+            UrlShortener::IsGd    => "is.gd",
+            UrlShortener::VGd     => "v.gd",
+            UrlShortener::TinyUrl => "TinyURL",
+            UrlShortener::DaGd    => "da.gd",
+        }
+    }
+}
+
 /// Strip non-SGR ANSI escape sequences (cursor movement, erase, etc.)
 /// Keep only SGR sequences (CSI ... m) for colors and styles
 /// For cursor positioning sequences, insert appropriate separators

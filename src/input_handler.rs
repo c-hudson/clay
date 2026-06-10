@@ -593,6 +593,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 if scrollback_changed {
                     app.init_scrollback();
                 }
+                app.settings.url_shortener_service = crate::encoding::UrlShortener::from_name(&settings.url_shortener);
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }

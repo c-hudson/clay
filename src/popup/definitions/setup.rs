@@ -26,6 +26,7 @@ pub const SETUP_FIELD_NEW_LINE_INDICATOR: FieldId = FieldId(17);
 pub const SETUP_FIELD_TTS: FieldId = FieldId(18);
 pub const SETUP_FIELD_TTS_SPEAK_MODE: FieldId = FieldId(19);
 pub const SETUP_FIELD_SCROLLBACK: FieldId = FieldId(20);
+pub const SETUP_FIELD_URL_SHORTENER: FieldId = FieldId(21);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -64,6 +65,16 @@ pub fn tts_mode_options() -> Vec<SelectOption> {
     ]
 }
 
+/// URL shortener service options
+pub fn url_shortener_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption::new("is.gd",    "is.gd"),
+        SelectOption::new("v.gd",     "v.gd"),
+        SelectOption::new("tinyurl",  "TinyURL"),
+        SelectOption::new("da.gd",    "da.gd"),
+    ]
+}
+
 /// TTS speak mode options (which lines to speak)
 pub fn tts_speak_mode_options() -> Vec<SelectOption> {
     vec![
@@ -92,6 +103,7 @@ pub fn create_setup_popup(
     tts_mode: &str,
     tts_speak_mode: &str,
     scrollback: bool,
+    url_shortener: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -102,6 +114,12 @@ pub fn create_setup_popup(
         _ => 0,  // "off"
     };
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
+    let url_shortener_idx = match url_shortener {
+        "v.gd"    => 1,
+        "tinyurl" => 2,
+        "da.gd"   => 3,
+        _         => 0,  // "is.gd" (default)
+    };
 
     PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -189,6 +207,11 @@ pub fn create_setup_popup(
             "Archive Output",
             FieldKind::toggle(scrollback),
         ))
+        .with_field(Field::new(
+            SETUP_FIELD_URL_SHORTENER,
+            "URL Shortener",
+            FieldKind::select(url_shortener_options(), url_shortener_idx),
+        ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
@@ -263,6 +286,12 @@ fn setup_help_text() -> Vec<String> {
         "  Enables /recall -D <pattern> to search the archive",
         "  and pg-up past the top of the scrollback buffer.",
         "  Changes take effect on next restart or /reload.",
+        "",
+        "URL Shortener: Service used by the /url command.",
+        "  is.gd / v.gd: sister services, same API.",
+        "  TinyURL: independent operator.",
+        "  da.gd: independent operator.",
+        "  Switch if your current service is unavailable.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 

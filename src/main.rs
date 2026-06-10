@@ -73,7 +73,7 @@ pub fn get_version_string() -> String {
 }
 
 // Re-export commonly used types from modules
-pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, convert_discord_emojis_with_links, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
+pub use encoding::{Encoding, Theme, UrlShortener, WorldSwitchMode, convert_discord_emojis, convert_discord_emojis_with_links, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point, build_naws_subnegotiation, build_ttype_response, TelnetResult,
@@ -1422,6 +1422,8 @@ pub struct Settings {
     pub tts_speak_mode: tts::TtsSpeakMode,
     pub tts_muted: bool,  // Runtime-only, toggled by F9
     pub scrollback_enabled: bool,
+    /// URL shortening service used by /url command
+    pub url_shortener_service: UrlShortener,
 }
 
 impl Default for Settings {
@@ -1467,6 +1469,7 @@ impl Default for Settings {
             tts_speak_mode: tts::TtsSpeakMode::All,
             tts_muted: false,
             scrollback_enabled: false,
+            url_shortener_service: UrlShortener::IsGd,
         }
     }
 }
@@ -3238,6 +3241,7 @@ impl App {
             tts_mode: self.settings.tts_mode.name().to_string(),
             tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
             scrollback_enabled: self.settings.scrollback_enabled,
+            url_shortener: self.settings.url_shortener_service.name().to_string(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
@@ -3296,6 +3300,7 @@ impl App {
             self.settings.tts_muted = false;
         }
         self.settings.scrollback_enabled = settings.scrollback_enabled;
+        self.settings.url_shortener_service = UrlShortener::from_name(&settings.url_shortener);
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
             self.keybindings = keybindings::KeyBindings::from_json(&settings.keybindings_json);
@@ -3580,6 +3585,7 @@ impl App {
             self.settings.tts_mode.name(),
             self.settings.tts_speak_mode.name(),
             self.settings.scrollback_enabled,
+            self.settings.url_shortener_service.name(),
         );
         self.popup_manager.open(def);
 
@@ -7085,7 +7091,7 @@ impl App {
                 }
             }
             Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } | Command::TinyUrl { .. } => {
-                spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
+                spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed, self.settings.url_shortener_service);
             }
             Command::DictUsage => {
                 self.ws_send_to_client(client_id, WsMessage::ServerData {
@@ -7695,7 +7701,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -7763,6 +7769,7 @@ impl App {
                 if scrollback_changed {
                     self.init_scrollback();
                 }
+                self.settings.url_shortener_service = UrlShortener::from_name(&url_shortener);
                 // Save settings to persist changes
                 let _ = persistence::save_settings(self);
                 // Build settings message for broadcast (uses build_global_settings_msg to avoid leaking sensitive data)
@@ -8811,6 +8818,7 @@ impl App {
         let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
         let visible_height = (self.output_height as usize).max(1);
         let width = (self.output_width as usize).max(1);
+        let show_tags = self.show_tags;
         let world_idx = self.current_world_index;
 
         self.worlds[world_idx].visual_line_offset = 0;
@@ -8819,7 +8827,9 @@ impl App {
             let mut min = 0usize;
             let mut vlines = 0usize;
             for (idx, line) in output_lines.iter().enumerate() {
-                vlines += visual_line_count(&line.text, width);
+                if show_tags || !line.gagged {
+                    vlines += visual_line_count(&line.text, width);
+                }
                 if vlines >= visible_height {
                     min = idx;
                     break;
@@ -8850,7 +8860,9 @@ impl App {
         let mut new_offset = world.scroll_offset;
 
         while visual_lines_moved < target_visual_lines {
-            visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+            if show_tags || !world.output_lines[new_offset].gagged {
+                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+            }
             if new_offset == 0 {
                 break;
             }
@@ -8868,6 +8880,7 @@ impl App {
         let more_mode = self.settings.more_mode_enabled;
         let visible_height = (self.output_height as usize).max(1);
         let width = (self.output_width as usize).max(1);
+        let show_tags = self.show_tags;
         let world_idx = self.current_world_index;
 
         self.worlds[world_idx].visual_line_offset = 0;
@@ -8876,7 +8889,9 @@ impl App {
             let mut min = 0usize;
             let mut vlines = 0usize;
             for (idx, line) in output_lines.iter().enumerate() {
-                vlines += visual_line_count(&line.text, width);
+                if show_tags || !line.gagged {
+                    vlines += visual_line_count(&line.text, width);
+                }
                 if vlines >= visible_height {
                     min = idx;
                     break;
@@ -8904,7 +8919,9 @@ impl App {
         let mut visual_lines_moved = 0;
         let mut new_offset = world.scroll_offset;
         while visual_lines_moved < lines {
-            visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+            if show_tags || !world.output_lines[new_offset].gagged {
+                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+            }
             if new_offset == 0 {
                 break;
             }
@@ -8921,6 +8938,7 @@ impl App {
     fn scroll_output_down(&mut self) {
         let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
         let width = (self.output_width as usize).max(1);
+        let show_tags = self.show_tags;
         let world = self.current_world_mut();
         world.visual_line_offset = 0;
         let max_scroll = world.output_lines.len().saturating_sub(1);
@@ -8935,7 +8953,9 @@ impl App {
         let mut new_offset = world.scroll_offset + 1;
 
         while new_offset <= max_scroll && visual_lines_moved < target_visual_lines {
-            visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+            if show_tags || !world.output_lines[new_offset].gagged {
+                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+            }
             new_offset += 1;
         }
 
@@ -9321,6 +9341,7 @@ pub(crate) struct SetupSettings {
     pub(crate) tts_mode: String,
     pub(crate) tts_speak_mode: String,
     pub(crate) scrollback: bool,
+    pub(crate) url_shortener: String,
 }
 
 /// Settings from the web popup
@@ -9459,7 +9480,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
-        SETUP_FIELD_SCROLLBACK,
+        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_URL_SHORTENER,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -9708,6 +9729,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
                     tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
                     scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
+                    url_shortener: state.get_selected(SETUP_FIELD_URL_SHORTENER).unwrap_or("is.gd").to_string(),
                 }
             };
 
