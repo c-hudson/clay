@@ -2,6 +2,7 @@
 /target/
 /output/
 clay.exe
+clay.sent.exe
 
 # Claude Code local settings
 .claude/
