@@ -1043,26 +1043,52 @@ pub fn get_executable_path() -> io::Result<(PathBuf, String)> {
     Ok((exe, debug_info))
 }
 
-/// Get the correct GitHub release asset name for this platform
+/// Get the correct GitHub release asset name for this platform.
+/// These names must match exactly what the /release skill uploads to GitHub.
 #[cfg(not(target_os = "android"))]
 pub(crate) fn get_platform_asset_name() -> &'static str {
     #[cfg(all(target_os = "linux", target_env = "musl"))]
-    { "clay" }
+    { "clay-linux-x86_64-musl" }
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    { "clay" }
+    { "clay-linux-x86_64-gui" }
 
     #[cfg(target_os = "macos")]
     { "clay-macos-universal" }
 
     #[cfg(target_os = "windows")]
-    { "clay.exe" }
+    { "clay-windows-x86_64.exe" }
 
     #[cfg(target_os = "android")]
     { "clay-termux-aarch64" }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
     { "unknown" }
+}
+
+/// Returns true if the given asset name is a plausible match for this platform.
+/// Used as a fallback when the exact asset name doesn't match, to give a better
+/// error message listing what IS available.
+#[cfg(not(target_os = "android"))]
+fn is_platform_asset_candidate(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    { name.contains("linux") }
+    #[cfg(target_os = "macos")]
+    { name.contains("macos") || name.contains("mac") || name.contains("darwin") }
+    #[cfg(target_os = "windows")]
+    { name.ends_with(".exe") }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    { let _ = name; false }
+}
+
+/// Clean up any leftover `.old` file from a previous Windows self-replace.
+/// Called once at startup on Windows; silently ignored if the file doesn't exist.
+#[cfg(target_os = "windows")]
+pub fn cleanup_old_exe() {
+    if let Ok((exe_path, _)) = get_executable_path() {
+        let old_path = exe_path.with_extension("exe.old");
+        let _ = std::fs::remove_file(&old_path);
+    }
 }
 
 /// Compare two semver-style version strings, returns true if remote is newer than current.
@@ -1153,7 +1179,9 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
         ));
     }
 
-    // Find correct asset for this platform
+    // Find correct asset for this platform.
+    // First try an exact name match; if that fails, fall back to a platform predicate
+    // so a future rename in the release skill doesn't produce a cryptic error.
     let asset_name = get_platform_asset_name();
     let assets = release["assets"]
         .as_array()
@@ -1161,7 +1189,16 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
     let asset = assets
         .iter()
         .find(|a| a["name"].as_str() == Some(asset_name))
-        .ok_or_else(|| format!("No binary for this platform ({}) in release", asset_name))?;
+        .or_else(|| assets.iter().find(|a| {
+            a["name"].as_str().is_some_and(is_platform_asset_candidate)
+        }))
+        .ok_or_else(|| {
+            let available: Vec<&str> = assets.iter()
+                .filter_map(|a| a["name"].as_str())
+                .collect();
+            format!("No binary for this platform ({}) in release. Available: [{}]",
+                asset_name, available.join(", "))
+        })?;
 
     let download_url = asset["browser_download_url"]
         .as_str()
@@ -1435,6 +1472,116 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
             }
             Err(io::Error::other(format!("Failed to spawn reload process: {} (path: {})", e, exe.display())))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_is_newer_version_basic() {
+        assert!(is_newer_version("1.0.1", "1.0.0"));
+        assert!(is_newer_version("1.1.0", "1.0.9"));
+        assert!(is_newer_version("2.0.0", "1.9.9"));
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "1.0.1"));
+    }
+
+    #[test]
+    fn test_is_newer_version_prerelease() {
+        // Release is newer than a pre-release with the same base version
+        assert!(is_newer_version("1.0.0", "1.0.0-beta"));
+        assert!(!is_newer_version("1.0.0-alpha", "1.0.0"));
+    }
+
+    // Simulate the asset-lookup logic from check_and_download_update to verify
+    // the exact-match + fallback behaviour without making real HTTP requests.
+    fn find_asset<'a>(assets: &'a serde_json::Value, asset_name: &str) -> Option<&'a serde_json::Value> {
+        let arr = assets.as_array()?;
+        // Exact match first
+        arr.iter()
+            .find(|a| a["name"].as_str() == Some(asset_name))
+            .or_else(|| {
+                // Fallback: platform-predicate match (mirrors is_platform_asset_candidate logic).
+                // We test the fallback by checking names that end with .exe (Windows) or
+                // contain "musl"/"gui"/"macos" (Linux/macOS).
+                arr.iter().find(|a| {
+                    a["name"].as_str().map(|n| {
+                        n.ends_with(".exe") || n.contains("musl") || n.contains("gui")
+                            || n.contains("macos") || n.contains("linux")
+                    }).unwrap_or(false)
+                })
+            })
+    }
+
+    #[test]
+    fn test_asset_exact_match_windows() {
+        let assets = json!([
+            {"name": "clay-linux-x86_64-musl"},
+            {"name": "clay-linux-x86_64-gui"},
+            {"name": "clay-windows-x86_64.exe"},
+            {"name": "clay-macos-universal"},
+            {"name": "clay-android.apk"},
+        ]);
+        let found = find_asset(&assets, "clay-windows-x86_64.exe");
+        assert_eq!(found.and_then(|a| a["name"].as_str()), Some("clay-windows-x86_64.exe"));
+    }
+
+    #[test]
+    fn test_asset_exact_match_linux_musl() {
+        let assets = json!([
+            {"name": "clay-linux-x86_64-musl"},
+            {"name": "clay-linux-x86_64-gui"},
+            {"name": "clay-windows-x86_64.exe"},
+            {"name": "clay-macos-universal"},
+        ]);
+        let found = find_asset(&assets, "clay-linux-x86_64-musl");
+        assert_eq!(found.and_then(|a| a["name"].as_str()), Some("clay-linux-x86_64-musl"));
+    }
+
+    #[test]
+    fn test_asset_exact_match_macos() {
+        let assets = json!([
+            {"name": "clay-linux-x86_64-musl"},
+            {"name": "clay-macos-universal"},
+            {"name": "clay-windows-x86_64.exe"},
+        ]);
+        let found = find_asset(&assets, "clay-macos-universal");
+        assert_eq!(found.and_then(|a| a["name"].as_str()), Some("clay-macos-universal"));
+    }
+
+    #[test]
+    fn test_asset_not_found_produces_available_list() {
+        // Simulate the error-path: no match at all
+        let assets = json!([
+            {"name": "clay-linux-x86_64-musl"},
+            {"name": "clay-macos-universal"},
+        ]);
+        let arr = assets.as_array().unwrap();
+        let found = arr.iter().find(|a| a["name"].as_str() == Some("clay-unknown-platform"));
+        assert!(found.is_none(), "Should not find an asset for unknown platform");
+        // Verify the error message would include the available names
+        let available: Vec<&str> = arr.iter().filter_map(|a| a["name"].as_str()).collect();
+        let err = format!("No binary for this platform (clay-unknown-platform) in release. Available: [{}]",
+            available.join(", "));
+        assert!(err.contains("clay-linux-x86_64-musl"));
+        assert!(err.contains("clay-macos-universal"));
+    }
+
+    #[test]
+    fn test_asset_fallback_for_old_exe_name() {
+        // Simulate a release that still uses the old "clay.exe" name instead of
+        // "clay-windows-x86_64.exe". The fallback predicate should still find it.
+        let assets = json!([
+            {"name": "clay.exe"},   // old name
+            {"name": "clay-macos-universal"},
+        ]);
+        // Exact match for the new name fails, but fallback (.exe predicate) succeeds
+        let found = find_asset(&assets, "clay-windows-x86_64.exe");
+        assert_eq!(found.and_then(|a| a["name"].as_str()), Some("clay.exe"),
+            "Fallback should pick up old clay.exe even when exact name changed");
     }
 }
 

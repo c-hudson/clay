@@ -2308,13 +2308,13 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
         }
         Command::Update { force } => {
-            #[cfg(any(target_os = "android", not(unix)))]
+            #[cfg(target_os = "android")]
             {
                 let _ = force;
                 app.add_output("Update is not available on this platform.");
             }
 
-            #[cfg(all(unix, not(target_os = "android")))]
+            #[cfg(not(target_os = "android"))]
             {
                 app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
                 let event_tx_clone = event_tx.clone();

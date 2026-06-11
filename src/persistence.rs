@@ -2162,6 +2162,7 @@ mod tests {
             web_font_line_height: 1.8,         // default: 1.2
             web_font_word_spacing: 2.0,        // default: 0.0
             scrollback_enabled: true,          // default: false
+            url_shortener_service: crate::encoding::UrlShortener::TinyUrl, // default: IsGd
         }
     }
 
