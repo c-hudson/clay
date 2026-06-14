@@ -1885,11 +1885,12 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         _ => {
-            // Check if it's an action command (starts with / but not a known command)
-            let action_name = cmd.trim_start_matches('/');
-            if !action_name.is_empty() {
+            // Check if it's an action command (starts with / but not a known command).
+            // Keep the leading slash in the name so "/common" matches an action named "/common"
+            // and falls back to one named "common" for backwards compatibility.
+            if !cmd.trim_start_matches('/').is_empty() {
                 Command::ActionCommand {
-                    name: action_name.to_string(),
+                    name: cmd.to_string(),
                     args: args.join(" "),
                 }
             } else {
@@ -6266,19 +6267,42 @@ impl App {
     /// if an async operation (connect/disconnect) is needed.
     #[allow(clippy::too_many_lines)]
     fn handle_ws_send_command(&mut self, client_id: u64, world_index: usize, command: &str, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
+        // For slash-less input, check if the first word is an action name and rewrite to "/name args".
+        // This allows invoking an action named "common" by typing "common" instead of "/common".
+        // Actions whose names start with "/" (e.g., "/common") are still invoked with a slash prefix.
+        let rewritten: Option<String> = {
+            let trimmed = command.trim();
+            if !trimmed.starts_with('/') {
+                let first_word = trimmed.split_whitespace().next().unwrap_or("");
+                if !first_word.is_empty() && self.settings.actions.iter().any(|a| a.name.eq_ignore_ascii_case(first_word)) {
+                    Some(format!("/{}{}", first_word, &trimmed[first_word.len()..]))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let command = rewritten.as_deref().unwrap_or(command);
         // Use shared command parsing
         let parsed = parse_command(command);
 
         match parsed {
             // Commands handled locally on server
             Command::ActionCommand { name, args } => {
-                // Execute action if it exists
-                if let Some(action) = self.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+                // Execute action if it exists.
+                // name includes the leading slash (e.g., "/common"), so we first try an exact match
+                // (finds actions explicitly named "/common"), then strip the slash for backwards
+                // compatibility with existing actions named "common".
+                let name_no_slash = name.trim_start_matches('/');
+                let action_opt = self.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name))
+                    .or_else(|| self.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(name_no_slash)));
+                if let Some(action) = action_opt {
                     // Skip disabled actions
                     if !action.enabled {
                         self.ws_broadcast(WsMessage::ServerData {
                             world_index,
-                            data: format!("\u{2728} Action '{}' is disabled.", name),
+                            data: format!("\u{2728} Action '{}' is disabled.", action.name),
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
@@ -6460,7 +6484,7 @@ impl App {
                         _ => {
                             self.ws_broadcast(WsMessage::ServerData {
                                 world_index,
-                                data: format!("Unknown command: /{}", name),
+                                data: format!("Unknown command: {}", name),
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
