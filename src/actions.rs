@@ -90,14 +90,36 @@ impl Action {
     }
 }
 
+/// Returns `true` when an action's `world` field names no specific world — i.e. the
+/// field is empty or contains only blank comma segments.  Such an action applies to
+/// all worlds.
+pub fn world_field_is_global(action_world: &str) -> bool {
+    action_world.split(',').all(|w| w.trim().is_empty())
+}
+
+/// Returns `true` when an action with the given `world` field is eligible to run in
+/// `world_name`.  A global field (see [`world_field_is_global`]) matches every world.
+/// Otherwise the field is split on commas, each segment is trimmed of whitespace, and
+/// the comparison is case-insensitive.
+///
+/// Examples:
+/// - `action_matches_world("", "MUD1")` → `true` (global)
+/// - `action_matches_world("MUD1, MUD2", "mud2")` → `true`
+/// - `action_matches_world(" MUD1 , MUD2 ", "MUD1")` → `true`
+/// - `action_matches_world("MUD1, MUD2", "MUD3")` → `false`
+pub fn action_matches_world(action_world: &str, world_name: &str) -> bool {
+    world_field_is_global(action_world)
+        || action_world.split(',').any(|w| w.trim().eq_ignore_ascii_case(world_name))
+}
+
 /// Find an action suitable for manual `/name` (or slash-less `name`) invocation
 /// from the given world.
 ///
-/// World eligibility mirrors `check_action_triggers`: an action whose `world` field
-/// is empty is available from every world; one with a non-empty `world` is only
-/// available from that world (case-insensitive). Within eligible actions, an
-/// exact name match wins over a slash-stripped match, and a world-specific action
-/// wins over a global one sharing the same name.
+/// World eligibility is determined by [`action_matches_world`]: an empty `world`
+/// field is available from every world; a comma-separated list is eligible from any
+/// listed world (case-insensitive, whitespace around commas ignored). Within eligible
+/// actions, an exact name match wins over a slash-stripped match, and a world-specific
+/// action wins over a global one sharing the same name.
 ///
 /// Does **not** check `enabled` — callers are responsible for showing the
 /// "action is disabled" message when `action.enabled` is false.
@@ -108,9 +130,9 @@ pub fn find_invocable_action<'a>(actions: &'a [Action], name: &str, world_name: 
     let find_in_scope = |world_specific: bool| -> Option<&'a Action> {
         let eligible = |a: &&Action| -> bool {
             if world_specific {
-                !a.world.is_empty() && a.world.eq_ignore_ascii_case(world_name)
+                !world_field_is_global(&a.world) && action_matches_world(&a.world, world_name)
             } else {
-                a.world.is_empty()
+                world_field_is_global(&a.world)
             }
         };
         actions.iter().filter(|a| eligible(a)).find(|a| a.name.eq_ignore_ascii_case(name))
@@ -506,8 +528,8 @@ pub fn check_action_triggers(
             continue;
         }
 
-        // Check if world matches (empty = all worlds, case-insensitive)
-        if !action.world.is_empty() && !action.world.eq_ignore_ascii_case(world_name) {
+        // Check if world matches (empty or comma-list = eligible worlds, case-insensitive)
+        if !action_matches_world(&action.world, world_name) {
             continue;
         }
 
@@ -574,7 +596,7 @@ pub fn compile_action_patterns(
         if action.pattern.is_empty() {
             continue;
         }
-        if !action.world.is_empty() && !action.world.eq_ignore_ascii_case(world_name) {
+        if !action_matches_world(&action.world, world_name) {
             continue;
         }
         let regex_pattern = match action.match_type {
@@ -1165,5 +1187,106 @@ mod tests {
         // scoped to MUD1, so from MUD2 the word is NOT rewritten
         let actions = vec![scoped_action("greet", "MUD1")];
         assert_eq!(rewrite_slashless_action("greet", &actions, "MUD2"), None);
+    }
+
+    // -- world_field_is_global --
+
+    #[test]
+    fn test_world_field_is_global_empty() {
+        assert!(world_field_is_global(""));
+    }
+
+    #[test]
+    fn test_world_field_is_global_blank() {
+        assert!(world_field_is_global("  "));
+    }
+
+    #[test]
+    fn test_world_field_is_global_blank_comma_segments() {
+        // ", ," has only blank segments → still global
+        assert!(world_field_is_global(", ,"));
+        assert!(world_field_is_global(" , "));
+    }
+
+    #[test]
+    fn test_world_field_is_global_single_name() {
+        assert!(!world_field_is_global("MUD1"));
+    }
+
+    #[test]
+    fn test_world_field_is_global_comma_list() {
+        assert!(!world_field_is_global("MUD1, MUD2"));
+    }
+
+    // -- action_matches_world --
+
+    #[test]
+    fn test_action_matches_world_global_matches_any() {
+        assert!(action_matches_world("", "MUD1"));
+        assert!(action_matches_world("", ""));
+    }
+
+    #[test]
+    fn test_action_matches_world_single_match() {
+        assert!(action_matches_world("MUD1", "MUD1"));
+        assert!(!action_matches_world("MUD1", "MUD2"));
+    }
+
+    #[test]
+    fn test_action_matches_world_comma_list() {
+        assert!(action_matches_world("MUD1, MUD2", "MUD1"));
+        assert!(action_matches_world("MUD1, MUD2", "MUD2"));
+        assert!(!action_matches_world("MUD1, MUD2", "MUD3"));
+    }
+
+    #[test]
+    fn test_action_matches_world_case_insensitive() {
+        assert!(action_matches_world("MUD1, MUD2", "mud2"));
+        assert!(action_matches_world("mud1", "MUD1"));
+    }
+
+    #[test]
+    fn test_action_matches_world_spaces_around_commas() {
+        // extra whitespace is trimmed
+        assert!(action_matches_world(" MUD1 , MUD2 ", "MUD1"));
+        assert!(action_matches_world(" MUD1 , MUD2 ", "MUD2"));
+        assert!(!action_matches_world(" MUD1 , MUD2 ", "MUD3"));
+    }
+
+    // -- find_invocable_action with comma-list world --
+
+    #[test]
+    fn test_find_invocable_action_multi_world_match() {
+        let actions = vec![scoped_action("greet", "MUD1, MUD2")];
+        assert!(find_invocable_action(&actions, "greet", "MUD1").is_some());
+        assert!(find_invocable_action(&actions, "greet", "MUD2").is_some());
+        assert!(find_invocable_action(&actions, "greet", "MUD3").is_none());
+    }
+
+    #[test]
+    fn test_find_invocable_action_multi_world_wins_over_global() {
+        let global = named_action("greet");
+        let local  = scoped_action("greet", "MUD1, MUD2");
+        let actions = vec![global, local];
+        // from MUD1 → multi-world action wins
+        let found = find_invocable_action(&actions, "greet", "MUD1").unwrap();
+        assert_eq!(found.world, "MUD1, MUD2");
+        // from MUD3 → falls back to global
+        let found2 = find_invocable_action(&actions, "greet", "MUD3").unwrap();
+        assert!(found2.world.is_empty());
+    }
+
+    #[test]
+    fn test_rewrite_slashless_multi_world() {
+        let actions = vec![scoped_action("greet", "MUD1, MUD2")];
+        assert_eq!(
+            rewrite_slashless_action("greet", &actions, "MUD1"),
+            Some("/greet".to_string())
+        );
+        assert_eq!(
+            rewrite_slashless_action("greet", &actions, "MUD2"),
+            Some("/greet".to_string())
+        );
+        assert_eq!(rewrite_slashless_action("greet", &actions, "MUD3"), None);
     }
 }
