@@ -90,6 +90,39 @@ impl Action {
     }
 }
 
+/// Find an action suitable for manual `/name` (or slash-less `name`) invocation.
+///
+/// Tries an exact case-insensitive match on `name` first (so an action explicitly
+/// named `/common` wins when the user types `/common`), then strips the leading
+/// slash and tries again (so `/common` also fires an action named `common`).
+///
+/// Does **not** check `enabled` — callers are responsible for reporting the
+/// "action is disabled" message when `action.enabled` is false.
+pub fn find_invocable_action<'a>(actions: &'a [Action], name: &str) -> Option<&'a Action> {
+    let no_slash = name.trim_start_matches('/');
+    actions.iter().find(|a| a.name.eq_ignore_ascii_case(name))
+        .or_else(|| actions.iter().find(|a| a.name.eq_ignore_ascii_case(no_slash)))
+}
+
+/// If `command` has no leading slash and its first word matches an action name,
+/// return the command rewritten with a leading slash so it routes through the
+/// normal `ActionCommand` dispatch path.
+///
+/// This lets a user type `common` to invoke an action named `common` instead of
+/// always requiring `/common`.  Returns `None` when no rewrite is needed.
+pub fn rewrite_slashless_action(command: &str, actions: &[Action]) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.starts_with('/') {
+        return None;
+    }
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    if !first.is_empty() && actions.iter().any(|a| a.name.eq_ignore_ascii_case(first)) {
+        Some(format!("/{}{}", first, &trimmed[first.len()..]))
+    } else {
+        None
+    }
+}
+
 /// Pre-compile regexes for all actions.
 /// Call after loading settings, restoring reload state, or bulk action updates.
 pub fn compile_all_action_regexes(actions: &mut [Action]) {
@@ -958,5 +991,89 @@ mod tests {
     fn test_match_type_as_str() {
         assert_eq!(MatchType::Regexp.as_str(), "Regexp");
         assert_eq!(MatchType::Wildcard.as_str(), "Wildcard");
+    }
+
+    // --- find_invocable_action / rewrite_slashless_action ---
+
+    fn named_action(name: &str) -> Action {
+        Action { name: name.to_string(), ..Action::default() }
+    }
+
+    #[test]
+    fn test_find_invocable_action_exact() {
+        let actions = vec![named_action("common")];
+        let found = find_invocable_action(&actions, "common");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "common");
+    }
+
+    #[test]
+    fn test_find_invocable_action_slash_strips_for_fallback() {
+        // typing "/common" finds action named "common" via fallback
+        let actions = vec![named_action("common")];
+        let found = find_invocable_action(&actions, "/common");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "common");
+    }
+
+    #[test]
+    fn test_find_invocable_action_slash_name_wins() {
+        // action named "/common" wins over "common" when both exist
+        let actions = vec![named_action("common"), named_action("/common")];
+        let found = find_invocable_action(&actions, "/common");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "/common");
+    }
+
+    #[test]
+    fn test_find_invocable_action_case_insensitive() {
+        let actions = vec![named_action("Common")];
+        assert!(find_invocable_action(&actions, "COMMON").is_some());
+        assert!(find_invocable_action(&actions, "/common").is_some());
+    }
+
+    #[test]
+    fn test_find_invocable_action_not_found() {
+        let actions = vec![named_action("other")];
+        assert!(find_invocable_action(&actions, "common").is_none());
+    }
+
+    #[test]
+    fn test_rewrite_slashless_no_op_for_slash_input() {
+        let actions = vec![named_action("common")];
+        assert_eq!(rewrite_slashless_action("/common", &actions), None);
+    }
+
+    #[test]
+    fn test_rewrite_slashless_no_op_for_unknown_word() {
+        let actions = vec![named_action("common")];
+        assert_eq!(rewrite_slashless_action("look", &actions), None);
+    }
+
+    #[test]
+    fn test_rewrite_slashless_rewrites_when_action_found() {
+        let actions = vec![named_action("common")];
+        assert_eq!(
+            rewrite_slashless_action("common", &actions),
+            Some("/common".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_slashless_preserves_args() {
+        let actions = vec![named_action("common")];
+        assert_eq!(
+            rewrite_slashless_action("common foo bar", &actions),
+            Some("/common foo bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_slashless_case_insensitive() {
+        let actions = vec![named_action("Common")];
+        assert_eq!(
+            rewrite_slashless_action("COMMON", &actions),
+            Some("/COMMON".to_string())
+        );
     }
 }

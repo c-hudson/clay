@@ -95,6 +95,7 @@ pub use actions::{
     wildcard_to_regex, execute_recall, check_action_triggers,
     compile_action_patterns, line_matches_compiled_patterns,
     compile_all_action_regexes,
+    find_invocable_action, rewrite_slashless_action,
 };
 pub use http::{HttpsServer, HttpServer, BanList, start_https_server, start_http_server, log_http_404, log_ws_auth, log_ban};
 pub use persistence::{
@@ -6267,22 +6268,9 @@ impl App {
     /// if an async operation (connect/disconnect) is needed.
     #[allow(clippy::too_many_lines)]
     fn handle_ws_send_command(&mut self, client_id: u64, world_index: usize, command: &str, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
-        // For slash-less input, check if the first word is an action name and rewrite to "/name args".
-        // This allows invoking an action named "common" by typing "common" instead of "/common".
-        // Actions whose names start with "/" (e.g., "/common") are still invoked with a slash prefix.
-        let rewritten: Option<String> = {
-            let trimmed = command.trim();
-            if !trimmed.starts_with('/') {
-                let first_word = trimmed.split_whitespace().next().unwrap_or("");
-                if !first_word.is_empty() && self.settings.actions.iter().any(|a| a.name.eq_ignore_ascii_case(first_word)) {
-                    Some(format!("/{}{}", first_word, &trimmed[first_word.len()..]))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        // For slash-less input, rewrite "name args" → "/name args" when "name" matches an
+        // action, so the user can type "common" instead of "/common".
+        let rewritten = rewrite_slashless_action(command, &self.settings.actions);
         let command = rewritten.as_deref().unwrap_or(command);
         // Use shared command parsing
         let parsed = parse_command(command);
@@ -6291,13 +6279,7 @@ impl App {
             // Commands handled locally on server
             Command::ActionCommand { name, args } => {
                 // Execute action if it exists.
-                // name includes the leading slash (e.g., "/common"), so we first try an exact match
-                // (finds actions explicitly named "/common"), then strip the slash for backwards
-                // compatibility with existing actions named "common".
-                let name_no_slash = name.trim_start_matches('/');
-                let action_opt = self.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name))
-                    .or_else(|| self.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(name_no_slash)));
-                if let Some(action) = action_opt {
+                if let Some(action) = find_invocable_action(&self.settings.actions, &name) {
                     // Skip disabled actions
                     if !action.enabled {
                         self.ws_broadcast(WsMessage::ServerData {
@@ -14159,7 +14141,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.add_output("Process suspension (Ctrl+Z) is not available on this platform.");
                             }
                         }
-                        KeyAction::SendCommand(cmd) => {
+                        KeyAction::SendCommand(mut cmd) => {
                             // Clear splash on first user input (same as server data)
                             if app.current_world().showing_splash {
                                 let world = app.current_world_mut();
@@ -14180,6 +14162,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                             app.spell_state.reset();
                             app.suggestion_message = None;
+
+                            // Rewrite slash-less action invocations: "common" → "/common"
+                            if let Some(rw) = rewrite_slashless_action(&cmd, &app.settings.actions) {
+                                cmd = rw;
+                            }
 
                             // Check for TF-style /N pattern shorthand (e.g., /10 *combat*)
                             if cmd.starts_with('/') && cmd.len() > 1 {

@@ -16,7 +16,8 @@ use crate::{
     get_multiuser_settings_path,
     enable_tcp_keepalive, parse_command, current_timestamp_secs,
 };
-use crate::actions::{split_action_commands, substitute_action_args, execute_recall};
+use crate::actions::{split_action_commands, substitute_action_args, execute_recall,
+    find_invocable_action, rewrite_slashless_action};
 use crate::util::local_time_from_epoch;
 use crate::websocket::{TimestampedLine, RemoteClientType};
 
@@ -375,6 +376,9 @@ pub async fn handle_daemon_ws_message(
     }
     match msg {
         WsMessage::SendCommand { world_index, command } => {
+            // Rewrite slash-less action invocations: "common" → "/common"
+            let command = rewrite_slashless_action(&command, &app.settings.actions)
+                .unwrap_or(command);
             // Use shared command parsing (same as console mode)
             let parsed = parse_command(&command);
 
@@ -391,11 +395,11 @@ pub async fn handle_daemon_ws_message(
             match parsed {
                 Command::ActionCommand { name, args } => {
                     // Execute action if it exists
-                    if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+                    if let Some(action) = find_invocable_action(&app.settings.actions, &name) {
                         if !action.enabled {
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index,
-                                data: format!("\u{2728} Action '{}' is disabled.", name),
+                                data: format!("\u{2728} Action '{}' is disabled.", action.name),
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
@@ -566,7 +570,7 @@ pub async fn handle_daemon_ws_message(
                             _ => {
                                 app.ws_broadcast(WsMessage::ServerData {
                                     world_index,
-                                    data: format!("Unknown command: /{}", name),
+                                    data: format!("Unknown command: {}", name),
                                     is_viewed: false,
                                     ts: current_timestamp_secs(),
                                     from_server: false,

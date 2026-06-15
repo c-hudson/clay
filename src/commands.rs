@@ -21,6 +21,7 @@ use crate::{
     Encoding, AutoConnectType,
     parse_command, get_version_string,
     split_action_commands, substitute_action_args, execute_recall,
+    find_invocable_action,
     format_duration_short, current_timestamp_secs,
     generate_test_music_notes,
     process_telnet, find_safe_split_point,
@@ -2715,14 +2716,12 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::ActionCommand { name, args } => {
             // Check if this is an action command (/name)
-            let action_found = app.settings.actions.iter()
-                .find(|a| a.name.eq_ignore_ascii_case(&name))
-                .cloned();
+            let action_found = find_invocable_action(&app.settings.actions, &name).cloned();
 
             if let Some(action) = action_found {
                 // Skip disabled actions
                 if !action.enabled {
-                    app.add_output(&format!("Action '{}' is disabled.", name));
+                    app.add_output(&format!("Action '{}' is disabled.", action.name));
                 } else {
                 // Execute the action's commands - process each individually
                 let commands = split_action_commands(&action.command);
@@ -2842,7 +2841,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     }
                     tf::TfCommandResult::ClayCommand(_) => {
                         // Avoid recursion - just show unknown
-                        app.add_output(&format!("Unknown command: /{}", name));
+                        app.add_output(&format!("Unknown command: {}", name));
                     }
                     tf::TfCommandResult::Recall(opts) => {
                         let fallback = app.current_world_index;
@@ -2897,7 +2896,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         }
                     }
                     _ => {
-                        app.add_output(&format!("Unknown command: /{}", name));
+                        app.add_output(&format!("Unknown command: {}", name));
                     }
                 }
             }
