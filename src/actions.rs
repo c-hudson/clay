@@ -90,33 +90,54 @@ impl Action {
     }
 }
 
-/// Find an action suitable for manual `/name` (or slash-less `name`) invocation.
+/// Find an action suitable for manual `/name` (or slash-less `name`) invocation
+/// from the given world.
 ///
-/// Tries an exact case-insensitive match on `name` first (so an action explicitly
-/// named `/common` wins when the user types `/common`), then strips the leading
-/// slash and tries again (so `/common` also fires an action named `common`).
+/// World eligibility mirrors `check_action_triggers`: an action whose `world` field
+/// is empty is available from every world; one with a non-empty `world` is only
+/// available from that world (case-insensitive). Within eligible actions, an
+/// exact name match wins over a slash-stripped match, and a world-specific action
+/// wins over a global one sharing the same name.
 ///
-/// Does **not** check `enabled` — callers are responsible for reporting the
+/// Does **not** check `enabled` — callers are responsible for showing the
 /// "action is disabled" message when `action.enabled` is false.
-pub fn find_invocable_action<'a>(actions: &'a [Action], name: &str) -> Option<&'a Action> {
+pub fn find_invocable_action<'a>(actions: &'a [Action], name: &str, world_name: &str) -> Option<&'a Action> {
     let no_slash = name.trim_start_matches('/');
-    actions.iter().find(|a| a.name.eq_ignore_ascii_case(name))
-        .or_else(|| actions.iter().find(|a| a.name.eq_ignore_ascii_case(no_slash)))
+    // Returns the first action in `scope` that matches by exact name then by
+    // slash-stripped name.
+    let find_in_scope = |world_specific: bool| -> Option<&'a Action> {
+        let eligible = |a: &&Action| -> bool {
+            if world_specific {
+                !a.world.is_empty() && a.world.eq_ignore_ascii_case(world_name)
+            } else {
+                a.world.is_empty()
+            }
+        };
+        actions.iter().filter(|a| eligible(a)).find(|a| a.name.eq_ignore_ascii_case(name))
+            .or_else(|| actions.iter().filter(|a| eligible(a)).find(|a| a.name.eq_ignore_ascii_case(no_slash)))
+    };
+    // Prefer a world-specific action over a global one.
+    find_in_scope(true).or_else(|| find_in_scope(false))
 }
 
-/// If `command` has no leading slash and its first word matches an action name,
-/// return the command rewritten with a leading slash so it routes through the
-/// normal `ActionCommand` dispatch path.
+/// If `command` has no leading slash and its first word matches an action that is
+/// eligible for `world_name`, return the command rewritten with a leading slash so
+/// it routes through the normal `ActionCommand` dispatch path.
 ///
 /// This lets a user type `common` to invoke an action named `common` instead of
-/// always requiring `/common`.  Returns `None` when no rewrite is needed.
-pub fn rewrite_slashless_action(command: &str, actions: &[Action]) -> Option<String> {
+/// always requiring `/common`. World-scoped actions are only eligible when the
+/// current world matches their `world` field; global actions (empty `world`) are
+/// always eligible. Returns `None` when no rewrite is needed.
+pub fn rewrite_slashless_action(command: &str, actions: &[Action], world_name: &str) -> Option<String> {
     let trimmed = command.trim();
     if trimmed.starts_with('/') {
         return None;
     }
     let first = trimmed.split_whitespace().next().unwrap_or("");
-    if !first.is_empty() && actions.iter().any(|a| a.name.eq_ignore_ascii_case(first)) {
+    if first.is_empty() {
+        return None;
+    }
+    if find_invocable_action(actions, first, world_name).is_some() {
         Some(format!("/{}{}", first, &trimmed[first.len()..]))
     } else {
         None
@@ -999,10 +1020,16 @@ mod tests {
         Action { name: name.to_string(), ..Action::default() }
     }
 
+    fn scoped_action(name: &str, world: &str) -> Action {
+        Action { name: name.to_string(), world: world.to_string(), ..Action::default() }
+    }
+
+    // -- name matching (global actions, world_name = "") --
+
     #[test]
     fn test_find_invocable_action_exact() {
         let actions = vec![named_action("common")];
-        let found = find_invocable_action(&actions, "common");
+        let found = find_invocable_action(&actions, "common", "");
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "common");
     }
@@ -1011,7 +1038,7 @@ mod tests {
     fn test_find_invocable_action_slash_strips_for_fallback() {
         // typing "/common" finds action named "common" via fallback
         let actions = vec![named_action("common")];
-        let found = find_invocable_action(&actions, "/common");
+        let found = find_invocable_action(&actions, "/common", "");
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "common");
     }
@@ -1020,7 +1047,7 @@ mod tests {
     fn test_find_invocable_action_slash_name_wins() {
         // action named "/common" wins over "common" when both exist
         let actions = vec![named_action("common"), named_action("/common")];
-        let found = find_invocable_action(&actions, "/common");
+        let found = find_invocable_action(&actions, "/common", "");
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "/common");
     }
@@ -1028,33 +1055,80 @@ mod tests {
     #[test]
     fn test_find_invocable_action_case_insensitive() {
         let actions = vec![named_action("Common")];
-        assert!(find_invocable_action(&actions, "COMMON").is_some());
-        assert!(find_invocable_action(&actions, "/common").is_some());
+        assert!(find_invocable_action(&actions, "COMMON", "").is_some());
+        assert!(find_invocable_action(&actions, "/common", "").is_some());
     }
 
     #[test]
     fn test_find_invocable_action_not_found() {
         let actions = vec![named_action("other")];
-        assert!(find_invocable_action(&actions, "common").is_none());
+        assert!(find_invocable_action(&actions, "common", "").is_none());
     }
+
+    // -- world filtering --
+
+    #[test]
+    fn test_find_invocable_action_world_specific_own_world() {
+        // scoped action found from its own world
+        let actions = vec![scoped_action("greet", "MUD1")];
+        assert!(find_invocable_action(&actions, "greet", "MUD1").is_some());
+        assert!(find_invocable_action(&actions, "/greet", "MUD1").is_some());
+    }
+
+    #[test]
+    fn test_find_invocable_action_world_specific_other_world() {
+        // scoped action NOT found from a different world
+        let actions = vec![scoped_action("greet", "MUD1")];
+        assert!(find_invocable_action(&actions, "greet", "MUD2").is_none());
+        assert!(find_invocable_action(&actions, "greet", "").is_none());
+    }
+
+    #[test]
+    fn test_find_invocable_action_world_case_insensitive() {
+        let actions = vec![scoped_action("greet", "MUD1")];
+        assert!(find_invocable_action(&actions, "greet", "mud1").is_some());
+    }
+
+    #[test]
+    fn test_find_invocable_action_global_works_anywhere() {
+        let actions = vec![named_action("greet")];
+        assert!(find_invocable_action(&actions, "greet", "MUD1").is_some());
+        assert!(find_invocable_action(&actions, "greet", "MUD2").is_some());
+        assert!(find_invocable_action(&actions, "greet", "").is_some());
+    }
+
+    #[test]
+    fn test_find_invocable_action_world_specific_wins_over_global() {
+        // both "greet" (global) and "greet" (MUD1-scoped) exist; from MUD1 get the scoped one
+        let global = named_action("greet");
+        let local  = scoped_action("greet", "MUD1");
+        let actions = vec![global, local];
+        let found = find_invocable_action(&actions, "greet", "MUD1").unwrap();
+        assert_eq!(found.world, "MUD1");
+        // from another world, fall back to the global one
+        let found2 = find_invocable_action(&actions, "greet", "MUD2").unwrap();
+        assert!(found2.world.is_empty());
+    }
+
+    // -- rewrite_slashless_action --
 
     #[test]
     fn test_rewrite_slashless_no_op_for_slash_input() {
         let actions = vec![named_action("common")];
-        assert_eq!(rewrite_slashless_action("/common", &actions), None);
+        assert_eq!(rewrite_slashless_action("/common", &actions, ""), None);
     }
 
     #[test]
     fn test_rewrite_slashless_no_op_for_unknown_word() {
         let actions = vec![named_action("common")];
-        assert_eq!(rewrite_slashless_action("look", &actions), None);
+        assert_eq!(rewrite_slashless_action("look", &actions, ""), None);
     }
 
     #[test]
     fn test_rewrite_slashless_rewrites_when_action_found() {
         let actions = vec![named_action("common")];
         assert_eq!(
-            rewrite_slashless_action("common", &actions),
+            rewrite_slashless_action("common", &actions, ""),
             Some("/common".to_string())
         );
     }
@@ -1063,7 +1137,7 @@ mod tests {
     fn test_rewrite_slashless_preserves_args() {
         let actions = vec![named_action("common")];
         assert_eq!(
-            rewrite_slashless_action("common foo bar", &actions),
+            rewrite_slashless_action("common foo bar", &actions, ""),
             Some("/common foo bar".to_string())
         );
     }
@@ -1072,8 +1146,24 @@ mod tests {
     fn test_rewrite_slashless_case_insensitive() {
         let actions = vec![named_action("Common")];
         assert_eq!(
-            rewrite_slashless_action("COMMON", &actions),
+            rewrite_slashless_action("COMMON", &actions, ""),
             Some("/COMMON".to_string())
         );
+    }
+
+    #[test]
+    fn test_rewrite_slashless_world_scoped_own_world() {
+        let actions = vec![scoped_action("greet", "MUD1")];
+        assert_eq!(
+            rewrite_slashless_action("greet", &actions, "MUD1"),
+            Some("/greet".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_slashless_world_scoped_other_world() {
+        // scoped to MUD1, so from MUD2 the word is NOT rewritten
+        let actions = vec![scoped_action("greet", "MUD1")];
+        assert_eq!(rewrite_slashless_action("greet", &actions, "MUD2"), None);
     }
 }

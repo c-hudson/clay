@@ -376,8 +376,11 @@ pub async fn handle_daemon_ws_message(
     }
     match msg {
         WsMessage::SendCommand { world_index, command } => {
+            // Determine the current world name for action world-scoping.
+            let world_name = app.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
             // Rewrite slash-less action invocations: "common" → "/common"
-            let command = rewrite_slashless_action(&command, &app.settings.actions)
+            // Only rewrites if an action eligible for the current world exists.
+            let command = rewrite_slashless_action(&command, &app.settings.actions, &world_name)
                 .unwrap_or(command);
             // Use shared command parsing (same as console mode)
             let parsed = parse_command(&command);
@@ -394,8 +397,8 @@ pub async fn handle_daemon_ws_message(
 
             match parsed {
                 Command::ActionCommand { name, args } => {
-                    // Execute action if it exists
-                    if let Some(action) = find_invocable_action(&app.settings.actions, &name) {
+                    // Execute action if it exists (respects the action's world field).
+                    if let Some(action) = find_invocable_action(&app.settings.actions, &name, &world_name) {
                         if !action.enabled {
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index,

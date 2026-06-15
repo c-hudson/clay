@@ -6268,9 +6268,11 @@ impl App {
     /// if an async operation (connect/disconnect) is needed.
     #[allow(clippy::too_many_lines)]
     fn handle_ws_send_command(&mut self, client_id: u64, world_index: usize, command: &str, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
+        // Determine the current world name for action world-scoping.
+        let world_name = self.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
         // For slash-less input, rewrite "name args" → "/name args" when "name" matches an
-        // action, so the user can type "common" instead of "/common".
-        let rewritten = rewrite_slashless_action(command, &self.settings.actions);
+        // action eligible for the current world, so the user can type "common" instead of "/common".
+        let rewritten = rewrite_slashless_action(command, &self.settings.actions, &world_name);
         let command = rewritten.as_deref().unwrap_or(command);
         // Use shared command parsing
         let parsed = parse_command(command);
@@ -6278,8 +6280,8 @@ impl App {
         match parsed {
             // Commands handled locally on server
             Command::ActionCommand { name, args } => {
-                // Execute action if it exists.
-                if let Some(action) = find_invocable_action(&self.settings.actions, &name) {
+                // Execute action if it exists (respects the action's world field).
+                if let Some(action) = find_invocable_action(&self.settings.actions, &name, &world_name) {
                     // Skip disabled actions
                     if !action.enabled {
                         self.ws_broadcast(WsMessage::ServerData {
@@ -14164,7 +14166,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.suggestion_message = None;
 
                             // Rewrite slash-less action invocations: "common" → "/common"
-                            if let Some(rw) = rewrite_slashless_action(&cmd, &app.settings.actions) {
+                            // Respects the action's world field so only eligible actions match.
+                            let current_world_name = app.current_world().name.clone();
+                            if let Some(rw) = rewrite_slashless_action(&cmd, &app.settings.actions, &current_world_name) {
                                 cmd = rw;
                             }
 

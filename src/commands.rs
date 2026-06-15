@@ -2715,8 +2715,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
         }
         Command::ActionCommand { name, args } => {
-            // Check if this is an action command (/name)
-            let action_found = find_invocable_action(&app.settings.actions, &name).cloned();
+            // Check if this is an action command (/name), respecting the action's world field.
+            let current_world_name = app.current_world().name.clone();
+            let action_found = find_invocable_action(&app.settings.actions, &name, &current_world_name).cloned();
 
             if let Some(action) = action_found {
                 // Skip disabled actions
