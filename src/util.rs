@@ -96,6 +96,33 @@ pub fn color_name_to_ansi_bg(color: &str) -> String {
     }
 }
 
+/// Width (in columns) of the new-line-indicator prefix "▶ " (triangle + space).
+/// This must stay in sync with the literal string "\x1b[32m▶\x1b[0m " used in
+/// rendering.rs — 1 col for ▶ + 1 col for the trailing space = 2 total.
+pub const NLI_PREFIX_WIDTH: usize = 2;
+
+/// Effective wrap width for a line, accounting for the new-line-indicator prefix.
+/// When `nli_enabled` is true and the line is `marked_new`, the prefix steals
+/// `NLI_PREFIX_WIDTH` columns; otherwise the full `output_width` is available.
+pub fn nli_wrap_width(output_width: usize, marked_new: bool, nli_enabled: bool) -> usize {
+    if nli_enabled && marked_new {
+        output_width.saturating_sub(NLI_PREFIX_WIDTH)
+    } else {
+        output_width
+    }
+}
+
+/// Visual row count for a line, using the indicator-aware wrap width.
+/// This must match the wrap width used in `render_output_crossterm` so that
+/// row-budget accounting (pause trigger, visual_line_offset, release_pending)
+/// agrees with what the renderer actually draws.
+pub fn nli_visual_rows(text: &str, output_width: usize, marked_new: bool, nli_enabled: bool) -> usize {
+    use crate::rendering::wrap_ansi_line;
+    wrap_ansi_line(text, nli_wrap_width(output_width, marked_new, nli_enabled))
+        .len()
+        .max(1)
+}
+
 /// Calculate the number of visual lines a string takes when wrapped to width
 pub fn visual_line_count(line: &str, width: usize) -> usize {
     if width == 0 {

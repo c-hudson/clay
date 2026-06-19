@@ -1712,7 +1712,7 @@
         // Simulate Tab: release_pending reveals more of the huge line first
         // Remaining vl of huge line: 25 - 17 = 8. Budget is 19.
         // 8 < 19, so partial clears and budget becomes 19 - 8 = 11 for pending.
-        world.release_pending(19 - 8, output_width as usize);
+        world.release_pending(19 - 8, output_width as usize, false);
         // visual_line_offset should be cleared by release_pending's scroll_to_bottom
         // (the App-level release_pending_screenful handles the VLO logic, but
         // at the World level, after release_pending, scroll_to_bottom clears it)
@@ -1955,7 +1955,7 @@
         // Each pending line is 7 visual lines. Budget=46 fits 6 lines (42 visual) or 7 lines (49 visual).
         // Since 42+7=49 > 46, it should stop at 6 lines (the 7th would exceed budget).
         let pending_before = world.pending_lines.len();
-        world.release_pending(46, 80);
+        world.release_pending(46, 80, false);
         let released = pending_before - world.pending_lines.len();
 
         // Should release 6 lines (42 visual lines fits in 46 budget, 49 would exceed)
@@ -2008,7 +2008,7 @@
         // 500-char line = ceil(500/80) = 7 visual lines
         // "after" = 1 visual line
         // total = 9 visual lines < 46, so all should be released
-        world.release_pending(46, 80);
+        world.release_pending(46, 80, false);
         assert_eq!(world.pending_lines.len(), 0,
             "All {} pending lines should fit in visual budget of 46", pending);
     }

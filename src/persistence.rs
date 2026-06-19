@@ -286,13 +286,14 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
         if !action.world.is_empty() {
             writeln!(file, "world={}", action.world)?;
         }
-        // Only save match_type if not the default (regexp)
+        // Save action-level match type (only when not the default Regexp)
         if action.match_type != MatchType::Regexp {
             writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
         }
-        if !action.pattern.is_empty() {
-            // Escape newlines and equals signs in pattern
-            writeln!(file, "pattern={}", action.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
+        // Save patterns as pattern.N.text (no per-pattern type; type is action-level)
+        for (i, mp) in action.patterns.iter().enumerate() {
+            if mp.pattern.is_empty() { continue; }
+            writeln!(file, "pattern.{}.text={}", i, mp.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
         }
         if !action.command.is_empty() {
             // Escape newlines and equals signs in command
@@ -462,6 +463,28 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                         "command" => action.command = unescape_action_value(value),
                         "enabled" => action.enabled = value != "false",
                         "startup" => action.startup = value == "true",
+                        _ if key.starts_with("pattern.") => {
+                            let parts: Vec<&str> = key.splitn(3, '.').collect();
+                            if parts.len() == 3 {
+                                if let Ok(idx) = parts[1].parse::<usize>() {
+                                    while action.patterns.len() <= idx {
+                                        action.patterns.push(MatchPattern::default());
+                                    }
+                                    match parts[2] {
+                                        // Back-compat: old files may have per-pattern type; fold into
+                                        // action-level match_type (any wildcard makes the whole action wildcard)
+                                        "type" => {
+                                            let mt = MatchType::parse(value);
+                                            if mt == MatchType::Wildcard {
+                                                action.match_type = MatchType::Wildcard;
+                                            }
+                                        }
+                                        "text" => action.patterns[idx].pattern = unescape_action_value(value),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -924,11 +947,34 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                     match key {
                         "name" => action.name = value.to_string(),
                         "world" => action.world = value.to_string(),
+                        // Action-level match type (also handles legacy single-pattern files)
                         "match_type" => action.match_type = MatchType::parse(value),
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
                         "enabled" => action.enabled = value != "false",
                         "startup" => action.startup = value == "true",
+                        _ if key.starts_with("pattern.") => {
+                            // Multi-pattern keys: "pattern.N.text" (and legacy "pattern.N.type")
+                            let parts: Vec<&str> = key.splitn(3, '.').collect();
+                            if parts.len() == 3 {
+                                if let Ok(idx) = parts[1].parse::<usize>() {
+                                    while action.patterns.len() <= idx {
+                                        action.patterns.push(MatchPattern::default());
+                                    }
+                                    match parts[2] {
+                                        // Back-compat: fold any per-pattern wildcard into action-level type
+                                        "type" => {
+                                            let mt = MatchType::parse(value);
+                                            if mt == MatchType::Wildcard {
+                                                action.match_type = MatchType::Wildcard;
+                                            }
+                                        }
+                                        "text" => action.patterns[idx].pattern = unescape_action_value(value),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1120,17 +1166,19 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             if !action.world.is_empty() {
                 writeln!(file, "world={}", action.world)?;
             }
-            writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
-            // Escape special chars in pattern and command
-            let escaped_pattern = action.pattern
-                .replace('\\', "\\\\")
-                .replace('=', "\\e")
-                .replace('\n', "\\n");
+            // Save action-level match type (only when not the default Regexp)
+            if action.match_type != MatchType::Regexp {
+                writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
+            }
+            // Save patterns as pattern.N.text (no per-pattern type; type is action-level)
+            for (i, mp) in action.patterns.iter().enumerate() {
+                if mp.pattern.is_empty() { continue; }
+                writeln!(file, "pattern.{}.text={}", i, mp.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
+            }
             let escaped_command = action.command
                 .replace('\\', "\\\\")
                 .replace('=', "\\e")
                 .replace('\n', "\\n");
-            writeln!(file, "pattern={}", escaped_pattern)?;
             writeln!(file, "command={}", escaped_command)?;
             if !action.enabled {
                 writeln!(file, "enabled=false")?;
@@ -1393,12 +1441,14 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         if !action.world.is_empty() {
             writeln!(file, "world={}", action.world)?;
         }
-        // Only save match_type if not the default (regexp)
+        // Save action-level match type (only when not the default Regexp)
         if action.match_type != MatchType::Regexp {
             writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
         }
-        if !action.pattern.is_empty() {
-            writeln!(file, "pattern={}", action.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
+        // Save patterns as pattern.N.text (no per-pattern type; type is action-level)
+        for (i, mp) in action.patterns.iter().enumerate() {
+            if mp.pattern.is_empty() { continue; }
+            writeln!(file, "pattern.{}.text={}", i, mp.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
         }
         if !action.command.is_empty() {
             writeln!(file, "command={}", action.command.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
@@ -2001,11 +2051,34 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         match key {
                             "name" => action.name = value.to_string(),
                             "world" => action.world = value.to_string(),
+                            // Action-level match type (also handles legacy single-pattern files)
                             "match_type" => action.match_type = MatchType::parse(value),
                             "pattern" => action.pattern = unescape_action_value(value),
                             "command" => action.command = unescape_action_value(value),
                             "enabled" => action.enabled = value != "false",
                             "startup" => action.startup = value == "true",
+                            _ if key.starts_with("pattern.") => {
+                                // Multi-pattern keys: "pattern.N.text" (and legacy "pattern.N.type")
+                                let parts: Vec<&str> = key.splitn(3, '.').collect();
+                                if parts.len() == 3 {
+                                    if let Ok(idx) = parts[1].parse::<usize>() {
+                                        while action.patterns.len() <= idx {
+                                            action.patterns.push(MatchPattern::default());
+                                        }
+                                        match parts[2] {
+                                            // Back-compat: fold any per-pattern wildcard into action-level type
+                                            "type" => {
+                                                let mt = MatchType::parse(value);
+                                                if mt == MatchType::Wildcard {
+                                                    action.match_type = MatchType::Wildcard;
+                                                }
+                                            }
+                                            "text" => action.patterns[idx].pattern = unescape_action_value(value),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -2140,10 +2213,15 @@ mod tests {
                 {
                     let mut a = Action::new();
                     a.name = "test_action".to_string();
-                    a.pattern = "^test.*pattern$".to_string();
+                    a.match_type = crate::actions::MatchType::Wildcard;
+                    a.patterns = vec![
+                        MatchPattern {
+                            pattern: "^test.*pattern$".to_string(),
+                            compiled_regex: None,
+                        },
+                    ];
                     a.command = "/echo matched".to_string();
                     a.world = "testworld".to_string();
-                    a.match_type = crate::actions::MatchType::Wildcard;
                     a.enabled = false;
                     a.startup = true;
                     a
@@ -2228,10 +2306,13 @@ mod tests {
         assert_eq!(a.actions.len(), b.actions.len(), "{context}: actions.len()");
         for (i, (aa, bb)) in a.actions.iter().zip(b.actions.iter()).enumerate() {
             assert_eq!(aa.name, bb.name, "{context}: action[{i}].name");
-            assert_eq!(aa.pattern, bb.pattern, "{context}: action[{i}].pattern");
+            assert_eq!(aa.match_type, bb.match_type, "{context}: action[{i}].match_type");
+            assert_eq!(aa.patterns.len(), bb.patterns.len(), "{context}: action[{i}].patterns.len()");
+            for (j, (pa, pb)) in aa.patterns.iter().zip(bb.patterns.iter()).enumerate() {
+                assert_eq!(pa.pattern, pb.pattern, "{context}: action[{i}].patterns[{j}].pattern");
+            }
             assert_eq!(aa.command, bb.command, "{context}: action[{i}].command");
             assert_eq!(aa.world, bb.world, "{context}: action[{i}].world");
-            assert_eq!(aa.match_type, bb.match_type, "{context}: action[{i}].match_type");
             assert_eq!(aa.enabled, bb.enabled, "{context}: action[{i}].enabled");
             assert_eq!(aa.startup, bb.startup, "{context}: action[{i}].startup");
         }

@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clay Action Editor</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --editor-bg: #0e1220;
+  --editor-bg2: #141828;
+  --editor-bg3: #1a1f33;
+  --editor-bg4: #222840;
+  --editor-fg: #d0ccd6;
+  --editor-fg2: #908a9a;
+  --editor-accent: #d4845a;
+  --editor-border: #2a2f44;
+  --editor-hover: #2a3050;
+  --editor-selected: #33395a;
+  --editor-success: #7ecf8b;
+  --editor-error: #e87070;
+  --editor-warning: #e8c46a;
+  --editor-enabled: #7ecf8b;
+  --editor-disabled: #e87070;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 13px;
+}
+
+/* Auth overlay */
+.auth-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--editor-bg);
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 16px;
+}
+.auth-overlay.hidden { display: none; }
+
+.auth-box {
+  background: var(--editor-bg3);
+  border: 1px solid var(--editor-accent);
+  border-radius: 6px;
+  padding: 24px 32px;
+  min-width: 300px;
+  text-align: center;
+}
+.auth-box h2 { color: var(--editor-accent); font-size: 16px; margin-bottom: 16px; }
+.auth-box input[type="password"] {
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  width: 100%;
+  border-radius: 3px;
+  margin-bottom: 12px;
+}
+.auth-box input[type="password"]:focus { outline: 1px solid var(--editor-accent); }
+.auth-error { color: var(--editor-error); font-size: 12px; margin-bottom: 8px; min-height: 16px; }
+.auth-status { color: var(--editor-fg2); font-size: 12px; margin-top: 8px; }
+
+/* Toolbar */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--editor-bg2);
+  border-bottom: 1px solid var(--editor-border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.toolbar-title { font-weight: bold; font-size: 14px; color: var(--editor-accent); margin-right: 12px; white-space: nowrap; }
+.toolbar-group { display: flex; align-items: center; gap: 4px; padding: 0 8px; border-left: 1px solid var(--editor-border); }
+.toolbar-group:first-child { border-left: none; padding-left: 0; }
+
+.back-btn {
+  background: none;
+  border: 1px solid var(--editor-border);
+  color: var(--editor-fg2);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  margin-right: 4px;
+}
+.back-btn:hover { color: var(--editor-accent); border-color: var(--editor-accent); }
+
+button {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+button:hover { background: var(--editor-hover); }
+button:active { background: var(--editor-selected); }
+button.primary { background: #3a4a30; border-color: #4a6a38; }
+button.primary:hover { background: #4a5a40; }
+button.danger { background: #4a2020; border-color: #6a3030; }
+button.danger:hover { background: #5a3030; }
+button.icon-btn { padding: 2px 6px; font-size: 12px; }
+
+.unsaved-dot { display: none; width: 8px; height: 8px; background: var(--editor-warning); border-radius: 50%; margin-left: 4px; flex-shrink: 0; }
+.unsaved-dot.visible { display: inline-block; }
+.save-status { color: var(--editor-success); font-size: 11px; margin-left: 8px; opacity: 0; transition: opacity 0.3s; }
+.save-status.visible { opacity: 1; }
+
+/* Main layout */
+.main-layout { display: flex; height: calc(100% - 37px); }
+
+/* Left panel: action list */
+.list-panel {
+  width: 280px;
+  min-width: 220px;
+  border-right: 1px solid var(--editor-border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.list-search {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--editor-border);
+  flex-shrink: 0;
+}
+.list-search input {
+  width: 100%;
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 3px;
+}
+.list-search input:focus { outline: 1px solid var(--editor-accent); }
+
+.list-add-bar {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--editor-border);
+  flex-shrink: 0;
+  display: flex;
+  gap: 4px;
+}
+.list-add-bar button { flex: 1; font-size: 11px; padding: 3px 6px; }
+
+.list-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.list-scroll::-webkit-scrollbar { width: 6px; }
+.list-scroll::-webkit-scrollbar-track { background: var(--editor-bg); }
+.list-scroll::-webkit-scrollbar-thumb { background: var(--editor-border); border-radius: 3px; }
+
+.list-item {
+  display: flex;
+  align-items: center;
+  padding: 5px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid rgba(42,47,68,0.5);
+  border-left: 3px solid transparent;
+  gap: 6px;
+  min-height: 36px;
+}
+.list-item:hover { background: var(--editor-hover); }
+.list-item.selected { background: var(--editor-selected); border-left-color: var(--editor-accent); }
+
+.list-item-en { font-size: 11px; flex-shrink: 0; width: 14px; text-align: center; }
+.list-item-en.on { color: var(--editor-enabled); }
+.list-item-en.off { color: var(--editor-disabled); }
+
+.list-item-info { flex: 1; min-width: 0; }
+.list-item-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.list-item-hint { font-size: 10px; color: var(--editor-fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+
+/* Right panel */
+.detail-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.detail-content {
+  padding: 16px 20px;
+  overflow-y: auto;
+  flex: 1;
+}
+.detail-content::-webkit-scrollbar { width: 6px; }
+.detail-content::-webkit-scrollbar-track { background: var(--editor-bg); }
+.detail-content::-webkit-scrollbar-thumb { background: var(--editor-border); border-radius: 3px; }
+
+.no-selection { color: var(--editor-fg2); font-style: italic; text-align: center; margin-top: 40px; }
+
+/* Form fields */
+.field-row { margin-bottom: 12px; }
+.field-label { font-size: 11px; color: var(--editor-fg2); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; }
+.field-hint { font-size: 10px; color: var(--editor-fg2); margin-top: 2px; font-style: italic; }
+
+input[type="text"], textarea, select {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 5px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 3px;
+  width: 100%;
+}
+input[type="text"]:focus, textarea:focus, select:focus { outline: 1px solid var(--editor-accent); border-color: var(--editor-accent); }
+textarea { resize: vertical; min-height: 60px; }
+select { cursor: pointer; }
+
+.checkbox-row { display: flex; align-items: center; gap: 20px; }
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--editor-fg);
+  cursor: pointer;
+  user-select: none;
+}
+input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; accent-color: var(--editor-accent); }
+
+/* Pattern rows */
+.patterns-container {
+  border: 1px solid var(--editor-border);
+  border-radius: 4px;
+  background: var(--editor-bg);
+  padding: 6px;
+}
+.pattern-empty-hint { color: var(--editor-fg2); font-size: 11px; font-style: italic; padding: 4px; }
+.pattern-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+}
+.pattern-row:last-child { margin-bottom: 0; }
+.pattern-row select { flex: 0 0 100px; width: 100px; }
+.pattern-row input[type="text"] { flex: 1; font-family: 'Consolas', 'Monaco', 'Courier New', monospace; }
+.pattern-row .remove-btn { flex-shrink: 0; padding: 3px 7px; font-size: 13px; line-height: 1; }
+
+.add-pattern-btn { margin-top: 6px; font-size: 11px; padding: 3px 8px; }
+
+/* Detail footer buttons */
+.detail-footer {
+  display: flex;
+  gap: 8px;
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--editor-border);
+  align-items: center;
+}
+.detail-footer .spacer { flex: 1; }
+</style>
+</head>
+<body>
+
+<!-- Auth overlay -->
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-box">
+    <h2>Clay Action Editor</h2>
+    <div class="auth-error" id="authError"></div>
+    <input type="password" id="authPassword" placeholder="Server password" autocomplete="off">
+    <div class="auth-status" id="authStatus">Connecting...</div>
+  </div>
+</div>
+
+<!-- Main editor (hidden until auth) -->
+<div id="editorMain" style="display:none; flex-direction:column; height:100%;">
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <button class="back-btn" id="backBtn" style="display:none" onclick="window.close()">&larr; Back</button>
+    <div class="toolbar-group">
+      <span class="toolbar-title">Clay Action Editor</span>
+      <span class="unsaved-dot" id="unsavedDot"></span>
+    </div>
+    <div class="toolbar-group">
+      <button class="primary" onclick="doSaveAll()">Save All</button>
+      <button onclick="doRevertAll()">Revert</button>
+      <span class="save-status" id="saveStatus"></span>
+    </div>
+  </div>
+
+  <!-- Main layout -->
+  <div class="main-layout">
+    <!-- Left: action list -->
+    <div class="list-panel">
+      <div class="list-search">
+        <input type="text" id="filterInput" placeholder="Filter actions..." oninput="applyFilter()">
+      </div>
+      <div class="list-add-bar">
+        <button onclick="addNewAction()">+ New Action</button>
+      </div>
+      <div class="list-scroll" id="actionList"></div>
+    </div>
+
+    <!-- Right: detail editor -->
+    <div class="detail-panel">
+      <div class="detail-content" id="detailPanel">
+        <div class="no-selection">Select an action from the list to edit it</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// State
+// ============================================================
+let ws = null;
+let actions = [];         // Array of Action objects (from server)
+let worldNames = [];      // Connected world names (for hints)
+let selectedIdx = -1;     // Index into (filtered view) — use selActionName for stability
+let selActionName = null; // Name of currently selected action
+let savedSnapshot = '';   // JSON.stringify(actions) at last save
+let filterText = '';
+let saveStatusTimeout = null;
+
+// ============================================================
+// WebSocket
+// ============================================================
+function connect() {
+  const wsHost = '{{WS_HOST}}' || window.location.hostname;
+  const wsPort = '{{WS_PORT}}' === '0' ? window.location.port : '{{WS_PORT}}';
+  const wsProto = '{{WS_PROTOCOL}}' || (window.location.protocol === 'https:' ? 'wss' : 'ws');
+  const url = wsProto + '://' + wsHost + ':' + wsPort;
+
+  document.getElementById('authStatus').textContent = 'Connecting...';
+  ws = new WebSocket(url);
+
+  ws.onopen = function() {
+    document.getElementById('authStatus').textContent = 'Enter password';
+    document.getElementById('authPassword').focus();
+  };
+  ws.onmessage = function(e) {
+    try { handleWsMessage(JSON.parse(e.data)); } catch (_) {}
+  };
+  ws.onclose = function() {
+    document.getElementById('authStatus').textContent = 'Disconnected. Refresh to reconnect.';
+  };
+  ws.onerror = function() {
+    document.getElementById('authStatus').textContent = 'Connection failed.';
+  };
+}
+
+function wsSend(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function handleWsMessage(msg) {
+  switch (msg.type) {
+    case 'ServerHello':
+      break;
+    case 'AuthResponse':
+      if (msg.success) {
+        document.getElementById('authOverlay').classList.add('hidden');
+        document.getElementById('editorMain').style.display = 'flex';
+        wsSend({ type: 'RequestActionEditorState' });
+      } else {
+        document.getElementById('authError').textContent = msg.error || 'Authentication failed';
+      }
+      break;
+    case 'ActionEditorState':
+      actions = JSON.parse(msg.actions_json || '[]');
+      worldNames = JSON.parse(msg.world_names_json || '[]');
+      // Ensure every action has a patterns array (legacy compat)
+      normalizeActions();
+      savedSnapshot = JSON.stringify(actions);
+      renderAll();
+      break;
+    case 'ActionsUpdated':
+      // Another client saved — refresh if no local unsaved changes
+      if (JSON.stringify(actions) === savedSnapshot) {
+        actions = msg.actions || [];
+        normalizeActions();
+        savedSnapshot = JSON.stringify(actions);
+        renderAll();
+        showSaveStatus('Updated from server');
+      }
+      break;
+    case 'Pong':
+      break;
+  }
+}
+
+// Legacy migration: normalize action from old format to new format.
+// Old format had per-pattern match_type; new format has action-level match_type
+// and patterns are objects with only {pattern}.
+function normalizeActions() {
+  for (const a of actions) {
+    if (!Array.isArray(a.patterns)) a.patterns = [];
+    if (a.patterns.length === 0 && a.pattern) {
+      // Migrate legacy single-pattern format
+      a.match_type = a.match_type || 'Regexp';
+      a.patterns.push({ pattern: a.pattern });
+    } else {
+      // Migrate per-pattern match_type to action-level (wildcard wins)
+      let hasWildcard = false;
+      a.patterns = a.patterns.map(function(mp) {
+        if (mp.match_type === 'Wildcard') hasWildcard = true;
+        return { pattern: mp.pattern || (typeof mp === 'string' ? mp : '') };
+      });
+      if (hasWildcard && !a.match_type) {
+        a.match_type = 'Wildcard';
+      } else if (!a.match_type) {
+        a.match_type = 'Regexp';
+      }
+    }
+    // Remove legacy fields from the live object so saves are clean
+    delete a.pattern;
+  }
+}
+
+// ============================================================
+// Auth
+// ============================================================
+async function doAuth() {
+  const password = document.getElementById('authPassword').value;
+  if (!password) return;
+  document.getElementById('authError').textContent = '';
+  try {
+    const hash = await hashPassword(password);
+    wsSend({ type: 'AuthRequest', password_hash: hash });
+  } catch (e) {
+    wsSend({ type: 'AuthRequest', password_hash: sha256Fallback(password) });
+  }
+}
+
+async function hashPassword(password) {
+  if (window.crypto && window.crypto.subtle) {
+    try {
+      const data = new TextEncoder().encode(password);
+      const buf = await crypto.subtle.digest('SHA-256', data);
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (_) {}
+  }
+  return sha256Fallback(password);
+}
+
+function sha256Fallback(message) {
+  const utf8 = unescape(encodeURIComponent(message));
+  const bytes = [];
+  for (let i = 0; i < utf8.length; i++) bytes.push(utf8.charCodeAt(i));
+  const K = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+  ];
+  let H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const l = bytes.length;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  const bitLen = l * 8;
+  for (let i = 56; i >= 0; i -= 8) bytes.push((bitLen / Math.pow(2, i)) & 0xff);
+  for (let off = 0; off < bytes.length; off += 64) {
+    const W = new Array(64);
+    for (let i = 0; i < 16; i++) W[i] = (bytes[off+i*4]<<24)|(bytes[off+i*4+1]<<16)|(bytes[off+i*4+2]<<8)|bytes[off+i*4+3];
+    for (let i = 16; i < 64; i++) {
+      const s0 = (ror(W[i-15],7)^ror(W[i-15],18)^(W[i-15]>>>3))>>>0;
+      const s1 = (ror(W[i-2],17)^ror(W[i-2],19)^(W[i-2]>>>10))>>>0;
+      W[i] = (W[i-16]+s0+W[i-7]+s1)>>>0;
+    }
+    let [a,b,c,d,e,f,g,h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1=(ror(e,6)^ror(e,11)^ror(e,25))>>>0;
+      const ch=((e&f)^(~e&g))>>>0;
+      const t1=(h+S1+ch+K[i]+W[i])>>>0;
+      const S0=(ror(a,2)^ror(a,13)^ror(a,22))>>>0;
+      const maj=((a&b)^(a&c)^(b&c))>>>0;
+      const t2=(S0+maj)>>>0;
+      h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;
+    }
+    H=H.map((v,i)=>(v+[a,b,c,d,e,f,g,h][i])>>>0);
+  }
+  return H.map(v=>v.toString(16).padStart(8,'0')).join('');
+  function ror(n,b){return((n>>>b)|(n<<(32-b)))>>>0;}
+}
+
+// ============================================================
+// Filtering & sorted view
+// ============================================================
+function filteredActions() {
+  const f = filterText.trim().toLowerCase();
+  if (!f) return actions.slice();
+  return actions.filter(a =>
+    a.name.toLowerCase().includes(f) ||
+    a.world.toLowerCase().includes(f) ||
+    a.patterns.some(p => p.pattern.toLowerCase().includes(f)) ||
+    a.command.toLowerCase().includes(f)
+  );
+}
+
+function applyFilter() {
+  filterText = document.getElementById('filterInput').value;
+  renderList();
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function renderAll() {
+  renderList();
+  renderDetail();
+  updateUnsaved();
+}
+
+function renderList() {
+  const container = document.getElementById('actionList');
+  const visible = filteredActions();
+  container.innerHTML = '';
+
+  if (visible.length === 0) {
+    const d = document.createElement('div');
+    d.style.cssText = 'color:var(--editor-fg2);font-size:11px;padding:12px 10px;font-style:italic;';
+    d.textContent = filterText ? 'No matching actions' : 'No actions yet — click + New Action';
+    container.appendChild(d);
+    return;
+  }
+
+  for (const a of visible) {
+    const item = document.createElement('div');
+    item.className = 'list-item' + (a.name === selActionName ? ' selected' : '');
+
+    const en = document.createElement('span');
+    en.className = 'list-item-en ' + (a.enabled ? 'on' : 'off');
+    en.textContent = a.enabled ? '●' : '○';
+
+    const info = document.createElement('div');
+    info.className = 'list-item-info';
+
+    const nm = document.createElement('div');
+    nm.className = 'list-item-name';
+    nm.textContent = a.name || '(unnamed)';
+
+    const hint = document.createElement('div');
+    hint.className = 'list-item-hint';
+    const firstPat = a.patterns[0] ? a.patterns[0].pattern : '';
+    const patCount = a.patterns.length;
+    if (patCount === 0) {
+      hint.textContent = 'manual-only (no patterns)';
+    } else if (patCount === 1) {
+      hint.textContent = firstPat || '(empty pattern)';
+    } else {
+      hint.textContent = patCount + ' patterns: ' + (firstPat || '(empty)');
+    }
+
+    info.appendChild(nm);
+    info.appendChild(hint);
+    item.appendChild(en);
+    item.appendChild(info);
+
+    item.addEventListener('click', () => {
+      commitCurrentEdits();
+      selActionName = a.name;
+      renderAll();
+    });
+
+    container.appendChild(item);
+  }
+}
+
+function renderDetail() {
+  const panel = document.getElementById('detailPanel');
+
+  const a = actions.find(x => x.name === selActionName);
+  if (!a) {
+    panel.innerHTML = '<div class="no-selection">Select an action from the list to edit it</div>';
+    return;
+  }
+
+  panel.innerHTML = '';
+
+  // Name
+  addField(panel, 'Name', buildInput('text', a.name, v => { a.name = v; selActionName = v; renderList(); markDirty(); }));
+
+  // World
+  const worldHint = document.createElement('div');
+  worldHint.className = 'field-hint';
+  worldHint.textContent = 'Comma-separated world names, or leave blank for all worlds' + (worldNames.length ? ' (connected: ' + worldNames.join(', ') + ')' : '');
+  addField(panel, 'World', buildInput('text', a.world, v => { a.world = v; markDirty(); }), worldHint);
+
+  // Enabled / Startup
+  const checkRow = document.createElement('div');
+  checkRow.className = 'checkbox-row';
+  checkRow.appendChild(buildCheckbox('Enabled', a.enabled, v => { a.enabled = v; renderList(); markDirty(); }));
+  checkRow.appendChild(buildCheckbox('Run at startup', a.startup, v => { a.startup = v; markDirty(); }));
+  const checkWrap = document.createElement('div');
+  checkWrap.className = 'field-row';
+  checkWrap.appendChild(checkRow);
+  panel.appendChild(checkWrap);
+
+  // Match Type (action-level)
+  const mtLabel = document.createElement('div');
+  mtLabel.className = 'field-label';
+  mtLabel.textContent = 'Match Type';
+  panel.appendChild(mtLabel);
+  const mtSel = document.createElement('select');
+  ['Regexp', 'Wildcard'].forEach(opt => {
+    const o = document.createElement('option');
+    o.value = opt; o.textContent = opt;
+    if ((a.match_type || 'Regexp') === opt) o.selected = true;
+    mtSel.appendChild(o);
+  });
+  mtSel.addEventListener('change', () => { a.match_type = mtSel.value; markDirty(); });
+  const mtWrap = document.createElement('div');
+  mtWrap.className = 'field-row';
+  mtWrap.appendChild(mtSel);
+  panel.appendChild(mtWrap);
+
+  // Patterns
+  const patLabel = document.createElement('div');
+  patLabel.className = 'field-label';
+  patLabel.textContent = 'Match Patterns';
+  panel.appendChild(patLabel);
+
+  const patHint = document.createElement('div');
+  patHint.className = 'field-hint';
+  patHint.style.marginBottom = '4px';
+  patHint.textContent = 'Action fires when ANY pattern matches; first match supplies $1..$9. Leave empty for manual-only (/name).';
+  panel.appendChild(patHint);
+
+  const patternsBox = document.createElement('div');
+  patternsBox.className = 'patterns-container';
+  patternsBox.id = 'patternsBox';
+
+  function rebuildPatternRows() {
+    patternsBox.innerHTML = '';
+    if (a.patterns.length === 0) {
+      const ph = document.createElement('div');
+      ph.className = 'pattern-empty-hint';
+      ph.textContent = 'No patterns — action runs only via /name';
+      patternsBox.appendChild(ph);
+    }
+    a.patterns.forEach((mp, idx) => {
+      const row = document.createElement('div');
+      row.className = 'pattern-row';
+
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.value = mp.pattern || '';
+      inp.placeholder = '^pattern$';
+      inp.addEventListener('input', () => { mp.pattern = inp.value; markDirty(); });
+
+      const del = document.createElement('button');
+      del.className = 'icon-btn danger remove-btn';
+      del.title = 'Remove pattern';
+      del.textContent = '✕';
+      del.addEventListener('click', () => {
+        a.patterns.splice(idx, 1);
+        markDirty();
+        rebuildPatternRows();
+        renderList();
+      });
+
+      row.appendChild(inp);
+      row.appendChild(del);
+      patternsBox.appendChild(row);
+    });
+  }
+
+  rebuildPatternRows();
+  panel.appendChild(patternsBox);
+
+  const addPatBtn = document.createElement('button');
+  addPatBtn.className = 'add-pattern-btn';
+  addPatBtn.textContent = '+ Add Pattern';
+  addPatBtn.addEventListener('click', () => {
+    a.patterns.push({ pattern: '' });
+    markDirty();
+    rebuildPatternRows();
+    renderList();
+    // Focus the new input
+    const rows = patternsBox.querySelectorAll('.pattern-row');
+    if (rows.length > 0) {
+      const lastInp = rows[rows.length - 1].querySelector('input');
+      if (lastInp) lastInp.focus();
+    }
+  });
+  panel.appendChild(addPatBtn);
+
+  // Command
+  const cmdHint = document.createElement('div');
+  cmdHint.className = 'field-hint';
+  cmdHint.textContent = 'Semicolon-separated. $1..$9 from captures. /gag, /highlight, /echo, /notify supported.';
+  const cmdTextarea = document.createElement('textarea');
+  cmdTextarea.value = a.command;
+  cmdTextarea.rows = 3;
+  cmdTextarea.addEventListener('input', () => { a.command = cmdTextarea.value; markDirty(); });
+  addField(panel, 'Command', cmdTextarea, cmdHint);
+
+  // Footer buttons
+  const footer = document.createElement('div');
+  footer.className = 'detail-footer';
+
+  const delBtn = document.createElement('button');
+  delBtn.className = 'danger';
+  delBtn.textContent = 'Delete Action';
+  delBtn.addEventListener('click', () => {
+    if (!confirm('Delete action "' + esc(a.name) + '"?')) return;
+    const idx = actions.indexOf(a);
+    if (idx >= 0) actions.splice(idx, 1);
+    selActionName = null;
+    markDirty();
+    renderAll();
+  });
+
+  const spacer = document.createElement('div');
+  spacer.className = 'spacer';
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'primary';
+  saveBtn.textContent = 'Save All';
+  saveBtn.addEventListener('click', doSaveAll);
+
+  footer.appendChild(delBtn);
+  footer.appendChild(spacer);
+  footer.appendChild(saveBtn);
+  panel.appendChild(footer);
+}
+
+function addField(parent, label, input, hint) {
+  const wrap = document.createElement('div');
+  wrap.className = 'field-row';
+  const lbl = document.createElement('div');
+  lbl.className = 'field-label';
+  lbl.textContent = label;
+  wrap.appendChild(lbl);
+  wrap.appendChild(input);
+  if (hint) wrap.appendChild(hint);
+  parent.appendChild(wrap);
+}
+
+function buildInput(type, value, onChange) {
+  const el = document.createElement('input');
+  el.type = type;
+  el.value = value;
+  el.addEventListener('input', () => onChange(el.value));
+  return el;
+}
+
+function buildCheckbox(label, checked, onChange) {
+  const lbl = document.createElement('label');
+  lbl.className = 'checkbox-label';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = checked;
+  cb.addEventListener('change', () => onChange(cb.checked));
+  lbl.appendChild(cb);
+  lbl.appendChild(document.createTextNode(label));
+  return lbl;
+}
+
+// commitCurrentEdits: no-op since we use live binding (onChange events update `actions` directly)
+function commitCurrentEdits() {}
+
+// ============================================================
+// Actions
+// ============================================================
+function addNewAction() {
+  const name = 'new_action_' + Date.now().toString(36);
+  const a = {
+    name,
+    world: '',
+    match_type: 'Regexp',
+    patterns: [{ pattern: '' }],
+    command: '',
+    owner: null,
+    enabled: true,
+    startup: false,
+  };
+  actions.push(a);
+  selActionName = name;
+  markDirty();
+  renderAll();
+  // Focus the name field
+  setTimeout(() => {
+    const inp = document.querySelector('.detail-content input[type="text"]');
+    if (inp) { inp.focus(); inp.select(); }
+  }, 50);
+}
+
+function markDirty() {
+  updateUnsaved();
+}
+
+function updateUnsaved() {
+  const dirty = JSON.stringify(actions) !== savedSnapshot;
+  document.getElementById('unsavedDot').className = 'unsaved-dot' + (dirty ? ' visible' : '');
+}
+
+function doSaveAll() {
+  // Send full action list to server via UpdateActions
+  wsSend({ type: 'UpdateActions', actions });
+  savedSnapshot = JSON.stringify(actions);
+  updateUnsaved();
+  showSaveStatus('Saved');
+}
+
+function doRevertAll() {
+  if (JSON.stringify(actions) === savedSnapshot) return;
+  if (!confirm('Revert all unsaved changes?')) return;
+  actions = JSON.parse(savedSnapshot);
+  normalizeActions();
+  renderAll();
+  showSaveStatus('Reverted');
+}
+
+function showSaveStatus(text) {
+  const el = document.getElementById('saveStatus');
+  el.textContent = text;
+  el.classList.add('visible');
+  if (saveStatusTimeout) clearTimeout(saveStatusTimeout);
+  saveStatusTimeout = setTimeout(() => el.classList.remove('visible'), 2000);
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ============================================================
+// Event handlers
+// ============================================================
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('authOverlay').classList.contains('hidden')) {
+    if (e.key === 'Enter') doAuth();
+  }
+});
+
+window.addEventListener('beforeunload', function(e) {
+  if (JSON.stringify(actions) !== savedSnapshot) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// Keepalive
+setInterval(() => wsSend({ type: 'Ping' }), 30000);
+
+// Init
+if (window.opener) document.getElementById('backBtn').style.display = '';
+connect();
+</script>
+</body>
+</html>

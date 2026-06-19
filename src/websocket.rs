@@ -359,6 +359,12 @@ pub enum WsMessage {
     ThemeFileSaved { success: bool, error: Option<String> },
     ThemeCssVarsUpdated { css_vars: String, colors_json: String },
 
+    // Action editor standalone page (client -> server)
+    RequestActionEditorState,
+
+    // Action editor standalone page (server -> client)
+    ActionEditorState { actions_json: String, world_names_json: String },
+
     // Keybind editor (client -> server)
     RequestKeybindEditorState,
     UpdateKeybindEditorBindings { bindings_json: String },

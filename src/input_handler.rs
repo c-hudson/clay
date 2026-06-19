@@ -661,7 +661,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                     .map(|(i, a)| ActionInfo {
                                         name: a.name.clone(),
                                         world: a.world.clone(),
-                                        pattern: a.pattern.clone(),
+                                        pattern: a.display_pattern().to_string(),
                                         enabled: a.enabled,
                                         index: i,
                                     })
@@ -725,7 +725,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         .map(|(i, a)| ActionInfo {
                             name: a.name.clone(),
                             world: a.world.clone(),
-                            pattern: a.pattern.clone(),
+                            pattern: a.display_pattern().to_string(),
                             enabled: a.enabled,
                             index: i,
                         })
@@ -998,12 +998,16 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         match key.code {
             KeyCode::Esc | KeyCode::F(5) => {
                 app.search_popup.close();
+                let w = app.current_world_mut();
+                w.search_active = false;
+                w.scroll_to_bottom();
                 app.needs_output_redraw = true;
             }
             KeyCode::Enter => {
                 let output_lines = app.current_world().output_lines.clone();
+                let show_tags = app.show_tags;
                 // Re-update in case lines changed
-                app.search_popup.update_search(&output_lines);
+                app.search_popup.update_search(&output_lines, show_tags);
                 if let Some(line_idx) = app.search_popup.advance() {
                     app.current_world_mut().scroll_offset = line_idx;
                     app.needs_output_redraw = true;
@@ -1014,7 +1018,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.search_popup.cursor -= 1;
                     app.search_popup.search_text.remove(app.search_popup.cursor);
                     let output_lines = app.current_world().output_lines.clone();
-                    app.search_popup.update_search(&output_lines);
+                    let show_tags = app.show_tags;
+                    app.search_popup.update_search(&output_lines, show_tags);
                     if let Some(line_idx) = app.search_popup.current_match_line() {
                         app.current_world_mut().scroll_offset = line_idx;
                     }
@@ -1025,10 +1030,23 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 if app.search_popup.cursor < app.search_popup.search_text.len() {
                     app.search_popup.search_text.remove(app.search_popup.cursor);
                     let output_lines = app.current_world().output_lines.clone();
-                    app.search_popup.update_search(&output_lines);
+                    let show_tags = app.show_tags;
+                    app.search_popup.update_search(&output_lines, show_tags);
                     if let Some(line_idx) = app.search_popup.current_match_line() {
                         app.current_world_mut().scroll_offset = line_idx;
                     }
+                    app.needs_output_redraw = true;
+                }
+            }
+            KeyCode::Up => {
+                if let Some(line_idx) = app.search_popup.advance() {
+                    app.current_world_mut().scroll_offset = line_idx;
+                    app.needs_output_redraw = true;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(line_idx) = app.search_popup.retreat() {
+                    app.current_world_mut().scroll_offset = line_idx;
                     app.needs_output_redraw = true;
                 }
             }
@@ -1048,7 +1066,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.search_popup.search_text.insert(app.search_popup.cursor, c);
                 app.search_popup.cursor += 1;
                 let output_lines = app.current_world().output_lines.clone();
-                app.search_popup.update_search(&output_lines);
+                let show_tags = app.show_tags;
+                app.search_popup.update_search(&output_lines, show_tags);
                 if let Some(line_idx) = app.search_popup.current_match_line() {
                     app.current_world_mut().scroll_offset = line_idx;
                 }
@@ -1157,9 +1176,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     "/tfhelp", "/tfgag",
                 ];
 
-                // Get manual actions (empty pattern)
+                // Get manual actions (no patterns = manual-only via /name)
                 let manual_actions: Vec<String> = app.settings.actions.iter()
-                    .filter(|a| a.pattern.is_empty())
+                    .filter(|a| a.patterns.is_empty())
                     .map(|a| format!("/{}", a.name))
                     .collect();
 
@@ -1706,8 +1725,10 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
         }
         "search_popup" => {
             app.search_popup.open();
+            app.current_world_mut().search_active = true;
             let output_lines = app.current_world().output_lines.clone();
-            app.search_popup.update_search(&output_lines);
+            let show_tags = app.show_tags;
+            app.search_popup.update_search(&output_lines, show_tags);
             app.needs_output_redraw = true;
             KeyAction::None
         }

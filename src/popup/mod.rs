@@ -105,6 +105,17 @@ pub enum FieldKind {
         scroll_offset: usize,
         visible_height: usize,
     },
+    /// Vertically-scrolling list of editable text items.
+    /// The selected row is edited in-place using the shared PopupState edit_buffer /
+    /// edit_cursor, with horizontal cursor-follow scroll identical to Text fields.
+    /// Up/Down navigates rows (committing the current edit); navigating past the last
+    /// non-empty row appends a new empty row.
+    EditableList {
+        items: Vec<String>,
+        selected_index: usize,
+        scroll_offset: usize,
+        visible_height: usize,
+    },
 }
 
 /// An item in a list field
@@ -255,26 +266,55 @@ impl FieldKind {
         }
     }
 
-    /// Get the string value for text-like fields
+    /// Create an editable list field (in-place row editing, vertical scroll)
+    pub fn editable_list(items: Vec<String>, visible_height: usize) -> Self {
+        Self::EditableList {
+            items,
+            selected_index: 0,
+            scroll_offset: 0,
+            visible_height,
+        }
+    }
+
+    /// Get the string value for text-like fields.
+    /// For EditableList, returns the currently selected item's text.
     pub fn get_text(&self) -> Option<&str> {
         match self {
             Self::Text { value, .. } => Some(value),
             Self::MultilineText { value, .. } => Some(value),
+            Self::EditableList { items, selected_index, .. } => {
+                items.get(*selected_index).map(|s| s.as_str())
+            }
             _ => None,
         }
     }
 
     /// Check if this is a text-like field (supports text editing)
     pub fn is_text(&self) -> bool {
-        matches!(self, Self::Text { .. } | Self::MultilineText { .. })
+        matches!(self, Self::Text { .. } | Self::MultilineText { .. } | Self::EditableList { .. })
     }
 
-    /// Set the string value for text-like fields
+    /// Set the string value for text-like fields.
+    /// For EditableList, sets the currently selected item's text.
     pub fn set_text(&mut self, new_value: String) {
         match self {
             Self::Text { value, .. } => *value = new_value,
             Self::MultilineText { value, .. } => *value = new_value,
+            Self::EditableList { items, selected_index, .. } => {
+                if let Some(item) = items.get_mut(*selected_index) {
+                    *item = new_value;
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Get all items from an EditableList field
+    pub fn get_items(&self) -> Option<&[String]> {
+        if let Self::EditableList { items, .. } = self {
+            Some(items)
+        } else {
+            None
         }
     }
 
@@ -367,7 +407,7 @@ impl FieldKind {
 
     /// Check if this is a text-editable field
     pub fn is_text_editable(&self) -> bool {
-        matches!(self, Self::Text { .. } | Self::MultilineText { .. })
+        matches!(self, Self::Text { .. } | Self::MultilineText { .. } | Self::EditableList { .. })
     }
 }
 
@@ -1684,6 +1724,67 @@ impl PopupState {
                 return;
             }
         }
+    }
+
+    /// Move selection up in the EditableList field with given id.
+    /// Commits any in-progress edit before moving.
+    /// Returns true if the row actually changed (false if already at first row).
+    pub fn editable_list_select_up(&mut self, id: FieldId) -> bool {
+        self.commit_edit();
+        if let Some(field) = self.definition.get_field_mut(id) {
+            if let FieldKind::EditableList { selected_index, scroll_offset, .. } = &mut field.kind {
+                if *selected_index > 0 {
+                    *selected_index -= 1;
+                    if *selected_index < *scroll_offset {
+                        *scroll_offset = *selected_index;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Move selection down in the EditableList field with given id.
+    /// Commits any in-progress edit before moving.
+    /// If at the last non-empty row, appends an empty row and moves into it.
+    /// Returns true if the row changed.
+    pub fn editable_list_select_down(&mut self, id: FieldId) -> bool {
+        self.commit_edit();
+        if let Some(field) = self.definition.get_field_mut(id) {
+            if let FieldKind::EditableList { items, selected_index, scroll_offset, visible_height } = &mut field.kind {
+                let next = *selected_index + 1;
+                // If moving past the last item, append an empty row (but only one trailing empty)
+                if next >= items.len() {
+                    // Only append if the current last item is non-empty
+                    let last_non_empty = items.last().map(|s| !s.is_empty()).unwrap_or(false);
+                    if last_non_empty {
+                        items.push(String::new());
+                    } else {
+                        return false; // Already have a trailing empty row
+                    }
+                }
+                *selected_index = next;
+                if *selected_index >= *scroll_offset + *visible_height {
+                    let new_offset = selected_index.saturating_sub(*visible_height - 1);
+                    let max_scroll = items.len().saturating_sub(*visible_height);
+                    *scroll_offset = new_offset.min(max_scroll);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get all items from the EditableList field with given id.
+    /// Flushes any in-progress edit first.
+    pub fn get_editable_list_items(&self, id: FieldId) -> Vec<String> {
+        if let Some(field) = self.definition.get_field(id) {
+            if let FieldKind::EditableList { items, .. } = &field.kind {
+                return items.clone();
+            }
+        }
+        Vec::new()
     }
 
     /// Handle mouse scroll: moves list selection or scrolls content

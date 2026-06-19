@@ -7,6 +7,7 @@ use crate::popup::{
     PopupDefinition, PopupId, PopupLayout, SelectOption,
 };
 
+
 // ============================================================================
 // Actions List View
 // ============================================================================
@@ -28,8 +29,8 @@ pub const ACTIONS_BTN_CANCEL: ButtonId = ButtonId(4);
 // Field IDs - Editor view
 pub const EDITOR_FIELD_NAME: FieldId = FieldId(10);
 pub const EDITOR_FIELD_WORLD: FieldId = FieldId(11);
-pub const EDITOR_FIELD_MATCH_TYPE: FieldId = FieldId(12);
-pub const EDITOR_FIELD_PATTERN: FieldId = FieldId(13);
+pub const EDITOR_FIELD_MATCH_TYPE: FieldId = FieldId(12);  // Single action-level match type
+pub const EDITOR_FIELD_PATTERNS: FieldId = FieldId(13);    // EditableList of pattern strings
 pub const EDITOR_FIELD_COMMAND: FieldId = FieldId(14);
 pub const EDITOR_FIELD_ENABLED: FieldId = FieldId(15);
 pub const EDITOR_FIELD_STARTUP: FieldId = FieldId(16);
@@ -44,7 +45,7 @@ pub const EDITOR_BTN_DELETE: ButtonId = ButtonId(12);
 pub struct ActionInfo {
     pub name: String,
     pub world: String,
-    pub pattern: String,
+    pub pattern: String,  // First pattern preview for list display
     pub enabled: bool,
     pub index: usize,
 }
@@ -168,23 +169,33 @@ fn actions_list_help_text() -> Vec<String> {
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
-/// Action settings for the editor
+/// Action settings for the editor.
+/// `patterns` holds the list of pattern strings (all sharing the same `match_type`).
+/// Displayed in a scrollable EditableList with max 4 visible rows.
 #[derive(Debug, Clone, Default)]
 pub struct ActionSettings {
     pub name: String,
     pub world: String,
+    /// Action-level match type ("regexp" or "wildcard")
     pub match_type: String,
-    pub pattern: String,
+    /// Pattern strings (action-level match type applies to all)
+    pub patterns: Vec<String>,
     pub command: String,
     pub enabled: bool,
     pub startup: bool,
 }
 
-/// Create the action editor popup definition
+/// Create the action editor popup definition (TUI — editable pattern list, max 4 visible)
 pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> PopupDefinition {
-    let match_type_idx = if settings.match_type == "wildcard" { 1 } else { 0 };
+    let mt_idx = |s: &str| if s == "wildcard" { 1 } else { 0 };
 
     let title = if is_new { "New Action" } else { "Edit Action" };
+
+    // Build pattern items: always at least one empty row so the user has somewhere to type
+    let mut pattern_items: Vec<String> = settings.patterns.clone();
+    if pattern_items.is_empty() {
+        pattern_items.push(String::new());
+    }
 
     PopupDefinition::new(PopupId("action_editor"), title)
         .with_field(Field::new(
@@ -197,15 +208,17 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
             "World",
             FieldKind::text_with_placeholder(&settings.world, "(all worlds)"),
         ))
+        // Single action-level match type
         .with_field(Field::new(
             EDITOR_FIELD_MATCH_TYPE,
             "Match Type",
-            FieldKind::select(match_type_options(), match_type_idx),
+            FieldKind::select(match_type_options(), mt_idx(&settings.match_type)),
         ))
+        // Full-width scrollable editable pattern list (max 4 visible)
         .with_field(Field::new(
-            EDITOR_FIELD_PATTERN,
-            "Pattern",
-            FieldKind::text(&settings.pattern),
+            EDITOR_FIELD_PATTERNS,
+            "Patterns",
+            FieldKind::editable_list(pattern_items, 4),
         ))
         .with_field(Field::new(
             EDITOR_FIELD_COMMAND,
@@ -227,7 +240,7 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
         .with_button(Button::new(EDITOR_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
             label_width: 12,
-            min_width: 60,
+            min_width: 70,
             max_width_percent: 90,
             center_horizontal: true,
             center_vertical: true,
@@ -252,13 +265,19 @@ fn action_editor_help_text() -> Vec<String> {
         "World: Which world this action applies to. Leave",
         "  blank to match output from any world.",
         "",
-        "Match Type:",
+        "Match Type: How all patterns are interpreted.",
         "  Regexp   - Regular expression (e.g. ^You are (\\w+))",
         "  Wildcard - Simple wildcards (* matches anything)",
         "",
-        "Pattern: The text to match against MUD output.",
-        "  Leave empty for actions that are only triggered",
+        "Patterns: Text patterns to match against MUD output.",
+        "  The action fires when ANY pattern matches; the first",
+        "  matching pattern (in order) supplies $1..$9 captures.",
+        "  Leave all patterns empty for actions invoked only",
         "  manually (by typing /actionname).",
+        "  Up/Down arrows navigate between patterns.",
+        "  Type to edit the selected pattern in place.",
+        "  Clear a pattern to remove it (pruned on Save).",
+        "  Down past the last filled row adds a new row.",
         "",
         "Command: What to execute when the pattern matches.",
         "  Multiple commands separated by semicolons (;).",
@@ -331,7 +350,8 @@ mod tests {
     fn test_action_editor_creation() {
         let settings = ActionSettings {
             name: "test_action".to_string(),
-            pattern: "test pattern".to_string(),
+            match_type: "regexp".to_string(),
+            patterns: vec!["test pattern".to_string()],
             command: "say hello".to_string(),
             enabled: true,
             ..Default::default()
@@ -342,6 +362,36 @@ mod tests {
         assert_eq!(state.definition.id, PopupId("action_editor"));
         assert_eq!(state.definition.title, "Edit Action");
         assert_eq!(state.get_text(EDITOR_FIELD_NAME), Some("test_action"));
+        // EditableList selected row 0 should be the first pattern
+        assert_eq!(state.get_text(EDITOR_FIELD_PATTERNS), Some("test pattern"));
+    }
+
+    #[test]
+    fn test_action_editor_multi_pattern() {
+        let settings = ActionSettings {
+            name: "multi_test".to_string(),
+            match_type: "regexp".to_string(),
+            patterns: vec![
+                "^pattern one".to_string(),
+                "pattern two".to_string(),
+            ],
+            command: "say hi".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        let def = create_action_editor_popup(&settings, false);
+        let state = PopupState::new(def);
+
+        // First item is selected by default
+        assert_eq!(state.get_text(EDITOR_FIELD_PATTERNS), Some("^pattern one"));
+        // All items accessible via get_items
+        let items = state.field(EDITOR_FIELD_PATTERNS)
+            .and_then(|f| f.kind.get_items())
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], "^pattern one");
+        assert_eq!(items[1], "pattern two");
     }
 
     #[test]

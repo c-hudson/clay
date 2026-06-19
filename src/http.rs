@@ -122,6 +122,9 @@ const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
 /// Embedded keybind editor HTML
 const WEB_KEYBIND_EDITOR_HTML: &str = include_str!("web/keybind-editor.html");
 
+/// Embedded action editor HTML
+const WEB_ACTION_EDITOR_HTML: &str = include_str!("web/action-editor.html");
+
 /// Bundled fonts (latin subset, variable weight)
 const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("web/fonts/jetbrains-mono-latin-400.woff2");
 const FONT_NUNITO: &[u8] = include_bytes!("web/fonts/nunito-latin-400.woff2");
@@ -308,6 +311,13 @@ fn handle_http_routes(
         }
         "/keybind-editor" => {
             let html = WEB_KEYBIND_EDITOR_HTML
+                .replace("{{WS_HOST}}", &sanitized_host)
+                .replace("{{WS_PORT}}", "0")
+                .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+            RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
+        }
+        "/action-editor" => {
+            let html = WEB_ACTION_EDITOR_HTML
                 .replace("{{WS_HOST}}", &sanitized_host)
                 .replace("{{WS_PORT}}", "0")
                 .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });

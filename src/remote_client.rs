@@ -1262,7 +1262,7 @@ pub(crate) fn handle_remote_client_key(
                                     .map(|(i, a)| ActionInfo {
                                         name: a.name.clone(),
                                         world: a.world.clone(),
-                                        pattern: a.pattern.clone(),
+                                        pattern: a.display_pattern().to_string(),
                                         enabled: a.enabled,
                                         index: i,
                                     })
@@ -1321,7 +1321,7 @@ pub(crate) fn handle_remote_client_key(
                         .map(|(i, a)| ActionInfo {
                             name: a.name.clone(),
                             world: a.world.clone(),
-                            pattern: a.pattern.clone(),
+                            pattern: a.display_pattern().to_string(),
                             enabled: a.enabled,
                             index: i,
                         })

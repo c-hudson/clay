@@ -160,6 +160,12 @@ fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
                 // Find the longest line in the scrollable content
                 lines.iter().map(|l| l.len()).max().unwrap_or(40) + 4
             }
+            FieldKind::EditableList { items, .. } => {
+                // Width driven by label + min edit space; items scroll horizontally
+                let label_part = layout.label_width;
+                let item_preview = items.iter().map(|s| s.len().min(40)).max().unwrap_or(20);
+                label_part + item_preview + 4
+            }
             _ => layout.label_width + 20,
         };
 
@@ -202,6 +208,9 @@ fn calculate_content_height(state: &PopupState) -> usize {
                 }
             }
             FieldKind::ScrollableContent { visible_height, .. } => {
+                *visible_height
+            }
+            FieldKind::EditableList { visible_height, .. } => {
                 *visible_height
             }
             _ => 1,
@@ -262,6 +271,10 @@ fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme
             }
             FieldKind::ScrollableContent { visible_height, .. } => {
                 // Use available space, capped by visible_height
+                (*visible_height).min(available_for_field) as u16
+            }
+            FieldKind::EditableList { visible_height, .. } => {
+                // Use visible_height, capped by available space
                 (*visible_height).min(available_for_field) as u16
             }
             _ => 1,
@@ -678,6 +691,10 @@ fn render_field(
             });
             render_scrollable_content(f, lines, *scroll_offset, *visible_height, area, highlight_range, theme);
         }
+
+        FieldKind::EditableList { items, selected_index, scroll_offset, visible_height } => {
+            render_editable_list_field(f, state, field, items, *selected_index, *scroll_offset, *visible_height, area, is_selected, theme);
+        }
     }
 }
 
@@ -951,6 +968,154 @@ fn render_list_field(
             };
             let scrollbar_line = Line::from(Span::styled(char, Style::default().fg(theme.fg_dim())));
             f.render_widget(Paragraph::new(scrollbar_line), scrollbar_area);
+        }
+    }
+}
+
+/// Render an EditableList field.
+///
+/// Shows `visible_height` rows at a time with a right-edge scrollbar when needed.
+/// The currently selected row is always highlighted; when in edit mode for this field
+/// the selected row additionally shows the shared `state.edit_buffer` with the text
+/// cursor and horizontal scroll (identical to the Text field renderer).
+#[allow(clippy::too_many_arguments)]
+fn render_editable_list_field(
+    f: &mut Frame,
+    state: &PopupState,
+    field: &super::Field,
+    items: &[String],
+    selected_index: usize,
+    scroll_offset: usize,
+    visible_height: usize,
+    area: Rect,
+    is_selected: bool,
+    theme: &Theme,
+) {
+    let label_width = state.definition.layout.label_width;
+
+    // Draw the label ("Patterns: ") to the left of the box
+    // The box itself occupies the remainder of the row height
+    let padding_width = label_width.saturating_sub(field.label.len() + 2);
+    let label_total = padding_width + field.label.len() + 2; // padding + label + ": "
+
+    // Label — rendered once in the top-left of the field area
+    if !field.label.is_empty() {
+        let label_style = Style::default().fg(theme.fg_dim());
+        let label_str = format!(
+            "{}{}: ",
+            " ".repeat(padding_width),
+            field.label
+        );
+        let label_area = Rect::new(area.x, area.y, label_total.min(area.width as usize) as u16, 1);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(label_str, label_style))),
+            label_area,
+        );
+    }
+
+    // The box starts after the label (first row) and uses full width on subsequent rows.
+    // To keep it simple: shift the content area right by label_total on all rows.
+    let box_x = area.x + label_total.min(area.width as usize) as u16;
+    let box_width = area.width.saturating_sub(label_total as u16);
+    if box_width == 0 || area.height == 0 {
+        return;
+    }
+
+    let needs_scrollbar = items.len() > visible_height;
+    let scrollbar_width = if needs_scrollbar { 1u16 } else { 0u16 };
+    let content_width = box_width.saturating_sub(scrollbar_width) as usize;
+
+    let actual_visible = visible_height.min(area.height as usize);
+    let max_scroll = items.len().saturating_sub(actual_visible);
+    let effective_scroll = scroll_offset.min(max_scroll);
+
+    let is_editing_this = is_selected && state.editing;
+
+    for i in 0..actual_visible {
+        let item_idx = effective_scroll + i;
+        let row_y = area.y + i as u16;
+        if row_y >= area.y + area.height {
+            break;
+        }
+
+        let row_area = Rect::new(box_x, row_y, box_width.saturating_sub(scrollbar_width), 1);
+        let is_row_selected = item_idx == selected_index && is_selected;
+
+        let display_text = if is_row_selected && is_editing_this {
+            // Show the live edit buffer with cursor + horizontal scroll
+            let chars: Vec<char> = state.edit_buffer.chars().collect();
+            let cursor_pos = state.edit_cursor.min(chars.len());
+
+            // Reserve 3 chars: cursor glyph + potential < > indicators
+            let visible_width = content_width.saturating_sub(3);
+            let scroll = if visible_width == 0 || cursor_pos <= visible_width {
+                0
+            } else {
+                let margin = (visible_width / 4).max(1);
+                cursor_pos.saturating_sub(visible_width - margin)
+            };
+
+            let has_left = scroll > 0;
+            let visible_start = scroll;
+            let visible_end = (scroll + visible_width).min(chars.len());
+            let has_right = visible_end < chars.len();
+
+            let mut result = String::new();
+            if has_left { result.push('<'); }
+            let visible_cursor = cursor_pos.saturating_sub(scroll);
+            for (ii, c) in chars.iter().enumerate().skip(visible_start).take(visible_end - visible_start) {
+                let idx = ii - visible_start;
+                if idx == visible_cursor { result.push('│'); }
+                result.push(*c);
+            }
+            if visible_cursor >= visible_end - visible_start { result.push('│'); }
+            if has_right { result.push('>'); }
+            result
+        } else {
+            // Idle display: show the stored item text, truncated to content_width
+            let text = items.get(item_idx).map(|s| s.as_str()).unwrap_or("");
+            truncate_str(text, content_width).to_string()
+        };
+
+        let padded = format!("{:<width$}", display_text, width = content_width);
+
+        let style = if is_row_selected {
+            Style::default()
+                .fg(theme.fg_accent())
+                .bg(theme.selection_bg())
+                .add_modifier(Modifier::BOLD)
+        } else if items.get(item_idx).map(|s| s.is_empty()).unwrap_or(true) {
+            // Empty rows are dimmed when not selected
+            Style::default().fg(theme.fg_dim())
+        } else {
+            Style::default().fg(theme.fg())
+        };
+
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(padded, style))),
+            row_area,
+        );
+    }
+
+    // Scrollbar
+    if needs_scrollbar {
+        let scrollbar_x = box_x + box_width.saturating_sub(1);
+        let thumb_size = ((actual_visible as f64 / items.len() as f64) * actual_visible as f64).max(1.0) as usize;
+        let thumb_pos = if max_scroll == 0 {
+            0
+        } else {
+            ((effective_scroll as f64 / max_scroll as f64) * (actual_visible - thumb_size) as f64) as usize
+        };
+
+        for i in 0..actual_visible {
+            let row_y = area.y + i as u16;
+            if row_y >= area.y + area.height { break; }
+            let scrollbar_area = Rect::new(scrollbar_x, row_y, 1, 1);
+            let ch = if i >= thumb_pos && i < thumb_pos + thumb_size { "█" } else { "│" };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(ch, Style::default().fg(theme.fg_dim())))),
+                scrollbar_area,
+            );
         }
     }
 }

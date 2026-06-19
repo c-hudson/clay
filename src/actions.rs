@@ -29,6 +29,29 @@ impl MatchType {
     }
 }
 
+/// A single match pattern with a pre-compiled regex.
+///
+/// An action can hold multiple `MatchPattern`s; the action fires when **any** pattern
+/// matches a line, and the **first** matching pattern supplies capture groups `$0..$9`.
+/// The match type (Regexp/Wildcard) is stored on the parent `Action`, not per-pattern.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MatchPattern {
+    /// The raw pattern string.
+    pub pattern: String,
+    /// Pre-compiled regex, rebuilt by `Action::compile_regex()`.  Not serialised.
+    #[serde(skip)]
+    pub compiled_regex: Option<Regex>,
+}
+
+impl Default for MatchPattern {
+    fn default() -> Self {
+        Self {
+            pattern: String::new(),
+            compiled_regex: None,
+        }
+    }
+}
+
 /// Helper function for serde default to return true
 fn default_enabled() -> bool { true }
 
@@ -36,10 +59,25 @@ fn default_enabled() -> bool { true }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Action {
     pub name: String,           // Unique name (also used as /name command if no pattern)
-    pub world: String,          // World name to match (empty = all worlds)
+    pub world: String,          // World name to match (empty = all worlds, comma-list OK)
+
+    /// The authoritative list of match patterns.  Any matching pattern fires the action;
+    /// the first matching pattern in list order supplies `$0..$9`.
+    /// An empty list means the action is manual-only (invoked via `/name`).
     #[serde(default)]
-    pub match_type: MatchType,  // How to interpret pattern (regexp or wildcard)
-    pub pattern: String,        // Pattern to match output (empty = manual /name only)
+    pub patterns: Vec<MatchPattern>,
+
+    /// How to interpret all patterns: regular expression or glob/wildcard.
+    /// This applies to every pattern in `patterns`.
+    #[serde(default)]
+    pub match_type: MatchType,
+
+    /// Legacy single-pattern field — accepted on deserialise for backward-compat with
+    /// old `settings.dat` and old WebSocket clients, but **never emitted** when
+    /// serialising.  `Action::normalize()` migrates it into `patterns`.
+    #[serde(default, skip_serializing)]
+    pub pattern: String,
+
     pub command: String,        // Command(s) to execute, semicolon-separated
     #[serde(default)]
     pub owner: Option<String>,  // Username who owns this action (multiuser mode)
@@ -47,8 +85,6 @@ pub struct Action {
     pub enabled: bool,          // If false, action will not fire
     #[serde(default)]
     pub startup: bool,          // If true, run commands on Clay startup
-    #[serde(skip)]
-    pub compiled_regex: Option<Regex>,  // Pre-compiled regex for pattern matching
 }
 
 impl Default for Action {
@@ -56,13 +92,13 @@ impl Default for Action {
         Self {
             name: String::new(),
             world: String::new(),
+            patterns: Vec::new(),
             match_type: MatchType::Regexp,
             pattern: String::new(),
             command: String::new(),
             owner: None,
             enabled: true,
             startup: false,
-            compiled_regex: None,
         }
     }
 }
@@ -72,21 +108,50 @@ impl Action {
         Self::default()
     }
 
-    /// Pre-compile the regex pattern for this action.
-    /// Call after changing pattern, match_type, or enabled.
-    pub fn compile_regex(&mut self) {
-        if self.pattern.is_empty() || !self.enabled {
-            self.compiled_regex = None;
-            return;
+    /// Migrate the legacy single-pattern field (`pattern`) into `patterns`.
+    ///
+    /// Idempotent: does nothing if `patterns` is already non-empty, or if the legacy
+    /// `pattern` field is empty (i.e. the action is manual-only).  Call this after any
+    /// deserialisation and before `compile_regex()`.  Does **not** touch `match_type`,
+    /// which is now the authoritative action-level type.
+    pub fn normalize(&mut self) {
+        if self.patterns.is_empty() && !self.pattern.is_empty() {
+            self.patterns.push(MatchPattern {
+                pattern: std::mem::take(&mut self.pattern),
+                compiled_regex: None,
+            });
         }
-        let regex_pattern = match self.match_type {
-            MatchType::Wildcard => wildcard_to_regex(&self.pattern),
-            MatchType::Regexp => self.pattern.clone(),
-        };
-        self.compiled_regex = RegexBuilder::new(&regex_pattern)
-            .case_insensitive(true)
-            .build()
-            .ok();
+    }
+
+    /// Return a display-friendly preview of the first pattern (empty string if none).
+    pub fn display_pattern(&self) -> &str {
+        self.patterns.first().map(|mp| mp.pattern.as_str()).unwrap_or("")
+    }
+
+    /// Pre-compile the regex for **every** pattern in this action.
+    ///
+    /// Automatically calls `normalize()` first so legacy single-pattern fields are
+    /// migrated into `patterns` before compilation.  Safe to call multiple times.
+    /// The action-level `match_type` is applied uniformly to all patterns.
+    /// - An empty pattern or a disabled action → `None` (never matches).
+    /// - A bad regex → `None` (silently skipped; never panics).
+    pub fn compile_regex(&mut self) {
+        self.normalize();
+        let match_type = self.match_type;
+        for mp in &mut self.patterns {
+            if mp.pattern.is_empty() || !self.enabled {
+                mp.compiled_regex = None;
+                continue;
+            }
+            let regex_pattern = match match_type {
+                MatchType::Wildcard => wildcard_to_regex(&mp.pattern),
+                MatchType::Regexp => mp.pattern.clone(),
+            };
+            mp.compiled_regex = RegexBuilder::new(&regex_pattern)
+                .case_insensitive(true)
+                .build()
+                .ok();
+        }
     }
 }
 
@@ -168,8 +233,10 @@ pub fn rewrite_slashless_action(command: &str, actions: &[Action], world_name: &
 
 /// Pre-compile regexes for all actions.
 /// Call after loading settings, restoring reload state, or bulk action updates.
+/// Also calls `normalize()` so legacy single-pattern actions are migrated.
 pub fn compile_all_action_regexes(actions: &mut [Action]) {
     for action in actions.iter_mut() {
+        action.normalize();
         action.compile_regex();
     }
 }
@@ -507,8 +574,11 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], sho
     (result, header)
 }
 
-/// Check if a line matches any action triggers
-/// Returns None if no match, Some(result) if matched
+/// Check if a line matches any action triggers.
+///
+/// For each eligible action, patterns are tested in list order.  The **first**
+/// matching pattern fires the action once and supplies capture groups `$0..$9`.
+/// Returns `None` if no action matched.
 pub fn check_action_triggers(
     line: &str,
     world_name: &str,
@@ -523,8 +593,8 @@ pub fn check_action_triggers(
             continue;
         }
 
-        // Skip actions without patterns (those are manual /name only)
-        if action.pattern.is_empty() {
+        // Skip actions with no patterns (manual /name only)
+        if action.patterns.is_empty() {
             continue;
         }
 
@@ -533,48 +603,50 @@ pub fn check_action_triggers(
             continue;
         }
 
-        // Use pre-compiled regex
-        if let Some(ref regex) = action.compiled_regex {
-            if let Some(caps) = regex.captures(&plain_line) {
-                // Extract capture groups: $0 is full match, $1-$9 are groups
-                let captures: Vec<&str> = caps.iter()
-                    .map(|m| m.map(|m| m.as_str()).unwrap_or(""))
-                    .collect();
+        // Test each pattern in order; first match fires the action
+        for mp in &action.patterns {
+            if let Some(ref regex) = mp.compiled_regex {
+                if let Some(caps) = regex.captures(&plain_line) {
+                    // Extract capture groups: $0 is full match, $1-$9 are groups
+                    let captures: Vec<&str> = caps.iter()
+                        .map(|m| m.map(|m| m.as_str()).unwrap_or(""))
+                        .collect();
 
-                let commands = split_action_commands(&action.command);
-                let should_gag = commands.iter().any(|cmd|
-                    cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ")
-                );
+                    let commands = split_action_commands(&action.command);
+                    let should_gag = commands.iter().any(|cmd|
+                        cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ")
+                    );
 
-                // Check for /highlight command and extract color
-                let highlight_color = commands.iter().find_map(|cmd| {
-                    let lower = cmd.to_lowercase();
-                    if lower == "/highlight" {
-                        Some(String::new()) // No color specified, use default
-                    } else if lower.starts_with("/highlight ") {
-                        Some(cmd[11..].trim().to_string()) // Extract color after "/highlight "
-                    } else {
-                        None
-                    }
-                });
-
-                // Filter out /gag and /highlight, then substitute captures in commands
-                let filtered_commands: Vec<String> = commands.into_iter()
-                    .filter(|cmd| {
+                    // Check for /highlight command and extract color
+                    let highlight_color = commands.iter().find_map(|cmd| {
                         let lower = cmd.to_lowercase();
-                        !lower.eq_ignore_ascii_case("/gag")
-                            && !lower.starts_with("/gag ")
-                            && lower != "/highlight"
-                            && !lower.starts_with("/highlight ")
-                    })
-                    .map(|cmd| substitute_pattern_captures(&cmd, &captures))
-                    .collect();
+                        if lower == "/highlight" {
+                            Some(String::new()) // No color specified, use default
+                        } else if lower.starts_with("/highlight ") {
+                            Some(cmd[11..].trim().to_string()) // Extract color after "/highlight "
+                        } else {
+                            None
+                        }
+                    });
 
-                return Some(ActionTriggerResult {
-                    should_gag,
-                    commands: filtered_commands,
-                    highlight_color,
-                });
+                    // Filter out /gag and /highlight, then substitute captures in commands
+                    let filtered_commands: Vec<String> = commands.into_iter()
+                        .filter(|cmd| {
+                            let lower = cmd.to_lowercase();
+                            !lower.eq_ignore_ascii_case("/gag")
+                                && !lower.starts_with("/gag ")
+                                && lower != "/highlight"
+                                && !lower.starts_with("/highlight ")
+                        })
+                        .map(|cmd| substitute_pattern_captures(&cmd, &captures))
+                        .collect();
+
+                    return Some(ActionTriggerResult {
+                        should_gag,
+                        commands: filtered_commands,
+                        highlight_color,
+                    });
+                }
             }
         }
     }
@@ -583,6 +655,7 @@ pub fn check_action_triggers(
 }
 
 /// Pre-compile action patterns into regexes for a specific world.
+/// Flattens across all patterns of all eligible actions.
 /// Call once before iterating over lines, not per-line.
 pub fn compile_action_patterns(
     world_name: &str,
@@ -593,21 +666,13 @@ pub fn compile_action_patterns(
         if !action.enabled {
             continue;
         }
-        if action.pattern.is_empty() {
-            continue;
-        }
         if !action_matches_world(&action.world, world_name) {
             continue;
         }
-        let regex_pattern = match action.match_type {
-            MatchType::Wildcard => wildcard_to_regex(&action.pattern),
-            MatchType::Regexp => action.pattern.clone(),
-        };
-        if let Ok(regex) = RegexBuilder::new(&regex_pattern)
-            .case_insensitive(true)
-            .build()
-        {
-            compiled.push(regex);
+        for mp in &action.patterns {
+            if let Some(ref regex) = mp.compiled_regex {
+                compiled.push(regex.clone());
+            }
         }
     }
     compiled
@@ -807,7 +872,47 @@ mod tests {
         assert!(re.is_match("say \u{201C}hello\u{201D}")); // curly double quotes
     }
 
-    // --- Action compile_regex ---
+    // --- Action normalize() ---
+
+    #[test]
+    fn test_normalize_migrates_legacy_pattern() {
+        let mut action = Action {
+            pattern: "^You say".to_string(),
+            match_type: MatchType::Wildcard,
+            ..Action::default()
+        };
+        assert!(action.patterns.is_empty());
+        action.normalize();
+        assert_eq!(action.patterns.len(), 1);
+        assert_eq!(action.patterns[0].pattern, "^You say");
+        assert_eq!(action.match_type, MatchType::Wildcard); // action-level type preserved
+        assert!(action.pattern.is_empty()); // legacy field cleared
+    }
+
+    #[test]
+    fn test_normalize_empty_legacy_pattern_no_op() {
+        let mut action = Action {
+            pattern: String::new(),
+            ..Action::default()
+        };
+        action.normalize();
+        assert!(action.patterns.is_empty()); // manual-only action stays empty
+    }
+
+    #[test]
+    fn test_normalize_idempotent_when_patterns_nonempty() {
+        let mut action = Action {
+            pattern: "legacy".to_string(), // would be migrated if patterns were empty
+            ..Action::default()
+        };
+        action.patterns.push(MatchPattern { pattern: "existing".to_string(), compiled_regex: None });
+        action.normalize();
+        // patterns already non-empty, legacy field NOT migrated
+        assert_eq!(action.patterns.len(), 1);
+        assert_eq!(action.patterns[0].pattern, "existing");
+    }
+
+    // --- Action compile_regex() ---
 
     #[test]
     fn test_action_compile_regexp() {
@@ -817,9 +922,11 @@ mod tests {
             enabled: true,
             ..Action::default()
         };
+        action.normalize();
         action.compile_regex();
-        assert!(action.compiled_regex.is_some());
-        assert!(action.compiled_regex.as_ref().unwrap().is_match("You say hello"));
+        assert_eq!(action.patterns.len(), 1);
+        assert!(action.patterns[0].compiled_regex.is_some());
+        assert!(action.patterns[0].compiled_regex.as_ref().unwrap().is_match("You say hello"));
     }
 
     #[test]
@@ -830,9 +937,11 @@ mod tests {
             enabled: true,
             ..Action::default()
         };
+        action.normalize();
         action.compile_regex();
-        assert!(action.compiled_regex.is_some());
-        assert!(action.compiled_regex.as_ref().unwrap().is_match("Bob tells you hello"));
+        assert_eq!(action.patterns.len(), 1);
+        assert!(action.patterns[0].compiled_regex.is_some());
+        assert!(action.patterns[0].compiled_regex.as_ref().unwrap().is_match("Bob tells you hello"));
     }
 
     #[test]
@@ -842,8 +951,11 @@ mod tests {
             enabled: false,
             ..Action::default()
         };
+        action.normalize();
         action.compile_regex();
-        assert!(action.compiled_regex.is_none());
+        // Disabled: pattern exists in list but compiled_regex is None
+        assert_eq!(action.patterns.len(), 1);
+        assert!(action.patterns[0].compiled_regex.is_none());
     }
 
     #[test]
@@ -853,8 +965,10 @@ mod tests {
             enabled: true,
             ..Action::default()
         };
+        action.normalize();
         action.compile_regex();
-        assert!(action.compiled_regex.is_none());
+        // Empty pattern: patterns vec stays empty (manual-only action)
+        assert!(action.patterns.is_empty());
     }
 
     #[test]
@@ -865,9 +979,9 @@ mod tests {
             Action { pattern: "test3".to_string(), enabled: true, ..Action::default() },
         ];
         compile_all_action_regexes(&mut actions);
-        assert!(actions[0].compiled_regex.is_some());
-        assert!(actions[1].compiled_regex.is_none()); // disabled
-        assert!(actions[2].compiled_regex.is_some());
+        assert!(actions[0].patterns[0].compiled_regex.is_some());
+        assert!(actions[1].patterns[0].compiled_regex.is_none()); // disabled
+        assert!(actions[2].patterns[0].compiled_regex.is_some());
     }
 
     // --- check_action_triggers ---
@@ -881,6 +995,7 @@ mod tests {
             enabled: true,
             ..Action::default()
         };
+        a.normalize();
         a.compile_regex();
         a
     }
@@ -986,6 +1101,121 @@ mod tests {
         assert!(result.is_some());
     }
 
+    // --- Multi-pattern tests ---
+
+    #[test]
+    fn test_multi_pattern_any_match_fires() {
+        // Action with two regexp patterns: either one matching should fire
+        let mut action = Action {
+            name: "test".to_string(),
+            command: "wave".to_string(),
+            enabled: true,
+            match_type: MatchType::Regexp,
+            patterns: vec![
+                MatchPattern { pattern: "^You wave".to_string(), compiled_regex: None },
+                MatchPattern { pattern: "^Bob waves".to_string(), compiled_regex: None },
+            ],
+            ..Action::default()
+        };
+        action.compile_regex();
+
+        assert!(check_action_triggers("You wave goodbye", "", &[action.clone()]).is_some());
+        assert!(check_action_triggers("Bob waves at you", "", &[action.clone()]).is_some());
+        assert!(check_action_triggers("Nothing happened", "", &[action]).is_none());
+    }
+
+    #[test]
+    fn test_multi_pattern_first_match_supplies_captures() {
+        // Pattern 1: regexp with capture; Pattern 2: also regexp with capture.
+        // Line matches ONLY pattern 1 → $1 comes from pattern 1's groups.
+        let mut action = Action {
+            name: "test".to_string(),
+            command: "say $1".to_string(),
+            enabled: true,
+            match_type: MatchType::Regexp,
+            patterns: vec![
+                MatchPattern {
+                    pattern: r"^(\w+) waves".to_string(),
+                    compiled_regex: None,
+                },
+                MatchPattern {
+                    pattern: r"^(\w+) tells you".to_string(),
+                    compiled_regex: None,
+                },
+            ],
+            ..Action::default()
+        };
+        action.compile_regex();
+
+        // "Bob waves" matches pattern 1 → $1 = "Bob"
+        let result = check_action_triggers("Bob waves", "", &[action.clone()]).unwrap();
+        assert_eq!(result.commands, vec!["say Bob"]);
+
+        // "Alice tells you hello" doesn't match pattern 1; matches pattern 2 → $1 = "Alice"
+        let result2 = check_action_triggers("Alice tells you hello", "", &[action]).unwrap();
+        assert_eq!(result2.commands, vec!["say Alice"]);
+    }
+
+    #[test]
+    fn test_multi_pattern_fires_once_not_twice() {
+        // Even if both patterns match the same line, the action fires only once
+        let mut action = Action {
+            name: "test".to_string(),
+            command: "nod".to_string(),
+            enabled: true,
+            match_type: MatchType::Regexp,
+            patterns: vec![
+                MatchPattern { pattern: "hello".to_string(), compiled_regex: None },
+                MatchPattern { pattern: "world".to_string(), compiled_regex: None },
+            ],
+            ..Action::default()
+        };
+        action.compile_regex();
+
+        // "hello world" matches both patterns but check_action_triggers returns Some once
+        let result = check_action_triggers("hello world", "", &[action]);
+        assert!(result.is_some()); // fired once (not None, not multiple)
+    }
+
+    #[test]
+    fn test_multi_pattern_wildcard_action() {
+        // Wildcard match type applies to all patterns
+        let mut action = Action {
+            name: "test".to_string(),
+            command: "wave".to_string(),
+            enabled: true,
+            match_type: MatchType::Wildcard,
+            patterns: vec![
+                MatchPattern { pattern: "* arrives *".to_string(), compiled_regex: None },
+                MatchPattern { pattern: "* departs *".to_string(), compiled_regex: None },
+            ],
+            ..Action::default()
+        };
+        action.compile_regex();
+
+        assert!(check_action_triggers("Bob arrives from the north", "", &[action.clone()]).is_some());
+        assert!(check_action_triggers("Bob departs to the south", "", &[action.clone()]).is_some());
+        assert!(check_action_triggers("Nothing happens", "", &[action]).is_none());
+    }
+
+    #[test]
+    fn test_display_pattern_first_pattern() {
+        let action = Action {
+            patterns: vec![
+                MatchPattern { pattern: "first".to_string(), ..Default::default() },
+                MatchPattern { pattern: "second".to_string(), ..Default::default() },
+            ],
+            ..Action::default()
+        };
+        assert_eq!(action.display_pattern(), "first");
+    }
+
+    #[test]
+    fn test_display_pattern_empty() {
+        let action = Action::default();
+        assert_eq!(action.display_pattern(), "");
+    }
+
     // --- compile_action_patterns / line_matches_compiled_patterns ---
 
     #[test]
@@ -1018,6 +1248,29 @@ mod tests {
 
         let patterns = compile_action_patterns("Other", &actions);
         assert_eq!(patterns.len(), 0);
+    }
+
+    #[test]
+    fn test_compiled_patterns_multi_pattern_action() {
+        // An action with 2 patterns contributes 2 compiled regexes to the highlight set
+        let mut action = Action {
+            name: "test".to_string(),
+            enabled: true,
+            match_type: MatchType::Regexp,
+            patterns: vec![
+                MatchPattern { pattern: "hello".to_string(), compiled_regex: None },
+                MatchPattern { pattern: "world".to_string(), compiled_regex: None },
+            ],
+            ..Action::default()
+        };
+        action.compile_regex();
+        let actions = vec![action];
+
+        let patterns = compile_action_patterns("", &actions);
+        assert_eq!(patterns.len(), 2);
+        assert!(line_matches_compiled_patterns("hello there", &patterns));
+        assert!(line_matches_compiled_patterns("world peace", &patterns));
+        assert!(!line_matches_compiled_patterns("nothing", &patterns));
     }
 
     // --- MatchType ---

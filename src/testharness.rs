@@ -333,7 +333,7 @@ pub async fn run_test_scenario(
                     let idx = app.current_world_index;
                     let visual_budget = (app.output_height as usize).saturating_sub(2);
                     let output_width = app.output_width as usize;
-                    app.worlds[idx].release_pending(visual_budget, output_width);
+                    app.worlds[idx].release_pending(visual_budget, output_width, app.settings.new_line_indicator);
                     action_iter.next();
                     check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
                     continue;

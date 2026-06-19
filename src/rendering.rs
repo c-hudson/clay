@@ -22,6 +22,7 @@ use crate::{
     is_debug_enabled, output_debug_log,
     popup,
 };
+use crate::util::NLI_PREFIX_WIDTH;
 
 // Break characters for word wrapping within long words
 const BREAK_CHARS: &[char] = &[']', ')', ',', '\\', '/', '-', '_', '&', '=', '?', ';'];
@@ -427,7 +428,7 @@ pub fn build_display_lines(
     let temp_convert_enabled = settings.temp_convert_enabled;
     let zwj_enabled = settings.zwj_enabled;
     let new_line_indicator = settings.new_line_indicator;
-    let nli_prefix_width: usize = 2;
+    let nli_prefix_width: usize = NLI_PREFIX_WIDTH;
     let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
     let cached_now = CachedNow::new();
 
@@ -647,8 +648,8 @@ pub(crate) fn render_output_crossterm(app: &App) {
     let cached_now = CachedNow::new();
 
     let new_line_indicator = app.settings.new_line_indicator;
-    // The "▶ " prefix is 2 columns wide (1 for triangle + 1 for space)
-    let nli_prefix_width: usize = 2;
+    // "▶ " prefix width — kept in sync via NLI_PREFIX_WIDTH const in util.rs
+    let nli_prefix_width: usize = NLI_PREFIX_WIDTH;
     // Minimum old (non-new) context lines to show at top when switching worlds
     let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool)> {
@@ -1209,7 +1210,7 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     // Build visual lines (wrapped ANSI strings) by working backwards from scroll_offset
     let mut wrapped_lines: Vec<String> = Vec::new();
     let new_line_indicator = app.settings.new_line_indicator;
-    let nli_prefix_width: usize = 2; // "▶ " = 2 columns
+    let nli_prefix_width: usize = NLI_PREFIX_WIDTH; // "▶ " = 2 columns
 
     if !world.output_lines.is_empty() {
         let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));

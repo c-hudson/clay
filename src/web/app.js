@@ -124,7 +124,9 @@
         actionName: document.getElementById('action-name'),
         actionWorld: document.getElementById('action-world'),
         actionMatchType: document.getElementById('action-match-type'),
-        actionPattern: document.getElementById('action-pattern'),
+        actionPatternsContainer: document.getElementById('action-patterns-container'),
+        actionAddPatternBtn: document.getElementById('action-add-pattern-btn'),
+        actionEditorPageBtn: document.getElementById('action-editor-page-btn'),
         actionCommand: document.getElementById('action-command'),
         actionEnabled: document.getElementById('action-enabled'),
         actionStartup: document.getElementById('action-startup'),
@@ -4136,21 +4138,28 @@
         for (const action of actions) {
             // Skip disabled actions
             if (action.enabled === false) continue;
-            // Skip actions without patterns
-            if (!action.pattern || action.pattern.trim() === '') continue;
             // Check world match (empty = all worlds)
             if (action.world && action.world.trim() !== '' &&
                 action.world.toLowerCase() !== worldName.toLowerCase()) continue;
-            // Convert pattern based on match type
-            try {
-                let pattern = action.pattern;
-                if (action.match_type === 'wildcard') {
-                    pattern = filterWildcardToRegex(action.pattern);
+            // Action-level match type (legacy per-pattern type ignored)
+            const matchType = action.match_type || 'Regexp';
+            // Build effective pattern list (new multi-pattern or legacy single)
+            const pats = Array.isArray(action.patterns) && action.patterns.length > 0
+                ? action.patterns
+                : (action.pattern ? [{ pattern: action.pattern }] : []);
+            for (const mp of pats) {
+                const patText = typeof mp === 'string' ? mp : (mp.pattern || '');
+                if (!patText || patText.trim() === '') continue;
+                try {
+                    let pat = patText;
+                    if (matchType === 'Wildcard') {
+                        pat = filterWildcardToRegex(patText);
+                    }
+                    const regex = new RegExp(pat, 'i');
+                    if (regex.test(plainLine)) return true;
+                } catch (e) {
+                    // Invalid regex, skip
                 }
-                const regex = new RegExp(pattern, 'i');
-                if (regex.test(plainLine)) return true;
-            } catch (e) {
-                // Invalid regex, skip
             }
         }
         return false;
@@ -5664,7 +5673,8 @@
                 if (filterText) {
                     const nameMatch = action.name.toLowerCase().includes(filterText);
                     const worldMatch = action.world.toLowerCase().includes(filterText);
-                    const patternMatch = action.pattern.toLowerCase().includes(filterText);
+                    const pats = Array.isArray(action.patterns) ? action.patterns : (action.pattern ? [{ pattern: action.pattern }] : []);
+                    const patternMatch = pats.some(p => (p.pattern || '').toLowerCase().includes(filterText));
                     if (!nameMatch && !worldMatch && !patternMatch) {
                         return false;
                     }
@@ -5749,7 +5759,13 @@
 
             const patternSpan = document.createElement('span');
             patternSpan.className = 'action-pattern';
-            patternSpan.textContent = action.pattern || '(manual)';
+            // Show first pattern; if multiple, note count
+            const pats = Array.isArray(action.patterns) ? action.patterns : [];
+            const firstPat = pats.length > 0 ? (pats[0].pattern || '') : (action.pattern || '');
+            const patCount = pats.length || (action.pattern ? 1 : 0);
+            patternSpan.textContent = patCount === 0 ? '(manual)'
+                : patCount === 1 ? firstPat
+                : firstPat + ' +' + (patCount - 1) + ' more';
             div.appendChild(patternSpan);
 
             div.onclick = () => {
@@ -5764,6 +5780,44 @@
         });
     }
 
+    // Build the pattern rows in the inline action editor (patterns is a simple string array)
+    function renderActionPatternRows(patterns) {
+        const container = elements.actionPatternsContainer;
+        container.innerHTML = '';
+        if (patterns.length === 0) {
+            const hint = document.createElement('div');
+            hint.style.cssText = 'font-size:11px;color:#888;font-style:italic;padding:2px 0;';
+            hint.textContent = 'No patterns — action runs only via /name';
+            container.appendChild(hint);
+        }
+        patterns.forEach(function(pat, idx) {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;gap:4px;align-items:center;';
+
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'form-input';
+            inp.style.flex = '1';
+            inp.value = pat;
+            inp.placeholder = '^pattern$';
+            inp.autocomplete = 'off';
+            inp.addEventListener('input', function() { patterns[idx] = inp.value; });
+
+            const del = document.createElement('button');
+            del.className = 'btn btn-danger';
+            del.style.cssText = 'padding:2px 6px;font-size:12px;flex-shrink:0;';
+            del.textContent = '✕';
+            del.addEventListener('click', function() {
+                patterns.splice(idx, 1);
+                renderActionPatternRows(patterns);
+            });
+
+            row.appendChild(inp);
+            row.appendChild(del);
+            container.appendChild(row);
+        });
+    }
+
     // Open Actions Editor popup
     function openActionsEditorPopup(editIndex) {
         actionsEditorPopupOpen = true;
@@ -5771,20 +5825,28 @@
         elements.actionsListModal.className = 'modal';  // Hide list
         elements.actionsEditorModal.className = 'modal visible';
 
+        // Track the live patterns array for this session
+        let editPatterns;
+
         if (editIndex >= 0 && editIndex < actions.length) {
             // Editing existing action
             elements.actionEditorTitle.textContent = 'Edit Action';
             const action = actions[editIndex];
             elements.actionName.value = action.name || '';
             elements.actionWorld.value = action.world || '';
-            const matchType = action.match_type === 'Wildcard' ? 'wildcard' : 'regexp';
-            elements.actionMatchType.value = matchType;
-            elements.actionPattern.placeholder = matchType === 'wildcard'
-                ? '(wildcard: * and ?, empty = manual only)'
-                : '(regex, empty = manual only)';
-            elements.actionPattern.value = action.pattern || '';
+            // Set action-level match type
+            elements.actionMatchType.value = action.match_type || 'Regexp';
+            // Build live patterns array (simple strings) from action.patterns or legacy single pattern
+            if (Array.isArray(action.patterns) && action.patterns.length > 0) {
+                editPatterns = action.patterns.map(function(p) {
+                    return typeof p === 'string' ? p : (p.pattern || '');
+                });
+            } else if (action.pattern) {
+                editPatterns = [action.pattern];
+            } else {
+                editPatterns = [];
+            }
             elements.actionCommand.value = action.command || '';
-            // Default to true if enabled is not set (for existing actions)
             elements.actionEnabled.value = (action.enabled !== false) ? 'yes' : 'no';
             elements.actionStartup.value = action.startup ? 'yes' : 'no';
         } else {
@@ -5792,13 +5854,27 @@
             elements.actionEditorTitle.textContent = 'New Action';
             elements.actionName.value = '';
             elements.actionWorld.value = '';
-            elements.actionMatchType.value = 'regexp';  // Default to Regexp
-            elements.actionPattern.placeholder = '(regex, empty = manual only)';
-            elements.actionPattern.value = '';
+            elements.actionMatchType.value = 'Regexp';
+            editPatterns = [''];
             elements.actionCommand.value = '';
-            elements.actionEnabled.value = 'yes';  // Default to enabled
-            elements.actionStartup.value = 'no';  // Default to disabled
+            elements.actionEnabled.value = 'yes';
+            elements.actionStartup.value = 'no';
         }
+
+        renderActionPatternRows(editPatterns);
+
+        // Add pattern button
+        elements.actionAddPatternBtn.onclick = function() {
+            editPatterns.push('');
+            renderActionPatternRows(editPatterns);
+            // Focus the new input
+            const rows = elements.actionPatternsContainer.querySelectorAll('input[type="text"]');
+            if (rows.length > 0) rows[rows.length - 1].focus();
+        };
+
+        // Store editPatterns reference so saveAction() can read it
+        elements.actionPatternsContainer._editPatterns = editPatterns;
+
         elements.actionError.textContent = '';
         elements.actionEditorDeleteBtn.style.display = (editIndex >= 0) ? '' : 'none';
         elements.actionName.focus();
@@ -5876,11 +5952,20 @@
             return;
         }
 
+        // Collect patterns from live array (set up in openActionsEditorPopup)
+        // Patterns are now simple strings; filter out empty ones
+        const rawPatterns = elements.actionPatternsContainer._editPatterns || [];
+        const filteredPatterns = rawPatterns.filter(function(p) {
+            return (typeof p === 'string' ? p : (p.pattern || '')).trim() !== '';
+        }).map(function(p) {
+            return { pattern: typeof p === 'string' ? p : (p.pattern || '') };
+        });
+
         const actionData = {
             name: name,
             world: elements.actionWorld.value.trim(),
-            match_type: elements.actionMatchType.value === 'wildcard' ? 'Wildcard' : 'Regexp',
-            pattern: elements.actionPattern.value,
+            match_type: elements.actionMatchType.value || 'Regexp',
+            patterns: filteredPatterns,
             command: elements.actionCommand.value,
             enabled: elements.actionEnabled.value === 'yes',
             startup: elements.actionStartup.value === 'yes'
@@ -8488,14 +8573,9 @@
         };
         elements.actionEditorCancelBtn.onclick = closeActionsEditorPopup;
         elements.actionsEditorCloseBtn.onclick = closeActionsEditorPopup;
-        elements.actionMatchType.onchange = function() {
-            // Update placeholder based on match type
-            if (this.value === 'wildcard') {
-                elements.actionPattern.placeholder = '(wildcard: * and ?, empty = manual only)';
-            } else {
-                elements.actionPattern.placeholder = '(regex, empty = manual only)';
-            }
-        };
+        if (elements.actionEditorPageBtn) {
+            elements.actionEditorPageBtn.onclick = function() { openEditorPage('action-editor'); };
+        }
 
         // actionEnabled is now a select, no onclick needed
 

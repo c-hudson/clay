@@ -83,14 +83,14 @@ pub use telnet::{
 };
 pub use spell::{SpellChecker, SpellState};
 pub use input::{InputArea, display_width, display_width_chars, chars_for_display_width};
-pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps, local_time_from_epoch, local_time_now, color_name_to_ansi_bg};
+pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps, local_time_from_epoch, local_time_now, color_name_to_ansi_bg, nli_visual_rows, nli_wrap_width};
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
     hash_password, hash_with_challenge, is_ip_in_allow_list,
 };
 pub use actions::{
-    Action, MatchType, ActionTriggerResult,
+    Action, MatchType, MatchPattern, ActionTriggerResult,
     split_action_commands, substitute_action_args, substitute_pattern_captures,
     wildcard_to_regex, execute_recall, check_action_triggers,
     compile_action_patterns, line_matches_compiled_patterns,
@@ -260,6 +260,21 @@ impl FilterPopup {
     }
 }
 
+/// Returns true if an output line should appear in F5 search results.
+/// Mirrors the renderer's visibility predicate (process_output_line in rendering.rs):
+/// gagged lines are hidden unless show_tags (F2) is active, and ANSI-only lines
+/// (cursor control garbage) are never visible. All other lines, including
+/// client-generated ones, are searchable while on screen.
+fn search_line_visible(line: &OutputLine, show_tags: bool) -> bool {
+    if line.gagged && !show_tags {
+        return false;
+    }
+    if is_ansi_only_line(&line.text) {
+        return false;
+    }
+    true
+}
+
 /// F5 history search popup state
 pub struct SearchPopup {
     pub visible: bool,
@@ -267,6 +282,7 @@ pub struct SearchPopup {
     pub cursor: usize,
     pub match_indices: Vec<usize>,  // output_lines indices that match (ascending)
     pub current_pos: usize,         // index into match_indices currently shown at bottom
+    pub last_searched: String,      // query used to build current match_indices/current_pos
 }
 
 impl SearchPopup {
@@ -277,6 +293,7 @@ impl SearchPopup {
             cursor: 0,
             match_indices: Vec::new(),
             current_pos: 0,
+            last_searched: String::new(),
         }
     }
 
@@ -286,20 +303,25 @@ impl SearchPopup {
         self.cursor = 0;
         self.match_indices.clear();
         self.current_pos = 0;
+        self.last_searched.clear();
     }
 
     pub fn close(&mut self) {
         self.visible = false;
         self.search_text.clear();
         self.match_indices.clear();
+        self.last_searched.clear();
     }
 
-    pub fn update_search(&mut self, output_lines: &[OutputLine]) {
+    pub fn update_search(&mut self, output_lines: &[OutputLine], show_tags: bool) {
         if self.search_text.is_empty() {
             self.match_indices.clear();
             self.current_pos = 0;
+            self.last_searched.clear();
             return;
         }
+        let query_changed = self.search_text != self.last_searched;
+        self.last_searched = self.search_text.clone();
         let has_wildcards = self.search_text.contains('*') || self.search_text.contains('?');
         if has_wildcards {
             if let Some(regex) = filter_wildcard_to_regex(&self.search_text) {
@@ -307,8 +329,10 @@ impl SearchPopup {
                     .iter()
                     .enumerate()
                     .filter(|(_, line)| {
-                        let plain = strip_ansi_codes(&line.text);
-                        regex.is_match(&plain)
+                        search_line_visible(line, show_tags) && {
+                            let plain = strip_ansi_codes(&line.text);
+                            regex.is_match(&plain)
+                        }
                     })
                     .map(|(i, _)| i)
                     .collect();
@@ -321,14 +345,21 @@ impl SearchPopup {
                 .iter()
                 .enumerate()
                 .filter(|(_, line)| {
-                    let plain = strip_ansi_codes(&line.text);
-                    plain.to_lowercase().contains(&search_lower)
+                    search_line_visible(line, show_tags) && {
+                        let plain = strip_ansi_codes(&line.text);
+                        plain.to_lowercase().contains(&search_lower)
+                    }
                 })
                 .map(|(i, _)| i)
                 .collect();
         }
-        // Start at the most recent (highest index) match
-        self.current_pos = self.match_indices.len().saturating_sub(1);
+        // Only reset to the most recent match when the query changed or the saved
+        // position is now out of range (e.g. matches shrunk). When the query is
+        // unchanged (e.g. Enter re-scans to pick up new output), preserve the
+        // current iteration position so advance() can keep walking backward.
+        if query_changed || self.current_pos >= self.match_indices.len() {
+            self.current_pos = self.match_indices.len().saturating_sub(1);
+        }
     }
 
     /// Returns the output_lines index of the current match, if any.
@@ -346,6 +377,20 @@ impl SearchPopup {
         } else {
             // Wrap to most recent
             self.current_pos = self.match_indices.len() - 1;
+        }
+        self.current_match_line()
+    }
+
+    /// Retreat to the next newer match. Returns the new match line index.
+    pub fn retreat(&mut self) -> Option<usize> {
+        if self.match_indices.is_empty() {
+            return None;
+        }
+        if self.current_pos + 1 < self.match_indices.len() {
+            self.current_pos += 1;
+        } else {
+            // Wrap to oldest
+            self.current_pos = 0;
         }
         self.current_match_line()
     }
@@ -2254,6 +2299,7 @@ pub struct World {
     pub command_tx: Option<mpsc::Sender<WriteCommand>>,
     pub unseen_lines: usize,
     pub paused: bool,
+    pub search_active: bool,  // true while the F5 search popup is open for this world
     pub pending_lines: Vec<OutputLine>,
     pub pending_count: usize, // For remote client mode: daemon's pending line count (not in pending_lines)
     pub lines_since_pause: usize,
@@ -2340,6 +2386,7 @@ impl World {
             command_tx: None,
             unseen_lines: 0,
             paused: false,
+            search_active: false,
             pending_lines: Vec::new(),
             pending_count: 0,
             lines_since_pause: 0,
@@ -2553,9 +2600,10 @@ impl World {
         // the world, causing immediate pause when new output arrives.
         if !is_current && !self.paused && self.lines_since_pause >= max_lines && max_lines > 0 {
             let width = (output_width as usize).max(1);
+            let nli = settings.new_line_indicator;
             let mut visible = 0;
             for line in self.output_lines.iter().rev() {
-                let vl = wrap_ansi_line(&line.text, width).len().max(1);
+                let vl = nli_visual_rows(&line.text, width, line.marked_new, nli);
                 if visible + vl > max_lines {
                     break;
                 }
@@ -2662,10 +2710,11 @@ impl World {
                 }
             }
 
-            // Use wrap_ansi_line for accurate visual line count — visual_line_count uses
-            // character-based division which undercounts when word wrapping pushes words
-            // to the next line, causing more-mode to pause too late.
-            let visual_lines = wrap_ansi_line(line, output_width as usize).len().max(1);
+            // Use nli_visual_rows for accurate visual line count — it uses wrap_ansi_line
+            // with the same effective width the renderer uses (reduced by NLI_PREFIX_WIDTH
+            // when the NLI setting is on and the line is marked_new), so that
+            // pause/partial-display budgeting stays in sync with what's drawn.
+            let visual_lines = nli_visual_rows(line, output_width as usize, !is_current, settings.new_line_indicator);
 
             // Track if this line goes to pending (for partial tracking)
             let goes_to_pending = self.paused && settings.more_mode_enabled;
@@ -2714,7 +2763,9 @@ impl World {
                     }
                     self.unseen_lines += 1;
                 }
-                self.scroll_to_bottom();
+                if !self.search_active {
+                    self.scroll_to_bottom();
+                }
                 // If this line overflows the remaining budget, show only what fits
                 let prior_visual = self.lines_since_pause.saturating_sub(visual_lines);
                 let remaining_budget = max_lines.saturating_sub(prior_visual);
@@ -2760,8 +2811,8 @@ impl World {
                 self.output_lines.append(&mut self.pending_lines);
             }
         }
-        // Always scroll to bottom unless paused (and more mode is on)
-        if !self.paused {
+        // Always scroll to bottom unless paused (and more mode is on), or search is holding the view
+        if !self.paused && !self.search_active {
             self.scroll_to_bottom();
         }
     }
@@ -2783,7 +2834,7 @@ impl World {
         }
     }
 
-    fn scroll_to_bottom(&mut self) {
+    pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = self.output_lines.len().saturating_sub(1);
         self.visual_line_offset = 0;
     }
@@ -2815,7 +2866,7 @@ impl World {
 
     /// Release pending lines, counting by VISUAL lines (wrapped line count) to fill
     /// approximately one screenful. Always releases at least one logical line.
-    pub fn release_pending(&mut self, visual_budget: usize, output_width: usize) {
+    pub fn release_pending(&mut self, visual_budget: usize, output_width: usize, nli_enabled: bool) {
         // Reset visual_line_offset so truncated wrapped lines from the pause trigger
         // are fully visible after releasing.
         self.visual_line_offset = 0;
@@ -2829,7 +2880,7 @@ impl World {
         let mut logical_count = 0;
 
         for line in &self.pending_lines {
-            let vl = visual_line_count(&line.text, width);
+            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli_enabled);
             // If adding this line would exceed budget AND we already have at least one,
             // stop before adding it. Always release at least 1 line.
             if visual_total > 0 && visual_total + vl > visual_budget {
@@ -3789,11 +3840,14 @@ impl App {
         let settings = if let Some(idx) = editing_index {
             if idx < self.settings.actions.len() {
                 let action = &self.settings.actions[idx];
+                let patterns: Vec<String> = action.patterns.iter()
+                    .map(|mp| mp.pattern.clone())
+                    .collect();
                 ActionSettings {
                     name: action.name.clone(),
                     world: action.world.clone(),
-                    match_type: action.match_type.as_str().to_string(),
-                    pattern: action.pattern.clone(),
+                    match_type: action.match_type.as_str().to_lowercase(),
+                    patterns,
                     command: action.command.clone(),
                     enabled: action.enabled,
                     startup: action.startup,
@@ -7586,10 +7640,11 @@ impl App {
 
                         // Pre-calculate logical lines to release (same logic as release_pending)
                         let width = client_width.max(1);
+                        let nli = self.settings.new_line_indicator;
                         let mut visual_total = 0;
                         let mut logical_count = 0;
                         for line in &self.worlds[world_index].pending_lines {
-                            let vl = visual_line_count(&line.text, width);
+                            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli);
                             if visual_total > 0 && visual_total + vl > visual_budget {
                                 break;
                             }
@@ -7616,7 +7671,7 @@ impl App {
                             .collect();
 
                         // Release the lines on the server
-                        self.worlds[world_index].release_pending(visual_budget, client_width);
+                        self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator);
 
                         // Broadcast the released lines to clients viewing this world
                         if !lines_to_broadcast.is_empty() {
@@ -7789,8 +7844,11 @@ impl App {
                 });
             }
             WsMessage::UpdateActions { actions } => {
-                // Update actions from remote client
+                // Update actions from remote client; normalize migrates any legacy single-pattern fields
                 self.settings.actions = actions.clone();
+                for action in &mut self.settings.actions {
+                    action.normalize();
+                }
                 compile_all_action_regexes(&mut self.settings.actions);
                 // Save settings to persist changes
                 let _ = persistence::save_settings(self);
@@ -8011,6 +8069,15 @@ impl App {
                         self.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: false, error: Some(e.to_string()) });
                     }
                 }
+            }
+            WsMessage::RequestActionEditorState => {
+                let actions_json = serde_json::to_string(&self.settings.actions).unwrap_or_default();
+                let world_names: Vec<&str> = self.worlds.iter().map(|w| w.name.as_str()).collect();
+                let world_names_json = serde_json::to_string(&world_names).unwrap_or_default();
+                self.ws_send_to_client(client_id, WsMessage::ActionEditorState {
+                    actions_json,
+                    world_names_json,
+                });
             }
             WsMessage::RequestKeybindEditorState => {
                 let bindings_json = self.keybindings.to_json();
@@ -8992,7 +9059,8 @@ impl App {
                 partial_idx -= 1;
             }
             if partial_idx < self.worlds[world_idx].output_lines.len() {
-                let total_vl = wrap_ansi_line(&self.worlds[world_idx].output_lines[partial_idx].text, width).len().max(1);
+                let partial_line = &self.worlds[world_idx].output_lines[partial_idx];
+                let total_vl = nli_visual_rows(&partial_line.text, width, partial_line.marked_new, self.settings.new_line_indicator);
                 let remaining = total_vl.saturating_sub(self.worlds[world_idx].visual_line_offset);
                 if remaining > visual_budget {
                     // More of this line than fits on screen — advance offset, done
@@ -9040,7 +9108,8 @@ impl App {
             .collect();
 
         let pending_before = self.worlds[world_idx].pending_lines.len();
-        self.current_world_mut().release_pending(visual_budget, output_width);
+        let nli_enabled = self.settings.new_line_indicator;
+        self.current_world_mut().release_pending(visual_budget, output_width, nli_enabled);
         let released = pending_before - self.worlds[world_idx].pending_lines.len();
 
         // Broadcast released lines to clients viewing this world.
@@ -9502,7 +9571,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST,
         ACTIONS_BTN_ADD, ACTIONS_BTN_EDIT, ACTIONS_BTN_DELETE, ACTIONS_BTN_CANCEL,
         EDITOR_FIELD_NAME, EDITOR_FIELD_WORLD, EDITOR_FIELD_MATCH_TYPE,
-        EDITOR_FIELD_PATTERN, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED, EDITOR_FIELD_STARTUP,
+        EDITOR_FIELD_PATTERNS, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED, EDITOR_FIELD_STARTUP,
         EDITOR_BTN_SAVE, EDITOR_BTN_CANCEL, EDITOR_BTN_DELETE,
     };
     use popup::definitions::world_editor::{
@@ -10388,6 +10457,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             let is_multiline = state.selected_field()
                 .map(|f| matches!(&f.kind, popup::FieldKind::MultilineText { .. }))
                 .unwrap_or(false);
+            let is_editable_list = state.selected_field()
+                .map(|f| matches!(&f.kind, popup::FieldKind::EditableList { .. }))
+                .unwrap_or(false);
             let is_toggle = state.selected_field()
                 .map(|f| matches!(&f.kind, popup::FieldKind::Toggle { .. }))
                 .unwrap_or(false);
@@ -10408,6 +10480,10 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         // In multiline field, Enter inserts a newline
                         state.insert_newline();
                         state.ensure_multiline_cursor_visible();
+                    } else if state.editing && is_editable_list {
+                        // In editable list: Enter commits and moves to the next row (or stays if at empty)
+                        state.editable_list_select_down(EDITOR_FIELD_PATTERNS);
+                        state.start_edit();
                     } else if state.editing {
                         state.commit_edit();
                         state.next_field();
@@ -10416,29 +10492,36 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             // Extract action data and save
                             let name = state.get_text(EDITOR_FIELD_NAME).unwrap_or("").to_string();
                             let world = state.get_text(EDITOR_FIELD_WORLD).unwrap_or("").to_string();
-                            let match_type_str = state.get_selected(EDITOR_FIELD_MATCH_TYPE).unwrap_or("regexp");
-                            let pattern = state.get_text(EDITOR_FIELD_PATTERN).unwrap_or("").to_string();
                             let command = state.get_text(EDITOR_FIELD_COMMAND).unwrap_or("").to_string();
                             let enabled = state.get_bool(EDITOR_FIELD_ENABLED).unwrap_or(true);
                             let startup = state.get_bool(EDITOR_FIELD_STARTUP).unwrap_or(false);
                             let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
 
-                            let match_type = if match_type_str == "wildcard" {
-                                MatchType::Wildcard
-                            } else {
-                                MatchType::Regexp
-                            };
+                            // Read the action-level match type
+                            let match_type_str = state.get_selected(EDITOR_FIELD_MATCH_TYPE).unwrap_or("regexp");
+                            let action_match_type = if match_type_str == "wildcard" { MatchType::Wildcard } else { MatchType::Regexp };
+
+                            // Collect patterns from the EditableList (flush any in-progress edit first)
+                            state.commit_edit();
+                            let all_items = state.get_editable_list_items(EDITOR_FIELD_PATTERNS);
+                            let patterns: Vec<MatchPattern> = all_items.iter()
+                                .filter(|p| !p.trim().is_empty())
+                                .map(|p| MatchPattern {
+                                    pattern: p.clone(),
+                                    compiled_regex: None,
+                                })
+                                .collect();
 
                             let action = Action {
                                 name,
                                 world,
-                                match_type,
-                                pattern,
+                                match_type: action_match_type,
+                                patterns,
                                 command,
                                 owner: None,
                                 enabled,
                                 startup,
-                                compiled_regex: None,
+                                ..Action::default()
                             };
 
                             app.popup_manager.close();
@@ -10478,6 +10561,15 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         // In multiline field, Up moves cursor up
                         state.cursor_up();
                         state.ensure_multiline_cursor_visible();
+                    } else if is_editable_list {
+                        // In editable list: Up moves to previous row (or exits to prev field)
+                        if !state.editable_list_select_up(EDITOR_FIELD_PATTERNS) {
+                            // Already at first row — commit and move to previous field
+                            state.commit_edit();
+                            state.prev_field();
+                        } else {
+                            state.start_edit();
+                        }
                     } else {
                         if state.editing {
                             state.commit_edit();
@@ -10490,6 +10582,17 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         // In multiline field, Down moves cursor down
                         state.cursor_down();
                         state.ensure_multiline_cursor_visible();
+                    } else if is_editable_list {
+                        // In editable list: Down moves to next row (or exits to next field)
+                        if !state.editable_list_select_down(EDITOR_FIELD_PATTERNS) {
+                            // At last row and can't add more — commit and move to next field
+                            state.commit_edit();
+                            if !state.next_field() {
+                                state.select_first_button();
+                            }
+                        } else {
+                            state.start_edit();
+                        }
                     } else {
                         if state.editing {
                             state.commit_edit();
@@ -10580,6 +10683,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             state.ensure_multiline_cursor_visible();
                         }
                     }
+                    // Editable list: typing starts edit on the selected row
+                    // (is_text_field is true for EditableList so already handled above)
                 }
                 _ => {}
             }

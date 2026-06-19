@@ -221,13 +221,14 @@
                 <div class="action-field">
                     <label for="action-match-type">Match Type:</label>
                     <select id="action-match-type" class="form-select">
-                        <option value="regexp">Regexp</option>
-                        <option value="wildcard">Wildcard</option>
+                        <option value="Regexp">Regexp</option>
+                        <option value="Wildcard">Wildcard</option>
                     </select>
                 </div>
                 <div class="action-field">
-                    <label for="action-pattern">Pattern:</label>
-                    <input type="text" id="action-pattern" autocomplete="off" placeholder="(regex, empty = manual only)">
+                    <label>Patterns: <span style="font-size:11px;opacity:0.7">(any match fires; first supplies $1..$9)</span></label>
+                    <div id="action-patterns-container" style="display:flex;flex-direction:column;gap:4px;"></div>
+                    <button id="action-add-pattern-btn" class="btn" style="margin-top:4px;font-size:11px;padding:2px 8px;">+ Add Pattern</button>
                 </div>
                 <div class="action-field">
                     <label for="action-enabled">Enabled:</label>
@@ -252,6 +253,7 @@
                     <button id="action-editor-help-btn" class="btn btn-help">?</button>
                     <button id="action-editor-delete-btn" class="btn btn-danger">Delete</button>
                     <span class="footer-spacer"></span>
+                    <button id="action-editor-page-btn" class="btn" title="Open standalone action editor">⊞ Editor</button>
                     <button id="action-editor-cancel-btn" class="btn">Cancel</button>
                     <button id="action-save-btn" class="btn btn-primary">Save</button>
                 </div>
