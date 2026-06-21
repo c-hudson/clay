@@ -5518,9 +5518,7 @@
         // Show Clay Server settings tab button only in Android app
         const clayServerTabBtn = document.getElementById('settings-clay-server-btn');
         if (clayServerTabBtn) clayServerTabBtn.style.display = isAndroid ? '' : 'none';
-        // Show Open in Browser settings button only in Android app
-        const openBrowserBtn = document.getElementById('settings-open-browser-btn');
-        if (openBrowserBtn) openBrowserBtn.style.display = isAndroid ? '' : 'none';
+        // Open in Browser button is visible in all interfaces (not Android-only)
         // Show auth key Download button only in Android app (starts disabled until connected)
         const dlBtn = document.getElementById('cs-auth-key-download');
         if (dlBtn) {
