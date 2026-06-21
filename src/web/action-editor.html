@@ -274,6 +274,30 @@ input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; accent-colo
   align-items: center;
 }
 .detail-footer .spacer { flex: 1; }
+
+/* Unsaved-changes confirm modal */
+.confirm-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.55);
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.confirm-overlay.hidden { display: none; }
+.confirm-box {
+  background: var(--editor-bg3);
+  border: 1px solid var(--editor-accent);
+  border-radius: 6px;
+  padding: 22px 28px;
+  min-width: 280px;
+  max-width: 380px;
+  text-align: center;
+}
+.confirm-box p { margin-bottom: 18px; font-size: 13px; color: var(--editor-fg); }
+.confirm-box .confirm-name { color: var(--editor-accent); }
+.confirm-actions { display: flex; gap: 8px; justify-content: center; }
 </style>
 </head>
 <body>
@@ -292,14 +316,10 @@ input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; accent-colo
 <div id="editorMain" style="display:none; flex-direction:column; height:100%;">
   <!-- Toolbar -->
   <div class="toolbar">
-    <button class="back-btn" id="backBtn" style="display:none" onclick="window.close()">&larr; Back</button>
+    <button class="back-btn" id="backBtn" style="display:none" onclick="tryLeaveForBack()">&larr; Back</button>
     <div class="toolbar-group">
       <span class="toolbar-title">Clay Action Editor</span>
       <span class="unsaved-dot" id="unsavedDot"></span>
-    </div>
-    <div class="toolbar-group">
-      <button class="primary" onclick="doSaveAll()">Save All</button>
-      <button onclick="doRevertAll()">Revert</button>
       <span class="save-status" id="saveStatus"></span>
     </div>
   </div>
@@ -310,6 +330,7 @@ input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; accent-colo
     <div class="list-panel">
       <div class="list-search">
         <input type="text" id="filterInput" placeholder="Filter actions..." oninput="applyFilter()">
+        <input type="text" id="worldFilterInput" placeholder="Filter world..." oninput="applyFilter()" style="margin-top:4px;">
       </div>
       <div class="list-add-bar">
         <button onclick="addNewAction()">+ New Action</button>
@@ -326,6 +347,18 @@ input[type="checkbox"] { width: 14px; height: 14px; cursor: pointer; accent-colo
   </div>
 </div>
 
+<!-- Unsaved-changes confirm modal -->
+<div class="confirm-overlay hidden" id="confirmOverlay">
+  <div class="confirm-box">
+    <p>Unsaved changes to <span class="confirm-name" id="confirmActionName"></span></p>
+    <div class="confirm-actions">
+      <button class="primary" id="confirmSaveBtn">Save</button>
+      <button class="danger" id="confirmDiscardBtn">Discard</button>
+      <button id="confirmStayBtn">Stay</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ============================================================
 // State
@@ -336,7 +369,9 @@ let worldNames = [];      // Connected world names (for hints)
 let selectedIdx = -1;     // Index into (filtered view) — use selActionName for stability
 let selActionName = null; // Name of currently selected action
 let savedSnapshot = '';   // JSON.stringify(actions) at last save
+let editBaseline = '';    // JSON.stringify of the selected action at time of selection / last save
 let filterText = '';
+let worldFilterText = '';
 let saveStatusTimeout = null;
 
 // ============================================================
@@ -389,6 +424,8 @@ function handleWsMessage(msg) {
       // Ensure every action has a patterns array (legacy compat)
       normalizeActions();
       savedSnapshot = JSON.stringify(actions);
+      // Reset per-action baseline in case a selection survives the refresh
+      { const a = currentAction(); editBaseline = a ? JSON.stringify(a) : ''; }
       renderAll();
       break;
     case 'ActionsUpdated':
@@ -509,17 +546,22 @@ function sha256Fallback(message) {
 // ============================================================
 function filteredActions() {
   const f = filterText.trim().toLowerCase();
-  if (!f) return actions.slice();
-  return actions.filter(a =>
-    a.name.toLowerCase().includes(f) ||
-    a.world.toLowerCase().includes(f) ||
-    a.patterns.some(p => p.pattern.toLowerCase().includes(f)) ||
-    a.command.toLowerCase().includes(f)
-  );
+  const w = worldFilterText.trim().toLowerCase();
+  return actions.filter(a => {
+    if (f && !(
+      a.name.toLowerCase().includes(f) ||
+      a.world.toLowerCase().includes(f) ||
+      a.patterns.some(p => p.pattern.toLowerCase().includes(f)) ||
+      a.command.toLowerCase().includes(f)
+    )) return false;
+    if (w && !a.world.toLowerCase().includes(w)) return false;
+    return true;
+  });
 }
 
 function applyFilter() {
   filterText = document.getElementById('filterInput').value;
+  worldFilterText = document.getElementById('worldFilterInput').value;
   renderList();
 }
 
@@ -578,9 +620,13 @@ function renderList() {
     item.appendChild(info);
 
     item.addEventListener('click', () => {
-      commitCurrentEdits();
-      selActionName = a.name;
-      renderAll();
+      if (a.name === selActionName) return;
+      tryLeaveCurrent(() => {
+        selActionName = a.name;
+        const next = actions.find(x => x.name === selActionName);
+        editBaseline = next ? JSON.stringify(next) : '';
+        renderAll();
+      });
     });
 
     container.appendChild(item);
@@ -604,7 +650,7 @@ function renderDetail() {
   // World
   const worldHint = document.createElement('div');
   worldHint.className = 'field-hint';
-  worldHint.textContent = 'Comma-separated world names, or leave blank for all worlds' + (worldNames.length ? ' (connected: ' + worldNames.join(', ') + ')' : '');
+  worldHint.textContent = 'Comma-separated world names';
   addField(panel, 'World', buildInput('text', a.world, v => { a.world = v; markDirty(); }), worldHint);
 
   // Enabled / Startup
@@ -735,13 +781,18 @@ function renderDetail() {
   const spacer = document.createElement('div');
   spacer.className = 'spacer';
 
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', discardCurrent);
+
   const saveBtn = document.createElement('button');
   saveBtn.className = 'primary';
-  saveBtn.textContent = 'Save All';
-  saveBtn.addEventListener('click', doSaveAll);
+  saveBtn.textContent = 'Save';
+  saveBtn.addEventListener('click', doSaveCurrent);
 
   footer.appendChild(delBtn);
   footer.appendChild(spacer);
+  footer.appendChild(cancelBtn);
   footer.appendChild(saveBtn);
   panel.appendChild(footer);
 }
@@ -785,26 +836,29 @@ function commitCurrentEdits() {}
 // Actions
 // ============================================================
 function addNewAction() {
-  const name = 'new_action_' + Date.now().toString(36);
-  const a = {
-    name,
-    world: '',
-    match_type: 'Regexp',
-    patterns: [{ pattern: '' }],
-    command: '',
-    owner: null,
-    enabled: true,
-    startup: false,
-  };
-  actions.push(a);
-  selActionName = name;
-  markDirty();
-  renderAll();
-  // Focus the name field
-  setTimeout(() => {
-    const inp = document.querySelector('.detail-content input[type="text"]');
-    if (inp) { inp.focus(); inp.select(); }
-  }, 50);
+  tryLeaveCurrent(() => {
+    const name = 'new_action_' + Date.now().toString(36);
+    const a = {
+      name,
+      world: '',
+      match_type: 'Regexp',
+      patterns: [{ pattern: '' }],
+      command: '',
+      owner: null,
+      enabled: true,
+      startup: false,
+    };
+    actions.push(a);
+    selActionName = name;
+    editBaseline = JSON.stringify(a);
+    markDirty();
+    renderAll();
+    // Focus the name field
+    setTimeout(() => {
+      const inp = document.querySelector('.detail-content input[type="text"]');
+      if (inp) { inp.focus(); inp.select(); }
+    }, 50);
+  });
 }
 
 function markDirty() {
@@ -816,21 +870,82 @@ function updateUnsaved() {
   document.getElementById('unsavedDot').className = 'unsaved-dot' + (dirty ? ' visible' : '');
 }
 
-function doSaveAll() {
-  // Send full action list to server via UpdateActions
+// Returns the currently selected action object, or null.
+function currentAction() {
+  return selActionName ? actions.find(x => x.name === selActionName) || null : null;
+}
+
+// True when the current action has edits not yet saved to the server.
+function currentActionDirty() {
+  const a = currentAction();
+  if (!a) return false;
+  return JSON.stringify(a) !== editBaseline;
+}
+
+// Save the current action (sends whole list; server replaces + persists).
+function doSaveCurrent() {
   wsSend({ type: 'UpdateActions', actions });
   savedSnapshot = JSON.stringify(actions);
+  const a = currentAction();
+  editBaseline = a ? JSON.stringify(a) : '';
   updateUnsaved();
   showSaveStatus('Saved');
 }
 
-function doRevertAll() {
-  if (JSON.stringify(actions) === savedSnapshot) return;
-  if (!confirm('Revert all unsaved changes?')) return;
-  actions = JSON.parse(savedSnapshot);
-  normalizeActions();
-  renderAll();
-  showSaveStatus('Reverted');
+// Discard edits to the current action, restoring from editBaseline.
+function discardCurrent() {
+  const a = currentAction();
+  if (a && editBaseline) {
+    const base = JSON.parse(editBaseline);
+    Object.assign(a, base);
+  }
+  updateUnsaved();
+  renderDetail();
+  showSaveStatus('Cancelled');
+}
+
+// Guard: if there are unsaved edits, show Save/Discard/Stay modal; else proceed immediately.
+function tryLeaveCurrent(proceedFn) {
+  if (!currentActionDirty()) {
+    proceedFn();
+    return;
+  }
+  const name = (currentAction() && currentAction().name) || '(unnamed)';
+  showUnsavedModal(name, {
+    onSave: () => { doSaveCurrent(); proceedFn(); },
+    onDiscard: () => { discardCurrent(); proceedFn(); },
+    onStay: () => {},
+  });
+}
+
+// Guard for the Back button (closes the window after resolving edits).
+function tryLeaveForBack() {
+  tryLeaveCurrent(() => window.close());
+}
+
+// Show the Save/Discard/Stay modal for the given action name.
+function showUnsavedModal(name, { onSave, onDiscard, onStay }) {
+  document.getElementById('confirmActionName').textContent = '"' + esc(name) + '"';
+  const overlay = document.getElementById('confirmOverlay');
+  overlay.classList.remove('hidden');
+
+  // Wire buttons (replace to clear old listeners)
+  const saveBtn = document.getElementById('confirmSaveBtn');
+  const discardBtn = document.getElementById('confirmDiscardBtn');
+  const stayBtn = document.getElementById('confirmStayBtn');
+
+  const close = () => overlay.classList.add('hidden');
+
+  const newSave = saveBtn.cloneNode(true);
+  const newDiscard = discardBtn.cloneNode(true);
+  const newStay = stayBtn.cloneNode(true);
+  saveBtn.replaceWith(newSave);
+  discardBtn.replaceWith(newDiscard);
+  stayBtn.replaceWith(newStay);
+
+  newSave.addEventListener('click', () => { close(); onSave(); });
+  newDiscard.addEventListener('click', () => { close(); onDiscard(); });
+  newStay.addEventListener('click', () => { close(); onStay(); });
 }
 
 function showSaveStatus(text) {
@@ -855,7 +970,7 @@ document.addEventListener('keydown', function(e) {
 });
 
 window.addEventListener('beforeunload', function(e) {
-  if (JSON.stringify(actions) !== savedSnapshot) {
+  if (JSON.stringify(actions) !== savedSnapshot || currentActionDirty()) {
     e.preventDefault();
     e.returnValue = '';
   }

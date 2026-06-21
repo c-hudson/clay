@@ -232,10 +232,12 @@
         // Filter popup (F4)
         filterPopup: document.getElementById('filter-popup'),
         filterInput: document.getElementById('filter-input'),
+        filterCloseBtn: document.getElementById('filter-close-btn'),
         // Search popup (F5)
         searchPopup: document.getElementById('search-popup'),
         searchInput: document.getElementById('search-input'),
         searchMatchInfo: document.getElementById('search-match-info'),
+        searchCloseBtn: document.getElementById('search-close-btn'),
         // Help popup (/help)
         helpModal: document.getElementById('help-modal'),
         helpContent: document.getElementById('help-content'),
@@ -5516,6 +5518,9 @@
         // Show Clay Server settings tab button only in Android app
         const clayServerTabBtn = document.getElementById('settings-clay-server-btn');
         if (clayServerTabBtn) clayServerTabBtn.style.display = isAndroid ? '' : 'none';
+        // Show Open in Browser settings button only in Android app
+        const openBrowserBtn = document.getElementById('settings-open-browser-btn');
+        if (openBrowserBtn) openBrowserBtn.style.display = isAndroid ? '' : 'none';
         // Show auth key Download button only in Android app (starts disabled until connected)
         const dlBtn = document.getElementById('cs-auth-key-download');
         if (dlBtn) {
@@ -6030,15 +6035,17 @@
     function openEditorPage(page) {
         var url;
         if (window.SERVER_URL) {
-            url = window.SERVER_URL + '/' + page;
+            url = window.SERVER_URL + (page ? '/' + page : '');
         } else {
             var proto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
             var host = window.WS_HOST || window.location.hostname;
             var port = (window.WS_PORT && window.WS_PORT !== 0) ? window.WS_PORT : window.location.port;
-            url = proto + '://' + host + ':' + port + '/' + page;
+            url = proto + '://' + host + ':' + port + (page ? '/' + page : '');
         }
         if (window.WEBVIEW_MODE) {
             sendIpc('open-url:' + url);
+        } else if (typeof Android !== 'undefined' && Android.openExternalUrl) {
+            Android.openExternalUrl(url);
         } else {
             window.open(url, '_blank');
         }
@@ -7527,10 +7534,10 @@
                 focusInputWithKeyboard();
                 break;
             case 'filter':
-                openFilterPopup();
+                if (filterPopupOpen) closeFilterPopup(); else openFilterPopup();
                 break;
             case 'search':
-                openSearchPopup();
+                if (searchPopupOpen) closeSearchPopup(); else openSearchPopup();
                 break;
             case 'reload':
                 // Local only — never restart the remote server
@@ -8154,6 +8161,14 @@
             }
         });
 
+        // Filter / search close button handlers
+        if (elements.filterCloseBtn) {
+            elements.filterCloseBtn.addEventListener('click', closeFilterPopup);
+        }
+        if (elements.searchCloseBtn) {
+            elements.searchCloseBtn.addEventListener('click', closeSearchPopup);
+        }
+
         // Help popup button handlers
         if (elements.helpCloseBtn) {
             elements.helpCloseBtn.addEventListener('click', closeHelpPopup);
@@ -8647,6 +8662,10 @@
         document.getElementById('settings-keybind-editor-btn').onclick = function() {
             openEditorPage('keybind-editor');
         };
+        var openBrowserSettingsBtn = document.getElementById('settings-open-browser-btn');
+        if (openBrowserSettingsBtn) {
+            openBrowserSettingsBtn.onclick = function() { openEditorPage(''); };
+        }
         elements.setupMoreModeToggle.onclick = function() {
             setupMoreMode = !setupMoreMode;
             updateSetupPopupUI();

@@ -410,6 +410,18 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public void openExternalUrl(String url) {
+            runOnUiThread(() -> {
+                try {
+                    Intent intent = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+                    startActivity(intent);
+                } catch (Exception e) {
+                    android.util.Log.w("Clay", "openExternalUrl failed: " + e.getMessage());
+                }
+            });
+        }
+
+        @JavascriptInterface
         public void reloadPage() {
             runOnUiThread(() -> {
                 // Close all WebSocket connections

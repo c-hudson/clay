@@ -596,6 +596,10 @@ body.device-phone #output-container { padding: 6px 10px; }
     padding: 4px 8px;
     font-size: 12px;
     border-bottom: 1px solid var(--accent-color);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
 }
 
 .filter-popup-content {
