@@ -883,14 +883,30 @@
         // Visible text should preserve ZWSP for word breaking
         assert!(result.contains("/\u{200B}path/\u{200B}to/\u{200B}page"));
 
-        // URL followed by ANSI color code — the code skips CSI sequences so they don't
-        // truncate the URL. Clean URL parameter has no ANSI; visible text keeps it.
+        // URL followed by a trailing ANSI color code — the trailing-strip loop now
+        // walks back over CSI sequences so they are emitted after the OSC 8 close
+        // rather than inside it, keeping them out of the href and the visible span.
         let url_with_ansi = "https://example.com\x1b[0;37m rest";
         let result = wrap_urls_with_osc8(url_with_ansi);
         // Clean URL in OSC 8 parameter should not include the ANSI code
         assert!(result.contains("\x1b]8;;https://example.com\x07"));
-        // ANSI code is part of the visible text inside the OSC 8 link
-        assert!(result.contains("https://example.com\x1b[0;37m\x1b]8;;\x07"));
+        // ANSI code now comes after the OSC 8 close (not inside the link)
+        assert!(result.contains("https://example.com\x1b]8;;\x07\x1b[0;37m"));
+
+        // Regression: colored URL ending with a period followed by a reset sequence.
+        // The period must NOT appear in the href (caused a 404 in browsers).
+        // Input byte stream: green-on, url, period, reset, closing quote
+        let colored_url_with_period = "\x1b[32mhttp://teenymush.dynu.net/~g7_cq7.\x1b[0m'";
+        let result = wrap_urls_with_osc8(colored_url_with_period);
+        // href must be clean (no period)
+        assert!(result.contains("\x1b]8;;http://teenymush.dynu.net/~g7_cq7\x07"),
+            "href should not contain trailing period; got: {:?}", result);
+        assert!(!result.contains("\x1b]8;;http://teenymush.dynu.net/~g7_cq7.\x07"),
+            "href must not include the trailing period");
+        // Option 2: the OSC 8 visible region now covers the trailing period, reset, and
+        // closing quote, so the terminal's own URL matcher is overridden on those cells.
+        assert!(result.contains("http://teenymush.dynu.net/~g7_cq7.\x1b[0m'\x1b]8;;\x07"),
+            "visible link region should include trailing period, reset, and quote; got: {:?}", result);
     }
 
     #[test]
@@ -3407,6 +3423,7 @@
             seq: 0,
             highlight_color: None,
             marked_new,
+            from_archive: false,
         }
     }
 

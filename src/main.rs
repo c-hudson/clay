@@ -2196,6 +2196,7 @@ pub struct OutputLine {
     pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
     pub marked_new: bool,   // true if line arrived while user wasn't viewing (unseen/pending)
+    pub from_archive: bool, // true if line was loaded from the scrollback.db archive (not current session)
 }
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
@@ -2240,6 +2241,7 @@ impl OutputLine {
             seq,
             highlight_color: None,
             marked_new: false,
+            from_archive: false,
         }
     }
 
@@ -2252,6 +2254,7 @@ impl OutputLine {
             seq,
             highlight_color: None,
             marked_new: false,
+            from_archive: false,
         }
     }
 
@@ -2264,11 +2267,12 @@ impl OutputLine {
             seq,
             highlight_color: None,
             marked_new: false,
+            from_archive: false,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None, marked_new: false }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None, marked_new: false, from_archive: false }
     }
 
     /// Format timestamp using a pre-computed "now" value for batch rendering
@@ -3568,6 +3572,62 @@ impl App {
         }
     }
 
+    /// Open the recent worlds popup listing the most-recently-active non-current worlds.
+    pub(crate) fn open_recent_worlds_popup(&mut self) {
+        use popup::definitions::recent_worlds::{
+            create_recent_worlds_popup, RecentWorldInfo, RECENT_FIELD_LIST,
+        };
+
+        let now = std::time::Instant::now();
+        let current_idx = self.current_world_index;
+
+        // Collect worlds with any activity, excluding the current world.
+        let mut entries: Vec<(usize, u64)> = self.worlds
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != current_idx)
+            .filter_map(|(i, w)| {
+                // Use the more-recent of last_receive_time and last_send_time.
+                let recv = w.last_receive_time.map(|t| now.duration_since(t).as_secs());
+                let send = w.last_send_time.map(|t| now.duration_since(t).as_secs());
+                match (recv, send) {
+                    (None, None) => None,
+                    (Some(r), None) => Some((i, r)),
+                    (None, Some(s)) => Some((i, s)),
+                    (Some(r), Some(s)) => Some((i, r.min(s))),
+                }
+            })
+            .collect();
+
+        // Sort most-recent first (lowest elapsed seconds first).
+        entries.sort_by_key(|(_, secs)| *secs);
+        entries.truncate(6);
+
+        let recent: Vec<RecentWorldInfo> = entries
+            .iter()
+            .map(|(i, secs)| RecentWorldInfo {
+                name: self.worlds[*i].name.clone(),
+                last_secs: Some(*secs),
+            })
+            .collect();
+
+        let visible_height = 6.min(recent.len().max(1));
+        let def = create_recent_worlds_popup(&recent, visible_height);
+        self.popup_manager.open(def);
+
+        // Pre-select the first (most recent) row and focus the list.
+        if let Some(state) = self.popup_manager.current_mut() {
+            if !recent.is_empty() {
+                state.select_field(RECENT_FIELD_LIST);
+                if let Some(field) = state.field_mut(RECENT_FIELD_LIST) {
+                    if let popup::FieldKind::List { selected_index, .. } = &mut field.kind {
+                        *selected_index = 0;
+                    }
+                }
+            }
+        }
+    }
+
     /// Open the notes list popup showing worlds with notes
     fn open_notes_list_popup(&mut self) {
         use popup::definitions::notes_list::{create_notes_list_popup, NoteInfo, NOTES_FIELD_LIST};
@@ -4023,6 +4083,7 @@ impl App {
                             seq,
                             highlight_color: tl.highlight_color,
                             marked_new: tl.marked_new,
+                            from_archive: false,
                         });
                         if tl.seq > 0 {
                             world.max_received_seq = tl.seq;
@@ -4176,6 +4237,7 @@ impl App {
                             seq: line.seq,
                             highlight_color: line.highlight_color,
                             marked_new: line.marked_new,
+                            from_archive: line.from_archive,
                         };
                         world.output_lines.push(output_line);
                         if line.seq >= world.next_seq {
@@ -4209,6 +4271,7 @@ impl App {
                             seq: line.seq,
                             highlight_color: line.highlight_color,
                             marked_new: line.marked_new,
+                            from_archive: line.from_archive,
                         }
                     }).collect();
                     let prepended_count = new_lines.len();
@@ -4278,6 +4341,7 @@ impl App {
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
                     marked_new: tl.marked_new,
+                    from_archive: tl.from_archive,
                 }
             }).collect();
             // Update next_seq to continue from highest seq in output_lines
@@ -4300,6 +4364,7 @@ impl App {
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
                     marked_new: tl.marked_new,
+                    from_archive: tl.from_archive,
                 }
             }).collect();
             // Update next_seq if pending_lines have higher seq values
@@ -6336,22 +6401,9 @@ impl App {
             Command::ActionCommand { name, args } => {
                 // Execute action if it exists (respects the action's world field).
                 if let Some(action) = find_invocable_action(&self.settings.actions, &name, &world_name) {
-                    // Skip disabled actions
-                    if !action.enabled {
-                        self.ws_broadcast(WsMessage::ServerData {
-                            world_index,
-                            data: format!("\u{2728} Action '{}' is disabled.", action.name),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0,
-                            marked_new: false,
-                            flush: false, gagged: false,
-                        });
-                    } else {
-                        let commands = split_action_commands(&action.command);
-                        let mut sent_to_server = false;
-                        for cmd in commands {
+                    let commands = split_action_commands(&action.command);
+                    let mut sent_to_server = false;
+                    for cmd in commands {
                             // Substitute $1-$9 and $* with arguments
                             let cmd = substitute_action_args(&cmd, &args);
 
@@ -6449,7 +6501,6 @@ impl App {
                         if sent_to_server {
                             self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
                         }
-                    }
                 } else {
                     // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
                     self.sync_tf_world_info();
@@ -7965,6 +8016,7 @@ impl App {
                             seq: line.seq,
                             highlight_color: line.highlight_color.clone(),
                             marked_new: line.marked_new,
+                            from_archive: line.from_archive,
                         })
                         .collect::<Vec<_>>()
                         .into_iter()
@@ -8244,6 +8296,7 @@ impl App {
                                         seq: line.seq,
                                         highlight_color: line.highlight_color.clone(),
                                         marked_new: line.marked_new,
+                                        from_archive: line.from_archive,
                                     }
                                 })
                                 .collect();
@@ -8291,6 +8344,7 @@ impl App {
                                     seq: line.seq,
                                     highlight_color: line.highlight_color.clone(),
                                     marked_new: line.marked_new,
+                                    from_archive: line.from_archive,
                                 }
                             })
                             .collect()
@@ -8312,6 +8366,7 @@ impl App {
                                     seq: line.seq,
                                     highlight_color: line.highlight_color.clone(),
                                     marked_new: line.marked_new,
+                                    from_archive: line.from_archive,
                                 }
                             })
                             .collect()
@@ -8428,6 +8483,7 @@ impl App {
                         seq: s.seq,
                         highlight_color: s.highlight_color.clone(),
                         marked_new: s.marked_new,
+                        from_archive: s.from_archive,
                     }
                 })
                 .collect();
@@ -8866,6 +8922,7 @@ impl App {
             let ts = std::time::UNIX_EPOCH + std::time::Duration::from_millis(al.ts_ms as u64);
             let mut line = OutputLine::new_with_timestamp(al.text, ts, seq_start + i as u64);
             line.from_server = true;
+            line.from_archive = true;
             prepend.push(line);
         }
 
@@ -9397,6 +9454,8 @@ pub(crate) enum NewPopupAction {
     WorldEditorConnect(usize),
     /// Notes list action
     NotesList(NotesListAction),
+    /// Recent worlds popup action
+    RecentWorlds(RecentWorldsAction),
 }
 
 /// Settings from the setup popup
@@ -9540,6 +9599,12 @@ pub(crate) enum NotesListAction {
     Open(String),         // Open notes for world by name
 }
 
+/// Actions from the recent worlds popup
+pub(crate) enum RecentWorldsAction {
+    Switch(String),       // Switch to world by name
+    Close,                // Dismiss without switching
+}
+
 /// Handle input for new unified popup system
 pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     use crossterm::event::KeyCode::*;
@@ -9621,6 +9686,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     let is_action_editor = popup_id == Some(popup::PopupId("action_editor"));
     let is_world_editor = popup_id == Some(popup::PopupId("world_editor"));
     let is_notes_list = popup_id == Some(popup::PopupId("notes_list"));
+    let is_recent_worlds = popup_id == Some(popup::PopupId("recent_worlds"));
 
     if let Some(state) = app.popup_manager.current_mut() {
         // World selector has special handling
@@ -10270,6 +10336,98 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 Char('c') | Char('C') => {
                     app.popup_manager.close();
                     return NewPopupAction::None;
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Recent Worlds popup handling
+        if is_recent_worlds {
+            use popup::definitions::recent_worlds::{
+                RECENT_FIELD_LIST, RECENT_BTN_CLOSE,
+            };
+
+            let get_selected_name = || state.get_selected_list_item().map(|item| item.id.clone());
+            let has_list = matches!(
+                state.field(RECENT_FIELD_LIST).map(|f| &f.kind),
+                Some(popup::FieldKind::List { .. })
+            );
+
+            match key.code {
+                Esc => {
+                    app.popup_manager.close();
+                    return NewPopupAction::RecentWorlds(RecentWorldsAction::Close);
+                }
+                Enter => {
+                    if state.is_button_focused(RECENT_BTN_CLOSE) {
+                        app.popup_manager.close();
+                        return NewPopupAction::RecentWorlds(RecentWorldsAction::Close);
+                    }
+                    // Enter on the OK button, the list, or the spacer all switch worlds
+                    if let Some(name) = get_selected_name() {
+                        app.popup_manager.close();
+                        return NewPopupAction::RecentWorlds(RecentWorldsAction::Switch(name));
+                    }
+                    // Empty popup: Enter just closes
+                    app.popup_manager.close();
+                    return NewPopupAction::RecentWorlds(RecentWorldsAction::Close);
+                }
+                // Up and Shift+Up (Shift+Up has code=Up) both navigate up the list
+                Up => {
+                    if has_list {
+                        state.select_field(RECENT_FIELD_LIST);
+                        state.list_select_up();
+                    }
+                }
+                // Down and Shift+Down (Shift+Down has code=Down) both navigate down the list
+                Down => {
+                    if has_list {
+                        state.select_field(RECENT_FIELD_LIST);
+                        state.list_select_down();
+                    }
+                }
+                Tab | BackTab => {
+                    // Custom Tab cycle: move through list rows, then to Close, then wrap.
+                    // The list's selected_index stays unchanged so a world is always highlighted.
+                    if state.is_button_focused(RECENT_BTN_CLOSE) {
+                        // Wrap back to row 0 in the list
+                        state.select_field(RECENT_FIELD_LIST);
+                        if let Some(field) = state.field_mut(RECENT_FIELD_LIST) {
+                            if let popup::FieldKind::List { selected_index, scroll_offset, .. } = &mut field.kind {
+                                *selected_index = 0;
+                                *scroll_offset = 0;
+                            }
+                        }
+                    } else if has_list {
+                        // Currently on the list (or spacer): check if there is a next row
+                        let (sel, len) = if let Some(field) = state.field(RECENT_FIELD_LIST) {
+                            if let popup::FieldKind::List { items, selected_index, .. } = &field.kind {
+                                (*selected_index, items.len())
+                            } else { (0, 0) }
+                        } else { (0, 0) };
+                        if len > 0 && sel + 1 < len {
+                            // Advance selection within the list
+                            state.select_field(RECENT_FIELD_LIST);
+                            state.list_select_down();
+                        } else {
+                            // On last row (or empty): move to Close button
+                            state.select_button(RECENT_BTN_CLOSE);
+                        }
+                    } else {
+                        // No list (empty popup): cycle Close <→ Close (no-op)
+                        state.select_button(RECENT_BTN_CLOSE);
+                    }
+                }
+                Char('o') | Char('O') => {
+                    if let Some(name) = get_selected_name() {
+                        app.popup_manager.close();
+                        return NewPopupAction::RecentWorlds(RecentWorldsAction::Switch(name));
+                    }
+                }
+                Char('c') | Char('C') => {
+                    app.popup_manager.close();
+                    return NewPopupAction::RecentWorlds(RecentWorldsAction::Close);
                 }
                 _ => {}
             }

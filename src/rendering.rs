@@ -22,7 +22,7 @@ use crate::{
     is_debug_enabled, output_debug_log,
     popup,
 };
-use crate::util::NLI_PREFIX_WIDTH;
+use crate::util::{NLI_PREFIX_WIDTH, ARCHIVE_PREFIX_WIDTH};
 
 // Break characters for word wrapping within long words
 const BREAK_CHARS: &[char] = &[']', ')', ',', '\\', '/', '-', '_', '&', '=', '?', ';'];
@@ -628,8 +628,8 @@ pub(crate) fn render_output_crossterm(app: &App) {
     }
 
     // Collect wrapped lines centered around scroll_offset to fill the screen
-    // Each entry is (line_text, should_highlight_f8, highlight_color_from_action, marked_new)
-    let mut visual_lines: Vec<(String, bool, Option<String>, bool)> = Vec::new();
+    // Each entry is (line_text, should_highlight_f8, highlight_color_from_action, marked_new, from_archive)
+    let mut visual_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::new();
     let mut first_line_idx: usize = 0;
 
     let show_tags = app.show_tags;
@@ -652,9 +652,9 @@ pub(crate) fn render_output_crossterm(app: &App) {
     let nli_prefix_width: usize = NLI_PREFIX_WIDTH;
     // Minimum old (non-new) context lines to show at top when switching worlds
     let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
-    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool)> {
+    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool, bool)> {
         let expanded = match process_output_line(line, show_tags, temp_convert_enabled, zwj_enabled, cached_now) {
-            Some(text) if text.is_empty() => return vec![("".to_string(), false, None, false)],
+            Some(text) if text.is_empty() => return vec![("".to_string(), false, None, false, false)],
             Some(text) => text,
             None => return Vec::new(),
         };
@@ -669,15 +669,23 @@ pub(crate) fn render_output_crossterm(app: &App) {
         };
         let hl_color = line.highlight_color.clone();
         let mn = line.marked_new;
-        // Reduce wrap width when new line indicator prefix will be prepended
-        let wrap_width = if new_line_indicator && mn {
-            term_width.saturating_sub(nli_prefix_width)
-        } else {
-            term_width
-        };
+        let fa = line.from_archive;
+        // Reduce wrap width to reserve space for any prefixes printed separately in the draw loop.
+        // The NLI "▶ " and the archive "🛢️ " prefixes are printed by the draw loop, NOT baked into
+        // the wrapped text, so we subtract their widths here.
+        // Note: ARCHIVE_PREFIX_WIDTH is hardcoded (not computed via unicode_width) because the VS16
+        // variation-selector emoji "🛢️" is measured as 1 col by unicode_width but rendered as 2 cells
+        // by terminals — baking the emoji into the text causes stray characters due to this mismatch.
+        let mut wrap_width = term_width;
+        if new_line_indicator && mn {
+            wrap_width = wrap_width.saturating_sub(nli_prefix_width);
+        }
+        if fa {
+            wrap_width = wrap_width.saturating_sub(ARCHIVE_PREFIX_WIDTH);
+        }
         wrap_ansi_line(&with_emoji_links, wrap_width)
             .into_iter()
-            .map(|s| (s, highlight_f8, hl_color.clone(), mn))
+            .map(|s| (s, highlight_f8, hl_color.clone(), mn, fa))
             .collect()
     };
 
@@ -697,7 +705,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
 
             // Work backwards from scroll_offset to fill the screen
             // Collect in reverse, then reverse once (avoids O(n²) insert(0, ...))
-            let mut rev_lines: Vec<(String, bool, Option<String>, bool)> = Vec::with_capacity(visible_height + 8);
+            let mut rev_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::with_capacity(visible_height + 8);
             for pos in (0..=end_pos).rev() {
                 let line_idx = filtered[pos];
                 if line_idx < world.output_lines.len() {
@@ -741,7 +749,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
         let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
 
         // Collect lines in reverse order, then reverse once (avoids O(n²) insert(0, ...))
-        let mut rev_lines: Vec<(String, bool, Option<String>, bool)> = Vec::with_capacity(visible_height + 8);
+        let mut rev_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::with_capacity(visible_height + 8);
         first_line_idx = end_line;
         let mut old_visual_count: usize = 0;
         let mut applied_vlo = false;
@@ -837,14 +845,14 @@ pub(crate) fn render_output_crossterm(app: &App) {
     // (has pending lines), compose: old context at top + newest lines at bottom,
     // dropping middle lines so total fits in visible_height. Once pending is fully
     // released, just show the bottom visible_height lines normally.
-    let mut composed_lines: Vec<(String, bool, Option<String>, bool)> = Vec::new();
-    let lines_to_show: &[(String, bool, Option<String>, bool)] = if visual_lines.len() <= visible_height {
+    let mut composed_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::new();
+    let lines_to_show: &[(String, bool, Option<String>, bool, bool)] = if visual_lines.len() <= visible_height {
         &visual_lines[..visual_lines.len()]
     } else if new_line_indicator && visual_lines.len() <= visible_height + min_old_context {
         // Old context lines are close to the bottom (within one screen + context).
         // Compose: old context at top + newest lines at bottom.
         let mut old_prefix = 0;
-        for (_,_,_,mn) in &visual_lines {
+        for (_,_,_,mn,_) in &visual_lines {
             if !mn { old_prefix += 1; } else { break; }
         }
         let context = old_prefix.min(min_old_context);
@@ -863,7 +871,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
         &visual_lines[start..]
     };
 
-    for (row_idx, (wrapped, highlight_f8, hl_color, marked_new)) in lines_to_show.iter().enumerate() {
+    for (row_idx, (wrapped, highlight_f8, hl_color, marked_new, from_archive)) in lines_to_show.iter().enumerate() {
         let row_y = row_idx as u16;
 
         let _ = stdout.queue(cursor::MoveTo(0, row_y));
@@ -871,6 +879,13 @@ pub(crate) fn render_output_crossterm(app: &App) {
         // New line indicator: green triangle prefix for unseen/pending lines
         if new_line_indicator && *marked_new {
             let _ = stdout.queue(Print("\x1b[32m▶\x1b[0m "));
+        }
+
+        // Archive indicator: barrel emoji prefix for lines loaded from scrollback.db
+        // Printed separately (not baked into `wrapped`) so that all width measurements
+        // on `wrapped` remain accurate — `unicode_width` undercounts VS16 emoji width.
+        if *from_archive {
+            let _ = stdout.queue(Print("🛢️ "));
         }
 
         // Determine background color: /highlight color takes priority, then F8 highlight
@@ -1221,10 +1236,12 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         for line_idx in (0..=end_line).rev() {
             let line = &world.output_lines[line_idx];
             let is_new = new_line_indicator && line.marked_new;
+            let is_archive = line.from_archive;
 
             let expanded = match process_output_line(line, app.show_tags, app.settings.temp_convert_enabled, app.settings.zwj_enabled, &cached_now) {
                 Some(text) if text.is_empty() => {
                     let prefix = if is_new { "\x1b[32m▶\x1b[0m ".to_string() } else { String::new() };
+                    let prefix = if is_archive { format!("{}🛢️ ", prefix) } else { prefix };
                     wrapped_lines.insert(0, prefix);
                     if wrapped_lines.len() >= visible_height {
                         break;
@@ -1235,15 +1252,20 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
                 None => continue,
             };
 
-            // Wrap the line to fit the output area width (narrower if NLI prefix)
-            let wrap_width = if is_new { area_width.saturating_sub(nli_prefix_width) } else { area_width };
+            // Wrap the line to fit the output area width (narrower if NLI or archive prefix)
+            // ARCHIVE_PREFIX_WIDTH is hardcoded (not computed via unicode_width) because the
+            // VS16 emoji "🛢️" measures as 1 col but renders as 2 cells in terminals.
+            let mut wrap_width = area_width;
+            if is_new { wrap_width = wrap_width.saturating_sub(nli_prefix_width); }
+            if is_archive { wrap_width = wrap_width.saturating_sub(ARCHIVE_PREFIX_WIDTH); }
             let wrapped = wrap_ansi_line(&expanded, wrap_width);
 
             for w in wrapped.into_iter().rev() {
-                let prefixed = if is_new {
-                    format!("\x1b[32m▶\x1b[0m {}", w)
-                } else {
-                    w
+                let prefixed = match (is_new, is_archive) {
+                    (true, true)   => format!("\x1b[32m▶\x1b[0m 🛢️ {}", w),
+                    (true, false)  => format!("\x1b[32m▶\x1b[0m {}", w),
+                    (false, true)  => format!("🛢️ {}", w),
+                    (false, false) => w,
                 };
                 wrapped_lines.insert(0, prefixed);
             }

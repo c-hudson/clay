@@ -28,7 +28,7 @@ use crate::{
     get_version_string, parse_command,
     UpdateSuccess,
     NewPopupAction, WebSettings,
-    ActionsListAction,
+    ActionsListAction, RecentWorldsAction,
     EditorSide, AutoConnectType, KeepAliveType,
     web_settings_from_custom_data, handle_new_popup_key,
     websocket, popup, keybindings, tf, platform,
@@ -1444,6 +1444,17 @@ pub(crate) fn handle_remote_client_key(
             NewPopupAction::NotesList(_action) => {
                 // Notes list not used in remote client
             }
+            NewPopupAction::RecentWorlds(action) => {
+                match action {
+                    RecentWorldsAction::Switch(name) => {
+                        // Route through the daemon's world-switch mechanism.
+                        if let Some(idx) = app.find_world(&name) {
+                            let _ = ws_tx.send(WsMessage::SwitchWorld { world_index: idx });
+                        }
+                    }
+                    RecentWorldsAction::Close => {}
+                }
+            }
             NewPopupAction::None => {}
         }
         return false;
@@ -1808,6 +1819,9 @@ pub(crate) fn dispatch_remote_action(
         }
         "world_activity" => {
             let _ = ws_tx.send(WsMessage::CalculateOldestPending { current_index: app.current_world_index });
+        }
+        "recent_worlds" => {
+            app.open_recent_worlds_popup();
         }
         "world_previous" => {
             let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });

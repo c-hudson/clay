@@ -402,6 +402,8 @@ pub struct TimestampedLine {
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
     #[serde(default)]
     pub marked_new: bool, // true if line arrived while user wasn't viewing (unseen/pending)
+    #[serde(default)]
+    pub from_archive: bool, // true if line was loaded from the scrollback.db archive
 }
 
 /// World state for WebSocket protocol

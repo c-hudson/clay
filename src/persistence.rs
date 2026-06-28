@@ -1571,6 +1571,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         seq,
                         highlight_color: None,
                         marked_new,
+                        from_archive: false,
                     };
                 } else if parts.len() == 3 {
                     // Older format: timestamp|flags|text (no seq)
@@ -1586,6 +1587,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         seq: 0,
                         highlight_color: None,
                         marked_new: false,
+                        from_archive: false,
                     };
                 } else {
                     // Old format: timestamp|text (assume from_server=true for compatibility)
@@ -1597,6 +1599,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         seq: 0,
                         highlight_color: None,
                         marked_new: false,
+                        from_archive: false,
                     };
                 }
             }

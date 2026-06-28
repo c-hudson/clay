@@ -186,14 +186,21 @@ pub fn action_matches_world(action_world: &str, world_name: &str) -> bool {
 /// actions, an exact name match wins over a slash-stripped match, and a world-specific
 /// action wins over a global one sharing the same name.
 ///
-/// Does **not** check `enabled` — callers are responsible for showing the
-/// "action is disabled" message when `action.enabled` is false.
+/// Only returns manual-only actions (no patterns) that are enabled and eligible for
+/// `world_name`. Pattern-based actions are trigger-only and cannot be invoked as commands.
 pub fn find_invocable_action<'a>(actions: &'a [Action], name: &str, world_name: &str) -> Option<&'a Action> {
     let no_slash = name.trim_start_matches('/');
     // Returns the first action in `scope` that matches by exact name then by
     // slash-stripped name.
     let find_in_scope = |world_specific: bool| -> Option<&'a Action> {
         let eligible = |a: &&Action| -> bool {
+            // Pattern-based actions are trigger-only; they cannot be invoked as command aliases.
+            if !a.patterns.is_empty() {
+                return false;
+            }
+            if !a.enabled {
+                return false;
+            }
             if world_specific {
                 !world_field_is_global(&a.world) && action_matches_world(&a.world, world_name)
             } else {
@@ -1527,6 +1534,25 @@ mod tests {
         // from MUD3 → falls back to global
         let found2 = find_invocable_action(&actions, "greet", "MUD3").unwrap();
         assert!(found2.world.is_empty());
+    }
+
+    #[test]
+    fn test_find_invocable_action_ignores_pattern_based() {
+        // An action with a pattern is trigger-only and must not be found as a command alias.
+        let mut action = named_action("adrick");
+        action.patterns.push(MatchPattern { pattern: "*adrick*".to_string(), compiled_regex: None });
+        let actions = vec![action];
+        assert!(find_invocable_action(&actions, "adrick", "").is_none());
+        assert!(find_invocable_action(&actions, "/adrick", "").is_none());
+    }
+
+    #[test]
+    fn test_find_invocable_action_ignores_disabled() {
+        // A disabled action must not be found as a command alias (silently ignored).
+        let mut action = named_action("greet");
+        action.enabled = false;
+        let actions = vec![action];
+        assert!(find_invocable_action(&actions, "greet", "").is_none());
     }
 
     #[test]

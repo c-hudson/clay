@@ -70,6 +70,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     ActionInfo { id: "world_activity", name: "World With Activity", category: "World" },
     ActionInfo { id: "world_previous", name: "Switch to Previous", category: "World" },
     ActionInfo { id: "world_forward", name: "Switch Forward", category: "World" },
+    ActionInfo { id: "recent_worlds", name: "Recent Worlds", category: "World" },
 
     // System
     ActionInfo { id: "help", name: "Help", category: "System" },

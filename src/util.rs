@@ -101,6 +101,13 @@ pub fn color_name_to_ansi_bg(color: &str) -> String {
 /// rendering.rs — 1 col for ▶ + 1 col for the trailing space = 2 total.
 pub const NLI_PREFIX_WIDTH: usize = 2;
 
+/// Width (in columns) of the scrollback-archive prefix "🛢️ " (oil drum emoji + space).
+/// Hardcoded because `unicode_width` undercounts the VS16 variation-selector (U+FE0F) emoji:
+/// it returns 1 for U+1F6E2, 0 for U+FE0F, and 1 for the space = 2 total, but terminals
+/// render the emoji in a 2-cell wide glyph, making the true display width 3 (2 + 1 space).
+/// Must stay in sync with the literal string "🛢️ " printed in rendering.rs.
+pub const ARCHIVE_PREFIX_WIDTH: usize = 3;
+
 /// Effective wrap width for a line, accounting for the new-line-indicator prefix.
 /// When `nli_enabled` is true and the line is `marked_new`, the prefix steals
 /// `NLI_PREFIX_WIDTH` columns; otherwise the full `output_width` is available.

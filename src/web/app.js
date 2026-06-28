@@ -2694,7 +2694,8 @@
                             from_server: line.from_server !== false,
                             seq: line.seq || 0,
                             highlight_color: line.highlight_color,
-                            marked_new: line.marked_new || false
+                            marked_new: line.marked_new || false,
+                            from_archive: line.from_archive || false
                         });
                     }
                     if (msg.world_index === currentWorldIndex) {
@@ -4246,6 +4247,7 @@
             const lineGagged = typeof lineObj === 'object' ? lineObj.gagged : false;
             const lineHighlightColor = typeof lineObj === 'object' ? lineObj.highlight_color : null;
             const lineMarkedNew = typeof lineObj === 'object' ? lineObj.marked_new : false;
+            const lineFromArchive = typeof lineObj === 'object' ? lineObj.from_archive : false;
 
             // Skip gagged lines unless showTags is enabled (F2)
             if (lineGagged && !showTags) {
@@ -4281,7 +4283,8 @@
             // Skip Discord emoji conversion when showTags is enabled so users can see original text
             const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
             const newLinePrefix = (newLineIndicator && lineMarkedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
-            let html = tsPrefix + newLinePrefix + (showTags ? processed : convertDiscordEmojis(processed));
+            const archivePrefix = lineFromArchive ? '🛢️ ' : '';
+            let html = tsPrefix + newLinePrefix + archivePrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
             // Apply /highlight color from action command (takes priority)
             if (lineHighlightColor !== null && lineHighlightColor !== undefined) {

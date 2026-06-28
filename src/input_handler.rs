@@ -16,7 +16,7 @@ use crate::{
     current_timestamp_secs,
     App, World, EditorFocus, EditorSide, DEBUG_ENABLED,
     handle_new_popup_key, NewPopupAction,
-    WorldSelectorAction, ActionsListAction, NotesListAction,
+    WorldSelectorAction, ActionsListAction, NotesListAction, RecentWorldsAction,
     web_settings_from_custom_data, apply_web_settings,
 };
 
@@ -906,6 +906,17 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
             }
+            NewPopupAction::RecentWorlds(action) => {
+                match action {
+                    RecentWorldsAction::Switch(name) => {
+                        if let Some(idx) = app.find_world(&name) {
+                            app.switch_world(idx);
+                            return KeyAction::SwitchedWorld(app.current_world_index);
+                        }
+                    }
+                    RecentWorldsAction::Close => {}
+                }
+            }
             NewPopupAction::None => {}
         }
         return KeyAction::None;
@@ -1606,6 +1617,9 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                 app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
                 app.broadcast_activity();
                 app.needs_output_redraw = true;
+            } else if !app.current_world().is_at_bottom() {
+                app.current_world_mut().scroll_to_bottom();
+                app.needs_output_redraw = true;
             }
             KeyAction::None
         }
@@ -1671,6 +1685,10 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
         }
         "world_activity" => {
             app.switch_to_oldest_pending();
+            KeyAction::None
+        }
+        "recent_worlds" => {
+            app.open_recent_worlds_popup();
             KeyAction::None
         }
         "world_previous" => {

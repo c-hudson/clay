@@ -1731,6 +1731,7 @@ pub async fn handle_daemon_ws_message(
                                     seq: line.seq,
                                     highlight_color: line.highlight_color.clone(),
                                     marked_new: line.marked_new,
+                                    from_archive: line.from_archive,
                                 }
                             })
                             .collect();
@@ -1778,6 +1779,7 @@ pub async fn handle_daemon_ws_message(
                                 seq: line.seq,
                                 highlight_color: line.highlight_color.clone(),
                                 marked_new: line.marked_new,
+                                from_archive: line.from_archive,
                             }
                         })
                         .collect()
@@ -1799,6 +1801,7 @@ pub async fn handle_daemon_ws_message(
                                 seq: line.seq,
                                 highlight_color: line.highlight_color.clone(),
                                 marked_new: line.marked_new,
+                                from_archive: line.from_archive,
                             }
                         })
                         .collect()
@@ -3131,6 +3134,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         seq: s.seq,
                         highlight_color: s.highlight_color.clone(),
                         marked_new: s.marked_new,
+                        from_archive: s.from_archive,
                     }
                 })
                 .collect();
@@ -3150,6 +3154,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         seq: s.seq,
                         highlight_color: s.highlight_color.clone(),
                         marked_new: s.marked_new,
+                        from_archive: s.from_archive,
                     }
                 })
                 .collect();

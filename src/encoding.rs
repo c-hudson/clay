@@ -796,30 +796,80 @@ pub fn wrap_urls_with_osc8(s: &str) -> String {
                 url_end += 1;
             }
 
-            // Strip trailing punctuation that's likely not part of the URL
-            while url_end > url_start {
+            // Strip trailing punctuation that isn't part of the URL. A colored URL often
+            // ends with the punctuation *before* a reset sequence (e.g. "...cq7.\x1b[0m"),
+            // so we also walk back over trailing CSI sequences and zero-width spaces to
+            // reach the real trailing punctuation; otherwise it leaks into the href target.
+            loop {
+                if url_end <= url_start { break; }
                 let c = chars[url_end - 1];
+                if c == '\u{200B}' { url_end -= 1; continue; }
                 if c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?' {
                     url_end -= 1;
-                } else {
-                    break;
+                    continue;
                 }
+                // Trailing CSI sequence: ESC '[' <params 0x20-0x3f>* <final 0x40-0x7e>
+                if ('\x40'..='\x7e').contains(&c) {
+                    let mut k = url_end - 1;
+                    while k > url_start && ('\x20'..='\x3f').contains(&chars[k - 1]) { k -= 1; }
+                    if k >= url_start + 2 && chars[k - 1] == '[' && chars[k - 2] == '\x1b' {
+                        url_end = k - 2;
+                        continue;
+                    }
+                }
+                break;
             }
 
             if url_end > url_start {
-                let url: String = chars[url_start..url_end].iter().collect();
+                let href_span: String = chars[url_start..url_end].iter().collect();
                 // Strip ANSI sequences and zero-width spaces for the OSC 8 parameter so
                 // the browser receives a clean URL. The visible text keeps them intact.
-                let clean_url = strip_ansi_codes(&url).replace('\u{200B}', "");
+                let clean_url = strip_ansi_codes(&href_span).replace('\u{200B}', "");
+
+                // Extend the *visible* link region over trailing punctuation/quotes that
+                // the terminal's own URL matcher would grab (xfce4-terminal, VTE, etc. run
+                // independently of OSC 8). By covering those cells with our OSC 8 link,
+                // Clay's clean href wins the click on every character — including the
+                // trailing `.'` that would otherwise open with a 404.
+                // We only advance link_end when we actually find an absorbable char; a
+                // purely trailing ANSI sequence (e.g. \x1b[0;37m before " rest") is NOT
+                // absorbed, preserving the existing behavior for that case.
+                let mut link_end = url_end;
+                let mut j = url_end;
+                while j < chars.len() {
+                    let c = chars[j];
+                    // Skip CSI sequences (ESC '[' <params>* <final>)
+                    if c == '\x1b' && j + 1 < chars.len() && chars[j + 1] == '[' {
+                        j += 2;
+                        while j < chars.len() {
+                            let sc = chars[j];
+                            j += 1;
+                            if ('\x40'..='\x7e').contains(&sc) { break; }
+                        }
+                        continue;
+                    }
+                    // Skip zero-width spaces
+                    if c == '\u{200B}' { j += 1; continue; }
+                    // Absorb trailing punctuation and quotes the terminal would include
+                    let absorbable = matches!(c,
+                        '.' | ',' | ';' | ':' | '!' | '?' |
+                        '"' | '\'' | '<' | '>' | '[' | ']' | '(' | ')' | '{' | '}' |
+                        '\u{201C}' | '\u{201D}' | '\u{2018}' | '\u{2019}');
+                    if absorbable { j += 1; link_end = j; continue; }
+                    break;
+                }
+
                 // OSC 8 format: \x1b]8;;URL\x07VISIBLE_TEXT\x1b]8;;\x07
-                // Using BEL (0x07) as terminator for better terminal compatibility
-                // URL parameter uses clean URL, visible text preserves original (may have ZWSP for breaking)
+                // Using BEL (0x07) as terminator for better terminal compatibility.
+                // href uses the clean stripped URL; visible text extends to link_end
+                // (covers trailing punctuation/quotes the terminal would otherwise grab).
+                let visible: String = chars[url_start..link_end].iter().collect();
                 result.push_str("\x1b]8;;");
                 result.push_str(&clean_url);
                 result.push('\x07');
-                result.push_str(&url);
+                result.push_str(&visible);
                 result.push_str("\x1b]8;;\x07");
-                i = url_end;
+                i = link_end;
                 continue;
             }
         }
