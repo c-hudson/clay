@@ -24,15 +24,16 @@ cp target/release/clay /tmp/clay-linux-x86_64-gui
 
 ### Windows (pre-built by user)
 
-The Windows binary is built natively on a Windows machine with MSVC (not cross-compiled).
-The user places `clay.exe` in the project root directory before running `/release`.
+**Note:** Windows is now built remotely on the Windows VM (see below). This section is kept
+for fallback: if the VM is unavailable and the user hand-builds `clay.exe`, place it in the
+project root before running `/release`.
 
 ```cmd
 set RUSTFLAGS=-C target-feature=+crt-static
 cargo build --release --features webview-gui,native-audio
 ```
 
-- Binary: `clay.exe` (project root)
+- Binary: `clay.exe` (project root, fallback only)
 - Release asset name: `clay-windows-x86_64.exe`
 - Static CRT linking (`+crt-static`) eliminates vcruntime140.dll dependency
 
@@ -51,6 +52,25 @@ zipalign -v -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk 
 # Sign
 ~/Android/Sdk/build-tools/35.0.0/apksigner sign --ks android/clay-release.keystore --ks-pass file:$HOME/.clay-keystore-pass --out android/clay-android.apk android/clay-android-aligned.apk
 ```
+
+## Windows VM (192.168.2.14) — VirtualBox guest on Linux host
+
+- User: `adrick`
+- SSH port: `22`
+- Path: `C:\Users\adrick\clay`
+- SSH command: `ssh adrick@192.168.2.14`
+- **Lifecycle:** VM is kept powered off when not in use. `/release` starts it before building and powers it off after (see SKILL.md Step 6b).
+- Start: `VBoxManage startvm clay-win11 --type headless`
+- Stop: `VBoxManage controlvm clay-win11 poweroff`
+
+### Windows x86_64 binary (MSVC, GUI + audio)
+```cmd
+cd clay && git pull && set RUSTFLAGS=-C target-feature=+crt-static && cargo build --release --features webview-gui,native-audio
+```
+- Binary: `target\release\clay.exe`
+- Release asset name: `clay-windows-x86_64.exe`
+- SCP back: `scp adrick@192.168.2.14:clay/target/release/clay.exe /tmp/clay-windows-x86_64.exe`
+- Static CRT (`+crt-static`) eliminates vcruntime140.dll dependency
 
 ## Mac (192.168.2.12)
 
