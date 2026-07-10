@@ -272,11 +272,14 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             "DM User",
             FieldKind::text(&settings.discord_dm_user),
         ))
-        // Buttons - Tab cycles: Save -> Cancel -> Connect -> Delete -> Save
-        .with_button(Button::new(WORLD_BTN_SAVE, "Save").primary().with_shortcut('S').with_tab_index(0))
-        .with_button(Button::new(WORLD_BTN_CANCEL, "Cancel").with_shortcut('C').with_tab_index(1))
-        .with_button(Button::new(WORLD_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align().with_tab_index(3))
-        .with_button(Button::new(WORLD_BTN_CONNECT, "Connect").with_shortcut('O').with_tab_index(2))
+        // Buttons cycle left-to-right within each group: right-aligned group is
+        // Save -> Cancel -> Connect; left-aligned group (after the ? help button
+        // is inserted by with_help() below) is ? -> Delete; then wraps to the
+        // first field.
+        .with_button(Button::new(WORLD_BTN_SAVE, "Save").primary().with_shortcut('S'))
+        .with_button(Button::new(WORLD_BTN_CANCEL, "Cancel").with_shortcut('C'))
+        .with_button(Button::new(WORLD_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
+        .with_button(Button::new(WORLD_BTN_CONNECT, "Connect").with_shortcut('O'))
         .with_layout(PopupLayout {
             label_width: 12,
             min_width: 50,

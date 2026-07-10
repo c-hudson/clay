@@ -105,7 +105,7 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             ACTIONS_FIELD_FILTER,
             "",
             FieldKind::text_with_placeholder("", "Filter Actions..."),
-        ))
+        ).with_shortcut('F').search())
         .with_field(Field::new(
             ACTIONS_FIELD_LIST,
             "",

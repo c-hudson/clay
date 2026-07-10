@@ -427,6 +427,9 @@ pub struct Field {
     pub shortcut: Option<char>,
     /// Tab order index (lower = earlier in tab cycle). None = use definition order after indexed elements.
     pub tab_index: Option<u32>,
+    /// Whether this is a filter/search field. Search fields are always ordered
+    /// first in the navigation cycle (see `PopupDefinition::ordered_elements`).
+    pub search: bool,
 }
 
 impl Field {
@@ -439,6 +442,7 @@ impl Field {
             enabled: true,
             shortcut: None,
             tab_index: None,
+            search: false,
         }
     }
 
@@ -452,6 +456,7 @@ impl Field {
             enabled: false,
             shortcut: None,
             tab_index: None,
+            search: false,
         }
     }
 
@@ -470,6 +475,14 @@ impl Field {
     /// Set the tab order index for this field
     pub fn with_tab_index(mut self, index: u32) -> Self {
         self.tab_index = Some(index);
+        self
+    }
+
+    /// Mark this as a filter/search field. Search fields are ordered first
+    /// in the navigation cycle (order of moving: search -> inputs -> right
+    /// buttons -> left buttons).
+    pub fn search(mut self) -> Self {
+        self.search = true;
         self
     }
 
@@ -722,6 +735,82 @@ impl PopupDefinition {
             .filter(|b| b.enabled)
             .map(|b| b.id)
             .collect()
+    }
+
+    /// Build the canonical "order of moving" for this popup:
+    /// 1. Filter/search fields
+    /// 2. Other focusable fields (in definition/tab_index order)
+    /// 3. Right-aligned enabled buttons
+    /// 4. Left-aligned enabled buttons
+    ///
+    /// Within each group, elements with an explicit `tab_index` are sorted by
+    /// that index and come first; the rest follow in definition order. This
+    /// generalizes the sort used by the old `cycle_field_buttons` to cover
+    /// every focusable field kind (not just text-editable ones), since Up/Down
+    /// navigation must be able to reach Toggle/Select/Number/List fields too.
+    ///
+    /// Returns (is_button, id) pairs in navigation order.
+    pub fn ordered_elements(&self) -> Vec<(bool, u32)> {
+        fn sort_group(group: &mut [(bool, u32, u32)]) {
+            group.sort_by(|a, b| match (a.0, b.0) {
+                (true, true) => a.1.cmp(&b.1),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => a.1.cmp(&b.1),
+            });
+        }
+
+        let mut search_fields: Vec<(bool, u32, u32)> = Vec::new();
+        let mut other_fields: Vec<(bool, u32, u32)> = Vec::new();
+        let mut right_buttons: Vec<(bool, u32, u32)> = Vec::new();
+        let mut left_buttons: Vec<(bool, u32, u32)> = Vec::new();
+
+        for (def_idx, field) in self.fields.iter().enumerate() {
+            if !field.is_focusable() {
+                continue;
+            }
+            let (has_idx, idx) = match field.tab_index {
+                Some(i) => (true, i),
+                None => (false, def_idx as u32),
+            };
+            if field.search {
+                search_fields.push((has_idx, idx, field.id.0));
+            } else {
+                other_fields.push((has_idx, idx, field.id.0));
+            }
+        }
+
+        for (def_idx, button) in self.buttons.iter().enumerate() {
+            if !button.enabled {
+                continue;
+            }
+            let (has_idx, idx) = match button.tab_index {
+                Some(i) => (true, i),
+                None => (false, def_idx as u32),
+            };
+            if button.left_align {
+                left_buttons.push((has_idx, idx, button.id.0));
+            } else {
+                right_buttons.push((has_idx, idx, button.id.0));
+            }
+        }
+
+        sort_group(&mut search_fields);
+        sort_group(&mut other_fields);
+        // Buttons are NOT sorted by tab_index: they must navigate in the same
+        // left-to-right order the console renderer draws them in (definition
+        // order), or Tab/Up/Down would visit a button group in a different
+        // order than what's on screen. See render_buttons() in
+        // console_renderer.rs, which lays out each group in definition order.
+
+        let mut result = Vec::with_capacity(
+            search_fields.len() + other_fields.len() + right_buttons.len() + left_buttons.len(),
+        );
+        result.extend(search_fields.into_iter().map(|(_, _, id)| (false, id)));
+        result.extend(other_fields.into_iter().map(|(_, _, id)| (false, id)));
+        result.extend(right_buttons.into_iter().map(|(_, _, id)| (true, id)));
+        result.extend(left_buttons.into_iter().map(|(_, _, id)| (true, id)));
+        result
     }
 }
 
@@ -1124,79 +1213,151 @@ impl PopupState {
         matches!(&self.selected, ElementSelection::Button(selected_id) if *selected_id == id)
     }
 
-    /// Cycle between focusable text fields and buttons (for Tab key)
-    /// Uses tab_index to determine order. Elements with tab_index are sorted by index,
-    /// elements without tab_index come after, in definition order.
-    /// If layout.tab_buttons_only is true, only cycles through buttons.
-    /// Returns true if selection changed
+    /// Find the position of the currently selected element within an
+    /// `ordered_elements()` list.
+    fn position_in(&self, elements: &[(bool, u32)]) -> Option<usize> {
+        match &self.selected {
+            ElementSelection::Field(id) => {
+                elements.iter().position(|(is_btn, elem_id)| !is_btn && *elem_id == id.0)
+            }
+            ElementSelection::Button(id) => {
+                elements.iter().position(|(is_btn, elem_id)| *is_btn && *elem_id == id.0)
+            }
+            ElementSelection::None => None,
+        }
+    }
+
+    fn select_element(&mut self, (is_button, id): (bool, u32)) {
+        self.selected = if is_button {
+            ElementSelection::Button(ButtonId(id))
+        } else {
+            ElementSelection::Field(FieldId(id))
+        };
+    }
+
+    /// Tab key: from a field, jump straight to the first button; from a
+    /// button, move to the next button; from the last button, wrap around to
+    /// the first field (first search field, else first input field). Popups
+    /// with no buttons simply cycle through fields; popups with no fields
+    /// simply cycle through buttons.
+    /// Returns true if selection changed.
     pub fn cycle_field_buttons(&mut self) -> bool {
-        // Build a list of tabbable elements: (sort_key, is_button, id)
-        // sort_key = (has_index, index_or_def_order)
-        let mut tabbable: Vec<(bool, u32, bool, u32)> = Vec::new(); // (has_index, index, is_button, id)
-
-        // Add text-editable fields (unless tab_buttons_only is set)
-        if !self.definition.layout.tab_buttons_only {
-            for (def_idx, field) in self.definition.fields.iter().enumerate() {
-                if field.is_focusable() && field.kind.is_text_editable() {
-                    let (has_idx, idx) = match field.tab_index {
-                        Some(i) => (true, i),
-                        None => (false, def_idx as u32),
-                    };
-                    tabbable.push((has_idx, idx, false, field.id.0));
-                }
-            }
-        }
-
-        // Add enabled buttons
-        for (def_idx, button) in self.definition.buttons.iter().enumerate() {
-            if button.enabled {
-                let (has_idx, idx) = match button.tab_index {
-                    Some(i) => (true, i),
-                    None => (false, def_idx as u32),
-                };
-                tabbable.push((has_idx, idx, true, button.id.0));
-            }
-        }
-
-        if tabbable.is_empty() {
+        let elements = self.definition.ordered_elements();
+        if elements.is_empty() {
             return false;
         }
 
-        // Sort: elements with tab_index come first (sorted by index),
-        // then elements without tab_index (sorted by their tuple values)
-        tabbable.sort_by(|a, b| {
-            match (a.0, b.0) {
-                (true, true) => a.1.cmp(&b.1),   // Both have index: sort by index
-                (true, false) => std::cmp::Ordering::Less,  // a has index, b doesn't: a first
-                (false, true) => std::cmp::Ordering::Greater, // b has index, a doesn't: b first
-                (false, false) => a.1.cmp(&b.1), // Neither has index: sort by def order
-            }
-        });
-
-        // Find current position in the sorted list
-        let current_pos = match &self.selected {
-            ElementSelection::Field(id) => {
-                tabbable.iter().position(|(_, _, is_btn, elem_id)| !is_btn && *elem_id == id.0)
-            }
-            ElementSelection::Button(id) => {
-                tabbable.iter().position(|(_, _, is_btn, elem_id)| *is_btn && *elem_id == id.0)
-            }
-            ElementSelection::None => None,
-        };
-
-        // Move to next element (or first if not found or at end)
+        let current_pos = self.position_in(&elements);
         let next_pos = match current_pos {
-            Some(pos) => (pos + 1) % tabbable.len(),
+            Some(pos) if !elements[pos].0 => {
+                // On a field: jump to the first button, if any; otherwise
+                // just advance to the next field (no buttons to tab to).
+                elements.iter().position(|(is_btn, _)| *is_btn).unwrap_or((pos + 1) % elements.len())
+            }
+            Some(pos) => {
+                // On a button: advance to the next button, or wrap to the
+                // first field (or first button, if there are no fields).
+                let next = pos + 1;
+                if next < elements.len() && elements[next].0 {
+                    next
+                } else {
+                    elements.iter().position(|(is_btn, _)| !is_btn).unwrap_or(0)
+                }
+            }
             None => 0,
         };
 
-        let (_, _, is_button, id) = tabbable[next_pos];
-        if is_button {
-            self.selected = ElementSelection::Button(ButtonId(id));
-        } else {
-            self.selected = ElementSelection::Field(FieldId(id));
-        }
+        self.select_element(elements[next_pos]);
         true
+    }
+
+    /// Shift+Tab: the exact reverse of `cycle_field_buttons`.
+    /// Returns true if selection changed.
+    pub fn cycle_field_buttons_rev(&mut self) -> bool {
+        let elements = self.definition.ordered_elements();
+        if elements.is_empty() {
+            return false;
+        }
+
+        let current_pos = self.position_in(&elements);
+        let prev_pos = match current_pos {
+            Some(pos) if elements[pos].0 => {
+                // On a button: previous button, or wrap to the last field
+                // (or last button, if there are no fields).
+                if pos > 0 && elements[pos - 1].0 {
+                    pos - 1
+                } else {
+                    elements.iter().rposition(|(is_btn, _)| !is_btn).unwrap_or(elements.len() - 1)
+                }
+            }
+            Some(pos) => {
+                // On a field: previous field, or wrap to the last button
+                // (or last field, if there are no buttons).
+                if pos > 0 && !elements[pos - 1].0 {
+                    pos - 1
+                } else {
+                    elements.iter().rposition(|(is_btn, _)| *is_btn).unwrap_or(elements.len() - 1)
+                }
+            }
+            None => elements.len() - 1,
+        };
+
+        self.select_element(elements[prev_pos]);
+        true
+    }
+
+    /// Down key: move forward through the "order of moving" (search fields,
+    /// then other fields, then right buttons, then left buttons), wrapping
+    /// around. If the currently selected field is a List or ScrollableContent,
+    /// this instead scrolls/moves the selection *within* that field, matching
+    /// "list/menu/help popups keep arrow-scrolling inside their list."
+    pub fn next_item(&mut self) {
+        if let Some(field) = self.selected_field() {
+            match &field.kind {
+                FieldKind::List { .. } => { self.list_select_down(); return; }
+                FieldKind::ScrollableContent { .. } => { self.scroll_down(1); return; }
+                _ => {}
+            }
+        }
+        let elements = self.definition.ordered_elements();
+        if elements.is_empty() {
+            return;
+        }
+        let next_pos = match self.position_in(&elements) {
+            Some(pos) => (pos + 1) % elements.len(),
+            None => 0,
+        };
+        self.select_element(elements[next_pos]);
+    }
+
+    /// Up key: the exact reverse of `next_item`.
+    pub fn prev_item(&mut self) {
+        if let Some(field) = self.selected_field() {
+            match &field.kind {
+                FieldKind::List { .. } => { self.list_select_up(); return; }
+                FieldKind::ScrollableContent { .. } => { self.scroll_up(1); return; }
+                _ => {}
+            }
+        }
+        let elements = self.definition.ordered_elements();
+        if elements.is_empty() {
+            return;
+        }
+        let prev_pos = match self.position_in(&elements) {
+            Some(pos) => if pos == 0 { elements.len() - 1 } else { pos - 1 },
+            None => elements.len() - 1,
+        };
+        self.select_element(elements[prev_pos]);
+    }
+
+    /// Find an enabled button whose shortcut letter matches (case-insensitive).
+    /// Used to dispatch a bare keypress (when not editing) to invoke that
+    /// button, per the "button hotkey letter" navigation rule.
+    pub fn find_button_by_shortcut(&self, key: char) -> Option<ButtonId> {
+        let key_lower = key.to_ascii_lowercase();
+        self.definition.buttons.iter()
+            .find(|b| b.enabled && b.shortcut.map(|s| s.to_ascii_lowercase()) == Some(key_lower))
+            .map(|b| b.id)
     }
 
     /// Find and select a field by its shortcut key
@@ -2053,6 +2214,141 @@ mod tests {
 
         state.prev_button();
         assert!(matches!(state.selected, ElementSelection::Button(BTN_CANCEL)));
+    }
+
+    #[test]
+    fn test_cycle_field_buttons_order() {
+        let def = create_test_popup();
+        let mut state = PopupState::new(def);
+        state.open();
+
+        // Starts on first field
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+
+        // Tab from a field jumps straight to the first button
+        assert!(state.cycle_field_buttons());
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_SAVE)));
+
+        // Tab from a button goes to the next button
+        assert!(state.cycle_field_buttons());
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_CANCEL)));
+
+        // Tab from the last button wraps to the first field
+        assert!(state.cycle_field_buttons());
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+    }
+
+    #[test]
+    fn test_cycle_field_buttons_rev_is_exact_reverse() {
+        let def = create_test_popup();
+        let mut state = PopupState::new(def);
+        state.open();
+
+        // From the first field, Shift+Tab wraps to the last button
+        assert!(state.cycle_field_buttons_rev());
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_CANCEL)));
+
+        // From a button, Shift+Tab goes to the previous button
+        assert!(state.cycle_field_buttons_rev());
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_SAVE)));
+
+        // From the first button, Shift+Tab wraps to the last field
+        assert!(state.cycle_field_buttons_rev());
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+    }
+
+    #[test]
+    fn test_left_aligned_buttons_ordered_last() {
+        let def = PopupDefinition::new(PopupId("test_left"), "Test")
+            .with_field(Field::new(FIELD_NAME, "Name", FieldKind::text("")))
+            .with_button(Button::new(BTN_SAVE, "Save").primary().with_shortcut('S'))
+            .with_button(Button::new(BTN_CANCEL, "Delete").danger().left_align().with_shortcut('D'));
+        let mut state = PopupState::new(def);
+        state.open();
+
+        // Right-aligned buttons come before left-aligned ones in the order
+        assert!(state.cycle_field_buttons()); // field -> first button (right-aligned Save)
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_SAVE)));
+        assert!(state.cycle_field_buttons()); // Save -> Delete (left-aligned)
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_CANCEL)));
+        assert!(state.cycle_field_buttons()); // wraps back to field
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+    }
+
+    #[test]
+    fn test_left_aligned_group_navigates_in_definition_order_not_tab_index() {
+        // Regression test: a left-aligned group must navigate in the same
+        // left-to-right order the console renderer draws it in (definition
+        // order), even if a later button in that group carries an explicit
+        // tab_index. This mirrors World Editor's real layout: the "?" help
+        // button is defined/inserted first with no tab_index, "Delete" is
+        // defined second with a tab_index — the left group must still be
+        // visited "?" then "Delete" (matching what's drawn), not reordered
+        // by tab_index.
+        const BTN_HELP: ButtonId = ButtonId(99);
+        const BTN_DELETE: ButtonId = ButtonId(3);
+        let def = PopupDefinition::new(PopupId("test_left_order"), "Test")
+            .with_field(Field::new(FIELD_NAME, "Name", FieldKind::text("")))
+            .with_button(Button::new(BTN_HELP, "?").left_align()) // defined first, no tab_index
+            .with_button(
+                Button::new(BTN_DELETE, "Delete")
+                    .danger()
+                    .left_align()
+                    .with_tab_index(3), // defined second, but has a tab_index
+            );
+        let mut state = PopupState::new(def);
+        state.open();
+
+        // No buttons are right-aligned, so Tab from the field jumps straight
+        // into the left group in definition/render order: "?" then "Delete".
+        assert!(state.cycle_field_buttons());
+        assert!(
+            matches!(state.selected, ElementSelection::Button(BTN_HELP)),
+            "left group must start on the first-defined button (?), not the one with a tab_index"
+        );
+        assert!(state.cycle_field_buttons());
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_DELETE)));
+        assert!(state.cycle_field_buttons()); // wraps back to field
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+    }
+
+    #[test]
+    fn test_next_item_and_prev_item_full_cycle() {
+        let def = create_test_popup();
+        let mut state = PopupState::new(def);
+        state.open();
+
+        // Down moves through fields in order, then into buttons
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_EMAIL)));
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_SAVE)));
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_CANCEL)));
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME))); // wraps
+
+        // Up is the exact reverse
+        state.prev_item();
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_CANCEL)));
+        state.prev_item();
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_SAVE)));
+        state.prev_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+    }
+
+    #[test]
+    fn test_find_button_by_shortcut() {
+        let def = create_test_popup();
+        let state = PopupState::new(def);
+
+        assert_eq!(state.find_button_by_shortcut('s'), Some(BTN_SAVE));
+        assert_eq!(state.find_button_by_shortcut('S'), Some(BTN_SAVE));
+        assert_eq!(state.find_button_by_shortcut('c'), Some(BTN_CANCEL));
+        assert_eq!(state.find_button_by_shortcut('z'), None);
     }
 
     #[test]

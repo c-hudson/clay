@@ -64,8 +64,8 @@ pub fn create_notes_list_popup(notes: &[NoteInfo], visible_height: usize) -> Pop
             "",
             FieldKind::list_with_headers_and_widths(items, visible_height, NOTES_LIST_HEADERS, column_widths),
         ))
-        .with_button(Button::new(NOTES_BTN_CANCEL, "Cancel").with_shortcut('C').with_tab_index(1))
-        .with_button(Button::new(NOTES_BTN_OPEN, "Open").primary().with_shortcut('O').with_tab_index(0))
+        .with_button(Button::new(NOTES_BTN_CANCEL, "Cancel").with_shortcut('C'))
+        .with_button(Button::new(NOTES_BTN_OPEN, "Open").primary().with_shortcut('O'))
         .with_layout(PopupLayout {
             label_width: 8,
             min_width: 50,

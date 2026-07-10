@@ -40,7 +40,7 @@ pub fn create_recent_worlds_popup(worlds: &[RecentWorldInfo], visible_height: us
                 FieldKind::label("No recently active worlds."),
             ))
             .with_field(Field::new(RECENT_FIELD_SPACER, "", FieldKind::label("")))
-            .with_button(Button::new(RECENT_BTN_CLOSE, "Close").with_shortcut('C').with_tab_index(0))
+            .with_button(Button::new(RECENT_BTN_CLOSE, "Close").with_shortcut('C'))
             .with_layout(PopupLayout {
                 label_width: 0,
                 min_width: 40,
@@ -87,7 +87,7 @@ pub fn create_recent_worlds_popup(worlds: &[RecentWorldInfo], visible_height: us
         // Blank spacer line between list and buttons (no blank_line_before_buttons flag exists)
         .with_field(Field::new(RECENT_FIELD_SPACER, "", FieldKind::label("")))
         .with_button(Button::new(RECENT_BTN_OK, "OK").primary().with_shortcut('O'))
-        .with_button(Button::new(RECENT_BTN_CLOSE, "Close").with_shortcut('C').with_tab_index(0))
+        .with_button(Button::new(RECENT_BTN_CLOSE, "Close").with_shortcut('C'))
         .with_layout(PopupLayout {
             label_width: 0,
             min_width: 40,

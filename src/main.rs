@@ -1719,6 +1719,9 @@ pub enum Command {
     WorldSwitch { name: String },
     /// /connect [host port [ssl]] - connect to server (internal use by buttons/TF)
     Connect { host: Option<String>, port: Option<String>, ssl: bool },
+    /// /connect host:port | host port | --close | --cancel - attach to/detach from a remote
+    /// Clay server instance (relaunches this process as a remote client, or back to master)
+    RemoteAttach { addr: String, close: bool, cancel: bool },
     /// /disconnect or /dc - disconnect current world
     Disconnect,
     /// /flush - clear output buffer for current world
@@ -1833,6 +1836,7 @@ pub fn parse_command(input: &str) -> Command {
         "/connections" | "/l" => Command::WorldsList,
         "/worlds" | "/world" => parse_world_command(args),
         "/__connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
+        "/connect" => parse_remote_attach_command(args),
         "/disconnect" | "/dc" => Command::Disconnect,
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
@@ -1996,6 +2000,30 @@ fn parse_connect_command(args: &[&str]) -> Command {
     let ssl = args.get(2).map(|s| s.to_lowercase() == "ssl").unwrap_or(false);
 
     Command::Connect { host, port, ssl }
+}
+
+/// Parse /connect command (attach to / detach from a remote Clay server instance)
+///
+/// Formats:
+///   /connect host:port
+///   /connect host port
+///   /connect --close    (detach and become an independent master)
+///   /connect --cancel   (cancel a pending confirmation)
+fn parse_remote_attach_command(args: &[&str]) -> Command {
+    if args.first().map(|a| a.eq_ignore_ascii_case("--close")).unwrap_or(false) {
+        return Command::RemoteAttach { addr: String::new(), close: true, cancel: false };
+    }
+    if args.first().map(|a| a.eq_ignore_ascii_case("--cancel")).unwrap_or(false) {
+        return Command::RemoteAttach { addr: String::new(), close: false, cancel: true };
+    }
+
+    let addr = match args.len() {
+        0 => String::new(),
+        1 => args[0].to_string(),
+        _ => format!("{}:{}", args[0], args[1]),
+    };
+
+    Command::RemoteAttach { addr, close: false, cancel: false }
 }
 
 /// Parse /addworld command (TF-compatible world creation)
@@ -3097,6 +3125,13 @@ pub struct App {
     pub pending_update: Option<bool>,
     /// Remote client mode: pending /reload request (re-exec local binary)
     pub pending_reload: bool,
+    /// Master mode: pending /connect confirmation (target addr, requested at). Cleared on
+    /// confirm/cancel or when superseded by a different target.
+    pub pending_remote_connect: Option<(String, std::time::Instant)>,
+    /// Remote client mode: pending /connect --close request (re-exec as independent master)
+    pub pending_remote_detach: bool,
+    /// Remote client mode: pending /connect host:port request (re-exec attached elsewhere)
+    pub pending_remote_switch: Option<String>,
     /// Activity count from server (used in remote client mode, i.e. --console)
     pub server_activity_count: usize,
     /// Remote client backfill: queue of (world_index, total_output_lines) to backfill
@@ -3201,6 +3236,9 @@ impl App {
             ws_client_tx: None, // Set when running as remote client (--console mode)
             pending_update: None,
             pending_reload: false,
+            pending_remote_connect: None,
+            pending_remote_detach: false,
+            pending_remote_switch: None,
             server_activity_count: 0, // Activity count from server (remote client mode)
             backfill_queue: Vec::new(),
             backfill_next: None,
@@ -4838,6 +4876,37 @@ impl App {
         self.needs_output_redraw = true;
     }
 
+    /// Handle a `/connect host:port` request from a master instance. Returns true if the
+    /// caller should proceed with the relaunch now, false if it printed a message instead
+    /// (usage error, or a confirmation warning that requires repeating the command).
+    ///
+    /// A second `/connect <same addr>` within ~15 seconds confirms and returns true.
+    fn request_remote_attach(&mut self, addr: &str) -> bool {
+        if addr.is_empty() {
+            self.add_output("Usage: /connect host:port  (or)  /connect host port  (or)  /connect --close");
+            return false;
+        }
+
+        const CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+        if let Some((pending_addr, requested_at)) = self.pending_remote_connect.take() {
+            if pending_addr == addr && requested_at.elapsed() < CONFIRM_WINDOW {
+                return true;
+            }
+        }
+
+        let connected_count = self.worlds.iter().filter(|w| w.connected).count();
+        self.pending_remote_connect = Some((addr.to_string(), std::time::Instant::now()));
+        self.add_output(&format!(
+            "This will disconnect this instance's server (and {} connected world{}) and attach \
+             to {} as a remote client. Run /connect {} again within 15s to confirm, or /connect --cancel.",
+            connected_count,
+            if connected_count == 1 { "" } else { "s" },
+            addr,
+            addr,
+        ));
+        false
+    }
+
     /// Add TF command output (does NOT get % prefix, but is client-generated so Ctrl+L filters it)
     fn add_tf_output(&mut self, text: &str) {
         let is_current = true;
@@ -6383,6 +6452,39 @@ impl App {
         }
     }
 
+    /// Handle a `TfCommandResult::ClayCommand` produced while executing a command on behalf of
+    /// a WebSocket client (web/Android/remote console). The master owns the sockets, so
+    /// world-switch/connect commands must be connected here rather than merely bounced back to
+    /// the client for local (view-only) handling — otherwise remote clients can "switch" to a
+    /// world without ever actually connecting it (e.g. an action like `/common` that loops over
+    /// worlds emitting `/worlds <name>` for each one). All other ClayCommands keep the existing
+    /// bounce-to-client behavior unchanged.
+    fn dispatch_ws_clay_command(&mut self, client_id: u64, clay_cmd: String, event_tx: &mpsc::Sender<AppEvent>) {
+        match parse_command(&clay_cmd) {
+            Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+                if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                    // Tell the client to switch its local view, same as before.
+                    self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd.clone() });
+                    // Connect server-side if needed. handle_ws_send_command is synchronous and
+                    // can only return one WsAsyncAction, but an action like /common can target
+                    // many worlds, so we enqueue an async connect request per world instead.
+                    if !self.worlds[idx].connected && self.worlds[idx].settings.has_connection_settings() {
+                        if matches!(parse_command(&clay_cmd), Command::WorldConnectNoLogin { .. }) {
+                            self.worlds[idx].skip_auto_login = true;
+                        }
+                        let _ = event_tx.try_send(AppEvent::ConnectWorldRequest(idx, String::new()));
+                    }
+                    return;
+                }
+                // Unknown world name - fall back to the existing bounce behavior.
+                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+            }
+            _ => {
+                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+            }
+        }
+    }
+
     /// Handle WsMessage::SendCommand - processes the command and returns a WsAsyncAction
     /// if an async operation (connect/disconnect) is needed.
     #[allow(clippy::too_many_lines)]
@@ -6448,7 +6550,7 @@ impl App {
                                         }
                                     }
                                     tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                        self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                        self.dispatch_ws_clay_command(client_id, clay_cmd, event_tx);
                                     }
                                     tf::TfCommandResult::Recall(opts) => {
                                         if world_index < self.worlds.len() {
@@ -6533,7 +6635,7 @@ impl App {
                             }
                         }
                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                            self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                            self.dispatch_ws_clay_command(client_id, clay_cmd, event_tx);
                         }
                         tf::TfCommandResult::Recall(opts) => {
                             if world_index < self.worlds.len() {
@@ -6678,6 +6780,43 @@ impl App {
                             let _ = tx.try_send(make_write_cmd(&text));
                             self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
                         }
+                    }
+                }
+            }
+            Command::RemoteAttach { addr, close, cancel } => {
+                // Only the master's own local GUI webview (connected from loopback) may
+                // trigger a relaunch. Any other WebSocket client (remote web/console/GUI,
+                // or a console master which has no gui_tx) is rejected — otherwise one
+                // remote client could hijack the master's server for everyone.
+                let is_local_gui_master = self.gui_tx.is_some()
+                    && self.ws_server.as_ref()
+                        .and_then(|s| s.get_client_ip(client_id))
+                        .map(|ip| ip == "127.0.0.1" || ip == "::1")
+                        .unwrap_or(false);
+
+                if !is_local_gui_master {
+                    self.ws_send_to_client(client_id, WsMessage::ServerData {
+                        world_index,
+                        data: "/connect is only available from the local console or GUI.".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                        seq: 0,
+                        marked_new: false,
+                        flush: false, gagged: false,
+                    });
+                } else if cancel {
+                    if self.pending_remote_connect.take().is_some() {
+                        self.add_output("Cancelled.");
+                    } else {
+                        self.add_output("No pending /connect to cancel.");
+                    }
+                } else if close {
+                    // This process is already an independent master; nothing to detach from.
+                    self.add_output("Already running as an independent master.");
+                } else if self.request_remote_attach(&addr) {
+                    if let Err(e) = crate::platform::exec_relaunch(Some(&addr), true) {
+                        self.add_output(&format!("Connect failed: {}", e));
                     }
                 }
             }
@@ -7884,8 +8023,11 @@ impl App {
                     self.init_scrollback();
                 }
                 self.settings.url_shortener_service = UrlShortener::from_name(&url_shortener);
-                // Save settings to persist changes
-                let _ = persistence::save_settings(self);
+                // Save settings to persist changes. Tag the (debug-mode-only) audit log
+                // with which kind of client pushed this, so a future settings-loss report
+                // can be traced back to its source (web/gui/console/android).
+                let save_source = self.ws_get_client_type(client_id).map(|t| t.label()).unwrap_or("web");
+                let _ = persistence::save_settings_with_source(self, save_source);
                 // Build settings message for broadcast (uses build_global_settings_msg to avoid leaking sensitive data)
                 let settings_msg = self.build_global_settings_msg();
                 // Broadcast update to all clients
@@ -9792,53 +9934,40 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     state.list_select_down();
                 }
                 Tab => {
-                    // Cycle between filter field and buttons
+                    // Cycle: field -> first button -> next button -> wrap to field
                     state.cycle_field_buttons();
                 }
                 BackTab => {
-                    // Cycle backwards
-                    state.cycle_field_buttons();
+                    // Exact reverse of Tab
+                    state.cycle_field_buttons_rev();
                 }
                 Char(c) => {
-                    // Check if filter field is selected - if so, start editing and add char
-                    if state.is_field_selected(SELECTOR_FIELD_FILTER) {
-                        state.start_edit();
-                        state.insert_char(c);
-                        return NewPopupAction::WorldSelectorFilter;
-                    }
-                    // Otherwise handle as shortcuts
-                    match c {
-                        'f' | 'F' => {
-                            // Select filter field and start editing
-                            state.select_field(SELECTOR_FIELD_FILTER);
-                            state.start_edit();
-                        }
-                        'a' | 'A' => {
-                            app.popup_manager.close();
-                            return NewPopupAction::WorldSelector(WorldSelectorAction::Add);
-                        }
-                        'e' | 'E' => {
-                            if let Some(name) = get_selected() {
-                                app.popup_manager.close();
-                                return NewPopupAction::WorldSelector(WorldSelectorAction::Edit(name));
-                            }
-                        }
-                        'd' | 'D' => {
-                            if let Some(name) = get_selected() {
-                                app.popup_manager.close();
-                                return NewPopupAction::WorldSelector(WorldSelectorAction::Delete(name));
-                            }
-                        }
-                        'o' | 'O' => {
+                    // Not editing: bare letters are button hotkeys only (never
+                    // implicit text entry - Enter is required to start editing).
+                    if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        if btn_id == SELECTOR_BTN_CONNECT {
                             if let Some(name) = get_selected() {
                                 app.popup_manager.close();
                                 return NewPopupAction::WorldSelector(WorldSelectorAction::Connect(name));
                             }
-                        }
-                        'c' | 'C' => {
+                        } else if btn_id == SELECTOR_BTN_EDIT {
+                            if let Some(name) = get_selected() {
+                                app.popup_manager.close();
+                                return NewPopupAction::WorldSelector(WorldSelectorAction::Edit(name));
+                            }
+                        } else if btn_id == SELECTOR_BTN_DELETE {
+                            if let Some(name) = get_selected() {
+                                app.popup_manager.close();
+                                return NewPopupAction::WorldSelector(WorldSelectorAction::Delete(name));
+                            }
+                        } else if btn_id == SELECTOR_BTN_ADD {
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldSelector(WorldSelectorAction::Add);
+                        } else if btn_id == SELECTOR_BTN_CANCEL {
                             app.popup_manager.close();
                         }
-                        _ => {}
+                    } else if state.select_field_by_shortcut(c) {
+                        // Field shortcut (e.g. 'F' for Filter): highlight only, no auto-edit
                     }
                 }
                 _ => {}
@@ -9882,7 +10011,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             match key.code {
                 Esc => {
                     if state.editing {
-                        state.cancel_edit();
+                        state.commit_edit();
                     } else {
                         app.popup_manager.close();
                     }
@@ -9928,55 +10057,29 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        // Go back to last field from button row
-                        state.select_last_field();
-                    } else {
-                        state.prev_field();
-                    }
-                    // Auto-start editing if new field is text
-                    if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
-                        state.start_edit();
-                    }
+                    // Full order-of-moving cycle: fields -> buttons -> wrap.
+                    // Highlighting a field never auto-enters edit mode.
+                    state.prev_item();
                 }
                 Down => {
-                    // Commit any current edit before moving
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        // Go back to last field from button row
-                        state.select_last_field();
-                    } else {
-                        // Move to next field (don't go to buttons)
-                        state.next_field();
-                    }
-                    // Auto-start editing if new field is text
-                    if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
-                        state.start_edit();
-                    }
+                    state.next_item();
                 }
                 Left => {
-                    if is_text_field {
-                        // Text field: move cursor (start editing if needed)
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.cursor_left();
                     } else {
-                        // Decrease number or cycle select
+                        // Not editing: only adjusts a Select/Number field
+                        // (no-op on Text/Toggle/etc; Toggle is never touched by arrows).
                         state.decrease_current();
                     }
                 }
                 Right => {
-                    if is_text_field {
-                        // Text field: move cursor (start editing if needed)
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.cursor_right();
                     } else {
-                        // Increase number or cycle select
                         state.increase_current();
                     }
                 }
@@ -9984,73 +10087,46 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        state.next_button();
-                    } else {
-                        state.select_first_button();
-                    }
+                    state.cycle_field_buttons();
                 }
                 BackTab => {
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        state.prev_button();
-                    } else {
-                        state.select_last_field();
-                        // Auto-start editing if new field is text
-                        if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
-                            state.start_edit();
-                        }
-                    }
+                    state.cycle_field_buttons_rev();
                 }
                 Backspace => {
-                    if is_text_field {
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.backspace();
                     }
                 }
                 Delete => {
-                    if is_text_field {
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.delete_char();
                     }
                 }
                 Home => {
-                    if is_text_field {
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.cursor_home();
                     }
                 }
                 End => {
-                    if is_text_field {
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.cursor_end();
                     }
-                }
-                Char('s') | Char('S') if !state.editing && !is_text_field => {
-                    let settings = extract_settings();
-                    app.popup_manager.close();
-                    return NewPopupAction::SetupSaved(settings);
-                }
-                Char('c') | Char('C') if !state.editing && !is_text_field => {
-                    app.popup_manager.close();
                 }
                 Char(c) => {
                     if state.editing {
                         state.insert_char(c);
-                    } else if is_text_field {
-                        // Start editing and insert character
-                        state.start_edit();
-                        state.insert_char(c);
+                    } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        // Not editing: bare letters are button hotkeys only.
+                        if btn_id == SETUP_BTN_SAVE {
+                            let settings = extract_settings();
+                            app.popup_manager.close();
+                            return NewPopupAction::SetupSaved(settings);
+                        } else if btn_id == SETUP_BTN_CANCEL {
+                            app.popup_manager.close();
+                        }
                     }
                 }
                 _ => {}
@@ -10080,7 +10156,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             match key.code {
                 Esc => {
                     if state.editing {
-                        state.cancel_edit();
+                        state.commit_edit();
                     } else {
                         app.popup_manager.close();
                     }
@@ -10151,48 +10227,26 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     }
                 }
                 Up => {
-                    // Commit any current edit before moving
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        // Go back to last field from button row
-                        state.select_last_field();
-                    } else {
-                        state.prev_field();
-                    }
-                    // Auto-start editing if new field is text
-                    if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
-                        state.start_edit();
-                    }
+                    // Full order-of-moving cycle: fields -> buttons -> wrap.
+                    // Highlighting a field never auto-enters edit mode.
+                    state.prev_item();
                 }
                 Down => {
-                    // Commit any current edit before moving
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        // Go back to last field from button row
-                        state.select_last_field();
-                    } else {
-                        // Move to next field (don't go to buttons)
-                        state.next_field();
-                    }
-                    // Auto-start editing if new field is text
-                    if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
-                        state.start_edit();
-                    }
+                    state.next_item();
                 }
                 Left => {
-                    if is_text_field {
-                        // Text field: move cursor (start editing if needed)
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.cursor_left();
                     } else {
+                        // Not editing: only adjusts a Select/Number field
+                        // (no-op on Text/Toggle/etc; Toggle is never touched by arrows).
                         state.decrease_current();
-                        // Update TLS visibility when protocol changes
                         if let ElementSelection::Field(id) = &state.selected {
                             if *id == WEB_FIELD_PROTOCOL {
                                 update_tls_visibility(state);
@@ -10201,15 +10255,10 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     }
                 }
                 Right => {
-                    if is_text_field {
-                        // Text field: move cursor (start editing if needed)
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.cursor_right();
                     } else {
                         state.increase_current();
-                        // Update TLS visibility when protocol changes
                         if let ElementSelection::Field(id) = &state.selected {
                             if *id == WEB_FIELD_PROTOCOL {
                                 update_tls_visibility(state);
@@ -10221,73 +10270,70 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        state.next_button();
-                    } else {
-                        state.select_first_button();
-                    }
+                    state.cycle_field_buttons();
                 }
                 BackTab => {
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        state.prev_button();
-                    } else {
-                        state.select_last_field();
-                        // Auto-start editing if new field is text
-                        if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
-                            state.start_edit();
-                        }
-                    }
+                    state.cycle_field_buttons_rev();
                 }
                 Backspace => {
-                    if is_text_field {
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.backspace();
                     }
                 }
                 Delete => {
-                    if is_text_field {
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.delete_char();
                     }
                 }
                 Home => {
-                    if is_text_field {
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.cursor_home();
                     }
                 }
                 End => {
-                    if is_text_field {
-                        if !state.editing {
-                            state.start_edit();
-                        }
+                    if state.editing {
                         state.cursor_end();
                     }
-                }
-                Char('s') | Char('S') if !state.editing && !is_text_field => {
-                    let settings = extract_settings();
-                    app.popup_manager.close();
-                    return NewPopupAction::WebSaved(settings);
-                }
-                Char('c') | Char('C') if !state.editing && !is_text_field => {
-                    app.popup_manager.close();
                 }
                 Char(c) => {
                     if state.editing {
                         state.insert_char(c);
-                    } else if is_text_field {
-                        // Start editing and insert character
-                        state.start_edit();
-                        state.insert_char(c);
+                    } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        // Not editing: bare letters are button hotkeys only.
+                        if btn_id == WEB_BTN_SAVE {
+                            let settings = extract_settings();
+                            app.popup_manager.close();
+                            return NewPopupAction::WebSaved(settings);
+                        } else if btn_id == WEB_BTN_REGEN_KEY {
+                            let new_key = App::generate_auth_key();
+                            if let Some(field) = state.definition.fields.iter_mut()
+                                .find(|f| f.id == WEB_FIELD_AUTH_KEY)
+                            {
+                                if let popup::FieldKind::Text { ref mut value, .. } = field.kind {
+                                    *value = new_key;
+                                }
+                            }
+                        } else if btn_id == WEB_BTN_COPY_KEY {
+                            if let Some(key_text) = state.get_text(WEB_FIELD_AUTH_KEY) {
+                                if !key_text.is_empty() {
+                                    use std::io::Write;
+                                    let encoded = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        key_text.as_bytes(),
+                                    );
+                                    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+                                    let _ = std::io::stdout().write_all(osc52.as_bytes());
+                                    let _ = std::io::stdout().flush();
+                                    state.error = Some("Auth key copied to clipboard".to_string());
+                                    state.error_at = Some(std::time::Instant::now());
+                                }
+                            }
+                        } else if btn_id == WEB_BTN_CANCEL {
+                            app.popup_manager.close();
+                        }
                     }
                 }
                 _ => {}
@@ -10324,18 +10370,22 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 Down => {
                     state.list_select_down();
                 }
-                Tab | BackTab => {
+                Tab => {
                     state.cycle_field_buttons();
                 }
-                Char('o') | Char('O') => {
-                    if let Some(name) = get_selected_name() {
-                        app.popup_manager.close();
-                        return NewPopupAction::NotesList(NotesListAction::Open(name));
-                    }
+                BackTab => {
+                    state.cycle_field_buttons_rev();
                 }
-                Char('c') | Char('C') => {
-                    app.popup_manager.close();
-                    return NewPopupAction::None;
+                Char(c) => {
+                    if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        if btn_id == NOTES_BTN_CANCEL {
+                            app.popup_manager.close();
+                            return NewPopupAction::None;
+                        } else if let Some(name) = get_selected_name() {
+                            app.popup_manager.close();
+                            return NewPopupAction::NotesList(NotesListAction::Open(name));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -10387,7 +10437,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         state.list_select_down();
                     }
                 }
-                Tab | BackTab => {
+                Tab => {
                     // Custom Tab cycle: move through list rows, then to Close, then wrap.
                     // The list's selected_index stays unchanged so a world is always highlighted.
                     if state.is_button_focused(RECENT_BTN_CLOSE) {
@@ -10416,6 +10466,35 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         }
                     } else {
                         // No list (empty popup): cycle Close <→ Close (no-op)
+                        state.select_button(RECENT_BTN_CLOSE);
+                    }
+                }
+                BackTab => {
+                    // Exact reverse of Tab: from Close, wrap to the LAST list
+                    // row; from a list row, step back a row or wrap to Close.
+                    if state.is_button_focused(RECENT_BTN_CLOSE) {
+                        if has_list {
+                            state.select_field(RECENT_FIELD_LIST);
+                            if let Some(field) = state.field_mut(RECENT_FIELD_LIST) {
+                                if let popup::FieldKind::List { items, selected_index, scroll_offset, visible_height, .. } = &mut field.kind {
+                                    *selected_index = items.len().saturating_sub(1);
+                                    *scroll_offset = selected_index.saturating_sub(visible_height.saturating_sub(1));
+                                }
+                            }
+                        }
+                    } else if has_list {
+                        let sel = if let Some(field) = state.field(RECENT_FIELD_LIST) {
+                            if let popup::FieldKind::List { selected_index, .. } = &field.kind {
+                                *selected_index
+                            } else { 0 }
+                        } else { 0 };
+                        if sel > 0 {
+                            state.select_field(RECENT_FIELD_LIST);
+                            state.list_select_up();
+                        } else {
+                            state.select_button(RECENT_BTN_CLOSE);
+                        }
+                    } else {
                         state.select_button(RECENT_BTN_CLOSE);
                     }
                 }
@@ -10558,48 +10637,41 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     state.cycle_field_buttons();
                 }
                 BackTab => {
-                    state.cycle_field_buttons();
+                    state.cycle_field_buttons_rev();
+                }
+                Char(' ') => {
+                    // Space toggles enable/disable for the selected action
+                    if let Some(idx) = get_selected_index() {
+                        // Don't close popup - stay on list for more toggles
+                        return NewPopupAction::ActionsList(ActionsListAction::Toggle(idx));
+                    }
+                }
+                Char('/') => {
+                    // Vim-style shortcut to jump to the filter field (highlight only)
+                    state.select_field(ACTIONS_FIELD_FILTER);
                 }
                 Char(c) => {
-                    // Check if filter field is selected - start editing
-                    if state.is_field_selected(ACTIONS_FIELD_FILTER) {
-                        state.start_edit();
-                        state.insert_char(c);
-                        return NewPopupAction::ActionsListFilter;
-                    }
-                    // Otherwise handle shortcuts
-                    match c {
-                        ' ' => {
-                            // Space toggles enable/disable for selected action
-                            if let Some(idx) = get_selected_index() {
-                                // Don't close popup - stay on list for more toggles
-                                return NewPopupAction::ActionsList(ActionsListAction::Toggle(idx));
-                            }
-                        }
-                        'f' | 'F' | '/' => {
-                            state.select_field(ACTIONS_FIELD_FILTER);
-                            state.start_edit();
-                        }
-                        'a' | 'A' => {
+                    // Not editing: bare letters are button hotkeys only (never
+                    // implicit text entry - Enter is required to start editing).
+                    if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        if btn_id == ACTIONS_BTN_ADD {
                             app.popup_manager.close();
                             return NewPopupAction::ActionsList(ActionsListAction::Add);
-                        }
-                        'e' | 'E' => {
+                        } else if btn_id == ACTIONS_BTN_EDIT {
                             if let Some(idx) = get_selected_index() {
                                 app.popup_manager.close();
                                 return NewPopupAction::ActionsList(ActionsListAction::Edit(idx));
                             }
-                        }
-                        'd' | 'D' => {
+                        } else if btn_id == ACTIONS_BTN_DELETE {
                             if let Some(idx) = get_selected_index() {
                                 app.popup_manager.close();
                                 return NewPopupAction::ActionsList(ActionsListAction::Delete(idx));
                             }
-                        }
-                        'c' | 'C' | 'o' | 'O' => {
+                        } else if btn_id == ACTIONS_BTN_CANCEL {
                             app.popup_manager.close();
                         }
-                        _ => {}
+                    } else if state.select_field_by_shortcut(c) {
+                        // Field shortcut: highlight only, no auto-edit
                     }
                 }
                 _ => {}
@@ -10628,7 +10700,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             match key.code {
                 Esc => {
                     if state.editing {
-                        state.cancel_edit();
+                        state.commit_edit();
                     } else {
                         app.popup_manager.close();
                     }
@@ -10709,10 +10781,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     if state.editing {
                         state.commit_edit();
                     }
-                    // Go to previous element
-                    if !state.prev_field() {
-                        state.select_last_field();
-                    }
+                    // Exact reverse of Tab
+                    state.cycle_field_buttons_rev();
                 }
                 Up => {
                     if state.editing && is_multiline {
@@ -10720,11 +10790,11 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         state.cursor_up();
                         state.ensure_multiline_cursor_visible();
                     } else if is_editable_list {
-                        // In editable list: Up moves to previous row (or exits to prev field)
+                        // In editable list: Up moves to previous row (or exits the field)
                         if !state.editable_list_select_up(EDITOR_FIELD_PATTERNS) {
-                            // Already at first row — commit and move to previous field
+                            // Already at first row — commit and move to the previous item
                             state.commit_edit();
-                            state.prev_field();
+                            state.prev_item();
                         } else {
                             state.start_edit();
                         }
@@ -10732,7 +10802,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         if state.editing {
                             state.commit_edit();
                         }
-                        state.prev_field();
+                        // Full order-of-moving cycle: fields -> buttons -> wrap.
+                        // Highlighting a field never auto-enters edit mode.
+                        state.prev_item();
                     }
                 }
                 Down => {
@@ -10741,13 +10813,11 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         state.cursor_down();
                         state.ensure_multiline_cursor_visible();
                     } else if is_editable_list {
-                        // In editable list: Down moves to next row (or exits to next field)
+                        // In editable list: Down moves to next row (or exits the field)
                         if !state.editable_list_select_down(EDITOR_FIELD_PATTERNS) {
-                            // At last row and can't add more — commit and move to next field
+                            // At last row and can't add more — commit and move to the next item
                             state.commit_edit();
-                            if !state.next_field() {
-                                state.select_first_button();
-                            }
+                            state.next_item();
                         } else {
                             state.start_edit();
                         }
@@ -10755,9 +10825,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         if state.editing {
                             state.commit_edit();
                         }
-                        if !state.next_field() {
-                            state.select_first_button();
-                        }
+                        state.next_item();
                     }
                 }
                 Left => {
@@ -10766,10 +10834,10 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         if is_multiline {
                             state.ensure_multiline_cursor_visible();
                         }
-                    } else if is_select || is_toggle {
+                    } else if is_select {
+                        // Not editing: only adjusts a Select field
+                        // (Toggle is never touched by arrows; no button navigation here)
                         state.decrease_current();
-                    } else if state.is_on_button() {
-                        state.prev_button();
                     }
                 }
                 Right => {
@@ -10778,10 +10846,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         if is_multiline {
                             state.ensure_multiline_cursor_visible();
                         }
-                    } else if is_select || is_toggle {
+                    } else if is_select {
                         state.increase_current();
-                    } else if state.is_on_button() {
-                        state.next_button();
                     }
                 }
                 Backspace => {
@@ -10813,20 +10879,16 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         }
                     }
                 }
-                Char('s') | Char('S') if !state.editing && !is_text_field => {
-                    // Save shortcut (only when not on a text field)
-                    state.select_button(EDITOR_BTN_SAVE);
-                }
-                Char('c') | Char('C') if !state.editing && !is_text_field => {
-                    app.popup_manager.close();
-                }
-                Char('d') | Char('D') if !state.editing && !is_text_field => {
-                    // Delete shortcut
-                    state.select_button(EDITOR_BTN_DELETE);
-                }
-                Char(' ') if !state.editing && (is_toggle || is_select) => {
-                    // Space toggles current toggle/select field
-                    state.toggle_current();
+                Char(' ') => {
+                    if state.editing {
+                        state.insert_char(' ');
+                        if is_multiline {
+                            state.ensure_multiline_cursor_visible();
+                        }
+                    } else if is_toggle || is_select {
+                        // Space flips a highlighted Toggle (or cycles a Select)
+                        state.toggle_current();
+                    }
                 }
                 Char(c) => {
                     if state.editing {
@@ -10834,15 +10896,54 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         if is_multiline {
                             state.ensure_multiline_cursor_visible();
                         }
-                    } else if is_text_field {
-                        state.start_edit();
-                        state.insert_char(c);
-                        if is_multiline {
-                            state.ensure_multiline_cursor_visible();
+                    } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        // Not editing: bare letters are button hotkeys only (never
+                        // implicit text entry - Enter is required to start editing).
+                        if btn_id == EDITOR_BTN_SAVE {
+                            let name = state.get_text(EDITOR_FIELD_NAME).unwrap_or("").to_string();
+                            let world = state.get_text(EDITOR_FIELD_WORLD).unwrap_or("").to_string();
+                            let command = state.get_text(EDITOR_FIELD_COMMAND).unwrap_or("").to_string();
+                            let enabled = state.get_bool(EDITOR_FIELD_ENABLED).unwrap_or(true);
+                            let startup = state.get_bool(EDITOR_FIELD_STARTUP).unwrap_or(false);
+                            let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
+
+                            let match_type_str = state.get_selected(EDITOR_FIELD_MATCH_TYPE).unwrap_or("regexp");
+                            let action_match_type = if match_type_str == "wildcard" { MatchType::Wildcard } else { MatchType::Regexp };
+
+                            state.commit_edit();
+                            let all_items = state.get_editable_list_items(EDITOR_FIELD_PATTERNS);
+                            let patterns: Vec<MatchPattern> = all_items.iter()
+                                .filter(|p| !p.trim().is_empty())
+                                .map(|p| MatchPattern {
+                                    pattern: p.clone(),
+                                    compiled_regex: None,
+                                })
+                                .collect();
+
+                            let action = Action {
+                                name,
+                                world,
+                                match_type: action_match_type,
+                                patterns,
+                                command,
+                                owner: None,
+                                enabled,
+                                startup,
+                                ..Action::default()
+                            };
+
+                            app.popup_manager.close();
+                            return NewPopupAction::ActionEditorSave { action, editing_index };
+                        } else if btn_id == EDITOR_BTN_CANCEL {
+                            app.popup_manager.close();
+                        } else if btn_id == EDITOR_BTN_DELETE {
+                            let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
+                            if let Some(idx) = editing_index {
+                                app.popup_manager.close();
+                                return NewPopupAction::ActionEditorDelete { editing_index: idx };
+                            }
                         }
                     }
-                    // Editable list: typing starts edit on the selected row
-                    // (is_text_field is true for EditableList so already handled above)
                 }
                 _ => {}
             }
@@ -10913,19 +11014,15 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             match key.code {
                 Esc => {
                     if state.editing {
-                        state.cancel_edit();
+                        state.commit_edit();
                     } else {
                         app.popup_manager.close();
                     }
                 }
                 Enter => {
                     if state.editing {
+                        // Single-line: commit and exit edit mode, staying on this field
                         state.commit_edit();
-                        state.next_field();
-                        // Auto-start editing on text/password fields
-                        if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
-                            state.start_edit();
-                        }
                     } else if state.is_on_button() {
                         if state.is_button_focused(WORLD_BTN_SAVE) {
                             let settings = extract_settings();
@@ -10955,6 +11052,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     if state.editing {
                         state.insert_char(' ');
                     } else if is_toggle {
+                        // Space flips a highlighted Toggle
                         state.toggle_current();
                     } else if is_select {
                         state.toggle_current();
@@ -10965,72 +11063,46 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     if state.editing {
                         state.commit_edit();
                     }
+                    // field -> first button -> next button -> wrap to first field
                     state.cycle_field_buttons();
-                    // Auto-start editing on text/password fields
-                    if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
-                        state.start_edit();
-                    }
                 }
                 BackTab => {
                     if state.editing {
                         state.commit_edit();
                     }
-                    // Go to previous element
-                    if !state.prev_field() {
-                        state.select_last_field();
-                    }
-                    // Auto-start editing on text/password fields
-                    if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
-                        state.start_edit();
-                    }
+                    // Exact reverse of Tab
+                    state.cycle_field_buttons_rev();
                 }
                 Up => {
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        state.select_last_field();
-                    } else {
-                        state.prev_field();
-                    }
-                    // Auto-start editing on text/password fields
-                    if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
-                        state.start_edit();
-                    }
+                    // Full order-of-moving cycle: fields -> buttons -> wrap.
+                    // Highlighting a field never auto-enters edit mode.
+                    state.prev_item();
                 }
                 Down => {
                     if state.editing {
                         state.commit_edit();
                     }
-                    if state.is_on_button() {
-                        state.select_last_field();
-                    } else {
-                        // Only move between fields, never to buttons
-                        state.next_field();
-                    }
-                    // Auto-start editing on text/password fields
-                    if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
-                        state.start_edit();
-                    }
+                    state.next_item();
                 }
                 Left => {
                     if state.editing {
                         state.cursor_left();
-                    } else if is_select || is_toggle {
+                    } else if is_select {
+                        // Not editing: only adjusts a Select field
+                        // (Toggle is never touched by arrows; no button navigation here)
                         state.decrease_current();
                         update_visibility!(state);
-                    } else if state.is_on_button() {
-                        state.prev_button();
                     }
                 }
                 Right => {
                     if state.editing {
                         state.cursor_right();
-                    } else if is_select || is_toggle {
+                    } else if is_select {
                         state.increase_current();
                         update_visibility!(state);
-                    } else if state.is_on_button() {
-                        state.next_button();
                     }
                 }
                 Backspace => {
@@ -11053,29 +11125,26 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         state.cursor_end();
                     }
                 }
-                Char('s') | Char('S') if !state.editing && !is_text_field => {
-                    let settings = extract_settings();
-                    app.popup_manager.close();
-                    return NewPopupAction::WorldEditorSaved(Box::new(settings));
-                }
-                Char('c') | Char('C') if !state.editing && !is_text_field => {
-                    app.popup_manager.close();
-                }
-                Char('d') | Char('D') if !state.editing && !is_text_field => {
-                    app.popup_manager.close();
-                    return NewPopupAction::WorldEditorDelete(world_index);
-                }
-                Char('o') | Char('O') if !state.editing && !is_text_field => {
-                    let _settings = extract_settings();
-                    app.popup_manager.close();
-                    return NewPopupAction::WorldEditorConnect(world_index);
-                }
                 Char(c) => {
                     if state.editing {
                         state.insert_char(c);
-                    } else if is_text_field {
-                        state.start_edit();
-                        state.insert_char(c);
+                    } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        // Not editing: bare letters are button hotkeys only (never
+                        // implicit text entry - Enter is required to start editing).
+                        if btn_id == WORLD_BTN_SAVE {
+                            let settings = extract_settings();
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldEditorSaved(Box::new(settings));
+                        } else if btn_id == WORLD_BTN_CANCEL {
+                            app.popup_manager.close();
+                        } else if btn_id == WORLD_BTN_DELETE {
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldEditorDelete(world_index);
+                        } else if btn_id == WORLD_BTN_CONNECT {
+                            let _settings = extract_settings();
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldEditorConnect(world_index);
+                        }
                     }
                 }
                 _ => {}
@@ -11139,18 +11208,23 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     }
                 }
             }
-            Left | Right | Tab => {
-                if is_confirm {
-                    // Toggle between Yes and No
-                    if state.is_button_focused(CONFIRM_BTN_YES) {
-                        state.select_button(CONFIRM_BTN_NO);
-                    } else {
-                        state.select_button(CONFIRM_BTN_YES);
-                    }
-                } else if matches!(key.code, Tab) {
-                    // Tab selects the first button (e.g., Ok in help popup)
-                    state.select_first_button();
+            Left | Right => {
+                // No navigation role outside edit mode here; only affects a
+                // Select field if one exists (no-op on everything else, and
+                // Toggle is never touched by arrows).
+                if matches!(key.code, Left) {
+                    state.decrease_current();
+                } else {
+                    state.increase_current();
                 }
+            }
+            Tab => {
+                // field -> first button -> next button -> wrap to first field
+                state.cycle_field_buttons();
+            }
+            BackTab => {
+                // Exact reverse of Tab
+                state.cycle_field_buttons_rev();
             }
             PageUp => {
                 state.scroll_content_up(5);
@@ -12767,6 +12841,7 @@ pub async fn run_app_headless(
                                     KeepAliveType::Nop => {
                                         let nop = vec![TELNET_IAC, TELNET_NOP];
                                         let _ = tx.try_send(WriteCommand::Raw(nop));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent NOP to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -12779,6 +12854,7 @@ pub async fn run_app_headless(
                                         let cmd = world.settings.keep_alive_cmd
                                             .replace("##rand##", &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Custom keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -12789,6 +12865,7 @@ pub async fn run_app_headless(
                                             .as_nanos() % 1000 + 1) as u32;
                                         let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Generic keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -13941,6 +14018,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         KeepAliveType::Nop => {
                             let nop = vec![TELNET_IAC, TELNET_NOP];
                             let _ = tx.try_send(WriteCommand::Raw(nop));
+                            debug_log(is_debug_enabled(), &format!("keepalive: sent NOP to world '{}'", world.name));
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -13953,6 +14031,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let cmd = world.settings.keep_alive_cmd
                                 .replace("##rand##", &idler_tag);
                             let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
+                            debug_log(is_debug_enabled(), &format!("keepalive: sent Custom keepalive to world '{}'", world.name));
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -13963,6 +14042,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 .as_nanos() % 1000 + 1) as u32;
                             let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                             let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
+                            debug_log(is_debug_enabled(), &format!("keepalive: sent Generic keepalive to world '{}'", world.name));
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -14855,8 +14935,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             return Ok(());
                         }
                     }
+                    // ConnectWorldRequest: a remote/WebSocket client executed a world-switch or
+                    // connect ClayCommand (e.g. via an action like /common); the master must
+                    // connect the world itself since it owns the sockets. Mirrors the
+                    // WsAsyncAction::Connect consumer above, but driven by an event instead of a
+                    // synchronous return value so a single action can connect many worlds.
+                    AppEvent::ConnectWorldRequest(world_index, _username) => {
+                        if world_index < app.worlds.len()
+                            && !app.worlds[world_index].connected
+                            && app.worlds[world_index].settings.has_connection_settings()
+                        {
+                            let prev_index = app.current_world_index;
+                            app.current_world_index = world_index;
+                            if handle_command("/__connect", &mut app, event_tx.clone()).await {
+                                return Ok(());
+                            }
+                            if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                                let name = app.worlds[world_index].name.clone();
+                                app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
+                            }
+                            app.current_world_index = prev_index;
+                        }
+                    }
                     // Multiuser events are only used in multiuser mode, ignore in normal mode
-                    AppEvent::ConnectWorldRequest(_, _) => {}
                     AppEvent::MultiuserServerData(_, _, _) => {}
                     AppEvent::MultiuserDisconnected(_, _) => {}
                     AppEvent::MultiuserTelnetDetected(_, _) => {}
@@ -15302,6 +15403,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     KeepAliveType::Nop => {
                                         let nop = vec![TELNET_IAC, TELNET_NOP];
                                         let _ = tx.try_send(WriteCommand::Raw(nop));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent NOP to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -15315,6 +15417,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         let cmd = world.settings.keep_alive_cmd
                                             .replace("##rand##", &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Custom keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -15326,6 +15429,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             .as_nanos() % 1000 + 1) as u32;
                                         let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                                         let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Generic keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -15751,8 +15855,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::SystemMessage(message) => {
                     app.add_output(&message);
                 }
+                // ConnectWorldRequest: a remote/WebSocket client executed a world-switch or
+                // connect ClayCommand (e.g. via an action like /common); the master must
+                // connect the world itself since it owns the sockets. Mirrors the
+                // WsAsyncAction::Connect consumer above, but driven by an event instead of a
+                // synchronous return value so a single action can connect many worlds.
+                AppEvent::ConnectWorldRequest(world_index, _username) => {
+                    if world_index < app.worlds.len()
+                        && !app.worlds[world_index].connected
+                        && app.worlds[world_index].settings.has_connection_settings()
+                    {
+                        let prev_index = app.current_world_index;
+                        app.current_world_index = world_index;
+                        if handle_command("/__connect", &mut app, event_tx.clone()).await {
+                            return Ok(());
+                        }
+                        if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                            let name = app.worlds[world_index].name.clone();
+                            app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
+                        }
+                        app.current_world_index = prev_index;
+                    }
+                }
                 // Multiuser events are only used in multiuser mode, ignore in normal mode
-                AppEvent::ConnectWorldRequest(_, _) => {}
                 AppEvent::MultiuserServerData(_, _, _) => {}
                 AppEvent::MultiuserDisconnected(_, _) => {}
                 AppEvent::MultiuserTelnetDetected(_, _) => {}

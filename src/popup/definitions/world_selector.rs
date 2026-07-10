@@ -73,17 +73,17 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
             SELECTOR_FIELD_FILTER,
             "Filter",
             FieldKind::text_with_placeholder("", "Type to filter..."),
-        ).with_shortcut('F').with_tab_index(0))
+        ).with_shortcut('F').with_tab_index(0).search())
         .with_field(Field::new(
             SELECTOR_FIELD_LIST,
             "",
             FieldKind::list_with_headers_and_widths(items, visible_height, WORLD_LIST_HEADERS, column_widths),
         ))
-        .with_button(Button::new(SELECTOR_BTN_ADD, "Add").with_shortcut('A').with_tab_index(1))
-        .with_button(Button::new(SELECTOR_BTN_EDIT, "Edit").with_shortcut('E').with_tab_index(2))
+        .with_button(Button::new(SELECTOR_BTN_ADD, "Add").with_shortcut('A'))
+        .with_button(Button::new(SELECTOR_BTN_EDIT, "Edit").with_shortcut('E'))
         .with_button(Button::new(SELECTOR_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
-        .with_button(Button::new(SELECTOR_BTN_CANCEL, "Cancel").with_shortcut('C').with_tab_index(3))
-        .with_button(Button::new(SELECTOR_BTN_CONNECT, "Connect").primary().with_shortcut('O').with_tab_index(4))
+        .with_button(Button::new(SELECTOR_BTN_CANCEL, "Cancel").with_shortcut('C'))
+        .with_button(Button::new(SELECTOR_BTN_CONNECT, "Connect").primary().with_shortcut('O'))
         .with_layout(PopupLayout {
             label_width: 8,
             min_width: 60,
