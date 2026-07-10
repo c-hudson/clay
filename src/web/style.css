@@ -1727,6 +1727,59 @@ body.device-phone #output-container { padding: 6px 10px; }
     border-radius: 0 2px 2px 0;
 }
 
+/* Divider between the real settings tabs and the external-editor links */
+.settings-tab-divider {
+    width: 24px;
+    height: 1px;
+    margin: 6px 0;
+    background: var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
+    flex-shrink: 0;
+}
+
+/* Theme/Keybind/Action Editor links: these open an external page rather than
+   switching a settings section, so they're styled distinctly from the real
+   tabs above -- a small label, a link-colored icon, and an external-link
+   arrow badge -- rather than looking like just another tab. */
+.settings-tab-btn.settings-tab-link {
+    flex-direction: column;
+    gap: 2px;
+    width: auto;
+    min-width: 40px;
+    height: auto;
+    min-height: 40px;
+    padding: 5px 2px 4px;
+    /* Reuse the app's established hyperlink color (same token as clickable
+       URLs in output, .output-link) so "this behaves like a link" reads
+       consistently across the whole UI, not just here. */
+    color: var(--theme-link, #00cdcd);
+}
+
+.settings-tab-btn.settings-tab-link:hover {
+    color: var(--theme-link, #00ffff);
+    background: rgba(0, 205, 205, 0.12);
+}
+
+.settings-tab-btn.settings-tab-link::after {
+    content: '';
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 6px;
+    height: 6px;
+    border-top: 1.4px solid currentColor;
+    border-right: 1.4px solid currentColor;
+    transform: rotate(45deg);
+}
+
+.settings-tab-label {
+    font-size: 8px;
+    font-weight: 600;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+}
+
 .settings-content {
     flex: 1;
     display: flex;
@@ -1740,6 +1793,13 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 .settings-section.active {
     display: block;
+    /* Harmless on desktop (parent height is content-driven, so flex-grow has
+       no free space to claim and overflow never triggers); on phone, where
+       .settings-content is given a real height, this lets the active
+       section scroll internally while the header/footer stay pinned. */
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
 }
 
 .settings-modal-content .popup-header {
@@ -1768,6 +1828,61 @@ body.device-phone #output-container { padding: 6px 10px; }
     gap: 6px;
     padding: 8px 14px 10px;
     background: transparent;
+}
+
+/* Phone: the settings window fills the screen (capped for landscape/large
+   phones) and the icon sidebar becomes a horizontal strip above the title
+   bar instead of a vertical column on the left, so form rows get the full
+   screen width instead of losing 48px to the sidebar. Mirrors the existing
+   body.device-phone pattern used for #nav-bar etc. */
+body.device-phone .settings-modal-content {
+    width: 100vw;
+    max-width: 520px; /* cap so a wide/landscape phone doesn't stretch edge to edge */
+    height: 100vh;
+    height: 100dvh; /* dvh with vh fallback for older WebViews */
+    max-height: 100dvh;
+    border-radius: 0;
+    margin: 0;
+}
+
+body.device-phone .settings-layout {
+    flex-direction: column;
+    height: 100%;
+}
+
+body.device-phone .settings-sidebar {
+    width: auto;
+    height: auto;
+    flex-direction: row;
+    align-items: center;
+    border-right: none;
+    border-bottom: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.06));
+    padding: 6px 8px;
+    overflow-x: auto; /* safety net if a very narrow phone can't fit every icon */
+}
+
+body.device-phone .settings-tab-divider {
+    width: 1px;
+    height: 20px;
+    align-self: stretch;
+    margin: 0 6px;
+}
+
+body.device-phone .settings-tab-btn.active::before {
+    /* The left-edge bar reads as a vertical-sidebar convention; in a
+       horizontal strip the active indicator moves to a bottom underline. */
+    left: 50%;
+    top: auto;
+    bottom: -6px;
+    transform: translateX(-50%);
+    width: 16px;
+    height: 3px;
+    border-radius: 2px 2px 0 0;
+}
+
+body.device-phone .settings-content {
+    flex: 1;
+    min-height: 0; /* required for .settings-section.active's overflow-y:auto to work */
 }
 
 /* Web section inputs */
