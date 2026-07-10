@@ -540,6 +540,13 @@ fn parse_time_to_seconds(s: &str) -> Option<f64> {
     }
 }
 
+/// Strip surrounding or embedded double-quotes from an option value.
+/// TinyFugue allows quoting option arguments (e.g. -t"..." or -w"world name")
+/// to protect spaces; the quotes are not part of the value.
+fn strip_quotes(s: &str) -> String {
+    s.replace('"', "")
+}
+
 /// Check if a string looks like a time format (contains colon with digits)
 fn looks_like_time(s: &str) -> bool {
     s.contains(':') && s.chars().all(|c| c.is_ascii_digit() || c == ':' || c == '.')
@@ -579,10 +586,20 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
             break;
         }
 
-        // Find end of this option (space or end)
-        let opt_end = trimmed[1..].find(char::is_whitespace)
-            .map(|i| i + 1)
-            .unwrap_or(trimmed.len());
+        // Find end of this option (space or end), respecting double-quoted spans.
+        // A space inside "..." does not end the token (TF allows -t"fmt with spaces").
+        let opt_end = {
+            let mut in_quote = false;
+            let mut end = trimmed.len(); // default: whole remaining
+            for (i, c) in trimmed[1..].char_indices() {
+                match c {
+                    '"' => in_quote = !in_quote,
+                    ' ' | '\t' if !in_quote => { end = i + 1; break; }
+                    _ => {}
+                }
+            }
+            end
+        };
         let opt = &trimmed[..opt_end];
         remaining = &trimmed[opt_end..];
 
@@ -601,7 +618,7 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
                     // -w or -wworld
                     if i + 1 < opt_chars.len() {
                         let world: String = opt_chars[i+1..].iter().collect();
-                        opts.source = RecallSource::World(world);
+                        opts.source = RecallSource::World(strip_quotes(&world));
                         i = opt_chars.len();
                     } else {
                         opts.source = RecallSource::CurrentWorld;
@@ -630,10 +647,10 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
                 }
                 't' => {
                     opts.show_timestamps = true;
-                    // Check for optional format
+                    // Check for optional format; strip quotes so -t"%H:%M:%S" works
                     if i + 1 < opt_chars.len() {
                         let fmt: String = opt_chars[i+1..].iter().collect();
-                        opts.timestamp_format = Some(fmt);
+                        opts.timestamp_format = Some(strip_quotes(&fmt));
                         i = opt_chars.len();
                     } else {
                         i += 1;
@@ -651,7 +668,8 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
                 'm' => {
                     // -mstyle
                     if i + 1 < opt_chars.len() {
-                        let style: String = opt_chars[i+1..].iter().collect();
+                        let style_raw: String = opt_chars[i+1..].iter().collect();
+                        let style = strip_quotes(&style_raw);
                         opts.match_style = match style.to_lowercase().as_str() {
                             "simple" => RecallMatchStyle::Simple,
                             "glob" => RecallMatchStyle::Glob,
@@ -2313,6 +2331,62 @@ pub fn cmd_watchname(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 mod tests {
     use super::*;
     use super::super::QuoteDisposition;
+    use super::super::RecallRange;
+
+    // ---- /recall argument parsing tests ----
+
+    fn recall_opts(args: &str) -> RecallOptions {
+        match cmd_recall(args) {
+            TfCommandResult::Recall(opts) => opts,
+            other => panic!("Expected Recall result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_recall_quoted_format_and_last_matching() {
+        // The canonical bug: /recall -t"%m/%d/%y %H:%M:%S" /10
+        let opts = recall_opts(r#"-t"%m/%d/%y %H:%M:%S" /10"#);
+        assert!(opts.show_timestamps);
+        assert_eq!(opts.timestamp_format.as_deref(), Some("%m/%d/%y %H:%M:%S"));
+        assert_eq!(opts.range, RecallRange::LastMatching(10));
+        assert_eq!(opts.pattern, None);
+    }
+
+    #[test]
+    fn test_recall_t_no_format() {
+        // -t alone → show_timestamps true, no custom format, range applied
+        let opts = recall_opts("-t /5");
+        assert!(opts.show_timestamps);
+        assert_eq!(opts.timestamp_format, None);
+        assert_eq!(opts.range, RecallRange::LastMatching(5));
+    }
+
+    #[test]
+    fn test_recall_quoted_format_with_pattern() {
+        // Quoted format followed by a plain-text pattern
+        let opts = recall_opts(r#"-t"%H:%M:%S" /10 hello"#);
+        assert!(opts.show_timestamps);
+        assert_eq!(opts.timestamp_format.as_deref(), Some("%H:%M:%S"));
+        assert_eq!(opts.range, RecallRange::LastMatching(10));
+        assert_eq!(opts.pattern.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_recall_unquoted_simple_format() {
+        // -t%H:%M:%S (no spaces in format, no quotes needed)
+        let opts = recall_opts("-t%H:%M:%S /3");
+        assert!(opts.show_timestamps);
+        assert_eq!(opts.timestamp_format.as_deref(), Some("%H:%M:%S"));
+        assert_eq!(opts.range, RecallRange::LastMatching(3));
+    }
+
+    #[test]
+    fn test_recall_no_args_returns_usage() {
+        match cmd_recall("") {
+            TfCommandResult::Success(Some(msg)) => assert!(msg.contains("Usage")),
+            other => panic!("Expected usage message, got {:?}", other),
+        }
+    }
 
     #[test]
     fn test_cmd_beep() {

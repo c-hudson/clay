@@ -586,6 +586,22 @@ pub enum RemoteClientType {
     RemoteGUI,
     /// Remote console client (TUI) - receives screenful, requests scrollback from master
     RemoteConsole,
+    /// Android app client (app.js running inside the Android WebView) - receives full
+    /// history like Web, but declared separately so the source is distinguishable in
+    /// diagnostics (e.g. the settings-save audit log).
+    Android,
+}
+
+impl RemoteClientType {
+    /// Short lowercase label used in diagnostics (e.g. the settings-save audit log).
+    pub fn label(&self) -> &'static str {
+        match self {
+            RemoteClientType::Web => "web",
+            RemoteClientType::RemoteGUI => "gui",
+            RemoteClientType::RemoteConsole => "console",
+            RemoteClientType::Android => "android",
+        }
+    }
 }
 
 
@@ -718,6 +734,16 @@ impl WebSocketServer {
         // Use try_read to avoid blocking in async context
         if let Ok(clients) = self.clients.try_read() {
             clients.get(&client_id).and_then(|c| c.username.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Get the IP address of a connected client
+    pub fn get_client_ip(&self, client_id: u64) -> Option<String> {
+        // Use try_read to avoid blocking in async context
+        if let Ok(clients) = self.clients.try_read() {
+            clients.get(&client_id).map(|c| c.ip_address.clone())
         } else {
             None
         }

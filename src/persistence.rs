@@ -141,15 +141,36 @@ pub fn decrypt_password(stored: &str) -> String {
 }
 
 pub fn save_settings(app: &App) -> io::Result<()> {
+    save_settings_with_source(app, "local")
+}
+
+/// Save settings, tagging the debug-mode audit log entry (if enabled) with `source` —
+/// the origin of this save, e.g. "web", "gui", "console", "android" for a remote
+/// client's UpdateGlobalSettings push (see the handlers in main.rs/daemon.rs), or
+/// "local" for TUI/lifecycle saves. Only master client saves.
+pub fn save_settings_with_source(app: &App, source: &str) -> io::Result<()> {
     // Only master client should save settings
     if !app.is_master {
         return Ok(());
     }
-    save_settings_to_path(app, &get_settings_path())
+    save_settings_to_path_with_source(app, &get_settings_path(), source)
 }
 
 /// Save settings to a specific path (used by tests)
 pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()> {
+    save_settings_to_path_with_source(app, path, "local")
+}
+
+/// Save settings to a specific path, tagging the debug-mode audit log (if enabled) with
+/// `source` — see `save_settings_with_source`.
+pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, source: &str) -> io::Result<()> {
+    // Snapshot the previous [global] section (debug mode only) so we can log exactly
+    // which keys changed after the full-file rewrite below. Settings loss has bitten
+    // silently before (a remote client pushing a stale/default snapshot clobbers globals
+    // wholesale) — this audit trail lets a future incident be diagnosed after the fact.
+    let debug_on = is_debug_enabled();
+    let old_global = if debug_on { read_global_section(path) } else { Default::default() };
+
     let mut file = std::fs::File::create(path)?;
 
     // Save global settings
@@ -324,8 +345,105 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
             writeln!(file, "{}={}", name, val_str)?;
         }
     }
+    drop(file);
+
+    // Debug-gated audit trail: log which [global] keys changed, old -> new, along with
+    // the source of the write and a backtrace of the code path that triggered it. Only
+    // active when debug mode is on (see CLAUDE.md debug-logging conventions), so this
+    // costs nothing normally but is available to diagnose a future settings-loss report.
+    if debug_on {
+        let new_global = read_global_section(path);
+        append_settings_audit_log(source, &old_global, &new_global);
+    }
 
     Ok(())
+}
+
+/// Parse just the `[global]` section of a settings.dat-style file into a key->value map
+/// of raw strings, for the debug-mode audit-log diff in `save_settings_to_path_with_source`.
+/// Returns an empty map if the file doesn't exist or has no `[global]` section.
+fn read_global_section(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return map,
+    };
+    let reader = io::BufReader::new(file);
+    let mut in_global = false;
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_global = trimmed == "[global]";
+            continue;
+        }
+        if !in_global || trimmed.is_empty() {
+            continue;
+        }
+        if let Some(eq) = trimmed.find('=') {
+            map.insert(trimmed[..eq].to_string(), trimmed[eq + 1..].to_string());
+        }
+    }
+    map
+}
+
+/// Append a diff of changed `[global]` keys to `~/.clay/settings-audit.log`, tagged with
+/// the save's source (web/gui/console/android/local) and a captured backtrace so a future
+/// settings-loss report can be traced to the exact code path that wrote the bad values.
+/// Only called when debug mode is on (see caller). Encrypted values (e.g.
+/// websocket_password) are stored/logged in their encrypted-at-rest form, same as on disk.
+fn append_settings_audit_log(
+    source: &str,
+    old: &std::collections::HashMap<String, String>,
+    new: &std::collections::HashMap<String, String>,
+) {
+    append_settings_audit_log_to_path(&clay_config_path("settings-audit.log"), source, old, new)
+}
+
+/// Same as `append_settings_audit_log`, but to an explicit path (used for tests so they
+/// don't write into the user's real `~/.clay/` directory).
+fn append_settings_audit_log_to_path(
+    log_path: &std::path::Path,
+    source: &str,
+    old: &std::collections::HashMap<String, String>,
+    new: &std::collections::HashMap<String, String>,
+) {
+    let mut keys: Vec<&String> = old.keys().chain(new.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let changes: Vec<String> = keys.into_iter()
+        .filter_map(|key| {
+            let old_val = old.get(key).map(|s| s.as_str()).unwrap_or("<unset>");
+            let new_val = new.get(key).map(|s| s.as_str()).unwrap_or("<unset>");
+            if old_val == new_val {
+                None
+            } else {
+                Some(format!("    {}: {} -> {}", key, old_val, new_val))
+            }
+        })
+        .collect();
+    if changes.is_empty() {
+        return;
+    }
+
+    let lt = local_time_now();
+    let timestamp = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second
+    );
+    let backtrace = std::backtrace::Backtrace::force_capture();
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = writeln!(file, "[{}] source={} changed global settings:", timestamp, source);
+        for change in &changes {
+            let _ = writeln!(file, "{}", change);
+        }
+        let _ = writeln!(file, "  backtrace:\n{}", backtrace);
+        let _ = writeln!(file);
+    }
 }
 
 pub fn load_settings(app: &mut App) -> io::Result<()> {
@@ -2467,5 +2585,66 @@ mod tests {
         assert_ne!(non_default.gmcp_packages, default.gmcp_packages, "gmcp_packages should differ");
         assert_ne!(non_default.auto_reconnect_secs, default.auto_reconnect_secs, "auto_reconnect_secs should differ");
         assert_ne!(non_default.auto_reconnect_on_web, default.auto_reconnect_on_web, "auto_reconnect_on_web should differ");
+    }
+
+    #[test]
+    fn test_read_global_section_parses_only_global_keys() {
+        let tmp = std::env::temp_dir().join("clay_test_read_global_section.dat");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(
+            &tmp,
+            "[global]\nscrollback_enabled=true\ndebug_enabled=false\n\n[world:test]\nhostname=example.com\n",
+        ).unwrap();
+
+        let global = read_global_section(&tmp);
+        assert_eq!(global.get("scrollback_enabled").map(String::as_str), Some("true"));
+        assert_eq!(global.get("debug_enabled").map(String::as_str), Some("false"));
+        assert!(global.get("hostname").is_none(), "world-section keys must not leak into the global map");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_read_global_section_missing_file_returns_empty() {
+        let tmp = std::env::temp_dir().join("clay_test_read_global_section_missing.dat");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(read_global_section(&tmp).is_empty());
+    }
+
+    #[test]
+    fn test_append_settings_audit_log_records_changed_keys_and_source() {
+        let tmp = std::env::temp_dir().join("clay_test_settings_audit.log");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut old = std::collections::HashMap::new();
+        old.insert("scrollback_enabled".to_string(), "true".to_string());
+        old.insert("debug_enabled".to_string(), "true".to_string());
+        let mut new = std::collections::HashMap::new();
+        new.insert("scrollback_enabled".to_string(), "false".to_string());
+        new.insert("debug_enabled".to_string(), "true".to_string()); // unchanged
+
+        append_settings_audit_log_to_path(&tmp, "android", &old, &new);
+
+        let contents = std::fs::read_to_string(&tmp).expect("audit log should have been written");
+        assert!(contents.contains("source=android"), "should record the source client type");
+        assert!(contents.contains("scrollback_enabled: true -> false"), "should record the changed key's old/new values");
+        assert!(!contents.contains("debug_enabled: true -> true"), "unchanged keys should not be logged");
+        assert!(contents.to_lowercase().contains("backtrace"), "should include a backtrace");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_append_settings_audit_log_no_changes_writes_nothing() {
+        let tmp = std::env::temp_dir().join("clay_test_settings_audit_no_change.log");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut old = std::collections::HashMap::new();
+        old.insert("debug_enabled".to_string(), "true".to_string());
+        let new = old.clone();
+
+        append_settings_audit_log_to_path(&tmp, "local", &old, &new);
+
+        assert!(!tmp.exists(), "no file should be created when nothing changed");
     }
 }

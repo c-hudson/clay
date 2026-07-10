@@ -3366,7 +3366,7 @@
         // When adding a new command to parse_command(), add it here too.
         let mut rust_commands: Vec<String> = vec![
             "help", "version", "quit", "reload", "update", "setup", "web", "actions",
-            "connections", "l", "worlds", "world", "disconnect", "dc",
+            "connections", "l", "worlds", "world", "disconnect", "dc", "connect",
             "flush", "menu", "send", "remote", "ban", "unban",
             "testmusic", "dump", "notify", "addworld", "note", "tag", "tags",
             "dict", "urban", "translate", "tr", "font", "window",
@@ -3757,5 +3757,65 @@
         assert!(display[0].text.contains("Old 1"));
         assert!(display[1].text.contains("Old 2"));
         assert!(display.last().unwrap().text.contains("Pending 19"));
+    }
+
+    #[test]
+    fn test_parse_remote_attach_command_host_port_colon() {
+        match parse_command("/connect example.com:9000") {
+            Command::RemoteAttach { addr, close, cancel } => {
+                assert_eq!(addr, "example.com:9000");
+                assert!(!close);
+                assert!(!cancel);
+            }
+            other => panic!("Expected RemoteAttach, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_remote_attach_command_host_port_space() {
+        match parse_command("/connect example.com 9000") {
+            Command::RemoteAttach { addr, close, cancel } => {
+                assert_eq!(addr, "example.com:9000");
+                assert!(!close);
+                assert!(!cancel);
+            }
+            other => panic!("Expected RemoteAttach, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_remote_attach_command_close() {
+        match parse_command("/connect --close") {
+            Command::RemoteAttach { addr, close, cancel } => {
+                assert!(addr.is_empty());
+                assert!(close);
+                assert!(!cancel);
+            }
+            other => panic!("Expected RemoteAttach, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_remote_attach_command_cancel() {
+        match parse_command("/connect --cancel") {
+            Command::RemoteAttach { addr, close, cancel } => {
+                assert!(addr.is_empty());
+                assert!(!close);
+                assert!(cancel);
+            }
+            other => panic!("Expected RemoteAttach, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_remote_attach_command_empty() {
+        match parse_command("/connect") {
+            Command::RemoteAttach { addr, close, cancel } => {
+                assert!(addr.is_empty());
+                assert!(!close);
+                assert!(!cancel);
+            }
+            other => panic!("Expected RemoteAttach, got {:?}", other),
+        }
     }
 

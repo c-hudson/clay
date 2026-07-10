@@ -106,6 +106,7 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 - `output.debug.log` - Output/seq debugging (via `output_debug_log()`)
 - `remote.log` - Remote connection events (HTTP 404s, WebSocket auth attempts)
 - `dump.log` - `/dump` debug state output
+- `settings-audit.log` - Debug-mode-only audit trail of `[global]` settings changes: old→new values, source client (web/gui/console/android/local), and a backtrace (via `persistence::save_settings_with_source()`, only written when debug mode is on)
 - `logs/<WorldName>.<YYYY-MM-DD>.log` - Per-world session logs (when log_enabled)
 - `media/` - Downloaded media cache
 

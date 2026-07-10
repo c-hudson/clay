@@ -267,6 +267,51 @@ pub fn local_time_now() -> LocalTime {
     local_time_from_epoch(epoch_secs)
 }
 
+/// Format a `LocalTime` using a strftime-style format string.
+///
+/// Supported specifiers (TinyFugue `/recall -t[format]` compatible):
+/// - `%Y` — 4-digit year
+/// - `%y` — 2-digit year
+/// - `%m` — month (01-12)
+/// - `%d` — day of month (01-31)
+/// - `%H` — hour 24h (00-23)
+/// - `%I` — hour 12h (01-12)
+/// - `%M` — minute (00-59)
+/// - `%S` — second (00-59)
+/// - `%p` — AM / PM
+/// - `%%` — literal `%`
+///
+/// Unknown `%X` specifiers are passed through literally (matching TF behavior).
+pub fn format_local_time(lt: &LocalTime, fmt: &str) -> String {
+    let am_pm = if lt.hour < 12 { "AM" } else { "PM" };
+    let hour_12 = match lt.hour % 12 { 0 => 12, h => h };
+
+    let mut result = String::with_capacity(fmt.len() + 8);
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            result.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => result.push_str(&format!("{:04}", lt.year)),
+            Some('y') => result.push_str(&format!("{:02}", lt.year % 100)),
+            Some('m') => result.push_str(&format!("{:02}", lt.month)),
+            Some('d') => result.push_str(&format!("{:02}", lt.day)),
+            Some('H') => result.push_str(&format!("{:02}", lt.hour)),
+            Some('I') => result.push_str(&format!("{:02}", hour_12)),
+            Some('M') => result.push_str(&format!("{:02}", lt.minute)),
+            Some('S') => result.push_str(&format!("{:02}", lt.second)),
+            Some('p') => result.push_str(am_pm),
+            Some('%') => result.push('%'),
+            // Unknown specifier — pass through literally (TF-compatible)
+            Some(x)  => { result.push('%'); result.push(x); }
+            None     => result.push('%'),
+        }
+    }
+    result
+}
+
 /// Get the current time in 12-hour format (H:MM)
 pub fn get_current_time_12hr() -> String {
     let lt = local_time_now();
@@ -1297,5 +1342,56 @@ mod tests {
         assert!(result.starts_with("Event at "));
         assert!(result.ends_with(" is cool"));
         assert!(!result.contains("<t:"));
+    }
+
+    // ---- format_local_time tests ----
+
+    fn make_lt(year: i32, month: i32, day: i32, hour: i32, minute: i32, second: i32) -> super::LocalTime {
+        super::LocalTime { year, month, day, hour, minute, second, weekday: 0 }
+    }
+
+    #[test]
+    fn test_format_local_time_default() {
+        let lt = make_lt(2026, 6, 30, 14, 5, 9);
+        assert_eq!(super::format_local_time(&lt, "%H:%M:%S"), "14:05:09");
+    }
+
+    #[test]
+    fn test_format_local_time_date() {
+        let lt = make_lt(2026, 6, 30, 14, 5, 9);
+        assert_eq!(super::format_local_time(&lt, "%m/%d/%y"), "06/30/26");
+        assert_eq!(super::format_local_time(&lt, "%Y-%m-%d"), "2026-06-30");
+    }
+
+    #[test]
+    fn test_format_local_time_full() {
+        let lt = make_lt(2026, 6, 30, 14, 5, 9);
+        assert_eq!(super::format_local_time(&lt, "%m/%d/%y %H:%M:%S"), "06/30/26 14:05:09");
+    }
+
+    #[test]
+    fn test_format_local_time_12h() {
+        let lt_pm = make_lt(2026, 6, 30, 14, 5, 9);
+        assert_eq!(super::format_local_time(&lt_pm, "%I:%M %p"), "02:05 PM");
+        let lt_am = make_lt(2026, 6, 30, 0, 0, 0);
+        assert_eq!(super::format_local_time(&lt_am, "%I:%M %p"), "12:00 AM");
+    }
+
+    #[test]
+    fn test_format_local_time_percent_escape() {
+        let lt = make_lt(2026, 6, 30, 14, 5, 9);
+        assert_eq!(super::format_local_time(&lt, "%%"), "%");
+        assert_eq!(super::format_local_time(&lt, "100%%"), "100%");
+    }
+
+    #[test]
+    fn test_format_local_time_unknown_specifier_passthrough() {
+        // TF-consistent: unknown %X passes through literally.
+        // %:%S → unknown %: passes through, then %S is recognized → 09
+        let lt = make_lt(2026, 6, 30, 14, 5, 9);
+        assert_eq!(super::format_local_time(&lt, "%H:%M%:%S"), "14:05%:09");
+        assert_eq!(super::format_local_time(&lt, "%Z"), "%Z");
+        // Trailing bare % passes through
+        assert_eq!(super::format_local_time(&lt, "%H%"), "14%");
     }
 }

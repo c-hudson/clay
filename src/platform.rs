@@ -1475,6 +1475,86 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     }
 }
 
+/// Relaunch this process attached to a different Clay server, or (when `connect_addr` is
+/// `None`) as an independent master — used by `/connect host:port` and `/connect --close`.
+/// Unlike `exec_reload`, no app state is saved/restored: the new process starts fresh and
+/// (for a remote client) fetches its state from the target server over WebSocket.
+/// Exec-replaces the process on Unix; spawns a new process and exits on Windows.
+pub fn exec_relaunch(connect_addr: Option<&str>, use_gui: bool) -> io::Result<()> {
+    debug_log(is_debug_enabled(), &format!(
+        "RELAUNCH: Starting exec_relaunch (connect_addr={:?}, use_gui={})", connect_addr, use_gui
+    ));
+
+    // Keep the existing argv (e.g. --conf=...) but drop any previous mode/reload flags —
+    // detaching/switching must not carry over a stale --console=/--gui= target.
+    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| {
+        a != "--reload" && a != "--crash"
+            && a != "--console" && a != "--gui"
+            && !a.starts_with("--console=") && !a.starts_with("--gui=")
+    }).collect();
+    let mode_flag = match (use_gui, connect_addr) {
+        (true, Some(addr)) => format!("--gui={}", addr),
+        (true, None) => "--gui".to_string(),
+        (false, Some(addr)) => format!("--console={}", addr),
+        (false, None) => "--console".to_string(),
+    };
+    args.push(mode_flag);
+
+    exec_relaunch_with_args(args, use_gui)
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn exec_relaunch_with_args(args: Vec<String>, use_gui: bool) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let (exe, debug_info) = get_executable_path()?;
+    debug_log(is_debug_enabled(), &format!("RELAUNCH: Executable path: {} ({})", exe.display(), debug_info));
+    if !exe.exists() {
+        return Err(io::Error::other(format!("Executable not found. Debug: {}", debug_info)));
+    }
+
+    // Console sessions own the terminal directly; restore it before handing off so the new
+    // process starts from a clean screen (GUI/headless processes don't touch the terminal).
+    if !use_gui {
+        let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    }
+
+    debug_log(is_debug_enabled(), &format!("RELAUNCH: About to exec {} with args={:?}", exe.display(), args));
+    let err = std::process::Command::new(&exe).args(&args).exec();
+
+    // If we get here, exec failed — restore the terminal so the caller isn't left broken.
+    if !use_gui {
+        let _ = crossterm::terminal::enable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableBracketedPaste
+        );
+    }
+    Err(io::Error::other(format!("exec failed: {} (path: {})", err, exe.display())))
+}
+
+#[cfg(windows)]
+fn exec_relaunch_with_args(args: Vec<String>, _use_gui: bool) -> io::Result<()> {
+    let (exe, debug_info) = get_executable_path()?;
+    debug_log(is_debug_enabled(), &format!("RELAUNCH: Executable path: {} ({})", exe.display(), debug_info));
+    if !exe.exists() {
+        return Err(io::Error::other(format!("Executable not found. Debug: {}", debug_info)));
+    }
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(_) => std::process::exit(0),
+        Err(e) => Err(io::Error::other(format!("Failed to spawn process: {} (path: {})", e, exe.display()))),
+    }
+}
+
+#[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
+fn exec_relaunch_with_args(_args: Vec<String>, _use_gui: bool) -> io::Result<()> {
+    Err(io::Error::other("Switching servers is not supported on this platform."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

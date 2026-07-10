@@ -872,6 +872,21 @@ pub(crate) async fn run_console_client(addr: &str) -> io::Result<()> {
                                     app.add_output("Reload is not available on this platform.");
                                 }
                             }
+                            // Check if a /connect --close was requested (detach and become
+                            // an independent master)
+                            if app.pending_remote_detach {
+                                app.pending_remote_detach = false;
+                                if let Err(e) = crate::platform::exec_relaunch(None, false) {
+                                    app.add_output(&format!("Detach failed: {}", e));
+                                }
+                            }
+                            // Check if a /connect host:port was requested (switch to a
+                            // different remote server)
+                            if let Some(addr) = app.pending_remote_switch.take() {
+                                if let Err(e) = crate::platform::exec_relaunch(Some(&addr), false) {
+                                    app.add_output(&format!("Connect failed: {}", e));
+                                }
+                            }
                             // Check if an /update was requested
                             if let Some(force) = app.pending_update.take() {
                                 app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
@@ -1643,6 +1658,19 @@ pub(crate) fn handle_remote_client_key(
                         let _ = ws_tx.send(WsMessage::DisconnectWorld {
                             world_index: app.current_world_index,
                         });
+                    }
+                    Command::RemoteAttach { addr, close, cancel } => {
+                        // A remote client owns no server/worlds of its own, so switching or
+                        // detaching relaunches immediately — no confirmation needed.
+                        if cancel {
+                            app.add_output("No pending /connect to cancel.");
+                        } else if close {
+                            app.pending_remote_detach = true;
+                        } else if addr.is_empty() {
+                            app.add_output("Usage: /connect host:port  (or)  /connect host port  (or)  /connect --close");
+                        } else {
+                            app.pending_remote_switch = Some(addr);
+                        }
                     }
                     Command::NotACommand { text } => {
                         // Regular text - send to server

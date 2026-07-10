@@ -1056,6 +1056,20 @@ pub async fn handle_daemon_ws_message(
                     crate::debug_log(is_debug_enabled(), "DAEMON: Received /reload command, sending Sigusr1Received event");
                     let _ = event_tx.send(AppEvent::Sigusr1Received).await;
                 }
+                Command::RemoteAttach { .. } => {
+                    // A headless daemon (-D) has no local console/GUI to relaunch into —
+                    // /connect only makes sense for an interactive master or client.
+                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                        world_index,
+                        data: "/connect is not available in daemon mode.".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                        seq: 0,
+                        marked_new: false,
+                        flush: false, gagged: false,
+                    });
+                }
                 // Commands that execute locally on the client
                 Command::Quit | Command::Update { .. } => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
@@ -1445,8 +1459,11 @@ pub async fn handle_daemon_ws_message(
                 app.init_scrollback();
             }
 
-            // Save settings
-            let _ = persistence::save_settings(app);
+            // Save settings. Tag the (debug-mode-only) audit log with which kind of
+            // client pushed this, so a future settings-loss report can be traced back
+            // to its source (web/gui/console/android).
+            let save_source = app.ws_get_client_type(client_id).map(|t| t.label()).unwrap_or("web");
+            let _ = persistence::save_settings_with_source(app, save_source);
 
             // Broadcast updated settings (use build_global_settings_msg to avoid leaking sensitive data)
             let settings = app.build_global_settings_msg();

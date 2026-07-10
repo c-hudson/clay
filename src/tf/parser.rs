@@ -210,6 +210,11 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
     // The body should be stored literally and only substituted when executed
     let is_def_command = lower_cmd == "def";
 
+    // /recall args must not be %-substituted: the time format (e.g. -t"%H:%M:%S") uses
+    // % as strftime specifiers, not TF variable sigils. TinyFugue itself does not
+    // %-expand typed commands, so skipping substitution here is TF-consistent.
+    let is_recall_command = lower_cmd == "recall";
+
     // Perform variable and command substitution before parsing (except for /def bodies, inline control flow,
     // or when called with pre-substituted input from control_flow)
     let substituted;
@@ -218,6 +223,9 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         rest_check
     } else if is_inline_control_flow {
         // Don't substitute - control flow executor will handle per-iteration substitution
+        rest_check
+    } else if is_recall_command {
+        // Don't substitute - strftime % specifiers in time formats must not be eaten
         rest_check
     } else if is_def_command {
         // For /def, only substitute variables in options, not in the body

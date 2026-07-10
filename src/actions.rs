@@ -542,13 +542,14 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], sho
                 strip_mud_tag(&line.text)
             };
 
-            // Add timestamp if requested
+            // Add timestamp if requested, honoring the optional -t[format] (default %H:%M:%S)
             if opts.show_timestamps {
                 let epoch_secs = line.timestamp.duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0) as i64;
                 let lt = crate::util::local_time_from_epoch(epoch_secs);
-                let ts_str = format!("{:02}:{:02}:{:02}", lt.hour, lt.minute, lt.second);
+                let fmt = opts.timestamp_format.as_deref().unwrap_or("%H:%M:%S");
+                let ts_str = crate::util::format_local_time(&lt, fmt);
                 display_line = format!("[{}] {}", ts_str, display_line);
             }
 

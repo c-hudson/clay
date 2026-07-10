@@ -421,6 +421,11 @@
     let wsPassword = '';
     let tlsConfigured = false;  // True if server has TLS cert+key configured
     let serverAuthKey = '';  // Auth key from server (for display in web settings)
+    // Guards against pushing a full UpdateGlobalSettings snapshot before this client
+    // has received the server's real values (InitialState / GlobalSettingsUpdated).
+    // Without this, any global still at its JS default (false/'') would overwrite
+    // and persist over the server's real setting. See settings-audit investigation.
+    let settingsSynced = false;
     // Temporary editing state for web popup (only saved on Save button)
     let editWebSecure = false;
     let editHttpEnabled = false;
@@ -636,7 +641,7 @@
     // This list is verified by test_command_parity_js_vs_rust in main.rs
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
-        'worlds', 'world', 'connections', 'l', 'disconnect', 'dc',
+        'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window',
@@ -1657,8 +1662,9 @@
                     elements.input.focus();
                     // Update UI based on multiuser mode
                     updateMultiuserUI();
-                    // Declare client type to server (Web for browser clients)
-                    send({ type: 'ClientTypeDeclaration', client_type: 'Web' });
+                    // Declare client type to server (Android when running inside the
+                    // Android app's WebView bridge, Web for regular browser clients)
+                    send({ type: 'ClientTypeDeclaration', client_type: window.Android ? 'Android' : 'Web' });
                     // Save password and username for Android auto-login on Activity recreation
                     if (window.Android && window.Android.savePassword && pendingAuthPassword) {
                         window.Android.savePassword(pendingAuthPassword);
@@ -1945,6 +1951,7 @@
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
+                    settingsSynced = true;
                 }
                 // Calculate activity count from world data (don't wait for ActivityUpdate message)
                 serverActivityCount = worlds.filter((w, i) =>
@@ -2463,6 +2470,7 @@
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
+                    settingsSynced = true;
                 }
                 break;
 
@@ -2614,7 +2622,9 @@
                 break;
 
             case 'ConnectionsListResponse':
-                addRawOutputLines(msg.lines || [], currentWorldIndex);
+                // Prefix each line with the client-generated marker to match the console,
+                // which adds this at render time (rendering.rs) for from_server:false lines.
+                addRawOutputLines((msg.lines || []).map(line => '✨ ' + line), currentWorldIndex);
                 redisplayCurrentPrompt();
                 break;
 
@@ -3255,6 +3265,26 @@
             return;
         }
 
+        // Intercept /connect in remote WebView mode — this client attaches to/detaches
+        // from remote Clay servers directly; never forwarded to the currently-attached
+        // server (the master WebView's /connect is handled server-side instead).
+        if (window.WEBVIEW_MODE && !window.AUTO_PASSWORD &&
+            (cmdTrimmed === '/connect' || cmdTrimmed.startsWith('/connect '))) {
+            elements.input.value = '';
+            var connectArgs = cmdTrimmed.length > 9 ? cmdTrimmed.substring(9).trim().split(/\s+/).filter(Boolean) : [];
+            if (connectArgs.length === 0) {
+                appendClientLine('Usage: /connect host:port  (or)  /connect host port  (or)  /connect --close');
+            } else if (connectArgs[0] === '--close') {
+                sendIpc('connect-close');
+            } else if (connectArgs[0] === '--cancel') {
+                appendClientLine('No pending /connect to cancel.');
+            } else {
+                var connectAddr = connectArgs.length > 1 ? (connectArgs[0] + ':' + connectArgs[1]) : connectArgs[0];
+                sendIpc('connect:' + connectAddr);
+            }
+            return;
+        }
+
         const sent = send({
             type: 'SendCommand',
             world_index: currentWorldIndex,
@@ -3781,6 +3811,8 @@
             { l: '/worlds -l &lt;name&gt;', r: 'Connect without auto-login' },
             { l: '/disconnect (or /dc)', r: 'Disconnect from server' },
             { l: '/connections (or /l)', r: 'List connected worlds' },
+            { l: '/connect &lt;host[:port]&gt;', r: 'Attach to a remote Clay server' },
+            { l: '/connect --close', r: 'Detach and become an independent master' },
             { heading: 'Communication' },
             { l: '/send [-W] [-w&lt;world&gt;] [-n] &lt;text&gt;', r: 'Send text to world(s)' },
             { l: '', r: '-W=all worlds, -n=no newline' },
@@ -6218,6 +6250,20 @@
         };
     }
 
+    // Send a full UpdateGlobalSettings snapshot to the server, but only once this
+    // client has synced real values from the server at least once. Every global in
+    // buildUpdateGlobalSettings() defaults to false/'' until a sync lands, so sending
+    // before that would silently reset unrelated globals on the server (and, since
+    // the server persists immediately, in ~/.clay/settings.dat). See CLAUDE.md /
+    // settings-audit investigation for the incident this guards against.
+    function sendGlobalSettings() {
+        if (!settingsSynced) {
+            console.warn('Clay: suppressed UpdateGlobalSettings push before initial settings sync');
+            return;
+        }
+        send(buildUpdateGlobalSettings());
+    }
+
     function saveSettingsAll() {
         // Clay Server tab (Android only) — save to SharedPreferences and reload
         if (settingsActiveTab === 'clay-server' && window.Android) {
@@ -6293,9 +6339,13 @@
         _saveFontSettingsInline();
 
         // Send combined update to server
-        const msg = buildUpdateGlobalSettings();
-        msg.input_height = setupInputHeightValue;
-        send(msg);
+        if (settingsSynced) {
+            const msg = buildUpdateGlobalSettings();
+            msg.input_height = setupInputHeightValue;
+            send(msg);
+        } else {
+            console.warn('Clay: suppressed UpdateGlobalSettings push before initial settings sync');
+        }
 
         closeSettingsPopup();
     }
@@ -7651,7 +7701,7 @@
 
         // Save to server so it persists across sessions
         if (sendToServer && authenticated) {
-            send(buildUpdateGlobalSettings());
+            sendGlobalSettings();
         }
 
         // Update view state for synchronized more-mode (visible lines changed with font size)

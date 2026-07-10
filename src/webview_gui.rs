@@ -57,6 +57,9 @@ enum WvEvent {
     UpdateStatus(String),
     /// Hot reload: exec a new binary (remote GUI only)
     Reload,
+    /// /connect: relaunch attached to a different server, or (addr=None) detach and become
+    /// an independent master (remote GUI only — master GUI handles /connect server-side)
+    RemoteRelaunch { addr: Option<String> },
     /// Open a new window (optionally locked to a world)
     NewWindow(Option<String>),
     /// Open a grep results window (half height, no status/input, filtered output)
@@ -839,6 +842,16 @@ fn dispatch_ipc_message(
         } else {
             let _ = proxy.send_event(WvEvent::Reload);
         }
+    } else if body == "connect-close" {
+        // /connect --close: only meaningful for a remote GUI (detach and become a master).
+        // The master webview never sends this — its /connect is handled server-side.
+        if !is_master {
+            let _ = proxy.send_event(WvEvent::RemoteRelaunch { addr: None });
+        }
+    } else if let Some(addr) = body.strip_prefix("connect:") {
+        if !is_master && !addr.is_empty() {
+            let _ = proxy.send_event(WvEvent::RemoteRelaunch { addr: Some(addr.to_string()) });
+        }
     } else if let Some(rest) = body.strip_prefix("opacity:") {
         if let Ok(opacity) = rest.parse::<f64>() {
             let _ = proxy.send_event(WvEvent::SetOpacity(opacity));
@@ -1185,6 +1198,19 @@ fn create_webview_window(
                         let _ = wv.evaluate_script(
                             "window.showUpdateStatus('Reload not supported on this platform')"
                         );
+                    }
+                }
+            }
+            Event::UserEvent(WvEvent::RemoteRelaunch { ref addr }) => {
+                // Remote GUI /connect: relaunch attached elsewhere, or (addr=None) detach
+                // and become an independent master. No state to save — a remote client's
+                // state lives on whichever server it's attached to.
+                if let Err(e) = crate::platform::exec_relaunch(addr.as_deref(), true) {
+                    if let Some(wv) = webviews.values().next() {
+                        let escaped = e.to_string().replace('\\', "\\\\").replace('\'', "\\'");
+                        let _ = wv.evaluate_script(&format!(
+                            "window.showUpdateStatus('Connect failed: {}')", escaped
+                        ));
                     }
                 }
             }

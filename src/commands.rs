@@ -1334,6 +1334,32 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 app.open_actions_list_popup();
             }
         }
+        Command::RemoteAttach { addr, close, cancel } => {
+            if cancel {
+                if app.pending_remote_connect.take().is_some() {
+                    app.add_output("Cancelled.");
+                } else {
+                    app.add_output("No pending /connect to cancel.");
+                }
+                return false;
+            }
+            if close {
+                // This process is already an independent master; nothing to detach from.
+                app.add_output("Already running as an independent master.");
+                return false;
+            }
+            if !app.is_master {
+                app.add_output("Only the master client can use /connect.");
+                return false;
+            }
+            if app.request_remote_attach(&addr) {
+                let use_gui = app.gui_tx.is_some();
+                if let Err(e) = crate::platform::exec_relaunch(Some(&addr), use_gui) {
+                    app.add_output(&format!("Connect failed: {}", e));
+                }
+            }
+            return false;
+        }
         Command::Connect { host: arg_host, port: arg_port, ssl: arg_ssl } => {
             // Only master client can initiate connections
             if !app.is_master {
