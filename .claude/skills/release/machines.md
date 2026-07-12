@@ -60,8 +60,8 @@ This sets `CC_armv7_linux_androideabi`/`CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LIN
 NDK's `armv7a-linux-androideabi24-clang`, runs `cargo build --release --target armv7-linux-androideabi
 --no-default-features --features rustls-backend`, then `patchelf --set-rpath` (mirroring the aarch64
 convention but with `/system/lib` instead of `/system/lib64`), and copies the result out.
-- Binary: `target/armv7-linux-androideabi/release/clay` → copied to `/tmp/clay-termux-armv7-nogui`
-- Release asset name: `clay-termux-armv7-nogui`
+- Binary: `target/armv7-linux-androideabi/release/clay` → copied to `/tmp/clay-termux-armv7-32bit-nogui`
+- Release asset name: `clay-termux-armv7-32bit-nogui`
 - Verified: builds clean, produces a valid `ELF32 ARM EABI5` binary, and has been confirmed to run
   on the aarch64 Termux phone (192.168.2.50) via its 32-bit userspace compatibility layer.
 

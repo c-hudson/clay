@@ -10,7 +10,7 @@
 #   - patchelf on PATH (installed to ~/.local/bin here; no root required)
 #
 # Usage: ./build-termux-armv7.sh
-# Output: /tmp/clay-termux-armv7-nogui
+# Output: /tmp/clay-termux-armv7-32bit-nogui
 
 set -euo pipefail
 
@@ -51,7 +51,7 @@ cargo build --release --target armv7-linux-androideabi \
     --no-default-features --features rustls-backend
 
 BIN="target/armv7-linux-androideabi/release/clay"
-OUT="/tmp/clay-termux-armv7-nogui"
+OUT="/tmp/clay-termux-armv7-32bit-nogui"
 
 # Mirror the aarch64 Termux rpath convention (see machines.md), using the 32-bit
 # system lib path instead of /system/lib64.
