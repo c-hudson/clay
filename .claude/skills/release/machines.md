@@ -37,6 +37,34 @@ cargo build --release --features webview-gui,native-audio
 - Release asset name: `clay-windows-x86_64.exe`
 - Static CRT linking (`+crt-static`) eliminates vcruntime140.dll dependency
 
+### Termux armv7 binary (cross-compiled, no GUI)
+
+Cross-compiled here on localhost via the Android NDK — there is no 32-bit device available, so
+unlike the aarch64 Termux binaries below (built natively on-device), this one targets
+`armv7-linux-androideabi` using the NDK's clang. No-GUI only (`rustls-backend`), so no
+tao/wry/X11 patches or libraries are needed.
+
+**One-time setup:**
+- Android NDK r26d unpacked at `~/Android/Sdk/ndk/26.3.11579264` (no `sdkmanager`/cmdline-tools
+  needed — downloaded directly from `https://dl.google.com/android/repository/android-ndk-r26d-linux.zip`)
+- `rustup target add armv7-linux-androideabi`
+- `patchelf` on PATH — installed to `~/.local/bin` from the prebuilt static release
+  (`https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz`);
+  no root/apt required
+
+**Build:**
+```bash
+./build-termux-armv7.sh
+```
+This sets `CC_armv7_linux_androideabi`/`CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER` etc. to the
+NDK's `armv7a-linux-androideabi24-clang`, runs `cargo build --release --target armv7-linux-androideabi
+--no-default-features --features rustls-backend`, then `patchelf --set-rpath` (mirroring the aarch64
+convention but with `/system/lib` instead of `/system/lib64`), and copies the result out.
+- Binary: `target/armv7-linux-androideabi/release/clay` → copied to `/tmp/clay-termux-armv7-nogui`
+- Release asset name: `clay-termux-armv7-nogui`
+- Verified: builds clean, produces a valid `ELF32 ARM EABI5` binary, and has been confirmed to run
+  on the aarch64 Termux phone (192.168.2.50) via its 32-bit userspace compatibility layer.
+
 ### Android APK
 ```bash
 cd android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleRelease
@@ -112,6 +140,18 @@ patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/
 - Binary: `~/clay/target/release/clay`
 - Release asset name: `clay-termux-aarch64`
 - SCP back: `scp -P 8022 adrick@192.168.2.50:~/clay/target/release/clay /tmp/clay-termux-aarch64`
+
+### Termux aarch64 binary (no GUI, reduced library needs)
+
+Built after the GUI binary, once `Cargo.toml`/`Cargo.lock` have been restored to their git state (no tao/wry patches applied) — this build needs no X11/webview libraries at all.
+
+```bash
+cd ~/clay
+cargo build --release --no-default-features --features rustls-backend
+```
+- Binary: `~/clay/target/release/clay`
+- Release asset name: `clay-termux-aarch64-nogui`
+- SCP back: `scp -P 8022 adrick@192.168.2.50:~/clay/target/release/clay /tmp/clay-termux-aarch64-nogui`
 
 ## Linux Test (192.168.2.6) — VERIFICATION ONLY
 
