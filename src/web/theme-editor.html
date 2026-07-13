@@ -1088,7 +1088,9 @@ function initConnection() {
   document.getElementById('fileOpsGroup').style.display = 'none';
   document.getElementById('remoteOpsGroup').style.display = 'flex';
 
-  const wsUrl = protocol + '://' + host + ':' + port;
+  // WS upgrade path must match the server's stealth prefix (empty WEB_PATH = legacy "/ws")
+  const basePath = window.WEB_PATH ? '/' + window.WEB_PATH : '';
+  const wsUrl = protocol + '://' + host + ':' + port + basePath + '/ws';
   document.getElementById('authStatus').textContent = 'Connecting to ' + host + ':' + port + '...';
 
   ws = new WebSocket(wsUrl);
@@ -2082,6 +2084,7 @@ function escapeHtml(s) {
 // ── Start ─────────────────────────────────────────────────────────────────
 
 // WebSocket configuration injected by server (or empty for standalone)
+window.WEB_PATH = '{{WEB_PATH}}';
 window.WS_HOST = '{{WS_HOST}}';
 window.WS_PORT = {{WS_PORT}};
 window.WS_PROTOCOL = '{{WS_PROTOCOL}}';

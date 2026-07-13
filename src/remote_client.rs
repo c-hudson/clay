@@ -1202,6 +1202,7 @@ pub(crate) fn handle_remote_client_key(
                     web_secure: app.settings.web_secure,
                     http_enabled: app.settings.http_enabled,
                     http_port: app.settings.http_port,
+                    web_path: app.settings.web_path.clone(),
                     ws_enabled: false,  // Legacy
                     ws_port: 0,        // Legacy
                     ws_cert_file: app.settings.websocket_cert_file.clone(),
@@ -1227,6 +1228,7 @@ pub(crate) fn handle_remote_client_key(
                     def.custom_data.insert("web_secure".to_string(), settings.web_secure.to_string());
                     def.custom_data.insert("http_enabled".to_string(), settings.http_enabled.to_string());
                     def.custom_data.insert("http_port".to_string(), settings.http_port);
+                    def.custom_data.insert("web_path".to_string(), settings.web_path);
                     def.custom_data.insert("ws_password".to_string(), settings.ws_password);
                     def.custom_data.insert("ws_allow_list".to_string(), settings.ws_allow_list);
                     def.custom_data.insert("ws_cert_file".to_string(), settings.ws_cert_file);
@@ -1939,6 +1941,7 @@ pub(crate) fn apply_remote_web_settings(
     app.settings.web_secure = settings.web_secure;
     app.settings.http_enabled = settings.http_enabled;
     app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
+    app.settings.web_path = crate::sanitize_web_path(&settings.web_path);
     app.settings.websocket_allow_list = settings.ws_allow_list.clone();
     app.settings.websocket_cert_file = settings.ws_cert_file.clone();
     app.settings.websocket_key_file = settings.ws_key_file.clone();
@@ -1969,6 +1972,7 @@ pub(crate) fn apply_remote_web_settings(
         web_secure: app.settings.web_secure,
         http_enabled: app.settings.http_enabled,
         http_port: app.settings.http_port,
+        web_path: app.settings.web_path.clone(),
         ws_enabled: false,  // Legacy
         ws_port: 0,         // Legacy
         ws_cert_file: app.settings.websocket_cert_file.clone(),

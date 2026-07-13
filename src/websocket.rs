@@ -241,6 +241,8 @@ pub enum WsMessage {
         web_secure: bool,
         http_enabled: bool,
         http_port: u16,
+        #[serde(default = "default_web_path")]
+        web_path: String,
         #[serde(default)]
         ws_enabled: bool,  // Legacy — ignored, kept for backward compat
         #[serde(default)]
@@ -511,6 +513,9 @@ pub struct GlobalSettingsMsg {
     pub web_secure: bool,
     pub http_enabled: bool,
     pub http_port: u16,
+    /// Stealth path prefix for the web UI (default "clay"; empty = legacy mode at "/")
+    #[serde(default = "default_web_path")]
+    pub web_path: String,
     #[serde(default)]
     pub ws_enabled: bool,  // Legacy — ignored, kept for backward compat
     #[serde(default)]
@@ -553,6 +558,10 @@ pub struct GlobalSettingsMsg {
 
 fn default_gui_transparency() -> f32 {
     1.0
+}
+
+fn default_web_path() -> String {
+    "clay".to_string()
 }
 
 fn default_web_font_size_phone() -> f32 {
@@ -666,15 +675,20 @@ pub struct WebSocketServer {
     pub tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
 }
 
+/// Parse a CSV allow-list string into trimmed, non-empty entries.
+pub fn parse_allow_list_csv(allow_list: &str) -> Vec<String> {
+    allow_list
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 impl WebSocketServer {
     pub fn new(password: &str, port: u16, allow_list: &str, whitelisted_host: Option<String>, multiuser_mode: bool, ban_list: BanList) -> Self {
         let password_hash = hash_password(password);
         // Parse allow list: comma-separated, trimmed entries
-        let allow_list_vec: Vec<String> = allow_list
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let allow_list_vec: Vec<String> = parse_allow_list_csv(allow_list);
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(std::sync::Mutex::new(1)),
@@ -1289,6 +1303,7 @@ pub async fn start_websocket_server(
                                                 multiuser_mode,
                                                 users,
                                                 ban_list,
+                                                false, // standalone WS-only server: no accept-time knock support
                                             ).await {
                                                 // Connection error, client disconnected
                                             }
@@ -1310,6 +1325,7 @@ pub async fn start_websocket_server(
                                     multiuser_mode,
                                     users,
                                     ban_list,
+                                    false, // standalone WS-only server: no accept-time knock support
                                 ).await {
                                     // Connection error, client disconnected
                                 }
@@ -1332,6 +1348,7 @@ pub async fn start_websocket_server(
                                                 multiuser_mode,
                                                 users,
                                                 ban_list,
+                                                false, // standalone WS-only server: no accept-time knock support
                                             ).await {
                                                 // Connection error, client disconnected
                                             }
@@ -1355,6 +1372,7 @@ pub async fn start_websocket_server(
                                     multiuser_mode,
                                     users,
                                     ban_list,
+                                    false, // standalone WS-only server: no accept-time knock support
                                 ).await {
                                     // Connection error, client disconnected
                                 }
@@ -1393,6 +1411,11 @@ pub async fn handle_ws_client<S>(
     multiuser_mode: bool,
     users: Arc<std::sync::RwLock<HashMap<String, UserCredential>>>,
     ban_list: BanList,
+    // True when this connection already passed the CLAY-KNOCK v1 preamble (D4,
+    // SECURITY-ROADMAP.md) at accept time. A knocked device has proven it holds a
+    // currently-valid auth key (a revoked key fails the knock) — see the "not in allow
+    // list" rejection below for why that matters here.
+    knocked: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1426,11 +1449,13 @@ where
         let allow_list_guard = allow_list.read().unwrap();
         is_in_allow_list(&client_ip, hostname.as_deref(), &allow_list_guard)
     };
-    let allow_list_empty = !is_localhost && {
+    // D5 (SECURITY-ROADMAP.md): an empty allow list means password auth is allowed from
+    // anywhere — it does NOT mean "in the list". Used below to skip the allow-list
+    // rejection entirely when no list is configured.
+    let allow_list_is_empty = !is_localhost && {
         let allow_list_guard = allow_list.read().unwrap();
         allow_list_guard.is_empty()
     };
-
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -1558,24 +1583,24 @@ where
                                 continue;
                             }
 
-                            // Password-based auth: check allow list first.
-                            // - Empty allow list: reject (only auth keys accepted)
-                            // - Non-empty allow list: IP must be in list or whitelisted
-                            if allow_list_empty {
-                                crate::http::log_remote_event("WS-REJECT", &client_ip,
-                                    "allow list empty, auth key required");
-                                let _ = tx.send(WsMessage::AuthResponse {
-                                    success: false,
-                                    error: Some("Password auth not available. Use an auth key.".to_string()),
-                                    username: None,
-                                    multiuser_mode,
-                                });
-                                continue;
-                            }
-                            if !in_allow_list && !is_whitelisted {
+                            // Password-based auth: check allow list (D5, SECURITY-ROADMAP.md).
+                            // - Empty allow list: password auth allowed from anywhere (no
+                            //   rejection here — this is the D5 behavior change).
+                            // - Non-empty allow list: IP must be in list or whitelisted.
+                            if !allow_list_is_empty && !in_allow_list && !is_whitelisted {
                                 crate::http::log_remote_event("WS-REJECT", &client_ip,
                                     "not in allow list");
-                                ban_list.record_violation(&client_ip, "WebSocket: not in allow list");
+                                // D6 (SECURITY-ROADMAP.md): with the accept-time gate
+                                // active, the only way a non-listed IP reaches this
+                                // branch at all is a successful knock — proof it holds
+                                // a currently-valid auth key. Don't strike it: a banned
+                                // IP can't even knock (ban check runs before accept),
+                                // so this would permanently lock the device out of its
+                                // own recovery path with no way back in short of a
+                                // server restart.
+                                if !knocked {
+                                    ban_list.record_violation(&client_ip, "WebSocket: not in allow list");
+                                }
                                 let _ = tx.send(WsMessage::AuthResponse {
                                     success: false,
                                     error: Some("Not authorized from this address".to_string()),
@@ -1653,8 +1678,10 @@ where
                             } else {
                                 // Log failed auth
                                 log_ws_auth(&client_ip, false, None);
-                                // Record violation for failed auth attempt
-                                ban_list.record_violation(&client_ip, "WebSocket: failed auth");
+                                // Record violation for failed auth attempt. Bans at 5
+                                // (not 2) and applies to allow-listed IPs too — see
+                                // `BanList::record_auth_failure` (D6, SECURITY-ROADMAP.md).
+                                ban_list.record_auth_failure(&client_ip, "WebSocket: failed auth");
                             }
                             // Send auth response
                             let response = WsMessage::AuthResponse {

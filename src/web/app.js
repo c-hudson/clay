@@ -185,6 +185,7 @@
         webProtocolSelect: document.getElementById('web-protocol-select'),
         webHttpEnabledSelect: document.getElementById('web-http-enabled-select'),
         webHttpPort: document.getElementById('web-http-port'),
+        webPath: document.getElementById('web-path'),
         webAllowList: document.getElementById('web-allow-list'),
         webWsPassword: document.getElementById('web-ws-password'),
         webCertFile: document.getElementById('web-cert-file'),
@@ -413,6 +414,7 @@
     let webSecure = false;
     let httpEnabled = false;
     let httpPort = 9000;
+    let webPath = 'clay';
     let wsEnabled = false;
     let wsPort = 9001;
     let wsAllowList = '';
@@ -1143,6 +1145,36 @@
         }
     }
 
+    // Stealth web-path prefix ("" = legacy mode, server UI lives at "/"). Prefer the
+    // value the server injected into this page's template; if unavailable (e.g. the
+    // Android WebView loading bundled assets from file:///android_asset, which never
+    // goes through the server's template substitution), derive it from the current
+    // page path as a best-effort fallback.
+    function basePath() {
+        if (typeof window.WEB_PATH === 'string') {
+            return window.WEB_PATH ? '/' + window.WEB_PATH : '';
+        }
+        const path = window.location.pathname || '/';
+        const segments = path.split('/').filter(Boolean);
+        if (segments.length === 0) return '';
+        const knownLegacyRoots = ['index.html', 'style.css', 'app.js', 'theme-editor',
+            'keybind-editor', 'action-editor', 'favicon.ico', 'fonts'];
+        return knownLegacyRoots.indexOf(segments[0]) === -1 ? '/' + segments[0] : '';
+    }
+
+    // WS upgrade path candidates to try, in order. Browser clients (server-rendered
+    // page, window.WEB_PATH known) use exactly one deterministic path. The Android
+    // WebView (bundled asset page, no injected WEB_PATH) doesn't know the server's
+    // configured web_path, so it tries the new stealth default then the legacy path —
+    // safe, since a wrong-path WS upgrade is silently dropped server-side with no
+    // ban-violation strike.
+    function wsPathCandidates() {
+        if (window.Android && typeof window.WEB_PATH !== 'string') {
+            return ['/clay/ws', '/ws'];
+        }
+        return [basePath() + '/ws'];
+    }
+
     // Build list of WebSocket candidates for this connect cycle.
     function buildCandidates() {
         const local = window.WS_LOCAL_HOST || window.WS_HOST || window.location.hostname;
@@ -1160,10 +1192,13 @@
             protos = (window.WS_PROTOCOL === 'ws') ? ['ws'] : ['wss', 'ws'];
         }
         const hosts = (remote && remote !== local) ? [local, remote] : [local];
+        const paths = wsPathCandidates();
         const result = [];
         hosts.forEach(function(h) {
             protos.forEach(function(p) {
-                result.push({ proto: p, host: h, url: p + '://' + h + ':' + port });
+                paths.forEach(function(wsPath) {
+                    result.push({ proto: p, host: h, url: p + '://' + h + ':' + port + wsPath });
+                });
             });
         });
         return result;
@@ -1871,6 +1906,9 @@
                     if (msg.settings.http_port !== undefined) {
                         httpPort = msg.settings.http_port;
                     }
+                    if (msg.settings.web_path !== undefined) {
+                        webPath = msg.settings.web_path;
+                    }
                     if (msg.settings.ws_enabled !== undefined) {
                         wsEnabled = msg.settings.ws_enabled;
                     }
@@ -2386,6 +2424,9 @@
                     if (msg.settings.http_port !== undefined) {
                         httpPort = msg.settings.http_port;
                     }
+                    if (msg.settings.web_path !== undefined) {
+                        webPath = msg.settings.web_path;
+                    }
                     if (msg.settings.ws_enabled !== undefined) {
                         wsEnabled = msg.settings.ws_enabled;
                     }
@@ -2582,7 +2623,7 @@
                 var wsHost = window.WS_HOST || window.location.hostname;
                 var wsPort = (window.WS_PORT && window.WS_PORT !== 0)
                     ? window.WS_PORT : window.location.port;
-                var openUrl = wsProto + '://' + wsHost + ':' + wsPort + '/' + worldParam;
+                var openUrl = wsProto + '://' + wsHost + ':' + wsPort + basePath() + '/' + worldParam;
                 window.open(openUrl, '_blank');
                 break;
 
@@ -3225,7 +3266,7 @@
                     var winHost = window.WS_HOST || window.location.hostname;
                     var winPort = (window.WS_PORT && window.WS_PORT !== 0)
                         ? window.WS_PORT : window.location.port;
-                    var grepUrl = winProto + '://' + winHost + ':' + winPort + '/'
+                    var grepUrl = winProto + '://' + winHost + ':' + winPort + basePath() + '/'
                         + '?grep=' + encodeURIComponent(grepPattern)
                         + (grepWorld ? '&world=' + encodeURIComponent(grepWorld) : '')
                         + (grepRegexp ? '&regexp=1' : '');
@@ -3239,13 +3280,13 @@
             // Build URL using real server address (SERVER_URL set by WebView, else use WS_HOST)
             var winUrl;
             if (window.SERVER_URL) {
-                winUrl = window.SERVER_URL + '/' + winParam;
+                winUrl = window.SERVER_URL + basePath() + '/' + winParam;
             } else {
                 var winProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
                 var winHost = window.WS_HOST || window.location.hostname;
                 var winPort = (window.WS_PORT && window.WS_PORT !== 0)
                     ? window.WS_PORT : window.location.port;
-                winUrl = winProto + '://' + winHost + ':' + winPort + '/' + winParam;
+                winUrl = winProto + '://' + winHost + ':' + winPort + basePath() + '/' + winParam;
             }
             // In WebView mode, use IPC to spawn a new WebView window (not system browser)
             if (window.WEBVIEW_MODE) {
@@ -6067,13 +6108,14 @@
 
     function openEditorPage(page) {
         var url;
+        var pagePath = basePath() + (page ? '/' + page : '/');
         if (window.SERVER_URL) {
-            url = window.SERVER_URL + (page ? '/' + page : '');
+            url = window.SERVER_URL + pagePath;
         } else {
             var proto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
             var host = window.WS_HOST || window.location.hostname;
             var port = (window.WS_PORT && window.WS_PORT !== 0) ? window.WS_PORT : window.location.port;
-            url = proto + '://' + host + ':' + port + (page ? '/' + page : '');
+            url = proto + '://' + host + ':' + port + pagePath;
         }
         if (window.WEBVIEW_MODE) {
             sendIpc('open-url:' + url);
@@ -6232,6 +6274,7 @@
             web_secure: webSecure,
             http_enabled: httpEnabled,
             http_port: httpPort,
+            web_path: webPath,
             ws_enabled: wsEnabled,
             ws_port: wsPort,
             ws_cert_file: wsCertFile,
@@ -6329,6 +6372,7 @@
             webSecure = editWebSecure;
             httpEnabled = editHttpEnabled;
             httpPort = parseInt(elements.webHttpPort.value) || 9000;
+            webPath = elements.webPath ? elements.webPath.value.replace(/^\/+|\/+$/g, '').replace(/[^A-Za-z0-9_-]/g, '') : webPath;
             wsAllowList = elements.webAllowList.value;
             wsPassword = elements.webWsPassword ? elements.webWsPassword.value : wsPassword;
             wsCertFile = elements.webCertFile.value;
@@ -6362,6 +6406,7 @@
 
         // Update input fields (from global state - text fields are read on save)
         elements.webHttpPort.value = httpPort;
+        if (elements.webPath) elements.webPath.value = webPath;
         elements.webAllowList.value = wsAllowList;
         if (elements.webWsPassword) elements.webWsPassword.value = wsPassword;
         // Show placeholder if TLS configured but paths not sent from server
@@ -7603,7 +7648,7 @@
                 var nwHost = window.WS_HOST || window.location.hostname;
                 var nwPort = (window.WS_PORT && window.WS_PORT !== 0)
                     ? window.WS_PORT : window.location.port;
-                var newWindowUrl = nwProto + '://' + nwHost + ':' + nwPort + '/';
+                var newWindowUrl = nwProto + '://' + nwHost + ':' + nwPort + basePath() + '/';
                 window.open(newWindowUrl, '_blank');
                 break;
             case 'resync':

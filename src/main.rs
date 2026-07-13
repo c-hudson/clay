@@ -97,7 +97,7 @@ pub use actions::{
     compile_all_action_regexes,
     find_invocable_action, rewrite_slashless_action,
 };
-pub use http::{HttpsServer, HttpServer, BanList, start_https_server, start_http_server, log_http_404, log_ws_auth, log_ban};
+pub use http::{HttpsServer, HttpServer, BanList, SecurityGate, start_https_server, start_http_server, log_http_404, log_ws_auth, log_ban};
 pub use persistence::{
     encrypt_password, decrypt_password,
     save_settings, load_settings,
@@ -1414,6 +1414,15 @@ impl AuthKey {
     }
 }
 
+/// Sanitize a `web_path` value: keep only `[A-Za-z0-9_-]`, trim leading/trailing slashes
+/// (an empty result means legacy mode — UI served at `/`).
+pub fn sanitize_web_path(raw: &str) -> String {
+    raw.trim_matches('/')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct Settings {
     pub more_mode_enabled: bool,
@@ -1442,6 +1451,7 @@ pub struct Settings {
     web_secure: bool,              // Protocol: true=Secure (https/wss), false=Non-Secure (http/ws)
     http_enabled: bool,            // Enable HTTP/HTTPS web server (name depends on web_secure)
     http_port: u16,                // Port for HTTP/HTTPS web interface
+    web_path: String,              // Stealth path prefix for web UI (default "clay"; empty = legacy mode at "/")
     websocket_password: String,
     websocket_allow_list: String,  // CSV list of hosts that can be whitelisted
     websocket_whitelisted_host: Option<String>,  // Currently whitelisted host (authenticated from allow list)
@@ -1498,6 +1508,7 @@ impl Default for Settings {
             web_secure: false,         // Default to non-secure
             http_enabled: false,
             http_port: 9000,
+            web_path: "clay".to_string(),
             websocket_password: String::new(),
             websocket_allow_list: String::new(),
             websocket_whitelisted_host: None,
@@ -3078,6 +3089,10 @@ pub struct App {
     pub highlight_actions: bool, // F8 toggles - highlight lines matching action patterns
     // WebSocket server (ws:// or wss:// depending on web_secure setting)
     pub ws_server: Option<WebSocketServer>,
+    /// Plaintext auth key, shared with SecurityGate.auth_key for accept-time knock
+    /// verification (Phase 3). Mirrors `settings.websocket_auth_key`; kept in sync by
+    /// settings load/reload and by handle_ws_key_request/handle_ws_key_revoke.
+    pub ws_auth_key_shared: Arc<std::sync::RwLock<Option<String>>>,
     // HTTP web interface server (no TLS)
     pub http_server: Option<HttpServer>,
     // HTTPS web interface server
@@ -3212,6 +3227,7 @@ impl App {
             show_tags: false, // Default: hide tags
             highlight_actions: false, // Default: don't highlight action matches
             ws_server: None,
+            ws_auth_key_shared: Arc::new(std::sync::RwLock::new(None)),
             http_server: None,
             #[cfg(feature = "native-tls-backend")]
             https_server: None,
@@ -3323,6 +3339,7 @@ impl App {
             web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
             http_port: self.settings.http_port,
+            web_path: self.settings.web_path.clone(),
             ws_enabled: false,  // Legacy
             ws_port: 0,        // Legacy
             ws_cert_file: self.settings.websocket_cert_file.clone(),
@@ -3374,6 +3391,7 @@ impl App {
         self.settings.web_secure = settings.web_secure;
         self.settings.http_enabled = settings.http_enabled;
         self.settings.http_port = settings.http_port;
+        self.settings.web_path = sanitize_web_path(&settings.web_path);
         // ws_enabled and ws_port are legacy — ignored
         // Only update cert/key if non-empty (server sends empty to avoid leaking paths)
         if !settings.ws_cert_file.is_empty() {
@@ -3758,6 +3776,7 @@ impl App {
             self.settings.web_secure,
             self.settings.http_enabled,
             &self.settings.http_port.to_string(),
+            &self.settings.web_path,
             &self.settings.websocket_password,
             &self.settings.websocket_allow_list,
             &self.settings.websocket_cert_file,
@@ -6310,6 +6329,7 @@ impl App {
     fn handle_ws_key_request(&mut self, _client_id: u64) {
         let key = App::generate_auth_key();
         self.settings.websocket_auth_key = Some(AuthKey::new(key.clone()));
+        *self.ws_auth_key_shared.write().unwrap() = Some(key.clone());
         let _ = persistence::save_settings(self);
         // Broadcast to ALL clients so every web UI updates its displayed key
         self.ws_broadcast(WsMessage::KeyGenerated { auth_key: key });
@@ -6318,6 +6338,7 @@ impl App {
     /// Handle WsKeyRevoke event — clear the single auth key.
     fn handle_ws_key_revoke(&mut self, _key: &str) {
         self.settings.websocket_auth_key = None;
+        *self.ws_auth_key_shared.write().unwrap() = None;
         let _ = persistence::save_settings(self);
     }
 
@@ -7954,7 +7975,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -7992,12 +8013,15 @@ impl App {
                     server.update_password(&ws_password);
                 }
                 // Update web settings — flag a restart if server-affecting settings changed
+                let sanitized_web_path = sanitize_web_path(&web_path);
                 let web_changed = self.settings.web_secure != web_secure
                     || self.settings.http_enabled != http_enabled
-                    || self.settings.http_port != http_port;
+                    || self.settings.http_port != http_port
+                    || self.settings.web_path != sanitized_web_path;
                 self.settings.web_secure = web_secure;
                 self.settings.http_enabled = http_enabled;
                 self.settings.http_port = http_port;
+                self.settings.web_path = sanitized_web_path;
                 if web_changed { self.web_restart_needed = true; }
                 // ws_enabled and ws_port are legacy — ignored
                 // Only update cert/key if non-empty (remote clients send empty for security)
@@ -9627,6 +9651,7 @@ pub(crate) struct WebSettings {
     pub(crate) web_secure: bool,
     pub(crate) http_enabled: bool,
     pub(crate) http_port: String,
+    pub(crate) web_path: String,
     pub(crate) ws_password: String,
     pub(crate) ws_allow_list: String,
     pub(crate) ws_cert_file: String,
@@ -9641,10 +9666,13 @@ pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
     let http_changed = app.settings.http_enabled != settings.http_enabled;
     let cert_changed = app.settings.websocket_cert_file != settings.ws_cert_file
         || app.settings.websocket_key_file != settings.ws_key_file;
+    let sanitized_web_path = sanitize_web_path(&settings.web_path);
+    let web_path_changed = app.settings.web_path != sanitized_web_path;
 
     app.settings.web_secure = settings.web_secure;
     app.settings.http_enabled = settings.http_enabled;
     app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
+    app.settings.web_path = sanitized_web_path;
     app.settings.websocket_password = settings.ws_password.clone();
     app.settings.websocket_allow_list = settings.ws_allow_list.clone();
     app.settings.websocket_cert_file = settings.ws_cert_file.clone();
@@ -9668,7 +9696,7 @@ pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
 
     let _ = persistence::save_settings(app);
 
-    if port_changed || secure_changed || http_changed || cert_changed {
+    if port_changed || secure_changed || http_changed || cert_changed || web_path_changed {
         app.web_restart_needed = true;
         app.add_output("Web settings saved. Restarting web server...");
     } else {
@@ -9682,6 +9710,7 @@ pub(crate) fn web_settings_from_custom_data(data: &std::collections::HashMap<Str
         web_secure: data.get("web_secure").map(|v| v == "true").unwrap_or(false),
         http_enabled: data.get("http_enabled").map(|v| v == "true").unwrap_or(false),
         http_port: data.get("http_port").cloned().unwrap_or_else(|| "9000".to_string()),
+        web_path: data.get("web_path").cloned().unwrap_or_else(|| "clay".to_string()),
         ws_password: data.get("ws_password").cloned().unwrap_or_default(),
         ws_allow_list: data.get("ws_allow_list").cloned().unwrap_or_default(),
         ws_cert_file: data.get("ws_cert_file").cloned().unwrap_or_default(),
@@ -9768,7 +9797,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
-        WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT,
+        WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT, WEB_FIELD_WEB_PATH,
         WEB_FIELD_WS_PASSWORD, WEB_FIELD_AUTH_KEY,
         WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
         WEB_BTN_SAVE, WEB_BTN_CANCEL, WEB_BTN_REGEN_KEY, WEB_BTN_COPY_KEY,
@@ -10142,6 +10171,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     web_secure: state.get_selected(WEB_FIELD_PROTOCOL) == Some("secure"),
                     http_enabled: state.get_bool(WEB_FIELD_HTTP_ENABLED).unwrap_or(false),
                     http_port: state.get_text(WEB_FIELD_HTTP_PORT).unwrap_or("9000").to_string(),
+                    web_path: state.get_text(WEB_FIELD_WEB_PATH).unwrap_or("clay").to_string(),
                     ws_password: state.get_text(WEB_FIELD_WS_PASSWORD).unwrap_or("").to_string(),
                     ws_allow_list: state.get_text(WEB_FIELD_WS_ALLOW_LIST).unwrap_or("").to_string(),
                     ws_cert_file: state.get_text(WEB_FIELD_WS_CERT_FILE).unwrap_or("").to_string(),
@@ -11788,6 +11818,25 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
     let ws_state = app.ws_server.as_ref().map(|server| {
         std::sync::Arc::new(server.connection_state(event_tx.clone()))
     });
+    let gate = if let Some(server) = app.ws_server.as_ref() {
+        SecurityGate {
+            allow_list: server.allow_list.clone(),
+            whitelisted_host: server.whitelisted_host.clone(),
+            auth_key: app.ws_auth_key_shared.clone(),
+            web_path: app.settings.web_path.clone(),
+            ban_list: app.ban_list.clone(),
+        }
+    } else {
+        SecurityGate {
+            allow_list: Arc::new(std::sync::RwLock::new(
+                websocket::parse_allow_list_csv(&app.settings.websocket_allow_list)
+            )),
+            whitelisted_host: Arc::new(std::sync::RwLock::new(app.settings.websocket_whitelisted_host.clone())),
+            auth_key: app.ws_auth_key_shared.clone(),
+            web_path: app.settings.web_path.clone(),
+            ban_list: app.ban_list.clone(),
+        }
+    };
 
     // Shut down existing HTTP server
     if let Some(ref mut server) = app.http_server {
@@ -11812,7 +11861,7 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
         #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
         {
             let mut https_server = HttpsServer::new(http_port);
-            match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, ban_list, theme_css).await {
+            match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, ban_list, theme_css, gate.clone()).await {
                 Ok(()) => {
                     app.add_output(&format!("HTTPS web interface restarted on port {http_port}"));
                     app.https_server = Some(https_server);
@@ -11824,7 +11873,7 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
         }
     } else {
         let mut http_server = HttpServer::new(http_port);
-        match start_http_server(&mut http_server, ws_state, ban_list, theme_css, None).await {
+        match start_http_server(&mut http_server, ws_state, ban_list, theme_css, None, gate.clone()).await {
             Ok(()) => {
                 app.add_output(&format!("HTTP web interface restarted on port {http_port}"));
                 app.http_server = Some(http_server);
@@ -12252,6 +12301,25 @@ pub async fn run_app_headless(
     } else {
         None
     };
+    let gate = if let Some(server) = app.ws_server.as_ref() {
+        SecurityGate {
+            allow_list: server.allow_list.clone(),
+            whitelisted_host: server.whitelisted_host.clone(),
+            auth_key: app.ws_auth_key_shared.clone(),
+            web_path: app.settings.web_path.clone(),
+            ban_list: app.ban_list.clone(),
+        }
+    } else {
+        SecurityGate {
+            allow_list: Arc::new(std::sync::RwLock::new(
+                websocket::parse_allow_list_csv(&app.settings.websocket_allow_list)
+            )),
+            whitelisted_host: Arc::new(std::sync::RwLock::new(app.settings.websocket_whitelisted_host.clone())),
+            auth_key: app.ws_auth_key_shared.clone(),
+            web_path: app.settings.web_path.clone(),
+            ban_list: app.ban_list.clone(),
+        }
+    };
 
     // Auto-generate self-signed certs if secure mode enabled but no cert files
     if app.settings.web_secure
@@ -12300,6 +12368,7 @@ pub async fn run_app_headless(
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
+                    gate.clone(),
                 ).await {
                     Ok(()) => {
                         if !app.is_reload {
@@ -12322,6 +12391,7 @@ pub async fn run_app_headless(
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
+                    gate.clone(),
                 ).await {
                     Ok(()) => {
                         if !app.is_reload {
@@ -12348,6 +12418,7 @@ pub async fn run_app_headless(
                 app.ban_list.clone(),
                 app.gui_theme_colors().to_css_vars(),
                 inherited_handle,
+                gate.clone(),
             ).await {
                 Ok(()) => {
                     if !app.is_reload {
@@ -14080,6 +14151,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     } else {
         None
     };
+    let gate = if let Some(server) = app.ws_server.as_ref() {
+        SecurityGate {
+            allow_list: server.allow_list.clone(),
+            whitelisted_host: server.whitelisted_host.clone(),
+            auth_key: app.ws_auth_key_shared.clone(),
+            web_path: app.settings.web_path.clone(),
+            ban_list: app.ban_list.clone(),
+        }
+    } else {
+        SecurityGate {
+            allow_list: Arc::new(std::sync::RwLock::new(
+                websocket::parse_allow_list_csv(&app.settings.websocket_allow_list)
+            )),
+            whitelisted_host: Arc::new(std::sync::RwLock::new(app.settings.websocket_whitelisted_host.clone())),
+            auth_key: app.ws_auth_key_shared.clone(),
+            web_path: app.settings.web_path.clone(),
+            ban_list: app.ban_list.clone(),
+        }
+    };
 
     // Start unified HTTP+WS server if enabled
     if app.settings.http_enabled {
@@ -14128,6 +14218,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
+                    gate.clone(),
                 ).await {
                     Ok(()) => {
                         if !app.is_reload {
@@ -14153,6 +14244,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
+                    gate.clone(),
                 ).await {
                     Ok(()) => {
                         if !app.is_reload {
@@ -14177,6 +14269,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 app.ban_list.clone(),
                 app.gui_theme_colors().to_css_vars(),
                 None,
+                gate.clone(),
             ).await {
                 Ok(()) => {
                     if !app.is_reload {

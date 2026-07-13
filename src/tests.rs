@@ -1007,6 +1007,7 @@
                 false, // not multiuser
                 users,
                 ban_list,
+                false, // knocked: not exercised by this test
             ).await.ok();
         });
 
@@ -1076,6 +1077,7 @@
                 stream, 1, server_clients, password_hash, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 false, users, ban_list,
+                false, // knocked: not exercised by this test
             ).await.ok();
         });
 
@@ -1139,6 +1141,7 @@
                 stream, 1, server_clients, password_hash, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 false, users, ban_list,
+                false, // knocked: not exercised by this test
             ).await.ok();
         });
 
@@ -1232,6 +1235,7 @@
                 allow_list, whitelisted, client_addr, event_tx,
                 true, // multiuser mode
                 users, ban_list,
+                false, // knocked: not exercised by this test
             ).await.ok();
         });
 
@@ -1246,6 +1250,7 @@
                 stream, 2, clients2, password_hash2, true,
                 allow_list2, whitelisted2, client_addr, event_tx2,
                 true, users2, ban_list2,
+                false, // knocked: not exercised by this test
             ).await.ok();
         });
 
@@ -1456,6 +1461,7 @@
                 stream, 1, server_clients, ph, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 false, users, ban_list,
+                false, // knocked: not exercised by this test
             ).await.ok();
         });
 
@@ -1590,6 +1596,7 @@
                 stream, 1, server_clients, ph, true,
                 allow_list, whitelisted, client_addr, event_tx,
                 false, users, ban_list,
+                false, // knocked: not exercised by this test
             ).await.ok();
         });
 

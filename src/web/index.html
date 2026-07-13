@@ -679,13 +679,19 @@
                                     </div>
                                 </div>
                                 <div class="setting-row">
-                                    <span class="setting-label">Allow List</span>
+                                    <span class="setting-label" title="Stealth path prefix for the web UI: the UI is served only at /<path>/ and every other path is silently dropped for non-localhost connections. Default &quot;clay&quot;. Empty = legacy mode (UI at &quot;/&quot;, visible to scanners). Localhost always works at both.">Web Path</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="web-path" autocomplete="off" class="web-input" placeholder="clay">
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label" title="Comma-separated IPs, IP wildcards or hostnames. Empty = any address may connect (password or auth key still required). When set, addresses not on the list are dropped at the TCP level — no page, no TLS handshake, no reply — and can only get in via the Android auth-key knock, which grants WebSocket access only. Multiuser mode has no auth key, so unlisted addresses cannot connect there at all. Addresses ON this list are never banned for bad paths, http/https typos, or other connection probes — only silently dropped. A bare &quot;*&quot; entry does NOT get this protection (it means &quot;let everyone in&quot;, not &quot;never ban anyone&quot;).">Allow List</span>
                                     <div class="setting-value">
                                         <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="192.168.*, *.example.com">
                                     </div>
                                 </div>
                                 <div class="setting-row">
-                                    <span class="setting-label">Password</span>
+                                    <span class="setting-label" title="Password for WebSocket clients (web, mobile, remote console). A wrong password bans the connecting address after 5 failed attempts (localhost excepted) — this applies even to addresses on the Allow List.">Password</span>
                                     <div class="setting-value">
                                         <input type="text" id="web-ws-password" autocomplete="off" class="web-input">
                                     </div>
@@ -921,6 +927,8 @@
     </div>
 
     <script>
+        // Stealth web-path prefix injected by server (empty string = legacy mode at "/")
+        window.WEB_PATH = '{{WEB_PATH}}';
         // WebSocket configuration injected by server
         window.WS_HOST = '{{WS_HOST}}';
         window.WS_PORT = parseInt('{{WS_PORT}}') || 0;

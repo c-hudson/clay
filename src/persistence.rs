@@ -199,6 +199,9 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
+    // Written unconditionally (even when empty): key-absent (old settings file) means
+    // default "clay"; present-but-empty means legacy mode (UI served at "/").
+    writeln!(file, "web_path={}", app.settings.web_path)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
@@ -762,6 +765,11 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                             app.settings.http_port = p;
                         }
                     }
+                    "web_path" => {
+                        // Key present (even empty) overrides the default "clay" — empty
+                        // means legacy mode (UI served at "/").
+                        app.settings.web_path = sanitize_web_path(value);
+                    }
                     // Legacy fields - map https to http when web_secure, ws_nonsecure to ws when !web_secure
                     "https_enabled" => {
                         // If https was enabled in old config, set http_enabled and web_secure
@@ -877,6 +885,8 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
             }
         }
     }
+
+    *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
 
     Ok(())
 }
@@ -1152,6 +1162,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                             app.settings.http_port = p;
                         }
                     }
+                    "web_path" => app.settings.web_path = sanitize_web_path(value),
                     _ => {}
                 }
             }
@@ -1183,6 +1194,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
+    // Written unconditionally (even when empty): key-absent (old settings file) means
+    // default "clay"; present-but-empty means legacy mode (UI served at "/").
+    writeln!(file, "web_path={}", app.settings.web_path)?;
 
     // [user:NAME] sections
     for user in &app.users {
@@ -1344,6 +1358,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
+    // Written unconditionally (even when empty): key-absent (old settings file) means
+    // default "clay"; present-but-empty means legacy mode (UI served at "/").
+    writeln!(file, "web_path={}", app.settings.web_path)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
@@ -1986,6 +2003,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             app.settings.http_port = p;
                         }
                     }
+                    "web_path" => {
+                        app.settings.web_path = sanitize_web_path(value);
+                    }
                     // Legacy fields
                     "https_enabled" => {
                         if value == "true" {
@@ -2286,6 +2306,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         }
     }
 
+    *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
+
     // Clean up the reload state file and env var
     let _ = std::fs::remove_file(&path);
     std::env::remove_var("CLAY_RELOAD_PID");
@@ -2321,6 +2343,7 @@ mod tests {
             web_secure: true,                  // default: false
             http_enabled: true,                // default: false
             http_port: 8080,                   // default: 9000
+            web_path: "stealth".to_string(),   // default: "clay"
             websocket_password: "testpass".to_string(),     // default: ""
             websocket_allow_list: "192.168.1.1".to_string(), // default: ""
             websocket_whitelisted_host: Some("10.0.0.1".to_string()), // default: None (not persisted to .clay.dat)
@@ -2415,6 +2438,7 @@ mod tests {
         assert_eq!(a.web_secure, b.web_secure, "{context}: web_secure");
         assert_eq!(a.http_enabled, b.http_enabled, "{context}: http_enabled");
         assert_eq!(a.http_port, b.http_port, "{context}: http_port");
+        assert_eq!(a.web_path, b.web_path, "{context}: web_path");
         assert_eq!(a.websocket_password, b.websocket_password, "{context}: websocket_password");
         assert_eq!(a.websocket_allow_list, b.websocket_allow_list, "{context}: websocket_allow_list");
         // websocket_whitelisted_host is not persisted to .clay.dat (runtime state)
@@ -2543,6 +2567,7 @@ mod tests {
         assert_ne!(non_default.web_secure, default.web_secure, "web_secure should differ");
         assert_ne!(non_default.http_enabled, default.http_enabled, "http_enabled should differ");
         assert_ne!(non_default.http_port, default.http_port, "http_port should differ");
+        assert_ne!(non_default.web_path, default.web_path, "web_path should differ");
         assert_ne!(non_default.websocket_password, default.websocket_password, "websocket_password should differ");
         assert_ne!(non_default.websocket_allow_list, default.websocket_allow_list, "websocket_allow_list should differ");
         assert_ne!(non_default.websocket_cert_file, default.websocket_cert_file, "websocket_cert_file should differ");

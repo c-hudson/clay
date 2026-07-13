@@ -381,7 +381,10 @@ function connect() {
   const wsHost = '{{WS_HOST}}' || window.location.hostname;
   const wsPort = '{{WS_PORT}}' === '0' ? window.location.port : '{{WS_PORT}}';
   const wsProto = '{{WS_PROTOCOL}}' || (window.location.protocol === 'https:' ? 'wss' : 'ws');
-  const url = wsProto + '://' + wsHost + ':' + wsPort;
+  // WS upgrade path must match the server's stealth prefix (empty WEB_PATH = legacy "/ws")
+  const webPath = '{{WEB_PATH}}';
+  const basePath = webPath ? '/' + webPath : '';
+  const url = wsProto + '://' + wsHost + ':' + wsPort + basePath + '/ws';
 
   document.getElementById('authStatus').textContent = 'Connecting...';
   ws = new WebSocket(url);

@@ -60,6 +60,25 @@ pub async fn run_daemon_server() -> io::Result<()> {
     } else {
         None
     };
+    let gate = if let Some(server) = app.ws_server.as_ref() {
+        SecurityGate {
+            allow_list: server.allow_list.clone(),
+            whitelisted_host: server.whitelisted_host.clone(),
+            auth_key: app.ws_auth_key_shared.clone(),
+            web_path: app.settings.web_path.clone(),
+            ban_list: app.ban_list.clone(),
+        }
+    } else {
+        SecurityGate {
+            allow_list: Arc::new(std::sync::RwLock::new(
+                crate::websocket::parse_allow_list_csv(&app.settings.websocket_allow_list)
+            )),
+            whitelisted_host: Arc::new(std::sync::RwLock::new(app.settings.websocket_whitelisted_host.clone())),
+            auth_key: app.ws_auth_key_shared.clone(),
+            web_path: app.settings.web_path.clone(),
+            ban_list: app.ban_list.clone(),
+        }
+    };
 
     // Start unified HTTP+WS server if enabled
     if app.settings.http_enabled {
@@ -79,6 +98,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
+                    gate.clone(),
                 ).await {
                     Ok(()) => {
                         let protocol = if ws_state.is_some() { "HTTPS+WSS" } else { "HTTPS" };
@@ -93,7 +113,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
         } else {
             // Start HTTP+WS
             let mut http_server = HttpServer::new(app.settings.http_port);
-            match start_http_server(&mut http_server, ws_state.clone(), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), None).await {
+            match start_http_server(&mut http_server, ws_state.clone(), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), None, gate.clone()).await {
                 Ok(()) => {
                     let protocol = if ws_state.is_some() { "HTTP+WS" } else { "HTTP" };
                     println!("{}: http://0.0.0.0:{}", protocol, app.settings.http_port);
@@ -348,6 +368,20 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             crate::exec_reload(&mut app)?;
                             return Ok(());
                         }
+                    }
+                    AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
+                        // Mirrors the console/GUI dispatch in main.rs: validate the auth key,
+                        // send AuthResponse, and (on success) mark the client authenticated and
+                        // send InitialState. Single-user daemon mode has no world-reconnect
+                        // timer (unlike console/GUI), so app.web_reconnect_needed is left unread
+                        // here — it's harmless, just unused in this mode.
+                        app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
+                    }
+                    AppEvent::WsKeyRequest(client_id) => {
+                        app.handle_ws_key_request(client_id);
+                    }
+                    AppEvent::WsKeyRevoke(_client_id, key) => {
+                        app.handle_ws_key_revoke(&key);
                     }
                     _ => {}
                 }
@@ -1404,7 +1438,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1426,13 +1460,16 @@ pub async fn handle_daemon_ws_message(
             app.settings.web_font_line_height = web_font_line_height;
             app.settings.web_font_letter_spacing = web_font_letter_spacing;
             app.settings.web_font_word_spacing = web_font_word_spacing;
+            let sanitized_web_path = sanitize_web_path(&web_path);
             let web_changed = app.settings.web_secure != web_secure
                 || app.settings.http_enabled != http_enabled
-                || app.settings.http_port != http_port;
+                || app.settings.http_port != http_port
+                || app.settings.web_path != sanitized_web_path;
             app.settings.websocket_allow_list = ws_allow_list;
             app.settings.web_secure = web_secure;
             app.settings.http_enabled = http_enabled;
             app.settings.http_port = http_port;
+            app.settings.web_path = sanitized_web_path;
             if web_changed { app.web_restart_needed = true; }
             // Only update cert/key if non-empty (remote clients send empty for security)
             if !ws_cert_file.is_empty() {
@@ -2095,13 +2132,21 @@ keep_alive_type=Generic
         server.add_user(&user.name, &user.password);
     }
 
+    let gate = SecurityGate {
+        allow_list: server.allow_list.clone(),
+        whitelisted_host: server.whitelisted_host.clone(),
+        auth_key: app.ws_auth_key_shared.clone(),
+        web_path: app.settings.web_path.clone(),
+        ban_list: app.ban_list.clone(),
+    };
+
     let ws_state = Arc::new(server.connection_state(event_tx.clone()));
     app.ws_server = Some(server);
 
     // Start unified HTTP+WS server
     {
         let mut http_server = HttpServer::new(app.settings.http_port);
-        match start_http_server(&mut http_server, Some(ws_state.clone()), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), None).await {
+        match start_http_server(&mut http_server, Some(ws_state.clone()), app.ban_list.clone(), app.gui_theme_colors().to_css_vars(), None, gate.clone()).await {
             Ok(()) => {
                 println!("HTTP+WS: http://0.0.0.0:{}", app.settings.http_port);
                 app.http_server = Some(http_server);
@@ -2370,6 +2415,23 @@ keep_alive_type=Generic
                             // world_name might be empty for multiuser reader tasks
                         }
                     }
+                    AppEvent::WsAuthKeyValidation(client_id, _msg, client_ip, _challenge) => {
+                        // Auth-key login is a single per-install device key and doesn't map to
+                        // multiuser's per-account model, so it's intentionally unsupported here.
+                        // Reply with a clean failure instead of silently dropping the request,
+                        // which would otherwise leave the client waiting for a response.
+                        crate::http::log_remote_event("WS-KEY-REJECT", &client_ip,
+                            "auth keys not supported in multiuser mode");
+                        app.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                            success: false,
+                            error: Some("Auth key login not supported in multiuser mode".to_string()),
+                            username: None,
+                            multiuser_mode: true,
+                        });
+                    }
+                    // WsKeyRequest / WsKeyRevoke: also intentionally unsupported in multiuser
+                    // mode (single per-install key model), so they fall through to the
+                    // wildcard below and are silently ignored.
                     _ => {} // Ignore other events in multiuser mode
                 }
             }

@@ -104,7 +104,7 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 - `cert.pem` / `key.pem` - Auto-generated TLS cert/key for `web_secure` mode
 - `debug.log` - Debug logging (via `debug_log()`)
 - `output.debug.log` - Output/seq debugging (via `output_debug_log()`)
-- `remote.log` - Remote connection events (HTTP 404s, WebSocket auth attempts)
+- `remote.log` - Remote connection events (silent drops, gate/knock outcomes, bans, WebSocket auth attempts)
 - `dump.log` - `/dump` debug state output
 - `settings-audit.log` - Debug-mode-only audit trail of `[global]` settings changes: old→new values, source client (web/gui/console/android/local), and a backtrace (via `persistence::save_settings_with_source()`, only written when debug mode is on)
 - `logs/<WorldName>.<YYYY-MM-DD>.log` - Per-world session logs (when log_enabled)
@@ -121,6 +121,17 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 - **Web content**: HTML/CSS/JS embedded via `include_str!()` in http.rs. Changes require rebuild + `/reload`.
 - **TF control flow in macros**: Body split by `%;`, control flow blocks grouped by `split_body_preserving_control_flow()`. Plain text in loop bodies becomes `SendToMud`, queued in `engine.pending_commands`.
 - **Async lock access**: Use `try_read()`/`try_write()` on tokio RwLock from sync code, never `blocking_read()`/`blocking_write()` inside async runtime.
+
+### Connection Security
+
+Incoming connections are gated in `src/http.rs` before anything is served. Design record: `SECURITY-ROADMAP.md`; user-facing summary: `SECURITY-NOTES.md`.
+
+- **Stealth path (`web_path` setting, default `"clay"`)**: web UI served only under `/clay/...`. Any other path from a non-localhost client is silently dropped (connection closed, zero response bytes) and records a ban strike — except `/favicon.ico` and `/apple-touch-icon*`, which drop without a strike. Empty `web_path` = legacy mode (UI at `/`, 404s as before). Localhost always works at both `/` and `/clay/` (the GUI WebView depends on this). Routing decisions live in the pure `decide_route()`; `SecurityGate` carries the shared allow-list/auth-key/ban-list state into all three server variants.
+- **Accept-time IP gate** (`gate_connection()`): when `websocket_allow_list` is non-empty, non-listed non-localhost IPs are dropped *before* the TLS peek — no handshake, no certificate, no redirect (`GATE-DROP`, deliberately not a ban strike, or the knock below could never get through). Allow-list membership never skips authentication.
+- **CLAY-KNOCK v1**: in-band auth-key preamble on the same TCP connection, before TLS/HTTP. Client sends `C7 4C 41 59 01 00`; server replies `C7 4B` + 32 random bytes; client sends raw `SHA256(auth_key || challenge)`; server acks `C7 06`. First byte `0xC7` disambiguates from TLS (`0x16`) and HTTP (ASCII) in the existing first-byte peek. A knocked connection may **WebSocket-upgrade at any path but never fetch a page** (`KNOCK-HTTP-DENIED`), and still performs normal WS auth. Android implements it in `NativeWebSocket.java` (`KnockSocketFactory`/`KnockSocket`, with fallback for old servers). Multiuser has no auth key → knocks always fail there.
+- **WS auth matrix**: no allow list → password or auth key from anywhere; allow list set → password only from listed/localhost/whitelisted addresses, everyone else must knock with the auth key.
+- **Ban exemption (D6)**: once an allow list is configured, the accept-time gate already drops every non-listed IP before it can reach any probe-strike site — so a probe strike can only ever ban a *legitimate, allow-listed* caller, never a scanner. `SecurityGate::strike()` is the one chokepoint every probe-strike site calls; it never bans an IP that's localhost, runtime-whitelisted, or matches a *specific* allow-list entry (exact IP, IP wildcard, or hostname pattern). A bare `*` allow-list entry does **not** confer this exemption — `*` means "let everyone reach the UI," not "nobody can ever be banned." `redirect_http_to_https()` (the plain-HTTP-on-the-HTTPS-port handler) reuses `decide_route()` directly instead of a separate reachability check, so it can never drift out of sync with it again — that drift was the root cause of a bug where an allow-listed user typing `http://` instead of `https://` got banned after two tries. Failed WebSocket password auth is the one exception: it still bans, and still applies to allow-listed IPs, via `BanList::record_auth_failure()` (threshold 5, not 2 — see `SECURITY-ROADMAP.md` D6). A connection that already knocked skips the "not in allow list" WS strike too (it proved a valid key; banning it would lock it out of its own recovery path).
+- **Debugging**: `~/.clay/remote.log` records `HTTP-DROP`, `GATE-DROP`, `GATE-TIMEOUT`, `TLS-ON-PLAIN` (ClientHello on a plain-HTTP server — logged, never struck), `KNOCK-OK`/`KNOCK-FAIL`/`KNOCK-BAD-MAGIC`, `KNOCK-HTTP-DENIED`, `WS-PATH-DROP` alongside the existing `BANNED`/`CONN-LIMIT`/`TLS-*` events. A silent drop is intentional — expect zero bytes, not an error page. `log_remote_event()` is a no-op under `#[cfg(test)]` — tests must never append to a real user's `~/.clay/remote.log`.
 
 ### /release Skill
 

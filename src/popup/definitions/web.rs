@@ -18,6 +18,7 @@ pub const WEB_FIELD_WS_ALLOW_LIST: FieldId = FieldId(7);
 pub const WEB_FIELD_WS_CERT_FILE: FieldId = FieldId(8);
 pub const WEB_FIELD_WS_KEY_FILE: FieldId = FieldId(9);
 pub const WEB_FIELD_AUTH_KEY: FieldId = FieldId(10);
+pub const WEB_FIELD_WEB_PATH: FieldId = FieldId(11);
 
 // Button IDs
 pub const WEB_BTN_SAVE: ButtonId = ButtonId(1);
@@ -39,6 +40,7 @@ pub fn create_web_popup(
     web_secure: bool,
     http_enabled: bool,
     http_port: &str,
+    web_path: &str,
     ws_password: &str,
     ws_allow_list: &str,
     ws_cert_file: &str,
@@ -62,6 +64,11 @@ pub fn create_web_popup(
             WEB_FIELD_HTTP_PORT,
             "HTTP Port",
             FieldKind::text(http_port),
+        ))
+        .with_field(Field::new(
+            WEB_FIELD_WEB_PATH,
+            "Web Path",
+            FieldKind::text(web_path),
         ))
         .with_field(Field::new(
             WEB_FIELD_WS_PASSWORD,
@@ -137,12 +144,40 @@ fn web_help_text() -> Vec<String> {
         "",
         "HTTP Port: The port number for the web server.",
         "",
+        "Web Path: Stealth path prefix for the web UI (default",
+        "  \"clay\" — UI served only at /clay/, everything else",
+        "  is silently dropped for non-localhost connections).",
+        "  Leave empty to restore legacy mode (UI at \"/\", old",
+        "  bookmarks and old Android APKs keep working, but",
+        "  scanners can see the login page). Localhost (the GUI",
+        "  WebView) always works at both paths, no config",
+        "  needed. Android app with an auth key can knock to",
+        "  connect from anywhere even in stealth mode; without",
+        "  a knock, non-localhost devices need to be on the WS",
+        "  Allow List.",
+        "",
         "WS Password: Password required for WebSocket clients",
-        "  (web, mobile, remote console) to connect.",
+        "  (web, mobile, remote console) to connect. Accepted",
+        "  from any address when the Allow List is empty; when",
+        "  an Allow List is set, only from listed addresses.",
+        "  A wrong password bans the address after 5 failed",
+        "  attempts (localhost excepted) — this applies even",
+        "  to addresses on the Allow List.",
         "",
         "WS Allow List: Comma-separated IPs, IP wildcards,",
-        "  or hostnames allowed to connect. Empty = allow all.",
+        "  or hostnames allowed to connect. Empty = allow all",
+        "  (password or Auth Key still required).",
         "  Examples: 192.168.1.*, *.rd.shawcable.net",
+        "  When set, addresses NOT on the list are dropped at",
+        "  the TCP level: no page, no TLS handshake, no reply.",
+        "  Their only way in is the Android auth-key knock,",
+        "  which grants WebSocket access only (never the web",
+        "  UI). Multiuser mode has no Auth Key, so unlisted",
+        "  addresses cannot connect there at all. Addresses ON",
+        "  the Allow List are never banned for bad paths, http/",
+        "  https typos, or other connection probes — only a",
+        "  bare \"*\" entry does NOT get this protection (it",
+        "  means \"let everyone in\", not \"never ban anyone\").",
         "",
         "TLS Cert File: Path to your TLS/SSL certificate",
         "  file (.pem or .crt) for secure connections.",
@@ -154,6 +189,10 @@ fn web_help_text() -> Vec<String> {
         "  login from the Android app or trusted devices.",
         "  Use Regen Key to generate a new key. Copy the key",
         "  to paste into the Android app's settings.",
+        "  The Android app also uses it to knock: it proves",
+        "  the key before any web request, which is the only",
+        "  way in from an address not on the Allow List.",
+        "  Regen or revoke takes effect immediately.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -177,7 +216,7 @@ mod tests {
     #[test]
     fn test_web_popup_creation() {
         let def = create_web_popup(
-            false, true, "9000",
+            false, true, "9000", "clay",
             "secret", "",
             "/path/to/cert", "/path/to/key",
             "testkey123",
@@ -192,7 +231,7 @@ mod tests {
     fn test_web_popup_tls_visibility() {
         // Non-secure mode - TLS fields hidden
         let def = create_web_popup(
-            false, true, "9000",
+            false, true, "9000", "clay",
             "secret", "",
             "", "",
             "",
@@ -204,7 +243,7 @@ mod tests {
 
         // Secure mode - TLS fields visible
         let def = create_web_popup(
-            true, true, "9000",
+            true, true, "9000", "clay",
             "secret", "",
             "", "",
             "",

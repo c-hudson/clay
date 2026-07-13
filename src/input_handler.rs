@@ -607,6 +607,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     def.custom_data.insert("web_secure".to_string(), settings.web_secure.to_string());
                     def.custom_data.insert("http_enabled".to_string(), settings.http_enabled.to_string());
                     def.custom_data.insert("http_port".to_string(), settings.http_port);
+                    def.custom_data.insert("web_path".to_string(), settings.web_path);
                     def.custom_data.insert("ws_password".to_string(), settings.ws_password);
                     def.custom_data.insert("ws_allow_list".to_string(), settings.ws_allow_list);
                     def.custom_data.insert("ws_cert_file".to_string(), settings.ws_cert_file);

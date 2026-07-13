@@ -334,7 +334,8 @@ public class MainActivity extends AppCompatActivity {
                 });
 
                 nativeWebSockets.put(id, ws);
-                ws.connect(url);
+                String authKey = prefs.getString(KEY_AUTH_KEY, "");
+                ws.connect(url, authKey);
                 android.util.Log.i("Clay", "connectWebSocket [" + id + "] " + url);
             });
         }
