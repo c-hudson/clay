@@ -23,6 +23,7 @@ public class SettingsActivity extends AppCompatActivity {
     private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
     private static final String KEY_AUTH_KEY = "authKey";
+    private static final String KEY_WEB_PATH = "webPath";
 
     private EditText serverHostInput;
     private EditText serverPortInput;
@@ -36,6 +37,7 @@ public class SettingsActivity extends AppCompatActivity {
     private Button saveButton;
     private Button cancelButton;
     private EditText authKeyValue;
+    private EditText webPathValue;
     private boolean fromMenu;
 
     @Override
@@ -55,6 +57,7 @@ public class SettingsActivity extends AppCompatActivity {
         saveButton = findViewById(R.id.saveButton);
         cancelButton = findViewById(R.id.cancelButton);
         authKeyValue = findViewById(R.id.authKeyValue);
+        webPathValue = findViewById(R.id.webPathValue);
 
         fromMenu = getIntent().getBooleanExtra("fromMenu", false);
 
@@ -68,6 +71,7 @@ public class SettingsActivity extends AppCompatActivity {
         String savedUsername = prefs.getString(KEY_SAVED_USERNAME, "");
         String savedPassword = prefs.getString(KEY_SAVED_PASSWORD, "");
         String authKey = prefs.getString(KEY_AUTH_KEY, "");
+        String webPath = prefs.getString(KEY_WEB_PATH, "");
 
         serverHostInput.setText(savedHost);
         serverPortInput.setText(savedPort > 0 ? String.valueOf(savedPort) : "");
@@ -81,6 +85,11 @@ public class SettingsActivity extends AppCompatActivity {
         // Display auth key (editable so user can paste or clear it)
         if (authKey != null && !authKey.isEmpty()) {
             authKeyValue.setText(authKey);
+        }
+
+        // Display web path (editable; blank = auto-detect)
+        if (webPath != null && !webPath.isEmpty()) {
+            webPathValue.setText(webPath);
         }
 
         // Toggle advanced section visibility
@@ -108,6 +117,25 @@ public class SettingsActivity extends AppCompatActivity {
         }
 
         saveButton.setOnClickListener(v -> saveAndConnect());
+    }
+
+    /** Mirror the server's sanitize_web_path(): trim slashes, keep only [A-Za-z0-9_-]. */
+    private static String sanitizeWebPath(String raw) {
+        if (raw == null) return "";
+        String trimmed = raw.trim();
+        int start = 0;
+        int end = trimmed.length();
+        while (start < end && trimmed.charAt(start) == '/') start++;
+        while (end > start && trimmed.charAt(end - 1) == '/') end--;
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < end; i++) {
+            char c = trimmed.charAt(i);
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                    || c == '_' || c == '-') {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     private void updatePortHint() {
@@ -166,6 +194,10 @@ public class SettingsActivity extends AppCompatActivity {
         // Save auth key: persist whatever the user left in the field (empty = clear it)
         String editedAuthKey = authKeyValue.getText().toString().trim();
         editor.putString(KEY_AUTH_KEY, editedAuthKey);
+        // Save web path: mirror the server's sanitize_web_path() so a value entered here
+        // matches what the server would actually configure (blank = auto-detect).
+        String editedWebPath = sanitizeWebPath(webPathValue.getText().toString());
+        editor.putString(KEY_WEB_PATH, editedWebPath);
         editor.apply();
 
         // Go back to MainActivity to attempt connection

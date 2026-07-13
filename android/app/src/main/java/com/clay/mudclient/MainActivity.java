@@ -42,6 +42,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_SAVED_PASSWORD = "savedPassword";
     private static final String KEY_SAVED_USERNAME = "savedUsername";
     private static final String KEY_AUTH_KEY = "authKey";  // Device auth key for passwordless login
+    private static final String KEY_WEB_PATH = "webPath";  // Server's stealth web_path prefix; blank = auto-detect
     private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
     private static final String KEY_CACHED_THEME_CSS = "cachedThemeCss";
@@ -251,6 +252,21 @@ public class MainActivity extends AppCompatActivity {
         public void clearAuthKey() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             prefs.edit().remove(KEY_AUTH_KEY).apply();
+        }
+
+        // Server's stealth web_path prefix. Blank = auto-detect (probe /clay/ws then /ws).
+        // Learned automatically from the server's settings payload (see app.js), and/or
+        // set explicitly in Settings.
+        @JavascriptInterface
+        public void saveWebPath(String path) {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().putString(KEY_WEB_PATH, path == null ? "" : path).apply();
+        }
+
+        @JavascriptInterface
+        public String getWebPath() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_WEB_PATH, "");
         }
 
         @JavascriptInterface
@@ -897,6 +913,13 @@ public class MainActivity extends AppCompatActivity {
         String theme      = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS)
                                  .replace("\\", "\\\\").replace("'", "\\'")
                                  .replace("\r", "").replace("\n", " ");
+        String webPath    = prefs.getString(KEY_WEB_PATH, "");
+        // Only inject window.WEB_PATH when we have a known non-empty value. Emitting an
+        // empty string would mean "legacy mode" and wrongly disable the Android probe
+        // path in wsPathCandidates(); leaving it unset (the bundled asset's raw
+        // '{{WEB_PATH}}' placeholder) is correctly treated as "unset" by injectedWebPath()
+        // in app.js, which engages the /clay/ws then /ws probe.
+        String webPathScript = webPath.isEmpty() ? "" : "window.WEB_PATH=" + jsStr(webPath) + ";";
         return "window.WS_HOST=" + localHost + ";" +
                "window.WS_LOCAL_HOST=" + localHost + ";" +
                "window.WS_REMOTE_HOST=" + remoteHost + ";" +
@@ -904,6 +927,7 @@ public class MainActivity extends AppCompatActivity {
                "window.WS_PROTOCOL='wss';" +
                "window.CONNECTION_MODE=" + mode + ";" +
                "window.SHOW_CONNECTION_WINDOW=true;" +
+               webPathScript +
                "(function(){var s=document.getElementById('theme-vars');" +
                "if(s)s.textContent=':root{" + theme + "}';}());";
     }

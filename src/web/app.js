@@ -1145,14 +1145,24 @@
         }
     }
 
+    // A page served by Clay has {{WEB_PATH}} substituted. A page loaded from bundled
+    // APK assets does not — treat the raw placeholder as "not provided" so the Android
+    // probe path below engages.
+    function injectedWebPath() {
+        const v = window.WEB_PATH;
+        if (typeof v !== 'string' || v.indexOf('{{') !== -1) return undefined;
+        return v;
+    }
+
     // Stealth web-path prefix ("" = legacy mode, server UI lives at "/"). Prefer the
     // value the server injected into this page's template; if unavailable (e.g. the
     // Android WebView loading bundled assets from file:///android_asset, which never
     // goes through the server's template substitution), derive it from the current
     // page path as a best-effort fallback.
     function basePath() {
-        if (typeof window.WEB_PATH === 'string') {
-            return window.WEB_PATH ? '/' + window.WEB_PATH : '';
+        const injected = injectedWebPath();
+        if (injected !== undefined) {
+            return injected ? '/' + injected : '';
         }
         const path = window.location.pathname || '/';
         const segments = path.split('/').filter(Boolean);
@@ -1169,7 +1179,7 @@
     // safe, since a wrong-path WS upgrade is silently dropped server-side with no
     // ban-violation strike.
     function wsPathCandidates() {
-        if (window.Android && typeof window.WEB_PATH !== 'string') {
+        if (window.Android && injectedWebPath() === undefined) {
             return ['/clay/ws', '/ws'];
         }
         return [basePath() + '/ws'];
@@ -1908,6 +1918,19 @@
                     }
                     if (msg.settings.web_path !== undefined) {
                         webPath = msg.settings.web_path;
+                        // Auto-learn: a bundled-asset page (e.g. Android WebView) never
+                        // gets {{WEB_PATH}} substituted by the server. Adopt the real
+                        // value from the settings payload so basePath()/wsPathCandidates()
+                        // use it immediately, and persist it via the Android bridge (if
+                        // present) so future launches inject it up front.
+                        window.WEB_PATH = msg.settings.web_path;
+                        try {
+                            if (window.Android && typeof window.Android.saveWebPath === 'function') {
+                                window.Android.saveWebPath(msg.settings.web_path);
+                            }
+                        } catch (e) {
+                            console.error('Error saving web path:', e);
+                        }
                     }
                     if (msg.settings.ws_enabled !== undefined) {
                         wsEnabled = msg.settings.ws_enabled;
@@ -2426,6 +2449,15 @@
                     }
                     if (msg.settings.web_path !== undefined) {
                         webPath = msg.settings.web_path;
+                        // Auto-learn (see InitialState handler above for rationale).
+                        window.WEB_PATH = msg.settings.web_path;
+                        try {
+                            if (window.Android && typeof window.Android.saveWebPath === 'function') {
+                                window.Android.saveWebPath(msg.settings.web_path);
+                            }
+                        } catch (e) {
+                            console.error('Error saving web path:', e);
+                        }
                     }
                     if (msg.settings.ws_enabled !== undefined) {
                         wsEnabled = msg.settings.ws_enabled;

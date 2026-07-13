@@ -640,8 +640,11 @@ function connect() {
   const wsHost = '{{WS_HOST}}' || window.location.hostname;
   const wsPort = '{{WS_PORT}}' === '0' ? window.location.port : '{{WS_PORT}}';
   const wsProto = '{{WS_PROTOCOL}}' || (window.location.protocol === 'https:' ? 'wss' : 'ws');
-  // WS upgrade path must match the server's stealth prefix (empty WEB_PATH = legacy "/ws")
-  const webPath = '{{WEB_PATH}}';
+  // WS upgrade path must match the server's stealth prefix (empty WEB_PATH = legacy "/ws").
+  // A page loaded from bundled APK assets never gets {{WEB_PATH}} substituted, so treat
+  // a raw placeholder as unset (falls back to legacy "/ws").
+  const rawWebPath = '{{WEB_PATH}}';
+  const webPath = rawWebPath.indexOf('{{') === -1 ? rawWebPath : '';
   const basePath = webPath ? '/' + webPath : '';
   const url = wsProto + '://' + wsHost + ':' + wsPort + basePath + '/ws';
 

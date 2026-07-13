@@ -292,6 +292,37 @@
             android:paddingBottom="6dp" />
     </LinearLayout>
 
+    <!-- Web Path (stealth prefix) -->
+    <LinearLayout
+        android:id="@+id/webPathRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginTop="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Web Path"
+            android:textSize="12sp"
+            android:textColor="#8b949e"
+            android:layout_marginBottom="2dp" />
+
+        <EditText
+            android:id="@+id/webPathValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="blank = auto-detect"
+            android:fontFamily="monospace"
+            android:textSize="11sp"
+            android:textColor="#e6edf3"
+            android:textColorHint="#484f58"
+            android:inputType="text"
+            android:backgroundTint="#3fb950"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp" />
+    </LinearLayout>
+
     <!-- Connection status -->
     <TextView
         android:id="@+id/connectionStatus"
