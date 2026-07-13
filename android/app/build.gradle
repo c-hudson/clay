@@ -18,8 +18,8 @@ android {
         applicationId "com.clay.mudclient"
         minSdk 26
         targetSdk 34
-        versionCode 139
-        versionName "1.0.4"
+        versionCode 140
+        versionName "1.1.0"
     }
 
     buildTypes {
