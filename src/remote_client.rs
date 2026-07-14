@@ -31,7 +31,7 @@ use crate::{
     ActionsListAction, RecentWorldsAction,
     EditorSide, AutoConnectType, KeepAliveType,
     web_settings_from_custom_data, handle_new_popup_key,
-    websocket, popup, keybindings, tf, platform,
+    websocket, popup, keybindings, tf, platform, persistence,
 };
 use crate::input_handler::*;
 use crate::rendering::*;
@@ -88,11 +88,16 @@ pub(crate) async fn run_grep_client(
         (format!("wss://{}", addr_with_port), true)
     };
 
+    let host_port_key = addr_with_port
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .to_string();
+
     #[cfg(feature = "rustls-backend")]
     let connect_result = if ws_url.starts_with("wss://") {
         let tls_config = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(platform::danger::NoCertificateVerification::new()))
+            .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.clone())))
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
         tokio_tungstenite::connect_async_tls_with_config(
@@ -121,6 +126,16 @@ pub(crate) async fn run_grep_client(
             }
         }
         Err(e) => {
+            #[cfg(feature = "rustls-backend")]
+            if let Some(mismatch) = platform::danger::take_cert_mismatch() {
+                eprintln!(
+                    "TLS certificate for {} has changed! Was {}, now {}.",
+                    mismatch.host, mismatch.old_fingerprint, mismatch.new_fingerprint
+                );
+                eprintln!("Refusing to connect (possible MITM, or the server was reinstalled/re-keyed).");
+                eprintln!("If you trust the new certificate, remove its old pin from ~/.clay/known_hosts.dat and reconnect.");
+                std::process::exit(1);
+            }
             eprintln!("Failed to connect to {}: {}", ws_url, e);
             std::process::exit(1);
         }
@@ -438,21 +453,62 @@ pub(crate) async fn run_console_client(addr: &str) -> io::Result<()> {
 
     println!("Connecting to {}...", ws_url);
 
-    // Connect to WebSocket server - for wss:// we need to configure TLS to accept self-signed certs
+    let host_port_key = addr_with_port
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .to_string();
+
+    // Connect to WebSocket server - for wss:// we need to configure TLS to accept self-signed
+    // certs (trust-on-first-use pinned via ~/.clay/known_hosts.dat, see platform::danger_rustls).
     #[cfg(feature = "rustls-backend")]
-    let connect_result = if ws_url.starts_with("wss://") {
-        // Configure rustls to accept self-signed/invalid certificates
+    async fn try_wss(ws_url: &str, host_port_key: &str) -> Result<
+        (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+         tokio_tungstenite::tungstenite::handshake::client::Response),
+        tokio_tungstenite::tungstenite::Error,
+    > {
         let tls_config = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(platform::danger::NoCertificateVerification::new()))
+            .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.to_string())))
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
         tokio_tungstenite::connect_async_tls_with_config(
-            &ws_url,
+            ws_url,
             None,
             false,
             Some(connector),
         ).await
+    }
+
+    #[cfg(feature = "rustls-backend")]
+    let connect_result = if ws_url.starts_with("wss://") {
+        match try_wss(&ws_url, &host_port_key).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // If this failed because the pinned certificate changed (as opposed to an
+                // ordinary network error), prompt interactively rather than silently
+                // falling back to plaintext ws:// (which would mask a possible MITM).
+                if let Some(mismatch) = platform::danger::take_cert_mismatch() {
+                    eprintln!();
+                    eprintln!("*** TLS CERTIFICATE FOR {} HAS CHANGED ***", mismatch.host);
+                    eprintln!("  old fingerprint: {}", mismatch.old_fingerprint);
+                    eprintln!("  new fingerprint: {}", mismatch.new_fingerprint);
+                    eprintln!("This could mean the server was reinstalled, or that someone is intercepting your connection.");
+                    eprint!("Trust the new certificate and reconnect? [y/N] ");
+                    let _ = io::stdout().flush();
+                    let mut answer = String::new();
+                    let _ = io::stdin().read_line(&mut answer);
+                    if answer.trim().eq_ignore_ascii_case("y") {
+                        persistence::replace_pin(&mismatch.host, &mismatch.new_fingerprint);
+                        try_wss(&ws_url, &host_port_key).await
+                    } else {
+                        eprintln!("Not trusting new certificate; aborting connection.");
+                        Err(e)
+                    }
+                } else {
+                    Err(e)
+                }
+            }
+        }
     } else {
         connect_async(&ws_url).await
     };
@@ -462,10 +518,10 @@ pub(crate) async fn run_console_client(addr: &str) -> io::Result<()> {
 
     let (ws_stream, _) = match connect_result {
         Ok(result) => result,
-        Err(e) if try_fallback => {
+        Err(_) if try_fallback => {
             // wss:// failed, try ws:// fallback
             let fallback_url = format!("ws://{}", addr_with_port);
-            eprintln!("Secure connection failed ({}), trying {}...", e, fallback_url);
+            eprintln!("Secure connection failed, trying {}...", fallback_url);
             match connect_async(&fallback_url).await {
                 Ok(result) => result,
                 Err(e2) => {

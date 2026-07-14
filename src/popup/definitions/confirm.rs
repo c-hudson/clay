@@ -70,6 +70,45 @@ pub fn create_allow_list_warning_dialog() -> PopupDefinition {
     )
 }
 
+// Custom_data keys used by the cert-mismatch dialog, shared with the confirm
+// handler in input_handler.rs so it can tell this dialog apart from
+// delete-world/delete-action/allow-list confirms (which key off different
+// custom_data entries).
+pub const CERT_MISMATCH_WORLD_INDEX: &str = "cert_mismatch_world_index";
+pub const CERT_MISMATCH_HOST: &str = "cert_mismatch_host";
+pub const CERT_MISMATCH_NEW_FP: &str = "cert_mismatch_new_fp";
+
+/// Create a TLS certificate pin-mismatch warning dialog (trust-on-first-use).
+/// Shown when a world's TLS certificate no longer matches the fingerprint
+/// pinned in `~/.clay/known_hosts.dat`. "Yes" trusts the new certificate
+/// (replaces the pin) and reconnects; "No" leaves the old pin in place and the
+/// connection blocked.
+pub fn create_cert_mismatch_dialog(
+    world_index: usize,
+    host: &str,
+    old_fingerprint: &str,
+    new_fingerprint: &str,
+) -> PopupDefinition {
+    // Shorten the fingerprints for display (first/last 8 hex chars is plenty to
+    // recognize "this is different" without wrapping the popup).
+    let short = |fp: &str| -> String {
+        if fp.len() > 20 {
+            format!("{}...{}", &fp[..10], &fp[fp.len() - 10..])
+        } else {
+            fp.to_string()
+        }
+    };
+    let message = format!(
+        "TLS certificate for {} has CHANGED.\n\nOld: {}\nNew: {}\n\nThis could mean the server was reinstalled, or that someone is intercepting your connection.\n\nTrust the new certificate and reconnect?",
+        host, short(old_fingerprint), short(new_fingerprint)
+    );
+    let mut def = create_confirm_dialog("cert_mismatch", "TLS Certificate Changed", &message);
+    def.custom_data.insert(CERT_MISMATCH_WORLD_INDEX.to_string(), world_index.to_string());
+    def.custom_data.insert(CERT_MISMATCH_HOST.to_string(), host.to_string());
+    def.custom_data.insert(CERT_MISMATCH_NEW_FP.to_string(), new_fingerprint.to_string());
+    def
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

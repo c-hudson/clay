@@ -247,6 +247,54 @@ pub fn play_file(
     }
 }
 
+/// B5 (security remediation): validate a MUD-supplied GMCP `Client.Media.*` URL before
+/// it's ever handed to curl. `download_to_cache` is the single choke point both media
+/// call sites (`main.rs` "Play" and "Load") route through, so validating here covers
+/// both.
+///
+/// - Only `http`/`https` schemes are allowed — this alone blocks `file://` (arbitrary
+///   local file read, e.g. `file:///etc/passwd`) and other exotic schemes (`gopher://`,
+///   etc.).
+/// - The host is rejected if it's a *literal* loopback/link-local/private (RFC1918) IP —
+///   this blocks the common SSRF targets, notably the cloud-metadata endpoint
+///   `169.254.169.254` (link-local).
+///
+/// Known limitation (documented rather than solved here): this only inspects the literal
+/// host in the URL. A *hostname* that resolves to an internal address (or one that's
+/// rebound between this check and curl's own DNS resolution — "DNS rebinding") is not
+/// caught. Closing that fully would mean resolving the hostname ourselves and pinning
+/// curl to the resolved IP (e.g. via `curl --resolve` or `--connect-to`), which is more
+/// invasive than this Phase-B pass; left as a follow-up (see SECURITY-ROADMAP.md).
+fn validate_media_url(url_str: &str) -> Result<url::Url, &'static str> {
+    let parsed = url::Url::parse(url_str).map_err(|_| "invalid URL")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("only http/https URLs are allowed"),
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            if ip.is_loopback() || ip.is_link_local() || ip.is_private() || ip.is_unspecified() {
+                return Err("target host is a loopback/link-local/private address");
+            }
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            // fe80::/10 = link-local unicast (top 10 bits of the first segment).
+            let is_link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
+            if ip.is_loopback() || ip.is_unspecified() || is_link_local {
+                return Err("target host is a loopback/link-local IPv6 address");
+            }
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                if v4.is_loopback() || v4.is_link_local() || v4.is_private() || v4.is_unspecified() {
+                    return Err("target host is a loopback/link-local/private address (IPv4-mapped)");
+                }
+            }
+        }
+        Some(url::Host::Domain(_)) => {} // resolved by curl at connect time; see limitation above
+        None => return Err("URL has no host"),
+    }
+    Ok(parsed)
+}
+
 /// Download a file to the cache directory.
 /// Returns the cache path on success. Uses curl for the download.
 /// Called from background threads.
@@ -254,6 +302,12 @@ pub fn download_to_cache(
     url: &str,
     cache_dir: &Path,
 ) -> Option<std::path::PathBuf> {
+    // B5: reject anything that isn't a plain http/https URL to a non-internal host
+    // before we ever touch the filesystem cache path or spawn curl.
+    if validate_media_url(url).is_err() {
+        return None;
+    }
+
     let _ = std::fs::create_dir_all(cache_dir);
     let safe_name = url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
     let cache_path = cache_dir.join(&safe_name);
@@ -262,7 +316,16 @@ pub fn download_to_cache(
     }
     let cache_path_str = cache_path.to_string_lossy().to_string();
     let status = std::process::Command::new("curl")
-        .args(["-sL", "-o", &cache_path_str, url])
+        .args([
+            "-s", "-o", &cache_path_str,
+            // B5: constrain both the initial request and any redirect target to
+            // http/https — matches the scheme check above but also stops a same-scheme
+            // redirect chain from hopping to a disallowed scheme mid-flight.
+            "--proto", "=http,https",
+            "--proto-redir", "=http,https",
+            "-L",
+            url,
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -270,5 +333,50 @@ pub fn download_to_cache(
         Some(cache_path)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod media_url_tests {
+    use super::validate_media_url;
+
+    #[test]
+    fn rejects_file_scheme() {
+        assert!(validate_media_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn rejects_other_exotic_schemes() {
+        assert!(validate_media_url("gopher://example.com/").is_err());
+        assert!(validate_media_url("ftp://example.com/x").is_err());
+    }
+
+    #[test]
+    fn rejects_link_local_metadata_ip() {
+        assert!(validate_media_url("http://169.254.169.254/latest/meta-data/").is_err());
+    }
+
+    #[test]
+    fn rejects_loopback_and_private_ips() {
+        assert!(validate_media_url("http://127.0.0.1/x").is_err());
+        assert!(validate_media_url("http://10.0.0.5/x").is_err());
+        assert!(validate_media_url("http://192.168.1.1/x").is_err());
+        assert!(validate_media_url("http://[::1]/x").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_url() {
+        assert!(validate_media_url("not a url").is_err());
+        assert!(validate_media_url("").is_err());
+    }
+
+    #[test]
+    fn accepts_normal_https_url() {
+        assert!(validate_media_url("https://example.com/sound.mp3").is_ok());
+    }
+
+    #[test]
+    fn accepts_normal_http_url() {
+        assert!(validate_media_url("http://cdn.example.com/media/x.wav").is_ok());
     }
 }

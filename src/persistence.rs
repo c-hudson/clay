@@ -16,7 +16,11 @@ use crate::{
     get_settings_path, get_multiuser_settings_path, get_reload_state_path, debug_log,
 };
 
-/// Legacy encryption key — only used for decrypting old .clay.dat files
+/// Legacy encryption key — only used for decrypting old .clay.dat files. Decrypt-only:
+/// `encrypt_password` never writes with this key, so no new data is ever protected by
+/// it (C5, security remediation) — it exists purely so pre-migration blobs still
+/// decrypt once, at which point they're re-encrypted under the per-machine
+/// `machine_key()` on the next save.
 const LEGACY_ENCRYPTION_KEY: &[u8; 32] = b"nonsupersecretpassword#\0\0\0\0\0\0\0\0\0";
 
 /// Per-machine encryption key, loaded from ~/.clay/secure.key (generated on first run)
@@ -48,24 +52,10 @@ fn load_or_generate_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key).expect("Failed to generate random key");
 
-    // Write with restrictive permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            let _ = f.write_all(&key);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::write(&path, &key);
-    }
+    // Write with restrictive (owner-only) permissions — B2 (security remediation) also
+    // hardens the previously-unrestricted Windows branch via `restrict_to_owner_windows`
+    // (currently best-effort/no-op there; see util.rs for the TODO).
+    let _ = crate::util::write_secret_file(&path, &key);
 
     key
 }
@@ -130,14 +120,122 @@ pub fn decrypt_password(stored: &str) -> String {
         return String::from_utf8_lossy(&plaintext).to_string();
     }
 
-    // Fall back to legacy key (old .clay.dat files)
+    // Fall back to legacy key (old .clay.dat files). This key is fixed/public (it ships
+    // in the binary) and exists ONLY to let old blobs migrate — new data is always
+    // written with `encrypt_password`, which only ever uses the per-machine
+    // `machine_key()` (C5, security remediation). Log (always-on, no secret content)
+    // whenever this fires so stale legacy-key blobs are noticed; they get re-encrypted
+    // under the machine key the next time settings are saved.
     let legacy_cipher = Aes256Gcm::new(LEGACY_ENCRYPTION_KEY.into());
     if let Ok(plaintext) = legacy_cipher.decrypt(nonce, ciphertext) {
+        debug_log(true, "decrypt_password: decrypted a stale blob using LEGACY_ENCRYPTION_KEY — will be re-encrypted under the machine key on next save");
         return String::from_utf8_lossy(&plaintext).to_string();
     }
 
     // Both failed — return as-is
     stored.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Trust-on-first-use (TOFU) TLS certificate pin store — `~/.clay/known_hosts.dat`
+//
+// Maps `host:port` -> hex-encoded SHA-256 fingerprint of the end-entity
+// certificate DER last seen (and trusted) for that host. Used by
+// `platform::danger::TofuVerifier` (rustls) and the native-tls MUD path to
+// detect when a server's certificate changes between connects.
+// ---------------------------------------------------------------------------
+
+fn known_hosts_path() -> PathBuf {
+    crate::clay_config_path("known_hosts.dat")
+}
+
+static KNOWN_HOSTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn known_hosts() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    KNOWN_HOSTS.get_or_init(|| std::sync::Mutex::new(load_known_hosts_from(&known_hosts_path())))
+}
+
+fn load_known_hosts_from(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(content) = std::fs::read_to_string(path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((host, fp)) = line.split_once('=') {
+                map.insert(host.trim().to_string(), fp.trim().to_lowercase());
+            }
+        }
+    }
+    map
+}
+
+fn save_known_hosts_to(path: &std::path::Path, map: &std::collections::HashMap<String, String>) {
+    let mut contents = String::from(
+        "# Clay TLS certificate pins (trust-on-first-use)\n\
+         # host:port=sha256(end-entity cert DER) hex — do not edit by hand\n",
+    );
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    for k in keys {
+        contents.push_str(k);
+        contents.push('=');
+        contents.push_str(&map[k]);
+        contents.push('\n');
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = f.write_all(contents.as_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, contents.as_bytes());
+    }
+}
+
+/// Look up the pinned fingerprint for a `host:port`, if one has been recorded.
+pub fn get_pin(host_port: &str) -> Option<String> {
+    known_hosts().lock().ok()?.get(host_port).cloned()
+}
+
+/// Pin a fingerprint for `host_port` only if no pin exists yet (first-connect,
+/// silent). Returns `true` if a new pin was written.
+pub fn add_pin(host_port: &str, fingerprint: &str) -> bool {
+    let Ok(mut map) = known_hosts().lock() else { return false };
+    if map.contains_key(host_port) {
+        return false;
+    }
+    map.insert(host_port.to_string(), fingerprint.to_lowercase());
+    save_known_hosts_to(&known_hosts_path(), &map);
+    true
+}
+
+/// Overwrite the pin for `host_port` (user explicitly chose to trust a new
+/// certificate after a mismatch warning).
+pub fn replace_pin(host_port: &str, fingerprint: &str) {
+    let Ok(mut map) = known_hosts().lock() else { return };
+    map.insert(host_port.to_string(), fingerprint.to_lowercase());
+    save_known_hosts_to(&known_hosts_path(), &map);
+}
+
+/// Remove a pin (e.g. so the next connect re-pins silently). Mostly useful for tests.
+#[cfg(test)]
+pub fn remove_pin(host_port: &str) {
+    let Ok(mut map) = known_hosts().lock() else { return };
+    map.remove(host_port);
+    save_known_hosts_to(&known_hosts_path(), &map);
 }
 
 pub fn save_settings(app: &App) -> io::Result<()> {
@@ -171,7 +269,9 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
     let debug_on = is_debug_enabled();
     let old_global = if debug_on { read_global_section(path) } else { Default::default() };
 
-    let mut file = std::fs::File::create(path)?;
+    // B2 (security remediation): settings.dat holds encrypted-at-rest passwords/tokens —
+    // create it owner-only (0600 on Unix) instead of default (often world-readable) perms.
+    let mut file = crate::util::secure_create_file(path)?;
 
     // Save global settings
     writeln!(file, "[global]")?;
@@ -435,11 +535,9 @@ fn append_settings_audit_log_to_path(
     );
     let backtrace = std::backtrace::Backtrace::force_capture();
 
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    {
+    // B2 (security remediation): the audit log records old/new setting values (including
+    // encrypted-at-rest secrets in their encrypted form) plus a backtrace — owner-only perms.
+    if let Ok(mut file) = crate::util::secure_append_file(log_path) {
         let _ = writeln!(file, "[{}] source={} changed global settings:", timestamp, source);
         for change in &changes {
             let _ = writeln!(file, "{}", change);
@@ -1061,8 +1159,13 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
             // User settings
             if let Some(ref user_name) = current_user {
                 if let Some(user) = app.users.iter_mut().find(|u| &u.name == user_name) {
-                    if key == "password" {
-                        user.password = decrypt_password(value);
+                    match key {
+                        "password" => user.password = decrypt_password(value),
+                        // C1 (security remediation): set by ChangePassword when it
+                        // stores an already-hashed value in `password` instead of a
+                        // plaintext one — see the `User::password_is_hash` doc comment.
+                        "password_is_hash" => user.password_is_hash = value == "true",
+                        _ => {}
                     }
                 }
             }
@@ -1175,7 +1278,8 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
 /// Save settings for multiuser mode to ~/.clay/multiuser.dat
 pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
     let path = get_multiuser_settings_path();
-    let mut file = std::fs::File::create(&path)?;
+    // B2 (security remediation): holds encrypted user/world passwords — owner-only perms.
+    let mut file = crate::util::secure_create_file(&path)?;
 
     // [global] section
     writeln!(file, "[global]")?;
@@ -1209,6 +1313,11 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             .replace(':', "\\:");
         writeln!(file, "[user:{}]", escaped_name)?;
         writeln!(file, "password={}", encrypt_password(&user.password))?;
+        // Only written when true (keeps old-format files/diffs minimal); absent means
+        // false, matching User::new's default. See User::password_is_hash doc comment.
+        if user.password_is_hash {
+            writeln!(file, "password_is_hash=true")?;
+        }
     }
 
     // [world:NAME:OWNER] sections
@@ -1329,7 +1438,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
 #[cfg(not(target_os = "android"))]
 pub fn save_reload_state(app: &App) -> io::Result<()> {
     let path = get_reload_state_path();
-    let mut file = std::fs::File::create(&path)?;
+    // B2 (security remediation): reload state holds world passwords/tokens and the
+    // encrypted auth key — create it owner-only (0600 on Unix), like settings.dat.
+    let mut file = crate::util::secure_create_file(&path)?;
 
     // Save global state
     writeln!(file, "[reload]")?;
@@ -2671,5 +2782,84 @@ mod tests {
         append_settings_audit_log_to_path(&tmp, "local", &old, &new);
 
         assert!(!tmp.exists(), "no file should be created when nothing changed");
+    }
+
+    // -----------------------------------------------------------------
+    // TOFU known_hosts pin store
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_known_hosts_load_save_roundtrip_via_path() {
+        let tmp = std::env::temp_dir().join("clay_test_known_hosts_roundtrip.dat");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("example.com:9000".to_string(), "aa".repeat(32));
+        map.insert("other.host:443".to_string(), "bb".repeat(32));
+        save_known_hosts_to(&tmp, &map);
+
+        let loaded = load_known_hosts_from(&tmp);
+        assert_eq!(loaded.get("example.com:9000"), Some(&"aa".repeat(32)));
+        assert_eq!(loaded.get("other.host:443"), Some(&"bb".repeat(32)));
+        assert_eq!(loaded.len(), 2);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_known_hosts_file_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join("clay_test_known_hosts_perms.dat");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("host:1".to_string(), "cc".repeat(32));
+        save_known_hosts_to(&tmp, &map);
+
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "known_hosts.dat must be created 0600");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_known_hosts_ignores_comments_and_blank_lines() {
+        let tmp = std::env::temp_dir().join("clay_test_known_hosts_comments.dat");
+        std::fs::write(&tmp, "# comment\n\nhost:1=deadbeef\n   \n# another\nhost:2=cafef00d\n").unwrap();
+
+        let loaded = load_known_hosts_from(&tmp);
+        assert_eq!(loaded.get("host:1"), Some(&"deadbeef".to_string()));
+        assert_eq!(loaded.get("host:2"), Some(&"cafef00d".to_string()));
+        assert_eq!(loaded.len(), 2);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_pin_lifecycle_add_get_replace() {
+        // Use a unique host key so this doesn't collide with any real pin the
+        // developer running these tests might already have.
+        let host = "clay-test-pin-lifecycle.invalid:9999";
+        remove_pin(host);
+
+        // No pin yet
+        assert_eq!(get_pin(host), None);
+
+        // First add pins silently
+        assert!(add_pin(host, "1111"));
+        assert_eq!(get_pin(host), Some("1111".to_string()));
+
+        // Adding again with a different fingerprint does NOT overwrite (add_pin
+        // is first-connect-only; a real mismatch must go through replace_pin)
+        assert!(!add_pin(host, "2222"));
+        assert_eq!(get_pin(host), Some("1111".to_string()));
+
+        // replace_pin overwrites unconditionally (the "trust new certificate" action)
+        replace_pin(host, "3333");
+        assert_eq!(get_pin(host), Some("3333".to_string()));
+
+        remove_pin(host);
+        assert_eq!(get_pin(host), None);
     }
 }

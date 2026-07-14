@@ -1150,11 +1150,13 @@ fn generate_self_signed_cert(cert_path: &std::path::Path, key_path: &std::path::
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
 
+    // Cert is public (sent to every TLS client during the handshake) — plain create is fine.
     let mut cert_file = std::fs::File::create(cert_path)?;
     cert_file.write_all(cert.pem().as_bytes())?;
 
-    let mut key_file = std::fs::File::create(key_path)?;
-    key_file.write_all(key_pair.serialize_pem().as_bytes())?;
+    // B2 (security remediation): the private key is a secret — create it owner-only
+    // (0600 on Unix) instead of world-readable.
+    crate::util::write_secret_file(key_path, key_pair.serialize_pem().as_bytes())?;
 
     // Save the SAN list so we can detect IP changes on next startup
     let ips_path = cert_path.with_extension("ips");
@@ -1226,6 +1228,15 @@ pub fn clay_config_dir() -> PathBuf {
     let home = get_home_dir();
     let dir = PathBuf::from(home).join(clay_filename("clay"));
     let _ = std::fs::create_dir_all(&dir);
+    // B2 (security remediation): the directory holds secure.key, settings.dat (encrypted
+    // passwords/tokens), key.pem, etc. — restrict to owner-only. Applied unconditionally
+    // (not just at creation) so it self-heals a pre-existing dir with looser perms too;
+    // this is cheap (one syscall) and idempotent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     dir
 }
 
@@ -1663,7 +1674,19 @@ impl WorldSettings {
 #[derive(Clone, Debug)]
 pub struct User {
     pub name: String,
-    pub password: String,  // Stored encrypted in file, decrypted in memory
+    /// Stored encrypted in file, decrypted in memory. Meaning depends on
+    /// `password_is_hash` below.
+    pub password: String,
+    /// When `false` (the normal case): `password` is the plaintext password, and the
+    /// live `UserCredential.password_hash` used for WS auth is derived from it via
+    /// `hash_password()` at startup (see `WebSocketServer::add_user`).
+    /// When `true`: `password` already holds the final SHA-256 hash (hex) in the exact
+    /// form the WS client sends/compares — set by the `ChangePassword` handler
+    /// (`daemon.rs`), which only ever receives `SHA256(new_password)` from the client,
+    /// never the plaintext. Re-hashing that value at load (`SHA256(SHA256(pw))`) would
+    /// silently break every subsequent login (C1, security remediation) — so the loader
+    /// and `add_user` must treat it as already-final instead.
+    pub password_is_hash: bool,
 }
 
 impl User {
@@ -1671,6 +1694,7 @@ impl User {
         Self {
             name: name.to_string(),
             password: password.to_string(),
+            password_is_hash: false,
         }
     }
 }
@@ -3597,6 +3621,18 @@ impl App {
         }
     }
 
+    /// Open a warning dialog for a TLS certificate pin mismatch (trust-on-first-use).
+    /// Called when a MUD world's certificate no longer matches the fingerprint
+    /// pinned in ~/.clay/known_hosts.dat. Defaults to "No" (keep blocking) for safety.
+    fn open_cert_mismatch_confirm(&mut self, world_index: usize, mismatch: &platform::danger::CertMismatch) {
+        use popup::definitions::confirm::{create_cert_mismatch_dialog, CONFIRM_BTN_NO};
+        let def = create_cert_mismatch_dialog(world_index, &mismatch.host, &mismatch.old_fingerprint, &mismatch.new_fingerprint);
+        self.popup_manager.open(def);
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.select_button(CONFIRM_BTN_NO);
+        }
+    }
+
     /// Open the world selector popup using the new unified popup system
     fn open_world_selector_new(&mut self) {
         use popup::definitions::world_selector::{create_world_selector_popup, WorldInfo, SELECTOR_FIELD_LIST};
@@ -4946,6 +4982,26 @@ impl App {
         self.needs_output_redraw = true;
     }
 
+    /// Check whether the most recent connection failure for `world_idx` was caused
+    /// by a TLS certificate pin mismatch (trust-on-first-use, see
+    /// `platform::danger`). If so, broadcasts a `CertMismatch` message to any
+    /// WebSocket clients (web/WebView) viewing the world and returns the details
+    /// so the caller can additionally open a console-TUI popup.
+    ///
+    /// Must be called promptly after a `ConnectionFailed` event — the mismatch is
+    /// stashed in a process-wide slot by the TLS verifier and consumed (cleared)
+    /// here, so it does not carry over to unrelated later failures.
+    fn check_and_broadcast_cert_mismatch(&mut self, world_idx: usize) -> Option<platform::danger::CertMismatch> {
+        let mismatch = platform::danger::take_cert_mismatch()?;
+        self.ws_broadcast_to_world(world_idx, WsMessage::CertMismatch {
+            world_index: world_idx,
+            host: mismatch.host.clone(),
+            old_fingerprint: mismatch.old_fingerprint.clone(),
+            new_fingerprint: mismatch.new_fingerprint.clone(),
+        });
+        Some(mismatch)
+    }
+
     /// Add output to a specific world by index (for background connection events)
     /// Also broadcasts to WebSocket clients viewing the world
     fn add_output_to_world(&mut self, world_idx: usize, text: &str) {
@@ -6278,7 +6334,9 @@ impl App {
                 if uses_challenge {
                     hash_with_challenge(&ak.key, challenge) == key
                 } else {
-                    ak.key == key
+                    // B3 (security remediation): constant-time compare — static stored-secret
+                    // vs. client-supplied-secret compare (no per-connection challenge salt).
+                    crate::util::constant_time_eq(ak.key.as_bytes(), key.as_bytes())
                 }
             } else {
                 false
@@ -6327,7 +6385,15 @@ impl App {
 
     /// Handle WsKeyRequest event — generate a new single auth key (replaces any existing).
     fn handle_ws_key_request(&mut self, _client_id: u64) {
-        let key = App::generate_auth_key();
+        let Some(key) = App::generate_auth_key() else {
+            // RNG failure (C2, fail closed): don't replace the existing key with a weak
+            // one — leave settings untouched and tell the requesting UI it failed.
+            self.ws_broadcast(WsMessage::Notification {
+                title: "Auth Key".to_string(),
+                message: "Failed to generate a new auth key: secure random number generator unavailable".to_string(),
+            });
+            return;
+        };
         self.settings.websocket_auth_key = Some(AuthKey::new(key.clone()));
         *self.ws_auth_key_shared.write().unwrap() = Some(key.clone());
         let _ = persistence::save_settings(self);
@@ -6342,9 +6408,17 @@ impl App {
         let _ = persistence::save_settings(self);
     }
 
-    /// Generate a new auth key string.
-    fn generate_auth_key() -> String {
+    /// Generate a new auth key string. Fails closed (returns `None`) rather than
+    /// producing a guessable key if the OS RNG is unavailable (C2, security
+    /// remediation) — the timestamp/pid-derived hasher input alone is not a secure
+    /// source of entropy, so a `getrandom` failure must not silently degrade the key.
+    fn generate_auth_key() -> Option<String> {
         use sha2::{Sha256, Digest};
+        let mut random_bytes = [0u8; 16];
+        if getrandom::getrandom(&mut random_bytes).is_err() {
+            debug_log(true, "AUTH KEY GENERATION FAILED: getrandom error, refusing to produce a weak key");
+            return None;
+        }
         let mut hasher = Sha256::new();
         hasher.update(std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6352,8 +6426,6 @@ impl App {
             .as_nanos()
             .to_le_bytes());
         hasher.update(std::process::id().to_le_bytes());
-        let mut random_bytes = [0u8; 16];
-        let _ = getrandom::getrandom(&mut random_bytes);
         hasher.update(random_bytes);
         let key = hex::encode(hasher.finalize());
         let bt = std::backtrace::Backtrace::force_capture();
@@ -6362,7 +6434,7 @@ impl App {
             "AUTH KEY GENERATED {:04}-{:02}-{:02} {:02}:{:02}:{:02}\n{}",
             now.year, now.month, now.day, now.hour, now.minute, now.second, bt
         ));
-        key
+        Some(key)
     }
 
     /// Handle initial WsClientMessage (AuthRequest) after authentication.
@@ -7683,6 +7755,19 @@ impl App {
                         });
                     } else {
                         // Save current world index, switch to target, connect, then restore
+                        let prev_index = self.current_world_index;
+                        self.current_world_index = world_index;
+                        return WsAsyncAction::Connect { world_index, prev_index, broadcast: true };
+                    }
+                }
+            }
+            WsMessage::TrustCertificate { world_index, host, new_fingerprint } => {
+                // User explicitly accepted a changed TLS certificate after a pin
+                // mismatch (see platform::danger). Re-pin and reconnect.
+                if world_index < self.worlds.len() {
+                    persistence::replace_pin(&host, &new_fingerprint);
+                    self.add_output_to_world(world_index, &format!("Trusting new certificate for {}, reconnecting...", host));
+                    if !self.worlds[world_index].connected {
                         let prev_index = self.current_world_index;
                         self.current_world_index = world_index;
                         return WsAsyncAction::Connect { world_index, prev_index, broadcast: true };
@@ -10200,13 +10285,16 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             app.popup_manager.close();
                             return NewPopupAction::WebSaved(settings);
                         } else if state.is_button_focused(WEB_BTN_REGEN_KEY) {
-                            // Generate a new auth key and update the field
-                            let new_key = App::generate_auth_key();
-                            if let Some(field) = state.definition.fields.iter_mut()
-                                .find(|f| f.id == WEB_FIELD_AUTH_KEY)
-                            {
-                                if let popup::FieldKind::Text { ref mut value, .. } = field.kind {
-                                    *value = new_key;
+                            // Generate a new auth key and update the field. On RNG
+                            // failure (C2, fail closed), leave the field untouched
+                            // rather than showing a weak/guessable key.
+                            if let Some(new_key) = App::generate_auth_key() {
+                                if let Some(field) = state.definition.fields.iter_mut()
+                                    .find(|f| f.id == WEB_FIELD_AUTH_KEY)
+                                {
+                                    if let popup::FieldKind::Text { ref mut value, .. } = field.kind {
+                                        *value = new_key;
+                                    }
                                 }
                             }
                         } else if state.is_button_focused(WEB_BTN_COPY_KEY) {
@@ -10338,12 +10426,15 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             app.popup_manager.close();
                             return NewPopupAction::WebSaved(settings);
                         } else if btn_id == WEB_BTN_REGEN_KEY {
-                            let new_key = App::generate_auth_key();
-                            if let Some(field) = state.definition.fields.iter_mut()
-                                .find(|f| f.id == WEB_FIELD_AUTH_KEY)
-                            {
-                                if let popup::FieldKind::Text { ref mut value, .. } = field.kind {
-                                    *value = new_key;
+                            // On RNG failure (C2, fail closed), leave the field
+                            // untouched rather than showing a weak/guessable key.
+                            if let Some(new_key) = App::generate_auth_key() {
+                                if let Some(field) = state.definition.fields.iter_mut()
+                                    .find(|f| f.id == WEB_FIELD_AUTH_KEY)
+                                {
+                                    if let popup::FieldKind::Text { ref mut value, .. } = field.kind {
+                                        *value = new_key;
+                                    }
                                 }
                             }
                         } else if btn_id == WEB_BTN_COPY_KEY {
@@ -12694,12 +12785,18 @@ pub async fn run_app_headless(
                     AppEvent::ConnectionFailed(world_name, error) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
-                            let secs = app.worlds[world_idx].settings.auto_reconnect_secs;
-                            if secs > 0 {
-                                app.worlds[world_idx].reconnect_at = Some(
-                                    std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
-                                );
-                                app.add_output_to_world(world_idx, &format!("Reconnecting in {} seconds...", secs));
+                            // A pin mismatch needs the user to explicitly trust the new
+                            // certificate (via the web/WebView CertMismatch dialog this
+                            // broadcasts) before reconnecting — auto-retrying against the
+                            // same mismatched cert would just fail again silently.
+                            if app.check_and_broadcast_cert_mismatch(world_idx).is_none() {
+                                let secs = app.worlds[world_idx].settings.auto_reconnect_secs;
+                                if secs > 0 {
+                                    app.worlds[world_idx].reconnect_at = Some(
+                                        std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                                    );
+                                    app.add_output_to_world(world_idx, &format!("Reconnecting in {} seconds...", secs));
+                                }
                             }
                         }
                     }
@@ -15307,12 +15404,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::ConnectionFailed(world_name, error) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
-                            let secs = app.worlds[world_idx].settings.auto_reconnect_secs;
-                            if secs > 0 {
-                                app.worlds[world_idx].reconnect_at = Some(
-                                    std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
-                                );
-                                app.add_output_to_world(world_idx, &format!("Reconnecting in {} seconds...", secs));
+                            if let Some(mismatch) = app.check_and_broadcast_cert_mismatch(world_idx) {
+                                // Don't clobber a popup the user already has open; the
+                                // error line above and the web/WebView CertMismatch dialog
+                                // still surface it.
+                                if app.popup_manager.current().is_none() {
+                                    app.open_cert_mismatch_confirm(world_idx, &mismatch);
+                                }
+                            } else {
+                                let secs = app.worlds[world_idx].settings.auto_reconnect_secs;
+                                if secs > 0 {
+                                    app.worlds[world_idx].reconnect_at = Some(
+                                        std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                                    );
+                                    app.add_output_to_world(world_idx, &format!("Reconnecting in {} seconds...", secs));
+                                }
                             }
                         }
                     }
@@ -16188,6 +16294,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::ConnectionFailed(world_name, error) => {
                     if let Some(world_idx) = app.find_world_index(&world_name) {
                         app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
+                        if let Some(mismatch) = app.check_and_broadcast_cert_mismatch(world_idx) {
+                            if app.popup_manager.current().is_none() {
+                                app.open_cert_mismatch_confirm(world_idx, &mismatch);
+                            }
+                        }
                     }
                 }
                 AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {

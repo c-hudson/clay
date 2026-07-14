@@ -1934,8 +1934,14 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
 
                                 match connector.connect(&connect_host, tcp_stream).await {
                                     Ok(tls_stream) => {
-                                        let (r, w) = tokio::io::split(tls_stream);
-                                        Ok((StreamReader::Tls(r), StreamWriter::Tls(w), true))
+                                        let peer_cert = tls_stream.get_ref().peer_certificate().ok().flatten();
+                                        match crate::platform::check_native_tls_peer_pin(&format!("{}:{}", connect_host, connect_port), peer_cert) {
+                                            Ok(()) => {
+                                                let (r, w) = tokio::io::split(tls_stream);
+                                                Ok((StreamReader::Tls(r), StreamWriter::Tls(w), true))
+                                            }
+                                            Err(msg) => Err(msg),
+                                        }
                                     }
                                     Err(e) => {
                                         Err(format!("SSL handshake failed: {}", e))
@@ -1950,11 +1956,11 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 use rustls::pki_types::ServerName;
 
                                 let mut root_store = RootCertStore::empty();
-                                root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
+                                root_store.roots = webpki_roots::TLS_SERVER_ROOTS.to_vec();
 
                                 let config = rustls::ClientConfig::builder()
                                     .dangerous()
-                                    .with_custom_certificate_verifier(Arc::new(crate::platform::danger::NoCertificateVerification::new()))
+                                    .with_custom_certificate_verifier(Arc::new(crate::platform::danger_rustls::TofuVerifier::new(format!("{}:{}", connect_host, connect_port))))
                                     .with_no_client_auth();
 
                                 let connector = TlsConnector::from(Arc::new(config));

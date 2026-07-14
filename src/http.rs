@@ -192,6 +192,15 @@ async fn redirect_http_to_https<S: AsyncRead + AsyncWrite + Unpin>(
 
     let host = get_host_from_request(&request);
     let host = if host.is_empty() { "localhost".to_string() } else { host };
+    // C3 (security remediation): the Host header is client-controlled and gets
+    // interpolated into both the Location header and the redirect HTML body below —
+    // sanitize it the same way handle_http_routes does for its WS_HOST substitution
+    // (:493) before it's used for anything, closing a reflected-XSS/open-redirect hole
+    // (e.g. `Host: "><script>...`). CRLF injection isn't possible here since `host` is
+    // always a single line from `.lines()`.
+    let host: String = host.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == ':')
+        .collect();
     let build_location = |p: &str| if port == 443 {
         format!("https://{}{}", host, p)
     } else {
@@ -450,10 +459,33 @@ fn decide_route(
     }
 }
 
+/// HTML-escape a string for safe interpolation into an HTML response body (not
+/// attribute/URL-safe on its own — callers that also use the value as a URL/attribute,
+/// like `build_redirect_response`, sanitize the value separately before it reaches here).
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Build a 301 redirect response with a `Location` header (e.g. `/{web_path}` →
 /// `/{web_path}/`, or the allow-listed grace redirect from `/`).
+/// `location` is reflected both in the `Location` header (raw — callers are
+/// responsible for it being a well-formed URL, e.g. `redirect_http_to_https` sanitizes
+/// the Host component before building it, C3 security remediation) and in the HTML
+/// body (HTML-escaped here, since the header value alone is not attribute/HTML-safe).
 fn build_redirect_response(location: &str, is_https: bool) -> Vec<u8> {
-    let body = format!("Redirecting to <a href=\"{loc}\">{loc}</a>", loc = location);
+    let escaped = html_escape(location);
+    let body = format!("Redirecting to <a href=\"{loc}\">{loc}</a>", loc = escaped);
     let mut headers = format!(
         "HTTP/1.1 301 Moved Permanently\r\n\
          Location: {}\r\n\
@@ -602,18 +634,6 @@ fn knock_expected_response(key: &str, challenge: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Constant-time byte comparison (avoids leaking digest-match progress via timing).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Outcome of `run_knock_handshake`.
 enum KnockOutcome {
     Success,
@@ -687,7 +707,7 @@ async fn run_knock_handshake(
     };
 
     let expected = knock_expected_response(&key, &challenge);
-    if !constant_time_eq(&response, &expected) {
+    if !crate::util::constant_time_eq(&response, &expected) {
         log_remote_event("KNOCK-FAIL", client_ip, "digest mismatch");
         gate.strike(client_ip, "knock-bad-digest").await;
         return KnockOutcome::Fail;
@@ -2185,6 +2205,60 @@ mod redirect_parity_tests {
         }
     }
 
+    /// Like `run_redirect` but lets the caller supply an arbitrary `Host` header value
+    /// (for the C3 Host-sanitization regression test below).
+    async fn run_redirect_with_host(
+        gate: &SecurityGate,
+        request_path: &str,
+        host_header: &str,
+        is_localhost: bool,
+        in_allow_list: bool,
+        knocked: bool,
+    ) -> Vec<u8> {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\n\r\n", request_path, host_header);
+        client.write_all(request.as_bytes()).await.unwrap();
+        redirect_http_to_https(server, 9000, is_localhost, in_allow_list, knocked, gate, "192.168.2.6").await;
+        let mut buf = vec![0u8; 8192];
+        match tokio::time::timeout(std::time::Duration::from_millis(300), client.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => buf[..n].to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// C3 (security remediation): a malicious `Host` header must not survive into the
+    /// `Location` header or the HTML body of the plain-HTTP-to-HTTPS redirect. Before
+    /// the fix, `Host: "><script>alert(1)</script>` was reflected verbatim into both,
+    /// giving reflected XSS (via the HTML body) and a corrupted `Location` value.
+    #[tokio::test]
+    async fn redirect_sanitizes_malicious_host_header() {
+        let gate = test_gate(vec!["192.168.2.*".to_string()]);
+        let malicious_host = "\"><script>alert(1)</script>";
+        let response = run_redirect_with_host(&gate, "/", malicious_host, false, true, false).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 301"), "expected 301, got: {text:?}");
+        // The raw payload must not appear anywhere in the response — neither the
+        // Location header (host chars filtered to alphanumeric/./-/:) nor the HTML
+        // body (also HTML-escaped as defense in depth).
+        assert!(
+            !text.contains("<script>"),
+            "malicious host leaked an executable <script> tag into the response: {text:?}"
+        );
+        assert!(
+            !text.contains("\"><script>"),
+            "malicious host broke out of the href attribute: {text:?}"
+        );
+        // Location header's host component must only contain the sanitized
+        // (alphanumeric/./-/:) characters — the raw `"><script>...` payload must be gone.
+        let location_line = text.lines().find(|l| l.starts_with("Location:")).unwrap();
+        let url = location_line.trim_start_matches("Location:").trim();
+        let host_part = url.trim_start_matches("https://").split('/').next().unwrap();
+        assert!(
+            host_part.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':'),
+            "Location header host component contains unsanitized characters: {host_part:?}"
+        );
+    }
+
     /// THE REPORTED BUG, reproduced directly: an allow-listed IP hitting the bare "/"
     /// over plain HTTP (web_secure=true, http/https typo) must get a 301 towards
     /// `/{web_path}/` — the same grace `decide_route` gives the `https://` request —
@@ -2308,14 +2382,8 @@ mod knock_tests {
         assert_ne!(d1, d2);
     }
 
-    #[test]
-    fn constant_time_eq_sanity() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(!constant_time_eq(b"", b"a"));
-        assert!(constant_time_eq(b"", b""));
-    }
+    // constant_time_eq now lives in util.rs (see constant_time_eq_sanity there) — it's
+    // shared with websocket.rs/main.rs for the WS/API-key credential compares (B3).
 
     fn test_gate(auth_key: Option<&str>) -> SecurityGate {
         SecurityGate {

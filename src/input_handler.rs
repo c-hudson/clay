@@ -428,7 +428,20 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             }
             NewPopupAction::Confirm(data) => {
                 // Handle confirmed action
-                if let Some(world_index_str) = data.get("world_index") {
+                if let (Some(world_index_str), Some(host), Some(new_fp)) = (
+                    data.get(popup::definitions::confirm::CERT_MISMATCH_WORLD_INDEX),
+                    data.get(popup::definitions::confirm::CERT_MISMATCH_HOST),
+                    data.get(popup::definitions::confirm::CERT_MISMATCH_NEW_FP),
+                ) {
+                    // User trusted the new TLS certificate after a pin mismatch warning.
+                    if let Ok(world_index) = world_index_str.parse::<usize>() {
+                        if world_index < app.worlds.len() {
+                            persistence::replace_pin(host, new_fp);
+                            app.add_output_to_world(world_index, &format!("Trusting new certificate for {}, reconnecting...", host));
+                            app.worlds[world_index].reconnect_at = Some(std::time::Instant::now());
+                        }
+                    }
+                } else if let Some(world_index_str) = data.get("world_index") {
                     if let Ok(world_index) = world_index_str.parse::<usize>() {
                         // Delete the world
                         if app.worlds.len() > 1 && world_index < app.worlds.len() {

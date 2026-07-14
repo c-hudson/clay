@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tokio::net::TcpListener;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
-use tokio_tungstenite::{accept_async, tungstenite::Message as WsRawMessage};
+use tokio_tungstenite::{accept_async_with_config, tungstenite::Message as WsRawMessage, tungstenite::protocol::WebSocketConfig};
 
 // Import AppEvent and Action from the main crate
 use crate::{AppEvent, Action, BanList};
@@ -164,6 +164,14 @@ pub enum WsMessage {
     SendCommand { world_index: usize, command: String },
     SwitchWorld { world_index: usize },
     ConnectWorld { world_index: usize },
+    /// Server -> client: a MUD world's TLS certificate no longer matches the
+    /// trust-on-first-use pin recorded in ~/.clay/known_hosts.dat. The connection
+    /// was blocked; the client should show old/new fingerprints and offer a
+    /// "Trust new certificate" action that replies with TrustCertificate.
+    CertMismatch { world_index: usize, host: String, old_fingerprint: String, new_fingerprint: String },
+    /// Client -> server: user explicitly accepted a changed certificate after a
+    /// CertMismatch warning. Server re-pins the fingerprint and reconnects.
+    TrustCertificate { world_index: usize, host: String, new_fingerprint: String },
     DisconnectWorld { world_index: usize },
     DeleteWorld { world_index: usize },
     CreateWorld { name: String },
@@ -727,9 +735,21 @@ impl WebSocketServer {
         }
     }
 
-    /// Add a user for multiuser authentication
+    /// Add a user for multiuser authentication, hashing the given plaintext password.
     pub fn add_user(&self, username: &str, password: &str) {
         let password_hash = hash_password(password);
+        let mut users = self.users.write().unwrap();
+        users.insert(username.to_string(), UserCredential { password_hash });
+    }
+
+    /// Set (or insert) a user's credential directly from an already-computed SHA-256
+    /// password hash (hex), without hashing it again. Used by the `ChangePassword`
+    /// handler (C1, security remediation): the client only ever sends
+    /// `SHA256(new_password)`, never the plaintext, so this is the only way to update
+    /// the live credential without breaking the invariant that `UserCredential.password_hash`
+    /// is exactly `hash_password(plaintext)` — re-hashing the already-hashed value here
+    /// would silently lock the user out.
+    pub fn set_user_password_hash(&self, username: &str, password_hash: String) {
         let mut users = self.users.write().unwrap();
         users.insert(username.to_string(), UserCredential { password_hash });
     }
@@ -1456,7 +1476,16 @@ where
         let allow_list_guard = allow_list.read().unwrap();
         allow_list_guard.is_empty()
     };
-    let ws_stream = match accept_async(stream).await {
+    // B1 (security remediation): cap message/frame size so an unauthenticated client
+    // can't pin large buffers pre-auth (the whole frame is buffered and serde_json-parsed
+    // before AuthRequest is checked, below). 256 KiB is comfortably above any legitimate
+    // client message (commands, settings pushes) while bounding per-connection memory.
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(256 * 1024),
+        max_frame_size: Some(64 * 1024),
+        ..Default::default()
+    };
+    let ws_stream = match accept_async_with_config(stream, Some(ws_config)).await {
         Ok(ws) => ws,
         Err(e) => {
             return Err(e.into());
@@ -1467,10 +1496,16 @@ where
     // Create channel for sending messages to this client
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
 
-    // Generate random challenge for challenge-response auth
+    // Generate random challenge for challenge-response auth. Fail closed: an all-zero
+    // (or otherwise predictable) challenge would let an attacker who knows a user's
+    // password hash replay a precomputed response, so refuse the connection outright
+    // rather than proceeding with a weak/default challenge (C2, security remediation).
     let challenge = {
         let mut bytes = [0u8; 16];
-        getrandom::getrandom(&mut bytes).unwrap_or_default();
+        if getrandom::getrandom(&mut bytes).is_err() {
+            crate::http::log_remote_event("WS-REJECT", &client_ip, "rng failure generating auth challenge");
+            return Err("failed to generate secure auth challenge".into());
+        }
         hex::encode(bytes)
     };
 
@@ -1622,7 +1657,11 @@ where
                                             let matches = if *uses_challenge {
                                                 hash_with_challenge(&user_cred.password_hash, &challenge) == *client_hash
                                             } else {
-                                                user_cred.password_hash == *client_hash
+                                                // B3 (security remediation): constant-time compare — this is a
+                                                // static stored-secret vs. client-supplied-secret compare (no
+                                                // per-connection challenge salt), so a naive `==` could leak
+                                                // match-progress via timing.
+                                                crate::util::constant_time_eq(user_cred.password_hash.as_bytes(), client_hash.as_bytes())
                                             };
                                             if matches {
                                                 (true, None, Some(uname.clone()))
@@ -1640,7 +1679,8 @@ where
                                 let matches = if *uses_challenge {
                                     hash_with_challenge(&password_hash, &challenge) == *client_hash
                                 } else {
-                                    *client_hash == password_hash
+                                    // B3 (security remediation): constant-time compare (see note above).
+                                    crate::util::constant_time_eq(client_hash.as_bytes(), password_hash.as_bytes())
                                 };
                                 if matches {
                                     (true, None, None)

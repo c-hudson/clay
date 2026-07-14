@@ -2248,6 +2248,14 @@
                 }
                 break;
 
+            case 'CertMismatch':
+                // The MUD server's TLS certificate no longer matches the
+                // trust-on-first-use pin in ~/.clay/known_hosts.dat. The
+                // connection was blocked server-side; show old vs new
+                // fingerprints and offer to trust the new certificate.
+                showCertMismatchDialog(msg.world_index, msg.host, msg.old_fingerprint, msg.new_fingerprint);
+                break;
+
             case 'WorldAdded':
                 if (msg.world) {
                     const world = msg.world;
@@ -4404,8 +4412,10 @@
             htmlParts.push(`<span data-line-idx="${i}">${html}</span>`);
         }
 
-        // Join with <br> tags for explicit line breaks
-        elements.output.innerHTML = htmlParts.join('<br>');
+        // Join with <br> tags for explicit line breaks.
+        // Defense-in-depth: strip any event handler attributes that slipped through
+        // (e.g. from MUD-supplied text) before it ever reaches the DOM.
+        elements.output.innerHTML = sanitizeHtml(htmlParts.join('<br>'));
         scrollToBottom();
 
         // Clear unseen for current world
@@ -4421,7 +4431,7 @@
         const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
         // Skip Discord emoji conversion when showTags is enabled so users can see original text
         const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
-        const html = showTags ? processed : convertDiscordEmojis(processed);
+        const html = sanitizeHtml(showTags ? processed : convertDiscordEmojis(processed));
         worldOutputCache[worldIndex][lineIndex] = { html, showTags };
         return html;
     }
@@ -4466,8 +4476,10 @@
         const html = tsPrefix + newLinePrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
         // Append to output with a <br> prefix (if not first line)
+        // Defense-in-depth: strip any event handler attributes that slipped through
+        // (e.g. from MUD-supplied text) before it ever reaches the DOM.
         const prefix = elements.output.childNodes.length > 0 ? '<br>' : '';
-        elements.output.insertAdjacentHTML('beforeend', prefix + `<span data-line-idx="${lineIndex}">${html}</span>`);
+        elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(prefix + `<span data-line-idx="${lineIndex}">${html}</span>`));
 
         scheduleScrollToBottom();
     }
@@ -4894,10 +4906,15 @@
     // Format: <:name:id> or <a:name:id> (animated)
     function convertDiscordEmojis(html) {
         // Match Discord emoji format: <:name:id> or <a:name:id>
-        return html.replace(/&lt;(a?):([^:]+):(\d+)&gt;/g, function(match, animated, name, id) {
+        // name is restricted to real Discord emoji name characters (alphanumeric + underscore)
+        // to prevent HTML/attribute injection via a crafted MUD line breaking out of the
+        // alt="..."/title="..." attributes below.
+        return html.replace(/&lt;(a?):([A-Za-z0-9_]+):(\d+)&gt;/g, function(match, animated, name, id) {
             const ext = animated ? 'gif' : 'png';
-            const url = `https://cdn.discordapp.com/emojis/${id}.${ext}`;
-            return `<img src="${url}" alt=":${name}:" title=":${name}:" class="discord-emoji" style="height: 1.2em; vertical-align: middle;">`;
+            const safeName = escapeHtml(name);
+            const safeId = escapeHtml(id);
+            const url = `https://cdn.discordapp.com/emojis/${safeId}.${ext}`;
+            return `<img src="${url}" alt=":${safeName}:" title=":${safeName}:" class="discord-emoji" style="height: 1.2em; vertical-align: middle;">`;
         });
     }
 
@@ -4905,7 +4922,7 @@
     function escapeHtml(text) {
         const div = document.createElement('div');
         div.textContent = text;
-        return div.innerHTML;
+        return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     // Defense-in-depth: strip any event handler attributes from parsed HTML
@@ -9162,6 +9179,51 @@
         const warning = document.getElementById('cert-warning');
         if (warning) {
             warning.style.display = 'none';
+        }
+    }
+
+    // Show a blocking dialog for a TLS certificate pin mismatch on a MUD world
+    // connection (trust-on-first-use, see platform::danger on the server). The
+    // connection is already blocked server-side; this offers an explicit
+    // "Trust new certificate" action that re-pins and reconnects.
+    function showCertMismatchDialog(worldIndex, host, oldFingerprint, newFingerprint) {
+        let dlg = document.getElementById('cert-mismatch-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'cert-mismatch-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            document.body.appendChild(dlg);
+        }
+        const safeHost = escapeHtml(String(host));
+        const safeOld = escapeHtml(String(oldFingerprint));
+        const safeNew = escapeHtml(String(newFingerprint));
+        dlg.innerHTML = sanitizeHtml(`
+            <div style="background:#1a1a1a;color:#eee;border:2px solid #c00;border-radius:8px;padding:20px;max-width:500px;width:90%;">
+                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;color:#f55;">TLS Certificate Changed</div>
+                <div style="margin-bottom:10px;">The certificate for <b>${safeHost}</b> no longer matches the one pinned on first connect. This could mean the server was reinstalled, or that someone is intercepting your connection.</div>
+                <div style="font-family:monospace;font-size:0.85em;word-break:break-all;margin-bottom:6px;">Old: ${safeOld}</div>
+                <div style="font-family:monospace;font-size:0.85em;word-break:break-all;margin-bottom:16px;">New: ${safeNew}</div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;">
+                    <button id="cert-mismatch-cancel" style="padding:8px 16px;">Cancel</button>
+                    <button id="cert-mismatch-trust" style="padding:8px 16px;background:#c00;color:#fff;border:none;border-radius:4px;">Trust new certificate</button>
+                </div>
+            </div>
+        `);
+        dlg.style.display = 'flex';
+
+        document.getElementById('cert-mismatch-cancel').onclick = function() {
+            hideCertMismatchDialog();
+        };
+        document.getElementById('cert-mismatch-trust').onclick = function() {
+            send({ type: 'TrustCertificate', world_index: worldIndex, host: host, new_fingerprint: newFingerprint });
+            hideCertMismatchDialog();
+        };
+    }
+
+    function hideCertMismatchDialog() {
+        const dlg = document.getElementById('cert-mismatch-dialog');
+        if (dlg) {
+            dlg.style.display = 'none';
         }
     }
 

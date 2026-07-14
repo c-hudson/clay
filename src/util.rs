@@ -1,6 +1,109 @@
 use ansi_to_tui::IntoText;
 use unicode_width::UnicodeWidthStr;
 
+// ============================================================================
+// Security helpers: constant-time comparison, owner-only file permissions
+// ============================================================================
+//
+// Shared by main.rs and persistence.rs (and http.rs / websocket.rs for the
+// comparison helper) so the same hardening lives in one place instead of being
+// re-implemented per call site.
+
+/// Constant-time byte comparison — avoids leaking a secret's length or
+/// prefix-match progress via timing. Unlike a naive `a == b` (or a compare
+/// that early-returns on a length mismatch), this always walks the full
+/// length of the longer input, folding the length-mismatch itself into the
+/// result instead of branching on it up front.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff: u8 = (a.len() != b.len()) as u8;
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Create (or truncate) `path` for writing with owner-only permissions, returning the
+/// open file handle so callers that write incrementally (e.g. `writeln!` in a loop) don't
+/// have to buffer the whole file in memory first.
+///
+/// Unix: the file is created with mode `0o600` directly via `O_CREAT` — there is no
+/// window where it's briefly world-readable (mirrors the pattern already used for
+/// `~/.clay/secure.key` in `persistence.rs`).
+/// Windows: created normally, then best-effort restricted to the owner (see
+/// `restrict_to_owner_windows` below — currently a documented no-op; matches prior
+/// behavior rather than blocking the build on a Windows ACL API).
+pub fn secure_create_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        restrict_to_owner_windows(path);
+        Ok(f)
+    }
+}
+
+/// Open `path` for appending, creating it with owner-only permissions if it doesn't
+/// already exist yet (used for the debug-mode `settings-audit.log`, which is opened
+/// repeatedly across the process lifetime rather than truncated).
+pub fn secure_append_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let existed = path.exists();
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        if !existed {
+            restrict_to_owner_windows(path);
+        }
+        Ok(f)
+    }
+}
+
+/// Write `bytes` to `path` as a new/truncated file, restricted to owner-only permissions
+/// (see `secure_create_file`). For secrets that already exist as a complete in-memory
+/// buffer (a generated key, a PEM-encoded cert/key) — the incremental writers
+/// (`settings.dat`, `multiuser.dat`) use `secure_create_file` directly instead.
+pub fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = secure_create_file(path)?;
+    f.write_all(bytes)
+}
+
+/// Best-effort owner-only ACL on Windows.
+///
+/// TODO: not yet implemented. A proper fix would call `SetNamedSecurityInfoW` (or the
+/// `windows`/`windows-acl` crate) to install a DACL granting `FILE_ALL_ACCESS` only to
+/// the current user SID, replacing the default inherited ACL (which is typically
+/// readable by other local accounts/Administrators). Left as a no-op for now — this
+/// matches Clay's existing (unhardened) behavior on Windows for these files rather than
+/// blocking the build on an ACL API that isn't already a dependency. Unix (the primary
+/// deployment target for multiuser/server mode, per CLAUDE.md) gets the real fix above.
+#[cfg(not(unix))]
+fn restrict_to_owner_windows(_path: &std::path::Path) {}
+
 /// Get the binary name of the current executable
 pub fn get_binary_name() -> String {
     std::env::current_exe()
@@ -942,6 +1045,57 @@ pub fn convert_temperatures(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- constant_time_eq ---
+
+    #[test]
+    fn constant_time_eq_sanity() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"short", b"a much longer string"));
+    }
+
+    // --- secure_create_file / write_secret_file ---
+
+    #[test]
+    fn write_secret_file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("clay-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("secret.bin");
+        write_secret_file(&path, b"topsecret").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"topsecret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn secure_append_file_creates_with_owner_only_perms() {
+        let dir = std::env::temp_dir().join(format!("clay-test-append-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("append.log");
+        let _ = std::fs::remove_file(&path);
+        {
+            use std::io::Write;
+            let mut f = secure_append_file(&path).unwrap();
+            writeln!(f, "line one").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line one\n");
+        let _ = std::fs::remove_file(&path);
+    }
 
     // --- strip_ansi_codes ---
 

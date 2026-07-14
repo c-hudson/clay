@@ -459,14 +459,15 @@ async fn ws_proxy_bridge(
     let local_ws = tokio_tungstenite::accept_async(local_stream).await?;
     let (mut local_sink, mut local_source) = local_ws.split();
 
-    // Try WSS first with self-signed cert support, fall back to WS
+    // Try WSS first with trust-on-first-use pinned cert support, fall back to WS.
     let remote_ws = {
         #[cfg(feature = "rustls-backend")]
         {
+            let host_port_key = wss_url.trim_start_matches("wss://").trim_start_matches("ws://").to_string();
             let tls_config = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(std::sync::Arc::new(
-                    crate::platform::danger::NoCertificateVerification::new()
+                    crate::platform::danger_rustls::TofuVerifier::new(host_port_key.clone())
                 ))
                 .with_no_client_auth();
             let connector = tokio_tungstenite::Connector::Rustls(
@@ -476,8 +477,19 @@ async fn ws_proxy_bridge(
                 wss_url, None, false, Some(connector),
             ).await {
                 Ok((ws, _)) => ws,
-                Err(_) => {
-                    // WSS failed, try plain WS
+                Err(e) => {
+                    // Do NOT silently fall back to plaintext ws:// if the WSS failure was a
+                    // pinned-certificate mismatch — that's exactly the MITM scenario pinning
+                    // exists to catch, and downgrading to plaintext would defeat it entirely.
+                    if let Some(mismatch) = crate::platform::danger::take_cert_mismatch() {
+                        return Err(format!(
+                            "TLS certificate for {} changed (was {}, now {}); refusing to fall back to an unencrypted connection. \
+                             Delete its entry from ~/.clay/known_hosts.dat if you trust the new certificate.",
+                            mismatch.host, mismatch.old_fingerprint, mismatch.new_fingerprint
+                        ).into());
+                    }
+                    let _ = e;
+                    // WSS failed for an ordinary reason (no listener, no rustls support, etc.), try plain WS
                     tokio_tungstenite::connect_async(ws_url).await?.0
                 }
             }

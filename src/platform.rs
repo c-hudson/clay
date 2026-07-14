@@ -27,73 +27,209 @@ use crate::{
 #[cfg(not(target_os = "android"))]
 use crate::UpdateSuccess;
 
-// Rustls danger module for accepting invalid certificates (MUD servers often have self-signed certs)
-#[cfg(feature = "rustls-backend")]
+// Trust-on-first-use (TOFU) certificate verification. MUD servers (and Clay's own
+// remote-console/WebView-proxy endpoints) very often present self-signed certs, so
+// Clay does not validate against a CA trust root. Instead it pins the SHA-256
+// fingerprint of the end-entity certificate on first connect (silently) and
+// requires an exact match on every later connect to the same host:port, blocking
+// the connection and surfacing old-vs-new fingerprints to the UI on a mismatch.
+//
+// This replaces the previous `NoCertificateVerification`, which accepted *any*
+// certificate on *every* connect and also used `assertion()` for the handshake
+// signature checks (i.e. it never verified the server actually held the private
+// key matching the certificate it presented). That combination means an
+// on-path attacker could simply replay whatever certificate they wanted —
+// signature checks are what prove possession of the private key.
 pub mod danger {
+    use sha2::{Digest, Sha256};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Details of a TLS certificate pin mismatch for `host`, stashed so the
+    /// connection-failure handling path (console TUI / web / WebView) can read it
+    /// and offer an explicit "Trust new certificate" action.
+    #[derive(Debug, Clone)]
+    pub struct CertMismatch {
+        pub host: String,
+        pub old_fingerprint: String,
+        pub new_fingerprint: String,
+    }
+
+    static CERT_MISMATCH: OnceLock<Mutex<Option<CertMismatch>>> = OnceLock::new();
+
+    fn cert_mismatch_slot() -> &'static Mutex<Option<CertMismatch>> {
+        CERT_MISMATCH.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Record a pin mismatch for a later UI read (called by both the rustls
+    /// verifier below and the native-tls pin check for the MUD path).
+    pub fn record_cert_mismatch(host: String, old_fingerprint: String, new_fingerprint: String) {
+        if let Ok(mut slot) = cert_mismatch_slot().lock() {
+            *slot = Some(CertMismatch { host, old_fingerprint, new_fingerprint });
+        }
+    }
+
+    /// Take (and clear) the most recently recorded cert mismatch, if any.
+    /// Connection-failure handlers call this after a TLS connect fails to learn
+    /// whether it was a pin mismatch (vs. an ordinary network error) and, if so,
+    /// what the old/new fingerprints were.
+    pub fn take_cert_mismatch() -> Option<CertMismatch> {
+        cert_mismatch_slot().lock().ok().and_then(|mut g| g.take())
+    }
+
+    pub fn sha256_hex(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Check a freshly-hashed end-entity certificate fingerprint against the pin
+    /// store for `host_port`. Returns `Ok(())` if this is a first connect (and
+    /// pins silently) or the fingerprint matches; returns `Err` (and records a
+    /// `CertMismatch`) if it differs from the pinned value.
+    ///
+    /// Shared by the rustls `TofuVerifier` below and the native-tls MUD path
+    /// (which checks the peer certificate post-handshake since native-tls has no
+    /// pluggable verifier callback — see `platform::check_native_tls_peer_pin`).
+    pub fn check_pin(host_port: &str, fingerprint: &str) -> Result<(), String> {
+        match crate::persistence::get_pin(host_port) {
+            None => {
+                crate::persistence::add_pin(host_port, fingerprint);
+                Ok(())
+            }
+            Some(pinned) if pinned == fingerprint => Ok(()),
+            Some(pinned) => {
+                record_cert_mismatch(host_port.to_string(), pinned.clone(), fingerprint.to_string());
+                Err(format!(
+                    "certificate for {} does not match the pinned fingerprint (was {}, now {})",
+                    host_port, pinned, fingerprint
+                ))
+            }
+        }
+    }
+}
+
+// Rustls-specific TOFU verifier. Kept in its own cfg-gated module since it needs
+// rustls's ServerCertVerifier trait/types; the pin logic itself (above) is shared
+// with the native-tls MUD path.
+#[cfg(feature = "rustls-backend")]
+pub mod danger_rustls {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::crypto::CryptoProvider;
     use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use std::sync::OnceLock;
+    use super::danger::{check_pin, sha256_hex};
 
+    /// The default rustls crypto provider (ring), cached — used to perform *real*
+    /// handshake signature verification (see `TofuVerifier` below) rather than
+    /// rustls's `default_provider()` allocating a fresh one on every handshake.
+    fn crypto_provider() -> &'static CryptoProvider {
+        static PROVIDER: OnceLock<CryptoProvider> = OnceLock::new();
+        PROVIDER.get_or_init(rustls::crypto::ring::default_provider)
+    }
+
+    /// Trust-on-first-use rustls `ServerCertVerifier`. Pins the SHA-256 fingerprint
+    /// of the end-entity certificate presented for `host_port` on first connect;
+    /// requires an exact match thereafter.
     #[derive(Debug)]
-    pub struct NoCertificateVerification;
+    pub struct TofuVerifier {
+        host_port: String,
+    }
 
-    impl Default for NoCertificateVerification {
-        fn default() -> Self {
-            Self::new()
+    impl TofuVerifier {
+        pub fn new(host_port: impl Into<String>) -> Self {
+            Self { host_port: host_port.into() }
         }
     }
 
-    impl NoCertificateVerification {
-        pub fn new() -> Self {
-            Self
-        }
-    }
-
-    impl ServerCertVerifier for NoCertificateVerification {
+    impl ServerCertVerifier for TofuVerifier {
         fn verify_server_cert(
             &self,
-            _end_entity: &CertificateDer<'_>,
+            end_entity: &CertificateDer<'_>,
             _intermediates: &[CertificateDer<'_>],
             _server_name: &ServerName<'_>,
             _ocsp_response: &[u8],
             _now: UnixTime,
         ) -> Result<ServerCertVerified, Error> {
-            Ok(ServerCertVerified::assertion())
+            let fingerprint = sha256_hex(end_entity.as_ref());
+            match check_pin(&self.host_port, &fingerprint) {
+                Ok(()) => Ok(ServerCertVerified::assertion()),
+                Err(msg) => Err(Error::General(msg)),
+            }
         }
 
+        // CRITICAL: unlike the old NoCertificateVerification, these must perform
+        // real signature verification. Certificates are sent in the clear during
+        // the TLS handshake, so an attacker who has merely observed a pinned
+        // certificate (e.g. from a prior legitimate connection) could replay it
+        // byte-for-byte without possessing the corresponding private key. Only
+        // the handshake signature (computed over the transcript with the
+        // server's private key) proves the peer actually holds that key — so
+        // skipping this check (as `assertion()` did) would let a replayed cert
+        // sail straight through the pin comparison above.
         fn verify_tls12_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &crypto_provider().signature_verification_algorithms,
+            )
         }
 
         fn verify_tls13_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &crypto_provider().signature_verification_algorithms,
+            )
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA384,
-                SignatureScheme::RSA_PKCS1_SHA512,
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::ECDSA_NISTP521_SHA512,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::ED25519,
-            ]
+            crypto_provider().signature_verification_algorithms.supported_schemes()
         }
     }
+}
+
+/// Post-handshake TOFU pin check for the native-tls MUD path.
+///
+/// native-tls has no pluggable certificate-verifier callback like rustls's
+/// `ServerCertVerifier` (that's a rustls-specific extension point), so it cannot
+/// reject a mismatched certificate *during* the handshake the way `TofuVerifier`
+/// does. Instead, connections still use `danger_accept_invalid_certs(true)` to
+/// complete the handshake (self-signed MUD certs are expected), and this function
+/// is called immediately afterwards with the peer's certificate. On a pin
+/// mismatch it records the same `CertMismatch` the rustls path would and returns
+/// an error; callers must treat that as a failed connection and tear the stream
+/// down rather than using it. Because native-tls (unlike our rustls verifier)
+/// performs its own internal handshake signature verification (it isn't skipped
+/// the way the old `NoCertificateVerification` skipped rustls's), a replayed
+/// certificate without the matching private key still fails the handshake before
+/// this function is ever reached.
+#[cfg(feature = "native-tls-backend")]
+pub fn check_native_tls_peer_pin(
+    host_port: &str,
+    cert: Option<native_tls::Certificate>,
+) -> Result<(), String> {
+    let cert = match cert {
+        Some(c) => c,
+        None => return Err(format!("no peer certificate presented by {}", host_port)),
+    };
+    let der = cert
+        .to_der()
+        .map_err(|e| format!("could not read peer certificate for {}: {}", host_port, e))?;
+    let fingerprint = danger::sha256_hex(&der);
+    danger::check_pin(host_port, &fingerprint)
 }
 
 pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
@@ -512,11 +648,11 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &Pa
 
         // Create a config that accepts invalid certs (common for MUD servers)
         let mut root_store = RootCertStore::empty();
-        root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
+        root_store.roots = webpki_roots::TLS_SERVER_ROOTS.to_vec();
 
         let config = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+            .with_custom_certificate_verifier(Arc::new(danger_rustls::TofuVerifier::new(format!("{}:{}", host, port))))
             .with_no_client_auth();
 
         let connector = TlsConnector::from(Arc::new(config));
@@ -543,7 +679,13 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &Pa
         let connector = tokio_native_tls::TlsConnector::from(connector);
 
         match connector.connect(host, tcp_stream).await {
-            Ok(s) => s,
+            Ok(s) => {
+                let peer_cert = s.get_ref().peer_certificate().ok().flatten();
+                if check_native_tls_peer_pin(&format!("{}:{}", host, port), peer_cert).is_err() {
+                    return;
+                }
+                s
+            }
             Err(_) => return,
         }
     };
@@ -829,17 +971,11 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path
         use rustls::pki_types::ServerName;
 
         let mut root_store = RootCertStore::empty();
-        root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            rustls::pki_types::TrustAnchor {
-                subject: ta.subject.into(),
-                subject_public_key_info: ta.spki.into(),
-                name_constraints: ta.name_constraints.map(|nc| nc.into()),
-            }
-        }).collect();
+        root_store.roots = webpki_roots::TLS_SERVER_ROOTS.to_vec();
 
         let config = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+            .with_custom_certificate_verifier(Arc::new(danger_rustls::TofuVerifier::new(format!("{}:{}", host, port))))
             .with_no_client_auth();
 
         let connector = TlsConnector::from(Arc::new(config));
@@ -866,7 +1002,13 @@ pub(crate) async fn run_tls_proxy_async(host: &str, port: &str, pipe_path: &Path
         let connector = tokio_native_tls::TlsConnector::from(connector);
 
         match connector.connect(host, tcp_stream).await {
-            Ok(s) => s,
+            Ok(s) => {
+                let peer_cert = s.get_ref().peer_certificate().ok().flatten();
+                if check_native_tls_peer_pin(&format!("{}:{}", host, port), peer_cert).is_err() {
+                    return;
+                }
+                s
+            }
             Err(_) => return,
         }
     };
@@ -1662,6 +1804,198 @@ mod tests {
         let found = find_asset(&assets, "clay-windows-x86_64.exe");
         assert_eq!(found.and_then(|a| a["name"].as_str()), Some("clay.exe"),
             "Fallback should pick up old clay.exe even when exact name changed");
+    }
+
+    // -----------------------------------------------------------------
+    // TOFU certificate pinning (danger module)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_hex_known_vector() {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(
+            danger::sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // SHA-256("abc") is a standard NIST test vector
+        assert_eq!(
+            danger::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn test_check_pin_first_connect_then_match_then_mismatch() {
+        let host = "clay-test-platform-danger.invalid:1234";
+        crate::persistence::remove_pin(host);
+
+        // First connect: silent pin
+        assert!(danger::check_pin(host, "fingerprint-a").is_ok());
+        assert_eq!(crate::persistence::get_pin(host), Some("fingerprint-a".to_string()));
+        // No mismatch should have been recorded for a first connect
+        assert!(danger::take_cert_mismatch().is_none());
+
+        // Same fingerprint again: still ok, no mismatch recorded
+        assert!(danger::check_pin(host, "fingerprint-a").is_ok());
+        assert!(danger::take_cert_mismatch().is_none());
+
+        // Different fingerprint: blocked, and mismatch details recorded
+        assert!(danger::check_pin(host, "fingerprint-b").is_err());
+        let mismatch = danger::take_cert_mismatch().expect("mismatch should be recorded");
+        assert_eq!(mismatch.host, host);
+        assert_eq!(mismatch.old_fingerprint, "fingerprint-a");
+        assert_eq!(mismatch.new_fingerprint, "fingerprint-b");
+
+        // take_cert_mismatch() clears the slot
+        assert!(danger::take_cert_mismatch().is_none());
+
+        // The old pin is still what's stored — a mismatch does NOT auto-replace the pin
+        assert_eq!(crate::persistence::get_pin(host), Some("fingerprint-a".to_string()));
+
+        crate::persistence::remove_pin(host);
+    }
+
+    #[cfg(feature = "rustls-backend")]
+    #[test]
+    fn test_tofu_verifier_supported_schemes_nonempty() {
+        use rustls::client::danger::ServerCertVerifier;
+        let verifier = danger_rustls::TofuVerifier::new("unused:0".to_string());
+        assert!(!verifier.supported_verify_schemes().is_empty());
+    }
+
+    /// End-to-end proof that `TofuVerifier` (a) pins silently on first connect,
+    /// (b) blocks and records a mismatch when a *different* certificate is
+    /// presented later, and — most importantly — (c) still rejects a connection
+    /// where the server replays the *exact* pinned certificate bytes but signs
+    /// the handshake with a different private key (i.e. doesn't actually possess
+    /// the certificate's private key). (c) is what proves
+    /// `verify_tls12_signature`/`verify_tls13_signature` perform real
+    /// verification instead of the old `assertion()` rubber-stamp — a bare
+    /// fingerprint check alone would NOT catch this, since certificates are
+    /// public and sent in the clear during the handshake.
+    #[cfg(feature = "rustls-backend")]
+    #[tokio::test]
+    async fn test_tofu_full_handshake_pin_then_mismatch_then_key_replay_fails() {
+        use rcgen::{CertificateParams, KeyPair};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+        use tokio::net::TcpListener;
+
+        fn make_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+            let key_pair = KeyPair::generate().unwrap();
+            let params = CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
+            let cert = params.self_signed(&key_pair).unwrap();
+            let cert_der = cert.der().clone();
+            let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+            (cert_der, key_der)
+        }
+
+        // A `ResolvesServerCert` that always hands back a fixed (cert, key) pair,
+        // used instead of `ServerConfig::builder().with_single_cert(...)` below.
+        // rustls (since 0.23) has `with_single_cert` call `CertifiedKey::keys_match()`
+        // internally and refuse to build a config for a cert/key pair that doesn't
+        // match — which is exactly the mismatched pair step 3 of this test needs to
+        // construct, to prove the *handshake* (not config construction) is what
+        // rejects a replayed certificate signed by the wrong key. Building the
+        // `CertifiedKey` directly skips that sanity check, so the mismatched config
+        // still builds and the rejection has to come from the TLS signature
+        // verification this test is actually exercising.
+        #[derive(Debug)]
+        struct FixedResolver(std::sync::Arc<rustls::sign::CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for FixedResolver {
+            fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+
+        async fn run_one_shot_server(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>, listener: TcpListener) {
+            let provider = rustls::crypto::ring::default_provider();
+            let signing_key = provider
+                .key_provider
+                .load_private_key(key)
+                .expect("load private key (test-generated PKCS8 key)");
+            let certified_key = std::sync::Arc::new(rustls::sign::CertifiedKey::new(vec![cert], signing_key));
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(std::sync::Arc::new(FixedResolver(certified_key)));
+            let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+            if let Ok((stream, _)) = listener.accept().await {
+                // We only care whether the handshake itself completes; drop the result.
+                let _ = acceptor.accept(stream).await;
+            }
+        }
+
+        async fn try_client_connect(addr: std::net::SocketAddr, host_port_key: &str) -> Result<(), String> {
+            let config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(danger_rustls::TofuVerifier::new(host_port_key.to_string())))
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+            let tcp = tokio::net::TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+            let server_name = ServerName::try_from("127.0.0.1").unwrap();
+            connector.connect(server_name, tcp).await.map(|_| ()).map_err(|e| e.to_string())
+        }
+
+        // Distinct host_port_key from any real pin a developer might have, and
+        // deliberately decoupled from the actual (ephemeral, per-listener) TCP
+        // port — the pin store keys purely on this string.
+        let host_port_key = "clay-tofu-integration-test.invalid:0";
+        crate::persistence::remove_pin(host_port_key);
+
+        // --- 1. First connect (correct cert+key pair): silent pin, handshake succeeds ---
+        let (cert_a, key_a) = make_cert();
+        let fp_a = danger::sha256_hex(cert_a.as_ref());
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let server_a = tokio::spawn(run_one_shot_server(cert_a.clone(), key_a, listener_a));
+        let result_a = try_client_connect(addr_a, host_port_key).await;
+        let _ = server_a.await;
+        assert!(result_a.is_ok(), "first connect with a correctly-signed cert should succeed: {:?}", result_a);
+        assert_eq!(crate::persistence::get_pin(host_port_key), Some(fp_a.clone()), "first connect should pin silently");
+        assert!(danger::take_cert_mismatch().is_none(), "no mismatch should be recorded on first connect");
+
+        // --- 2. Reconnect with a DIFFERENT (but correctly signed) cert: blocked + mismatch surfaced ---
+        let (cert_b, key_b) = make_cert();
+        let fp_b = danger::sha256_hex(cert_b.as_ref());
+        assert_ne!(fp_a, fp_b);
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let server_b = tokio::spawn(run_one_shot_server(cert_b.clone(), key_b, listener_b));
+        let result_b = try_client_connect(addr_b, host_port_key).await;
+        let _ = server_b.await;
+        assert!(result_b.is_err(), "reconnect with a DIFFERENT certificate must be blocked");
+        let mismatch = danger::take_cert_mismatch().expect("mismatch should be recorded for a changed cert");
+        assert_eq!(mismatch.host, host_port_key);
+        assert_eq!(mismatch.old_fingerprint, fp_a);
+        assert_eq!(mismatch.new_fingerprint, fp_b);
+        assert_eq!(crate::persistence::get_pin(host_port_key), Some(fp_a.clone()), "a mismatch must NOT auto-replace the pin");
+
+        // --- 3. THE CRITICAL CHECK: replay the pinned cert_a bytes signed with a
+        //        DIFFERENT private key (key_c) — simulating an attacker who
+        //        captured cert_a's public bytes off the wire (certs are sent
+        //        unencrypted during the handshake) but does not possess key_a.
+        //        The fingerprint check alone would PASS here (it's the same
+        //        cert_a bytes as the pin) — only real signature verification
+        //        catches this.
+        let (_cert_c_unused, key_c) = make_cert();
+        let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_c = listener_c.local_addr().unwrap();
+        let server_c = tokio::spawn(run_one_shot_server(cert_a.clone(), key_c, listener_c));
+        let result_c = try_client_connect(addr_c, host_port_key).await;
+        let _ = server_c.await;
+        assert!(
+            result_c.is_err(),
+            "presenting the pinned certificate without its matching private key must still fail the handshake"
+        );
+        // Crucially, this must fail via signature verification, not the pin
+        // comparison — cert_a's fingerprint matches the existing pin exactly, so
+        // no CertMismatch should be recorded for this attempt.
+        assert!(
+            danger::take_cert_mismatch().is_none(),
+            "the key-replay rejection must come from signature verification, not a fingerprint mismatch"
+        );
+        assert_eq!(crate::persistence::get_pin(host_port_key), Some(fp_a), "pin must remain unchanged");
+
+        crate::persistence::remove_pin(host_port_key);
     }
 }
 

@@ -2033,6 +2033,22 @@ pub async fn handle_daemon_ws_message(
     }
 }
 
+/// Install every user's credential onto a `WebSocketServer`, respecting
+/// `password_is_hash` (C1, security remediation) so a value already hashed by a prior
+/// `ChangePassword` (see `User::password_is_hash`) isn't hashed a second time — that
+/// would silently lock the user out on every subsequent login. Shared by multiuser
+/// server startup (mirroring a settings reload/restart after a password change) and
+/// exercised directly by tests below.
+fn install_user_credentials(server: &WebSocketServer, users: &[User]) {
+    for user in users {
+        if user.password_is_hash {
+            server.set_user_password_hash(&user.name, user.password.clone());
+        } else {
+            server.add_user(&user.name, &user.password);
+        }
+    }
+}
+
 /// Run in multiuser server mode - web interface only, no console
 pub async fn run_multiuser_server() -> io::Result<()> {
     let mut app = App::new();
@@ -2127,10 +2143,8 @@ keep_alive_type=Generic
         app.ban_list.clone(),
     );
 
-    // Add user credentials to the WebSocket server for multiuser authentication
-    for user in &app.users {
-        server.add_user(&user.name, &user.password);
-    }
+    // Add user credentials to the WebSocket server for multiuser authentication.
+    install_user_credentials(&server, &app.users);
 
     let gate = SecurityGate {
         allow_list: server.allow_list.clone(),
@@ -2490,6 +2504,10 @@ pub async fn connect_multiuser_world(
 
                     match connector.connect(host, tcp_stream).await {
                         Ok(tls_stream) => {
+                            let peer_cert = tls_stream.get_ref().peer_certificate().ok().flatten();
+                            if crate::platform::check_native_tls_peer_pin(&format!("{}:{}", host, port), peer_cert).is_err() {
+                                return None;
+                            }
                             let (r, w) = tokio::io::split(tls_stream);
                             (StreamReader::Tls(r), StreamWriter::Tls(w))
                         }
@@ -2504,11 +2522,11 @@ pub async fn connect_multiuser_world(
                     use rustls::pki_types::ServerName;
 
                     let mut root_store = RootCertStore::empty();
-                    root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
+                    root_store.roots = webpki_roots::TLS_SERVER_ROOTS.to_vec();
 
                     let config = rustls::ClientConfig::builder()
                         .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(crate::platform::danger::NoCertificateVerification::new()))
+                        .with_custom_certificate_verifier(Arc::new(crate::platform::danger_rustls::TofuVerifier::new(format!("{}:{}", host, port))))
                         .with_no_client_auth();
 
                     let connector = TlsConnector::from(Arc::new(config));
@@ -2930,6 +2948,10 @@ pub async fn connect_daemon_world(
 
                     match connector.connect(host, tcp_stream).await {
                         Ok(tls_stream) => {
+                            let peer_cert = tls_stream.get_ref().peer_certificate().ok().flatten();
+                            if crate::platform::check_native_tls_peer_pin(&format!("{}:{}", host, port), peer_cert).is_err() {
+                                return None;
+                            }
                             let (r, w) = tokio::io::split(tls_stream);
                             (StreamReader::Tls(r), StreamWriter::Tls(w))
                         }
@@ -2944,11 +2966,11 @@ pub async fn connect_daemon_world(
                     use rustls::pki_types::ServerName;
 
                     let mut root_store = RootCertStore::empty();
-                    root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
+                    root_store.roots = webpki_roots::TLS_SERVER_ROOTS.to_vec();
 
                     let config = rustls::ClientConfig::builder()
                         .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(crate::platform::danger::NoCertificateVerification::new()))
+                        .with_custom_certificate_verifier(Arc::new(crate::platform::danger_rustls::TofuVerifier::new(format!("{}:{}", host, port))))
                         .with_no_client_auth();
 
                     let connector = TlsConnector::from(Arc::new(config));
@@ -3163,11 +3185,30 @@ pub async fn connect_daemon_world(
 /// Build initial state message for a specific user (multiuser mode)
 /// World definitions are shared, but connection state is per-user
 /// Actions are still filtered per-user
+///
+/// B4 (security remediation): every world's `hostname`/`port`/`user` used to be sent to
+/// every authenticated user regardless of ownership (`has_password`/`password` were
+/// already correctly scoped). All worlds must have an `owner` in multiuser mode (enforced
+/// at startup, see the "all worlds must have owners" validation) — there is no un-owned
+/// / global-world concept to special-case here, so the predicate is a straight ownership
+/// match, mirroring `SwitchWorld`/`ConnectWorld`/etc. below and the action filter a few
+/// lines down. World *entries* (and their `index`) are still sent for every world — not
+/// just the ones this user owns — because `index` is the same global `app.worlds`
+/// position used by every other WS message (`ServerData`, `WorldConnected`, ...); dropping
+/// entries would desync that indexing for the console remote-client and web/GUI clients,
+/// which both key off position == server-global `world_index`. Only the sensitive
+/// connection-identifying fields are redacted for worlds this user doesn't own.
 pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
     // Show all worlds with per-user connection state
     let worlds: Vec<WorldStateMsg> = app.worlds.iter().enumerate()
         .map(|(idx, world)| {
-            // Get user's connection state for this world (if any)
+            let is_owner = world.owner.as_deref() == Some(username);
+
+            // Get user's connection state for this world (if any). Non-owned worlds never
+            // have a connection entry keyed by this username (ConnectWorld is gated to the
+            // owner), so this is already correctly empty for them independent of the
+            // redaction below — but we redact the static settings explicitly too, rather
+            // than relying on that as the only guard.
             let key = (idx, username.to_string());
             let user_conn = app.user_connections.get(&key);
 
@@ -3251,18 +3292,21 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 paused,
                 unseen_lines,
                 settings: WorldSettingsMsg {
-                    hostname: world.settings.hostname.clone(),
-                    port: world.settings.port.clone(),
-                    user: world.settings.user.clone(),
+                    // B4 (security remediation): hostname/port/user (and has_password) are
+                    // only meaningful to the owner — a non-owner gets empty/false instead
+                    // of another user's connection details.
+                    hostname: if is_owner { world.settings.hostname.clone() } else { String::new() },
+                    port: if is_owner { world.settings.port.clone() } else { String::new() },
+                    user: if is_owner { world.settings.user.clone() } else { String::new() },
                     password: String::new(),
-                    has_password: !world.settings.password.is_empty(),
+                    has_password: is_owner && !world.settings.password.is_empty(),
                     use_ssl: world.settings.use_ssl,
                     log_enabled: world.settings.log_enabled,
                     encoding: world.settings.encoding.name().to_string(),
                     auto_connect_type: world.settings.auto_connect_type.name().to_string(),
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                    keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
-                    gmcp_packages: world.settings.gmcp_packages.clone(),
+                    keep_alive_cmd: if is_owner { world.settings.keep_alive_cmd.clone() } else { String::new() },
+                    gmcp_packages: if is_owner { world.settings.gmcp_packages.clone() } else { String::new() },
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
                 },
                 last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
@@ -3361,10 +3405,16 @@ pub async fn handle_multiuser_ws_message(
             }
         }
         WsMessage::ConnectWorld { world_index } => {
-            // Any user can connect to any world
-            if world_index < app.worlds.len() {
-                if let Some(ref uname) = username {
-                    let _ = event_tx.send(AppEvent::ConnectWorldRequest(world_index, uname.clone())).await;
+            // Verify the client owns this world (mirrors SwitchWorld/MarkWorldSeen/
+            // ReleasePending below). Without this check, any authenticated user could
+            // request a connect on another user's world_index and
+            // connect_multiuser_world() would auto-replay that world's stored
+            // `connect <user> <password>` credential, seizing the owner's character.
+            if let Some(world) = app.worlds.get(world_index) {
+                if world.owner.as_ref() == username.as_ref() {
+                    if let Some(ref uname) = username {
+                        let _ = event_tx.send(AppEvent::ConnectWorldRequest(world_index, uname.clone())).await;
+                    }
                 }
             }
         }
@@ -3389,10 +3439,31 @@ pub async fn handle_multiuser_ws_message(
             if let Some(ref uname) = username {
                 // Find the user and verify old password
                 if let Some(user) = app.users.iter_mut().find(|u| &u.name == uname) {
-                    let old_hash = hash_password(&user.password);
+                    // C1 (security remediation): `user.password` may itself already be
+                    // an already-hashed value from a prior password change
+                    // (password_is_hash) — only hash it here if it's still plaintext,
+                    // otherwise compare it directly. Hashing an already-hashed value
+                    // again would make every subsequent password change compare against
+                    // the wrong old hash too.
+                    let old_hash = if user.password_is_hash {
+                        user.password.clone()
+                    } else {
+                        hash_password(&user.password)
+                    };
                     if old_hash == old_password_hash {
-                        // Update password (store the hash, will be encrypted on save)
+                        // Store the new credential as an already-hashed value (the
+                        // client only ever sends SHA256(new_password), never the
+                        // plaintext, so it cannot be stored as a plaintext `password`
+                        // without being re-hashed — and therefore corrupted — the next
+                        // time settings are loaded; see User::password_is_hash).
                         user.password = new_password_hash.clone();
+                        user.password_is_hash = true;
+                        // Update the live WebSocket server's credential immediately so
+                        // the running server accepts the new password right away,
+                        // without requiring a reload.
+                        if let Some(ws) = &app.ws_server {
+                            ws.set_user_password_hash(uname, new_password_hash.clone());
+                        }
                         // Save settings
                         if let Err(e) = persistence::save_multiuser_settings(app) {
                             eprintln!("Failed to save settings after password change: {}", e);
@@ -3497,6 +3568,18 @@ pub async fn handle_multiuser_ws_message(
                 }
             }
         }
+        WsMessage::TrustCertificate { world_index, host, new_fingerprint } => {
+            // Verify the client owns this world (mirrors ConnectWorld above) before
+            // re-pinning and reconnecting on their behalf.
+            if let Some(world) = app.worlds.get(world_index) {
+                if world.owner.as_ref() == username.as_ref() {
+                    persistence::replace_pin(&host, &new_fingerprint);
+                    if let Some(ref uname) = username {
+                        let _ = event_tx.send(AppEvent::ConnectWorldRequest(world_index, uname.clone())).await;
+                    }
+                }
+            }
+        }
         WsMessage::SelectiveFlush { world_index } => {
             if let Some(world) = app.worlds.get_mut(world_index) {
                 if world.owner.as_ref() == username.as_ref() && world.paused {
@@ -3588,5 +3671,152 @@ pub async fn handle_multiuser_ws_message(
             }
         }
         _ => {} // Handle other messages as needed
+    }
+}
+
+#[cfg(test)]
+mod change_password_tests {
+    use super::*;
+
+    /// Register a fake authenticated WS client so `get_client_username` resolves.
+    /// Returns the client id and a receiver for whatever the handler sends back.
+    fn register_client(server: &WebSocketServer, client_id: u64, username: &str) -> mpsc::UnboundedReceiver<WsMessage> {
+        let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
+        // try_write (not blocking_write) per CLAUDE.md: never block a tokio RwLock from
+        // inside the runtime. No contention here — this runs before any concurrent access.
+        let mut clients = server.clients.try_write().expect("clients lock should be uncontended in test setup");
+        clients.insert(client_id, WsClientInfo {
+            authenticated: true,
+            tx,
+            current_world: None,
+            username: Some(username.to_string()),
+            received_initial_state: true,
+            client_type: RemoteClientType::Web,
+            viewport_height: 24,
+            ip_address: "127.0.0.1".to_string(),
+            connected_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            paused: false,
+        });
+        rx
+    }
+
+    /// C1 (security remediation) regression test: before the fix, `ChangePassword`
+    /// stored the client-sent hash into the plaintext `User.password` field, which was
+    /// then re-hashed (`SHA256(SHA256(pw))`) the next time credentials were installed
+    /// on a `WebSocketServer` (originally only at startup/reload) — permanently locking
+    /// the user out of the new password. This drives the actual `ChangePassword`
+    /// handler and then reinstalls credentials the same way a restart/reload would
+    /// (`install_user_credentials`, shared with `run_multiuser_server`), proving a
+    /// login with the new password succeeds both immediately (live server) and after
+    /// a reload (persisted `password_is_hash` form).
+    #[tokio::test]
+    async fn change_password_then_login_with_new_password_succeeds() {
+        let old_password = "correct horse battery staple";
+        let new_password = "new-super-secret-password";
+
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.users.push(User::new("alice", old_password));
+
+        let server = WebSocketServer::new("", 9000, "", None, true, BanList::new());
+        install_user_credentials(&server, &app.users);
+
+        let client_id = 1u64;
+        let mut rx = register_client(&server, client_id, "alice");
+        app.ws_server = Some(server);
+
+        let (event_tx, _event_rx) = mpsc::channel::<AppEvent>(8);
+
+        // Change the password via the real handler, exactly as a client would trigger it.
+        let msg = WsMessage::ChangePassword {
+            old_password_hash: hash_password(old_password),
+            new_password_hash: hash_password(new_password),
+        };
+        handle_multiuser_ws_message(&mut app, client_id, msg, &event_tx).await;
+
+        // Handler must report success.
+        match rx.try_recv() {
+            Ok(WsMessage::PasswordChanged { success, error }) => {
+                assert!(success, "ChangePassword should succeed, got error: {:?}", error);
+            }
+            other => panic!("expected PasswordChanged, got {:?}", other),
+        }
+
+        // In-memory User record must now hold the new credential in hashed form.
+        let user = app.users.iter().find(|u| u.name == "alice").unwrap();
+        assert!(user.password_is_hash, "password_is_hash should be set after a change");
+        assert_eq!(user.password, hash_password(new_password));
+
+        // The LIVE server's credential must already accept the new password —
+        // no reload required (this is what makes an immediate reconnect work).
+        {
+            let ws = app.ws_server.as_ref().unwrap();
+            let users = ws.users.read().unwrap();
+            let cred = users.get("alice").expect("alice should still be a known user");
+            assert_eq!(
+                cred.password_hash,
+                hash_password(new_password),
+                "live server credential must match the NEW password, not a double-hash of it"
+            );
+            assert_ne!(
+                cred.password_hash,
+                hash_password(&hash_password(new_password)),
+                "live server credential must not be double-hashed (the original C1 bug)"
+            );
+        }
+
+        // Simulate a restart/reload: reinstall credentials from the persisted User
+        // records the same way run_multiuser_server does at startup.
+        let reloaded_server = WebSocketServer::new("", 9000, "", None, true, BanList::new());
+        install_user_credentials(&reloaded_server, &app.users);
+        let users = reloaded_server.users.read().unwrap();
+        let cred = users.get("alice").expect("alice should survive a reload");
+        assert_eq!(
+            cred.password_hash,
+            hash_password(new_password),
+            "after a reload, login with the NEW password must still succeed"
+        );
+
+        // And the OLD password must no longer work, live or after reload.
+        assert_ne!(cred.password_hash, hash_password(old_password));
+    }
+
+    /// A second, consecutive password change must also work — guards against a fix
+    /// that only handles the plaintext-to-hash transition once (e.g. by
+    /// unconditionally hashing `user.password` for the old-password check instead of
+    /// checking `password_is_hash`).
+    #[tokio::test]
+    async fn second_consecutive_password_change_succeeds() {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.users.push(User::new("bob", "first-password"));
+
+        let server = WebSocketServer::new("", 9000, "", None, true, BanList::new());
+        install_user_credentials(&server, &app.users);
+        let client_id = 1u64;
+        let _rx1 = register_client(&server, client_id, "bob");
+        app.ws_server = Some(server);
+        let (event_tx, _event_rx) = mpsc::channel::<AppEvent>(8);
+
+        // First change: first-password -> second-password
+        handle_multiuser_ws_message(&mut app, client_id, WsMessage::ChangePassword {
+            old_password_hash: hash_password("first-password"),
+            new_password_hash: hash_password("second-password"),
+        }, &event_tx).await;
+        assert!(app.users[0].password_is_hash);
+        assert_eq!(app.users[0].password, hash_password("second-password"));
+
+        // Second change: second-password -> third-password. Must authenticate against
+        // the (already-hashed) current password correctly.
+        handle_multiuser_ws_message(&mut app, client_id, WsMessage::ChangePassword {
+            old_password_hash: hash_password("second-password"),
+            new_password_hash: hash_password("third-password"),
+        }, &event_tx).await;
+
+        let ws = app.ws_server.as_ref().unwrap();
+        assert_eq!(app.users[0].password, hash_password("third-password"));
+        let users = ws.users.read().unwrap();
+        assert_eq!(users.get("bob").unwrap().password_hash, hash_password("third-password"));
     }
 }
