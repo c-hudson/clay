@@ -25,13 +25,18 @@ rcgen = "0.14"
 # TLS support - native-tls by default, rustls for static builds
 tokio-native-tls = { version = "0.3", optional = true }
 native-tls = { version = "0.2", optional = true }
-tokio-rustls = { version = "0.25", optional = true }
-rustls = { version = "0.22", optional = true }
+# default-features = false + explicit "ring" feature: rustls 0.23 defaults its
+# crypto provider to aws-lc-rs, which needs a C toolchain and does not
+# cross-compile cleanly to Android armv7 (breaks the Termux build). ring
+# cross-compiles fine and is what Clay has always used. Every TLS dep below
+# must stay pinned to ring the same way - see TofuVerifier in platform.rs.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["logging", "tls12", "ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = { version = "1", optional = true }
-webpki-roots = { version = "0.25", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 # WebSocket support (TLS features are conditional on backend)
-tokio-tungstenite = "0.21"
+tokio-tungstenite = "0.24"
 
 # Serialization for WebSocket protocol
 serde = { version = "1", features = ["derive"] }
@@ -46,17 +51,20 @@ async-recursion = "1.0"
 
 # Force older versions of transitive deps for Rust 1.75 compatibility
 indexmap = ">=2.2.0, <2.5.0"
-url = "=2.5.0"
+url = ">=2.5.4"
 hashbrown = "0.14"
 home = "=0.5.5"
-time = ">=0.3.0, <0.3.37"
-time-core = ">=0.1.0, <0.1.3"
+time = ">=0.3.37"
 
 # MCCP2 (MUD Client Compression Protocol) zlib decompression
 flate2 = "1"
 
 # HTTP client for Slack/Discord APIs
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+# "rustls-tls" here resolves to reqwest's "rustls-tls-webpki-roots" feature, which
+# pulls in "__rustls-ring" - the ring-based crypto provider variant. This unifies
+# with our direct rustls/tokio-rustls deps above on the same ring-backed rustls
+# 0.23, keeping aws-lc-rs out of the build (see the comment on tokio-rustls above).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # UUID for Edge TTS request IDs
 uuid = { version = "1", features = ["v4"] }
