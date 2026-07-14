@@ -1313,10 +1313,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             // /dump is passive — don't reset more-mode state
             let is_dump = input.trim().eq_ignore_ascii_case("/dump");
             if !is_dump {
-                app.current_world_mut().lines_since_pause = 0;
-                if app.current_world().pending_lines.is_empty() {
-                    app.current_world_mut().paused = false;
-                }
+                app.current_world_mut().reset_more_mode_on_send();
             }
             return KeyAction::SendCommand(input);
         }

@@ -3258,13 +3258,16 @@
         const cmd = elements.input.value;
         if (!authenticated) return;
 
-        // Release all pending lines when sending a command
-        if (paused) {
-            releaseAll();
+        // Only release held output / reset more-mode state when following live output at
+        // the bottom. If the user has scrolled up to read history, keep their position —
+        // the command still sends and its reply queues below, revealed on scroll-down.
+        if (isAtBottom()) {
+            if (paused) {
+                releaseAll();
+            }
+            // Reset lines since pause counter on user input
+            linesSincePause = 0;
         }
-
-        // Reset lines since pause counter on user input
-        linesSincePause = 0;
 
         // Clear splash on user input (server will also clear and send WorldFlushed)
         if (worlds[currentWorldIndex] && worlds[currentWorldIndex].showing_splash) {

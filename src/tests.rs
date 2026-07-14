@@ -1652,6 +1652,43 @@
             "Expected 77 pending lines, got {}", world.pending_lines.len());
     }
 
+    // Regression: sending a command while scrolled up into scrollback must NOT drop the
+    // user back to the bottom. reset_more_mode_on_send() must be a no-op unless the
+    // viewport is already at the bottom.
+    #[test]
+    fn reset_more_mode_on_send_preserves_scrollback() {
+        let mut world = World::new("test");
+        for i in 0..50 {
+            world.output_lines.push(OutputLine::new(format!("line {}", i), i as u64));
+        }
+        // Scrolled up into history in more-mode: paused, viewport above bottom, nothing held.
+        world.paused = true;
+        world.scroll_offset = 10; // bottom would be 49
+        world.lines_since_pause = 5;
+        assert!(!world.is_at_bottom(), "precondition: viewport is scrolled up");
+
+        world.reset_more_mode_on_send();
+
+        assert!(world.paused, "scroll lock must be kept when a command is sent from scrollback");
+        assert_eq!(world.scroll_offset, 10, "viewport must not move when sending from scrollback");
+    }
+
+    #[test]
+    fn reset_more_mode_on_send_releases_at_bottom() {
+        let mut world = World::new("test");
+        for i in 0..50 {
+            world.output_lines.push(OutputLine::new(format!("line {}", i), i as u64));
+        }
+        // Following live at the bottom, no held output.
+        world.paused = true;
+        world.scroll_offset = world.output_lines.len() - 1;
+        assert!(world.is_at_bottom(), "precondition: viewport is at the bottom");
+
+        world.reset_more_mode_on_send();
+
+        assert!(!world.paused, "at the bottom, sending a command releases the more-mode lock");
+    }
+
     #[test]
     fn test_more_mode_long_wrapped_lines_unit() {
         // Test that add_output correctly triggers more-mode with long lines that wrap

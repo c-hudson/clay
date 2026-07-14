@@ -2906,6 +2906,21 @@ impl World {
         self.visual_line_offset = 0;
     }
 
+    /// Reset more-mode state when the user sends a command — but ONLY when they are
+    /// following live output at the bottom. If they have scrolled up into scrollback,
+    /// leave `paused`/`scroll_offset` alone so the viewport stays put; the command still
+    /// sends and its reply queues below (revealed on scroll-down). Clearing `paused` here
+    /// would let the next incoming line snap the view to the bottom (`add_output`), which
+    /// is the "sending a command drops out of scrollback" bug.
+    pub fn reset_more_mode_on_send(&mut self) {
+        if self.is_at_bottom() {
+            self.lines_since_pause = 0;
+            if self.pending_lines.is_empty() {
+                self.paused = false;
+            }
+        }
+    }
+
     pub fn mark_seen(&mut self) {
         self.unseen_lines = 0;
         self.first_unseen_at = None;
