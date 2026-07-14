@@ -276,6 +276,86 @@ about the no-strike rules that were already right).
 
 ---
 
+### D7. Security-audit remediation (added 2026-07-14)
+
+A follow-up audit (three parallel reviews, every finding verified against the code)
+surfaced weaknesses across the web frontend, multiuser mode, client-side TLS, file
+permissions, and resource limits — all *outside* the incoming-connection surface D1–D6
+hardened. Fixed in three severity-ordered phases. The load-bearing decisions:
+
+**Client-side TLS is now trust-on-first-use (TOFU), not accept-all.** Every outbound TLS
+client path (remote-console channel `remote_client.rs`, WebView proxy `webview_gui.rs`,
+MUD world connections and the hot-reload TLS proxy in `platform.rs`, `/connect` in
+`commands.rs`, multiuser/daemon world connects in `daemon.rs`) previously used
+`NoCertificateVerification`, which asserted *both* the cert chain and the handshake
+signature unconditionally — pure MITM exposure on the channel that carries the
+auth-key/password handshake and full command injection. Replaced with `TofuVerifier`
+(`platform::danger_rustls`): SHA-256 the presented end-entity cert DER, key on the SNI
+host, and pin it in `~/.clay/known_hosts.dat` (0600) on first sight — **silent, no
+first-connect prompt**. A later mismatch is *blocked* and surfaced in all three UIs with
+old vs new fingerprint and an explicit "trust new certificate" action (`replace_pin` +
+reconnect). CA verification was deliberately *not* used: Clay's own `web_secure` server
+and most hobbyist MUDs present self-signed certs, which CA verification would reject.
+**Critical correctness point:** `verify_tls12_signature`/`verify_tls13_signature`
+delegate to the real `rustls::crypto` verifiers (default `ring` provider), NOT
+`assertion()`. Certificates are public and sent in the clear during the handshake;
+without proving private-key possession, an attacker could replay the pinned cert and
+defeat the pin. The native-tls MUD path can't reject *during* the handshake (no
+pluggable verifier) so it checks the peer-cert fingerprint post-handshake
+(`platform::check_native_tls_peer_pin`) — native-tls still does its own signature
+verification internally, so the replay defense holds there too. A regression test drives
+a real rustls handshake through pin → mismatch-blocked → *pinned-cert-replayed-with-
+wrong-key-still-fails*, the last case proving rejection came from signature verification,
+not the fingerprint.
+
+**Web-client XSS from MUD output (`app.js`).** `escapeHtml` didn't escape `"`, and
+`convertDiscordEmojis` re-injected an unescaped `[^:]+` name capture into an `<img
+alt="…">` — so a crafted MUD line broke out and landed an `onerror` handler, running by
+default (`showTags` defaults false). It pivoted to auth-key theft and, via `/load`/
+`/save`, host file I/O. Fixed at three layers: `escapeHtml` now escapes `"`/`'`;
+`convertDiscordEmojis` restricts the name to `[A-Za-z0-9_]+` and escapes what it
+interpolates; and `sanitizeHtml` now wraps the scrollback/new-line sinks, not just the
+prompt.
+
+**Multiuser isolation.** `ConnectWorld` had no ownership check and auto-replayed the
+*owner's* stored `connect <user> <password>` — any authenticated user could seize
+another's character with no password. Now gated on `world.owner == username`, matching
+the sibling handlers. `build_multiuser_initial_state` also stopped broadcasting every
+world's hostname/port/MUD-login to every user (now redacted for non-owners; passwords
+were already blanked). And `ChangePassword` stored the client-sent hash into the
+plaintext field, which got re-hashed at load into `SHA256(SHA256(pw))` — a permanent
+lockout; fixed with a `password_is_hash` marker so the loader/installer treats an
+already-hashed credential as final.
+
+**Defense-in-depth / hygiene.** WS frames are now capped (256 KB message / 64 KB frame)
+via `accept_async_with_config`, closing pre-auth memory amplification. All at-rest secret
+files (`secure.key`, `settings.dat`, `multiuser.dat`, `key.pem`, the reload-state file,
+`settings-audit.log`) are created 0600 and `~/.clay` is 0700, via
+`util::write_secret_file`/`secure_create_file`/`secure_append_file` (the TLS private key
+`key.pem` was previously world-readable). Static-secret comparisons use the shared
+`util::constant_time_eq`. The GMCP media auto-download validates the URL (http/https
+only; `file:`/loopback/link-local/RFC1918 rejected) and constrains curl with `--proto`/
+`--proto-redir` — closing a MUD-triggerable SSRF + local-file read. RNG failures fail
+closed (WS challenge refuses the connection; `generate_auth_key` returns `None`) instead
+of proceeding with zeroed bytes. The plain-HTTP→HTTPS redirect sanitizes the reflected
+`Host` header. `println!`/`eprintln!` were routed through `debug_log` per the TUI rule.
+
+**Flagged, not fixed (needs its own cycle):** `cargo audit` reported vulnerabilities in
+`rustls-webpki` (0.101/0.102), `idna` (0.5, behind the `url=2.5.0` pin), and `time`
+(<0.3.37 pin) — all requiring a rustls major bump and/or a Rust-toolchain move off the
+1.75 pins, so they were reported rather than forced. Clay's real exposure to the
+`rustls-webpki` name-constraint/CRL bugs is low: `TofuVerifier` pins fingerprints and
+uses the crypto provider's signature verification directly rather than exercising
+webpki's cert-chain/name-constraint/CRL path, and the server uses `no_client_auth`.
+
+**Not changed (documented tradeoffs):** unsalted SHA-256 password hashing (the hash is a
+bearer credential by design for the JS client), `LEGACY_ENCRYPTION_KEY` (kept as a
+decrypt-only fallback, now logged when it fires so stale blobs get re-encrypted), and
+`with_no_client_auth()` on Clay's own server (correct — Clay authenticates by
+password/knock, not client certs).
+
+---
+
 ## Phase 0 — Refactor and plumbing (no behavior change)
 
 Files: `src/http.rs`, `src/websocket.rs`, `src/main.rs`.

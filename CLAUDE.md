@@ -8,13 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **World passwords are stored encrypted in `~/.clay/settings.dat` but sent as plaintext to authenticated WebSocket clients and displayed as readable text in all UI editors.** Do not hide or mask world passwords in the world editor — the encryption is for at-rest storage only. The `has_password` field mirrors whether the password is non-empty.
 
-**NEVER write debug output to stdout or stderr (no `println!`, `eprintln!`, `dbg!`).** Debug output corrupts the TUI. Use instead:
+**Do not write to stdout/stderr once the TUI is initialized (no `println!`, `eprintln!`, `dbg!`).** The rule exists because such output corrupts the ratatui screen (scroll regions, separator bar) after it's been drawn. It does NOT apply before the TUI is initialized, nor in headless contexts that never draw a TUI — startup/config messages before the alternate screen is entered, the `-D` daemon and `--multiuser` server (both headless, including the interactive first-run wizard's operator output), and the panic hook during teardown may use `println!`/`eprintln!` normally. Once the TUI is live, use instead:
 - `debug_log(true, msg)` for always-on logging (writes to `~/.clay/debug.log`)
 - `debug_log(is_debug_enabled(), msg)` for user-toggled debug
 - `output_debug_log(msg)` for output/seq debugging (writes to `~/.clay/output.debug.log`)
 - `add_tf_output()` to display messages in the output area
 
-Debug output interferes with the TUI and corrupts the terminal display. Instead:
+Debug output interferes with the TUI and corrupts the terminal display *once the TUI is live* (see the exception above for pre-init/headless/panic contexts). When the TUI is running, instead:
 - Use `debug_log(true, msg)` for always-on logging or `debug_log(is_debug_enabled(), msg)` for user-toggled debug (writes to `~/.clay/debug.log`)
 - Use `output_debug_log(msg)` for output/seq debugging (writes to `~/.clay/output.debug.log`)
 - Display messages in the output area using `add_tf_output()` or `add_output()`
@@ -97,6 +97,7 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 **Data Files** (all inside `~/.clay/` on Unix, `~/clay/` on Windows):
 - `settings.dat` - Main settings (INI format with `[global]` and `[world:name]` sections)
 - `secure.key` - Per-machine AES-256 encryption key (binary, 0600 permissions)
+- `known_hosts.dat` - Trust-on-first-use TLS certificate pins (`host:port` -> hex SHA-256 of the end-entity cert DER), 0600 permissions. Written by `persistence::add_pin`/`replace_pin`, read by `persistence::get_pin`; enforced by `platform::danger_rustls::TofuVerifier` (rustls MUD/remote-console/WebView-proxy connections) and `platform::check_native_tls_peer_pin` (native-tls MUD path).
 - `theme.dat` - Theme colors (INI format with `[theme:name]` sections)
 - `keybindings.dat` - Keyboard bindings (INI, only non-default bindings saved)
 - `multiuser.dat` - Multiuser server settings
@@ -132,6 +133,10 @@ Incoming connections are gated in `src/http.rs` before anything is served. Desig
 - **WS auth matrix**: no allow list → password or auth key from anywhere; allow list set → password only from listed/localhost/whitelisted addresses, everyone else must knock with the auth key.
 - **Ban exemption (D6)**: once an allow list is configured, the accept-time gate already drops every non-listed IP before it can reach any probe-strike site — so a probe strike can only ever ban a *legitimate, allow-listed* caller, never a scanner. `SecurityGate::strike()` is the one chokepoint every probe-strike site calls; it never bans an IP that's localhost, runtime-whitelisted, or matches a *specific* allow-list entry (exact IP, IP wildcard, or hostname pattern). A bare `*` allow-list entry does **not** confer this exemption — `*` means "let everyone reach the UI," not "nobody can ever be banned." `redirect_http_to_https()` (the plain-HTTP-on-the-HTTPS-port handler) reuses `decide_route()` directly instead of a separate reachability check, so it can never drift out of sync with it again — that drift was the root cause of a bug where an allow-listed user typing `http://` instead of `https://` got banned after two tries. Failed WebSocket password auth is the one exception: it still bans, and still applies to allow-listed IPs, via `BanList::record_auth_failure()` (threshold 5, not 2 — see `SECURITY-ROADMAP.md` D6). A connection that already knocked skips the "not in allow list" WS strike too (it proved a valid key; banning it would lock it out of its own recovery path).
 - **Debugging**: `~/.clay/remote.log` records `HTTP-DROP`, `GATE-DROP`, `GATE-TIMEOUT`, `TLS-ON-PLAIN` (ClientHello on a plain-HTTP server — logged, never struck), `KNOCK-OK`/`KNOCK-FAIL`/`KNOCK-BAD-MAGIC`, `KNOCK-HTTP-DENIED`, `WS-PATH-DROP` alongside the existing `BANNED`/`CONN-LIMIT`/`TLS-*` events. A silent drop is intentional — expect zero bytes, not an error page. `log_remote_event()` is a no-op under `#[cfg(test)]` — tests must never append to a real user's `~/.clay/remote.log`.
+
+**Outbound TLS is pinned, not CA-verified (D7).** Every client-side TLS connection (MUD worlds, remote-console, WebView proxy, hot-reload proxy, `/connect`) uses `platform::danger_rustls::TofuVerifier` (rustls) or `platform::check_native_tls_peer_pin` (native-tls), not CA verification — Clay's own server and most MUDs are self-signed. Trust-on-first-use: pin `sha256(end_entity_DER)` in `~/.clay/known_hosts.dat` (`persistence::add_pin`/`get_pin`/`replace_pin`) silently on first sight; on a mismatch, **block** and surface old-vs-new fingerprint + a "trust new cert" action in all three UIs (`WsMessage::CertMismatch`/`TrustCertificate`, web `showCertMismatchDialog`, TUI `create_cert_mismatch_dialog`). **The signature-verification methods MUST do real verification** (delegate to `rustls::crypto`) — pinning the fingerprint alone is defeatable by replaying the public cert without its key. See `SECURITY-ROADMAP.md` D7.
+
+**Other D7 invariants**: secret files go through `util::write_secret_file`/`secure_create_file`/`secure_append_file` (0600; `~/.clay` is 0700) — never plain `File::create` for anything holding a password/key/token. Static-secret comparisons use `util::constant_time_eq`. Multiuser handlers taking a client `world_index` must check `world.owner == username` (see `ConnectWorld`/`SwitchWorld` in `daemon.rs`). MUD text reaching the web client must be escaped — `app.js` `escapeHtml` (incl. quotes) + `sanitizeHtml` on output sinks, and any HTML-building helper (e.g. `convertDiscordEmojis`) must escape what it interpolates. GMCP media URLs are http/https-only with internal targets refused.
 
 ### /release Skill
 

@@ -100,3 +100,53 @@ asked for a page), and `WS-PATH-DROP` (WebSocket upgrade at the wrong path).
 builds.
 
 Design record, including the wire protocol: `SECURITY-ROADMAP.md`.
+
+---
+
+# Security-audit hardening (v1.1.x)
+
+A follow-up audit tightened several areas beyond the incoming-connection surface above.
+The user-visible changes:
+
+## TLS connections are now pinned (trust-on-first-use)
+
+When Clay connects *out* over TLS — to a MUD, to another Clay via the remote console, or
+the WebView proxy — it now remembers the server's certificate the first time and checks
+it every time after. Previously it accepted any certificate, which meant a network
+attacker could silently intercept the connection (including the one that carries your
+password and commands).
+
+- **First connection:** silent. Clay records the certificate's fingerprint in
+  `~/.clay/known_hosts.dat` and connects.
+- **Later connections:** if the certificate is unchanged, silent. If it *changed*, Clay
+  **blocks the connection** and shows you the old vs new fingerprint with a "trust new
+  certificate" button. Click it only if you know the server's cert was legitimately
+  renewed; otherwise it may be an interception attempt.
+
+This works with self-signed certificates (Clay's own server and most MUDs use them), so
+there's nothing to configure. To forget a pin, remove its line from
+`~/.clay/known_hosts.dat`.
+
+## Other fixes
+
+- **Web client:** text from a MUD can no longer inject scripts into the web/mobile
+  interface (an emoji-rendering XSS hole is closed).
+- **Multiuser mode:** one user can no longer connect to, or see the server/login details
+  of, another user's worlds; and changing a user's password now actually works (it
+  previously locked the account out on the next login).
+- **File permissions:** all files holding secrets (`secure.key`, `settings.dat`,
+  `multiuser.dat`, `key.pem`, `known_hosts.dat`, the reload-state and audit-log files)
+  are now owner-only (0600), and `~/.clay` is 0700. The auto-generated TLS private key
+  was previously world-readable.
+- **Media auto-download:** a MUD can no longer make Clay fetch arbitrary URLs — only
+  `http`/`https` media URLs are allowed, and internal/loopback/`file://` targets are
+  refused.
+- WebSocket frames are size-capped, credential comparisons are constant-time, and a few
+  crash-resistance/logging issues were cleaned up.
+
+**Known follow-up:** `cargo audit` flags a few dependencies (`rustls-webpki`, `idna`,
+`time`) with advisories whose fixes require a larger dependency/toolchain upgrade,
+tracked separately. Clay's certificate pinning does not exercise the vulnerable
+`rustls-webpki` code paths.
+
+Design record: `SECURITY-ROADMAP.md` (decision D7).
