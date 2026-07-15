@@ -47,6 +47,13 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
     private static final String KEY_CACHED_THEME_CSS = "cachedThemeCss";
     private static final String KEY_SETUP_COMPLETE = "setupComplete";
+    // Whether Clay runs its own server on-device ("local") or connects to one elsewhere
+    // ("remote"). Unset on first launch until the user picks in the startup chooser; changeable
+    // later from Settings. Purely a stored preference until later wiring (LocalServerManager,
+    // WebView localhost injection) reads it.
+    private static final String KEY_RUN_MODE = "runMode";
+    private static final String RUN_MODE_LOCAL = "local";
+    private static final String RUN_MODE_REMOTE = "remote";
 
     // Minimal first-launch page — loads instantly, immediately hands off to the full app
     private static final String FIRST_LAUNCH_HTML =
@@ -570,7 +577,34 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void proceedAfterPermissions() {
-        loadInterface();
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (!prefs.contains(KEY_RUN_MODE)) {
+            showRunModeChooser();
+        } else {
+            loadInterface();
+        }
+    }
+
+    // First-launch chooser: run Clay's own server on this phone, or connect to one running
+    // elsewhere. Not cancelable — the app needs an explicit choice before it can proceed.
+    // Also reachable later from Settings to change the choice (SettingsActivity).
+    private void showRunModeChooser() {
+        new AlertDialog.Builder(this)
+            .setTitle("How do you want to run Clay?")
+            .setMessage("Clay can run entirely on this phone, with no separate server needed, " +
+                "or connect to a Clay server running elsewhere. You can change this later in Settings.")
+            .setCancelable(false)
+            .setPositiveButton("Run on This Phone", (dialog, which) -> {
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(KEY_RUN_MODE, RUN_MODE_LOCAL).apply();
+                loadInterface();
+            })
+            .setNegativeButton("Connect to a Server", (dialog, which) -> {
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(KEY_RUN_MODE, RUN_MODE_REMOTE).apply();
+                loadInterface();
+            })
+            .show();
     }
 
     private void createNotificationChannel() {
