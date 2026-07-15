@@ -306,9 +306,13 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void connectWebSocket(int id, String url) {
             runOnUiThread(() -> {
-                // Block connections until the user has configured a server
+                // Block connections until the user has configured a remote server. Local mode
+                // needs no such configuration — choosing it in the run-mode chooser is itself
+                // "configured" (buildVarInjectionScript already points the WebView at the
+                // locally-running server by the time this fires).
                 SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-                if (!prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
+                boolean isLocalMode = RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE));
+                if (!isLocalMode && !prefs.getBoolean(KEY_SETUP_COMPLETE, false)) {
                     webView.evaluateJavascript(
                         "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');",
                         null);
@@ -400,6 +404,12 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public boolean isSettingsConfigured() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            // app.js's connect() gates its entire flow on this before even attempting a
+            // WebSocket — local mode needs no remote host/port configuration, so it always
+            // counts as configured (same reasoning as the connectWebSocket() gate below).
+            if (RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))) {
+                return true;
+            }
             return prefs.getBoolean(KEY_SETUP_COMPLETE, false);
         }
 
@@ -577,12 +587,25 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // Guards against proceedAfterPermissions() running twice: onResume()/onNewIntent() can fire
+    // while it's already in flight (e.g. the notification/battery permission dialogs themselves
+    // cycle the Activity through onPause/onResume), which used to race a plain loadInterface()
+    // call against the run-mode chooser — loading with stale/default vars and no mode decided
+    // yet. checkAndLoadInterface() now routes through this method instead of loadInterface()
+    // directly, and this flag makes repeat entry a safe no-op.
+    private boolean runModeFlowStarted = false;
+
     private void proceedAfterPermissions() {
+        if (runModeFlowStarted) {
+            return;
+        }
+        runModeFlowStarted = true;
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         if (!prefs.contains(KEY_RUN_MODE)) {
             showRunModeChooser();
+        } else if (RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))) {
+            startLocalServerThenLoadInterface();
         } else {
-            maybeStartLocalServer();
             loadInterface();
         }
     }
@@ -599,8 +622,7 @@ public class MainActivity extends AppCompatActivity {
             .setPositiveButton("Run on This Phone", (dialog, which) -> {
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                     .putString(KEY_RUN_MODE, RUN_MODE_LOCAL).apply();
-                maybeStartLocalServer();
-                loadInterface();
+                startLocalServerThenLoadInterface();
             })
             .setNegativeButton("Connect to a Server", (dialog, which) -> {
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
@@ -610,22 +632,22 @@ public class MainActivity extends AppCompatActivity {
             .show();
     }
 
-    // Kicks off the bundled Clay server in the background when run mode is "local". Fires the
-    // process spawn + readiness poll on a worker thread since both block. Does not yet affect
-    // where the WebView connects — see buildVarInjectionScript for the localhost wiring.
-    private void maybeStartLocalServer() {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        if (!RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))) {
-            return;
-        }
+    // Starts the bundled Clay server (spawn + readiness poll, both blocking) on a worker thread,
+    // then loads the WebView — buildVarInjectionScript() reads localServerManager's port/password
+    // once it's running, so the WebView must not load (and race to connect) before this
+    // completes. Proceeds to loadInterface() either way; if the server failed to start, app.js
+    // will simply fail to connect, the same UX as an unreachable remote host.
+    private void startLocalServerThenLoadInterface() {
         if (localServerManager == null) {
             localServerManager = new LocalServerManager(this);
         }
         final LocalServerManager manager = localServerManager;
+        runOnUiThread(() -> showConnectingOverlay("Starting local server..."));
         new Thread(() -> {
             boolean ready = manager.start();
             android.util.Log.i("Clay", "Local server " + (ready ? "ready" : "FAILED to start")
                 + " on port " + manager.getPort());
+            runOnUiThread(this::loadInterface);
         }, "ClayLocalServerStart").start();
     }
 
@@ -962,20 +984,42 @@ public class MainActivity extends AppCompatActivity {
     /** Build a JS snippet that sets window.WS_* vars and applies the saved theme. */
     private String buildVarInjectionScript() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String localHost  = jsStr(prefs.getString(KEY_SERVER_HOST, ""));
-        String remoteHost = jsStr(prefs.getString(KEY_REMOTE_HOSTNAME, ""));
-        int    port       = prefs.getInt(KEY_SERVER_PORT, 9000);
-        String mode       = jsStr(prefs.getString("connectionMode", "auto"));
-        String theme      = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS)
-                                 .replace("\\", "\\\\").replace("'", "\\'")
-                                 .replace("\r", "").replace("\n", " ");
-        String webPath    = prefs.getString(KEY_WEB_PATH, "");
-        // Only inject window.WEB_PATH when we have a known non-empty value. Emitting an
-        // empty string would mean "legacy mode" and wrongly disable the Android probe
-        // path in wsPathCandidates(); leaving it unset (the bundled asset's raw
-        // '{{WEB_PATH}}' placeholder) is correctly treated as "unset" by injectedWebPath()
-        // in app.js, which engages the /clay/ws then /ws probe.
-        String webPathScript = webPath.isEmpty() ? "" : "window.WEB_PATH=" + jsStr(webPath) + ";";
+        boolean isLocalMode = RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))
+            && localServerManager != null && localServerManager.isRunning();
+
+        String localHost;
+        String remoteHost;
+        int port;
+        String mode;
+        String autoPasswordScript;
+        String webPathScript;
+        if (isLocalMode) {
+            localHost = jsStr("127.0.0.1");
+            remoteHost = jsStr("");  // no remote candidate to race against in local mode
+            port = localServerManager.getPort();
+            mode = jsStr("non_secure");  // plain ws only — local server is loopback, unencrypted
+            autoPasswordScript = "window.AUTO_PASSWORD=" + jsStr(localServerManager.getPasswordHash()) + ";";
+            // Leave window.WEB_PATH unset (not the possibly-stale value saved from a previous
+            // remote server) — the local server always uses the default "clay" web_path, and
+            // wsPathCandidates() already probes /clay/ws then /ws when WEB_PATH is unset.
+            webPathScript = "";
+        } else {
+            localHost = jsStr(prefs.getString(KEY_SERVER_HOST, ""));
+            remoteHost = jsStr(prefs.getString(KEY_REMOTE_HOSTNAME, ""));
+            port = prefs.getInt(KEY_SERVER_PORT, 9000);
+            mode = jsStr(prefs.getString("connectionMode", "auto"));
+            autoPasswordScript = "";
+            String webPath = prefs.getString(KEY_WEB_PATH, "");
+            // Only inject window.WEB_PATH when we have a known non-empty value. Emitting an
+            // empty string would mean "legacy mode" and wrongly disable the Android probe
+            // path in wsPathCandidates(); leaving it unset (the bundled asset's raw
+            // '{{WEB_PATH}}' placeholder) is correctly treated as "unset" by injectedWebPath()
+            // in app.js, which engages the /clay/ws then /ws probe.
+            webPathScript = webPath.isEmpty() ? "" : "window.WEB_PATH=" + jsStr(webPath) + ";";
+        }
+        String theme = prefs.getString(KEY_CACHED_THEME_CSS, DEFAULT_THEME_CSS)
+                            .replace("\\", "\\\\").replace("'", "\\'")
+                            .replace("\r", "").replace("\n", " ");
         return "window.WS_HOST=" + localHost + ";" +
                "window.WS_LOCAL_HOST=" + localHost + ";" +
                "window.WS_REMOTE_HOST=" + remoteHost + ";" +
@@ -984,6 +1028,7 @@ public class MainActivity extends AppCompatActivity {
                "window.CONNECTION_MODE=" + mode + ";" +
                "window.SHOW_CONNECTION_WINDOW=true;" +
                webPathScript +
+               autoPasswordScript +
                "(function(){var s=document.getElementById('theme-vars');" +
                "if(s)s.textContent=':root{" + theme + "}';}());";
     }
@@ -1090,7 +1135,10 @@ public class MainActivity extends AppCompatActivity {
     private void checkAndLoadInterface() {
         if (!interfaceLoaded) {
             android.util.Log.i("Clay", "Loading interface: not yet loaded");
-            loadInterface();
+            // Route through the run-mode decision (chooser / local / remote), not loadInterface()
+            // directly — runModeFlowStarted makes this a no-op if that's already in flight, and
+            // a real fallback if this is somehow the first thing to reach it.
+            proceedAfterPermissions();
         } else if (webView != null) {
             // Interface loaded - always verify connection health on resume.
             missedHeartbeats = 0;

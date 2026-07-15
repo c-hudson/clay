@@ -9,6 +9,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 
 /**
@@ -47,6 +49,30 @@ public class LocalServerManager {
 
     public synchronized String getPassword() {
         return password;
+    }
+
+    /**
+     * SHA-256 hex digest of the password — matches Rust's websocket::hash_password() exactly.
+     * This, not the raw password, is what the WebView injects as window.AUTO_PASSWORD so app.js
+     * can auto-authenticate (see handleSocketOpen() in app.js) the same way the desktop GUI's
+     * master mode does.
+     */
+    public synchronized String getPasswordHash() {
+        if (password == null) {
+            return null;
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(password.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is guaranteed available on every Android API level; unreachable.
+            throw new RuntimeException(e);
+        }
     }
 
     /** Starts the server if not already running. Returns true once it's accepting connections. */
