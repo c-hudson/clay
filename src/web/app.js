@@ -5708,6 +5708,13 @@
             if (modeEl && typeof window.Android.getConnectionMode === 'function') {
                 modeEl.value = window.Android.getConnectionMode() || 'auto';
             }
+            var runModeEl = document.getElementById('cs-run-mode');
+            var remoteFields = document.getElementById('cs-remote-fields');
+            if (runModeEl && typeof window.Android.getRunMode === 'function') {
+                var runMode = window.Android.getRunMode() || 'remote';
+                runModeEl.value = runMode;
+                if (remoteFields) remoteFields.style.display = (runMode === 'local') ? 'none' : '';
+            }
             var dlBtn = document.getElementById('cs-auth-key-download');
             if (dlBtn) dlBtn.textContent = 'Download';
             var errEl = document.getElementById('cs-auth-key-error');
@@ -6362,6 +6369,14 @@
     function saveSettingsAll() {
         // Clay Server tab (Android only) — save to SharedPreferences and reload
         if (settingsActiveTab === 'clay-server' && window.Android) {
+            var runMode = ((document.getElementById('cs-run-mode') || {}).value || 'remote');
+            if (typeof window.Android.setRunMode === 'function') window.Android.setRunMode(runMode);
+            if (runMode === 'local') {
+                // No remote fields to validate/save — the local server needs no configuration.
+                if (typeof window.Android.reloadPage === 'function') window.Android.reloadPage();
+                return;
+            }
+
             var host = (document.getElementById('cs-host') || {}).value || '';
             host = host.trim();
             if (!host) {
@@ -8896,6 +8911,16 @@
         }
         elements.settingsSaveBtn.onclick = saveSettingsAll;
         elements.settingsCancelBtn.onclick = closeSettingsPopup;
+
+        // Clay Server tab (Android only): toggle remote fields live when Run Mode changes,
+        // without needing to save+reopen first.
+        var csRunModeEl = document.getElementById('cs-run-mode');
+        if (csRunModeEl) {
+            csRunModeEl.onchange = function() {
+                var remoteFields = document.getElementById('cs-remote-fields');
+                if (remoteFields) remoteFields.style.display = (this.value === 'local') ? 'none' : '';
+            };
+        }
 
         // Web settings popup (use edit state, not global state)
         elements.webProtocolSelect.onchange = function() {

@@ -89,11 +89,19 @@ git push origin master
 ok "Pushed to origin/master."
 
 # ─── Step 6: Build Android APK ───────────────────────────────────────────────
+# assembleRelease also builds and bundles the standalone-mode native server (libclay.so) —
+# see android/app/build.gradle's buildNativeServer task, which shells out to
+# build-android-aarch64.sh and is wired via preBuild.dependsOn. Requires the Android NDK +
+# rustup aarch64-linux-android target on this machine (see build-android-aarch64.sh).
 log "Building Android APK..."
 (cd android && ./gradlew assembleRelease) || die "Android Gradle build failed."
 
 UNSIGNED_APK="android/app/build/outputs/apk/release/app-release-unsigned.apk"
 [[ -f "$UNSIGNED_APK" ]] || die "Unsigned APK not found: $UNSIGNED_APK"
+
+unzip -l "$UNSIGNED_APK" | grep -q "lib/arm64-v8a/libclay.so" \
+    || die "libclay.so missing from APK — the standalone/local-server mode would silently break. Check buildNativeServer / build-android-aarch64.sh."
+ok "libclay.so present in APK (standalone mode)."
 
 log "Signing Android APK..."
 rm -f android/clay-android-aligned.apk android/clay-android.apk

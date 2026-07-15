@@ -289,6 +289,21 @@ public class MainActivity extends AppCompatActivity {
             prefs.edit().putString("connectionMode", mode).apply();
         }
 
+        // Run mode ("local" | "remote") — used by the web settings popup's Clay Server tab to
+        // show/hide the remote fields and to persist a mode switch before calling reloadPage().
+        @JavascriptInterface
+        public String getRunMode() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE);
+        }
+
+        @JavascriptInterface
+        public void setRunMode(String mode) {
+            String sanitized = RUN_MODE_LOCAL.equals(mode) ? RUN_MODE_LOCAL : RUN_MODE_REMOTE;
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_RUN_MODE, sanitized).apply();
+        }
+
         @JavascriptInterface
         public void showToast(String message) {
             runOnUiThread(() -> {
@@ -464,11 +479,10 @@ public class MainActivity extends AppCompatActivity {
                 nativeWebSockets.clear();
                 // Clear cache for a true hard refresh
                 webView.clearCache(true);
-                // Reset interface loaded flag
-                interfaceLoaded = false;
-                loadedInterfaceUrl = null;
-                // Reload interface
-                loadInterface();
+                // Reload — restarts the local server first if the run mode just changed (see
+                // saveSettingsAll()'s 'clay-server' tab in app.js, which calls this after saving),
+                // otherwise just a normal reload/resync.
+                reloadInterfaceRespectingRunMode();
             });
         }
     }
@@ -594,6 +608,11 @@ public class MainActivity extends AppCompatActivity {
     // yet. checkAndLoadInterface() now routes through this method instead of loadInterface()
     // directly, and this flag makes repeat entry a safe no-op.
     private boolean runModeFlowStarted = false;
+    // The run mode actually applied by the last completed proceedAfterPermissions() /
+    // startLocalServerThenLoadInterface() / loadInterfaceForRemoteMode(). Compared against the
+    // live pref in onNewIntent() (see reloadIfRunModeChanged()) to detect a mode switch made from
+    // Settings, since that path reuses this Activity instance rather than a fresh onCreate().
+    private String lastAppliedRunMode = null;
 
     private void proceedAfterPermissions() {
         if (runModeFlowStarted) {
@@ -606,7 +625,7 @@ public class MainActivity extends AppCompatActivity {
         } else if (RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))) {
             startLocalServerThenLoadInterface();
         } else {
-            loadInterface();
+            loadInterfaceForRemoteMode();
         }
     }
 
@@ -627,9 +646,14 @@ public class MainActivity extends AppCompatActivity {
             .setNegativeButton("Connect to a Server", (dialog, which) -> {
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                     .putString(KEY_RUN_MODE, RUN_MODE_REMOTE).apply();
-                loadInterface();
+                loadInterfaceForRemoteMode();
             })
             .show();
+    }
+
+    private void loadInterfaceForRemoteMode() {
+        lastAppliedRunMode = RUN_MODE_REMOTE;
+        loadInterface();
     }
 
     // Starts the bundled Clay server (spawn + readiness poll, both blocking) on a worker thread,
@@ -638,6 +662,7 @@ public class MainActivity extends AppCompatActivity {
     // completes. Proceeds to loadInterface() either way; if the server failed to start, app.js
     // will simply fail to connect, the same UX as an unreachable remote host.
     private void startLocalServerThenLoadInterface() {
+        lastAppliedRunMode = RUN_MODE_LOCAL;
         if (localServerManager == null) {
             localServerManager = new LocalServerManager(this);
         }
@@ -1106,10 +1131,38 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        // Called when activity is brought to front via FLAG_ACTIVITY_CLEAR_TOP
-        // Force a check to load the web interface if settings are now available
+        // Called when activity is brought to front via FLAG_ACTIVITY_CLEAR_TOP — notably this is
+        // how SettingsActivity returns after saveAndConnect(), reusing this same instance rather
+        // than a fresh onCreate().
         android.util.Log.i("Clay", "onNewIntent called, checking if interface needs loading");
-        checkAndLoadInterface();
+        if (interfaceLoaded) {
+            reloadInterfaceRespectingRunMode();
+        } else {
+            checkAndLoadInterface();
+        }
+    }
+
+    // Reloads the WebView. If the run mode changed since it was last applied (from either
+    // SettingsActivity or the web settings popup's "clay-server" tab — see reloadPage() below),
+    // tears down the old local server / WebSockets first and re-enters the run-mode decision
+    // fresh via proceedAfterPermissions(). Otherwise this is just a normal reload (e.g. a manual
+    // resync, or unrelated remote-settings changes) — the fast path, since restarting an
+    // already-running local server would lose its in-memory world state for no reason.
+    private void reloadInterfaceRespectingRunMode() {
+        interfaceLoaded = false;
+        loadedInterfaceUrl = null;
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String currentMode = prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE);
+        if (lastAppliedRunMode != null && !currentMode.equals(lastAppliedRunMode)) {
+            android.util.Log.i("Clay", "Run mode changed (" + lastAppliedRunMode + " -> " + currentMode + "), reloading");
+            if (localServerManager != null) {
+                localServerManager.stop();
+            }
+            runModeFlowStarted = false;
+            proceedAfterPermissions();
+        } else {
+            loadInterface();
+        }
     }
 
     @Override

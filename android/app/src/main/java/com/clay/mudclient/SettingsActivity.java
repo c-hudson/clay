@@ -24,7 +24,12 @@ public class SettingsActivity extends AppCompatActivity {
     private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
     private static final String KEY_AUTH_KEY = "authKey";
     private static final String KEY_WEB_PATH = "webPath";
+    private static final String KEY_RUN_MODE = "runMode";
+    private static final String RUN_MODE_LOCAL = "local";
+    private static final String RUN_MODE_REMOTE = "remote";
 
+    private Switch runModeSwitch;
+    private LinearLayout remoteSettingsSection;
     private EditText serverHostInput;
     private EditText serverPortInput;
     private Switch secureSwitch;
@@ -45,6 +50,8 @@ public class SettingsActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_settings);
 
+        runModeSwitch = findViewById(R.id.runModeSwitch);
+        remoteSettingsSection = findViewById(R.id.remoteSettingsSection);
         serverHostInput = findViewById(R.id.serverHost);
         serverPortInput = findViewById(R.id.serverPort);
         secureSwitch = findViewById(R.id.secureSwitch);
@@ -72,6 +79,13 @@ public class SettingsActivity extends AppCompatActivity {
         String savedPassword = prefs.getString(KEY_SAVED_PASSWORD, "");
         String authKey = prefs.getString(KEY_AUTH_KEY, "");
         String webPath = prefs.getString(KEY_WEB_PATH, "");
+        boolean savedLocalMode = RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE));
+
+        runModeSwitch.setChecked(savedLocalMode);
+        remoteSettingsSection.setVisibility(savedLocalMode ? View.GONE : View.VISIBLE);
+        runModeSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            remoteSettingsSection.setVisibility(isChecked ? View.GONE : View.VISIBLE);
+        });
 
         serverHostInput.setText(savedHost);
         serverPortInput.setText(savedPort > 0 ? String.valueOf(savedPort) : "");
@@ -147,6 +161,18 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     private void saveAndConnect() {
+        if (runModeSwitch.isChecked()) {
+            // Local mode needs none of the remote fields below — just record the choice and
+            // relaunch MainActivity, which will start (or reconnect to) the on-device server.
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_RUN_MODE, RUN_MODE_LOCAL).apply();
+            Intent localIntent = new Intent(this, MainActivity.class);
+            localIntent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(localIntent);
+            finish();
+            return;
+        }
+
         String host = serverHostInput.getText().toString().trim();
         String portStr = serverPortInput.getText().toString().trim();
         boolean useSecure = secureSwitch.isChecked();
@@ -184,6 +210,7 @@ public class SettingsActivity extends AppCompatActivity {
         // Save settings
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         SharedPreferences.Editor editor = prefs.edit();
+        editor.putString(KEY_RUN_MODE, RUN_MODE_REMOTE);
         editor.putString(KEY_SERVER_HOST, host);
         editor.putInt(KEY_SERVER_PORT, port);
         editor.putBoolean(KEY_USE_SECURE, useSecure);
@@ -215,7 +242,12 @@ public class SettingsActivity extends AppCompatActivity {
             return;
         }
 
-        // Initial setup - check if we have valid settings before allowing back
+        // Initial setup - check if we have valid settings before allowing back. Local mode
+        // needs no host/port at all, so the switch alone (even unsaved) is enough to proceed.
+        if (runModeSwitch.isChecked()) {
+            super.onBackPressed();
+            return;
+        }
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, null);
         int port = prefs.getInt(KEY_SERVER_PORT, 0);

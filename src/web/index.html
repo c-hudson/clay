@@ -808,6 +808,20 @@
                         <!-- Clay Server section (Android only) -->
                         <div class="settings-section" id="settings-clay-server">
                             <div class="popup-body">
+                                <!-- Local vs remote: this whole section only exists in the Android
+                                     app (updateAndroidUI() in app.js gates the tab itself), so
+                                     this choice is deliberately Android-only, mirroring the
+                                     desktop GUI where the local instance IS the app already. -->
+                                <div class="setting-row">
+                                    <span class="setting-label">Run Mode</span>
+                                    <div class="setting-value">
+                                        <select id="cs-run-mode" class="web-input">
+                                            <option value="remote">Connect to a Server</option>
+                                            <option value="local">Run on This Phone</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div id="cs-remote-fields">
                                 <div class="setting-row">
                                     <span class="setting-label">Host</span>
                                     <div class="setting-value">
@@ -856,6 +870,8 @@
                                     </div>
                                 </div>
                                 <div id="cs-auth-key-error" style="display:none;padding:2px 0 4px;font-size:0.78em;color:#e44;"></div>
+                                </div>
+                                <!-- end cs-remote-fields -->
                             </div>
                         </div>
                         <!-- Shared footer -->

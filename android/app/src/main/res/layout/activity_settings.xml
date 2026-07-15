@@ -21,6 +21,56 @@
         android:textColor="#e6edf3"
         android:layout_marginBottom="12dp" />
 
+    <!-- Run mode: local (this device) vs remote (configured server below) -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp">
+
+        <TextView
+            android:id="@+id/runModeLabel"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Run on This Phone"
+            android:textSize="14sp"
+            android:textColor="#e6edf3" />
+
+        <Switch
+            android:id="@+id/runModeSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="false"
+            android:thumbTint="#3fb950"
+            android:trackTint="#8b949e" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Runs Clay entirely on this device — no separate server needed."
+        android:textSize="11sp"
+        android:textColor="#8b949e"
+        android:layout_marginBottom="8dp" />
+
+    <!-- Divider -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="12dp"
+        android:background="#30363d" />
+
+    <!-- Remote server settings — hidden entirely when running locally -->
+    <LinearLayout
+        android:id="@+id/remoteSettingsSection"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
     <!-- Host + Port on same row -->
     <LinearLayout
         android:layout_width="match_parent"
@@ -322,6 +372,9 @@
             android:paddingTop="6dp"
             android:paddingBottom="6dp" />
     </LinearLayout>
+
+    </LinearLayout>
+    <!-- end remoteSettingsSection -->
 
     <!-- Connection status -->
     <TextView
