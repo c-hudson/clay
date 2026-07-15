@@ -137,8 +137,13 @@ impl SpellChecker {
             }
         }
 
-        // If no dictionary file found, try aspell (works with aspell-en on Termux)
-        if words.is_empty() {
+        // If no dictionary file found, try aspell (works with aspell-en on Termux).
+        // Skipped for --local-server (see LOCAL_SERVER_LOOPBACK_ONLY doc comment) — that mode
+        // has no local input area to spell-check, and spawning a subprocess just to discover
+        // aspell isn't installed is both wasted work and, in that specific context, a hang risk.
+        if words.is_empty()
+            && !crate::LOCAL_SERVER_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+        {
             if let Ok(output) = Command::new("aspell")
                 .args(["dump", "master"])
                 .output()

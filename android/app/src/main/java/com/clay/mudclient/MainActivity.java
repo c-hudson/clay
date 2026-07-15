@@ -107,6 +107,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean batteryOptimizationDone = false;
     private boolean interfaceLoaded = false;
     private String loadedInterfaceUrl = null;
+    private LocalServerManager localServerManager;
     // Removed duplicate screenOffWakeLock - ClayForegroundService already holds one
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
@@ -581,6 +582,7 @@ public class MainActivity extends AppCompatActivity {
         if (!prefs.contains(KEY_RUN_MODE)) {
             showRunModeChooser();
         } else {
+            maybeStartLocalServer();
             loadInterface();
         }
     }
@@ -597,6 +599,7 @@ public class MainActivity extends AppCompatActivity {
             .setPositiveButton("Run on This Phone", (dialog, which) -> {
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                     .putString(KEY_RUN_MODE, RUN_MODE_LOCAL).apply();
+                maybeStartLocalServer();
                 loadInterface();
             })
             .setNegativeButton("Connect to a Server", (dialog, which) -> {
@@ -605,6 +608,25 @@ public class MainActivity extends AppCompatActivity {
                 loadInterface();
             })
             .show();
+    }
+
+    // Kicks off the bundled Clay server in the background when run mode is "local". Fires the
+    // process spawn + readiness poll on a worker thread since both block. Does not yet affect
+    // where the WebView connects — see buildVarInjectionScript for the localhost wiring.
+    private void maybeStartLocalServer() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (!RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))) {
+            return;
+        }
+        if (localServerManager == null) {
+            localServerManager = new LocalServerManager(this);
+        }
+        final LocalServerManager manager = localServerManager;
+        new Thread(() -> {
+            boolean ready = manager.start();
+            android.util.Log.i("Clay", "Local server " + (ready ? "ready" : "FAILED to start")
+                + " on port " + manager.getPort());
+        }, "ClayLocalServerStart").start();
     }
 
     private void createNotificationChannel() {
@@ -1102,6 +1124,9 @@ public class MainActivity extends AppCompatActivity {
         stopKeepalive();
         stopHeartbeat();
         cancelBackgroundShutdownTimer();
+        if (localServerManager != null) {
+            localServerManager.stop();
+        }
         super.onDestroy();
     }
 

@@ -51,9 +51,19 @@ static STARTUP_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub static GUI_RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Flag set by HTTP server after successful bind — checked by GUI readiness wait
 pub static GUI_HTTP_READY: AtomicBool = AtomicBool::new(false);
-/// Set by `--local-server` before starting the HTTP server — restricts the bind address to
-/// 127.0.0.1 instead of 0.0.0.0, since the embedding client (e.g. Android WebView) always
-/// connects from the same device and the server should not be reachable from the LAN.
+/// Set by `--local-server` before startup. General "local-server mode is active" signal, used
+/// wherever headless-server behavior needs to differ from other headless modes (-D, --multiuser)
+/// or from interactive modes:
+/// - restricts the HTTP+WS bind address to 127.0.0.1 instead of 0.0.0.0, since the embedding
+///   client (e.g. Android WebView) always connects from the same device and the server should
+///   not be reachable from the LAN (see `http::http_bind_host`).
+/// - skips `SpellChecker::new`'s subprocess-spawning `aspell` fallback (see `spell.rs`): a
+///   `--local-server` instance has no local input area to spell-check in the first place (the
+///   embedding client's own UI is remote from this process's point of view), and spawning a
+///   subprocess to probe for a nonexistent `aspell` binary was observed to hang unpredictably
+///   when run as an Android app's own bundled subprocess (worst-case reproduced under the
+///   x86_64 emulator's ARM binary-translation layer, but not proven safe on real devices either
+///   — better to simply not do work this mode never needed).
 pub static LOCAL_SERVER_LOOPBACK_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Check if debug logging is enabled
