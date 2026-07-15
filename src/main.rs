@@ -51,6 +51,10 @@ static STARTUP_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub static GUI_RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Flag set by HTTP server after successful bind — checked by GUI readiness wait
 pub static GUI_HTTP_READY: AtomicBool = AtomicBool::new(false);
+/// Set by `--local-server` before starting the HTTP server — restricts the bind address to
+/// 127.0.0.1 instead of 0.0.0.0, since the embedding client (e.g. Android WebView) always
+/// connects from the same device and the server should not be reachable from the LAN.
+pub static LOCAL_SERVER_LOOPBACK_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Check if debug logging is enabled
 pub fn is_debug_enabled() -> bool {

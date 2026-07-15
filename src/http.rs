@@ -1667,6 +1667,16 @@ impl HttpServer {
     }
 }
 
+/// Host to bind the HTTP+WS listener to. Loopback-only when running as `--local-server`
+/// (`LOCAL_SERVER_LOOPBACK_ONLY`), otherwise all interfaces as before.
+fn http_bind_host() -> &'static str {
+    if crate::LOCAL_SERVER_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    }
+}
+
 /// Start the HTTP server (plain TCP, no TLS, unified HTTP+WS)
 pub async fn start_http_server(
     server: &mut HttpServer,
@@ -1691,7 +1701,7 @@ pub async fn start_http_server(
             return Err("inherited_handle not supported on this platform".into());
         }
     } else {
-        let addr = format!("0.0.0.0:{}", server.port);
+        let addr = format!("{}:{}", http_bind_host(), server.port);
         // Retry binding with delays — on reload, the previous process may still be releasing the port
         let mut last_err = None;
         let mut bound = None;
@@ -1774,6 +1784,30 @@ pub async fn start_http_server(
     });
 
     Ok(())
+}
+
+// ============================================================================
+// local-server loopback bind unit test
+// ============================================================================
+
+#[cfg(test)]
+mod local_server_bind_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// `--local-server` must bind the HTTP+WS listener to loopback only, never the LAN.
+    #[test]
+    fn local_server_mode_binds_loopback_only() {
+        let prev = crate::LOCAL_SERVER_LOOPBACK_ONLY.load(Ordering::SeqCst);
+
+        crate::LOCAL_SERVER_LOOPBACK_ONLY.store(true, Ordering::SeqCst);
+        assert_eq!(http_bind_host(), "127.0.0.1");
+
+        crate::LOCAL_SERVER_LOOPBACK_ONLY.store(false, Ordering::SeqCst);
+        assert_eq!(http_bind_host(), "0.0.0.0");
+
+        crate::LOCAL_SERVER_LOOPBACK_ONLY.store(prev, Ordering::SeqCst);
+    }
 }
 
 // ============================================================================

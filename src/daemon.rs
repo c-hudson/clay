@@ -37,6 +37,7 @@ pub async fn run_local_server(port_override: Option<u16>) -> io::Result<()> {
     };
 
     println!("clay: starting local server (loopback only)...");
+    crate::LOCAL_SERVER_LOOPBACK_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // These channels satisfy run_app_headless's GUI-bridge API; nothing reads/writes them here
     // since the embedding client talks to the App over the WebSocket server, not this channel.
