@@ -3671,7 +3671,11 @@
                     const name = args.length > 1 ? args.slice(1).join(' ') : null;
                     if (name) {
                         const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
-                        if (idx >= 0) openWorldEditorPopup(idx);
+                        if (idx >= 0) {
+                            openWorldEditorPopup(idx);
+                        } else {
+                            appendClientLine('No world named "' + name + '".', currentWorldIndex, 'system');
+                        }
                     } else {
                         openWorldEditorPopup(currentWorldIndex);
                     }
@@ -3680,13 +3684,21 @@
                     if (args.length > 1) {
                         const name = args.slice(1).join(' ');
                         const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
-                        if (idx >= 0) switchWorldLocal(idx);
+                        if (idx >= 0) {
+                            switchWorldLocal(idx);
+                        } else {
+                            appendClientLine('No world named "' + name + '".', currentWorldIndex, 'system');
+                        }
                     }
                 } else {
                     // /worlds <name> - server already connected if needed, switch local view
                     const name = args.join(' ');
                     const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
-                    if (idx >= 0) switchWorldLocal(idx);
+                    if (idx >= 0) {
+                        switchWorldLocal(idx);
+                    } else {
+                        appendClientLine('No world named "' + name + '".', currentWorldIndex, 'system');
+                    }
                 }
                 break;
 
@@ -8546,6 +8558,20 @@
                 } else if (e.key === 'y' || e.key === 'Y' || e.key === 'Enter') {
                     e.preventDefault();
                     confirmDeleteWorld();
+                }
+                return;
+            }
+
+            // Handle world editor popup — a form (unlike the world *selector* list below), so
+            // it needs no arrow-key list-navigation; just let every key reach its own <input>
+            // fields normally, and handle Escape to close. Without this guard, keys typed while
+            // editing (arrows, Backspace, Delete, Home/End, Tab — all bound to actions by
+            // default in keybindings.rs) fall through to the document-level catch-all further
+            // below and steal focus back to the main command line on nearly every keystroke.
+            if (worldEditorPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeWorldEditorPopup();
                 }
                 return;
             }
