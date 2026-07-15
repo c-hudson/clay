@@ -1681,10 +1681,12 @@ pub(crate) fn handle_remote_client_key(
                         }
                     }
                     Command::WorldEdit { ref name } => {
-                        // /worlds -e [name] - open world editor using new popup
+                        // /worlds -e [name] - open world editor using new popup. Creates the
+                        // world if it doesn't exist yet (mirrors commands.rs's local-TUI
+                        // find_or_create_world behavior) instead of silently falling back to
+                        // editing the current world.
                         let idx = if let Some(ref n) = name {
-                            app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(n))
-                                .unwrap_or(app.current_world_index)
+                            app.find_or_create_world(n)
                         } else {
                             app.current_world_index
                         };

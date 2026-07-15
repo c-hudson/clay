@@ -3667,38 +3667,37 @@
                 if (args.length === 0) {
                     openWorldSelectorPopup();
                 } else if (args[0] === '-e') {
-                    // /worlds -e [name] - open world editor
+                    // /worlds -e [name] - open world editor. If the name doesn't match an
+                    // existing world, create it (same CreateWorld round trip addNewWorld() uses)
+                    // and open the editor on the real new world once WorldCreated arrives —
+                    // mirrors the TUI's find_or_create_world behavior.
                     const name = args.length > 1 ? args.slice(1).join(' ') : null;
                     if (name) {
                         const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
                         if (idx >= 0) {
                             openWorldEditorPopup(idx);
                         } else {
-                            appendClientLine('No world named "' + name + '".', currentWorldIndex, 'system');
+                            send({ type: 'CreateWorld', name: name });
                         }
                     } else {
                         openWorldEditorPopup(currentWorldIndex);
                     }
                 } else if (args[0] === '-l') {
-                    // /worlds -l <name> - server already connected, just switch local view
+                    // /worlds -l <name> - server already connected, just switch local view.
+                    // Unreachable-if-not-found in practice: -l parses to Command::WorldSwitch
+                    // server-side, which is handled entirely there (own "not found" ServerData
+                    // message, main.rs) and never bounced here via ExecuteLocalCommand.
                     if (args.length > 1) {
                         const name = args.slice(1).join(' ');
                         const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
-                        if (idx >= 0) {
-                            switchWorldLocal(idx);
-                        } else {
-                            appendClientLine('No world named "' + name + '".', currentWorldIndex, 'system');
-                        }
+                        if (idx >= 0) switchWorldLocal(idx);
                     }
                 } else {
-                    // /worlds <name> - server already connected if needed, switch local view
+                    // /worlds <name> - server already connected if needed, switch local view.
+                    // Same as -l above: the not-found case is handled server-side, not here.
                     const name = args.join(' ');
                     const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
-                    if (idx >= 0) {
-                        switchWorldLocal(idx);
-                    } else {
-                        appendClientLine('No world named "' + name + '".', currentWorldIndex, 'system');
-                    }
+                    if (idx >= 0) switchWorldLocal(idx);
                 }
                 break;
 
