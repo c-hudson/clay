@@ -10,6 +10,20 @@ task copyWebAssets(type: Copy) {
 }
 preBuild.dependsOn copyWebAssets
 
+// Cross-compile the bundled headless Clay server (for standalone/on-device mode) from Rust
+// source into jniLibs at build time. Requires the Android NDK + rustup aarch64-linux-android
+// target (see build-android-aarch64.sh for one-time setup). Gradle skips re-running this when
+// the Rust sources haven't changed, so Java-only iteration stays fast after the first build.
+task buildNativeServer(type: Exec) {
+    workingDir '../..'
+    commandLine 'bash', 'build-android-aarch64.sh'
+    inputs.dir '../../src'
+    inputs.file '../../Cargo.toml'
+    inputs.file '../../Cargo.lock'
+    outputs.file 'src/main/jniLibs/arm64-v8a/libclay.so'
+}
+preBuild.dependsOn buildNativeServer
+
 android {
     namespace 'com.clay.mudclient'
     compileSdk 34
@@ -20,6 +34,9 @@ android {
         targetSdk 34
         versionCode 140
         versionName "1.1.0"
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
     }
 
     buildTypes {
@@ -31,6 +48,15 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // Extract libclay.so to a real file on disk (ApplicationInfo.nativeLibraryDir) instead of
+    // the default mmap-from-APK packaging — we exec() it as a subprocess, not System.loadLibrary
+    // it, so it must exist as an actual executable file.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 
