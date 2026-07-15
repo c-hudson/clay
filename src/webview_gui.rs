@@ -233,6 +233,7 @@ pub fn run_master_webgui() -> io::Result<()> {
             gui_to_app_rx,
             Some(ws_password),
             None, // No GUI repaint callback (webview is event-driven)
+            None, // Port comes from settings.http_port (already probed above)
         ).await {
         }
     });

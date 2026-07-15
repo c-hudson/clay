@@ -21,6 +21,31 @@ use crate::actions::{split_action_commands, substitute_action_args, execute_reca
 use crate::util::local_time_from_epoch;
 use crate::websocket::{TimestampedLine, RemoteClientType};
 
+/// Run headlessly as a local, loopback-only Clay instance for an embedding client — currently
+/// the Android app's bundled server, spawned as a child process. No TUI, no native WebView; the
+/// embedding client (e.g. the Android WebView) connects over ws://127.0.0.1:<port> using the
+/// password supplied via the CLAY_WS_PASSWORD environment variable. This mirrors desktop GUI
+/// master mode (`webview_gui::run_master_webgui` -> `run_app_headless`) minus opening a window —
+/// the caller supplies its own client instead of a native WebView.
+pub async fn run_local_server(port_override: Option<u16>) -> io::Result<()> {
+    let password = match std::env::var("CLAY_WS_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            eprintln!("clay: --local-server requires a non-empty CLAY_WS_PASSWORD environment variable.");
+            std::process::exit(1);
+        }
+    };
+
+    println!("clay: starting local server (loopback only)...");
+
+    // These channels satisfy run_app_headless's GUI-bridge API; nothing reads/writes them here
+    // since the embedding client talks to the App over the WebSocket server, not this channel.
+    let (gui_tx, _gui_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let (_gui_to_app_tx, gui_to_app_rx) = mpsc::unbounded_channel::<WsMessage>();
+
+    crate::run_app_headless(gui_tx, gui_to_app_rx, Some(password), None, port_override).await
+}
+
 /// Run in daemon mode (-D) - background server for remote connections only
 /// No console UI, just prints listening ports and handles remote clients
 pub async fn run_daemon_server() -> io::Result<()> {

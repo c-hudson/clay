@@ -11431,6 +11431,8 @@ async fn main() -> io::Result<()> {
     let mut conf_path: Option<String> = None;
     let mut daemon_mode = false;
     let mut multiuser_mode = false;
+    let mut local_server_mode = false;
+    let mut local_server_port: Option<u16> = None;
     let mut is_reload_arg = false;
     let mut is_crash_arg = false;
     #[allow(unused_variables)]
@@ -11469,6 +11471,7 @@ async fn main() -> io::Result<()> {
                 "-h" | "--help" => show_help = true,
                 "-D" => daemon_mode = true,
                 "--multiuser" => multiuser_mode = true,
+                "--local-server" => local_server_mode = true,
                 "--reload" => is_reload_arg = true,
                 "--crash" => is_crash_arg = true,
                 "--console" => console_arg = Some(None),
@@ -11476,6 +11479,15 @@ async fn main() -> io::Result<()> {
                 "--dump" => dump_mode = true,
                 _ if arg.starts_with("--dump=") => { dump_mode = true; dump_out_dir = Some(arg[7..].to_string()); },
                 _ if arg.starts_with("--conf=") => conf_path = Some(arg[7..].to_string()),
+                _ if arg.starts_with("--port=") => {
+                    match arg[7..].parse::<u16>() {
+                        Ok(p) => local_server_port = Some(p),
+                        Err(_) => {
+                            eprintln!("Error: invalid --port value '{}'. Use -h for help.", &arg[7..]);
+                            std::process::exit(1);
+                        }
+                    }
+                },
                 _ if arg.starts_with("--console=") => console_arg = Some(Some(arg[10..].to_string())),
                 _ if arg.starts_with("--gui=") => gui_arg = Some(Some(arg[6..].to_string())),
                 _ if arg.starts_with("--tls-proxy=") => tls_proxy_config = Some(arg[12..].to_string()),
@@ -11501,6 +11513,10 @@ async fn main() -> io::Result<()> {
         println!("    --gui=host[:port]    Connect to a Clay server via GUI (default port: 9000)");
         println!("    -D                   Run as headless daemon server");
         println!("    --multiuser          Run as multiuser server");
+        println!("    --local-server       Run headless, loopback-only, for an embedding client");
+        println!("                         (e.g. the Android app's bundled instance).");
+        println!("                         Requires CLAY_WS_PASSWORD to be set.");
+        println!("    --port=<N>           Override the listen port (used with --local-server)");
         println!("    --conf=<path>        Use custom config file (default: ~/.clay/settings.dat)");
         println!("    --grep=host[:port] <pattern>  Search world output (default port: 9000)");
         println!("      -w <world>              Limit to specific world");
@@ -11717,6 +11733,12 @@ async fn main() -> io::Result<()> {
             grep_strip_ansi,
             grep_follow_mode,
         ).await;
+    }
+
+    // Handle --local-server mode (headless, loopback-only, for an embedding client such as
+    // the Android app's bundled instance)
+    if local_server_mode {
+        return daemon::run_local_server(local_server_port).await;
     }
 
     // Handle --multiuser mode
@@ -11998,6 +12020,7 @@ pub async fn run_app_headless(
     mut gui_rx: mpsc::UnboundedReceiver<WsMessage>,
     ws_override: Option<String>,  // password for auto-started WS (GUI master mode)
     gui_repaint: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    port_override: Option<u16>,   // force http_port (e.g. --local-server on Android)
 ) -> io::Result<()> {
     let mut app = App::new();
     app.gui_tx = Some(gui_tx.clone());
@@ -12388,6 +12411,9 @@ pub async fn run_app_headless(
         app.settings.http_enabled = true;
         app.settings.web_secure = false;
         app.settings.websocket_password = ws_password.clone();
+    }
+    if let Some(port) = port_override {
+        app.settings.http_port = port;
     }
 
     // Create WebSocket server state (for client management, no standalone listener).
