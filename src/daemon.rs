@@ -409,6 +409,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     AppEvent::WsKeyRevoke(_client_id, key) => {
                         app.handle_ws_key_revoke(&key);
                     }
+                    AppEvent::ImportResult(client_id, addr, result) => {
+                        app.handle_import_result(client_id, addr, result);
+                    }
                     _ => {}
                 }
             }
@@ -3710,6 +3713,29 @@ pub async fn handle_multiuser_ws_message(
                     let _ = tx.try_send(WriteCommand::Raw(msg));
                 }
             }
+        }
+        // /import export side: mirrors the handler in main.rs's App::handle_ws_message —
+        // needed here too since --local-server (Android on-device mode) runs this separate
+        // dispatcher instead. See plan `i-d-like-to-make-snuggly-rain.md`.
+        WsMessage::RequestSettingsExport => {
+            let settings_dat = persistence::serialize_settings_for_export(app);
+            let theme_dat = app.theme_file.generate_file_content();
+            let keybindings_dat = app.keybindings.to_dat_string();
+            app.ws_send_to_client(client_id, WsMessage::SettingsExport { settings_dat, theme_dat, keybindings_dat });
+        }
+        // /import trigger side: mirrors the handler in main.rs's App::handle_ws_message.
+        // Result comes back via AppEvent::ImportResult, handled in this module's event loop.
+        WsMessage::ImportSettings { addr, password, auth_key, allow_insecure } => {
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let result = remote_client::run_import_client(
+                    &addr,
+                    password.as_deref(),
+                    auth_key.as_deref(),
+                    allow_insecure,
+                ).await;
+                let _ = event_tx.send(AppEvent::ImportResult(client_id, addr, result)).await;
+            });
         }
         _ => {} // Handle other messages as needed
     }

@@ -4362,15 +4362,17 @@
         }
 
         // WebView mode (desktop GUI) or the Android app: show the image splash instead of
-        // the ASCII-art one. clay2.png is served two ways: the desktop GUI's own
-        // clay://clay2.png custom protocol (webview_gui.rs), and — for Android's WebView,
-        // which has no such custom protocol, just a normal HTTP connection to its bundled
-        // local server — the regular /clay2.png HTTP route (http.rs) added alongside it.
+        // the ASCII-art one. clay2.png always lives alongside index.html — desktop's
+        // clay://localhost/ custom protocol (webview_gui.rs) and Android's bundled
+        // file:///android_asset/web/ (copyLogoAsset in build.gradle) both serve it from the
+        // same directory as the page itself, so a relative src resolves correctly under
+        // either origin (also handles Windows WebView2, which serves "clay://" as
+        // "http://clay.localhost/"). Do NOT use window.location.origin here — Android loads
+        // index.html via file:///android_asset/..., so origin is "file://" and an
+        // origin-absolute src would resolve to a nonexistent path on the device filesystem.
         if ((window.WEBVIEW_MODE || typeof Android !== 'undefined') && world.showing_splash) {
-            // On Windows WebView2, custom protocol "clay://" is served as "http://clay.localhost/"
-            const imgBase = window.location.origin || 'clay://localhost';
             elements.output.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:5px;">' +
-                '<img src="' + imgBase + '/clay2.png" alt="Clay" style="width:200px;height:200px;">' +
+                '<img src="clay2.png" alt="Clay" style="width:200px;height:200px;">' +
                 '<div style="color:#ff87ff;font-style:italic;">A 90dies mud client written today</div>' +
                 '<div style="color:#888;">/help for how to use clay</div>' +
                 '</div>';

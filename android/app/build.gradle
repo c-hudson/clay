@@ -10,6 +10,16 @@ task copyWebAssets(type: Copy) {
 }
 preBuild.dependsOn copyWebAssets
 
+// clay2.png (the image splash) lives at the repo root, not under src/web, since it's also
+// embedded directly into the desktop binary (webview_gui.rs / http.rs). Copy it alongside
+// index.html in the asset bundle so app.js's relative "clay2.png" <img src> resolves under
+// file:///android_asset/web/.
+task copyLogoAsset(type: Copy) {
+    from '../../clay2.png'
+    into 'src/main/assets/web'
+}
+preBuild.dependsOn copyLogoAsset
+
 // Cross-compile the bundled headless Clay server (for standalone/on-device mode) from Rust
 // source into jniLibs at build time. Requires the Android NDK + rustup aarch64-linux-android
 // target (see build-android-aarch64.sh for one-time setup). Gradle skips re-running this when
