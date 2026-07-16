@@ -8209,6 +8209,8 @@
                 !elements.worldSelectorModal.classList.contains('visible') &&
                 !elements.settingsModal?.classList.contains('visible') &&
                 !elements.worldEditorModal?.classList.contains('visible') &&
+                !importDialogOpen &&
+                !importInsecureDialogOpen &&
                 !e.target.closest('#status-bar') &&
                 !e.target.closest('#nav-bar') &&
                 !e.target.closest('.menu-dropdown') &&
@@ -8232,6 +8234,8 @@
                     elements.passwordModal?.classList.contains('visible') ||
                     filterPopupOpen ||
                     activeCustomDropdown !== null ||
+                    importDialogOpen ||
+                    importInsecureDialogOpen ||
                     menuOpen;
             }
 
