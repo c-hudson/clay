@@ -1056,6 +1056,70 @@ pub fn merge_keybindings_dat(app: &mut App, remote_keybindings_dat: &str) {
     app.keybindings.merge_remote(remote_keybindings_dat);
 }
 
+/// Counts of entities found in a `/import` payload, for the post-import summary message
+/// (`App::handle_import_result`). Counts what the *remote* sent, not what actually changed
+/// locally (the merge is remote-wins, so in practice these numbers are what landed).
+pub struct ImportCounts {
+    pub worlds: usize,
+    pub actions: usize,
+    pub settings: usize,
+    pub themes: usize,
+    pub keybindings: usize,
+}
+
+/// Counts worlds/actions/global-settings/themes/keybindings in a `/import` payload by
+/// scanning the exported `.dat` text directly — cheaper than threading counts through
+/// `load_settings_from_str`/`ThemeFile::merge_remote`/`KeyBindings::merge_remote`, and the
+/// three payload strings are exactly what `handle_import_result` already has on hand right
+/// after the WS round-trip. Section formats mirror `write_settings_dat`,
+/// `ThemeFile::generate_file_content`, and `KeyBindings::to_dat_string`.
+pub fn count_import_entities(settings_dat: &str, theme_dat: &str, keybindings_dat: &str) -> ImportCounts {
+    let mut worlds = 0;
+    let mut actions = 0;
+    let mut settings = 0;
+    let mut in_global = false;
+    for raw in settings_dat.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_global = line == "[global]";
+            if line.starts_with("[world:") {
+                worlds += 1;
+            } else if line.starts_with("[action:") {
+                actions += 1;
+            }
+            continue;
+        }
+        if in_global && line.contains('=') {
+            settings += 1;
+        }
+    }
+
+    let themes = theme_dat.lines()
+        .filter(|l| l.trim().starts_with("[theme:") && l.trim().ends_with(']'))
+        .count();
+
+    let mut keybindings = 0;
+    let mut in_bindings = false;
+    for raw in keybindings_dat.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_bindings = line == "[bindings]";
+            continue;
+        }
+        if in_bindings && line.contains('=') {
+            keybindings += 1;
+        }
+    }
+
+    ImportCounts { worlds, actions, settings, themes, keybindings }
+}
+
 /// Load settings for multiuser mode from ~/.clay/multiuser.dat
 pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
     let path = get_multiuser_settings_path();
@@ -2856,6 +2920,81 @@ mod tests {
             let stored = line.trim_start_matches("password=");
             assert!(stored.starts_with("ENC:"), "world password should be encrypted at rest: {stored}");
         }
+    }
+
+    #[test]
+    fn test_count_import_entities_matches_real_export() {
+        // Build a payload the same way RequestSettingsExport does, then count it.
+        let mut app = App::new();
+        let mut world_one = World::new("world_one");
+        world_one.settings.hostname = "world-one.example.com".to_string();
+        app.worlds.push(world_one);
+        let mut world_two = World::new("world_two");
+        world_two.settings.hostname = "world-two.example.com".to_string();
+        app.worlds.push(world_two);
+
+        let mut action_a = Action::new();
+        action_a.name = "action_a".to_string();
+        app.settings.actions.push(action_a);
+        let mut action_b = Action::new();
+        action_b.name = "action_b".to_string();
+        app.settings.actions.push(action_b);
+        let mut action_c = Action::new();
+        action_c.name = "action_c".to_string();
+        app.settings.actions.push(action_c);
+
+        app.theme_file.set_theme("theme_one", theme::ThemeColors::dark_default());
+        app.theme_file.set_theme("theme_two", theme::ThemeColors::light_default());
+
+        app.keybindings.set_binding("F5", "action_a");
+        app.keybindings.set_binding("F6", "action_b");
+
+        let settings_dat = serialize_settings_for_export(&app);
+        let theme_dat = app.theme_file.generate_file_content();
+        let keybindings_dat = app.keybindings.to_dat_string();
+
+        let counts = count_import_entities(&settings_dat, &theme_dat, &keybindings_dat);
+
+        assert_eq!(counts.worlds, 2, "world_one + world_two:\n{settings_dat}");
+        assert_eq!(counts.actions, 3, "action_a/b/c:\n{settings_dat}");
+        assert!(counts.settings > 0, "global settings should be non-zero:\n{settings_dat}");
+        // ThemeFile::new() always seeds default themes in addition to the two set above —
+        // just assert our two extra themes are reflected, not an exact total.
+        assert!(counts.themes >= 2, "theme_one + theme_two at minimum:\n{theme_dat}");
+        assert_eq!(counts.keybindings, 2, "F5 + F6:\n{keybindings_dat}");
+    }
+
+    #[test]
+    fn test_count_import_entities_empty_payload() {
+        let counts = count_import_entities("", "", "");
+        assert_eq!(counts.worlds, 0);
+        assert_eq!(counts.actions, 0);
+        assert_eq!(counts.settings, 0);
+        assert_eq!(counts.themes, 0);
+        assert_eq!(counts.keybindings, 0);
+    }
+
+    #[test]
+    fn test_count_import_entities_ignores_non_global_key_value_lines() {
+        // world/action sections have their own key=value lines (hostname=, pattern=, etc.)
+        // that must NOT be counted as [global] settings.
+        let settings_dat = "\
+[global]
+more_mode=true
+spell_check=false
+
+[world:test_world]
+hostname=example.com
+port=4000
+
+[action:test_action]
+name=test_action
+pattern=foo
+";
+        let counts = count_import_entities(settings_dat, "", "");
+        assert_eq!(counts.worlds, 1);
+        assert_eq!(counts.actions, 1);
+        assert_eq!(counts.settings, 2, "only the two [global] keys, not world/action keys");
     }
 
     #[test]

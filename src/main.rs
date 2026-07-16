@@ -8807,24 +8807,29 @@ impl App {
                 let _ = std::fs::write(clay_config_path("theme.dat"), self.theme_file.generate_file_content());
                 let _ = self.keybindings.save(&clay_config_path("keybindings.dat"));
 
+                // Counts-only summary of what the remote sent (== what got merged in, since
+                // the merge is remote-wins on every key/world/action/theme/binding it names).
+                let counts = persistence::count_import_entities(&settings_dat, &theme_dat, &keybindings_dat);
+                let summary = format!(
+                    "Imported: {} worlds, {} actions, {} settings, {} themes, {} keybindings.",
+                    counts.worlds, counts.actions, counts.settings, counts.themes, counts.keybindings
+                );
+
                 if is_console {
                     self.pending_console_import = None;
                     // Master TUI/desktop: offer /reload (re-exec) to apply immediately,
                     // rather than just printing a passive notice — plan step 9.
-                    let summary = format!(
-                        "Imported settings from {} (worlds, theme, keybindings merged — remote wins on conflicts).",
-                        addr
-                    );
                     self.popup_manager.open(popup::definitions::confirm::create_import_reload_dialog(&summary));
                 } else {
-                    // Android/web/remote-console: hot-reload isn't available there (Android
-                    // has it disabled outright; a WS client can't re-exec the server process
-                    // it's connected to), so this is a passive notice, not an offer — same
-                    // wording Command::Reload already uses for Android (commands.rs).
-                    let summary = format!(
-                        "Imported settings from {} (worlds, theme, keybindings merged — remote wins on conflicts). Restart the app manually to apply changes.",
-                        addr
-                    );
+                    // Android/web/remote-console: the merge above already updated in-memory
+                    // App state (worlds/settings/actions/theme/keybindings — see
+                    // load_settings_from_str/ThemeFile::merge_remote/KeyBindings::merge_remote),
+                    // so no reload/restart is actually needed for correctness. Push a fresh
+                    // InitialState to the connected client to refresh its UI in place — the
+                    // same mechanism WsMessage::RequestState uses — before the summary line, so
+                    // the summary appears after (not wiped out by) the resync.
+                    let initial_state = self.build_initial_state();
+                    self.ws_send_initial_state_and_mark(client_id, initial_state);
                     self.ws_send_to_client(client_id, WsMessage::ImportResult { success: true, summary });
                 }
             }
