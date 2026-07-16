@@ -1771,6 +1771,8 @@ pub enum Command {
     /// /connect host:port | host port | --close | --cancel - attach to/detach from a remote
     /// Clay server instance (relaunches this process as a remote client, or back to master)
     RemoteAttach { addr: String, close: bool, cancel: bool },
+    /// /import host[:port] - download settings/theme/keybindings from another Clay instance
+    Import { addr: String },
     /// /disconnect or /dc - disconnect current world
     Disconnect,
     /// /flush - clear output buffer for current world
@@ -1886,6 +1888,7 @@ pub fn parse_command(input: &str) -> Command {
         "/worlds" | "/world" => parse_world_command(args),
         "/__connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
         "/connect" => parse_remote_attach_command(args),
+        "/import" => parse_import_command(args),
         "/disconnect" | "/dc" => Command::Disconnect,
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
@@ -2073,6 +2076,21 @@ fn parse_remote_attach_command(args: &[&str]) -> Command {
     };
 
     Command::RemoteAttach { addr, close: false, cancel: false }
+}
+
+/// Parse /import command (download settings/theme/keybindings from another Clay instance)
+///
+/// Formats:
+///   /import host:port
+///   /import host port
+fn parse_import_command(args: &[&str]) -> Command {
+    let addr = match args.len() {
+        0 => String::new(),
+        1 => args[0].to_string(),
+        _ => format!("{}:{}", args[0], args[1]),
+    };
+
+    Command::Import { addr }
 }
 
 /// Parse /addworld command (TF-compatible world creation)
@@ -3196,6 +3214,12 @@ pub struct App {
     /// Master mode: pending /connect confirmation (target addr, requested at). Cleared on
     /// confirm/cancel or when superseded by a different target.
     pub pending_remote_connect: Option<(String, std::time::Instant)>,
+    /// Console TUI: credentials from the last /import attempt (addr, password, auth_key),
+    /// kept around so the insecure-transport confirm dialog can retry with
+    /// allow_insecure: true without re-prompting. Cleared on success, any failure other
+    /// than NeedsInsecureConfirm, or if the confirm dialog is cancelled. See
+    /// handle_import_result and plan i-d-like-to-make-snuggly-rain.md.
+    pub pending_console_import: Option<(String, Option<String>, Option<String>)>,
     /// Remote client mode: pending /connect --close request (re-exec as independent master)
     pub pending_remote_detach: bool,
     /// Remote client mode: pending /connect host:port request (re-exec attached elsewhere)
@@ -3306,6 +3330,7 @@ impl App {
             pending_update: None,
             pending_reload: false,
             pending_remote_connect: None,
+            pending_console_import: None,
             pending_remote_detach: false,
             pending_remote_switch: None,
             server_activity_count: 0, // Activity count from server (remote client mode)
@@ -6820,6 +6845,21 @@ impl App {
                     }
                 }
             }
+            Command::Import { .. } => {
+                // WS clients must collect the password/auth-key client-side and send a
+                // dedicated ImportSettings message instead (see plan) - a bounced /import
+                // typed on the command line can't carry secrets, so it's rejected here.
+                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                    world_index,
+                    data: "Use the /import dialog (not the command line) so your password/auth-key aren't sent unprotected.".to_string(),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                    seq: 0,
+                    marked_new: false,
+                    flush: false, gagged: false,
+                });
+            }
             Command::Edit { .. } | Command::EditList => {
                 // Edit command is handled locally on the client, not on server
                 // Send back to client for local execution
@@ -8330,6 +8370,35 @@ impl App {
                     self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                 }
             }
+            // /import export side: an authenticated peer (another Clay instance running
+            // /import) is requesting this instance's settings/theme/keybindings with all
+            // secrets decrypted. Gating is the same as every other Request* handler here —
+            // reaching this match arm at all already implies a valid WS auth (password or
+            // auth-key). See plan `i-d-like-to-make-snuggly-rain.md`.
+            WsMessage::RequestSettingsExport => {
+                let settings_dat = persistence::serialize_settings_for_export(self);
+                let theme_dat = self.theme_file.generate_file_content();
+                let keybindings_dat = self.keybindings.to_dat_string();
+                self.ws_send_to_client(client_id, WsMessage::SettingsExport { settings_dat, theme_dat, keybindings_dat });
+            }
+            // /import trigger side: a client (web/Android/remote-console dialog, or the TUI's
+            // own in-process path for the master) asked us to pull settings from `addr`. The
+            // network round-trip can't block this handler, so it runs in a spawned task and
+            // reports back via AppEvent::ImportResult, handled in every event loop that can
+            // receive a WsClientMessage (run_app's two loops, run_app_headless) — see
+            // handle_import_result. See plan `i-d-like-to-make-snuggly-rain.md`.
+            WsMessage::ImportSettings { addr, password, auth_key, allow_insecure } => {
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let result = remote_client::run_import_client(
+                        &addr,
+                        password.as_deref(),
+                        auth_key.as_deref(),
+                        allow_insecure,
+                    ).await;
+                    let _ = event_tx.send(AppEvent::ImportResult(client_id, addr, result)).await;
+                });
+            }
             // Theme editor messages
             WsMessage::RequestThemeEditorState => {
                 let themes_json = self.theme_file.to_json_all();
@@ -8707,6 +8776,84 @@ impl App {
             }
         }
         WsAsyncAction::Done
+    }
+
+    /// Handles the outcome of a background `run_import_client` attempt (`AppEvent::ImportResult`,
+    /// plan `i-d-like-to-make-snuggly-rain.md`). On success, merges the export into this
+    /// instance and re-encrypts/saves all three files under this machine's own key; on a TLS
+    /// failure the client hasn't confirmed yet, asks it to confirm; any other failure is
+    /// reported as-is. `client_id == 0` means the master console TUI's own in-process
+    /// `/import` (step 8; mirrors `AppEvent::RemoteListResult`'s "0 = console" convention —
+    /// unrelated to `ws_send_to_client`'s own different "0 = embedded GUI" special case,
+    /// since that path is never reached for 0 here), which has no WebSocket client to reply
+    /// to and must drive `add_output`/a TUI confirm popup directly instead. Called from
+    /// every event loop that can receive a `WsClientMessage` or a console `KeyEvent`
+    /// (`run_app`'s two loops, `run_app_headless`), since that's everywhere an import could
+    /// have been started from in the first place.
+    fn handle_import_result(
+        &mut self,
+        client_id: u64,
+        addr: String,
+        result: Result<(String, String, String), remote_client::ImportClientError>,
+    ) {
+        let is_console = client_id == 0;
+        match result {
+            Ok((settings_dat, theme_dat, keybindings_dat)) => {
+                persistence::merge_settings_dat(self, &settings_dat);
+                persistence::merge_theme_dat(self, &theme_dat);
+                persistence::merge_keybindings_dat(self, &keybindings_dat);
+
+                let _ = persistence::save_settings(self);
+                let _ = std::fs::write(clay_config_path("theme.dat"), self.theme_file.generate_file_content());
+                let _ = self.keybindings.save(&clay_config_path("keybindings.dat"));
+
+                if is_console {
+                    self.pending_console_import = None;
+                    // Master TUI/desktop: offer /reload (re-exec) to apply immediately,
+                    // rather than just printing a passive notice — plan step 9.
+                    let summary = format!(
+                        "Imported settings from {} (worlds, theme, keybindings merged — remote wins on conflicts).",
+                        addr
+                    );
+                    self.popup_manager.open(popup::definitions::confirm::create_import_reload_dialog(&summary));
+                } else {
+                    // Android/web/remote-console: hot-reload isn't available there (Android
+                    // has it disabled outright; a WS client can't re-exec the server process
+                    // it's connected to), so this is a passive notice, not an offer — same
+                    // wording Command::Reload already uses for Android (commands.rs).
+                    let summary = format!(
+                        "Imported settings from {} (worlds, theme, keybindings merged — remote wins on conflicts). Restart the app manually to apply changes.",
+                        addr
+                    );
+                    self.ws_send_to_client(client_id, WsMessage::ImportResult { success: true, summary });
+                }
+            }
+            Err(remote_client::ImportClientError::NeedsInsecureConfirm) => {
+                if is_console {
+                    self.popup_manager.open(popup::definitions::confirm::create_import_insecure_dialog(&addr));
+                } else {
+                    self.ws_send_to_client(client_id, WsMessage::ImportNeedsInsecureConfirm { addr });
+                }
+            }
+            Err(remote_client::ImportClientError::AuthFailed(msg)) => {
+                let summary = format!("Import from {} failed: authentication rejected ({})", addr, msg);
+                if is_console {
+                    self.pending_console_import = None;
+                    self.add_output(&summary);
+                } else {
+                    self.ws_send_to_client(client_id, WsMessage::ImportResult { success: false, summary });
+                }
+            }
+            Err(remote_client::ImportClientError::ConnectFailed(msg)) => {
+                let summary = format!("Import from {} failed: {}", addr, msg);
+                if is_console {
+                    self.pending_console_import = None;
+                    self.add_output(&summary);
+                } else {
+                    self.ws_send_to_client(client_id, WsMessage::ImportResult { success: false, summary });
+                }
+            }
+        }
     }
 
     /// Build initial state message for a newly authenticated client.
@@ -9545,6 +9692,10 @@ pub enum AppEvent {
     RemoteListResult(u64, usize, Vec<String>),  // requesting_client_id (0 = console), world_index, output lines
     // Result from background update check/download
     UpdateResult(Result<UpdateSuccess, String>),
+    // Result from a background /import attempt: requesting client_id, target addr, and
+    // Ok((settings_dat, theme_dat, keybindings_dat)) or the failure reason. See
+    // handle_import_result and plan `i-d-like-to-make-snuggly-rain.md`.
+    ImportResult(u64, String, Result<(String, String, String), remote_client::ImportClientError>),
 }
 
 /// Successful update download ready to install
@@ -9736,6 +9887,8 @@ pub(crate) enum NewPopupAction {
     NotesList(NotesListAction),
     /// Recent worlds popup action
     RecentWorlds(RecentWorldsAction),
+    /// /import popup submitted (plan i-d-like-to-make-snuggly-rain.md, step 8)
+    ImportSubmit { addr: String, password: Option<String>, auth_key: Option<String> },
 }
 
 /// Settings from the setup popup
@@ -9934,6 +10087,10 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_BTN_SAVE, WORLD_BTN_CANCEL, WORLD_BTN_DELETE, WORLD_BTN_CONNECT,
         WorldType as PopupWorldType, update_field_visibility,
     };
+    use popup::definitions::import::{
+        IMPORT_FIELD_ADDR, IMPORT_FIELD_PASSWORD, IMPORT_FIELD_AUTH_KEY,
+        IMPORT_BTN_GO, IMPORT_BTN_CANCEL,
+    };
 
     // Clear mouse highlight on any keyboard interaction
     if let Some(state) = app.popup_manager.current_mut() {
@@ -9972,6 +10129,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     let is_world_editor = popup_id == Some(popup::PopupId("world_editor"));
     let is_notes_list = popup_id == Some(popup::PopupId("notes_list"));
     let is_recent_worlds = popup_id == Some(popup::PopupId("recent_worlds"));
+    let is_import = popup_id == Some(popup::PopupId("import"));
 
     if let Some(state) = app.popup_manager.current_mut() {
         // World selector has special handling
@@ -10482,6 +10640,103 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 }
                             }
                         } else if btn_id == WEB_BTN_CANCEL {
+                            app.popup_manager.close();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // /import popup handling (plan i-d-like-to-make-snuggly-rain.md, step 8). Only text
+        // fields (no select/toggle), so this is a trimmed-down version of the is_web block
+        // above: no Char(' ') toggle case, no Left/Right increase/decrease_current.
+        if is_import {
+            let extract_submit = || -> NewPopupAction {
+                let addr = state.get_text(IMPORT_FIELD_ADDR).unwrap_or("").trim().to_string();
+                let password = state.get_text(IMPORT_FIELD_PASSWORD).unwrap_or("").to_string();
+                let auth_key = state.get_text(IMPORT_FIELD_AUTH_KEY).unwrap_or("").to_string();
+                NewPopupAction::ImportSubmit {
+                    addr,
+                    password: if password.is_empty() { None } else { Some(password) },
+                    auth_key: if auth_key.is_empty() { None } else { Some(auth_key) },
+                }
+            };
+
+            match key.code {
+                Esc => {
+                    if state.editing {
+                        state.commit_edit();
+                    } else {
+                        app.popup_manager.close();
+                    }
+                }
+                Enter => {
+                    if state.editing {
+                        state.commit_edit();
+                    } else if state.is_on_button() {
+                        if state.is_button_focused(IMPORT_BTN_GO) {
+                            let addr_empty = state.get_text(IMPORT_FIELD_ADDR).unwrap_or("").trim().is_empty();
+                            let no_creds = state.get_text(IMPORT_FIELD_PASSWORD).unwrap_or("").is_empty()
+                                && state.get_text(IMPORT_FIELD_AUTH_KEY).unwrap_or("").is_empty();
+                            if addr_empty {
+                                state.error = Some("Enter a host[:port].".to_string());
+                                state.error_at = Some(std::time::Instant::now());
+                            } else if no_creds {
+                                state.error = Some("Enter a password or an auth key.".to_string());
+                                state.error_at = Some(std::time::Instant::now());
+                            } else {
+                                let action = extract_submit();
+                                app.popup_manager.close();
+                                return action;
+                            }
+                        } else if state.is_button_focused(IMPORT_BTN_CANCEL) {
+                            app.popup_manager.close();
+                        }
+                    } else {
+                        state.start_edit();
+                    }
+                }
+                Up => {
+                    if state.editing { state.commit_edit(); }
+                    state.prev_item();
+                }
+                Down => {
+                    if state.editing { state.commit_edit(); }
+                    state.next_item();
+                }
+                Left => {
+                    if state.editing { state.cursor_left(); }
+                }
+                Right => {
+                    if state.editing { state.cursor_right(); }
+                }
+                Tab => {
+                    if state.editing { state.commit_edit(); }
+                    state.cycle_field_buttons();
+                }
+                BackTab => {
+                    if state.editing { state.commit_edit(); }
+                    state.cycle_field_buttons_rev();
+                }
+                Backspace => {
+                    if state.editing { state.backspace(); }
+                }
+                Delete => {
+                    if state.editing { state.delete_char(); }
+                }
+                Home => {
+                    if state.editing { state.cursor_home(); }
+                }
+                End => {
+                    if state.editing { state.cursor_end(); }
+                }
+                Char(c) => {
+                    if state.editing {
+                        state.insert_char(c);
+                    } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
+                        if btn_id == IMPORT_BTN_CANCEL {
                             app.popup_manager.close();
                         }
                     }
@@ -13032,6 +13287,9 @@ pub async fn run_app_headless(
                             }
                         }
                     }
+                    AppEvent::ImportResult(client_id, addr, result) => {
+                        app.handle_import_result(client_id, addr, result);
+                    }
                     AppEvent::Prompt(ref world_name, ref prompt_bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             app.handle_prompt(world_idx, prompt_bytes);
@@ -14695,6 +14953,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 return Ok(());
                             }
                         }
+                        KeyAction::RunImport { addr, password, auth_key, allow_insecure } => {
+                            app.pending_console_import = Some((addr.clone(), password.clone(), auth_key.clone()));
+                            let event_tx = event_tx.clone();
+                            tokio::spawn(async move {
+                                let result = remote_client::run_import_client(
+                                    &addr,
+                                    password.as_deref(),
+                                    auth_key.as_deref(),
+                                    allow_insecure,
+                                ).await;
+                                let _ = event_tx.send(AppEvent::ImportResult(0, addr, result)).await;
+                            });
+                        }
                         KeyAction::Reload => {
                             if handle_command("/reload", &mut app, event_tx.clone()).await {
                                 return Ok(());
@@ -15619,6 +15890,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
+                    AppEvent::ImportResult(client_id, addr, result) => {
+                        app.handle_import_result(client_id, addr, result);
+                    }
                 }
             }
 
@@ -16145,6 +16419,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         Err(e) => { app.add_output(&e); }
                     }
+                }
+                AppEvent::ImportResult(client_id, addr, result) => {
+                    app.handle_import_result(client_id, addr, result);
                 }
                 AppEvent::GmcpNegotiated(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {

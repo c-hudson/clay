@@ -109,6 +109,41 @@ pub fn create_cert_mismatch_dialog(
     def
 }
 
+// Custom_data key used by the /import insecure-transport confirm dialog. The credentials
+// themselves live in App::pending_console_import (input_handler.rs reads them back from
+// there, not from custom_data) — this key only needs to carry enough to identify the
+// dialog and let the message reference the target.
+pub const IMPORT_INSECURE_ADDR: &str = "import_insecure_addr";
+
+/// Create the /import insecure-transport confirm dialog: `addr` didn't accept a TLS
+/// connection, so continuing sends the password/auth-key from `App::pending_console_import`
+/// unencrypted. See plan i-d-like-to-make-snuggly-rain.md step 8.
+pub fn create_import_insecure_dialog(addr: &str) -> PopupDefinition {
+    let message = format!(
+        "{} did not accept a TLS connection.\n\nContinuing will send your password/auth-key to it UNENCRYPTED. Only do this on a network you trust.",
+        addr
+    );
+    let mut def = create_confirm_dialog("import_insecure", "No Secure Connection", &message);
+    def.custom_data.insert(IMPORT_INSECURE_ADDR.to_string(), addr.to_string());
+    def
+}
+
+// Marker custom_data key for the /import "reload now?" offer — no extra data needed
+// beyond identifying the dialog (unlike IMPORT_INSECURE_ADDR, there's no retry to drive).
+pub const IMPORT_RELOAD_OFFER: &str = "import_reload_offer";
+
+/// Create the /import "apply now?" dialog shown to the master console TUI after a
+/// successful import: `/reload` re-execs the process so the merged settings take full
+/// effect immediately (matching the design's "master TUI/desktop offers /reload" — plan
+/// i-d-like-to-make-snuggly-rain.md step 9). "No" leaves the merged settings.dat/theme.dat/
+/// keybindings.dat on disk as-is, applied next time Clay starts.
+pub fn create_import_reload_dialog(summary: &str) -> PopupDefinition {
+    let message = format!("{}\n\nReload now to apply?", summary);
+    let mut def = create_confirm_dialog("import_reload_offer", "Import Complete", &message);
+    def.custom_data.insert(IMPORT_RELOAD_OFFER.to_string(), "1".to_string());
+    def
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -643,7 +643,7 @@
     // This list is verified by test_command_parity_js_vs_rust in main.rs
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
-        'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect',
+        'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'import',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window',
@@ -2256,6 +2256,16 @@
                 showCertMismatchDialog(msg.world_index, msg.host, msg.old_fingerprint, msg.new_fingerprint);
                 break;
 
+            case 'ImportNeedsInsecureConfirm':
+                // /import's target didn't accept TLS; ask before resending the
+                // password/auth-key over a plaintext ws:// connection.
+                showImportInsecureConfirmDialog(msg.addr);
+                break;
+
+            case 'ImportResult':
+                appendClientLine(msg.summary, currentWorldIndex, 'system');
+                break;
+
             case 'WorldAdded':
                 if (msg.world) {
                     const world = msg.world;
@@ -3366,6 +3376,17 @@
                 var connectAddr = connectArgs.length > 1 ? (connectArgs[0] + ':' + connectArgs[1]) : connectArgs[0];
                 sendIpc('connect:' + connectAddr);
             }
+            return;
+        }
+
+        // Intercept /import — the password/auth-key must be collected client-side (never
+        // sent as a bounced command line) and delivered via a dedicated ImportSettings
+        // message instead. See plan i-d-like-to-make-snuggly-rain.md.
+        if (cmdTrimmed === '/import' || cmdTrimmed.startsWith('/import ')) {
+            elements.input.value = '';
+            var importArgs = cmdTrimmed.length > 7 ? cmdTrimmed.substring(7).trim().split(/\s+/).filter(Boolean) : [];
+            var importAddr = importArgs.length > 1 ? (importArgs[0] + ':' + importArgs[1]) : (importArgs[0] || '');
+            showImportDialog(importAddr);
             return;
         }
 
@@ -9278,6 +9299,109 @@
         if (dlg) {
             dlg.style.display = 'none';
         }
+    }
+
+    // /import dialogs (plan i-d-like-to-make-snuggly-rain.md, step 7). Same pattern as
+    // showCertMismatchDialog above: a dynamically created full-screen overlay, styled
+    // inline, content run through sanitizeHtml/escapeHtml.
+
+    // Stashed credentials from the last ImportSettings attempt, so the insecure-confirm
+    // retry (allow_insecure: true) can resend them without prompting the user again.
+    let pendingImportCredentials = null;
+
+    function showImportDialog(prefillAddr) {
+        let dlg = document.getElementById('import-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'import-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            document.body.appendChild(dlg);
+        }
+        const safeAddr = escapeHtml(String(prefillAddr || ''));
+        dlg.innerHTML = sanitizeHtml(`
+            <div style="background:#1a1a1a;color:#eee;border:2px solid #555;border-radius:8px;padding:20px;max-width:420px;width:90%;">
+                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;">Import Settings</div>
+                <div style="margin-bottom:12px;opacity:0.85;">Pull worlds, theme, and keybindings from another Clay instance. Remote values win on conflicts; everything else you have locally is kept.</div>
+                <label style="display:block;margin-bottom:8px;">Host[:port]<br>
+                    <input id="import-addr" type="text" value="${safeAddr}" style="width:100%;box-sizing:border-box;padding:6px;margin-top:4px;" autocomplete="off">
+                </label>
+                <label style="display:block;margin-bottom:8px;">Password<br>
+                    <input id="import-password" type="password" style="width:100%;box-sizing:border-box;padding:6px;margin-top:4px;" autocomplete="off">
+                </label>
+                <label style="display:block;margin-bottom:16px;">Auth key (optional, instead of password)<br>
+                    <input id="import-authkey" type="password" style="width:100%;box-sizing:border-box;padding:6px;margin-top:4px;" autocomplete="off">
+                </label>
+                <div style="display:flex;gap:10px;justify-content:flex-end;">
+                    <button id="import-cancel" style="padding:8px 16px;">Cancel</button>
+                    <button id="import-go" style="padding:8px 16px;background:#06c;color:#fff;border:none;border-radius:4px;">Import</button>
+                </div>
+            </div>
+        `);
+        dlg.style.display = 'flex';
+        const addrInput = document.getElementById('import-addr');
+        addrInput.focus();
+        addrInput.select();
+
+        function submit() {
+            const addr = document.getElementById('import-addr').value.trim();
+            const password = document.getElementById('import-password').value;
+            const authKey = document.getElementById('import-authkey').value;
+            if (!addr) return;
+            if (!password && !authKey) {
+                appendClientLine('Enter a password or an auth key.', currentWorldIndex, 'system');
+                return;
+            }
+            pendingImportCredentials = { addr: addr, password: password || null, auth_key: authKey || null };
+            send({ type: 'ImportSettings', addr: addr, password: password || null, auth_key: authKey || null, allow_insecure: false });
+            hideImportDialog();
+        }
+
+        document.getElementById('import-cancel').onclick = hideImportDialog;
+        document.getElementById('import-go').onclick = submit;
+        document.getElementById('import-authkey').onkeydown = function(e) {
+            if (e.key === 'Enter') submit();
+        };
+    }
+
+    function hideImportDialog() {
+        const dlg = document.getElementById('import-dialog');
+        if (dlg) {
+            dlg.style.display = 'none';
+        }
+    }
+
+    function showImportInsecureConfirmDialog(addr) {
+        let dlg = document.getElementById('import-insecure-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'import-insecure-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            document.body.appendChild(dlg);
+        }
+        const safeAddr = escapeHtml(String(addr));
+        dlg.innerHTML = sanitizeHtml(`
+            <div style="background:#1a1a1a;color:#eee;border:2px solid #c00;border-radius:8px;padding:20px;max-width:460px;width:90%;">
+                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;color:#f55;">No Secure Connection</div>
+                <div style="margin-bottom:16px;">${safeAddr} did not accept a TLS connection. Continuing will send your password/auth-key to it <b>unencrypted</b>. Only do this on a network you trust.</div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;">
+                    <button id="import-insecure-cancel" style="padding:8px 16px;">Cancel</button>
+                    <button id="import-insecure-go" style="padding:8px 16px;background:#c00;color:#fff;border:none;border-radius:4px;">Send unencrypted</button>
+                </div>
+            </div>
+        `);
+        dlg.style.display = 'flex';
+
+        document.getElementById('import-insecure-cancel').onclick = function() {
+            pendingImportCredentials = null;
+            dlg.style.display = 'none';
+        };
+        document.getElementById('import-insecure-go').onclick = function() {
+            dlg.style.display = 'none';
+            if (pendingImportCredentials) {
+                send(Object.assign({ type: 'ImportSettings', allow_insecure: true }, pendingImportCredentials));
+                pendingImportCredentials = null;
+            }
+        };
     }
 
     // Expose keepalive function for Android app to call

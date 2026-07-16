@@ -2,6 +2,16 @@
 
 Single source of truth for all build targets and machine details.
 
+## Remote checkouts are routinely dirty — sync deliberately
+
+Every remote (Mac, Windows VM, Termux, Linux test) tends to carry a modified `Cargo.lock`,
+because `cargo build` rewrites the `clay` version line whenever the committed lock file
+lags the bumped `Cargo.toml`. A dirty tree makes `git pull` **abort**, and a `git pull &&
+cargo build` chain then builds the *old* checkout without an obvious error — this has
+shipped stale binaries. Always `git stash push -- Cargo.lock`, pull, and then assert
+`git rev-parse HEAD` matches the release commit before building. See SKILL.md Step 6
+("Syncing a remote"). Never `git reset --hard` a remote: it destroys work you can't see.
+
 ## Local Machine (localhost)
 
 No SSH required — commands run directly.
@@ -48,12 +58,15 @@ tao/wry/X11 patches or libraries are needed.
 - Android NDK r26d unpacked at `~/Android/Sdk/ndk/26.3.11579264` (no `sdkmanager`/cmdline-tools
   needed — downloaded directly from `https://dl.google.com/android/repository/android-ndk-r26d-linux.zip`)
 - `rustup target add armv7-linux-androideabi`
-- `patchelf` on PATH — installed to `~/.local/bin` from the prebuilt static release
+- `patchelf` installed at `~/.local/bin/patchelf` from the prebuilt static release
   (`https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz`);
   no root/apt required
 
 **Build:**
 ```bash
+export PATH="$HOME/.local/bin:$PATH"   # required: ~/.local/bin is NOT on PATH in a
+                                       # non-interactive shell, so the script's patchelf
+                                       # lookup fails with "patchelf not found on PATH"
 ./build-termux-armv7.sh
 ```
 This sets `CC_armv7_linux_androideabi`/`CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER` etc. to the
@@ -73,12 +86,26 @@ cd android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleRel
 - Unsigned APK: `android/app/build/outputs/apk/release/app-release-unsigned.apk`
 - After signing, the release asset name: `clay-android.apk`
 
-**APK Signing:**
+**Standalone mode (`libclay.so`):** `assembleRelease` automatically cross-compiles and bundles the
+headless Clay server for the app's on-device/standalone run mode — no separate manual step. This
+is the `buildNativeServer` Gradle task (`android/app/build.gradle`), wired via
+`preBuild.dependsOn`, which shells out to `build-android-aarch64.sh` (repo root) using the same
+NDK already set up for the armv7 Termux build above, just targeting `aarch64-linux-android`
+instead. One-time setup: `rustup target add aarch64-linux-android` (NDK r26d is already required
+for the armv7 build; no separate download). `android.sh` asserts `lib/arm64-v8a/libclay.so` is
+present in the unsigned APK before signing — if that check fails, the NDK/rustup target is
+probably missing on this machine.
+
+**APK Signing** (run from the repo root, not from `android/`). Use the **full path** to
+`zipalign` — the Android build-tools dir is not on PATH in a non-interactive shell:
 ```bash
+BT=~/Android/Sdk/build-tools/35.0.0
 # Align
-zipalign -v -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk android/clay-android-aligned.apk
+$BT/zipalign -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk android/clay-android-aligned.apk
 # Sign
-~/Android/Sdk/build-tools/35.0.0/apksigner sign --ks android/clay-release.keystore --ks-pass file:$HOME/.clay-keystore-pass --out android/clay-android.apk android/clay-android-aligned.apk
+$BT/apksigner sign --ks android/clay-release.keystore --ks-pass file:$HOME/.clay-keystore-pass --out android/clay-android.apk android/clay-android-aligned.apk
+# Verify (expect "Verifies")
+$BT/apksigner verify android/clay-android.apk
 ```
 
 ## Windows VM (192.168.2.14) — VirtualBox guest on Linux host
@@ -92,8 +119,14 @@ zipalign -v -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk 
 - Stop: `VBoxManage controlvm clay-win11 poweroff`
 
 ### Windows x86_64 binary (MSVC, GUI + audio)
+
+This VM runs **cmd.exe**, not bash — use `&&` (not `;`), no `2>/dev/null`, no `test "$()"`.
+`git checkout -- Cargo.lock` first: cargo rewrites `Cargo.lock` on every build, and a bare
+`git pull` on the resulting dirty tree ABORTS, silently building stale code (a `&&` chain
+stops on the abort, which is why the chain form below is safe — but only if the discard
+runs first). Confirm the printed SHA equals the release commit before trusting the binary.
 ```cmd
-cd clay && git pull && set RUSTFLAGS=-C target-feature=+crt-static && cargo build --release --features webview-gui,native-audio
+cd clay && git checkout -- Cargo.lock && git pull && git rev-parse HEAD && set RUSTFLAGS=-C target-feature=+crt-static && cargo build --release --features webview-gui,native-audio
 ```
 - Binary: `target\release\clay.exe`
 - Release asset name: `clay-windows-x86_64.exe`

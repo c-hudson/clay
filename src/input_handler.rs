@@ -56,6 +56,11 @@ pub(crate) enum KeyAction {
     Reload,  // Trigger /reload
     Suspend, // Ctrl+Z to suspend process
     SwitchedWorld(usize), // Console switched to this world, broadcast unseen clear
+    /// Run the /import driver in-process for the master console TUI (plan
+    /// i-d-like-to-make-snuggly-rain.md, step 8). handle_key_event has no event_tx, so —
+    /// same reasoning as KeyAction::Connect ("/__connect") — the actual async spawn is
+    /// deferred to the one loop that does: the network round-trip can't happen here.
+    RunImport { addr: String, password: Option<String>, auth_key: Option<String>, allow_insecure: bool },
     None,
 }
 
@@ -483,6 +488,16 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     // Allow list wildcard warning confirmed — apply settings
                     let settings = web_settings_from_custom_data(&data);
                     apply_web_settings(app, &settings);
+                } else if data.contains_key(popup::definitions::confirm::IMPORT_INSECURE_ADDR) {
+                    // /import's TLS attempt failed and the user accepted sending the
+                    // password/auth-key unencrypted — retry with the credentials stashed
+                    // when the import was first submitted (never re-prompted for them).
+                    if let Some((addr, password, auth_key)) = app.pending_console_import.clone() {
+                        return KeyAction::RunImport { addr, password, auth_key, allow_insecure: true };
+                    }
+                } else if data.contains_key(popup::definitions::confirm::IMPORT_RELOAD_OFFER) {
+                    // Post-import "reload now?" offer confirmed.
+                    return KeyAction::Reload;
                 }
             }
             NewPopupAction::ConfirmCancelled(data) => {
@@ -491,6 +506,11 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.open_world_selector_new();
                 } else if data.contains_key("action_index") {
                     app.open_actions_list_popup();
+                } else if data.contains_key(popup::definitions::confirm::IMPORT_INSECURE_ADDR) {
+                    app.pending_console_import = None;
+                    app.add_output("Import cancelled.");
+                } else if data.contains_key(popup::definitions::confirm::IMPORT_RELOAD_OFFER) {
+                    app.add_output("Settings imported and saved — run /reload later to fully apply.");
                 }
             }
             NewPopupAction::WorldSelector(action) => {
@@ -930,6 +950,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                     RecentWorldsAction::Close => {}
                 }
+            }
+            NewPopupAction::ImportSubmit { addr, password, auth_key } => {
+                return KeyAction::RunImport { addr, password, auth_key, allow_insecure: false };
             }
             NewPopupAction::None => {}
         }

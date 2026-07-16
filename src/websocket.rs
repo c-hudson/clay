@@ -357,6 +357,25 @@ pub enum WsMessage {
         paused: bool,
     },
 
+    // Settings import (client -> local server): /import host[:port] downloads
+    // settings.dat/theme.dat/keybindings.dat from another Clay instance and merges
+    // them in (remote wins on conflicts). See plan `i-d-like-to-make-snuggly-rain.md`.
+    /// Client -> local server: start an import from `addr`. Collected client-side because
+    /// the password/auth-key must never be sent as a bounced /import command line.
+    ImportSettings { addr: String, password: Option<String>, auth_key: Option<String>, allow_insecure: bool },
+    /// Local server -> client: the target has no TLS and `allow_insecure` was false.
+    /// Client should show an explicit "passwords will be sent unencrypted" confirmation
+    /// and, if accepted, resend ImportSettings with allow_insecure: true.
+    ImportNeedsInsecureConfirm { addr: String },
+    /// Local server -> client: final outcome of an import attempt.
+    ImportResult { success: bool, summary: String },
+    /// Importer -> target, sent over the outbound connection opened for the import: request
+    /// the target's settings/theme/keybindings with all secrets decrypted.
+    RequestSettingsExport,
+    /// Target -> importer: raw file contents (secrets decrypted; importer re-encrypts under
+    /// its own local machine key before saving).
+    SettingsExport { settings_dat: String, theme_dat: String, keybindings_dat: String },
+
     // Theme editor (client -> server)
     RequestThemeEditorState,
     UpdateThemeColors { theme_name: String, colors_json: String },

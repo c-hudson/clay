@@ -484,6 +484,18 @@ impl ThemeFile {
         file
     }
 
+    /// Merges another theme file's content into `self`: every theme name it defines is
+    /// inserted or overwritten wholesale (including "dark"/"light", if the remote
+    /// customized them); theme names only `self` has — a local-only custom theme the
+    /// remote export never mentions — are left untouched. Used by `/import`'s
+    /// `merge_theme_dat` (persistence.rs; plan `i-d-like-to-make-snuggly-rain.md`).
+    pub fn merge_remote(&mut self, remote_theme_dat: &str) {
+        let remote = Self::parse(remote_theme_dat);
+        for (name, colors) in remote.themes {
+            self.themes.insert(name, colors);
+        }
+    }
+
     /// Get a theme by name, falling back to dark default
     pub fn get(&self, name: &str) -> &ThemeColors {
         self.themes.get(name).unwrap_or_else(|| {

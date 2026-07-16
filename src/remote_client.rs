@@ -427,6 +427,193 @@ pub(crate) async fn run_grep_client(
 
     Ok(())
 }
+
+/// Why a `run_import_client` attempt failed — lets the caller (the server-side `/import`
+/// driver) turn this into the right `WsMessage` reply instead of just a string.
+pub enum ImportClientError {
+    /// The target didn't accept a TLS connection and `allow_insecure` was false. The caller
+    /// should ask the user to confirm sending the password/auth-key in cleartext, then retry
+    /// with `allow_insecure: true`.
+    NeedsInsecureConfirm,
+    /// Connected, but the target rejected the password/auth-key.
+    AuthFailed(String),
+    /// Couldn't reach or complete a handshake with the target at all (DNS, refused, timeout,
+    /// protocol error, or — treated as fatal rather than falling back to plaintext — a
+    /// TLS certificate that no longer matches a previously trusted pin).
+    ConnectFailed(String),
+}
+
+/// Timeout for each network step of an import attempt (connect, or a single expected-message
+/// wait). An import runs as a background task inside a live server, so unlike the CLI client
+/// modes above it must never hang indefinitely on an unresponsive target.
+const IMPORT_NET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Connects outbound to another Clay instance at `addr` (for `/import host[:port]`,
+/// plan `i-d-like-to-make-snuggly-rain.md`), authenticates with `password` or `auth_key`,
+/// and fetches its settings/theme/keybindings with secrets decrypted. Reuses the same
+/// TOFU-pinned wss://-then-ws:// connection pattern as `run_console_client`/`run_grep_client`,
+/// but — unlike those CLI-mode functions — never writes to stdout/stderr or exits the
+/// process: this runs as a background task inside a live TUI/server (CLAUDE.md), and reports
+/// outcomes back through its return value instead.
+pub(crate) async fn run_import_client(
+    addr: &str,
+    password: Option<&str>,
+    auth_key: Option<&str>,
+    allow_insecure: bool,
+) -> Result<(String, String, String), ImportClientError> {
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use futures::SinkExt;
+
+    let addr_with_port = if addr.contains(':') { addr.to_string() } else { format!("{}:9000", addr) };
+    let host_port_key = addr_with_port.clone();
+    let ws_url = format!("wss://{}", addr_with_port);
+
+    #[cfg(feature = "rustls-backend")]
+    async fn try_wss(ws_url: &str, host_port_key: &str) -> Result<
+        (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+         tokio_tungstenite::tungstenite::handshake::client::Response),
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.to_string())))
+            .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+        tokio_tungstenite::connect_async_tls_with_config(ws_url, None, false, Some(connector)).await
+    }
+
+    let ws_stream = {
+        #[cfg(feature = "rustls-backend")]
+        let attempt = tokio::time::timeout(IMPORT_NET_TIMEOUT, try_wss(&ws_url, &host_port_key)).await;
+        #[cfg(not(feature = "rustls-backend"))]
+        let attempt = tokio::time::timeout(IMPORT_NET_TIMEOUT, connect_async(&ws_url)).await;
+
+        match attempt {
+            Ok(Ok((stream, _))) => stream,
+            Ok(Err(e)) => {
+                // A pin mismatch means the target's certificate changed since we last trusted
+                // it (possible MITM, or a reinstalled/re-keyed server) — never silently fall
+                // back to plaintext ws:// for that, unlike an ordinary connection failure.
+                #[cfg(feature = "rustls-backend")]
+                if let Some(mismatch) = platform::danger::take_cert_mismatch() {
+                    return Err(ImportClientError::ConnectFailed(format!(
+                        "TLS certificate for {} has changed (was {}, now {}) - refusing to connect",
+                        mismatch.host, mismatch.old_fingerprint, mismatch.new_fingerprint
+                    )));
+                }
+                if !allow_insecure {
+                    return Err(ImportClientError::NeedsInsecureConfirm);
+                }
+                let fallback_url = format!("ws://{}", addr_with_port);
+                match tokio::time::timeout(IMPORT_NET_TIMEOUT, connect_async(&fallback_url)).await {
+                    Ok(Ok((stream, _))) => stream,
+                    Ok(Err(e2)) => return Err(ImportClientError::ConnectFailed(format!("Failed to connect to {}: {} (after wss:// failed: {})", fallback_url, e2, e))),
+                    Err(_) => return Err(ImportClientError::ConnectFailed(format!("Timed out connecting to {}", fallback_url))),
+                }
+            }
+            Err(_) => return Err(ImportClientError::ConnectFailed(format!("Timed out connecting to {}", ws_url))),
+        }
+    };
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsMessage>();
+    tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if ws_write.send(Message::Text(json)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for ServerHello to get the auth challenge.
+    let server_challenge = match tokio::time::timeout(IMPORT_NET_TIMEOUT, async {
+        loop {
+            match ws_read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(WsMessage::ServerHello { challenge, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                        return Some(challenge);
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => return None,
+                _ => {}
+            }
+        }
+    }).await {
+        Ok(Some(challenge)) => challenge,
+        Ok(None) => return Err(ImportClientError::ConnectFailed("Connection closed before authentication".to_string())),
+        Err(_) => return Err(ImportClientError::ConnectFailed("Timed out waiting for server hello".to_string())),
+    };
+
+    // Authenticate: auth-key path takes precedence when both are supplied, matching the
+    // server's own routing in websocket.rs (checks `auth_key.is_some()` first). The stored
+    // auth-key is never sent in the clear — only its challenge-response hash — mirroring
+    // `handle_ws_auth_key_validation`'s `hash_with_challenge(&ak.key, challenge) == key` check.
+    let auth_request = if let Some(key) = auth_key {
+        WsMessage::AuthRequest {
+            password_hash: String::new(),
+            username: None,
+            current_world: None,
+            auth_key: Some(hash_with_challenge(key, &server_challenge)),
+            request_key: false,
+            challenge_response: true,
+        }
+    } else {
+        let password_hash = hash_password(password.unwrap_or_default());
+        WsMessage::AuthRequest {
+            password_hash: hash_with_challenge(&password_hash, &server_challenge),
+            username: None,
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+            challenge_response: true,
+        }
+    };
+    let _ = ws_tx.send(auth_request);
+
+    match tokio::time::timeout(IMPORT_NET_TIMEOUT, async {
+        loop {
+            match ws_read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(WsMessage::AuthResponse { success, error, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                        return Some((success, error));
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => return None,
+                _ => {}
+            }
+        }
+    }).await {
+        Ok(Some((true, _))) => {}
+        Ok(Some((false, error))) => return Err(ImportClientError::AuthFailed(error.unwrap_or_else(|| "Authentication failed".to_string()))),
+        Ok(None) => return Err(ImportClientError::ConnectFailed("Connection closed during authentication".to_string())),
+        Err(_) => return Err(ImportClientError::ConnectFailed("Timed out waiting for authentication response".to_string())),
+    }
+
+    // Authenticated — request the export. Other post-auth traffic (InitialState etc.) may
+    // arrive first; only the messages we're waiting for below stop the loop.
+    let _ = ws_tx.send(WsMessage::RequestSettingsExport);
+
+    match tokio::time::timeout(IMPORT_NET_TIMEOUT, async {
+        loop {
+            match ws_read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(WsMessage::SettingsExport { settings_dat, theme_dat, keybindings_dat }) = serde_json::from_str::<WsMessage>(&text) {
+                        return Some((settings_dat, theme_dat, keybindings_dat));
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => return None,
+                _ => {}
+            }
+        }
+    }).await {
+        Ok(Some(export)) => Ok(export),
+        Ok(None) => Err(ImportClientError::ConnectFailed("Connection closed before receiving settings export".to_string())),
+        Err(_) => Err(ImportClientError::ConnectFailed("Timed out waiting for settings export".to_string())),
+    }
+}
+
 /// Run as console client connecting to remote daemon (--console=host:port)
 /// Uses the same App struct and ui() function as the normal console interface
 pub(crate) async fn run_console_client(addr: &str) -> io::Result<()> {
@@ -1527,6 +1714,14 @@ pub(crate) fn handle_remote_client_key(
                     }
                     RecentWorldsAction::Close => {}
                 }
+            }
+            NewPopupAction::ImportSubmit { .. } => {
+                // /import's in-process driver (plan i-d-like-to-make-snuggly-rain.md, step 8)
+                // is master-console-only for now — this popup is never opened from a
+                // --console remote-attach client (Command::Import checks is_master first),
+                // so reaching here shouldn't be possible. Kept as a defensive no-op rather
+                // than an unreachable!() since a future change to that gate could make it
+                // reachable, and silently dropping a submitted import is safer than a panic.
             }
             NewPopupAction::None => {}
         }

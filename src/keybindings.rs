@@ -258,12 +258,18 @@ impl KeyBindings {
     /// Load from INI file, merging with TF defaults.
     /// Accepts files with or without a [bindings] section header.
     pub fn load(path: &Path) -> Self {
-        let mut kb = Self::tf_defaults();
-
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return kb,
+            Err(_) => return Self::tf_defaults(),
         };
+        Self::from_dat_string(&content)
+    }
+
+    /// Same parsing `load` does, from an in-memory string instead of a file. Used by `load`
+    /// and by the `/import` merge path (a `keybindings_dat` string arrives over the wire,
+    /// never touching disk until after the remote-wins merge is applied).
+    pub fn from_dat_string(content: &str) -> Self {
+        let mut kb = Self::tf_defaults();
 
         // If file has no [bindings] section at all, treat all lines as bindings
         let has_section = content.lines().any(|l| l.trim() == "[bindings]");
@@ -301,6 +307,30 @@ impl KeyBindings {
 
     /// Save to INI file. Only saves bindings that differ from TF defaults.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        std::fs::write(path, self.to_dat_string())
+    }
+
+    /// Merges another instance's *effective* binding set into `self`: every key `other` has
+    /// an opinion on (its own customizations, plus whatever TF defaults it didn't explicitly
+    /// UNBOUND — `from_dat_string` starts from `tf_defaults()`) overwrites `self`'s binding
+    /// for that key; a key only `self` has customized — one `other` never touched — is left
+    /// alone. Note: if `other` explicitly UNBOUND'd a default, that removal doesn't
+    /// propagate here (the key is simply absent from `other.bindings`, indistinguishable
+    /// from "other never considered this key") — an accepted gap for now, not a full
+    /// diff-aware merge. Used by `/import`'s `merge_keybindings_dat` (persistence.rs; plan
+    /// `i-d-like-to-make-snuggly-rain.md`).
+    pub fn merge_remote(&mut self, remote_keybindings_dat: &str) {
+        let remote = Self::from_dat_string(remote_keybindings_dat);
+        for (key, action) in remote.bindings {
+            self.bindings.insert(key, action);
+        }
+    }
+
+    /// Same INI text `save` writes to `keybindings.dat`, as a `String`. Only bindings that
+    /// differ from TF defaults are included. Used by `save` and by the `/import` export
+    /// path (`RequestSettingsExport` handler) to send this instance's keybindings to an
+    /// importer without going through the filesystem.
+    pub fn to_dat_string(&self) -> String {
         let defaults = Self::tf_defaults();
         let mut lines = vec![
             "# Clay Keyboard Bindings".to_string(),
@@ -333,7 +363,7 @@ impl KeyBindings {
             lines.push(format!("{} = UNBOUND", key));
         }
 
-        std::fs::write(path, lines.join("\n") + "\n")
+        lines.join("\n") + "\n"
     }
 
     /// Serialize action metadata to JSON for the web editor.
@@ -535,6 +565,31 @@ mod tests {
         assert_eq!(loaded.get_action("^A"), Some("cursor_home"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_to_dat_string_matches_save() {
+        let mut kb = KeyBindings::tf_defaults();
+        kb.set_binding("Up", "world_next");
+        kb.remove_binding("^Z");
+
+        // to_dat_string (used by the /import export path) must be byte-identical to what
+        // save() writes to keybindings.dat, since it's the same content taking a different
+        // exit (a WsMessage instead of a file).
+        let dir = std::env::temp_dir().join("clay_test_keybindings_dat_string");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.key.dat");
+        kb.save(&path).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(kb.to_dat_string(), on_disk);
+
+        // And it round-trips through the same parser as the on-disk file.
+        let loaded = KeyBindings::from_dat_string(&kb.to_dat_string());
+        assert_eq!(loaded.get_action("Up"), Some("world_next"));
+        assert_eq!(loaded.get_action("^Z"), None);
+        assert_eq!(loaded.get_action("^A"), Some("cursor_home"));
     }
 
     #[test]

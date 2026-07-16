@@ -1130,6 +1130,21 @@ pub async fn handle_daemon_ws_message(
                         flush: false, gagged: false,
                     });
                 }
+                Command::Import { .. } => {
+                    // Same reasoning as the WS-bounced-command rejection in main.rs: the
+                    // command line can't carry a password/auth-key, so a dedicated
+                    // ImportSettings message is required (later plan step).
+                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                        world_index,
+                        data: "Use the /import dialog (not the command line) so your password/auth-key aren't sent unprotected.".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                        seq: 0,
+                        marked_new: false,
+                        flush: false, gagged: false,
+                    });
+                }
                 // Commands that execute locally on the client
                 Command::Quit | Command::Update { .. } => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });

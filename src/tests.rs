@@ -3410,7 +3410,7 @@
         // When adding a new command to parse_command(), add it here too.
         let mut rust_commands: Vec<String> = vec![
             "help", "version", "quit", "reload", "update", "setup", "web", "actions",
-            "connections", "l", "worlds", "world", "disconnect", "dc", "connect",
+            "connections", "l", "worlds", "world", "disconnect", "dc", "connect", "import",
             "flush", "menu", "send", "remote", "ban", "unban",
             "testmusic", "dump", "notify", "addworld", "note", "tag", "tags",
             "dict", "urban", "translate", "tr", "font", "window",

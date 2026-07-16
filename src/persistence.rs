@@ -272,6 +272,43 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
     // B2 (security remediation): settings.dat holds encrypted-at-rest passwords/tokens —
     // create it owner-only (0600 on Unix) instead of default (often world-readable) perms.
     let mut file = crate::util::secure_create_file(path)?;
+    write_settings_dat(app, &mut file, false)?;
+    drop(file);
+
+    // Debug-gated audit trail: log which [global] keys changed, old -> new, along with
+    // the source of the write and a backtrace of the code path that triggered it. Only
+    // active when debug mode is on (see CLAUDE.md debug-logging conventions), so this
+    // costs nothing normally but is available to diagnose a future settings-loss report.
+    if debug_on {
+        let new_global = read_global_section(path);
+        append_settings_audit_log(source, &old_global, &new_global);
+    }
+
+    Ok(())
+}
+
+/// Serializes the current settings to `settings.dat` text (same format as the file on
+/// disk) with every secret — world passwords, Slack/Discord tokens, the WS password and
+/// auth key — written **in plaintext** rather than encrypted-at-rest. Used only by the
+/// `/import` export path (`RequestSettingsExport` handler): the sender decrypts, the
+/// wire carries plaintext to an authenticated peer (same trust level `InitialState`
+/// already grants — see plan `i-d-like-to-make-snuggly-rain.md`), and the importer
+/// re-encrypts under its own local `machine_key()` before ever touching disk.
+pub fn serialize_settings_for_export(app: &App) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    write_settings_dat(app, &mut buf, true).expect("writing to an in-memory Vec<u8> cannot fail");
+    String::from_utf8(buf).expect("settings.dat content is always valid UTF-8")
+}
+
+/// Writes the settings.dat body (global settings, worlds, actions, TF globals) to `w`.
+/// When `plaintext_secrets` is true, passwords/tokens are written in cleartext instead of
+/// their encrypted-at-rest form — see `serialize_settings_for_export`. Shared so the two
+/// callers can never drift apart on which fields are considered secret.
+fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) -> io::Result<()> {
+    let secret = |s: &str| -> String {
+        if plaintext_secrets { s.to_string() } else { encrypt_password(s) }
+    };
+    let file = w;
 
     // Save global settings
     writeln!(file, "[global]")?;
@@ -303,7 +340,7 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
     // default "clay"; present-but-empty means legacy mode (UI served at "/").
     writeln!(file, "web_path={}", app.settings.web_path)?;
     if !app.settings.websocket_password.is_empty() {
-        writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
+        writeln!(file, "websocket_password={}", secret(&app.settings.websocket_password))?;
     }
     if !app.settings.websocket_allow_list.is_empty() {
         writeln!(file, "websocket_allow_list={}", app.settings.websocket_allow_list)?;
@@ -316,7 +353,7 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
     }
     // Save single device auth key (encrypted, with timestamp)
     if let Some(ref ak) = app.settings.websocket_auth_key {
-        writeln!(file, "websocket_auth_key={}|{}", encrypt_password(&ak.key), ak.created_at)?;
+        writeln!(file, "websocket_auth_key={}|{}", secret(&ak.key), ak.created_at)?;
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
     if !app.settings.dictionary_path.is_empty() {
@@ -346,7 +383,7 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
         writeln!(file, "hostname={}", world.settings.hostname)?;
         writeln!(file, "port={}", world.settings.port)?;
         writeln!(file, "user={}", world.settings.user)?;
-        writeln!(file, "password={}", encrypt_password(&world.settings.password))?;
+        writeln!(file, "password={}", secret(&world.settings.password))?;
         writeln!(file, "use_ssl={}", world.settings.use_ssl)?;
         writeln!(file, "encoding={}", world.settings.encoding.name())?;
         writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
@@ -366,7 +403,7 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
         }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
-            writeln!(file, "slack_token={}", encrypt_password(&world.settings.slack_token))?;
+            writeln!(file, "slack_token={}", secret(&world.settings.slack_token))?;
         }
         if !world.settings.slack_channel.is_empty() {
             writeln!(file, "slack_channel={}", world.settings.slack_channel)?;
@@ -376,7 +413,7 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
         }
         // Discord settings
         if !world.settings.discord_token.is_empty() {
-            writeln!(file, "discord_token={}", encrypt_password(&world.settings.discord_token))?;
+            writeln!(file, "discord_token={}", secret(&world.settings.discord_token))?;
         }
         if !world.settings.discord_guild.is_empty() {
             writeln!(file, "discord_guild={}", world.settings.discord_guild)?;
@@ -447,16 +484,6 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
                 .replace('\n', "\\n");
             writeln!(file, "{}={}", name, val_str)?;
         }
-    }
-    drop(file);
-
-    // Debug-gated audit trail: log which [global] keys changed, old -> new, along with
-    // the source of the write and a backtrace of the code path that triggered it. Only
-    // active when debug mode is on (see CLAUDE.md debug-logging conventions), so this
-    // costs nothing normally but is available to diagnose a future settings-loss report.
-    if debug_on {
-        let new_global = read_global_section(path);
-        append_settings_audit_log(source, &old_global, &new_global);
     }
 
     Ok(())
@@ -557,17 +584,34 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
     if !path.exists() {
         return Ok(());
     }
+    let content = std::fs::read_to_string(path)?;
+    load_settings_from_str(app, &content);
+    Ok(())
+}
 
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-
+/// Parses settings.dat-format text and merges it into `app` **in place**: a `[global]` key
+/// present in `content` overwrites `app.settings`'s matching field; a `[world:name]`/
+/// `[action:name]` section is matched by name (found via `find_or_create_world`/by-name
+/// lookup) and overwrites that entry's fields, creating a new one if the name doesn't
+/// already exist. Anything `content` doesn't mention is left exactly as `app` already had
+/// it. This "merge into existing state" behavior — rather than resetting `app` first — is
+/// what `load_settings_from_path` has always done (needed for `/reload`), and turns out to
+/// be exactly the remote-wins-on-conflict / keep-local-only-entries semantics `/import`'s
+/// `merge_settings_dat` needs (plan `i-d-like-to-make-snuggly-rain.md`): `decrypt_password`
+/// treats an already-plaintext value (no `ENC:` prefix, which is what
+/// `serialize_settings_for_export` emits) as a no-op passthrough, so merging a remote
+/// export's plaintext secrets into `app`'s always-in-memory-plaintext settings needs no new
+/// crypto here — the next `save_settings` re-encrypts everything under the local machine key.
+/// One asymmetry worth knowing: a key `content` omits entirely (e.g. `write_settings_dat`
+/// skips `websocket_password=` when it's empty) leaves `app`'s existing value alone rather
+/// than clearing it — an absent remote value can't "win" a conflict it never entered.
+pub fn load_settings_from_str(app: &mut App, content: &str) {
     let mut current_world: Option<String> = None;
     let mut current_action: Option<usize> = None;
     let mut in_banned_hosts = false;
     let mut in_tf_globals = false;
 
-    for line in reader.lines() {
-        let line = line?;
+    for line in content.lines() {
         let line = line.trim();
 
         if line.is_empty() {
@@ -985,8 +1029,31 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
     }
 
     *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
+}
 
-    Ok(())
+/// Merges a remote Clay instance's exported settings.dat text into `app` — remote-wins on
+/// every key it mentions, local-only worlds/actions/global keys are left untouched. Thin
+/// wrapper over `load_settings_from_str`; see its doc comment for exactly how the merge
+/// and re-encryption work. Part of the `/import` merge step (plan
+/// `i-d-like-to-make-snuggly-rain.md`) — the caller must still call `save_settings` (or
+/// `save_settings_to_path`) afterward to persist the merged, re-encrypted result.
+pub fn merge_settings_dat(app: &mut App, remote_settings_dat: &str) {
+    load_settings_from_str(app, remote_settings_dat);
+}
+
+/// Merges a remote instance's exported theme.dat text into `app.theme_file`. Thin wrapper
+/// over `ThemeFile::merge_remote` — see its doc comment. Part of the `/import` merge step
+/// (plan `i-d-like-to-make-snuggly-rain.md`); no secrets involved, so no re-encryption step.
+pub fn merge_theme_dat(app: &mut App, remote_theme_dat: &str) {
+    app.theme_file.merge_remote(remote_theme_dat);
+}
+
+/// Merges a remote instance's exported keybindings.dat text into `app.keybindings`. Thin
+/// wrapper over `KeyBindings::merge_remote` — see its doc comment. Part of the `/import`
+/// merge step (plan `i-d-like-to-make-snuggly-rain.md`); no secrets involved, so no
+/// re-encryption step.
+pub fn merge_keybindings_dat(app: &mut App, remote_keybindings_dat: &str) {
+    app.keybindings.merge_remote(remote_keybindings_dat);
 }
 
 /// Load settings for multiuser mode from ~/.clay/multiuser.dat
@@ -2649,6 +2716,146 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_serialize_settings_for_export_plaintext_secrets() {
+        let mut app = App::new();
+        app.settings = make_non_default_settings();
+        let mut world = World::new("testworld");
+        world.settings = make_non_default_world_settings();
+        app.worlds.push(world);
+
+        let exported = serialize_settings_for_export(&app);
+
+        // Every secret must appear in plaintext in the export...
+        assert!(exported.contains("websocket_password=testpass\n"),
+            "export should contain plaintext ws password:\n{exported}");
+        assert!(exported.contains("websocket_auth_key=key1|"),
+            "export should contain plaintext auth key:\n{exported}");
+        assert!(exported.contains("password=testpassword\n"),
+            "export should contain plaintext world password:\n{exported}");
+        assert!(exported.contains("slack_token=slack_tok\n"),
+            "export should contain plaintext slack token:\n{exported}");
+        assert!(exported.contains("discord_token=disc_tok\n"),
+            "export should contain plaintext discord token:\n{exported}");
+
+        // ...but the real on-disk save (sharing the same write_settings_dat helper) must
+        // still encrypt at rest - this is the regression check that the refactor didn't
+        // accidentally flip plaintext_secrets for the real save path.
+        let tmp = std::env::temp_dir().join("clay_test_export_vs_disk.dat");
+        let _ = std::fs::remove_file(&tmp);
+        save_settings_to_path(&app, &tmp).expect("save_settings_to_path failed");
+        let on_disk = std::fs::read_to_string(&tmp).expect("read saved settings.dat");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(!on_disk.contains("websocket_password=testpass\n"),
+            "on-disk save must not contain the plaintext ws password:\n{on_disk}");
+        assert!(!on_disk.contains("password=testpassword\n"),
+            "on-disk save must not contain the plaintext world password:\n{on_disk}");
+
+        // Sanity: the encrypted-at-rest value on disk still decrypts back to the original,
+        // i.e. export plaintext and on-disk ciphertext are two views of the same secret.
+        let stored_line = on_disk.lines().find(|l| l.starts_with("password="))
+            .expect("password line present in saved file");
+        let stored = stored_line.trim_start_matches("password=");
+        assert_eq!(decrypt_password(stored), "testpassword");
+    }
+
+    #[test]
+    fn test_import_merge_remote_wins_and_reencrypts() {
+        // "Instance A" — the export source (what /import connects out to).
+        let mut app_a = App::new();
+        app_a.settings.websocket_password = "a_ws_pass".to_string();
+
+        let mut shared_a = World::new("shared_world");
+        shared_a.settings.hostname = "a-host.example.com".to_string();
+        shared_a.settings.password = "a_world_pass".to_string();
+        app_a.worlds.push(shared_a);
+
+        let mut remote_only = World::new("remote_only_world");
+        remote_only.settings.hostname = "remote-only.example.com".to_string();
+        remote_only.settings.password = "remote_only_pass".to_string();
+        app_a.worlds.push(remote_only);
+
+        app_a.theme_file.set_theme("a_theme", theme::ThemeColors::dark_default());
+        app_a.keybindings.set_binding("F5", "remote_action");
+
+        // "Instance B" — the local instance running /import, with its own pre-existing state.
+        let mut app_b = App::new();
+        app_b.settings.websocket_password = "b_ws_pass".to_string();
+
+        let mut shared_b = World::new("shared_world");
+        shared_b.settings.hostname = "b-host.example.com".to_string();
+        shared_b.settings.password = "b_world_pass".to_string();
+        app_b.worlds.push(shared_b);
+
+        let mut local_only = World::new("local_only_world");
+        local_only.settings.hostname = "local-only.example.com".to_string();
+        local_only.settings.password = "local_only_pass".to_string();
+        app_b.worlds.push(local_only);
+
+        app_b.theme_file.set_theme("b_theme", theme::ThemeColors::light_default());
+        app_b.keybindings.set_binding("F6", "local_action");
+
+        // Export A, exactly as the RequestSettingsExport handler would build it, and merge
+        // into B, exactly as the /import driver will (plan step 6).
+        let settings_dat = serialize_settings_for_export(&app_a);
+        let theme_dat = app_a.theme_file.generate_file_content();
+        let keybindings_dat = app_a.keybindings.to_dat_string();
+        merge_settings_dat(&mut app_b, &settings_dat);
+        merge_theme_dat(&mut app_b, &theme_dat);
+        merge_keybindings_dat(&mut app_b, &keybindings_dat);
+
+        // Remote wins on the conflicting global key.
+        assert_eq!(app_b.settings.websocket_password, "a_ws_pass");
+
+        // Remote wins on the conflicting world name; remote-only world is added.
+        assert_eq!(app_b.worlds.len(), 3, "shared + remote_only + local_only");
+        let shared = app_b.worlds.iter().find(|w| w.name == "shared_world").expect("shared_world");
+        assert_eq!(shared.settings.hostname, "a-host.example.com");
+        assert_eq!(shared.settings.password, "a_world_pass");
+        let remote_only = app_b.worlds.iter().find(|w| w.name == "remote_only_world").expect("remote_only_world");
+        assert_eq!(remote_only.settings.password, "remote_only_pass");
+
+        // B's local-only world survives untouched.
+        let local_only = app_b.worlds.iter().find(|w| w.name == "local_only_world").expect("local_only_world");
+        assert_eq!(local_only.settings.hostname, "local-only.example.com");
+        assert_eq!(local_only.settings.password, "local_only_pass");
+
+        // Remote theme/keybinding are added; B's local-only theme/keybinding survive.
+        assert!(app_b.theme_file.themes.contains_key("a_theme"));
+        assert!(app_b.theme_file.themes.contains_key("b_theme"));
+        assert_eq!(app_b.keybindings.get_action("F5"), Some("remote_action"));
+        assert_eq!(app_b.keybindings.get_action("F6"), Some("local_action"));
+
+        // Re-encryption: saving B to disk now must store every password/token encrypted at
+        // rest (never the plaintext that arrived over the wire), and it must decrypt back to
+        // the original. (A real cross-machine /import re-encrypts under a *different*
+        // secure.key than the sender used — this process only has one machine_key() to work
+        // with, but that's exactly why the mechanism matters: the merge step never touches
+        // encrypt/decrypt at all, so the same code path is exercised regardless of whose key
+        // it is — see load_settings_from_str's doc comment.)
+        let tmp = std::env::temp_dir().join("clay_test_import_merge_reencrypt.dat");
+        let _ = std::fs::remove_file(&tmp);
+        save_settings_to_path(&app_b, &tmp).expect("save_settings_to_path failed");
+        let on_disk = std::fs::read_to_string(&tmp).expect("read saved settings.dat");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(!on_disk.contains("a_world_pass"), "plaintext password must not reach disk:\n{on_disk}");
+        assert!(!on_disk.contains("a_ws_pass"), "plaintext ws password must not reach disk:\n{on_disk}");
+
+        let ws_line = on_disk.lines().find(|l| l.starts_with("websocket_password=")).expect("websocket_password line");
+        let ws_stored = ws_line.trim_start_matches("websocket_password=");
+        assert!(ws_stored.starts_with("ENC:"), "websocket_password should be encrypted at rest: {ws_stored}");
+        assert_eq!(decrypt_password(ws_stored), "a_ws_pass");
+
+        let password_lines: Vec<&str> = on_disk.lines().filter(|l| l.starts_with("password=")).collect();
+        assert_eq!(password_lines.len(), 3, "shared_world + remote_only_world + local_only_world:\n{on_disk}");
+        for line in password_lines {
+            let stored = line.trim_start_matches("password=");
+            assert!(stored.starts_with("ENC:"), "world password should be encrypted at rest: {stored}");
+        }
     }
 
     #[test]

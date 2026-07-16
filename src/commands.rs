@@ -1360,6 +1360,17 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
             return false;
         }
+        Command::Import { addr } => {
+            if !app.is_master {
+                app.add_output("Only the master client can use /import.");
+                return false;
+            }
+            // Opens a password/auth-key popup (host prefilled if given); submitting it
+            // drives the in-process import (KeyAction::RunImport in input_handler.rs). See
+            // plan i-d-like-to-make-snuggly-rain.md, step 8.
+            app.popup_manager.open(popup::definitions::import::create_import_popup(&addr));
+            return false;
+        }
         Command::Connect { host: arg_host, port: arg_port, ssl: arg_ssl } => {
             // Only master client can initiate connections
             if !app.is_master {
