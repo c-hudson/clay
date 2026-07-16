@@ -408,6 +408,10 @@
     let worldEditorPopupOpen = false;
     let worldEditorIndex = -1;  // Index of world being edited
 
+    // /import dialog state (see the worldEditorPopupOpen guard below for why this is needed)
+    let importDialogOpen = false;
+    let importInsecureDialogOpen = false;
+
     // Web settings popup state (global state from server)
     let settingsPopupOpen = false;
     let settingsActiveTab = 'general';
@@ -7711,6 +7715,9 @@
             case 'setup':
                 openSettingsPopup('general');
                 break;
+            case 'import':
+                showImportDialog('');
+                break;
             case 'web':
                 openSettingsPopup('web');
                 break;
@@ -8596,6 +8603,32 @@
                 return;
             }
 
+            // Handle /import dialog — same reasoning as worldEditorPopupOpen above: it's a
+            // form with real <input> fields, so every key needs to reach them normally
+            // (arrows, Backspace, Delete, Home/End, Tab are all bound to actions by default
+            // in keybindings.rs and would otherwise fall through to the catch-all below and
+            // steal focus back to the main command line on nearly every keystroke).
+            if (importDialogOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    hideImportDialog();
+                }
+                return;
+            }
+
+            // Handle /import insecure-transport confirm — no text inputs, but still needs a
+            // guard so its own Escape/click handling isn't shadowed by the catch-all below.
+            if (importInsecureDialogOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    importInsecureDialogOpen = false;
+                    pendingImportCredentials = null;
+                    const dlg = document.getElementById('import-insecure-dialog');
+                    if (dlg) dlg.style.display = 'none';
+                }
+                return;
+            }
+
             // Handle world selector popup
             if (worldSelectorPopupOpen) {
                 if (e.key === 'Escape') {
@@ -9310,6 +9343,7 @@
     let pendingImportCredentials = null;
 
     function showImportDialog(prefillAddr) {
+        importDialogOpen = true;
         let dlg = document.getElementById('import-dialog');
         if (!dlg) {
             dlg = document.createElement('div');
@@ -9364,6 +9398,7 @@
     }
 
     function hideImportDialog() {
+        importDialogOpen = false;
         const dlg = document.getElementById('import-dialog');
         if (dlg) {
             dlg.style.display = 'none';
@@ -9371,6 +9406,7 @@
     }
 
     function showImportInsecureConfirmDialog(addr) {
+        importInsecureDialogOpen = true;
         let dlg = document.getElementById('import-insecure-dialog');
         if (!dlg) {
             dlg = document.createElement('div');
@@ -9392,10 +9428,12 @@
         dlg.style.display = 'flex';
 
         document.getElementById('import-insecure-cancel').onclick = function() {
+            importInsecureDialogOpen = false;
             pendingImportCredentials = null;
             dlg.style.display = 'none';
         };
         document.getElementById('import-insecure-go').onclick = function() {
+            importInsecureDialogOpen = false;
             dlg.style.display = 'none';
             if (pendingImportCredentials) {
                 send(Object.assign({ type: 'ImportSettings', allow_insecure: true }, pendingImportCredentials));
