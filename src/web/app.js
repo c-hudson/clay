@@ -4361,8 +4361,12 @@
             return;
         }
 
-        // WebView mode: show image splash instead of text splash
-        if (window.WEBVIEW_MODE && world.showing_splash) {
+        // WebView mode (desktop GUI) or the Android app: show the image splash instead of
+        // the ASCII-art one. clay2.png is served two ways: the desktop GUI's own
+        // clay://clay2.png custom protocol (webview_gui.rs), and — for Android's WebView,
+        // which has no such custom protocol, just a normal HTTP connection to its bundled
+        // local server — the regular /clay2.png HTTP route (http.rs) added alongside it.
+        if ((window.WEBVIEW_MODE || typeof Android !== 'undefined') && world.showing_splash) {
             // On Windows WebView2, custom protocol "clay://" is served as "http://clay.localhost/"
             const imgBase = window.location.origin || 'clay://localhost';
             elements.output.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:5px;">' +

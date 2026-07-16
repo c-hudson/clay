@@ -138,6 +138,12 @@ const WEB_ACTION_EDITOR_HTML: &str = include_str!("web/action-editor.html");
 const FONT_JETBRAINS_MONO: &[u8] = include_bytes!("web/fonts/jetbrains-mono-latin-400.woff2");
 const FONT_NUNITO: &[u8] = include_bytes!("web/fonts/nunito-latin-400.woff2");
 
+/// Clay logo image. Same source `webview_gui.rs` embeds for the native desktop GUI's
+/// `clay://clay2.png` splash image — served here too so any HTTP-connected client (the
+/// Android app's local-mode WebView included) can show the same picture instead of the
+/// ASCII-art splash (`App::generate_splash_lines`).
+const CLAY_LOGO_PNG: &[u8] = include_bytes!("../clay2.png");
+
 /// Seconds to wait for first bytes of an HTTP request before dropping the connection.
 const READ_TIMEOUT_SECS: u64 = 10;
 /// Seconds to wait for a TLS handshake to complete before recording a violation and dropping.
@@ -343,7 +349,7 @@ const KNOWN_ASSET_PATHS: &[&str] = &[
     "/", "/index.html", "/style.css", "/app.js", "/theme-editor",
     "/keybind-editor", "/action-editor",
     "/fonts/jetbrains-mono-latin-400.woff2", "/fonts/nunito-latin-400.woff2",
-    "/favicon.ico",
+    "/favicon.ico", "/clay2.png",
 ];
 
 fn is_known_asset(path: &str) -> bool {
@@ -574,6 +580,9 @@ fn handle_http_routes(
         }
         "/fonts/nunito-latin-400.woff2" => {
             RouteResult::Ok(build_binary_http_response(200, "OK", "font/woff2", FONT_NUNITO, is_https))
+        }
+        "/clay2.png" => {
+            RouteResult::Ok(build_binary_http_response(200, "OK", "image/png", CLAY_LOGO_PNG, is_https))
         }
         "/favicon.ico" => {
             RouteResult::Ok(build_http_response(204, "No Content", "image/x-icon", "", is_https))
