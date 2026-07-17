@@ -1772,7 +1772,7 @@
         // Simulate Tab: release_pending reveals more of the huge line first
         // Remaining vl of huge line: 25 - 17 = 8. Budget is 19.
         // 8 < 19, so partial clears and budget becomes 19 - 8 = 11 for pending.
-        world.release_pending(19 - 8, output_width as usize, false);
+        world.release_pending(19 - 8, output_width as usize, false, 0);
         // visual_line_offset should be cleared by release_pending's scroll_to_bottom
         // (the App-level release_pending_screenful handles the VLO logic, but
         // at the World level, after release_pending, scroll_to_bottom clears it)
@@ -2015,7 +2015,7 @@
         // Each pending line is 7 visual lines. Budget=46 fits 6 lines (42 visual) or 7 lines (49 visual).
         // Since 42+7=49 > 46, it should stop at 6 lines (the 7th would exceed budget).
         let pending_before = world.pending_lines.len();
-        world.release_pending(46, 80, false);
+        world.release_pending(46, 80, false, 0);
         let released = pending_before - world.pending_lines.len();
 
         // Should release 6 lines (42 visual lines fits in 46 budget, 49 would exceed)
@@ -2068,7 +2068,7 @@
         // 500-char line = ceil(500/80) = 7 visual lines
         // "after" = 1 visual line
         // total = 9 visual lines < 46, so all should be released
-        world.release_pending(46, 80, false);
+        world.release_pending(46, 80, false, 0);
         assert_eq!(world.pending_lines.len(), 0,
             "All {} pending lines should fit in visual budget of 46", pending);
     }
@@ -2077,7 +2077,7 @@
     fn test_wrap_ansi_line_no_spaces() {
         // No spaces = hard wrap at character boundary
         let line = "a".repeat(100);
-        let lines = wrap_ansi_line(&line, 10);
+        let lines = wrap_ansi_line(&line, 10, 0);
         assert_eq!(lines.len(), 10, "Should produce 10 visual lines");
         for (i, vl) in lines.iter().enumerate() {
             let stripped = strip_ansi_codes(vl);
@@ -2097,7 +2097,7 @@
         //   Line 2: "ccc ddd " (wraps at space before "eee")
         //   Line 3: "eee fff"
         let line = "aaa bbb ccc ddd eee fff";
-        let lines = wrap_ansi_line(line, 10);
+        let lines = wrap_ansi_line(line, 10, 0);
         assert!(lines.len() >= 2, "Should produce multiple lines, got {}", lines.len());
         // First line should break at word boundary
         let first_stripped = strip_ansi_codes(&lines[0]);
@@ -2109,7 +2109,7 @@
     fn test_wrap_ansi_line_with_ansi() {
         // Test ANSI color codes carried across line boundaries
         let line = format!("\x1b[31m{}\x1b[0m", "r".repeat(25));
-        let lines = wrap_ansi_line(&line, 10);
+        let lines = wrap_ansi_line(&line, 10, 0);
         assert_eq!(lines.len(), 3, "Should produce 3 lines");
         // Second line should carry the red color code
         assert!(lines[1].contains("\x1b[31m"),
@@ -2122,7 +2122,7 @@
     #[test]
     fn test_wrap_ansi_line_short_passthrough() {
         let line = "hello world";
-        let lines = wrap_ansi_line(line, 80);
+        let lines = wrap_ansi_line(line, 80, 0);
         assert_eq!(lines.len(), 1);
         // Should contain the original text (plus trailing reset)
         assert!(strip_ansi_codes(&lines[0]).contains("hello world"));
@@ -2133,7 +2133,7 @@
         // Simulate the actual test case: space-separated fffff words at width 80
         let words: Vec<String> = (0..1000).map(|i| format!("fffff{}", i)).collect();
         let line = words.join(" ");
-        let lines = wrap_ansi_line(&line, 80);
+        let lines = wrap_ansi_line(&line, 80, 0);
         assert!(lines.len() > 1, "Should produce multiple visual lines");
         // Each visual line (except last) should be <= 80 display width
         for (i, vl) in lines.iter().enumerate() {
@@ -2151,6 +2151,68 @@
                     i, &stripped[..20.min(stripped.len())]);
             }
         }
+    }
+
+    // --- wrapspace (hanging indent on continuation rows) ---
+
+    #[test]
+    fn test_wrap_ansi_line_indent_word_boundary() {
+        // Same as test_wrap_ansi_line_word_boundary but with a 4-space wrapspace indent.
+        // First row unindented; every continuation row gets 4 leading spaces.
+        let line = "aaa bbb ccc ddd eee fff";
+        let lines = wrap_ansi_line(line, 10, 4);
+        assert!(lines.len() >= 2, "Should produce multiple lines, got {}", lines.len());
+        let first_stripped = strip_ansi_codes(&lines[0]);
+        assert!(!first_stripped.starts_with(' '), "First row must not be indented: {:?}", first_stripped);
+        for (i, vl) in lines.iter().enumerate().skip(1) {
+            let stripped = strip_ansi_codes(vl);
+            assert!(stripped.starts_with("    "), "Row {} should start with 4 spaces: {:?}", i, stripped);
+        }
+    }
+
+    #[test]
+    fn test_wrap_ansi_line_indent_zero_adds_no_leading_spaces() {
+        // indent=0 (the wrapspace default) must reproduce the exact pre-wrapspace behavior:
+        // no continuation row gets any leading whitespace added.
+        let line = "aaa bbb ccc ddd eee fff";
+        for vl in &wrap_ansi_line(line, 10, 0) {
+            let stripped = strip_ansi_codes(vl);
+            assert!(!stripped.starts_with(' '), "indent=0 should never add leading spaces: {:?}", stripped);
+        }
+    }
+
+    #[test]
+    fn test_wrap_ansi_line_indent_uncolored_with_active_background() {
+        // A line with an active background color that wraps — the injected indent spaces
+        // on the continuation row must appear BEFORE the color-restoring prefix, so they
+        // render in the terminal's default color, not painted by the active background.
+        let line = format!("\x1b[41m{}\x1b[0m", "x".repeat(30)); // 41 = red background
+        let lines = wrap_ansi_line(&line, 10, 3);
+        assert!(lines.len() >= 2, "Should wrap into multiple rows");
+        let second = &lines[1];
+        // The row must start with the 3 raw indent spaces, THEN the color code — not
+        // color code first (which would paint the indent).
+        assert!(second.starts_with("   \x1b[41m") || second.starts_with("   "),
+            "Continuation row should lead with uncolored indent spaces: {:?}", second);
+        assert!(!second.starts_with("\x1b"), "Indent spaces must precede any color code: {:?}", second);
+    }
+
+    #[test]
+    fn test_wrap_ansi_line_indent_pathological_still_progresses() {
+        // indent >= max_width must not stall/loop — it should clamp internally and still
+        // consume the whole input, leaving at least 1 content column per row.
+        let line = "a".repeat(50);
+        let lines = wrap_ansi_line(&line, 10, 999);
+        assert!(!lines.is_empty(), "Must still produce output");
+        // Every produced row's stripped text must be non-empty (forward progress guaranteed).
+        for (i, vl) in lines.iter().enumerate() {
+            let stripped = strip_ansi_codes(vl);
+            assert!(!stripped.trim().is_empty() || i == lines.len() - 1,
+                "Row {} should carry real content: {:?}", i, stripped);
+        }
+        // All 50 'a' characters must still be present across all rows combined.
+        let total_as: usize = lines.iter().map(|l| strip_ansi_codes(l).matches('a').count()).sum();
+        assert_eq!(total_as, 50, "No characters should be lost at a pathological indent");
     }
 
     #[tokio::test]
@@ -3652,6 +3714,41 @@
         assert!(display_partial.len() < display_full.len(),
             "Partial display ({}) should have fewer lines than full ({})",
             display_partial.len(), display_full.len());
+    }
+
+    /// End-to-end wrapspace check through the full display pipeline (World + Settings +
+    /// build_display_lines), using the exact example text from the feature request, at the
+    /// exact width that produces the reported 3-row wrap. Confirms wrapspace=0 reproduces
+    /// today's behavior and wrapspace=4 hang-indents every continuation row by 4 spaces
+    /// while leaving the first row flush.
+    #[test]
+    fn test_build_display_wrapspace_hanging_indent() {
+        let text = "[Public] P Phantom says, \"Yep. ORignally live around 2010-ish, got resurrected \
+by fans, devs handed over code and license. Google 'City of Heroes: Homecoming' \
+if you're more curious.\"";
+        let width = 80;
+
+        let mut world = World::new("test");
+        world.output_lines.push(make_output_line(text, false));
+        world.scroll_offset = 0;
+
+        // wrapspace=0 — must match current (pre-feature) behavior exactly.
+        let settings_off = Settings { wrapspace: 0, ..Settings::default() };
+        let display_off = build_display_lines(&world, &settings_off, 21, width, false);
+        assert!(display_off.len() >= 3, "Expected this line to wrap to 3+ rows at width {}: got {}", width, display_off.len());
+        for row in &display_off {
+            assert!(!row.text.starts_with(' '), "wrapspace=0 must add no indent: {:?}", row.text);
+        }
+
+        // wrapspace=4 — every row after the first gets a 4-space hang indent.
+        let settings_on = Settings { wrapspace: 4, ..Settings::default() };
+        let display_on = build_display_lines(&world, &settings_on, 21, width, false);
+        assert_eq!(display_on.len(), display_off.len(),
+            "Row count should be identical here since 4 columns of indent doesn't push this text past an extra wrap boundary");
+        assert!(!display_on[0].text.starts_with(' '), "First row must stay flush: {:?}", display_on[0].text);
+        for (i, row) in display_on.iter().enumerate().skip(1) {
+            assert!(row.text.starts_with("    "), "Row {} should be indented 4 spaces: {:?}", i, row.text);
+        }
     }
 
     // --- Integration test with test harness ---

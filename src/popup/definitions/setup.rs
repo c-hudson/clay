@@ -27,6 +27,7 @@ pub const SETUP_FIELD_TTS: FieldId = FieldId(18);
 pub const SETUP_FIELD_TTS_SPEAK_MODE: FieldId = FieldId(19);
 pub const SETUP_FIELD_SCROLLBACK: FieldId = FieldId(20);
 pub const SETUP_FIELD_URL_SHORTENER: FieldId = FieldId(21);
+pub const SETUP_FIELD_WRAPSPACE: FieldId = FieldId(22);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -104,6 +105,7 @@ pub fn create_setup_popup(
     tts_speak_mode: &str,
     scrollback: bool,
     url_shortener: &str,
+    wrapspace: i64,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -212,6 +214,11 @@ pub fn create_setup_popup(
             "URL Shortener",
             FieldKind::select(url_shortener_options(), url_shortener_idx),
         ))
+        .with_field(Field::new(
+            SETUP_FIELD_WRAPSPACE,
+            "Wrap Space",
+            FieldKind::number_range(wrapspace, 0, 20),
+        ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
@@ -292,6 +299,10 @@ fn setup_help_text() -> Vec<String> {
         "  TinyURL: independent operator.",
         "  da.gd: independent operator.",
         "  Switch if your current service is unavailable.",
+        "",
+        "Wrap Space: Number of spaces to hang-indent wrapped",
+        "  continuation lines of long MUD output (0 = off).",
+        "  Like TinyFugue's wrapspace, but defaults to 0.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -305,13 +316,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", false, "is.gd",
+            false, "off", "words", false, "is.gd", 0,
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 18);
+        assert_eq!(state.definition.fields.len(), 19);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -320,7 +331,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, "edge", "sentences", true, "tinyurl",
+            false, "edge", "sentences", true, "tinyurl", 4,
         );
         let state = PopupState::new(def);
 
@@ -334,5 +345,6 @@ mod tests {
         assert_eq!(state.get_bool(SETUP_FIELD_TLS_PROXY), Some(true));
         assert_eq!(state.get_bool(SETUP_FIELD_MOUSE), Some(true));
         assert_eq!(state.get_bool(SETUP_FIELD_ZWJ), Some(true));
+        assert_eq!(state.get_number(SETUP_FIELD_WRAPSPACE), Some(4));
     }
 }

@@ -225,40 +225,48 @@ pub fn nli_wrap_width(output_width: usize, marked_new: bool, nli_enabled: bool) 
 /// Visual row count for a line, using the indicator-aware wrap width.
 /// This must match the wrap width used in `render_output_crossterm` so that
 /// row-budget accounting (pause trigger, visual_line_offset, release_pending)
-/// agrees with what the renderer actually draws.
-pub fn nli_visual_rows(text: &str, output_width: usize, marked_new: bool, nli_enabled: bool) -> usize {
+/// agrees with what the renderer actually draws. `indent` is the `wrapspace` setting —
+/// threaded through so this count matches `wrap_ansi_line`'s actual row count exactly
+/// (it calls the same function, so the internal effective-indent clamp there keeps this
+/// automatically consistent even at pathological indent/width combinations).
+pub fn nli_visual_rows(text: &str, output_width: usize, marked_new: bool, nli_enabled: bool, indent: usize) -> usize {
     use crate::rendering::wrap_ansi_line;
-    wrap_ansi_line(text, nli_wrap_width(output_width, marked_new, nli_enabled))
+    wrap_ansi_line(text, nli_wrap_width(output_width, marked_new, nli_enabled), indent)
         .len()
         .max(1)
 }
 
-/// Calculate the number of visual lines a string takes when wrapped to width
-pub fn visual_line_count(line: &str, width: usize) -> usize {
+/// Calculate the number of visual lines a string takes when wrapped to width. `indent` is
+/// the `wrapspace` setting: the first row holds `width` columns, every continuation row
+/// holds `width - indent` (clamped so at least 1 column remains, mirroring
+/// `wrap_ansi_line`'s internal clamp — this function doesn't call `wrap_ansi_line` itself,
+/// it's a cheaper div_ceil-based approximation, so the clamp needs to be duplicated here to
+/// stay consistent with it).
+pub fn visual_line_count(line: &str, width: usize, indent: usize) -> usize {
     if width == 0 {
         return 1;
     }
+    let eff_indent = indent.min(width.saturating_sub(1));
+    let cont_width = width - eff_indent;
+    let rows_for = |line_width: usize| -> usize {
+        // line_width == 0 falls into this arm too (0 <= width always holds since the
+        // width == 0 case already returned above) — same "1 row" result either way.
+        if line_width <= width {
+            1
+        } else {
+            1 + (line_width - width).div_ceil(cont_width)
+        }
+    };
     match line.as_bytes().into_text() {
         Ok(text) => {
             let mut total = 0;
             for l in text.lines {
                 let line_width: usize = l.spans.iter().map(|s| s.content.width()).sum();
-                if line_width == 0 {
-                    total += 1;
-                } else {
-                    total += line_width.div_ceil(width);
-                }
+                total += rows_for(line_width);
             }
             total.max(1)
         }
-        Err(_) => {
-            let line_width = line.width();
-            if line_width == 0 {
-                1
-            } else {
-                line_width.div_ceil(width)
-            }
-        }
+        Err(_) => rows_for(line.width()),
     }
 }
 
@@ -1192,22 +1200,32 @@ mod tests {
 
     #[test]
     fn test_visual_lines_short() {
-        assert_eq!(visual_line_count("hello", 80), 1);
+        assert_eq!(visual_line_count("hello", 80, 0), 1);
     }
 
     #[test]
     fn test_visual_lines_wrapping() {
-        assert_eq!(visual_line_count("12345678901234567890", 10), 2);
+        assert_eq!(visual_line_count("12345678901234567890", 10, 0), 2);
     }
 
     #[test]
     fn test_visual_lines_empty() {
-        assert_eq!(visual_line_count("", 80), 1);
+        assert_eq!(visual_line_count("", 80, 0), 1);
     }
 
     #[test]
     fn test_visual_lines_zero_width() {
-        assert_eq!(visual_line_count("hello", 0), 1);
+        assert_eq!(visual_line_count("hello", 0, 0), 1);
+    }
+
+    #[test]
+    fn test_visual_lines_with_indent() {
+        // 20 columns of content at width 10: first row holds 10, remaining 10 needs
+        // ceil(10 / (10-2)) = 2 continuation rows with indent 2 => 3 total.
+        assert_eq!(visual_line_count("12345678901234567890", 10, 2), 3);
+        // indent >= width clamps to width-1 (=9 here), leaving 1 content column per
+        // continuation row: first row holds 10, remaining 10 needs ceil(10/1) = 10 rows.
+        assert_eq!(visual_line_count("12345678901234567890", 10, 15), 11);
     }
 
     // --- truncate_str ---

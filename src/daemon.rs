@@ -1482,7 +1482,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1495,6 +1495,13 @@ pub async fn handle_daemon_ws_message(
             app.settings.gui_theme = Theme::from_name(&gui_theme);
             app.settings.gui_transparency = gui_transparency;
             app.settings.color_offset_percent = color_offset_percent;
+            // No clamp on wrapspace itself — wrap_ansi_line/visual_line_count clamp the
+            // effective indent internally. Rewrap already-visible output immediately
+            // (mirrors a terminal resize) only when it actually changed.
+            if app.settings.wrapspace != wrapspace {
+                app.settings.wrapspace = wrapspace;
+                app.needs_output_redraw = true;
+            }
             app.settings.font_name = font_name;
             app.settings.font_size = font_size;
             app.settings.web_font_size_phone = web_font_size_phone;
@@ -1647,7 +1654,7 @@ pub async fn handle_daemon_ws_message(
                     let mut visual_total = 0;
                     let mut logical_count = 0;
                     for line in &app.worlds[world_index].pending_lines {
-                        let vl = visual_line_count(&line.text, width);
+                        let vl = visual_line_count(&line.text, width, app.settings.wrapspace as usize);
                         if visual_total > 0 && visual_total + vl > visual_budget {
                             break;
                         }
@@ -1673,7 +1680,7 @@ pub async fn handle_daemon_ws_message(
                         .collect();
 
                     // Release the lines
-                    app.worlds[world_index].release_pending(visual_budget, client_width, app.settings.new_line_indicator);
+                    app.worlds[world_index].release_pending(visual_budget, client_width, app.settings.new_line_indicator, app.settings.wrapspace as usize);
 
                     // Broadcast the released lines to clients viewing this world,
                     // but skip clients that already have these lines from InitialState
@@ -2096,6 +2103,28 @@ pub async fn handle_daemon_ws_message(
                 ).await;
                 let _ = event_tx.send(AppEvent::ImportResult(client_id, addr, result)).await;
             });
+        }
+        // Full state resync — mirrors the handler in main.rs's App::handle_ws_message
+        // (WsMessage::RequestState). Needed here too since --local-server (Android
+        // on-device mode) and -D (run_daemon_server) both dispatch through this function
+        // instead of main.rs's. Without this arm the message silently fell into the
+        // catch-all below: no reply, no error — the exact same class of bug as the
+        // /import handlers above, this time affecting reconnect/wake-from-background
+        // resync (web/Android ping the server on visibility change and call RequestState
+        // when the connection looks stale).
+        WsMessage::RequestState => {
+            let initial_state = app.build_initial_state();
+            app.ws_send_initial_state_and_mark(client_id, initial_state);
+            // Set client's initial world so broadcast_to_world_viewers works immediately
+            app.ws_set_client_world(client_id, Some(app.current_world_index));
+            // Also send current activity count and pause state
+            app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+                count: app.activity_count(),
+            });
+            let is_paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
+            if is_paused {
+                app.ws_send_to_client(client_id, WsMessage::PausedState { paused: true });
+            }
         }
         _ => {}
     }

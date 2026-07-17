@@ -1417,6 +1417,10 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.settings.scrollback_enabled = settings.scrollback;
                 app.settings.url_shortener_service = crate::encoding::UrlShortener::from_name(&settings.url_shortener);
+                // No local needs_output_redraw here — this is a remote console client; the
+                // master (which owns rendering for its own TUI) applies its own redraw when
+                // it processes the resulting UpdateGlobalSettings message below.
+                app.settings.wrapspace = settings.wrapspace.clamp(0, 20) as u8;
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -1431,6 +1435,8 @@ pub(crate) fn handle_remote_client_key(
                     gui_theme: app.settings.gui_theme.name().to_string(),
                     gui_transparency: app.settings.gui_transparency,
                     color_offset_percent: app.settings.color_offset_percent,
+                    // app.settings.wrapspace was already updated from the popup above.
+                    wrapspace: app.settings.wrapspace,
                     input_height: app.input_height,
                     font_name: app.settings.font_name.clone(),
                     font_size: app.settings.font_size,
@@ -2211,6 +2217,7 @@ pub(crate) fn apply_remote_web_settings(
         gui_theme: app.settings.gui_theme.name().to_string(),
         gui_transparency: app.settings.gui_transparency,
         color_offset_percent: app.settings.color_offset_percent,
+        wrapspace: app.settings.wrapspace,  // unchanged — this function only touches web settings
         input_height: app.input_height,
         font_name: app.settings.font_name.clone(),
         font_size: app.settings.font_size,

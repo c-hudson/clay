@@ -113,9 +113,19 @@ body {
 #output .line {
     line-height: 1.0;
     margin: 0;
-    padding: 0;
+    padding-top: 0;
+    padding-right: 0;
+    padding-bottom: 0;
     display: block;
     min-height: 1em;
+    /* wrapspace: hanging indent for wrapped continuation rows. --wrapspace is a unitless
+       column count set live via document.documentElement.style.setProperty() (see
+       applyWrapspace() in app.js). The negative text-indent pulls the FIRST line back to
+       column 0 (out of the padding), so only rows the browser actually wraps to (i.e. every
+       row after the first) end up indented by padding-left. Font is monospace (var(--mono))
+       so 1ch == the width of any character, keeping the indent exact. */
+    padding-left: calc(var(--wrapspace, 0) * 1ch);
+    text-indent: calc(var(--wrapspace, 0) * -1ch);
 }
 
 /* ANSI color classes - use theme variables with fallbacks */

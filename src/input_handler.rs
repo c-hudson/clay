@@ -627,6 +627,15 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.init_scrollback();
                 }
                 app.settings.url_shortener_service = crate::encoding::UrlShortener::from_name(&settings.url_shortener);
+                // Rewrap already-visible output immediately (mirrors a terminal resize) only
+                // when wrapspace actually changed, so an unrelated setup save doesn't force
+                // a spurious redraw. No clamp beyond the popup's 0-20 field range — the
+                // width-aware clamp inside wrap_ansi_line/visual_line_count handles the rest.
+                let new_wrapspace = settings.wrapspace.clamp(0, 20) as u8;
+                if app.settings.wrapspace != new_wrapspace {
+                    app.settings.wrapspace = new_wrapspace;
+                    app.needs_output_redraw = true;
+                }
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }

@@ -31,10 +31,19 @@ const BREAK_CHARS: &[char] = &[']', ')', ',', '\\', '/', '-', '_', '&', '=', '?'
 // Similar to CSS white-space: pre-wrap; word-wrap: break-word
 // Optimized to track byte positions instead of cloning the full string at every break point
 // (still clones the small active_codes vector, but that's typically 0-5 elements)
-pub(crate) fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
+//
+// `indent`: number of uncolored leading spaces to prepend to every continuation row (i.e.
+// every wrapped row after the first) — the `wrapspace` setting. Clamped internally to
+// `max_width - 1` so a pathologically large value can never eat the entire row width and
+// stall progress; the caller doesn't need to pre-clamp. 0 reproduces the pre-wrapspace
+// behavior exactly (continuation rows start at column 0, matching the old fixed function).
+pub(crate) fn wrap_ansi_line(line: &str, max_width: usize, indent: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![line.to_string()];
     }
+    // Always leave at least 1 column for real content, no matter how large `indent` is
+    // relative to `max_width` (e.g. a narrow terminal/window with a large wrapspace).
+    let eff_indent = indent.min(max_width.saturating_sub(1));
 
     let mut result = Vec::new();
     let mut current_line = String::new();
@@ -192,8 +201,10 @@ pub(crate) fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
 
                     let prefix = build_prefix(&last_break_codes, &last_break_hyperlink);
                     let remainder = &current_line[last_break_byte_pos..];
-                    current_line = prefix + remainder;
-                    current_width -= last_break_width;
+                    // Indent spaces go BEFORE the color prefix so they're never painted by
+                    // an active background/foreground color — always plain uncolored indent.
+                    current_line = " ".repeat(eff_indent) + &prefix + remainder;
+                    current_width = current_width - last_break_width + eff_indent;
                 } else if has_space_on_line && last_space_width > 0 {
                     // Break at word boundary - emit up to and including the space
                     let mut break_line = current_line[..last_space_byte_pos].to_string();
@@ -203,14 +214,14 @@ pub(crate) fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
                     // Start new line with content after the space
                     let prefix = build_prefix(&last_space_codes, &last_space_hyperlink);
                     let remainder = &current_line[last_space_byte_pos..];
-                    current_line = prefix + remainder;
-                    current_width -= last_space_width;
+                    current_line = " ".repeat(eff_indent) + &prefix + remainder;
+                    current_width = current_width - last_space_width + eff_indent;
                 } else {
                     // No break point at all - hard wrap at current position
                     current_line.push_str(&build_suffix(&active_hyperlink));
                     result.push(current_line);
-                    current_line = build_prefix(&active_codes, &active_hyperlink);
-                    current_width = 0;
+                    current_line = " ".repeat(eff_indent) + &build_prefix(&active_codes, &active_hyperlink);
+                    current_width = eff_indent;
                 }
 
                 // Reset tracking for new line
@@ -451,7 +462,7 @@ pub fn build_display_lines(
         } else {
             term_width
         };
-        wrap_ansi_line(&with_emoji_links, wrap_width)
+        wrap_ansi_line(&with_emoji_links, wrap_width, settings.wrapspace as usize)
             .into_iter()
             .map(|s| (s, highlight_f8, hl_color.clone(), mn))
             .collect()
@@ -683,7 +694,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
         if fa {
             wrap_width = wrap_width.saturating_sub(ARCHIVE_PREFIX_WIDTH);
         }
-        wrap_ansi_line(&with_emoji_links, wrap_width)
+        wrap_ansi_line(&with_emoji_links, wrap_width, app.settings.wrapspace as usize)
             .into_iter()
             .map(|s| (s, highlight_f8, hl_color.clone(), mn, fa))
             .collect()
@@ -1258,7 +1269,7 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
             let mut wrap_width = area_width;
             if is_new { wrap_width = wrap_width.saturating_sub(nli_prefix_width); }
             if is_archive { wrap_width = wrap_width.saturating_sub(ARCHIVE_PREFIX_WIDTH); }
-            let wrapped = wrap_ansi_line(&expanded, wrap_width);
+            let wrapped = wrap_ansi_line(&expanded, wrap_width, app.settings.wrapspace as usize);
 
             for w in wrapped.into_iter().rev() {
                 let prefixed = match (is_new, is_archive) {

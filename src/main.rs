@@ -1461,6 +1461,10 @@ pub struct Settings {
     gui_transparency: f32,  // GUI window transparency (0.0-1.0)
     // Color contrast adjustment for web/GUI (0 = disabled, 1-100 = adjustment percentage)
     color_offset_percent: u8,
+    // TinyFugue-style wrapspace: number of leading spaces to hang-indent every continuation
+    // row of a wrapped output line (0 = disabled/current behavior, unlike TF's own default).
+    // Width-aware-clamped inside wrap_ansi_line/visual_line_count, not here — see their docs.
+    wrapspace: u8,
     // Remote GUI font settings
     font_name: String,
     font_size: f32,
@@ -1520,6 +1524,7 @@ impl Default for Settings {
             gui_theme: Theme::Dark,
             gui_transparency: 1.0,
             color_offset_percent: 0,   // 0 = disabled, 1-100 = adjustment percentage
+            wrapspace: 0,   // 0 = no hanging indent (current behavior); TF itself defaults differently
             font_name: String::new(),  // Empty means use system default
             font_size: 14.0,
             // Web interface font sizes (per device type)
@@ -2702,7 +2707,7 @@ impl World {
             let nli = settings.new_line_indicator;
             let mut visible = 0;
             for line in self.output_lines.iter().rev() {
-                let vl = nli_visual_rows(&line.text, width, line.marked_new, nli);
+                let vl = nli_visual_rows(&line.text, width, line.marked_new, nli, settings.wrapspace as usize);
                 if visible + vl > max_lines {
                     break;
                 }
@@ -2813,7 +2818,7 @@ impl World {
             // with the same effective width the renderer uses (reduced by NLI_PREFIX_WIDTH
             // when the NLI setting is on and the line is marked_new), so that
             // pause/partial-display budgeting stays in sync with what's drawn.
-            let visual_lines = nli_visual_rows(line, output_width as usize, !is_current, settings.new_line_indicator);
+            let visual_lines = nli_visual_rows(line, output_width as usize, !is_current, settings.new_line_indicator, settings.wrapspace as usize);
 
             // Track if this line goes to pending (for partial tracking)
             let goes_to_pending = self.paused && settings.more_mode_enabled;
@@ -2980,7 +2985,7 @@ impl World {
 
     /// Release pending lines, counting by VISUAL lines (wrapped line count) to fill
     /// approximately one screenful. Always releases at least one logical line.
-    pub fn release_pending(&mut self, visual_budget: usize, output_width: usize, nli_enabled: bool) {
+    pub fn release_pending(&mut self, visual_budget: usize, output_width: usize, nli_enabled: bool, wrapspace: usize) {
         // Reset visual_line_offset so truncated wrapped lines from the pause trigger
         // are fully visible after releasing.
         self.visual_line_offset = 0;
@@ -2994,7 +2999,7 @@ impl World {
         let mut logical_count = 0;
 
         for line in &self.pending_lines {
-            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli_enabled);
+            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli_enabled, wrapspace);
             // If adding this line would exceed budget AND we already have at least one,
             // stop before adding it. Always release at least 1 line.
             if visual_total > 0 && visual_total + vl > visual_budget {
@@ -3403,6 +3408,7 @@ impl App {
             gui_theme: self.settings.gui_theme.name().to_string(),
             gui_transparency: self.settings.gui_transparency,
             color_offset_percent: self.settings.color_offset_percent,
+            wrapspace: self.settings.wrapspace,
             input_height: self.input_height,
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
@@ -3454,6 +3460,7 @@ impl App {
         self.settings.gui_theme = Theme::from_name(&settings.gui_theme);
         self.settings.gui_transparency = settings.gui_transparency;
         self.settings.color_offset_percent = settings.color_offset_percent;
+        self.settings.wrapspace = settings.wrapspace;
         self.input_height = settings.input_height;
         self.input.visible_height = self.input_height;
         self.settings.font_name = settings.font_name.clone();
@@ -3845,6 +3852,7 @@ impl App {
             self.settings.tts_speak_mode.name(),
             self.settings.scrollback_enabled,
             self.settings.url_shortener_service.name(),
+            self.settings.wrapspace as i64,
         );
         self.popup_manager.open(def);
 
@@ -8009,7 +8017,7 @@ impl App {
                         let mut visual_total = 0;
                         let mut logical_count = 0;
                         for line in &self.worlds[world_index].pending_lines {
-                            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli);
+                            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli, self.settings.wrapspace as usize);
                             if visual_total > 0 && visual_total + vl > visual_budget {
                                 break;
                             }
@@ -8036,7 +8044,7 @@ impl App {
                             .collect();
 
                         // Release the lines on the server
-                        self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator);
+                        self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator, self.settings.wrapspace as usize);
 
                         // Broadcast the released lines to clients viewing this world
                         if !lines_to_broadcast.is_empty() {
@@ -8129,7 +8137,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -8145,6 +8153,14 @@ impl App {
                 self.settings.gui_theme = Theme::from_name(&gui_theme);
                 self.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
                 self.settings.color_offset_percent = color_offset_percent.min(100);
+                // No clamp on wrapspace itself — wrap_ansi_line/visual_line_count clamp the
+                // effective indent internally against whatever width is in play. Rewrap
+                // already-visible output immediately (mirrors a terminal resize) only when
+                // it actually changed, so an unrelated settings save doesn't force a redraw.
+                if self.settings.wrapspace != wrapspace {
+                    self.settings.wrapspace = wrapspace;
+                    self.needs_output_redraw = true;
+                }
                 self.input_height = input_height.clamp(1, 15);
                 self.input.visible_height = self.input_height;
                 self.settings.font_name = font_name;
@@ -9383,6 +9399,7 @@ impl App {
         let visible_height = (self.output_height as usize).max(1);
         let width = (self.output_width as usize).max(1);
         let show_tags = self.show_tags;
+        let wrapspace = self.settings.wrapspace as usize;
         let world_idx = self.current_world_index;
 
         self.worlds[world_idx].visual_line_offset = 0;
@@ -9392,7 +9409,7 @@ impl App {
             let mut vlines = 0usize;
             for (idx, line) in output_lines.iter().enumerate() {
                 if show_tags || !line.gagged {
-                    vlines += visual_line_count(&line.text, width);
+                    vlines += visual_line_count(&line.text, width, wrapspace);
                 }
                 if vlines >= visible_height {
                     min = idx;
@@ -9425,7 +9442,7 @@ impl App {
 
         while visual_lines_moved < target_visual_lines {
             if show_tags || !world.output_lines[new_offset].gagged {
-                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width, wrapspace);
             }
             if new_offset == 0 {
                 break;
@@ -9445,6 +9462,7 @@ impl App {
         let visible_height = (self.output_height as usize).max(1);
         let width = (self.output_width as usize).max(1);
         let show_tags = self.show_tags;
+        let wrapspace = self.settings.wrapspace as usize;
         let world_idx = self.current_world_index;
 
         self.worlds[world_idx].visual_line_offset = 0;
@@ -9454,7 +9472,7 @@ impl App {
             let mut vlines = 0usize;
             for (idx, line) in output_lines.iter().enumerate() {
                 if show_tags || !line.gagged {
-                    vlines += visual_line_count(&line.text, width);
+                    vlines += visual_line_count(&line.text, width, wrapspace);
                 }
                 if vlines >= visible_height {
                     min = idx;
@@ -9484,7 +9502,7 @@ impl App {
         let mut new_offset = world.scroll_offset;
         while visual_lines_moved < lines {
             if show_tags || !world.output_lines[new_offset].gagged {
-                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width, wrapspace);
             }
             if new_offset == 0 {
                 break;
@@ -9503,6 +9521,7 @@ impl App {
         let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
         let width = (self.output_width as usize).max(1);
         let show_tags = self.show_tags;
+        let wrapspace = self.settings.wrapspace as usize;
         let world = self.current_world_mut();
         world.visual_line_offset = 0;
         let max_scroll = world.output_lines.len().saturating_sub(1);
@@ -9518,7 +9537,7 @@ impl App {
 
         while new_offset <= max_scroll && visual_lines_moved < target_visual_lines {
             if show_tags || !world.output_lines[new_offset].gagged {
-                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width, wrapspace);
             }
             new_offset += 1;
         }
@@ -9549,7 +9568,7 @@ impl App {
             }
             if partial_idx < self.worlds[world_idx].output_lines.len() {
                 let partial_line = &self.worlds[world_idx].output_lines[partial_idx];
-                let total_vl = nli_visual_rows(&partial_line.text, width, partial_line.marked_new, self.settings.new_line_indicator);
+                let total_vl = nli_visual_rows(&partial_line.text, width, partial_line.marked_new, self.settings.new_line_indicator, self.settings.wrapspace as usize);
                 let remaining = total_vl.saturating_sub(self.worlds[world_idx].visual_line_offset);
                 if remaining > visual_budget {
                     // More of this line than fits on screen — advance offset, done
@@ -9574,7 +9593,7 @@ impl App {
         let mut visual_total = 0;
         let mut logical_count = 0;
         for line in &self.worlds[world_idx].pending_lines {
-            let vl = visual_line_count(&line.text, width);
+            let vl = visual_line_count(&line.text, width, self.settings.wrapspace as usize);
             if visual_total > 0 && visual_total + vl > visual_budget {
                 break;
             }
@@ -9598,7 +9617,8 @@ impl App {
 
         let pending_before = self.worlds[world_idx].pending_lines.len();
         let nli_enabled = self.settings.new_line_indicator;
-        self.current_world_mut().release_pending(visual_budget, output_width, nli_enabled);
+        let wrapspace = self.settings.wrapspace as usize;
+        self.current_world_mut().release_pending(visual_budget, output_width, nli_enabled, wrapspace);
         let released = pending_before - self.worlds[world_idx].pending_lines.len();
 
         // Broadcast released lines to clients viewing this world.
@@ -9916,6 +9936,7 @@ pub(crate) struct SetupSettings {
     pub(crate) tts_speak_mode: String,
     pub(crate) scrollback: bool,
     pub(crate) url_shortener: String,
+    pub(crate) wrapspace: i64,
 }
 
 /// Settings from the web popup
@@ -10065,7 +10086,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
-        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_URL_SHORTENER,
+        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_URL_SHORTENER, SETUP_FIELD_WRAPSPACE,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -10308,6 +10329,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
                     scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
                     url_shortener: state.get_selected(SETUP_FIELD_URL_SHORTENER).unwrap_or("is.gd").to_string(),
+                    wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
                 }
             };
 

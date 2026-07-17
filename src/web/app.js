@@ -226,6 +226,9 @@
         setupColorOffsetValue: document.getElementById('setup-color-offset-value'),
         setupColorOffsetMinus: document.getElementById('setup-color-offset-minus'),
         setupColorOffsetPlus: document.getElementById('setup-color-offset-plus'),
+        setupWrapspaceValue: document.getElementById('setup-wrapspace-value'),
+        setupWrapspaceMinus: document.getElementById('setup-wrapspace-minus'),
+        setupWrapspacePlus: document.getElementById('setup-wrapspace-plus'),
         setupThemeSelect: document.getElementById('setup-theme-select'),
         setupTransparencyRow: document.getElementById('setup-transparency-row'),
         setupTransparencySlider: document.getElementById('setup-transparency-slider'),
@@ -396,6 +399,9 @@
     // Color offset percentage (0 = disabled, 1-100 = adjustment percentage)
     let colorOffsetPercent = 0;
 
+    // Wrapspace: hanging indent (in spaces) for wrapped output continuation rows (0 = off)
+    let wrapspace = 0;
+
     // Command completion state
     let lastCompletionPrefix = '';
     let lastCompletionIndex = -1;
@@ -454,6 +460,7 @@
     let setupArchive = false;
     let setupDebug = false;
     let setupInputHeightValue = 1;
+    let setupWrapspace = 0;
     let setupGuiTheme = 'dark';
     let setupTransparency = 1.0;
 
@@ -626,6 +633,14 @@
 
     function applyFontWeight(w) {
         document.body.style.fontWeight = w;
+    }
+
+    // Apply wrapspace (hanging indent for wrapped output continuation rows) via the
+    // --wrapspace CSS custom property read by #output .line in style.css. No re-render
+    // needed — this is pure CSS reflow, so already-visible wrapped lines re-indent
+    // instantly the moment the property changes.
+    function applyWrapspace(value) {
+        document.documentElement.style.setProperty('--wrapspace', String(value));
     }
 
     function applyAdvancedFontSettings() {
@@ -1980,6 +1995,10 @@
                     if (msg.settings.color_offset_percent !== undefined) {
                         colorOffsetPercent = msg.settings.color_offset_percent;
                     }
+                    if (msg.settings.wrapspace !== undefined) {
+                        wrapspace = msg.settings.wrapspace;
+                        applyWrapspace(wrapspace);
+                    }
                     if (msg.settings.gui_transparency !== undefined) {
                         applyTransparency(msg.settings.gui_transparency);
                     }
@@ -2525,6 +2544,10 @@
                         if (oldOffset !== colorOffsetPercent) {
                             renderOutput(); // Re-render with new color offset
                         }
+                    }
+                    if (msg.settings.wrapspace !== undefined) {
+                        wrapspace = msg.settings.wrapspace;
+                        applyWrapspace(wrapspace); // pure CSS reflow, no re-render needed
                     }
                     if (msg.settings.gui_transparency !== undefined) {
                         applyTransparency(msg.settings.gui_transparency);
@@ -4454,13 +4477,17 @@
                 html = `<span class="action-highlight">${html}</span>`;
             }
 
-            htmlParts.push(`<span data-line-idx="${i}">${html}</span>`);
+            htmlParts.push(`<span class="line" data-line-idx="${i}">${html}</span>`);
         }
 
-        // Join with <br> tags for explicit line breaks.
+        // Each line is its own block-level element (the "line" class, see style.css) so
+        // it auto-stacks vertically without needing <br> separators — this is also what
+        // makes the wrapspace hanging-indent CSS trick possible (text-indent only works
+        // on elements that establish their own line-wrapping context, not plain inline
+        // spans separated by <br>).
         // Defense-in-depth: strip any event handler attributes that slipped through
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
-        elements.output.innerHTML = sanitizeHtml(htmlParts.join('<br>'));
+        elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
         scrollToBottom();
 
         // Clear unseen for current world
@@ -4520,11 +4547,12 @@
         const newLinePrefix = (newLineIndicator && markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
         const html = tsPrefix + newLinePrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
-        // Append to output with a <br> prefix (if not first line)
+        // "line" is a block-level element (see style.css) so it auto-stacks below the
+        // previous one — no <br> separator needed (also what makes the wrapspace
+        // hanging-indent CSS work; see renderOutput()'s comment).
         // Defense-in-depth: strip any event handler attributes that slipped through
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
-        const prefix = elements.output.childNodes.length > 0 ? '<br>' : '';
-        elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(prefix + `<span data-line-idx="${lineIndex}">${html}</span>`));
+        elements.output.insertAdjacentHTML('beforeend', sanitizeHtml(`<span class="line" data-line-idx="${lineIndex}">${html}</span>`));
 
         scheduleScrollToBottom();
     }
@@ -6245,6 +6273,7 @@
         setupDebug = debugEnabled;
         setupArchive = scrollbackEnabled;
         setupInputHeightValue = inputHeight;
+        setupWrapspace = wrapspace;
         setupGuiTheme = guiTheme;
         setupColorOffset = colorOffsetPercent;
         setupTransparency = guiTransparency;
@@ -6334,6 +6363,8 @@
         updateCustomDropdown(elements.setupWorldSwitchSelect);
         // Input height stepper
         elements.setupInputHeightValue.textContent = setupInputHeightValue;
+        // Wrap space stepper
+        elements.setupWrapspaceValue.textContent = setupWrapspace;
         // Color offset stepper
         elements.setupColorOffsetValue.textContent = setupColorOffset === 0 ? 'OFF' : setupColorOffset + '%';
         // Theme dropdown
@@ -6362,6 +6393,7 @@
             gui_theme: guiTheme,
             gui_transparency: guiTransparency,
             color_offset_percent: colorOffsetPercent,
+            wrapspace: wrapspace,
             font_name: fontName,
             font_size: guiFontSize,
             web_font_size_phone: webFontSizePhone,
@@ -6458,6 +6490,8 @@
         if (setupInputHeightValue > 15) setupInputHeightValue = 15;
         if (setupColorOffset < 0) setupColorOffset = 0;
         if (setupColorOffset > 100) setupColorOffset = 100;
+        if (setupWrapspace < 0) setupWrapspace = 0;
+        if (setupWrapspace > 20) setupWrapspace = 20;
 
         moreModeEnabled = setupMoreMode;
         worldSwitchMode = setupWorldSwitchMode;
@@ -6471,9 +6505,11 @@
         scrollbackEnabled = setupArchive;
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
+        wrapspace = setupWrapspace;
         applyTheme(guiTheme);
         setInputHeight(setupInputHeightValue);
         applyTransparency(setupTransparency);
+        applyWrapspace(wrapspace);
         renderOutput();
 
         // Save web settings (skip if multiuser)
@@ -8972,6 +9008,18 @@
         elements.setupHeightPlus.onclick = function() {
             if (setupInputHeightValue < 15) {
                 setupInputHeightValue++;
+                updateSetupPopupUI();
+            }
+        };
+        elements.setupWrapspaceMinus.onclick = function() {
+            if (setupWrapspace > 0) {
+                setupWrapspace--;
+                updateSetupPopupUI();
+            }
+        };
+        elements.setupWrapspacePlus.onclick = function() {
+            if (setupWrapspace < 20) {
+                setupWrapspace++;
                 updateSetupPopupUI();
             }
         };

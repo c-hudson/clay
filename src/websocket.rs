@@ -231,6 +231,8 @@ pub enum WsMessage {
         gui_transparency: f32,
         #[serde(default)]
         color_offset_percent: u8,
+        #[serde(default)]
+        wrapspace: u8,
         input_height: u16,
         font_name: String,
         font_size: f32,
@@ -519,6 +521,8 @@ pub struct GlobalSettingsMsg {
     pub gui_transparency: f32,
     #[serde(default)]
     pub color_offset_percent: u8,
+    #[serde(default)]
+    pub wrapspace: u8,
     pub input_height: u16,
     pub font_name: String,
     pub font_size: f32,
