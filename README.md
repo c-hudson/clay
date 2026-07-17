@@ -11,44 +11,46 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 
 ## Features
 
-- **Multi-World Support** - Connect to multiple MUD servers simultaneously
-- **SSL/TLS** - Secure connections with full TLS support
-- **ANSI Colors** - Full ANSI color and formatting support (256-color, true color)
-- **Web Interface** - Browser-based client via WebSocket
-- **WebView GUI** - Native graphical client using system WebView (wry/tao)
-- **Remote Console** - Connect to a running Clay instance from another terminal
-- **More-Mode** - Pagination for fast-scrolling output
-- **Scrollback** - Unlimited history with PageUp/PageDown navigation
-- **Command History** - Navigate previous commands with Ctrl+P/N
-- **Telnet Protocol** - Full telnet negotiation with keepalive support (SGA, TTYPE, EOR, NAWS, MCCP2, GMCP, MSDP)
-- **Auto-Login** - Configurable automatic login (Connect, Prompt, MOO modes)
-- **Hot Reload** - Update the binary without losing connections (`/reload`)
-- **Crash Recovery** - Automatic restart with state preservation on panic
-- **Self-Update** - Download and install latest release from GitHub (`/update`)
-- **TLS Proxy** - Optional proxy to preserve TLS connections across hot reload
-- **Spell Check** - Built-in spell checking with suggestions
-- **Command Completion** - Tab completion for `/` commands and action names
-- **Output Filtering** - Search/filter output with F4
-- **File Logging** - Per-world output logging
-- **ANSI Music** - BBS-style music playback (web/GUI interfaces)
-- **GMCP** - Generic MUD Communication Protocol for structured data exchange
-- **MSDP** - MUD Server Data Protocol for server variable updates
-- **GMCP Media** - Server-driven sound effects and music via Client.Media protocol
-- **MCCP2 Compression** - Automatic zlib compression for reduced bandwidth (telnet option 86)
-- **Lookup Commands** - Dictionary, Urban Dictionary, translation, and URL shortening (`/dict`, `/urban`, `/translate`, `/url`)
-- **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands, startup actions
-- **TinyFugue Compatibility** - Full TF command support (`/def`, `/set`, `/if`, `/load`, etc.)
-- **Configurable Keybindings** - All keys configurable via `~/.clay.key.dat` with TF defaults, browser-based editor
-- **Kill Ring** - Emacs-style kill ring (Ctrl+K/U/W push, Ctrl+Y yanks)
-- **Themes** - Customizable color themes for GUI/web via `~/clay.theme.dat` with browser-based theme editor
-- **Context Help** - Press `?` in any popup for beginner-friendly help
-- **Notes Editor** - Per-world split-screen notes editor (`/edit`)
-- **Text-to-Speech** - Speak MUD output aloud via local engines or Microsoft Edge neural TTS (`/say`)
-- **Termux Support** - Runs on Android via Termux
-- **Android App** - WebSocket client with push notifications via `/notify`
-- **Grep Mode** - Search world output history or follow live output (`--grep`, `/window --grep`)
-- **Daemon Mode** - Run headless as a background process (`-D`)
-- **Multiuser Mode** - Shared server with per-user worlds and actions (`--multiuser`)
+**Core MUD client.** Connect to multiple MUD servers at once, over SSL/TLS, with full ANSI
+color and formatting (256-color, true color) and a complete telnet negotiation suite (SGA,
+TTYPE, EOR, NAWS, MCCP2 compression, GMCP, MSDP). Configurable auto-login, unlimited
+scrollback with more-mode pagination, command history, built-in spell checking, tab
+completion for commands and action names, output search/filtering, an Emacs-style kill ring,
+and per-world file logging round out the day-to-day experience.
+
+**One server, viewed from anywhere.** The same running Clay instance can be viewed
+simultaneously from the terminal TUI, a native WebView GUI (desktop), a browser over
+WebSocket, a remote console attached from another terminal, and the Android app — which can
+either connect to a remote Clay server or run a complete standalone server on the phone
+itself with no configuration. Hot reload (`/reload`) updates the binary without dropping
+connections, and crash recovery restores state automatically.
+
+**Security & remote access.** Exposing Clay beyond localhost is gated by default: the web UI
+only answers under a stealth path (`/clay/`), an optional IP allow-list hard-drops unlisted
+connections before any handshake, Android proves a shared auth key to reach the server from
+off-list addresses, outbound TLS is pinned on first use (trust-on-first-use) with a
+confirmation prompt if a certificate ever changes, and repeated bad requests earn a ban. See
+[SECURITY-NOTES.md](SECURITY-NOTES.md) for the full picture.
+
+**Settings sync.** `/import` pulls worlds, actions, theme, and keybindings from another
+running Clay instance, so setting up a new device doesn't mean re-entering everything by
+hand.
+
+**TinyFugue compatibility & scripting.** A full TF command layer (`/def`, `/set`, `/if`,
+`/while`, `/for`, `/load`, etc., with `#` as an alternate prefix), pattern-matching
+actions/triggers with regex or wildcards, auto-commands and startup actions, and direct
+import of an existing `.tfrc` — if you know TF, you already know Clay.
+
+**Customization.** Color themes and keybindings are fully configurable (INI files with
+browser-based editors for live preview), fonts and hanging-indent wrap spacing are
+adjustable, and mouse support is on by default in the console.
+
+**Extras.** GMCP/MSDP structured data exchange (including server-driven sound/music via
+Client.Media), BBS-style ANSI music playback, dictionary/Urban Dictionary/translation/URL-
+shortening lookups, text-to-speech via local engines or Microsoft Edge neural TTS, a
+per-world notes editor, a long-term SQLite scrollback archive with full-text search
+(`/recall -D`), self-update from GitHub releases, grep-mode output search, and headless
+daemon/multiuser server modes for shared or unattended deployments.
 
 ## Installation
 
@@ -60,8 +62,10 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 |----------|--------|-------|
 | Linux x86_64 (static) | `clay-linux-x86_64-musl` | TUI only, works on any Linux |
 | Linux x86_64 (GUI) | `clay-linux-x86_64-gui` | TUI + WebView GUI + audio |
-| Linux ARM64 (Termux) | `clay-termux-aarch64` | TUI only, for Android/Termux |
-| Android | `clay-android.apk` | WebSocket client app |
+| Android | `clay-android.apk` | Remote client, or a full standalone server on-device |
+| Termux ARM64 (GUI) | `clay-termux-aarch64` | TUI + WebView GUI, needs [Termux:X11](https://github.com/termux/termux-x11) |
+| Termux ARM64 (TUI only) | `clay-termux-aarch64-nogui` | No GUI dependencies |
+| Termux ARMv7 (TUI only, 32-bit) | `clay-termux-armv7-32bit-nogui` | For older 32-bit devices |
 | macOS (Universal) | `clay-macos-universal` | GUI + audio, Intel & Apple Silicon |
 | Windows x86_64 | `clay-windows-x86_64.exe` | GUI + audio |
 
@@ -142,7 +146,7 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port '*tells you*'
 # Follow live output matching a pattern (like tail -f | grep)
 CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 
-# Use custom config file (default: ~/.clay.dat)
+# Use custom config file (default: ~/.clay/settings.dat)
 ./clay --conf=/path/to/config.dat
 ```
 
@@ -161,11 +165,13 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 
 **Worlds & Connections:**
 
+`/world` and `/worlds` are interchangeable aliases.
+
 | Command | Description |
 |---------|-------------|
 | `/worlds` | Open world selector popup |
 | `/worlds <name>` | Connect to or switch to a world |
-| `/worlds -e [name]` | Edit world settings |
+| `/worlds -e [name]` | Edit world settings — creates the world first if `name` doesn't exist yet |
 | `/worlds -l <name>` | Connect to world without running auto-login |
 | `/worlds -b <name>` | Connect to world in background without switching to it |
 | `/addworld <name> [host port]` | Add/update a world (TF-compatible) |
@@ -183,12 +189,20 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 |---------|-------------|
 | `/setup` | Open global settings |
 | `/web` | Open web/WebSocket settings |
+| `/import [host[:port]]` | Pull worlds, actions, theme, and keybindings from another Clay instance |
 | `/actions [world]` | Open actions/triggers editor |
 | `/edit [file]` | Open split-screen notes editor |
 | `/edit -l` | Open notes list popup |
 | `/font` | Font settings popup (web/GUI only) |
 | `/tag` | Toggle MUD tag display with timestamps (same as F2) |
 | `/say <text>` | Speak text via TTS (uses configured TTS mode) |
+
+**Search & Archive:**
+
+| Command | Description |
+|---------|-------------|
+| `/recall [options] [range] [pattern]` | Search output/input history (see `/help recall` for the full option list) |
+| `/recall -D <pattern>` | Search the long-term scrollback archive (requires "Archive Output" in `/setup`) |
 
 **Lookup & Utility:**
 
@@ -216,7 +230,7 @@ Lookup commands place the result in the input buffer with the cursor at the star
 | Command | Description |
 |---------|-------------|
 | `/testmusic` | Play test ANSI music sequence |
-| `/dump` | Dump scrollback buffers to `~/.clay.dmp.log` |
+| `/dump` | Dump scrollback buffers to `~/.clay/dump.log` |
 
 ## TinyFugue Commands
 
@@ -248,7 +262,7 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 
 ## Controls
 
-All keybindings are configurable via `~/.clay.key.dat`. Defaults follow TinyFugue conventions. A browser-based keybind editor is available at `/keybind-editor`.
+All keybindings are configurable via `~/.clay/keybindings.dat`. Defaults follow TinyFugue conventions. A browser-based keybind editor is available at `/keybind-editor`.
 
 **World Switching:**
 
@@ -323,18 +337,22 @@ All keybindings are configurable via `~/.clay.key.dat`. Defaults follow TinyFugu
 
 ## Android App
 
-The Android app (`clay-android.apk`) is a WebSocket client that connects to a running Clay instance:
+On first launch, the Android app (`clay-android.apk`) asks how you want to run:
 
-1. Run Clay on a server/computer with WebSocket enabled (`/web` settings)
-2. Install the APK on your Android device
-3. Enter the server address and WebSocket password
-4. Connect to control your MUD sessions remotely
+- **Run on This Phone** — spawns a complete Clay server on-device (`--local-server`),
+  loopback-only with a random password generated per launch. No configuration needed; this
+  is the easiest way to try Clay on a phone. Hot reload and the TLS proxy aren't available
+  in this mode.
+- **Connect to a remote server** — the app becomes a WebSocket client of a Clay instance
+  running elsewhere:
+  1. Run Clay on a server/computer with WebSocket enabled (`/web` settings)
+  2. Install the APK and enter the server address and WebSocket password
+  3. Connect to control your MUD sessions remotely
 
-Features:
-- Full MUD client interface
-- Push notifications via `/notify` command
-- Background service keeps connection alive
-- Works alongside Termux native binary
+Either way you get the full MUD client interface, push notifications via `/notify`, and a
+background service that keeps the connection alive. The mode can be changed later in the
+app's settings, and it works alongside the native Termux binary if you'd rather run Clay
+directly in Termux.
 
 ## Web Interface
 
@@ -344,7 +362,30 @@ Enable in `/web` settings:
 2. Set a `WS password` (required for authentication)
 3. Optionally enable `Secure` for HTTPS (auto-generates self-signed certs)
 
-Access via browser at `http://localhost:9000`. HTTP and WebSocket share the same port.
+From `localhost`, access via browser at `http://localhost:9000`. From any other machine,
+the UI is served only under the stealth path `http://yourhost:9000/clay/` by default — see
+[Security](#security) below.
+
+## Security
+
+Clay is gated against unknown callers by default once you expose it beyond localhost:
+
+- **Stealth web path** — the web UI answers only under `/clay/` (configurable, empty
+  restores the old behavior); every other path is silently dropped for non-localhost
+  connections, with no response at all.
+- **IP allow-listing** — set a **WS Allow List** in `/web` and non-listed addresses are
+  dropped at the TCP level, before any TLS handshake or HTTP response.
+- **CLAY-KNOCK** — the Android app can prove a shared auth key to reach the server from an
+  address that isn't on the allow list, without opening it up to everyone.
+- **TLS certificate pinning (TOFU)** — outbound connections (to MUDs, remote consoles, the
+  WebView proxy) pin the server's certificate on first use in `~/.clay/known_hosts.dat`
+  rather than relying on a CA; if the certificate ever changes, the connection blocks and
+  asks you to confirm the new one.
+- **Ban list** — repeated bad requests or failed logins earn a ban, with allow-listed
+  addresses exempted from bans caused by stale bookmarks or protocol typos.
+
+See [SECURITY-NOTES.md](SECURITY-NOTES.md) for exactly what changes, what (if anything)
+might break, and how to opt back into the old, fully-open behavior if you need to.
 
 ## Actions/Triggers
 
@@ -364,7 +405,7 @@ Actions can also be invoked manually by typing `/actionname` in the input. Enabl
 
 Clay supports customizable color themes for the GUI and web interfaces:
 
-- Theme file: `~/clay.theme.dat` (INI format with `[theme:name]` sections)
+- Theme file: `~/.clay/theme.dat` (INI format with `[theme:name]` sections)
 - Browser-based theme editor included for live color preview
 - Select themes in `/setup` (GUI Theme setting)
 - Console uses separate dark/light theme toggle
@@ -381,7 +422,7 @@ Use `/say <text>` to speak text immediately regardless of TTS mode. A per-world 
 
 ## Keybindings
 
-All keyboard shortcuts are configurable via `~/.clay.key.dat` (INI format). Only non-default bindings need to be saved — defaults follow TinyFugue conventions.
+All keyboard shortcuts are configurable via `~/.clay/keybindings.dat` (INI format). Only non-default bindings need to be saved — defaults follow TinyFugue conventions.
 
 ```ini
 [bindings]
@@ -394,7 +435,10 @@ Use `UNBOUND` to remove a default binding. A browser-based keybind editor is ava
 
 ## Configuration
 
-Settings are stored in `~/.clay.dat`. Per-world settings include:
+Settings are stored in `~/.clay/settings.dat` (`~/clay/settings.dat` on Windows). If you're
+upgrading from an older Clay that used `~/.clay.dat`/`~/.clay.key.dat`/`~/clay.theme.dat`,
+those legacy dotfiles are migrated into `~/.clay/` automatically on first run. Per-world
+settings include:
 
 - Hostname, port, SSL toggle
 - Username/password for auto-login
@@ -403,6 +447,14 @@ Settings are stored in `~/.clay.dat`. Per-world settings include:
 - Keepalive type (NOP, Custom, Generic)
 - Log file path
 - TTS mode (Off, Local, Edge) and speaker whitelist
+
+## Importing Settings from Another Clay Instance
+
+`/import [host[:port]]` opens a dialog (with the host pre-filled if you typed one) for
+pulling worlds, actions, theme, and keybindings from another running Clay instance —
+remote values win on conflicts, local-only entries are kept. This is the easiest way to
+set up a new device: enter the address and password in the dialog and everything else
+carries over.
 
 ## License
 
