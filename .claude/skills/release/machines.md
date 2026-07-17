@@ -78,6 +78,39 @@ convention but with `/system/lib` instead of `/system/lib64`), and copies the re
 - Verified: builds clean, produces a valid `ELF32 ARM EABI5` binary, and has been confirmed to run
   on the aarch64 Termux phone (192.168.2.50) via its 32-bit userspace compatibility layer.
 
+### Termux aarch64 binary (cross-compiled, no GUI)
+
+Cross-compiled here on localhost via the same Android NDK as the armv7 build above, targeting
+`aarch64-linux-android` instead. Termux doesn't ship its own libc — it links against Android's
+Bionic (`/system/lib64/libc.so`), the exact libc the NDK's `aarch64-linux-android24-clang`
+targets, so this cross-compile is ABI-compatible with the on-device Termux environment. No-GUI
+only (`rustls-backend`), same as armv7 — no tao/wry/X11 patches or libraries needed. This
+replaced building the no-GUI aarch64 binary on-device (see "Termux aarch64 binary (with GUI,
+no audio)" below, which still builds on-device — the GUI variant is not cross-compilable, it
+needs Termux's own compiled GTK3/WebKit2GTK/X11 libraries which only exist in the Termux
+userland).
+
+**One-time setup:** same as armv7 above (NDK + `patchelf` already covered) plus
+`rustup target add aarch64-linux-android`.
+
+**Build:**
+```bash
+export PATH="$HOME/.local/bin:$PATH"   # same PATH note as armv7 — non-interactive shells
+                                       # don't have ~/.local/bin by default
+./build-termux-aarch64.sh
+```
+This sets `CC_aarch64_linux_android`/`CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` etc. to the
+NDK's `aarch64-linux-android24-clang`, runs `cargo build --release --target aarch64-linux-android
+--no-default-features --features rustls-backend`, then `patchelf --set-rpath
+'/system/lib64:/data/data/com.termux/files/usr/lib'` (the same rpath the on-device build used to
+apply itself), and copies the result out.
+- Binary: `target/aarch64-linux-android/release/clay` → copied to `/tmp/clay-termux-aarch64-nogui`
+- Release asset name: `clay-termux-aarch64-nogui`
+- Verified: builds clean, produces a valid `ELF 64-bit ARM aarch64` binary; confirmed by copying
+  it to the Termux phone (192.168.2.50) and running it there directly — `--version` printed
+  correctly, and a `--local-server` smoke test (bundled SQLite + socket bind + HTTP request)
+  returned `HTTP 200`, both under the phone's real Bionic/Termux environment.
+
 ### Android APK
 ```bash
 cd android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleRelease
@@ -163,6 +196,13 @@ lipo -create \
 - SSH command: `ssh -p 8022 adrick@192.168.2.50`
 
 ### Termux aarch64 binary (with GUI, no audio)
+
+This is the only Termux build still done on-device — it needs Termux's own compiled
+GTK3/WebKit2GTK/X11 libraries (`pkg install webkit2gtk-4.1 xorgproto`), which don't exist
+outside the Termux userland and can't be cross-compiled against (see
+`patches/apply-patches.sh`; the no-GUI aarch64 build was moved to the "Local Machine" section
+above once this stopped being true for it).
+
 ```bash
 cd ~/clay
 git pull
@@ -173,18 +213,6 @@ patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/
 - Binary: `~/clay/target/release/clay`
 - Release asset name: `clay-termux-aarch64`
 - SCP back: `scp -P 8022 adrick@192.168.2.50:~/clay/target/release/clay /tmp/clay-termux-aarch64`
-
-### Termux aarch64 binary (no GUI, reduced library needs)
-
-Built after the GUI binary, once `Cargo.toml`/`Cargo.lock` have been restored to their git state (no tao/wry patches applied) — this build needs no X11/webview libraries at all.
-
-```bash
-cd ~/clay
-cargo build --release --no-default-features --features rustls-backend
-```
-- Binary: `~/clay/target/release/clay`
-- Release asset name: `clay-termux-aarch64-nogui`
-- SCP back: `scp -P 8022 adrick@192.168.2.50:~/clay/target/release/clay /tmp/clay-termux-aarch64-nogui`
 
 ## Linux Test (192.168.2.6) — VERIFICATION ONLY
 
