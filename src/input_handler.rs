@@ -529,9 +529,11 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         }
                     }
                     WorldSelectorAction::Edit(name) => {
-                        // Open world editor using new popup
+                        // Open world editor using new popup. Editing an existing,
+                        // already-saved world - not a fresh creation, so Cancel must not
+                        // remove it.
                         if let Some(idx) = app.find_world(&name) {
-                            app.open_world_editor_popup_new(idx);
+                            app.open_world_editor_popup_new(idx, false);
                         }
                     }
                     WorldSelectorAction::Delete(name) => {
@@ -545,12 +547,14 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         }
                     }
                     WorldSelectorAction::Add => {
-                        // Create new world and open editor using new popup
+                        // Create new world and open editor using new popup. Freshly
+                        // created purely to populate the editor - Cancel must roll it
+                        // back, same as /world -e <new name>.
                         let new_name = format!("World {}", app.worlds.len() + 1);
                         let new_world = World::new(&new_name);
                         app.worlds.push(new_world);
                         let idx = app.worlds.len() - 1;
-                        app.open_world_editor_popup_new(idx);
+                        app.open_world_editor_popup_new(idx, true);
                     }
                 }
             }

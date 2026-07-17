@@ -861,6 +861,12 @@ pub struct PopupState {
     /// Distinct from a `FieldKind::List`/`ScrollableContent`/`EditableList` field's own
     /// internal `scroll_offset`, which lives on the field itself, not here.
     pub scroll_offset: usize,
+    /// Whether the top-level field list currently needs `scroll_offset` (i.e. there are
+    /// more fields than fit the visible area) — set fresh every frame by
+    /// `render_popup_content` in console_renderer.rs. When true, Up/Down navigation and
+    /// the mouse wheel are confined to the field list (see `select_field_only`) instead of
+    /// cycling into the buttons, so the buttons stay reachable only via Tab/Shift+Tab.
+    pub field_list_needs_scroll: bool,
     /// Custom state for complex popups (e.g., filter text)
     pub custom: HashMap<String, String>,
     /// Actual rendered content height (set during rendering, used for scroll calculations)
@@ -926,6 +932,7 @@ impl PopupState {
             error: None,
             error_at: None,
             scroll_offset: 0,
+            field_list_needs_scroll: false,
             custom: HashMap::new(),
             actual_content_height: None,
             hit_areas: Vec::new(),
@@ -1311,11 +1318,40 @@ impl PopupState {
         true
     }
 
+    /// Move selection to the next/prev FIELD only, clamped at both ends — never onto a
+    /// button, and never wrapping past the first/last field either. Used instead of the
+    /// button-inclusive cycle when `field_list_needs_scroll` is set (popups with more
+    /// scalar fields than fit the screen, e.g. `/setup`, `/world -e`), so Up/Down/the
+    /// mouse wheel stay confined to the field list and only Tab/Shift+Tab reach the
+    /// buttons — matching how a `FieldKind::List` field already keeps arrow/wheel
+    /// navigation confined to itself.
+    fn select_field_only(&mut self, forward: bool) {
+        let elements = self.definition.ordered_elements();
+        let field_positions: Vec<usize> = elements.iter()
+            .enumerate()
+            .filter(|(_, (is_btn, _))| !is_btn)
+            .map(|(i, _)| i)
+            .collect();
+        if field_positions.is_empty() {
+            return;
+        }
+        let current_field_idx = self.position_in(&elements)
+            .and_then(|pos| field_positions.iter().position(|&fp| fp == pos));
+        let next_field_idx = match current_field_idx {
+            Some(idx) if forward => (idx + 1).min(field_positions.len() - 1),
+            Some(idx) => idx.saturating_sub(1),
+            None => 0,
+        };
+        self.select_element(elements[field_positions[next_field_idx]]);
+    }
+
     /// Down key: move forward through the "order of moving" (search fields,
     /// then other fields, then right buttons, then left buttons), wrapping
     /// around. If the currently selected field is a List or ScrollableContent,
     /// this instead scrolls/moves the selection *within* that field, matching
-    /// "list/menu/help popups keep arrow-scrolling inside their list."
+    /// "list/menu/help popups keep arrow-scrolling inside their list." Same idea when
+    /// `field_list_needs_scroll` is set — stays within the field list, never escaping
+    /// to the buttons (see `select_field_only`).
     pub fn next_item(&mut self) {
         if let Some(field) = self.selected_field() {
             match &field.kind {
@@ -1323,6 +1359,10 @@ impl PopupState {
                 FieldKind::ScrollableContent { .. } => { self.scroll_down(1); return; }
                 _ => {}
             }
+        }
+        if self.field_list_needs_scroll && matches!(self.selected, ElementSelection::Field(_)) {
+            self.select_field_only(true);
+            return;
         }
         let elements = self.definition.ordered_elements();
         if elements.is_empty() {
@@ -1343,6 +1383,10 @@ impl PopupState {
                 FieldKind::ScrollableContent { .. } => { self.scroll_up(1); return; }
                 _ => {}
             }
+        }
+        if self.field_list_needs_scroll && matches!(self.selected, ElementSelection::Field(_)) {
+            self.select_field_only(false);
+            return;
         }
         let elements = self.definition.ordered_elements();
         if elements.is_empty() {
@@ -1961,8 +2005,17 @@ impl PopupState {
                 return;
             }
         }
-        // Scroll the first scrollable content field (works even when button is selected)
-        self.scroll_any_content_up(1);
+        if self.definition.fields.iter().any(|f| matches!(&f.kind, FieldKind::ScrollableContent { .. })) {
+            // Scroll the first scrollable content field (works even when button is selected)
+            self.scroll_any_content_up(1);
+            return;
+        }
+        // No List/ScrollableContent field — for popups with a scrollable top-level field
+        // list (e.g. /setup, /world -e), move the selection up through the fields, same as
+        // pressing Up (see select_field_only).
+        if self.field_list_needs_scroll {
+            self.select_field_only(false);
+        }
     }
 
     /// Handle mouse scroll down: moves list selection or scrolls content
@@ -1973,8 +2026,14 @@ impl PopupState {
                 return;
             }
         }
-        // Scroll the first scrollable content field (works even when button is selected)
-        self.scroll_any_content_down(1);
+        if self.definition.fields.iter().any(|f| matches!(&f.kind, FieldKind::ScrollableContent { .. })) {
+            // Scroll the first scrollable content field (works even when button is selected)
+            self.scroll_any_content_down(1);
+            return;
+        }
+        if self.field_list_needs_scroll {
+            self.select_field_only(true);
+        }
     }
 
     /// Handle mouse scrollbar click: scroll up by amount (lists or content)
@@ -2260,6 +2319,76 @@ mod tests {
         // From the first button, Shift+Tab wraps to the last field
         assert!(state.cycle_field_buttons_rev());
         assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+    }
+
+    #[test]
+    fn test_next_prev_item_confined_to_fields_when_scroll_needed() {
+        let def = create_test_popup();
+        let mut state = PopupState::new(def);
+        state.open();
+        state.field_list_needs_scroll = true;
+
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+
+        // Down moves through fields...
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_EMAIL)));
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+
+        // ...but clamps at the last field instead of wrapping onto a button.
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+
+        // Up moves back through fields...
+        state.prev_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_EMAIL)));
+        state.prev_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+
+        // ...and clamps at the first field instead of wrapping onto a button.
+        state.prev_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+    }
+
+    #[test]
+    fn test_next_prev_item_reaches_buttons_when_scroll_not_needed() {
+        // Without field_list_needs_scroll (the default), Up/Down still cycle through
+        // buttons the old way - only popups with more fields than fit the screen get the
+        // confinement behavior.
+        let def = create_test_popup();
+        let mut state = PopupState::new(def);
+        state.open();
+        assert!(!state.field_list_needs_scroll);
+
+        state.next_item();
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+        state.next_item();
+        assert!(matches!(state.selected, ElementSelection::Button(BTN_SAVE)));
+    }
+
+    #[test]
+    fn test_mouse_wheel_confined_to_fields_when_scroll_needed_and_no_list() {
+        let def = create_test_popup();
+        let mut state = PopupState::new(def);
+        state.open();
+        state.field_list_needs_scroll = true;
+
+        state.mouse_scroll_down();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_EMAIL)));
+        state.mouse_scroll_down();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+        // Clamps rather than reaching a button.
+        state.mouse_scroll_down();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_ENABLED)));
+
+        state.mouse_scroll_up();
+        state.mouse_scroll_up();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
+        // Clamps at the top too.
+        state.mouse_scroll_up();
+        assert!(matches!(state.selected, ElementSelection::Field(FIELD_NAME)));
     }
 
     #[test]

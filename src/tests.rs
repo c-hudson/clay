@@ -3960,3 +3960,60 @@ if you're more curious.\"";
         }
     }
 
+    /// Serializes tests that toggle the process-wide LOCAL_SERVER_LOOPBACK_ONLY static so
+    /// they can't race each other's set/restore when cargo test runs them concurrently.
+    static LOOPBACK_ONLY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that restores LOCAL_SERVER_LOOPBACK_ONLY to its previous value on drop
+    /// (including on panic), since it's a process-wide global shared with other tests.
+    /// Holds LOOPBACK_ONLY_TEST_LOCK for its lifetime so concurrent uses of this guard
+    /// (e.g. the two ensure_has_world tests below) can't interleave their set/restore.
+    struct LoopbackOnlyGuard(bool, std::sync::MutexGuard<'static, ()>);
+    impl LoopbackOnlyGuard {
+        fn set(value: bool) -> Self {
+            let lock = LOOPBACK_ONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = LOCAL_SERVER_LOOPBACK_ONLY.swap(value, std::sync::atomic::Ordering::SeqCst);
+            LoopbackOnlyGuard(previous, lock)
+        }
+    }
+    impl Drop for LoopbackOnlyGuard {
+        fn drop(&mut self) {
+            LOCAL_SERVER_LOOPBACK_ONLY.store(self.0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_ensure_has_world_desktop_uses_binary_name_placeholder() {
+        let _guard = LoopbackOnlyGuard::set(false);
+        let mut app = App::new();
+        assert!(app.worlds.is_empty());
+
+        app.ensure_has_world();
+
+        assert_eq!(app.worlds.len(), 1);
+        assert!(app.worlds[0].is_initial_world);
+        // Not the Android-seeded default - hostname/port stay empty (default), and the
+        // name comes from get_binary_name() rather than "Ascii".
+        assert_ne!(app.worlds[0].name, "Ascii");
+        assert!(app.worlds[0].settings.hostname.is_empty());
+    }
+
+    #[test]
+    fn test_ensure_has_world_android_local_server_seeds_ascii_default() {
+        let _guard = LoopbackOnlyGuard::set(true);
+        let mut app = App::new();
+        assert!(app.worlds.is_empty());
+
+        app.ensure_has_world();
+
+        assert_eq!(app.worlds.len(), 1);
+        let world = &app.worlds[0];
+        assert!(world.is_initial_world);
+        assert_eq!(world.name, "Ascii");
+        assert_eq!(world.settings.hostname, "teenymush.dynu.net");
+        assert_eq!(world.settings.port, "4096");
+        assert!(matches!(world.settings.world_type, WorldType::Mud));
+        assert!(matches!(world.settings.encoding, Encoding::Utf8));
+        assert!(matches!(world.settings.keep_alive_type, KeepAliveType::Nop));
+    }
+

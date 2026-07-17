@@ -1239,14 +1239,19 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::WorldEdit { name } => {
             // /worlds -e or /worlds -e <name>
-            let idx = if let Some(ref world_name) = name {
-                // /worlds -e <name> - find or create the world, then edit
-                app.find_or_create_world(world_name)
+            let (idx, created) = if let Some(ref world_name) = name {
+                // /worlds -e <name> - find or create the world, then edit. Only truly
+                // "created" if it didn't already exist - Cancel must roll back a fresh
+                // creation but must never touch a pre-existing world.
+                match app.find_world(world_name) {
+                    Some(existing_idx) => (existing_idx, false),
+                    None => (app.find_or_create_world(world_name), true),
+                }
             } else {
                 // /worlds -e - edit current world
-                app.current_world_index
+                (app.current_world_index, false)
             };
-            app.open_world_editor_popup_new(idx);
+            app.open_world_editor_popup_new(idx, created);
         }
         Command::WorldConnectNoLogin { name } => {
             // /worlds -l <name> - connect without auto-login

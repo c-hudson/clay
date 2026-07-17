@@ -341,6 +341,7 @@ fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme
         has_buttons,
     );
     state.scroll_offset = new_scroll_offset;
+    state.field_list_needs_scroll = needs_scroll;
     let scroll_offset = state.scroll_offset;
 
     // Reserve a column on the right for the scrollbar (only when actually scrolling), same

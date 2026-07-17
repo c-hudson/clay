@@ -3509,7 +3509,20 @@ impl App {
     /// Also adds splash screen to current world if it has no output
     fn ensure_has_world(&mut self) {
         if self.worlds.is_empty() {
-            let mut initial_world = World::new_with_splash(&get_binary_name(), true);
+            let mut initial_world = if LOCAL_SERVER_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+                // Android standalone/local-server first run: get_binary_name() would
+                // resolve to the literal native-library filename "libclay.so" here (see
+                // LocalServerManager.java), which is meaningless as a world name. Seed a
+                // real, ready-to-connect default world instead. world_type/encoding/
+                // keep_alive_type already come out as Mud/Utf8/Nop via
+                // WorldSettings::default() - only hostname/port need overriding.
+                let mut w = World::new_with_splash("Ascii", true);
+                w.settings.hostname = "teenymush.dynu.net".to_string();
+                w.settings.port = "4096".to_string();
+                w
+            } else {
+                World::new_with_splash(&get_binary_name(), true)
+            };
             initial_world.is_initial_world = true;
             initial_world.scrollback_tx = self.scrollback.as_ref().map(|db| db.sender());
             self.worlds.push(initial_world);
@@ -3890,7 +3903,12 @@ impl App {
     }
 
     /// Open the world editor popup for a specific world
-    fn open_world_editor_popup_new(&mut self, world_index: usize) {
+    /// `created`: true if `world_index` was just freshly pushed into `self.worlds` solely
+    /// to populate this editor session (i.e. `/world -e <name>` on a name that didn't
+    /// exist yet) — not yet confirmed by the user. Stashed on the popup so Cancel/Escape
+    /// can roll the creation back instead of silently persisting an unsaved new world (see
+    /// `handle_new_popup_key`'s world-editor Cancel handling).
+    fn open_world_editor_popup_new(&mut self, world_index: usize, created: bool) {
         use popup::definitions::world_editor::{
             create_world_editor_popup, WorldSettings as PopupWorldSettings, WORLD_FIELD_NAME,
         };
@@ -3943,6 +3961,9 @@ impl App {
         // Store world index in popup custom state and select first field
         if let Some(state) = self.popup_manager.current_mut() {
             state.set_custom("world_index", world_index.to_string());
+            if created {
+                state.set_custom("world_created", "1");
+            }
             state.select_field(WORLD_FIELD_NAME);
             // Auto-start editing on the name field
             state.start_edit();
@@ -4948,6 +4969,30 @@ impl App {
                         self.previous_world_index = Some(prev - 1);
                     }
                 }
+            }
+        }
+    }
+
+    /// Roll back a world that was pushed into `self.worlds` solely to populate the world
+    /// editor (`/world -e <new name>`, or the `/worlds` selector's "Add" action) when the
+    /// user cancels instead of saving. No-op if `created` is false (editing a pre-existing
+    /// world) or if `world_index` is out of range. Mirrors `discard_initial_world`'s index
+    /// bookkeeping.
+    fn discard_uncommitted_new_world(&mut self, world_index: usize, created: bool) {
+        if !created || world_index >= self.worlds.len() {
+            return;
+        }
+        self.worlds.remove(world_index);
+        if self.current_world_index > world_index {
+            self.current_world_index -= 1;
+        } else if self.current_world_index >= self.worlds.len() {
+            self.current_world_index = self.worlds.len().saturating_sub(1);
+        }
+        if let Some(prev) = self.previous_world_index {
+            if prev >= self.worlds.len() {
+                self.previous_world_index = self.worlds.len().checked_sub(1);
+            } else if prev > world_index {
+                self.previous_world_index = Some(prev - 1);
             }
         }
     }
@@ -11388,6 +11433,12 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             let world_index: usize = state.get_custom("world_index")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            // Whether this world was freshly pushed into app.worlds solely to populate
+            // this editor session (see open_world_editor_popup_new) - if so, Cancel/Esc
+            // must roll the creation back instead of silently persisting it.
+            let created_for_edit = state.get_custom("world_created")
+                .map(|s| s == "1")
+                .unwrap_or(false);
 
             // Helper to extract settings before closing
             let extract_settings = || -> WorldEditorSettings {
@@ -11448,6 +11499,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     if state.editing {
                         state.commit_edit();
                     } else {
+                        app.discard_uncommitted_new_world(world_index, created_for_edit);
                         app.popup_manager.close();
                     }
                 }
@@ -11461,6 +11513,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             app.popup_manager.close();
                             return NewPopupAction::WorldEditorSaved(Box::new(settings));
                         } else if state.is_button_focused(WORLD_BTN_CANCEL) {
+                            app.discard_uncommitted_new_world(world_index, created_for_edit);
                             app.popup_manager.close();
                         } else if state.is_button_focused(WORLD_BTN_DELETE) {
                             app.popup_manager.close();
@@ -11568,6 +11621,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             app.popup_manager.close();
                             return NewPopupAction::WorldEditorSaved(Box::new(settings));
                         } else if btn_id == WORLD_BTN_CANCEL {
+                            app.discard_uncommitted_new_world(world_index, created_for_edit);
                             app.popup_manager.close();
                         } else if btn_id == WORLD_BTN_DELETE {
                             app.popup_manager.close();

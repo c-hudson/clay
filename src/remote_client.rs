@@ -1885,14 +1885,19 @@ pub(crate) fn handle_remote_client_key(
                         // /worlds -e [name] - open world editor using new popup. Creates the
                         // world if it doesn't exist yet (mirrors commands.rs's local-TUI
                         // find_or_create_world behavior) instead of silently falling back to
-                        // editing the current world.
-                        let idx = if let Some(ref n) = name {
-                            app.find_or_create_world(n)
+                        // editing the current world. Only marked "created" when it didn't
+                        // already exist, so Cancel can roll back a fresh creation without
+                        // ever touching a pre-existing world.
+                        let (idx, created) = if let Some(ref n) = name {
+                            match app.find_world(n) {
+                                Some(existing_idx) => (existing_idx, false),
+                                None => (app.find_or_create_world(n), true),
+                            }
                         } else {
-                            app.current_world_index
+                            (app.current_world_index, false)
                         };
                         if idx < app.worlds.len() {
-                            app.open_world_editor_popup_new(idx);
+                            app.open_world_editor_popup_new(idx, created);
                         }
                     }
                     Command::Actions { world } => {

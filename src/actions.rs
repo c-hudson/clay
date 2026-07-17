@@ -34,22 +34,13 @@ impl MatchType {
 /// An action can hold multiple `MatchPattern`s; the action fires when **any** pattern
 /// matches a line, and the **first** matching pattern supplies capture groups `$0..$9`.
 /// The match type (Regexp/Wildcard) is stored on the parent `Action`, not per-pattern.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MatchPattern {
     /// The raw pattern string.
     pub pattern: String,
     /// Pre-compiled regex, rebuilt by `Action::compile_regex()`.  Not serialised.
     #[serde(skip)]
     pub compiled_regex: Option<Regex>,
-}
-
-impl Default for MatchPattern {
-    fn default() -> Self {
-        Self {
-            pattern: String::new(),
-            compiled_regex: None,
-        }
-    }
 }
 
 /// Helper function for serde default to return true
