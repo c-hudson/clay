@@ -11695,10 +11695,17 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 }
             }
             Left | Right => {
-                // No navigation role outside edit mode here; only affects a
-                // Select field if one exists (no-op on everything else, and
-                // Toggle is never touched by arrows).
-                if matches!(key.code, Left) {
+                if is_confirm {
+                    // Toggle between Yes and No, same as Up/Down.
+                    if state.is_button_focused(CONFIRM_BTN_YES) {
+                        state.select_button(CONFIRM_BTN_NO);
+                    } else {
+                        state.select_button(CONFIRM_BTN_YES);
+                    }
+                } else if matches!(key.code, Left) {
+                    // No navigation role outside edit mode here; only affects a
+                    // Select field if one exists (no-op on everything else, and
+                    // Toggle is never touched by arrows).
                     state.decrease_current();
                 } else {
                     state.increase_current();
