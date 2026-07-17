@@ -285,7 +285,11 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             min_width: 50,
             max_width_percent: 70,
             center_horizontal: true,
-            center_vertical: true,
+            // Top-aligned (matches world_selector.rs / setup.rs) — this popup has 21 fields
+            // and can otherwise size/position itself to overlap the input pane on a short
+            // terminal (same fix as the /setup popup, see plan
+            // `the-android-app-is-steady-sphinx.md`).
+            center_vertical: false,
             modal: true,
             buttons_right_align: false,
             blank_line_before_list: false,

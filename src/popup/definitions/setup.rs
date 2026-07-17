@@ -226,7 +226,11 @@ pub fn create_setup_popup(
             min_width: 40,
             max_width_percent: 60,
             center_horizontal: true,
-            center_vertical: true,
+            // Top-aligned (matches world_selector.rs) so the popup's height budget reserves
+            // the separator+input rows at the bottom instead of centering blind to them —
+            // this popup has 19 fields and can otherwise size/position itself to overlap
+            // the input pane on a short terminal.
+            center_vertical: false,
             modal: true,
             buttons_right_align: true,
             blank_line_before_list: false,

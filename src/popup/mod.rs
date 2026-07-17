@@ -854,7 +854,12 @@ pub struct PopupState {
     pub error: Option<String>,
     /// When the error was set (for auto-clear)
     pub error_at: Option<std::time::Instant>,
-    /// Scroll offset for scrollable content
+    /// Vertical scroll offset into the popup's top-level field list, in whole-field units —
+    /// used only when the popup has more scalar fields (Toggle/Select/Number/Text/...) than
+    /// fit the visible area (see `render_popup_content` in console_renderer.rs, which both
+    /// clamps this to keep the selected field visible and renders the matching scrollbar).
+    /// Distinct from a `FieldKind::List`/`ScrollableContent`/`EditableList` field's own
+    /// internal `scroll_offset`, which lives on the field itself, not here.
     pub scroll_offset: usize,
     /// Custom state for complex popups (e.g., filter text)
     pub custom: HashMap<String, String>,

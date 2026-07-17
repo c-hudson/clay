@@ -225,67 +225,153 @@ fn calculate_content_height(state: &PopupState) -> usize {
     height
 }
 
+/// One measured row in the popup's top-level field list — computed once up front so the
+/// scroll-window decision (which whole fields are currently visible) and the actual
+/// rendering agree exactly. `row_start`/`height` are in the same relative-row units as
+/// `PopupState.scroll_offset` (0 = first row of the field area).
+#[derive(Debug, Clone, PartialEq)]
+struct FieldRow {
+    index: usize,
+    height: usize,
+    row_start: usize,
+}
+
+/// Pure, testable core of the popup field-list scroll/windowing decision — measures every
+/// visible field's height/row-start, decides whether the field list needs to scroll to fit
+/// `area_height`, and (if so) adjusts `scroll_offset` to keep the selected field in view.
+/// Takes no ratatui types (unlike `render_popup_content`, which wraps this with the actual
+/// `Frame` drawing) so it can be unit-tested directly — mirrors how `build_display_lines` in
+/// rendering.rs separates pure layout logic from its Frame-coupled caller.
+///
+/// Returns `(rows, total_field_rows, needs_scroll, new_scroll_offset)`.
+fn compute_field_layout(
+    definition: &super::PopupDefinition,
+    selected: &ElementSelection,
+    scroll_offset: usize,
+    area_height: usize,
+    has_buttons: bool,
+) -> (Vec<FieldRow>, usize, bool, usize) {
+    let blank_line_before_list = definition.layout.blank_line_before_list;
+    // Reserve space for buttons if present (1 blank line + 1 button row) — the caller pins
+    // these to the bottom of the popup regardless of how many fields there are or how the
+    // field list scrolls (previously the button row was drawn at a running cursor that
+    // could run past the bottom of a short terminal, hiding the buttons entirely — see plan
+    // `the-android-app-is-steady-sphinx.md`).
+    let button_space = if has_buttons { 2 } else { 0 };
+    let visible_rows = area_height.saturating_sub(button_space);
+
+    // --- Measure every visible field's height and cumulative row offset. Mirrors the
+    // per-kind height logic that used to run inline in the render loop, unchanged, so
+    // List/ScrollableContent/EditableList fields keep self-sizing against whatever's left
+    // in the box exactly as before; only the windowing decision (which whole fields to
+    // actually draw) is new.
+    let mut rows: Vec<FieldRow> = Vec::with_capacity(definition.fields.len());
+    let mut cursor = 0usize;
+    for (i, field) in definition.fields.iter().enumerate() {
+        if !field.visible {
+            continue;
+        }
+        if blank_line_before_list {
+            if let FieldKind::List { .. } = &field.kind {
+                cursor += 1;
+            }
+        }
+        let remaining_height = area_height.saturating_sub(cursor);
+        let available_for_field = remaining_height.saturating_sub(button_space);
+        let field_height = match &field.kind {
+            FieldKind::Label { text } => text.lines().count().max(1),
+            FieldKind::MultilineText { visible_lines, .. } => *visible_lines,
+            FieldKind::List { visible_height, headers, .. } => {
+                // Use visible_height to maintain consistent size (don't shrink when filtering)
+                let header_rows = if headers.is_some() { 1 } else { 0 };
+                let max_items = available_for_field.saturating_sub(header_rows);
+                (*visible_height).min(max_items) + header_rows
+            }
+            FieldKind::ScrollableContent { visible_height, .. } => {
+                (*visible_height).min(available_for_field)
+            }
+            FieldKind::EditableList { visible_height, .. } => {
+                (*visible_height).min(available_for_field)
+            }
+            _ => 1,
+        };
+        rows.push(FieldRow { index: i, height: field_height, row_start: cursor });
+        cursor += field_height;
+    }
+    let total_field_rows = rows.last().map(|r| r.row_start + r.height).unwrap_or(0);
+    let needs_scroll = total_field_rows > visible_rows;
+
+    // --- Scroll offset: keep the currently selected field fully in view, then clamp so we
+    // never scroll past the end. Called at render time (every frame, from the current
+    // terminal size and selection) rather than patching every place selection can change
+    // (Tab/Shift+Tab, Up/Down, shortcut keys, mouse clicks all funnel through different
+    // PopupState methods) — mirrors how render_list_field clamps its own scroll fresh every
+    // frame.
+    let new_scroll_offset = if needs_scroll {
+        let mut offset = scroll_offset;
+        if let ElementSelection::Field(sel_id) = selected {
+            if let Some(sel_row) = rows.iter().find(|r| definition.fields[r.index].id == *sel_id) {
+                if sel_row.row_start < offset {
+                    offset = sel_row.row_start;
+                } else if sel_row.row_start + sel_row.height > offset + visible_rows {
+                    offset = sel_row.row_start + sel_row.height - visible_rows;
+                }
+            }
+        }
+        offset.min(total_field_rows.saturating_sub(visible_rows))
+    } else {
+        0
+    };
+
+    (rows, total_field_rows, needs_scroll, new_scroll_offset)
+}
+
 /// Render popup content (fields and buttons)
 fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme: &Theme) {
-    let mut y = area.y;
     let available_width = area.width as usize;
-    let layout = &state.definition.layout;
+    let has_buttons = !state.definition.buttons.is_empty();
+    let button_space = if has_buttons { 2 } else { 0 };
+    let visible_rows = (area.height as usize).saturating_sub(button_space);
+
+    let (rows, total_field_rows, needs_scroll, new_scroll_offset) = compute_field_layout(
+        &state.definition,
+        &state.selected,
+        state.scroll_offset,
+        area.height as usize,
+        has_buttons,
+    );
+    state.scroll_offset = new_scroll_offset;
+    let scroll_offset = state.scroll_offset;
+
+    // Reserve a column on the right for the scrollbar (only when actually scrolling), same
+    // as render_list_field's content_width calculation.
+    let scrollbar_width: u16 = if needs_scroll { 1 } else { 0 };
+    let field_area_width = area.width.saturating_sub(scrollbar_width);
 
     // Clear hit areas and content areas for this render pass
     state.hit_areas.clear();
     state.content_areas.clear();
 
-    // Render fields
-    let has_buttons = !state.definition.buttons.is_empty();
-    let num_fields = state.definition.fields.len();
-    let blank_line_before_list = layout.blank_line_before_list;
     let mut field_hit_areas: Vec<(Rect, super::FieldId)> = Vec::new();
     let mut content_area_infos: Vec<ContentArea> = Vec::new();
-    for i in 0..num_fields {
-        if !state.definition.fields[i].visible {
+
+    for row in &rows {
+        // Skip whole fields entirely above or below the visible window — same granularity
+        // List uses for its own items (never splits a row mid-field).
+        if row.row_start + row.height <= scroll_offset {
             continue;
         }
-
-        // Add blank line before list if configured
-        if blank_line_before_list {
-            if let FieldKind::List { .. } = &state.definition.fields[i].kind {
-                y += 1;
-            }
+        if row.row_start >= scroll_offset + visible_rows {
+            break;
         }
 
-        // Calculate remaining height available for this field
-        let remaining_height = (area.y + area.height).saturating_sub(y) as usize;
-        // Reserve space for buttons if present (1 blank line + 1 button row)
-        let button_space = if has_buttons { 2 } else { 0 };
-        let available_for_field = remaining_height.saturating_sub(button_space);
-
-        let field_height = match &state.definition.fields[i].kind {
-            FieldKind::Label { text } => text.lines().count().max(1) as u16,
-            FieldKind::MultilineText { visible_lines, .. } => *visible_lines as u16,
-            FieldKind::List { visible_height, headers, .. } => {
-                // Use visible_height to maintain consistent size (don't shrink when filtering)
-                let header_rows = if headers.is_some() { 1 } else { 0 };
-                let max_items = available_for_field.saturating_sub(header_rows);
-                let list_height = (*visible_height).min(max_items) as u16;
-                list_height + header_rows as u16
-            }
-            FieldKind::ScrollableContent { visible_height, .. } => {
-                // Use available space, capped by visible_height
-                (*visible_height).min(available_for_field) as u16
-            }
-            FieldKind::EditableList { visible_height, .. } => {
-                // Use visible_height, capped by available space
-                (*visible_height).min(available_for_field) as u16
-            }
-            _ => 1,
-        };
-
-        let field_area = Rect::new(area.x, y, area.width, field_height);
-        let field_id = state.definition.fields[i].id;
+        let y = area.y + (row.row_start - scroll_offset) as u16;
+        let field_area = Rect::new(area.x, y, field_area_width, row.height as u16);
+        let field_id = state.definition.fields[row.index].id;
         let is_selected = matches!(&state.selected, ElementSelection::Field(id) if *id == field_id);
 
         // Collect content area info for mouse highlighting
-        match &state.definition.fields[i].kind {
+        match &state.definition.fields[row.index].kind {
             FieldKind::ScrollableContent { lines, scroll_offset, .. } => {
                 content_area_infos.push(ContentArea {
                     area: field_area,
@@ -312,10 +398,9 @@ fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme
             _ => {}
         }
 
-        render_field(f, state, &state.definition.fields[i], field_area, is_selected, theme);
+        render_field(f, state, &state.definition.fields[row.index], field_area, is_selected, theme);
 
         field_hit_areas.push((field_area, field_id));
-        y += field_height;
     }
     // Record field hit areas for mouse click detection
     for (area, id) in field_hit_areas {
@@ -324,23 +409,30 @@ fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme
     // Record content areas for mouse highlighting
     state.content_areas = content_area_infos;
 
-    // Render buttons if present
-    if !state.definition.buttons.is_empty() {
-        // Render blank line before buttons with background
-        if y < area.y + area.height {
-            let blank_area = Rect::new(area.x, y, area.width, 1);
-            let blank_line = Line::from(Span::styled(
-                " ".repeat(area.width as usize),
-                Style::default().bg(theme.popup_bg()),
-            ));
-            f.render_widget(Paragraph::new(blank_line), blank_area);
-        }
-        y += 1;
+    // Field-list scrollbar (mirrors render_list_field's visual style via the shared helper).
+    if needs_scroll {
+        let scrollbar_x = area.x + area.width.saturating_sub(1);
+        render_scrollbar_column(
+            f, scrollbar_x, area.y, area.y + visible_rows as u16,
+            visible_rows, total_field_rows, scroll_offset, theme,
+        );
+    }
 
-        if y < area.y + area.height {
-            let button_area = Rect::new(area.x, y, area.width, 1);
-            render_buttons(f, state, button_area, theme);
-        }
+    // Buttons pinned to the bottom of `area`, independent of field scrolling — always
+    // inside the popup box since `area.height` is already clamped to the terminal
+    // (calculate_popup_area) and popup_height is guaranteed >= 5, so inner area.height >= 3.
+    if has_buttons {
+        let blank_y = area.y + area.height.saturating_sub(2);
+        let blank_area = Rect::new(area.x, blank_y, area.width, 1);
+        let blank_line = Line::from(Span::styled(
+            " ".repeat(area.width as usize),
+            Style::default().bg(theme.popup_bg()),
+        ));
+        f.render_widget(Paragraph::new(blank_line), blank_area);
+
+        let button_y = area.y + area.height.saturating_sub(1);
+        let button_area = Rect::new(area.x, button_y, area.width, 1);
+        render_buttons(f, state, button_area, theme);
     }
 
     // Render error message if present
@@ -944,31 +1036,52 @@ fn render_list_field(
     if needs_scrollbar {
         let scrollbar_x = area.x + area.width.saturating_sub(1);
         let list_start_y = if headers.is_some() { header_y + 1 } else { header_y };
-        let scrollbar_height = actual_visible;
+        render_scrollbar_column(
+            f, scrollbar_x, list_start_y, area.y + area.height,
+            actual_visible, items.len(), effective_scroll, theme,
+        );
+    }
+}
 
-        let total_items = items.len();
-        let thumb_size = ((scrollbar_height as f64 / total_items as f64) * scrollbar_height as f64).max(1.0) as usize;
-        let thumb_pos = if max_scroll == 0 {
-            0
-        } else {
-            ((effective_scroll as f64 / max_scroll as f64) * (scrollbar_height - thumb_size) as f64) as usize
-        };
+/// Draw a single-column vertical scrollbar: a `"█"` thumb over a `"│"` track, in
+/// `theme.fg_dim()` — the shared visual style used by both list-style popups (`/worlds`,
+/// see `render_list_field` above) and the field-list scrollbar for popups with more scalar
+/// fields (Toggle/Select/Number/Text/...) than fit the screen (see `render_popup_content`).
+///
+/// `x`/`y`: top-left of the scrollbar column. `row_limit`: absolute row past which nothing
+/// is drawn (caller's area boundary). `viewport`: rows visible at once. `total`: total
+/// rows/items being scrolled over. `offset`: current scroll position, in the same units as
+/// `total`/`viewport`, already clamped by the caller to `[0, total - viewport]`.
+#[allow(clippy::too_many_arguments)]
+fn render_scrollbar_column(
+    f: &mut Frame,
+    x: u16,
+    y: u16,
+    row_limit: u16,
+    viewport: usize,
+    total: usize,
+    offset: usize,
+    theme: &Theme,
+) {
+    if viewport == 0 || total == 0 {
+        return;
+    }
+    let max_scroll = total.saturating_sub(viewport);
+    let thumb_size = ((viewport as f64 / total as f64) * viewport as f64).max(1.0) as usize;
+    let thumb_pos = if max_scroll == 0 {
+        0
+    } else {
+        ((offset as f64 / max_scroll as f64) * viewport.saturating_sub(thumb_size) as f64) as usize
+    };
 
-        for i in 0..scrollbar_height {
-            let row_y = list_start_y + i as u16;
-            if row_y >= area.y + area.height {
-                break;
-            }
-
-            let scrollbar_area = Rect::new(scrollbar_x, row_y, 1, 1);
-            let char = if i >= thumb_pos && i < thumb_pos + thumb_size {
-                "█"
-            } else {
-                "│"
-            };
-            let scrollbar_line = Line::from(Span::styled(char, Style::default().fg(theme.fg_dim())));
-            f.render_widget(Paragraph::new(scrollbar_line), scrollbar_area);
+    for i in 0..viewport {
+        let row_y = y + i as u16;
+        if row_y >= row_limit {
+            break;
         }
+        let ch = if i >= thumb_pos && i < thumb_pos + thumb_size { "█" } else { "│" };
+        let line = Line::from(Span::styled(ch, Style::default().fg(theme.fg_dim())));
+        f.render_widget(Paragraph::new(line), Rect::new(x, row_y, 1, 1));
     }
 }
 
@@ -1654,5 +1767,85 @@ mod tests {
         let height = calculate_content_height(&state);
         // 2 fields + 2 for button row (blank + buttons)
         assert_eq!(height, 4);
+    }
+
+    /// Build a popup definition with `n` single-row toggle fields (ids 1..=n) and a Save
+    /// button — the shape /setup and /world -e are in (many scalar fields, no List).
+    fn many_field_def(n: u32) -> PopupDefinition {
+        let mut def = PopupDefinition::new(PopupId("test"), "Test");
+        for i in 1..=n {
+            def = def.with_field(Field::new(FieldId(i), &format!("Field {i}"), FieldKind::toggle(false)));
+        }
+        def.with_button(Button::new(ButtonId(1), "Save"))
+    }
+
+    #[test]
+    fn test_compute_field_layout_no_scroll_when_it_fits() {
+        let def = many_field_def(3);
+        let selected = ElementSelection::Field(FieldId(1));
+        // area_height=5, has_buttons -> button_space=2 -> visible_rows=3; 3 fields fit exactly.
+        let (rows, total, needs_scroll, offset) = compute_field_layout(&def, &selected, 0, 5, true);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(total, 3);
+        assert!(!needs_scroll, "3 rows in a 3-row viewport should NOT need scrolling (boundary case)");
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_compute_field_layout_scrolls_to_reveal_selected_field() {
+        let def = many_field_def(10);
+        // area_height=5, has_buttons -> visible_rows=3; 10 fields >> 3, must scroll.
+        let selected_last = ElementSelection::Field(FieldId(10));
+        let (rows, total, needs_scroll, offset) = compute_field_layout(&def, &selected_last, 0, 5, true);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(total, 10);
+        assert!(needs_scroll);
+        // Selecting the last field (row_start=9, height=1) must bring it fully into a
+        // 3-row viewport: offset = 9 + 1 - 3 = 7.
+        assert_eq!(offset, 7, "scrolling down should reveal the last field, not just clamp to 0");
+
+        // Now selecting the first field from that scrolled-down position must scroll back up.
+        let selected_first = ElementSelection::Field(FieldId(1));
+        let (_, _, _, offset2) = compute_field_layout(&def, &selected_first, offset, 5, true);
+        assert_eq!(offset2, 0, "scrolling up should reveal the first field, not stay scrolled down");
+    }
+
+    #[test]
+    fn test_compute_field_layout_never_scrolls_past_end() {
+        let def = many_field_def(10);
+        let selected = ElementSelection::Field(FieldId(10));
+        // Start with an already-huge stale offset (e.g. left over from a taller terminal) —
+        // must clamp down to the real max, not stay pinned to something past the content.
+        let (_, total, needs_scroll, offset) = compute_field_layout(&def, &selected, 9999, 5, true);
+        assert!(needs_scroll);
+        let visible_rows = 5usize.saturating_sub(2); // button_space=2
+        assert_eq!(offset, total.saturating_sub(visible_rows));
+    }
+
+    #[test]
+    fn test_compute_field_layout_no_buttons_uses_full_height() {
+        let def_no_buttons = {
+            let mut def = PopupDefinition::new(PopupId("test"), "Test");
+            for i in 1..=5u32 {
+                def = def.with_field(Field::new(FieldId(i), &format!("Field {i}"), FieldKind::toggle(false)));
+            }
+            def
+        };
+        let selected = ElementSelection::Field(FieldId(1));
+        // No buttons -> button_space=0 -> visible_rows == area_height == 5; 5 fields fit exactly.
+        let (_, total, needs_scroll, _) = compute_field_layout(&def_no_buttons, &selected, 0, 5, false);
+        assert_eq!(total, 5);
+        assert!(!needs_scroll);
+    }
+
+    #[test]
+    fn test_compute_field_layout_no_selection_keeps_offset_clamped() {
+        let def = many_field_def(10);
+        // Nothing selected (e.g. only buttons focusable in some popup) — offset should still
+        // be clamped to a valid range rather than left at an out-of-bounds stale value.
+        let (_, total, needs_scroll, offset) = compute_field_layout(&def, &ElementSelection::None, 9999, 5, true);
+        let visible_rows = 5usize.saturating_sub(2);
+        assert!(needs_scroll);
+        assert_eq!(offset, total.saturating_sub(visible_rows));
     }
 }
