@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Cleartext (unencrypted HTTP/WS) traffic is permitted only to the on-device standalone
+    server's loopback address. That's the only legitimate cleartext use in the Android app:
+    the local-server WebSocket connection is plain ws://127.0.0.1 (see
+    LocalServerManager.java), while every remote connection always uses wss:// (see
+    MainActivity.java's buildVarInjectionScript(), which sets WS_PROTOCOL='wss' for remote
+    mode). Everything else defaults to HTTPS/WSS-only, replacing the previous blanket
+    android:usesCleartextTraffic="true" manifest flag.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

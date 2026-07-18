@@ -373,6 +373,40 @@
             android:paddingBottom="6dp" />
     </LinearLayout>
 
+    <!-- Divider -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginBottom="8dp"
+        android:background="#30363d" />
+
+    <!-- Certificate pinning -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Server Certificate"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="#e6edf3" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Clay trusts a server's certificate the first time it connects, then rejects any later connection whose certificate has changed. If your server's certificate was rotated intentionally, clear pinned certificates below and reconnect."
+        android:textSize="11sp"
+        android:textColor="#8b949e"
+        android:layout_marginTop="2dp"
+        android:layout_marginBottom="8dp" />
+
+    <Button
+        android:id="@+id/clearPinsButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Clear Pinned Certificates"
+        android:backgroundTint="#30363d"
+        android:textColor="#e6edf3" />
+
     </LinearLayout>
     <!-- end remoteSettingsSection -->
 

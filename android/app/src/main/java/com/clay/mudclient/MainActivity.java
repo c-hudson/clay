@@ -105,6 +105,15 @@ public class MainActivity extends AppCompatActivity {
     private boolean permissionsHandled = false;
     private boolean notificationPermissionDone = false;
     private boolean batteryOptimizationDone = false;
+    // Battery optimization exemption is requested lazily (Play Store restricts
+    // REQUEST_IGNORE_BATTERY_OPTIMIZATIONS to apps that actually need it, and requesting it
+    // unconditionally on every fresh install before any connection is made is the kind of
+    // usage Google pushes back on) - it's now asked for the first time a persistent
+    // background connection actually starts (see startBackgroundService() /
+    // checkBatteryOptimization()), not during startPermissionFlow(). This callback carries
+    // the "proceed with starting the connection" continuation across the async
+    // startActivityForResult() round-trip.
+    private Runnable pendingBatteryOptCallback = null;
     private boolean interfaceLoaded = false;
     private String loadedInterfaceUrl = null;
     private LocalServerManager localServerManager;
@@ -173,19 +182,23 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void startBackgroundService() {
             runOnUiThread(() -> {
-                // Battery optimization should already be handled during startup
+                // Request battery optimization exemption here, lazily, the first time a
+                // persistent background connection actually starts - not unconditionally at
+                // app startup (see checkBatteryOptimization()'s doc comment). No-ops
+                // immediately if already granted/handled.
+                checkBatteryOptimization(() -> {
+                    Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(serviceIntent);
+                    } else {
+                        startService(serviceIntent);
+                    }
 
-                Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(serviceIntent);
-                } else {
-                    startService(serviceIntent);
-                }
-
-                // Mark as connected and start keepalive + heartbeat
-                isConnected = true;
-                startKeepalive();
-                startHeartbeat();
+                    // Mark as connected and start keepalive + heartbeat
+                    isConnected = true;
+                    startKeepalive();
+                    startHeartbeat();
+                });
             });
         }
 
@@ -334,7 +347,7 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
-                NativeWebSocket ws = new NativeWebSocket(new NativeWebSocket.WebSocketCallback() {
+                NativeWebSocket ws = new NativeWebSocket(MainActivity.this, new NativeWebSocket.WebSocketCallback() {
                     @Override
                     public void onOpen() {
                         runOnUiThread(() -> {
@@ -547,11 +560,22 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         notificationPermissionDone = true;
-        checkBatteryOptimization();
+        // Battery optimization exemption is no longer requested here - see
+        // checkBatteryOptimization()'s doc comment. Startup proceeds straight to loading the
+        // interface once notification permission is resolved.
+        finishPermissionFlow();
     }
 
-    private void checkBatteryOptimization() {
-        // Step 2: Check battery optimization
+    // Requests exemption from battery optimization (Doze mode), lazily: only called the first
+    // time the user actually starts a persistent background connection (from
+    // startBackgroundService()), not unconditionally at app startup. `onDone` runs once the
+    // exemption is either already granted, just granted/denied by the user, or unsupported on
+    // this device - i.e. it's always eventually invoked exactly once per call.
+    private void checkBatteryOptimization(Runnable onDone) {
+        if (batteryOptimizationDone) {
+            onDone.run();
+            return;
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
             String packageName = getPackageName();
@@ -561,8 +585,9 @@ public class MainActivity extends AppCompatActivity {
                 intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
                 intent.setData(Uri.parse("package:" + packageName));
                 try {
+                    pendingBatteryOptCallback = onDone;
                     startActivityForResult(intent, BATTERY_OPTIMIZATION_REQUEST);
-                    return; // Wait for callback
+                    return; // Wait for callback via onActivityResult
                 } catch (Exception e) {
                     // Device doesn't support this intent
                     Toast.makeText(this,
@@ -572,7 +597,7 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         batteryOptimizationDone = true;
-        finishPermissionFlow();
+        onDone.run();
     }
 
     private void finishPermissionFlow() {
@@ -588,7 +613,7 @@ public class MainActivity extends AppCompatActivity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == NOTIFICATION_PERMISSION_REQUEST) {
             notificationPermissionDone = true;
-            checkBatteryOptimization();
+            finishPermissionFlow();
         }
     }
 
@@ -597,7 +622,11 @@ public class MainActivity extends AppCompatActivity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == BATTERY_OPTIMIZATION_REQUEST) {
             batteryOptimizationDone = true;
-            finishPermissionFlow();
+            Runnable callback = pendingBatteryOptCallback;
+            pendingBatteryOptCallback = null;
+            if (callback != null) {
+                callback.run();
+            }
         }
     }
 
@@ -860,7 +889,7 @@ public class MainActivity extends AppCompatActivity {
                     // Retry up to 3 times for transient connection failures
                     for (int attempt = 1; attempt <= 3; attempt++) {
                         // Create fresh client for each attempt to avoid connection reuse issues
-                        okhttp3.OkHttpClient freshClient = activity.createTrustAllClient();
+                        okhttp3.OkHttpClient freshClient = activity.createHttpsInterceptClient();
                         try {
                             okhttp3.Request okRequest = new okhttp3.Request.Builder()
                                 .url(url)
@@ -1077,55 +1106,26 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * Creates an OkHttpClient that accepts all SSL certificates.
-     * Used for intercepting HTTPS requests to handle hostname mismatches and expired certs.
+     * Creates an OkHttpClient for intercepting arbitrary third-party HTTPS requests the
+     * WebView's JS makes (e.g. GMCP media URLs a MUD server sends — see
+     * shouldInterceptRequest() below). Unlike NativeWebSocket's connection to a
+     * user-configured Clay server, this fetches arbitrary internet content picked by
+     * whatever server the user connected to, so it deliberately uses standard platform CA-chain
+     * + hostname validation rather than trust-on-first-use pinning or accept-all: there is no
+     * single "known host" relationship here to pin against, and blindly trusting self-signed
+     * certificates for arbitrary third-party URLs would let a malicious server point this at an
+     * internal/spoofed HTTPS endpoint. Normal websites' CDNs/image hosts already use CA-signed
+     * certificates, so this should not affect legitimate content.
      */
-    private okhttp3.OkHttpClient createTrustAllClient() {
-        try {
-            // Create a trust manager that accepts all certificates
-            final javax.net.ssl.TrustManager[] trustAllCerts = new javax.net.ssl.TrustManager[]{
-                new javax.net.ssl.X509TrustManager() {
-                    @Override
-                    public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
-                        // Accept all client certificates
-                    }
-
-                    @Override
-                    public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
-                        // Accept all server certificates (including self-signed, expired, hostname mismatch)
-                    }
-
-                    @Override
-                    public java.security.cert.X509Certificate[] getAcceptedIssuers() {
-                        return new java.security.cert.X509Certificate[0];
-                    }
-                }
-            };
-
-            // Install the trust manager
-            final javax.net.ssl.SSLContext sslContext = javax.net.ssl.SSLContext.getInstance("TLS");
-            sslContext.init(null, trustAllCerts, new java.security.SecureRandom());
-            final javax.net.ssl.SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
-
-            // Build OkHttpClient with custom SSL settings
-            // Disable connection pooling to avoid stale connection issues
-            return new okhttp3.OkHttpClient.Builder()
-                .sslSocketFactory(sslSocketFactory, (javax.net.ssl.X509TrustManager) trustAllCerts[0])
-                .hostnameVerifier((hostname, session) -> true) // Accept all hostnames
-                .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-                .connectionPool(new okhttp3.ConnectionPool(0, 1, java.util.concurrent.TimeUnit.MILLISECONDS)) // No pooling
-                .retryOnConnectionFailure(true)
-                .build();
-        } catch (Exception e) {
-            android.util.Log.e("Clay", "Failed to create trust-all client: " + e.getMessage());
-            // Return a default client if trust-all setup fails
-            return new okhttp3.OkHttpClient.Builder()
-                .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                .build();
-        }
+    private okhttp3.OkHttpClient createHttpsInterceptClient() {
+        // Disable connection pooling to avoid stale connection issues across retries.
+        return new okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .connectionPool(new okhttp3.ConnectionPool(0, 1, java.util.concurrent.TimeUnit.MILLISECONDS)) // No pooling
+            .retryOnConnectionFailure(true)
+            .build();
     }
 
     @Override

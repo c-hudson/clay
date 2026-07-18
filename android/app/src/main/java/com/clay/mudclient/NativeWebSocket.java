@@ -1,5 +1,6 @@
 package com.clay.mudclient;
 
+import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -14,8 +15,6 @@ import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 
@@ -23,7 +22,7 @@ import javax.net.SocketFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
+import javax.net.ssl.X509ExtendedTrustManager;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -57,6 +56,7 @@ public class NativeWebSocket {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private WebSocketCallback callback;
     private boolean isConnected = false;
+    private final Context appContext;
 
     public interface WebSocketCallback {
         void onOpen();
@@ -65,7 +65,8 @@ public class NativeWebSocket {
         void onError(String error);
     }
 
-    public NativeWebSocket(WebSocketCallback callback) {
+    public NativeWebSocket(Context context, WebSocketCallback callback) {
+        this.appContext = context.getApplicationContext();
         this.callback = callback;
     }
 
@@ -83,35 +84,22 @@ public class NativeWebSocket {
         Log.d(TAG, "Connecting to: " + url + (useKnock ? " (with CLAY-KNOCK)" : ""));
 
         try {
-            // Create a trust manager that accepts all certificates
-            final TrustManager[] trustAllCerts = new TrustManager[]{
-                new X509TrustManager() {
-                    @Override
-                    public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-                        // Accept all client certificates
-                    }
+            // Trust-on-first-use certificate pinning (see CertPinning) instead of accepting
+            // every certificate unconditionally - mirrors the Rust TofuVerifier used by every
+            // other Clay client. Hostname verification is intentionally left permissive here
+            // (like the Rust side): the per-host-keyed pin itself is what provides the
+            // protection, and many self-hosted Clay servers use ad hoc self-signed certs
+            // without proper SANs.
+            final X509ExtendedTrustManager tofuTrustManager = CertPinning.createTofuTrustManager(appContext);
 
-                    @Override
-                    public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-                        // Accept all server certificates (including self-signed)
-                    }
-
-                    @Override
-                    public X509Certificate[] getAcceptedIssuers() {
-                        return new X509Certificate[0];
-                    }
-                }
-            };
-
-            // Install the trust manager
             final SSLContext sslContext = SSLContext.getInstance("TLS");
-            sslContext.init(null, trustAllCerts, new java.security.SecureRandom());
+            sslContext.init(null, new TrustManager[]{tofuTrustManager}, new java.security.SecureRandom());
             final SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
 
             // Build OkHttpClient with custom SSL settings
             OkHttpClient.Builder builder = new OkHttpClient.Builder()
-                .sslSocketFactory(sslSocketFactory, (X509TrustManager) trustAllCerts[0])
-                .hostnameVerifier((hostname, session) -> true) // Accept all hostnames
+                .sslSocketFactory(sslSocketFactory, tofuTrustManager)
+                .hostnameVerifier((hostname, session) -> true) // see comment above
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.MILLISECONDS) // No read timeout for WebSocket
                 .writeTimeout(10, TimeUnit.SECONDS)

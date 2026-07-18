@@ -40,6 +40,10 @@ command -v git    >/dev/null || die "'git' not found"
 command -v gh     >/dev/null || die "'gh' (GitHub CLI) not found"
 command -v zipalign  >/dev/null || die "'zipalign' not found (Android build-tools)"
 command -v $APKSIGNER >/dev/null || die "'apksigner' not found (Android build-tools)"
+command -v jarsigner >/dev/null || die "'jarsigner' not found (JDK) — needed to sign the .aab"
+
+# jarsigner (unlike apksigner) needs the keystore's key alias explicitly.
+KEYSTORE_ALIAS="clay"
 
 KEYSTORE_PASS_FILE="$HOME/.clay-keystore-pass"
 [[ -f "$KEYSTORE_PASS_FILE" ]] || die "Keystore password file not found: $KEYSTORE_PASS_FILE"
@@ -117,6 +121,29 @@ $APKSIGNER sign \
 ok "Android APK signed."
 APK_SIZE=$(du -sh "android/clay-android.apk" | cut -f1)
 
+# ─── Step 6b: Build + sign Android App Bundle (.aab) ─────────────────────────
+# Google Play has required the AAB format for new app submissions since August 2021 - a
+# plain APK (built above) can't be uploaded as a new Play listing. This doesn't replace the
+# APK: clay-android.apk keeps feeding the existing GitHub Releases distribution, and
+# clay-android.aab is produced alongside it purely for a future Play Store submission.
+log "Building Android App Bundle (.aab)..."
+(cd android && ./gradlew bundleRelease) || die "Android App Bundle build failed."
+
+UNSIGNED_AAB="android/app/build/outputs/bundle/release/app-release.aab"
+[[ -f "$UNSIGNED_AAB" ]] || die "Unsigned .aab not found: $UNSIGNED_AAB"
+
+log "Signing Android App Bundle..."
+rm -f android/clay-android.aab
+cp "$UNSIGNED_AAB" android/clay-android.aab
+jarsigner -keystore "$KEYSTORE_FILE" -storepass:file "$KEYSTORE_PASS_FILE" \
+    -sigalg SHA256withRSA -digestalg SHA-256 \
+    android/clay-android.aab "$KEYSTORE_ALIAS" \
+    || die "jarsigner failed on .aab."
+jarsigner -verify android/clay-android.aab >/dev/null \
+    || die "Signed .aab failed verification."
+ok "Android App Bundle signed and verified."
+AAB_SIZE=$(du -sh "android/clay-android.aab" | cut -f1)
+
 # ─── Step 7: Upload to GitHub ─────────────────────────────────────────────────
 log "Uploading Android APK to GitHub release ${VERSION}..."
 
@@ -143,5 +170,7 @@ echo ""
 printf "%-20s %-8s %-10s %s\n" "Target" "Status" "Size" "Uploaded"
 printf "%-20s %-8s %-10s %s\n" "------" "------" "----" "--------"
 printf "%-20s %-8s %-10s %s\n" "Android APK" "PASS" "$APK_SIZE" "Yes"
+printf "%-20s %-8s %-10s %s\n" "Android AAB" "PASS" "$AAB_SIZE" "No (local only)"
 echo ""
 echo -e "Release: ${RELEASE_URL}"
+echo -e "AAB (for a future Play Store submission): android/clay-android.aab"

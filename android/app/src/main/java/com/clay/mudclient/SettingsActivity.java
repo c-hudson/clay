@@ -10,6 +10,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
 
@@ -43,6 +44,7 @@ public class SettingsActivity extends AppCompatActivity {
     private Button cancelButton;
     private EditText authKeyValue;
     private EditText webPathValue;
+    private Button clearPinsButton;
     private boolean fromMenu;
 
     @Override
@@ -65,6 +67,11 @@ public class SettingsActivity extends AppCompatActivity {
         cancelButton = findViewById(R.id.cancelButton);
         authKeyValue = findViewById(R.id.authKeyValue);
         webPathValue = findViewById(R.id.webPathValue);
+        clearPinsButton = findViewById(R.id.clearPinsButton);
+        clearPinsButton.setOnClickListener(v -> {
+            CertPinning.clearAllPins(this);
+            Toast.makeText(this, "Pinned certificates cleared", Toast.LENGTH_SHORT).show();
+        });
 
         fromMenu = getIntent().getBooleanExtra("fromMenu", false);
 
