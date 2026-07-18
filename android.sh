@@ -41,9 +41,23 @@ command -v gh     >/dev/null || die "'gh' (GitHub CLI) not found"
 command -v zipalign  >/dev/null || die "'zipalign' not found (Android build-tools)"
 command -v $APKSIGNER >/dev/null || die "'apksigner' not found (Android build-tools)"
 command -v jarsigner >/dev/null || die "'jarsigner' not found (JDK) — needed to sign the .aab"
+command -v java >/dev/null || die "'java' not found — needed to run bundletool"
 
 # jarsigner (unlike apksigner) needs the keystore's key alias explicitly.
 KEYSTORE_ALIAS="clay"
+
+# bundletool: verifies the signed .aab actually produces a valid installable APK (an .aab
+# can't be sideloaded/installed directly - it's a Play-Console-only publishing format - so
+# this is the only way to catch a broken bundle before it reaches Play Console). No
+# standalone 'bundletool' CLI ships with the Android SDK; one-time setup (GitHub's
+# releases/latest/download URL 404s for this repo since the asset filename is
+# version-suffixed, so resolve the actual filename via the API first):
+#   mkdir -p ~/.local/share/bundletool
+#   url=$(wget -qO- https://api.github.com/repos/google/bundletool/releases/latest \
+#       | grep -oP '"browser_download_url":\s*"\K[^"]+bundletool-all[^"]+\.jar')
+#   wget -O ~/.local/share/bundletool/bundletool-all.jar "$url"
+BUNDLETOOL_JAR="$HOME/.local/share/bundletool/bundletool-all.jar"
+[[ -f "$BUNDLETOOL_JAR" ]] || die "bundletool not found: $BUNDLETOOL_JAR (see android.sh comment for one-time setup)"
 
 KEYSTORE_PASS_FILE="$HOME/.clay-keystore-pass"
 [[ -f "$KEYSTORE_PASS_FILE" ]] || die "Keystore password file not found: $KEYSTORE_PASS_FILE"
@@ -144,6 +158,24 @@ jarsigner -verify android/clay-android.aab >/dev/null \
 ok "Android App Bundle signed and verified."
 AAB_SIZE=$(du -sh "android/clay-android.aab" | cut -f1)
 
+log "Verifying the .aab actually produces an installable APK (via bundletool)..."
+rm -f android/clay-android-bundletool-check.apks
+java -jar "$BUNDLETOOL_JAR" build-apks \
+    --bundle=android/clay-android.aab \
+    --output=android/clay-android-bundletool-check.apks \
+    --mode=universal \
+    --ks="$KEYSTORE_FILE" \
+    --ks-key-alias="$KEYSTORE_ALIAS" \
+    --ks-pass="file:${KEYSTORE_PASS_FILE}" \
+    --overwrite \
+    || die "bundletool could not generate an installable APK from the .aab — it would likely be rejected by Play Console."
+unzip -p android/clay-android-bundletool-check.apks universal.apk > /tmp/clay-bundletool-universal.apk \
+    || die "Failed to extract universal.apk from bundletool output."
+$APKSIGNER verify /tmp/clay-bundletool-universal.apk >/dev/null \
+    || die "The APK bundletool extracted from the .aab does not verify — the .aab is broken."
+rm -f android/clay-android-bundletool-check.apks /tmp/clay-bundletool-universal.apk
+ok "bundletool confirms the .aab produces a valid, verifiable APK."
+
 # ─── Step 7: Upload to GitHub ─────────────────────────────────────────────────
 log "Uploading Android APK to GitHub release ${VERSION}..."
 
@@ -170,7 +202,7 @@ echo ""
 printf "%-20s %-8s %-10s %s\n" "Target" "Status" "Size" "Uploaded"
 printf "%-20s %-8s %-10s %s\n" "------" "------" "----" "--------"
 printf "%-20s %-8s %-10s %s\n" "Android APK" "PASS" "$APK_SIZE" "Yes"
-printf "%-20s %-8s %-10s %s\n" "Android AAB" "PASS" "$AAB_SIZE" "No (local only)"
+printf "%-20s %-8s %-10s %s\n" "Android AAB" "PASS (bundletool-verified)" "$AAB_SIZE" "No (local only)"
 echo ""
 echo -e "Release: ${RELEASE_URL}"
 echo -e "AAB (for a future Play Store submission): android/clay-android.aab"
