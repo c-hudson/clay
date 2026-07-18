@@ -212,7 +212,6 @@
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
-        setupUrlShortenerSelect: document.getElementById('setup-url-shortener-select'),
         setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
@@ -453,7 +452,6 @@
     let setupColorOffset = 0;
     let setupAnsiMusic = true;
     let setupZwj = false;
-    let setupUrlShortener = 'is.gd';
     let setupTtsMode = 'Off';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
@@ -554,7 +552,6 @@
     let zwjEnabled = false;  // Will be synced from server settings
     let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'edge')
     let ttsSpeakMode = 'all';  // 'all' or 'limit'
-    let urlShortener = 'is.gd';  // Will be synced from server settings
     let newLineIndicator = false;  // Will be synced from server settings
 
     // MCMP (MUD Client Media Protocol) state
@@ -1900,7 +1897,6 @@
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
-                    if (msg.settings.url_shortener !== undefined) urlShortener = msg.settings.url_shortener;
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
                     }
@@ -2446,7 +2442,6 @@
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
-                    if (msg.settings.url_shortener !== undefined) urlShortener = msg.settings.url_shortener;
                     if (msg.settings.new_line_indicator !== undefined) {
                         const oldNli = newLineIndicator;
                         newLineIndicator = msg.settings.new_line_indicator;
@@ -6267,7 +6262,6 @@
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'edge' ? 'Edge' : 'Off';
-        setupUrlShortener = urlShortener || 'is.gd';
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupDebug = debugEnabled;
@@ -6327,10 +6321,6 @@
             elements.setupZwjToggle.classList.add('active');
         } else {
             elements.setupZwjToggle.classList.remove('active');
-        }
-        if (elements.setupUrlShortenerSelect) {
-            elements.setupUrlShortenerSelect.value = setupUrlShortener;
-            updateCustomDropdown(elements.setupUrlShortenerSelect);
         }
         elements.setupTtsSelect.value = setupTtsMode;
         updateCustomDropdown(elements.setupTtsSelect);
@@ -6421,8 +6411,7 @@
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
             dictionary_path: dictionaryPath,
-            scrollback_enabled: scrollbackEnabled,
-            url_shortener: urlShortener
+            scrollback_enabled: scrollbackEnabled
         };
     }
 
@@ -6498,7 +6487,6 @@
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
         ttsMode = setupTtsMode.toLowerCase();
-        urlShortener = setupUrlShortener;
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         debugEnabled = setupDebug;
@@ -8967,11 +8955,6 @@
             setupZwj = !setupZwj;
             updateSetupPopupUI();
         };
-        if (elements.setupUrlShortenerSelect) {
-            elements.setupUrlShortenerSelect.onchange = function() {
-                setupUrlShortener = this.value;
-            };
-        }
         elements.setupTtsSelect.onchange = function() {
             setupTtsMode = this.value;
         };

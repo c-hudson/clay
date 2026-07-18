@@ -630,7 +630,6 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 if scrollback_changed {
                     app.init_scrollback();
                 }
-                app.settings.url_shortener_service = crate::encoding::UrlShortener::from_name(&settings.url_shortener);
                 // Rewrap already-visible output immediately (mirrors a terminal resize) only
                 // when wrapspace actually changed, so an unrelated setup save doesn't force
                 // a spurious redraw. No clamp beyond the popup's 0-20 field range — the

@@ -220,9 +220,10 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         "url" => vec![
             "/url <url>",
             "",
-            "Shorten a URL using is.gd. Result is placed in the",
-            "input buffer with cursor at start — type a prefix",
-            "(e.g. 'say') then press Enter to send.",
+            "Shorten a URL, trying several services until one",
+            "works. Result is placed in the input buffer with",
+            "cursor at start — type a prefix (e.g. 'say') then",
+            "press Enter to send.",
         ],
         "remote" => vec![
             "/remote                    List connected clients",

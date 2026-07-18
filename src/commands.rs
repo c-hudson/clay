@@ -914,6 +914,45 @@ pub fn normalize_language_code(lang: &str) -> String {
     }
 }
 
+/// Remembers which non-tinyurl service last succeeded, so `shorten_url_fallback`
+/// tries it first on the next call. In-memory only (not persisted) - resets on restart.
+static LAST_WORKING_SHORTENER: std::sync::Mutex<Option<crate::encoding::UrlShortener>> =
+    std::sync::Mutex::new(None);
+
+/// Shorten a URL, trying non-tinyurl services first and falling back to tinyurl
+/// last. Tries the non-tinyurl service that worked last time first (if any), then
+/// the remaining non-tinyurl services, and only tries tinyurl after all of them
+/// have failed - tinyurl is never tried first.
+pub async fn shorten_url_fallback(url: &str) -> Result<String, String> {
+    use crate::encoding::UrlShortener;
+
+    let last = *LAST_WORKING_SHORTENER.lock().unwrap();
+    let mut order: Vec<UrlShortener> = Vec::new();
+    if let Some(s) = last {
+        order.push(s);
+    }
+    for s in [UrlShortener::IsGd, UrlShortener::VGd, UrlShortener::DaGd] {
+        if !order.contains(&s) {
+            order.push(s);
+        }
+    }
+    order.push(UrlShortener::TinyUrl); // always last
+
+    let mut last_err = "no URL shortener available".to_string();
+    for service in order {
+        match lookup_tinyurl(url, service).await {
+            Ok(short) => {
+                if service != UrlShortener::TinyUrl {
+                    *LAST_WORKING_SHORTENER.lock().unwrap() = Some(service);
+                }
+                return Ok(short);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 /// Shorten a URL using the selected service.
 /// Validates that the response body is actually a URL (starts with "http") so
 /// plain-text error bodies like "Error, database insert failed" are returned as
@@ -1031,7 +1070,6 @@ pub fn spawn_api_lookup(
     client_id: u64,
     world_index: usize,
     command: Command,
-    url_shortener: crate::encoding::UrlShortener,
 ) {
     match command {
         Command::Dict { word } => {
@@ -1072,7 +1110,7 @@ pub fn spawn_api_lookup(
         }
         Command::TinyUrl { url } => {
             tokio::spawn(async move {
-                let result = match lookup_tinyurl(&url, url_shortener).await {
+                let result = match shorten_url_fallback(&url).await {
                     Ok(short) => Ok(short),
                     Err(e) => Err(format!("URL shortening failed: {}", e)),
                 };
@@ -2530,8 +2568,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output("  Example: /tr es Hello");
         }
         Command::TinyUrl { url } => {
-            let service = app.settings.url_shortener_service;
-            match lookup_tinyurl(&url, service).await {
+            match shorten_url_fallback(&url).await {
                 Ok(short) => {
                     app.input.buffer = short;
                     app.input.cursor_position = 0;
@@ -2543,7 +2580,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::TinyUrlUsage => {
             app.add_output("Usage: /url <url>");
-            app.add_output(&format!("  Shortens <url> via {} and places the result in the input buffer.", app.settings.url_shortener_service.name()));
+            app.add_output("  Shortens <url> and places the result in the input buffer.");
             app.add_output("  Example: /url https://github.com/c-hudson/clay");
         }
         Command::Dump => {

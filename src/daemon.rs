@@ -671,7 +671,7 @@ pub async fn handle_daemon_ws_message(
                     app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
                 }
                 Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } | Command::TinyUrl { .. } => {
-                    spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed, app.settings.url_shortener_service);
+                    spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
                 }
                 Command::DictUsage => {
                     app.ws_send_to_client(client_id, WsMessage::ServerData {
@@ -1482,7 +1482,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, url_shortener } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1535,7 +1535,6 @@ pub async fn handle_daemon_ws_message(
             app.settings.new_line_indicator = new_line_indicator;
             app.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
             app.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
-            app.settings.url_shortener_service = crate::encoding::UrlShortener::from_name(&url_shortener);
             if app.settings.dictionary_path != dictionary_path {
                 app.settings.dictionary_path = dictionary_path;
                 app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);

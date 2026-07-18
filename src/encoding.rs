@@ -399,24 +399,6 @@ pub enum UrlShortener {
 }
 
 impl UrlShortener {
-    pub fn name(&self) -> &'static str {
-        match self {
-            UrlShortener::IsGd    => "is.gd",
-            UrlShortener::VGd     => "v.gd",
-            UrlShortener::TinyUrl => "tinyurl",
-            UrlShortener::DaGd    => "da.gd",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Self {
-        match name.to_lowercase().as_str() {
-            "v.gd"    => UrlShortener::VGd,
-            "tinyurl" => UrlShortener::TinyUrl,
-            "da.gd"   => UrlShortener::DaGd,
-            _         => UrlShortener::IsGd,
-        }
-    }
-
     /// Build the full API request URL for the given long URL.
     pub fn build_request_url(&self, long_url: &str) -> String {
         match self {
@@ -440,16 +422,6 @@ impl UrlShortener {
                     .finish();
                 format!("https://da.gd/s?{}", encoded)
             }
-        }
-    }
-
-    /// Human-readable label for the service (shown in UI).
-    pub fn label(&self) -> &'static str {
-        match self {
-            UrlShortener::IsGd    => "is.gd",
-            UrlShortener::VGd     => "v.gd",
-            UrlShortener::TinyUrl => "TinyURL",
-            UrlShortener::DaGd    => "da.gd",
         }
     }
 }

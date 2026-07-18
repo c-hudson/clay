@@ -276,8 +276,6 @@ pub enum WsMessage {
         tts_speak_mode: String,
         #[serde(default)]
         scrollback_enabled: bool,
-        #[serde(default)]
-        url_shortener: String,
     },
 
     // Settings update confirmations (server -> client)
@@ -571,8 +569,6 @@ pub struct GlobalSettingsMsg {
     pub tts_speak_mode: String,
     #[serde(default)]
     pub scrollback_enabled: bool,
-    #[serde(default)]
-    pub url_shortener: String,
     /// Theme colors from ~/.clay/theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
