@@ -1777,7 +1777,7 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
         // Clay Extensions
         "toggle_tags" => {
             app.show_tags = !app.show_tags;
-            app.current_world_mut().visual_line_offset = 0;
+            app.current_world_mut().reset_visual_truncation();
             KeyAction::Redraw
         }
         "filter_popup" => {

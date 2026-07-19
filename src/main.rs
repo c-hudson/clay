@@ -2940,6 +2940,34 @@ impl World {
         self.visual_line_offset = 0;
     }
 
+    /// Visual rows of the partially-shown (VLO-truncated) line that are hidden
+    /// from the display. 0 when no truncation is active.
+    /// Mirrors the partial-line lookup in release_pending_screenful (walk back
+    /// past gagged lines from scroll_offset).
+    pub fn hidden_visual_rows(&self, output_width: usize, nli_enabled: bool, wrapspace: usize) -> usize {
+        if self.visual_line_offset == 0 || self.output_lines.is_empty() {
+            return 0;
+        }
+        let mut idx = self.scroll_offset.min(self.output_lines.len() - 1);
+        while idx > 0 && self.output_lines[idx].gagged {
+            idx -= 1;
+        }
+        let line = &self.output_lines[idx];
+        let total = nli_visual_rows(&line.text, output_width.max(1), line.marked_new, nli_enabled, wrapspace);
+        total.saturating_sub(self.visual_line_offset)
+    }
+
+    /// Reset VLO truncation and, when nothing else is held back and the user is
+    /// following live output, clear the stale pause so future output flows freely.
+    /// pending_count guard keeps remote-console mode (daemon-mirrored pause) intact.
+    pub fn reset_visual_truncation(&mut self) {
+        self.visual_line_offset = 0;
+        if self.pending_lines.is_empty() && self.pending_count == 0 && self.is_at_bottom() {
+            self.paused = false;
+            self.lines_since_pause = 0;
+        }
+    }
+
     /// Reset more-mode state when the user sends a command — but ONLY when they are
     /// following live output at the bottom. If they have scrolled up into scrollback,
     /// leave `paused`/`scroll_offset` alone so the viewport stays put; the command still
@@ -3079,7 +3107,7 @@ impl World {
         for line in &mut self.pending_lines {
             line.marked_new = false;
         }
-        self.visual_line_offset = 0;
+        self.reset_visual_truncation();
         // Adjust scroll offset if it's now past the end
         if self.scroll_offset > 0 && self.scroll_offset >= self.output_lines.len() {
             self.scroll_offset = self.output_lines.len().saturating_sub(1);
@@ -4736,9 +4764,13 @@ impl App {
             return true;
         }
 
-        // Second, check for worlds with unseen output (activity indicator)
+        // Second, check for worlds with unseen output (activity indicator),
+        // or worlds left paused with hidden VLO-truncated rows and nothing
+        // pending (e.g. viewed then switched away without releasing).
         for (idx, world) in self.worlds.iter().enumerate() {
-            if idx != self.current_world_index && world.unseen_lines > 0 {
+            if idx != self.current_world_index
+                && (world.unseen_lines > 0 || (world.paused && world.visual_line_offset > 0))
+            {
                 self.switch_world(idx);
                 return true;
             }
@@ -9709,6 +9741,31 @@ impl App {
         // Broadcast activity count since pending lines changed
         self.broadcast_activity();
         self.needs_output_redraw = true;
+    }
+
+    /// If more-mode is disabled but the current world still holds pending lines
+    /// (e.g. the setting was toggled off from another client while paused),
+    /// release them and request a repaint. Must run BEFORE rendering a frame —
+    /// previously this ran after render_output_crossterm, so released lines
+    /// didn't appear until the next unrelated redraw.
+    pub(crate) fn release_orphaned_pending(&mut self) -> bool {
+        if self.settings.more_mode_enabled || self.current_world().pending_lines.is_empty() {
+            return false;
+        }
+        let world = self.current_world_mut();
+        if world.first_marked_new_index.is_none() && world.pending_lines.iter().any(|l| l.marked_new) {
+            world.first_marked_new_index = Some(world.output_lines.len());
+        }
+        world.output_lines.append(&mut world.pending_lines);
+        world.pending_since = None;
+        world.paused = false;
+        // If partial was in pending, it's now in output
+        if world.partial_in_pending {
+            world.partial_in_pending = false;
+        }
+        world.scroll_to_bottom();
+        self.needs_output_redraw = true;
+        true
     }
 }
 
@@ -16768,6 +16825,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
+        // Release orphaned pending lines before drawing so they appear this frame
+        if app.release_orphaned_pending() {
+            needs_draw = true;
+        }
+
         // Skip drawing when no visible state changed (e.g., pending update WS broadcast)
         if needs_draw {
             // Check if any popup is now visible
@@ -16821,21 +16883,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 app.needs_output_redraw = false;
                 // Mark current world as seen since its output was just displayed
                 let has_unseen = app.current_world().unseen_lines > 0;
-                let has_pending = !app.current_world().pending_lines.is_empty();
                 if has_unseen {
                     app.current_world_mut().mark_seen();
                     // Broadcast to WebSocket clients
                     app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
                     // Broadcast activity count since a world was just marked as seen
                     app.broadcast_activity();
-                }
-                // If more mode is disabled but world has orphaned pending_lines, release them
-                if has_pending && !app.settings.more_mode_enabled {
-                    let world = app.current_world_mut();
-                    world.output_lines.append(&mut world.pending_lines);
-                    world.pending_since = None;
-                    world.paused = false;
-                    world.scroll_to_bottom();
                 }
             }
         }

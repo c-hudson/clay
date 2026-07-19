@@ -361,22 +361,20 @@
             while let Some(msg_result) = ws_source.next().await {
                 if let Ok(WsRawMessage::Text(text)) = msg_result {
                     println!("Server received: {}", text);
-                    if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                        if let WsMessage::AuthRequest { password_hash: client_hash, .. } = ws_msg {
-                            println!("Client hash: {}", client_hash);
-                            println!("Server hash: {}", server_hash);
-                            let auth_success = client_hash == server_hash;
-                            println!("Auth success: {}", auth_success);
-                            let response = WsMessage::AuthResponse {
-                                success: auth_success,
-                                error: if auth_success { None } else { Some("Invalid password".to_string()) },
-                                username: None,
-                                multiuser_mode: false,
-                            };
-                            let json = serde_json::to_string(&response).unwrap();
-                            ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
-                            break;
-                        }
+                    if let Ok(WsMessage::AuthRequest { password_hash: client_hash, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                        println!("Client hash: {}", client_hash);
+                        println!("Server hash: {}", server_hash);
+                        let auth_success = client_hash == server_hash;
+                        println!("Auth success: {}", auth_success);
+                        let response = WsMessage::AuthResponse {
+                            success: auth_success,
+                            error: if auth_success { None } else { Some("Invalid password".to_string()) },
+                            username: None,
+                            multiuser_mode: false,
+                        };
+                        let json = serde_json::to_string(&response).unwrap();
+                        ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
+                        break;
                     }
                 }
             }
@@ -396,7 +394,7 @@
         println!("Client sending hash: {}", client_hash);
         let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false };
         let json = serde_json::to_string(&auth_msg).unwrap();
-        ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
+        ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
         // Wait for response
         if let Some(Ok(WsRawMessage::Text(text))) = ws_source.next().await {
@@ -1024,7 +1022,7 @@
         // Try to send RevokeKey without authenticating
         let revoke_msg = WsMessage::RevokeKey { auth_key: "some_key".to_string() };
         let json = serde_json::to_string(&revoke_msg).unwrap();
-        ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
+        ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
         // The server should disconnect us (break from loop) since we're not authenticated
         // Wait briefly for the server to process
@@ -1090,7 +1088,7 @@
         // Try sending a command without authenticating
         let cmd = WsMessage::SendCommand { world_index: 0, command: "look".to_string() };
         let json = serde_json::to_string(&cmd).unwrap();
-        ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
+        ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -1165,7 +1163,7 @@
             challenge_response: false,
         };
         let json = serde_json::to_string(&auth_msg).unwrap();
-        ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
+        ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
         // Read response - should be auth failure
         if let Some(Ok(WsRawMessage::Text(text))) = ws_source.next().await {
@@ -1270,7 +1268,7 @@
             request_key: false,
             challenge_response: false,
         };
-        sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap().into())).await.unwrap();
+        sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap())).await.unwrap();
         let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
             let resp: WsMessage = serde_json::from_str(&text).unwrap();
             if let WsMessage::AuthResponse { error, .. } = resp { error } else { None }
@@ -1290,7 +1288,7 @@
             request_key: false,
             challenge_response: false,
         };
-        sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap().into())).await.unwrap();
+        sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap())).await.unwrap();
         let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
             let resp: WsMessage = serde_json::from_str(&text).unwrap();
             if let WsMessage::AuthResponse { error, .. } = resp { error } else { None }
@@ -1482,7 +1480,7 @@
             request_key: false,
             challenge_response: false,
         };
-        sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap().into())).await.unwrap();
+        sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
 
         if let Some(Ok(WsRawMessage::Text(text))) = source.next().await {
             let resp: WsMessage = serde_json::from_str(&text).unwrap();
@@ -1697,7 +1695,7 @@
 
         // 50 lines, each ~120 chars (wraps to 2 visual lines at width 80)
         let data: String = (1..=50).map(|i| {
-            format!("{}{}\n", "x".repeat(100), format!("LINE{:03}", i))
+            format!("{}LINE{:03}\n", "x".repeat(100), i)
         }).collect();
         world.add_output(&data, true, &settings, 24, 80, false, true);
 
@@ -1828,6 +1826,237 @@
 
         assert_eq!(world.visual_line_offset, saved_vlo,
             "visual_line_offset should survive gagged line append");
+    }
+
+    #[test]
+    fn test_hidden_visual_rows_and_more_indicator_vlo_only() {
+        // Regression test for the "hidden row, no More indicator" bug: a world can be
+        // paused with visual_line_offset > 0 and pending_lines EMPTY (the huge-line-only
+        // batch never produced any pending lines). Before the fix, render_separator_bar's
+        // condition was `paused && (!pending_lines.is_empty() || pending_count > 0)`, which
+        // is false here — so the truncated row(s) would be hidden with no indicator at all.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        let output_height: u16 = 21;
+        let output_width: u16 = 80;
+        let max_lines = (output_height as usize) - 2; // 19
+
+        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true);
+        let huge_line = "A".repeat(80 * 25); // 25 visual rows at width 80
+        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true);
+
+        assert!(world.paused, "Should be paused after huge line");
+        assert!(world.pending_lines.is_empty(), "Huge line goes to output, not pending");
+
+        // Same accounting as test_more_mode_single_line_exceeds_screen: visual_line_offset
+        // ends up at max_lines - 2 (17), out of 25 total visual rows for the huge line.
+        assert_eq!(world.visual_line_offset, max_lines - 2);
+        let expected_hidden = 25 - world.visual_line_offset; // 8
+
+        assert_eq!(world.hidden_visual_rows(80, false, 0), expected_hidden);
+        assert_eq!(
+            crate::rendering::more_indicator_count(&world, 80, false, 0),
+            Some(expected_hidden),
+            "More indicator must fire for VLO-only truncation even with no pending lines"
+        );
+    }
+
+    #[test]
+    fn test_more_indicator_pending_plus_hidden() {
+        // Continue from the VLO-only state, then add more output while still paused —
+        // it should land in pending_lines. The indicator should report hidden + pending.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        let output_height: u16 = 21;
+        let output_width: u16 = 80;
+
+        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true);
+        let huge_line = "A".repeat(80 * 25);
+        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true);
+        let hidden = world.hidden_visual_rows(80, false, 0);
+
+        // Five more short (one-row) lines while paused with empty pending -> goes_to_pending.
+        let more = "extra1\nextra2\nextra3\nextra4\nextra5\n";
+        world.add_output(more, true, &settings, output_height, output_width, false, true);
+
+        assert_eq!(world.pending_lines.len(), 5);
+        assert_eq!(
+            crate::rendering::more_indicator_count(&world, 80, false, 0),
+            Some(5 + hidden)
+        );
+
+        // Control case: pending lines present but visual_line_offset == 0 -> today's
+        // pre-fix behavior is preserved exactly (count == pending_lines.len()).
+        let mut plain_world = World::new("plain");
+        let plain_settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        plain_world.add_output(
+            "one\ntwo\nthree\n",
+            true,
+            &plain_settings,
+            output_height,
+            output_width,
+            false,
+            true,
+        );
+        plain_world.paused = true;
+        plain_world.pending_lines.clear();
+        for i in 0..3 {
+            plain_world.pending_lines.push(make_output_line(&format!("pending {}", i), false));
+        }
+        assert_eq!(plain_world.visual_line_offset, 0);
+        assert_eq!(
+            crate::rendering::more_indicator_count(&plain_world, 80, false, 0),
+            Some(plain_world.pending_lines.len())
+        );
+    }
+
+    /// Build the T1 VLO-only-truncation state: paused, visual_line_offset > 0,
+    /// pending_lines empty, at bottom (scroll_offset points at the huge line).
+    fn build_vlo_only_paused_world() -> World {
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        let output_height: u16 = 21;
+        let output_width: u16 = 80;
+
+        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true);
+        let huge_line = "A".repeat(80 * 25);
+        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true);
+
+        assert!(world.paused);
+        assert!(world.pending_lines.is_empty());
+        assert!(world.visual_line_offset > 0);
+        assert!(world.is_at_bottom());
+        world
+    }
+
+    #[test]
+    fn test_filter_to_server_output_clears_stale_pause() {
+        // Base case: at bottom, nothing pending -> Ctrl+L / toggle-tags should fully
+        // unpause, not just clear visual_line_offset (the stale-pause bug, issue B).
+        let mut world = build_vlo_only_paused_world();
+        world.filter_to_server_output();
+
+        assert_eq!(world.visual_line_offset, 0, "VLO should be reset");
+        assert!(!world.paused, "Stale pause should be cleared with nothing held back");
+        assert_eq!(world.lines_since_pause, 0, "lines_since_pause should be reset with paused");
+        assert_eq!(
+            crate::rendering::more_indicator_count(&world, 80, false, 0),
+            None,
+            "No indicator should remain once fully unpaused with nothing hidden/pending"
+        );
+    }
+
+    #[test]
+    fn test_filter_to_server_output_keeps_pause_with_pending_lines() {
+        // Variant (a): non-empty pending_lines -> paused must stay true, and the
+        // indicator should report the still-held-back pending lines.
+        let mut world = build_vlo_only_paused_world();
+        for i in 0..4 {
+            world.pending_lines.push(make_output_line(&format!("pending {}", i), false));
+        }
+
+        world.filter_to_server_output();
+
+        assert_eq!(world.visual_line_offset, 0, "VLO should still be reset");
+        assert!(world.paused, "Should remain paused while pending_lines is non-empty");
+        assert_eq!(
+            crate::rendering::more_indicator_count(&world, 80, false, 0),
+            Some(world.pending_lines.len()),
+            "Indicator should report the pending backlog"
+        );
+    }
+
+    #[test]
+    fn test_filter_to_server_output_keeps_pause_with_remote_pending_count() {
+        // Variant (b): empty local pending_lines but pending_count > 0 (simulated
+        // remote-console mode, where paused mirrors the daemon-mirrored pending_count).
+        // reset_visual_truncation's guard must leave paused untouched here.
+        let mut world = build_vlo_only_paused_world();
+        world.pending_count = 3;
+
+        world.filter_to_server_output();
+
+        assert_eq!(world.visual_line_offset, 0, "VLO should still be reset");
+        assert!(world.paused, "Should remain paused/mirrored while pending_count > 0");
+    }
+
+    #[test]
+    fn test_reset_visual_truncation_display() {
+        // Resetting VLO truncation must reveal previously hidden wrapped rows via
+        // build_display_lines, not just flip the internal counters.
+        let mut world = build_vlo_only_paused_world();
+        let settings = Settings::default();
+        let rows_before = build_display_lines(&world, &settings, 21, 80, false).len();
+
+        world.reset_visual_truncation();
+        let rows_after = build_display_lines(&world, &settings, 21, 80, false).len();
+
+        assert!(
+            rows_after > rows_before,
+            "Expected more display rows after reset_visual_truncation ({} before, {} after)",
+            rows_before,
+            rows_after
+        );
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_before_draw() {
+        // Issue A: if more-mode is disabled but the current world still holds
+        // pending lines (e.g. the setting was toggled off elsewhere while paused),
+        // release_orphaned_pending must drain them and request a redraw so they
+        // appear this frame instead of on the next unrelated redraw.
+        let mut app = App::new();
+        app.worlds.push(World::new("test"));
+        app.settings.more_mode_enabled = false;
+
+        for i in 0..3 {
+            app.current_world_mut().pending_lines.push(make_output_line(&format!("line {}", i), false));
+        }
+        app.current_world_mut().paused = true;
+        app.needs_output_redraw = false;
+
+        let released = app.release_orphaned_pending();
+
+        assert!(released, "Should report that orphaned pending lines were released");
+        assert!(app.current_world().pending_lines.is_empty(), "pending_lines should be drained");
+        let output_tail: Vec<&str> = app.current_world().output_lines
+            .iter()
+            .rev()
+            .take(3)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(output_tail, vec!["line 2", "line 1", "line 0"], "Released lines should be appended to output_lines");
+        assert!(!app.current_world().paused, "Stale pause should be cleared");
+        assert!(app.needs_output_redraw, "Should request a redraw");
+        assert_eq!(app.current_world().pending_since, None, "pending_since should be cleared");
+
+        // Second call: nothing left to release
+        assert!(!app.release_orphaned_pending(), "Second call should report nothing released");
+    }
+
+    #[test]
+    fn test_switch_to_oldest_pending_finds_vlo_only_world() {
+        // Issue C: switch_to_oldest_pending's tiers only checked pending_lines/
+        // unseen_lines, so a world left paused with hidden VLO-truncated rows
+        // (viewed then switched away without releasing, so unseen_lines == 0
+        // and pending_since == None) was invisible to Alt+w. Tier 2 must also
+        // catch paused-with-VLO worlds.
+        let mut app = App::new();
+        app.worlds.push(World::new("world0"));
+        app.worlds.push(World::new("world1"));
+
+        app.worlds[1].paused = true;
+        app.worlds[1].visual_line_offset = 3;
+        app.worlds[1].unseen_lines = 0;
+        app.worlds[1].pending_lines.clear();
+
+        app.current_world_index = 0;
+
+        assert!(app.switch_to_oldest_pending(), "Should switch to the VLO-only paused world");
+        assert_eq!(app.current_world_index, 1);
     }
 
     #[test]
@@ -3968,17 +4197,17 @@ if you're more curious.\"";
     /// (including on panic), since it's a process-wide global shared with other tests.
     /// Holds LOOPBACK_ONLY_TEST_LOCK for its lifetime so concurrent uses of this guard
     /// (e.g. the two ensure_has_world tests below) can't interleave their set/restore.
-    struct LoopbackOnlyGuard(bool, std::sync::MutexGuard<'static, ()>);
+    struct LoopbackOnlyGuard { previous: bool, _lock: std::sync::MutexGuard<'static, ()> }
     impl LoopbackOnlyGuard {
         fn set(value: bool) -> Self {
             let lock = LOOPBACK_ONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let previous = LOCAL_SERVER_LOOPBACK_ONLY.swap(value, std::sync::atomic::Ordering::SeqCst);
-            LoopbackOnlyGuard(previous, lock)
+            LoopbackOnlyGuard { previous, _lock: lock }
         }
     }
     impl Drop for LoopbackOnlyGuard {
         fn drop(&mut self) {
-            LOCAL_SERVER_LOOPBACK_ONLY.store(self.0, std::sync::atomic::Ordering::SeqCst);
+            LOCAL_SERVER_LOOPBACK_ONLY.store(self.previous, std::sync::atomic::Ordering::SeqCst);
         }
     }
 

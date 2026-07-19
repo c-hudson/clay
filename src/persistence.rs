@@ -1667,6 +1667,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "scroll_offset={}", world.scroll_offset)?;
         writeln!(file, "connected={}", world.connected)?;
         writeln!(file, "unseen_lines={}", world.unseen_lines)?;
+        // The console More indicator (rendering::more_indicator_count) depends on
+        // paused + visual_line_offset (+ lines_since_pause) persisting together —
+        // do not remove or reorder any one of these three independently of the others.
         writeln!(file, "paused={}", world.paused)?;
         writeln!(file, "lines_since_pause={}", world.lines_since_pause)?;
         writeln!(file, "visual_line_offset={}", world.visual_line_offset)?;
@@ -3093,7 +3096,7 @@ pattern=foo
         let global = read_global_section(&tmp);
         assert_eq!(global.get("scrollback_enabled").map(String::as_str), Some("true"));
         assert_eq!(global.get("debug_enabled").map(String::as_str), Some("false"));
-        assert!(global.get("hostname").is_none(), "world-section keys must not leak into the global map");
+        assert!(!global.contains_key("hostname"), "world-section keys must not leak into the global map");
 
         let _ = std::fs::remove_file(&tmp);
     }

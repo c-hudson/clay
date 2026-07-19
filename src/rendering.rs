@@ -288,6 +288,13 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let dimensions_changed = new_output_height != app.output_height || new_output_width != app.output_width;
     if dimensions_changed {
         app.needs_output_redraw = true;
+        // Width/height change invalidates visual_line_offset (wrap counts differ);
+        // reveal the truncated rows rather than hide the wrong number of them.
+        for w in app.worlds.iter_mut() {
+            if w.visual_line_offset > 0 {
+                w.reset_visual_truncation();
+            }
+        }
     }
     app.output_height = new_output_height;
     app.output_width = new_output_width;
@@ -1532,6 +1539,26 @@ pub(crate) fn render_splash_centered<'a>(world: &World, visible_height: usize, a
     Text::from(lines)
 }
 
+/// Number to show in the More indicator, or None to hide it.
+/// Counts pending lines (local, or daemon-mirrored pending_count in remote
+/// console mode) plus visual rows hidden by visual_line_offset truncation,
+/// so truncated output is never silently invisible.
+pub(crate) fn more_indicator_count(
+    world: &World,
+    output_width: usize,
+    nli_enabled: bool,
+    wrapspace: usize,
+) -> Option<usize> {
+    let pending = if !world.pending_lines.is_empty() {
+        world.pending_lines.len()
+    } else {
+        world.pending_count
+    };
+    let hidden = world.hidden_visual_rows(output_width, nli_enabled, wrapspace);
+    let total = if world.paused { pending + hidden } else { hidden };
+    if total > 0 { Some(total) } else { None }
+}
+
 pub(crate) fn format_more_count(count: usize) -> String {
     // Returns exactly 4 characters to make "More XXXX" or "Hist XXXX" = 9 chars total (right-justified)
     if count <= 9999 {
@@ -1559,10 +1586,14 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         // Show History indicator when scrolled back (takes precedence over More)
         let lines_back = world.lines_from_bottom(app.show_tags);
         (format!("Hist {}", format_more_count(lines_back)), true)
-    } else if world.paused && (!world.pending_lines.is_empty() || world.pending_count > 0) {
-        // Show More indicator when paused with pending lines
-        // Use pending_count for console mode (synced from daemon), pending_lines.len() for daemon mode
-        let count = if !world.pending_lines.is_empty() { world.pending_lines.len() } else { world.pending_count };
+    } else if let Some(count) = more_indicator_count(
+        world,
+        app.output_width as usize,
+        app.settings.new_line_indicator,
+        app.settings.wrapspace as usize,
+    ) {
+        // Show More indicator when paused with pending lines, or when
+        // visual_line_offset truncation is hiding rows of the current world
         (format!("More {}", format_more_count(count)), true)
     } else {
         // Fill with underscores when nothing to show
