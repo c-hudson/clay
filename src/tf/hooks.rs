@@ -318,7 +318,7 @@ mod tests {
 
         register_hook(&mut engine, TfHookEvent::Connect, "say Hello!".to_string());
 
-        assert!(engine.hooks.get(&TfHookEvent::Connect).is_some());
+        assert!(engine.hooks.contains_key(&TfHookEvent::Connect));
         assert_eq!(engine.hooks.get(&TfHookEvent::Connect).unwrap().len(), 1);
     }
 
@@ -331,6 +331,6 @@ mod tests {
 
         let count = unregister_hooks(&mut engine, TfHookEvent::Connect);
         assert_eq!(count, 2);
-        assert!(engine.hooks.get(&TfHookEvent::Connect).is_none());
+        assert!(!engine.hooks.contains_key(&TfHookEvent::Connect));
     }
 }

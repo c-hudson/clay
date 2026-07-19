@@ -1775,7 +1775,7 @@ mod tests {
     fn many_field_def(n: u32) -> PopupDefinition {
         let mut def = PopupDefinition::new(PopupId("test"), "Test");
         for i in 1..=n {
-            def = def.with_field(Field::new(FieldId(i), &format!("Field {i}"), FieldKind::toggle(false)));
+            def = def.with_field(Field::new(FieldId(i), format!("Field {i}"), FieldKind::toggle(false)));
         }
         def.with_button(Button::new(ButtonId(1), "Save"))
     }
@@ -1828,7 +1828,7 @@ mod tests {
         let def_no_buttons = {
             let mut def = PopupDefinition::new(PopupId("test"), "Test");
             for i in 1..=5u32 {
-                def = def.with_field(Field::new(FieldId(i), &format!("Field {i}"), FieldKind::toggle(false)));
+                def = def.with_field(Field::new(FieldId(i), format!("Field {i}"), FieldKind::toggle(false)));
             }
             def
         };

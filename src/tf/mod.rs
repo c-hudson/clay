@@ -577,16 +577,16 @@ mod tests {
         let zero = TfValue::Integer(0);
         assert!(!zero.to_bool());
 
-        let f = TfValue::Float(3.14);
+        let f = TfValue::Float(3.25);
         assert_eq!(f.to_int(), Some(3));
-        assert!((f.to_float().unwrap() - 3.14).abs() < 0.001);
+        assert!((f.to_float().unwrap() - 3.25).abs() < 0.001);
     }
 
     #[test]
     fn test_tf_value_from_str() {
         assert_eq!(TfValue::from("42"), TfValue::Integer(42));
         assert_eq!(TfValue::from("-5"), TfValue::Integer(-5));
-        assert!(matches!(TfValue::from("3.14"), TfValue::Float(_)));
+        assert!(matches!(TfValue::from("3.25"), TfValue::Float(_)));
         assert_eq!(TfValue::from("hello"), TfValue::String("hello".to_string()));
     }
 

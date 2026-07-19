@@ -2646,9 +2646,9 @@ mod tests {
 
     #[test]
     fn test_lexer_numbers() {
-        let mut lexer = Lexer::new("42 3.14 1e10");
+        let mut lexer = Lexer::new("42 3.25 1e10");
         assert_eq!(lexer.next_token().unwrap(), Token::Integer(42));
-        assert_eq!(lexer.next_token().unwrap(), Token::Float(3.14));
+        assert_eq!(lexer.next_token().unwrap(), Token::Float(3.25));
         assert!(matches!(lexer.next_token().unwrap(), Token::Float(_)));
     }
 
