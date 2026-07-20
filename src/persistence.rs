@@ -352,6 +352,17 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
+    // Auto-generated web cert/key (see resolve_web_cert_files in main.rs). Public cert
+    // is base64'd only to keep it on one INI line (it's not secret); the private key
+    // additionally goes through secret() so it's encrypted at rest like other secrets.
+    if !app.settings.web_cert_pem.is_empty() {
+        writeln!(file, "web_cert_pem={}", BASE64.encode(app.settings.web_cert_pem.as_bytes()))?;
+    }
+    if !app.settings.web_key_pem.is_empty() {
+        // base64 first (so it stays single-line even under plaintext_secrets export),
+        // then secret() encrypts that base64 string at rest in the normal case.
+        writeln!(file, "web_key_pem={}", secret(&BASE64.encode(app.settings.web_key_pem.as_bytes())))?;
+    }
     // Save single device auth key (encrypted, with timestamp)
     if let Some(ref ak) = app.settings.websocket_auth_key {
         writeln!(file, "websocket_auth_key={}|{}", secret(&ak.key), ak.created_at)?;
@@ -884,6 +895,22 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     "websocket_key_file" => {
                         app.settings.websocket_key_file = value.to_string();
                     }
+                    "web_cert_pem" => {
+                        if let Ok(bytes) = BASE64.decode(value) {
+                            if let Ok(pem) = String::from_utf8(bytes) {
+                                app.settings.web_cert_pem = pem;
+                            }
+                        }
+                    }
+                    "web_key_pem" => {
+                        // Stored as secret(base64(pem)) — decrypt (if ENC:) to get the
+                        // base64 string back, then base64-decode to the PEM itself.
+                        if let Ok(bytes) = BASE64.decode(decrypt_password(value)) {
+                            if let Ok(pem) = String::from_utf8(bytes) {
+                                app.settings.web_key_pem = pem;
+                            }
+                        }
+                    }
                     "websocket_auth_key" => {
                         // Load single device auth key (format: ENC:...|timestamp or legacy ENC:...)
                         // If multiple lines found, ignore all (migration: startup will generate fresh)
@@ -1394,6 +1421,20 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                     "websocket_allow_list" => app.settings.websocket_allow_list = value.to_string(),
                     "websocket_cert_file" => app.settings.websocket_cert_file = value.to_string(),
                     "websocket_key_file" => app.settings.websocket_key_file = value.to_string(),
+                    "web_cert_pem" => {
+                        if let Ok(bytes) = BASE64.decode(value) {
+                            if let Ok(pem) = String::from_utf8(bytes) {
+                                app.settings.web_cert_pem = pem;
+                            }
+                        }
+                    }
+                    "web_key_pem" => {
+                        if let Ok(bytes) = BASE64.decode(decrypt_password(value)) {
+                            if let Ok(pem) = String::from_utf8(bytes) {
+                                app.settings.web_key_pem = pem;
+                            }
+                        }
+                    }
                     "web_secure" => app.settings.web_secure = value == "true",
                     "http_enabled" => app.settings.http_enabled = value == "true",
                     "http_port" => {
@@ -1430,6 +1471,12 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
     }
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
+    }
+    if !app.settings.web_cert_pem.is_empty() {
+        writeln!(file, "web_cert_pem={}", BASE64.encode(app.settings.web_cert_pem.as_bytes()))?;
+    }
+    if !app.settings.web_key_pem.is_empty() {
+        writeln!(file, "web_key_pem={}", encrypt_password(&BASE64.encode(app.settings.web_key_pem.as_bytes())))?;
     }
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
@@ -1624,6 +1671,12 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     }
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
+    }
+    if !app.settings.web_cert_pem.is_empty() {
+        writeln!(file, "web_cert_pem={}", BASE64.encode(app.settings.web_cert_pem.as_bytes()))?;
+    }
+    if !app.settings.web_key_pem.is_empty() {
+        writeln!(file, "web_key_pem={}", encrypt_password(&BASE64.encode(app.settings.web_key_pem.as_bytes())))?;
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
     if !app.settings.dictionary_path.is_empty() {
@@ -2253,6 +2306,20 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "websocket_key_file" => {
                         app.settings.websocket_key_file = value.to_string();
                     }
+                    "web_cert_pem" => {
+                        if let Ok(bytes) = BASE64.decode(value) {
+                            if let Ok(pem) = String::from_utf8(bytes) {
+                                app.settings.web_cert_pem = pem;
+                            }
+                        }
+                    }
+                    "web_key_pem" => {
+                        if let Ok(bytes) = BASE64.decode(decrypt_password(value)) {
+                            if let Ok(pem) = String::from_utf8(bytes) {
+                                app.settings.web_key_pem = pem;
+                            }
+                        }
+                    }
                     "http_enabled" => {
                         app.settings.http_enabled = value == "true";
                     }
@@ -2605,6 +2672,8 @@ mod tests {
             websocket_whitelisted_host: Some("10.0.0.1".to_string()), // default: None (not persisted to .clay.dat)
             websocket_cert_file: "/tmp/cert.pem".to_string(), // default: ""
             websocket_key_file: "/tmp/key.pem".to_string(),   // default: ""
+            web_cert_pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n".to_string(), // default: ""
+            web_key_pem: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n".to_string(),  // default: ""
             websocket_auth_key: {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                 Some(crate::AuthKey { key: "key1".to_string(), created_at: now })
@@ -2700,6 +2769,8 @@ mod tests {
         // websocket_whitelisted_host is not persisted to .clay.dat (runtime state)
         assert_eq!(a.websocket_cert_file, b.websocket_cert_file, "{context}: websocket_cert_file");
         assert_eq!(a.websocket_key_file, b.websocket_key_file, "{context}: websocket_key_file");
+        assert_eq!(a.web_cert_pem, b.web_cert_pem, "{context}: web_cert_pem");
+        assert_eq!(a.web_key_pem, b.web_key_pem, "{context}: web_key_pem");
         assert_eq!(a.websocket_auth_key.is_some(), b.websocket_auth_key.is_some(), "{context}: websocket_auth_key.is_some()");
         if let (Some(ak_a), Some(ak_b)) = (&a.websocket_auth_key, &b.websocket_auth_key) {
             assert_eq!(ak_a.key, ak_b.key, "{context}: websocket_auth_key.key");
@@ -3044,6 +3115,8 @@ pattern=foo
         assert_ne!(non_default.websocket_allow_list, default.websocket_allow_list, "websocket_allow_list should differ");
         assert_ne!(non_default.websocket_cert_file, default.websocket_cert_file, "websocket_cert_file should differ");
         assert_ne!(non_default.websocket_key_file, default.websocket_key_file, "websocket_key_file should differ");
+        assert_ne!(non_default.web_cert_pem, default.web_cert_pem, "web_cert_pem should differ");
+        assert_ne!(non_default.web_key_pem, default.web_key_pem, "web_key_pem should differ");
         assert!(non_default.websocket_auth_key.is_some(), "websocket_auth_key should be Some");
         assert!(!non_default.actions.is_empty(), "actions should be non-empty");
         assert_ne!(non_default.tls_proxy_enabled, default.tls_proxy_enabled, "tls_proxy_enabled should differ");

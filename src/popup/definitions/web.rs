@@ -1,6 +1,9 @@
 //! Web settings popup definition
 //!
-//! Allows editing HTTP/HTTPS and WebSocket server settings.
+//! Allows editing the web/WebSocket server settings. The server is always
+//! TLS-capable for remote clients now (trust-on-first-use auto cert, or a
+//! user-provided one); localhost is always served plain. See CLAUDE.md
+//! "Connection Security" and `resolve_web_cert_files` in main.rs.
 
 use crate::popup::{
     Button, ButtonId, Field, FieldId, FieldKind, PopupDefinition, PopupId, PopupLayout,
@@ -8,11 +11,9 @@ use crate::popup::{
 };
 
 // Field IDs
-pub const WEB_FIELD_PROTOCOL: FieldId = FieldId(1);
-pub const WEB_FIELD_HTTP_ENABLED: FieldId = FieldId(2);
-pub const WEB_FIELD_HTTP_PORT: FieldId = FieldId(3);
-pub const WEB_FIELD_WS_ENABLED: FieldId = FieldId(4);
-pub const WEB_FIELD_WS_PORT: FieldId = FieldId(5);
+pub const WEB_FIELD_PORT: FieldId = FieldId(3);
+pub const WEB_FIELD_CUSTOM_PORT: FieldId = FieldId(4);
+pub const WEB_FIELD_CUSTOM_CERT: FieldId = FieldId(5);
 pub const WEB_FIELD_WS_PASSWORD: FieldId = FieldId(6);
 pub const WEB_FIELD_WS_ALLOW_LIST: FieldId = FieldId(7);
 pub const WEB_FIELD_WS_CERT_FILE: FieldId = FieldId(8);
@@ -23,23 +24,32 @@ pub const WEB_FIELD_WEB_PATH: FieldId = FieldId(11);
 // Button IDs
 pub const WEB_BTN_SAVE: ButtonId = ButtonId(1);
 pub const WEB_BTN_CANCEL: ButtonId = ButtonId(2);
-pub const WEB_BTN_REGEN_KEY: ButtonId = ButtonId(3);
-pub const WEB_BTN_COPY_KEY: ButtonId = ButtonId(4);
+pub const WEB_BTN_MODIFY_KEY: ButtonId = ButtonId(3);
 
-/// Protocol options
-pub fn protocol_options() -> Vec<SelectOption> {
+/// Port field options: disabled, the default 9000, or a user-defined port
+/// (revealed as a separate "Custom Port" text field).
+pub fn port_options() -> Vec<SelectOption> {
     vec![
-        SelectOption::new("nonsecure", "Non-Secure"),
-        SelectOption::new("secure", "Secure"),
+        SelectOption::new("disabled", "Disabled"),
+        SelectOption::new("9000", "9000"),
+        SelectOption::new("custom", "Custom"),
     ]
 }
 
-/// Create the web settings popup definition with current values
+/// Custom Cert File options: No (use the auto-generated cert) or Yes (reveals
+/// the cert/key file path fields).
+pub fn custom_cert_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption::new("no", "No"),
+        SelectOption::new("yes", "Yes"),
+    ]
+}
+
+/// Create the web settings popup definition with current values.
 #[allow(clippy::too_many_arguments)]
 pub fn create_web_popup(
-    web_secure: bool,
     http_enabled: bool,
-    http_port: &str,
+    http_port: u16,
     web_path: &str,
     ws_password: &str,
     ws_allow_list: &str,
@@ -47,23 +57,27 @@ pub fn create_web_popup(
     ws_key_file: &str,
     auth_key: &str,
 ) -> PopupDefinition {
-    let protocol_idx = if web_secure { 1 } else { 0 };
+    let port_selected = if !http_enabled {
+        "disabled"
+    } else if http_port == 9000 {
+        "9000"
+    } else {
+        "custom"
+    };
+    let port_idx = port_options().iter().position(|o| o.value == port_selected).unwrap_or(0);
+    let has_custom_cert = !ws_cert_file.is_empty() && !ws_key_file.is_empty();
+    let cert_idx = if has_custom_cert { 1 } else { 0 };
 
     let mut def = PopupDefinition::new(PopupId("web"), "Web Settings")
         .with_field(Field::new(
-            WEB_FIELD_PROTOCOL,
-            "Protocol",
-            FieldKind::select(protocol_options(), protocol_idx),
+            WEB_FIELD_PORT,
+            "Port",
+            FieldKind::select(port_options(), port_idx),
         ))
         .with_field(Field::new(
-            WEB_FIELD_HTTP_ENABLED,
-            "HTTP Enabled",
-            FieldKind::toggle(http_enabled),
-        ))
-        .with_field(Field::new(
-            WEB_FIELD_HTTP_PORT,
-            "HTTP Port",
-            FieldKind::text(http_port),
+            WEB_FIELD_CUSTOM_PORT,
+            "Custom Port",
+            FieldKind::text(http_port.to_string()),
         ))
         .with_field(Field::new(
             WEB_FIELD_WEB_PATH,
@@ -72,7 +86,7 @@ pub fn create_web_popup(
         ))
         .with_field(Field::new(
             WEB_FIELD_WS_PASSWORD,
-            "WS Password",
+            "Password",
             FieldKind::text(ws_password),
         ))
         .with_field(Field::new(
@@ -81,22 +95,29 @@ pub fn create_web_popup(
             FieldKind::text(ws_allow_list),
         ))
         .with_field(Field::new(
+            WEB_FIELD_CUSTOM_CERT,
+            "Custom Cert File",
+            FieldKind::select(custom_cert_options(), cert_idx),
+        ))
+        .with_field(Field::new(
             WEB_FIELD_WS_CERT_FILE,
-            "TLS Cert File",
+            "Cert File",
             FieldKind::text(ws_cert_file),
         ))
         .with_field(Field::new(
             WEB_FIELD_WS_KEY_FILE,
-            "TLS Key File",
+            "Key File",
             FieldKind::text(ws_key_file),
         ))
-        .with_field(Field::new(
-            WEB_FIELD_AUTH_KEY,
-            "Auth Key",
-            FieldKind::text(auth_key),
-        ))
-        .with_button(Button::new(WEB_BTN_COPY_KEY, "Copy Key").with_shortcut('K'))
-        .with_button(Button::new(WEB_BTN_REGEN_KEY, "Regen Key").with_shortcut('R'))
+        .with_field(
+            Field::new(
+                WEB_FIELD_AUTH_KEY,
+                "Auth Key",
+                FieldKind::text(auth_key),
+            )
+            .disabled(),
+        )
+        .with_button(Button::new(WEB_BTN_MODIFY_KEY, "Modify Key").with_shortcut('M'))
         .with_button(Button::new(WEB_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(WEB_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
@@ -115,15 +136,7 @@ pub fn create_web_popup(
 
     def = def.with_help(web_help_text());
 
-    // Hide TLS fields if not secure
-    if !web_secure {
-        if let Some(field) = def.get_field_mut(WEB_FIELD_WS_CERT_FILE) {
-            field.visible = false;
-        }
-        if let Some(field) = def.get_field_mut(WEB_FIELD_WS_KEY_FILE) {
-            field.visible = false;
-        }
-    }
+    update_web_visibility_def(&mut def);
 
     def
 }
@@ -134,15 +147,26 @@ fn web_help_text() -> Vec<String> {
         "Web Settings - Remote Access",
         "",
         "These settings let you access Clay from a web",
-        "browser or mobile device on your network.",
+        "browser or mobile device on your network. The",
+        "server is always TLS-encrypted for remote clients",
+        "(auto-generated certificate, or your own — see",
+        "Custom Cert File below); connections from this",
+        "same machine (localhost) are always unencrypted,",
+        "so the desktop app never shows a certificate prompt.",
         "",
-        "Protocol: Choose Secure (HTTPS/WSS) or Non-Secure",
-        "  (HTTP/WS). Secure requires TLS certificate files.",
+        "Other Clay instances connecting to this one (remote",
+        "console, another Clay's WebView, the Android app)",
+        "trust the certificate automatically the first time",
+        "and only ask for confirmation if it later changes —",
+        "so there is nothing to configure for that to work.",
+        "A plain web browser will show a one-time \"not",
+        "secure\" warning for the self-signed certificate;",
+        "use Custom Cert File to supply a CA-signed one and",
+        "avoid that.",
         "",
-        "HTTP Enabled: Starts a web server so you can open",
-        "  Clay in a browser at http://yourhost:port.",
-        "",
-        "HTTP Port: The port number for the web server.",
+        "Port: Disabled turns the web server off. 9000 is",
+        "  the default port. Custom lets you pick your own",
+        "  (shown in the Custom Port field below).",
         "",
         "Web Path: Stealth path prefix for the web UI (default",
         "  \"clay\" — UI served only at /clay/, everything else",
@@ -156,8 +180,8 @@ fn web_help_text() -> Vec<String> {
         "  a knock, non-localhost devices need to be on the WS",
         "  Allow List.",
         "",
-        "WS Password: Password required for WebSocket clients",
-        "  (web, mobile, remote console) to connect. Accepted",
+        "Password: Required for WebSocket clients (web,",
+        "  mobile, remote console) to connect. Accepted",
         "  from any address when the Allow List is empty; when",
         "  an Allow List is set, only from listed addresses.",
         "  A wrong password bans the address after 5 failed",
@@ -179,32 +203,60 @@ fn web_help_text() -> Vec<String> {
         "  bare \"*\" entry does NOT get this protection (it",
         "  means \"let everyone in\", not \"never ban anyone\").",
         "",
-        "TLS Cert File: Path to your TLS/SSL certificate",
-        "  file (.pem or .crt) for secure connections.",
-        "",
-        "TLS Key File: Path to your TLS/SSL private key",
-        "  file (.pem or .key) for secure connections.",
+        "Custom Cert File: No (default) uses an automatically",
+        "  generated, self-signed certificate — nothing to",
+        "  configure. Yes lets you supply your own cert/key",
+        "  PEM files (e.g. a CA-signed certificate) instead.",
         "",
         "Auth Key: Device authentication key for passwordless",
         "  login from the Android app or trusted devices.",
-        "  Use Regen Key to generate a new key. Copy the key",
-        "  to paste into the Android app's settings.",
-        "  The Android app also uses it to knock: it proves",
-        "  the key before any web request, which is the only",
-        "  way in from an address not on the Allow List.",
-        "  Regen or revoke takes effect immediately.",
+        "  Read-only here — use Modify Key to copy, regenerate,",
+        "  or delete it. The Android app also uses it to knock:",
+        "  it proves the key before any web request, which is",
+        "  the only way in from an address not on the Allow",
+        "  List. Regen or delete takes effect immediately.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
-/// Update visibility of TLS fields based on protocol selection
-pub fn update_tls_visibility(state: &mut crate::popup::PopupState) {
-    let is_secure = state.get_selected(WEB_FIELD_PROTOCOL) == Some("secure");
+/// Update visibility of the Custom Port and cert/key fields based on the
+/// current Port / Custom Cert File selections.
+pub fn update_web_visibility(state: &mut crate::popup::PopupState) {
+    let show_custom_port = state.get_selected(WEB_FIELD_PORT) == Some("custom");
+    if let Some(field) = state.field_mut(WEB_FIELD_CUSTOM_PORT) {
+        field.visible = show_custom_port;
+    }
 
+    let show_cert_fields = state.get_selected(WEB_FIELD_CUSTOM_CERT) == Some("yes");
     if let Some(field) = state.field_mut(WEB_FIELD_WS_CERT_FILE) {
-        field.visible = is_secure;
+        field.visible = show_cert_fields;
     }
     if let Some(field) = state.field_mut(WEB_FIELD_WS_KEY_FILE) {
-        field.visible = is_secure;
+        field.visible = show_cert_fields;
+    }
+}
+
+/// Same as `update_web_visibility` but operates directly on a `PopupDefinition`
+/// (used at creation time, before a `PopupState` wraps it).
+fn update_web_visibility_def(def: &mut PopupDefinition) {
+    let show_custom_port = def.get_field(WEB_FIELD_PORT)
+        .and_then(|f| if let FieldKind::Select { options, selected_index } = &f.kind {
+            options.get(*selected_index).map(|o| o.value == "custom")
+        } else { None })
+        .unwrap_or(false);
+    if let Some(field) = def.get_field_mut(WEB_FIELD_CUSTOM_PORT) {
+        field.visible = show_custom_port;
+    }
+
+    let show_cert_fields = def.get_field(WEB_FIELD_CUSTOM_CERT)
+        .and_then(|f| if let FieldKind::Select { options, selected_index } = &f.kind {
+            options.get(*selected_index).map(|o| o.value == "yes")
+        } else { None })
+        .unwrap_or(false);
+    if let Some(field) = def.get_field_mut(WEB_FIELD_WS_CERT_FILE) {
+        field.visible = show_cert_fields;
+    }
+    if let Some(field) = def.get_field_mut(WEB_FIELD_WS_KEY_FILE) {
+        field.visible = show_cert_fields;
     }
 }
 
@@ -216,7 +268,7 @@ mod tests {
     #[test]
     fn test_web_popup_creation() {
         let def = create_web_popup(
-            false, true, "9000", "clay",
+            true, 9000, "clay",
             "secret", "",
             "/path/to/cert", "/path/to/key",
             "testkey123",
@@ -228,29 +280,45 @@ mod tests {
     }
 
     #[test]
-    fn test_web_popup_tls_visibility() {
-        // Non-secure mode - TLS fields hidden
-        let def = create_web_popup(
-            false, true, "9000", "clay",
-            "secret", "",
-            "", "",
-            "",
+    fn test_web_popup_port_selection() {
+        // Disabled
+        let def = create_web_popup(false, 9000, "clay", "", "", "", "", "");
+        assert_eq!(
+            def.get_field(WEB_FIELD_PORT).and_then(|f| if let FieldKind::Select { options, selected_index } = &f.kind {
+                Some(options[*selected_index].value.clone())
+            } else { None }),
+            Some("disabled".to_string())
         );
-        let state = PopupState::new(def);
+        assert!(!def.get_field(WEB_FIELD_CUSTOM_PORT).unwrap().visible);
 
+        // Default port
+        let def = create_web_popup(true, 9000, "clay", "", "", "", "", "");
+        assert!(!def.get_field(WEB_FIELD_CUSTOM_PORT).unwrap().visible);
+
+        // Custom port
+        let def = create_web_popup(true, 1234, "clay", "", "", "", "", "");
+        assert!(def.get_field(WEB_FIELD_CUSTOM_PORT).unwrap().visible);
+    }
+
+    #[test]
+    fn test_web_popup_cert_visibility() {
+        // No custom cert configured — fields hidden
+        let def = create_web_popup(true, 9000, "clay", "secret", "", "", "", "");
+        let state = PopupState::new(def);
         assert!(!state.field(WEB_FIELD_WS_CERT_FILE).unwrap().visible);
         assert!(!state.field(WEB_FIELD_WS_KEY_FILE).unwrap().visible);
 
-        // Secure mode - TLS fields visible
-        let def = create_web_popup(
-            true, true, "9000", "clay",
-            "secret", "",
-            "", "",
-            "",
-        );
+        // Custom cert configured — fields visible
+        let def = create_web_popup(true, 9000, "clay", "secret", "", "/c", "/k", "");
         let state = PopupState::new(def);
-
         assert!(state.field(WEB_FIELD_WS_CERT_FILE).unwrap().visible);
         assert!(state.field(WEB_FIELD_WS_KEY_FILE).unwrap().visible);
+    }
+
+    #[test]
+    fn test_web_popup_auth_key_readonly() {
+        let def = create_web_popup(true, 9000, "clay", "", "", "", "", "testkey");
+        let field = def.get_field(WEB_FIELD_AUTH_KEY).unwrap();
+        assert!(!field.is_focusable(), "Auth Key must be read-only (not focusable)");
     }
 }

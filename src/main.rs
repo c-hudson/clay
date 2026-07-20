@@ -1221,6 +1221,68 @@ fn cert_needs_regeneration(cert_path: &std::path::Path) -> bool {
     saved_ips != current_ips
 }
 
+/// Resolve which cert/key files the web server should use for this run, always
+/// returning usable file paths (materializing settings.dat's stored auto-cert to
+/// disk, generating a fresh one if missing/stale). User-provided certs take
+/// priority; otherwise an auto-generated self-signed cert is used, backed by
+/// `web_cert_pem`/`web_key_pem` in settings.dat so it survives a fresh `~/.clay`
+/// and travels with `/import` (the private key simply fails to decrypt on another
+/// machine's `secure.key` and gets silently regenerated — see persistence.rs).
+/// Returns `None` only if generation itself fails.
+fn resolve_web_cert_files(app: &mut App) -> Option<(String, String)> {
+    if !app.settings.websocket_cert_file.is_empty() && !app.settings.websocket_key_file.is_empty() {
+        return Some((app.settings.websocket_cert_file.clone(), app.settings.websocket_key_file.clone()));
+    }
+
+    let cert_path = clay_config_path("cert.pem");
+    let key_path = clay_config_path("key.pem");
+
+    // Materialize a settings-stored auto-cert to disk if the cache is missing
+    // (fresh ~/.clay, or settings imported from another machine).
+    if !app.settings.web_cert_pem.is_empty() && !app.settings.web_key_pem.is_empty()
+        && (!cert_path.exists() || !key_path.exists())
+    {
+        let _ = std::fs::write(&cert_path, &app.settings.web_cert_pem);
+        let _ = crate::util::write_secret_file(&key_path, app.settings.web_key_pem.as_bytes());
+    }
+
+    let needs_gen = !cert_path.exists() || !key_path.exists();
+    let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
+    if needs_gen || needs_regen {
+        if needs_regen {
+            app.add_output("\u{2728} IP address changed, regenerating TLS certificate...");
+        }
+        match generate_self_signed_cert(&cert_path, &key_path) {
+            Ok(()) => {
+                app.add_output("\u{2728} Generated self-signed TLS certificate.");
+            }
+            Err(e) => {
+                app.add_output(&format!("\u{2728} Failed to generate TLS certificate: {}", e));
+                return None;
+            }
+        }
+    }
+
+    if !cert_path.exists() || !key_path.exists() {
+        return None;
+    }
+
+    // Sync the resolved PEM content back into settings.dat (canonical store),
+    // re-encrypting the key under this machine's key on every save.
+    if let (Ok(cert_pem), Ok(key_pem)) = (
+        std::fs::read_to_string(&cert_path),
+        std::fs::read_to_string(&key_path),
+    ) {
+        if app.settings.web_cert_pem != cert_pem || app.settings.web_key_pem != key_pem {
+            app.settings.web_cert_pem = cert_pem;
+            app.settings.web_key_pem = key_pem;
+            let _ = persistence::save_settings(app);
+        }
+    }
+
+    Some((cert_path.to_string_lossy().to_string(), key_path.to_string_lossy().to_string()))
+}
+
 pub fn get_home_dir() -> String {
     home::home_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -1477,15 +1539,27 @@ pub struct Settings {
     web_font_letter_spacing: f32,  // Letter spacing in px (default 0)
     web_font_word_spacing: f32,    // Word spacing in px (default 0)
     // Web server settings (consolidated)
-    web_secure: bool,              // Protocol: true=Secure (https/wss), false=Non-Secure (http/ws)
-    http_enabled: bool,            // Enable HTTP/HTTPS web server (name depends on web_secure)
-    http_port: u16,                // Port for HTTP/HTTPS web interface
+    // The server is always TLS-capable now: localhost is served plain (no cert prompt,
+    // see http::route_connection's loopback branch), remote clients always get TLS —
+    // either a user-provided cert (websocket_cert_file/websocket_key_file) or the
+    // auto-generated one below. `web_secure` is kept only for settings.dat/import
+    // backward-compat and is no longer read to choose the server mode.
+    web_secure: bool,
+    http_enabled: bool,            // Enable the web server
+    http_port: u16,                // Port for the web interface
     web_path: String,              // Stealth path prefix for web UI (default "clay"; empty = legacy mode at "/")
     websocket_password: String,
     websocket_allow_list: String,  // CSV list of hosts that can be whitelisted
     websocket_whitelisted_host: Option<String>,  // Currently whitelisted host (authenticated from allow list)
-    websocket_cert_file: String,   // Path to TLS certificate file (PEM) - only used when web_secure=true
-    websocket_key_file: String,    // Path to TLS private key file (PEM) - only used when web_secure=true
+    websocket_cert_file: String,   // Path to a user-provided TLS certificate file (PEM); empty = use the auto-generated cert
+    websocket_key_file: String,    // Path to a user-provided TLS private key file (PEM); empty = use the auto-generated cert
+    // Auto-generated self-signed cert/key, canonically stored here so it survives a
+    // fresh ~/.clay and travels with /import. Materialized to ~/.clay/cert.pem and
+    // key.pem on disk (a derived cache) for the file-based TLS server APIs to read.
+    // Public cert stored in cleartext; the private key is encrypted at rest (see
+    // persistence::secret()) the same way websocket_auth_key/world passwords are.
+    web_cert_pem: String,
+    web_key_pem: String,
     // Single persistent auth key for passwordless device authentication
     websocket_auth_key: Option<AuthKey>,
     // User-defined actions/triggers
@@ -1542,6 +1616,8 @@ impl Default for Settings {
             websocket_whitelisted_host: None,
             websocket_cert_file: String::new(),
             websocket_key_file: String::new(),
+            web_cert_pem: String::new(),
+            web_key_pem: String::new(),
             websocket_auth_key: None,
             actions: Vec::new(),
             tls_proxy_enabled: false,
@@ -3910,16 +3986,15 @@ impl App {
 
     /// Open the new web settings popup
     fn open_web_popup_new(&mut self) {
-        use popup::definitions::web::{create_web_popup, WEB_FIELD_PROTOCOL};
+        use popup::definitions::web::{create_web_popup, WEB_FIELD_PORT};
 
         let auth_key_str = self.settings.websocket_auth_key
             .as_ref()
             .map(|ak| ak.key.clone())
             .unwrap_or_default();
         let def = create_web_popup(
-            self.settings.web_secure,
             self.settings.http_enabled,
-            &self.settings.http_port.to_string(),
+            self.settings.http_port,
             &self.settings.web_path,
             &self.settings.websocket_password,
             &self.settings.websocket_allow_list,
@@ -3931,7 +4006,7 @@ impl App {
 
         // Select first field
         if let Some(state) = self.popup_manager.current_mut() {
-            state.select_field(WEB_FIELD_PROTOCOL);
+            state.select_field(WEB_FIELD_PORT);
         }
     }
 
@@ -10044,45 +10119,44 @@ pub(crate) struct SetupSettings {
     pub(crate) wrapspace: i64,
 }
 
-/// Settings from the web popup
+/// Settings from the web popup. The auth key is NOT included here — it's
+/// read-only in the popup and only changed via the Modify Key sub-popup, which
+/// applies immediately (see App::handle_ws_key_request/handle_ws_key_revoke)
+/// rather than waiting for Save.
 pub(crate) struct WebSettings {
-    pub(crate) web_secure: bool,
     pub(crate) http_enabled: bool,
     pub(crate) http_port: String,
     pub(crate) web_path: String,
     pub(crate) ws_password: String,
     pub(crate) ws_allow_list: String,
+    /// true = use ws_cert_file/ws_key_file (user-provided cert); false = use
+    /// the auto-generated cert (see resolve_web_cert_files in main.rs).
+    pub(crate) custom_cert: bool,
     pub(crate) ws_cert_file: String,
     pub(crate) ws_key_file: String,
-    pub(crate) auth_key: String,
 }
 
 /// Apply web settings to app and save to disk
 pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
     let port_changed = app.settings.http_port != settings.http_port.parse().unwrap_or(9000);
-    let secure_changed = app.settings.web_secure != settings.web_secure;
     let http_changed = app.settings.http_enabled != settings.http_enabled;
-    let cert_changed = app.settings.websocket_cert_file != settings.ws_cert_file
-        || app.settings.websocket_key_file != settings.ws_key_file;
+    let (new_cert_file, new_key_file) = if settings.custom_cert {
+        (settings.ws_cert_file.clone(), settings.ws_key_file.clone())
+    } else {
+        (String::new(), String::new())
+    };
+    let cert_changed = app.settings.websocket_cert_file != new_cert_file
+        || app.settings.websocket_key_file != new_key_file;
     let sanitized_web_path = sanitize_web_path(&settings.web_path);
     let web_path_changed = app.settings.web_path != sanitized_web_path;
 
-    app.settings.web_secure = settings.web_secure;
     app.settings.http_enabled = settings.http_enabled;
     app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
     app.settings.web_path = sanitized_web_path;
     app.settings.websocket_password = settings.ws_password.clone();
     app.settings.websocket_allow_list = settings.ws_allow_list.clone();
-    app.settings.websocket_cert_file = settings.ws_cert_file.clone();
-    app.settings.websocket_key_file = settings.ws_key_file.clone();
-
-    // Update auth key if changed
-    if !settings.auth_key.is_empty() {
-        let current_key = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.as_str()).unwrap_or("");
-        if settings.auth_key != current_key {
-            app.settings.websocket_auth_key = Some(AuthKey::new(settings.auth_key.clone()));
-        }
-    }
+    app.settings.websocket_cert_file = new_cert_file;
+    app.settings.websocket_key_file = new_key_file;
 
     // Update the running server's allow list and password immediately (no reload needed)
     if let Some(ref server) = app.ws_server {
@@ -10094,7 +10168,7 @@ pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
 
     let _ = persistence::save_settings(app);
 
-    if port_changed || secure_changed || http_changed || cert_changed || web_path_changed {
+    if port_changed || http_changed || cert_changed || web_path_changed {
         app.web_restart_needed = true;
         app.add_output("Web settings saved. Restarting web server...");
     } else {
@@ -10105,15 +10179,14 @@ pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
 /// Extract WebSettings from a confirm dialog's custom_data
 pub(crate) fn web_settings_from_custom_data(data: &std::collections::HashMap<String, String>) -> WebSettings {
     WebSettings {
-        web_secure: data.get("web_secure").map(|v| v == "true").unwrap_or(false),
         http_enabled: data.get("http_enabled").map(|v| v == "true").unwrap_or(false),
         http_port: data.get("http_port").cloned().unwrap_or_else(|| "9000".to_string()),
         web_path: data.get("web_path").cloned().unwrap_or_else(|| "clay".to_string()),
         ws_password: data.get("ws_password").cloned().unwrap_or_default(),
         ws_allow_list: data.get("ws_allow_list").cloned().unwrap_or_default(),
+        custom_cert: data.get("custom_cert").map(|v| v == "true").unwrap_or(false),
         ws_cert_file: data.get("ws_cert_file").cloned().unwrap_or_default(),
         ws_key_file: data.get("ws_key_file").cloned().unwrap_or_default(),
-        auth_key: data.get("auth_key").cloned().unwrap_or_default(),
     }
 }
 
@@ -10179,7 +10252,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     use crossterm::event::KeyCode::*;
     use popup::definitions::help::HELP_BTN_OK;
     use popup::definitions::confirm::{CONFIRM_BTN_YES, CONFIRM_BTN_NO};
-    use popup::ElementSelection;
     use popup::definitions::world_selector::{
         SELECTOR_FIELD_FILTER,
         SELECTOR_BTN_ADD, SELECTOR_BTN_EDIT, SELECTOR_BTN_DELETE,
@@ -10195,11 +10267,16 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
-        WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT, WEB_FIELD_WEB_PATH,
+        WEB_FIELD_PORT, WEB_FIELD_CUSTOM_PORT, WEB_FIELD_WEB_PATH,
         WEB_FIELD_WS_PASSWORD, WEB_FIELD_AUTH_KEY,
-        WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
-        WEB_BTN_SAVE, WEB_BTN_CANCEL, WEB_BTN_REGEN_KEY, WEB_BTN_COPY_KEY,
-        update_tls_visibility,
+        WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_CUSTOM_CERT, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
+        WEB_BTN_SAVE, WEB_BTN_CANCEL, WEB_BTN_MODIFY_KEY,
+        update_web_visibility,
+    };
+    use popup::definitions::modify_key::{
+        create_modify_key_popup, set_displayed_key,
+        MODIFY_KEY_BTN_COPY, MODIFY_KEY_BTN_REGEN,
+        MODIFY_KEY_BTN_DELETE, MODIFY_KEY_BTN_CLOSE,
     };
     use popup::definitions::actions::{
         ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST,
@@ -10254,6 +10331,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     let is_world_selector = popup_id == Some(popup::PopupId("world_selector"));
     let is_setup = popup_id == Some(popup::PopupId("setup"));
     let is_web = popup_id == Some(popup::PopupId("web"));
+    let is_modify_key = popup_id == Some(popup::PopupId("modify_key"));
     let is_connections = popup_id == Some(popup::PopupId("connections"));
     let is_actions_list = popup_id == Some(popup::PopupId("actions_list"));
     let is_action_editor = popup_id == Some(popup::PopupId("action_editor"));
@@ -10570,17 +10648,28 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         if is_web {
             // Helper to extract settings before closing
             let extract_settings = || -> WebSettings {
+                let port_selected = state.get_selected(WEB_FIELD_PORT).unwrap_or("disabled");
+                let (http_enabled, http_port) = match port_selected {
+                    "disabled" => (false, "9000".to_string()),
+                    "9000" => (true, "9000".to_string()),
+                    _ => (true, state.get_text(WEB_FIELD_CUSTOM_PORT).unwrap_or("9000").to_string()),
+                };
                 WebSettings {
-                    web_secure: state.get_selected(WEB_FIELD_PROTOCOL) == Some("secure"),
-                    http_enabled: state.get_bool(WEB_FIELD_HTTP_ENABLED).unwrap_or(false),
-                    http_port: state.get_text(WEB_FIELD_HTTP_PORT).unwrap_or("9000").to_string(),
+                    http_enabled,
+                    http_port,
                     web_path: state.get_text(WEB_FIELD_WEB_PATH).unwrap_or("clay").to_string(),
                     ws_password: state.get_text(WEB_FIELD_WS_PASSWORD).unwrap_or("").to_string(),
                     ws_allow_list: state.get_text(WEB_FIELD_WS_ALLOW_LIST).unwrap_or("").to_string(),
+                    custom_cert: state.get_selected(WEB_FIELD_CUSTOM_CERT) == Some("yes"),
                     ws_cert_file: state.get_text(WEB_FIELD_WS_CERT_FILE).unwrap_or("").to_string(),
                     ws_key_file: state.get_text(WEB_FIELD_WS_KEY_FILE).unwrap_or("").to_string(),
-                    auth_key: state.get_text(WEB_FIELD_AUTH_KEY).unwrap_or("").to_string(),
                 }
+            };
+
+            // Open the Modify Key sub-popup, stacking on top of this one.
+            let open_modify_key = |app: &mut App| {
+                let auth_key = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default();
+                app.popup_manager.push(create_modify_key_popup(&auth_key));
             };
 
             // Check if current field is a text field
@@ -10602,36 +10691,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             let settings = extract_settings();
                             app.popup_manager.close();
                             return NewPopupAction::WebSaved(settings);
-                        } else if state.is_button_focused(WEB_BTN_REGEN_KEY) {
-                            // Generate a new auth key and update the field. On RNG
-                            // failure (C2, fail closed), leave the field untouched
-                            // rather than showing a weak/guessable key.
-                            if let Some(new_key) = App::generate_auth_key() {
-                                if let Some(field) = state.definition.fields.iter_mut()
-                                    .find(|f| f.id == WEB_FIELD_AUTH_KEY)
-                                {
-                                    if let popup::FieldKind::Text { ref mut value, .. } = field.kind {
-                                        *value = new_key;
-                                    }
-                                }
-                            }
-                        } else if state.is_button_focused(WEB_BTN_COPY_KEY) {
-                            // Copy auth key to clipboard via OSC 52
-                            if let Some(key_text) = state.get_text(WEB_FIELD_AUTH_KEY) {
-                                if !key_text.is_empty() {
-                                    use std::io::Write;
-                                    let encoded = base64::Engine::encode(
-                                        &base64::engine::general_purpose::STANDARD,
-                                        key_text.as_bytes(),
-                                    );
-                                    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
-                                    let _ = std::io::stdout().write_all(osc52.as_bytes());
-                                    let _ = std::io::stdout().flush();
-                                    // Show feedback (auto-clears after 10s)
-                                    state.error = Some("Auth key copied to clipboard".to_string());
-                                    state.error_at = Some(std::time::Instant::now());
-                                }
-                            }
+                        } else if state.is_button_focused(WEB_BTN_MODIFY_KEY) {
+                            open_modify_key(app);
                         } else if state.is_button_focused(WEB_BTN_CANCEL) {
                             app.popup_manager.close();
                         }
@@ -10640,24 +10701,14 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     } else {
                         // Toggle current field
                         state.toggle_current();
-                        // Update TLS visibility when protocol changes
-                        if let ElementSelection::Field(id) = &state.selected {
-                            if *id == WEB_FIELD_PROTOCOL {
-                                update_tls_visibility(state);
-                            }
-                        }
+                        update_web_visibility(state);
                     }
                 }
                 Char(' ') => {
                     if !state.editing {
                         // Toggle for non-text fields
                         state.toggle_current();
-                        // Update TLS visibility when protocol changes
-                        if let ElementSelection::Field(id) = &state.selected {
-                            if *id == WEB_FIELD_PROTOCOL {
-                                update_tls_visibility(state);
-                            }
-                        }
+                        update_web_visibility(state);
                     } else {
                         state.insert_char(' ');
                     }
@@ -10683,11 +10734,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         // Not editing: only adjusts a Select/Number field
                         // (no-op on Text/Toggle/etc; Toggle is never touched by arrows).
                         state.decrease_current();
-                        if let ElementSelection::Field(id) = &state.selected {
-                            if *id == WEB_FIELD_PROTOCOL {
-                                update_tls_visibility(state);
-                            }
-                        }
+                        update_web_visibility(state);
                     }
                 }
                 Right => {
@@ -10695,11 +10742,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                         state.cursor_right();
                     } else {
                         state.increase_current();
-                        if let ElementSelection::Field(id) = &state.selected {
-                            if *id == WEB_FIELD_PROTOCOL {
-                                update_tls_visibility(state);
-                            }
-                        }
+                        update_web_visibility(state);
                     }
                 }
                 Tab => {
@@ -10743,39 +10786,102 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             let settings = extract_settings();
                             app.popup_manager.close();
                             return NewPopupAction::WebSaved(settings);
-                        } else if btn_id == WEB_BTN_REGEN_KEY {
-                            // On RNG failure (C2, fail closed), leave the field
-                            // untouched rather than showing a weak/guessable key.
-                            if let Some(new_key) = App::generate_auth_key() {
-                                if let Some(field) = state.definition.fields.iter_mut()
-                                    .find(|f| f.id == WEB_FIELD_AUTH_KEY)
-                                {
-                                    if let popup::FieldKind::Text { ref mut value, .. } = field.kind {
-                                        *value = new_key;
-                                    }
-                                }
-                            }
-                        } else if btn_id == WEB_BTN_COPY_KEY {
-                            if let Some(key_text) = state.get_text(WEB_FIELD_AUTH_KEY) {
-                                if !key_text.is_empty() {
-                                    use std::io::Write;
-                                    let encoded = base64::Engine::encode(
-                                        &base64::engine::general_purpose::STANDARD,
-                                        key_text.as_bytes(),
-                                    );
-                                    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
-                                    let _ = std::io::stdout().write_all(osc52.as_bytes());
-                                    let _ = std::io::stdout().flush();
-                                    state.error = Some("Auth key copied to clipboard".to_string());
-                                    state.error_at = Some(std::time::Instant::now());
-                                }
-                            }
+                        } else if btn_id == WEB_BTN_MODIFY_KEY {
+                            open_modify_key(app);
                         } else if btn_id == WEB_BTN_CANCEL {
                             app.popup_manager.close();
                         }
                     }
                 }
                 _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Modify Key popup handling (nested under /web — see WEB_BTN_MODIFY_KEY above).
+        // Copy/Regen/Delete act on app.settings.websocket_auth_key directly (not on this
+        // popup's own field, which is purely presentational) and take effect immediately —
+        // reusing the same App methods the web/GUI "Regen"/"Revoke" buttons already use, so
+        // regen/delete here is persisted and broadcast to every connected client too.
+        if is_modify_key {
+            // Takes `app` as an explicit parameter (not captured) so each call is an
+            // independent reborrow — needed since regen/delete calls interleave
+            // reads of the key with `&mut App` method calls in the same match arm.
+            let current_key = |app: &App| app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default();
+            let copy_key = |state: &mut popup::PopupState, key_text: &str| {
+                if key_text.is_empty() { return; }
+                use std::io::Write;
+                let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_text.as_bytes());
+                let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+                let _ = std::io::stdout().write_all(osc52.as_bytes());
+                let _ = std::io::stdout().flush();
+                state.error = Some("Auth key copied to clipboard".to_string());
+                state.error_at = Some(std::time::Instant::now());
+            };
+            // Sync the underlying /web popup's read-only Auth Key field after a change.
+            // Called after popup_manager.close() pops the /web popup back into `current`.
+            let sync_parent = |app: &mut App| {
+                let key = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default();
+                if let Some(parent) = app.popup_manager.current_mut() {
+                    parent.set_text(WEB_FIELD_AUTH_KEY, key);
+                }
+            };
+
+            // Resolve which action (if any) this key press triggers, without holding
+            // `state` (borrowed from app.popup_manager) across the app.xxx() calls below.
+            enum ModifyKeyAction { Copy, Regen, Delete, Close, None }
+            let action = match key.code {
+                Esc => ModifyKeyAction::Close,
+                Enter | Char(' ') => {
+                    if state.is_button_focused(MODIFY_KEY_BTN_COPY) { ModifyKeyAction::Copy }
+                    else if state.is_button_focused(MODIFY_KEY_BTN_REGEN) { ModifyKeyAction::Regen }
+                    else if state.is_button_focused(MODIFY_KEY_BTN_DELETE) { ModifyKeyAction::Delete }
+                    else if state.is_button_focused(MODIFY_KEY_BTN_CLOSE) { ModifyKeyAction::Close }
+                    else { ModifyKeyAction::None }
+                }
+                Char(c) => {
+                    match state.find_button_by_shortcut(c) {
+                        Some(id) if id == MODIFY_KEY_BTN_COPY => ModifyKeyAction::Copy,
+                        Some(id) if id == MODIFY_KEY_BTN_REGEN => ModifyKeyAction::Regen,
+                        Some(id) if id == MODIFY_KEY_BTN_DELETE => ModifyKeyAction::Delete,
+                        Some(id) if id == MODIFY_KEY_BTN_CLOSE => ModifyKeyAction::Close,
+                        _ => ModifyKeyAction::None,
+                    }
+                }
+                Tab => { state.cycle_field_buttons(); ModifyKeyAction::None }
+                BackTab => { state.cycle_field_buttons_rev(); ModifyKeyAction::None }
+                Up => { state.prev_item(); ModifyKeyAction::None }
+                Down => { state.next_item(); ModifyKeyAction::None }
+                _ => ModifyKeyAction::None,
+            };
+
+            match action {
+                ModifyKeyAction::Copy => {
+                    let key_text = current_key(app);
+                    if let Some(state) = app.popup_manager.current_mut() {
+                        copy_key(state, &key_text);
+                    }
+                }
+                ModifyKeyAction::Regen => {
+                    // Fail-closed on RNG failure handled inside handle_ws_key_request
+                    // (leaves the existing key untouched, notifies via WsMessage).
+                    app.handle_ws_key_request(0);
+                    let key_text = current_key(app);
+                    if let Some(state) = app.popup_manager.current_mut() {
+                        set_displayed_key(state, &key_text);
+                    }
+                }
+                ModifyKeyAction::Delete => {
+                    app.handle_ws_key_revoke("");
+                    if let Some(state) = app.popup_manager.current_mut() {
+                        set_displayed_key(state, "");
+                    }
+                }
+                ModifyKeyAction::Close => {
+                    app.popup_manager.close();
+                    sync_parent(app);
+                }
+                ModifyKeyAction::None => {}
             }
             return NewPopupAction::None;
         }
@@ -12354,9 +12460,6 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
     // Collect everything we need before any mutable borrows
     let http_enabled = app.settings.http_enabled;
     let http_port = app.settings.http_port;
-    let web_secure = app.settings.web_secure;
-    let cert_file = app.settings.websocket_cert_file.clone();
-    let key_file = app.settings.websocket_key_file.clone();
     let ban_list = app.ban_list.clone();
     let theme_css = app.gui_theme_colors().to_css_vars();
     let ws_state = app.ws_server.as_ref().map(|server| {
@@ -12401,29 +12504,25 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
         return;
     }
 
-    if web_secure {
-        #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
-        {
-            let mut https_server = HttpsServer::new(http_port);
-            match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, ban_list, theme_css, gate.clone()).await {
-                Ok(()) => {
-                    app.add_output(&format!("HTTPS web interface restarted on port {http_port}"));
-                    app.https_server = Some(https_server);
-                }
-                Err(e) => {
-                    app.add_output(&format!("Failed to start HTTPS server on port {http_port}: {e}"));
+    // Always HTTPS-capable now (see resolve_web_cert_files); localhost is served
+    // plain by the accept loop itself regardless (see http::route_connection).
+    #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
+    {
+        match resolve_web_cert_files(app) {
+            Some((cert_file, key_file)) => {
+                let mut https_server = HttpsServer::new(http_port);
+                match start_https_server(&mut https_server, &cert_file, &key_file, ws_state, ban_list, theme_css, gate.clone()).await {
+                    Ok(()) => {
+                        app.add_output(&format!("HTTPS web interface restarted on port {http_port}"));
+                        app.https_server = Some(https_server);
+                    }
+                    Err(e) => {
+                        app.add_output(&format!("Failed to start HTTPS server on port {http_port}: {e}"));
+                    }
                 }
             }
-        }
-    } else {
-        let mut http_server = HttpServer::new(http_port);
-        match start_http_server(&mut http_server, ws_state, ban_list, theme_css, None, gate.clone()).await {
-            Ok(()) => {
-                app.add_output(&format!("HTTP web interface restarted on port {http_port}"));
-                app.http_server = Some(http_server);
-            }
-            Err(e) => {
-                app.add_output(&format!("Failed to start HTTP server on port {http_port}: {e}"));
+            None => {
+                app.add_output("Failed to restart web server: no TLS certificate available.");
             }
         }
     }
@@ -12821,11 +12920,12 @@ pub async fn run_app_headless(
         app.add_output(reload_msg);
     }
 
-    // In GUI master mode, enable the web interface and set the auto-generated password
-    // Force plain HTTP — WebView connects via ws:// on localhost, doesn't need TLS
+    // In GUI master mode, enable the web interface and set the auto-generated password.
+    // The server always runs TLS-capable now (see http::route_connection's loopback
+    // branch): localhost — where the WebView connects — is served plain regardless,
+    // so there's no cert prompt for the desktop GUI; remote clients get TLS.
     if let Some(ref ws_password) = ws_override {
         app.settings.http_enabled = true;
-        app.settings.web_secure = false;
         app.settings.websocket_password = ws_password.clone();
     }
     if let Some(port) = port_override {
@@ -12869,73 +12969,21 @@ pub async fn run_app_headless(
         }
     };
 
-    // Auto-generate self-signed certs if secure mode enabled but no cert files
-    if app.settings.web_secure
-        && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
-    {
-        let cert_path = clay_config_path("cert.pem");
-        let key_path = clay_config_path("key.pem");
-
-        let needs_gen = !cert_path.exists() || !key_path.exists();
-        let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
-        if needs_gen || needs_regen {
-            if needs_regen {
-                app.add_output("\u{2728} IP address changed, regenerating TLS certificate...");
-            }
-            match generate_self_signed_cert(&cert_path, &key_path) {
-                Ok(()) => {
-                    app.add_output("\u{2728} Generated self-signed TLS certificate.");
-                }
-                Err(e) => {
-                    app.add_output(&format!("\u{2728} Failed to generate TLS certificate: {}", e));
-                    app.add_output("\u{2728} Falling back to non-secure HTTP.");
-                }
-            }
-        }
-
-        if cert_path.exists() && key_path.exists() {
-            app.settings.websocket_cert_file = cert_path.to_string_lossy().to_string();
-            app.settings.websocket_key_file = key_path.to_string_lossy().to_string();
-            let _ = persistence::save_settings(&app);
-        }
-    }
-
-    // Start unified HTTP+WS server if enabled
+    // Start the unified HTTP+WS server if enabled. Always HTTPS-capable now — cert
+    // resolution (user-provided, or auto-generated + settings.dat-backed) happens in
+    // resolve_web_cert_files. NOTE: the CLAY_HTTP_LISTENER Windows socket-handle-passing
+    // optimization (previously used here for the GUI's plain HTTP listener) no longer
+    // applies since this path always binds via start_https_server; a hot reload falls
+    // back to that function's existing bind-retry-with-backoff loop instead.
     if app.settings.http_enabled {
-        if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            #[cfg(feature = "native-tls-backend")]
+        if let Some((cert_file, key_file)) = resolve_web_cert_files(&mut app) {
+            #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
             {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
                 match start_https_server(
                     &mut https_server,
-                    &app.settings.websocket_cert_file,
-                    &app.settings.websocket_key_file,
-                    ws_state.clone(),
-                    app.ban_list.clone(),
-                    app.gui_theme_colors().to_css_vars(),
-                    gate.clone(),
-                ).await {
-                    Ok(()) => {
-                        if !app.is_reload {
-                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
-                        }
-                        app.https_server = Some(https_server);
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
-                    }
-                }
-            }
-            #[cfg(feature = "rustls-backend")]
-            {
-                let mut https_server = HttpsServer::new(app.settings.http_port);
-                match start_https_server(
-                    &mut https_server,
-                    &app.settings.websocket_cert_file,
-                    &app.settings.websocket_key_file,
+                    &cert_file,
+                    &key_file,
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
@@ -12953,31 +13001,7 @@ pub async fn run_app_headless(
                 }
             }
         } else {
-            // Check for inherited HTTP listener handle (from GUI reload)
-            let inherited_handle = std::env::var("CLAY_HTTP_LISTENER").ok()
-                .and_then(|s| s.parse::<u64>().ok());
-            if inherited_handle.is_some() {
-                std::env::remove_var("CLAY_HTTP_LISTENER");
-            }
-            let mut http_server = HttpServer::new(app.settings.http_port);
-            match start_http_server(
-                &mut http_server,
-                ws_state.clone(),
-                app.ban_list.clone(),
-                app.gui_theme_colors().to_css_vars(),
-                inherited_handle,
-                gate.clone(),
-            ).await {
-                Ok(()) => {
-                    if !app.is_reload {
-                        app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
-                    }
-                    app.http_server = Some(http_server);
-                }
-                Err(e) => {
-                    app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
-                }
-            }
+            app.add_output("Warning: No TLS certificate available — web server not started.");
         }
     }
 
@@ -14728,50 +14752,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     };
 
-    // Start unified HTTP+WS server if enabled
+    // Start the unified HTTP+WS server if enabled. Always HTTPS-capable now (see
+    // resolve_web_cert_files) — user-provided cert takes priority, else an
+    // auto-generated cert backed by settings.dat. Localhost is served plain by
+    // the accept loop itself regardless (see http::route_connection), so no cert
+    // prompt is involved for local use.
     if app.settings.http_enabled {
-        // Auto-generate self-signed certs if secure mode enabled but no cert files
-        if app.settings.web_secure
-            && (app.settings.websocket_cert_file.is_empty() || app.settings.websocket_key_file.is_empty())
-        {
-            let cert_path = clay_config_path("cert.pem");
-            let key_path = clay_config_path("key.pem");
-
-            let needs_gen = !cert_path.exists() || !key_path.exists();
-            let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
-            if needs_gen || needs_regen {
-                if needs_regen {
-                    app.add_output("\u{2728} IP address changed, regenerating TLS certificate...");
-                }
-                match generate_self_signed_cert(&cert_path, &key_path) {
-                    Ok(()) => {
-                        app.add_output("\u{2728} Generated self-signed TLS certificate.");
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("\u{2728} Failed to generate TLS certificate: {}", e));
-                        app.add_output("\u{2728} Falling back to non-secure HTTP.");
-                    }
-                }
-            }
-
-            if cert_path.exists() && key_path.exists() {
-                app.settings.websocket_cert_file = cert_path.to_string_lossy().to_string();
-                app.settings.websocket_key_file = key_path.to_string_lossy().to_string();
-                let _ = persistence::save_settings(&app);
-            }
-        }
-        if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            // Start HTTPS+WSS server (secure mode)
+        if let Some((cert_file, key_file)) = resolve_web_cert_files(&mut app) {
             #[cfg(feature = "native-tls-backend")]
             {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
                 match start_https_server(
                     &mut https_server,
-                    &app.settings.websocket_cert_file,
-                    &app.settings.websocket_key_file,
+                    &cert_file,
+                    &key_file,
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
@@ -14796,8 +14790,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let mut https_server = HttpsServer::new(app.settings.http_port);
                 match start_https_server(
                     &mut https_server,
-                    &app.settings.websocket_cert_file,
-                    &app.settings.websocket_key_file,
+                    &cert_file,
+                    &key_file,
                     ws_state.clone(),
                     app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
@@ -14818,29 +14812,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
             }
         } else {
-            // Start HTTP+WS server (non-secure mode)
-            let mut http_server = HttpServer::new(app.settings.http_port);
-            match start_http_server(
-                &mut http_server,
-                ws_state.clone(),
-                app.ban_list.clone(),
-                app.gui_theme_colors().to_css_vars(),
-                None,
-                gate.clone(),
-            ).await {
-                Ok(()) => {
-                    if !app.is_reload {
-                        app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
-                    }
-                    app.http_server = Some(http_server);
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                        app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
-                    }
-                }
-            }
+            app.add_output("Warning: No TLS certificate available — web server not started.");
         }
     }
 

@@ -1245,10 +1245,17 @@ pub async fn start_https_server(
                                             stream.peek(&mut peek),
                                         ).await {
                                             Ok(Ok(1)) if peek[0] != 0x16 => {
-                                                // Not a TLS ClientHello — redirect HTTP to HTTPS
-                                                // (D2/D6: reuses decide_route via gate/in_allow_list,
-                                                // see redirect_http_to_https doc comment)
-                                                redirect_http_to_https(stream, server_port, addr.ip().is_loopback(), in_allow_list, knocked, &gate, &client_ip).await;
+                                                // Not a TLS ClientHello. Localhost is always
+                                                // served plain — no TLS handshake, no cert
+                                                // prompt (desktop GUI WebView, local browser).
+                                                // Remote clients get redirected to HTTPS (D2/D6:
+                                                // reuses decide_route via gate/in_allow_list, see
+                                                // redirect_http_to_https doc comment).
+                                                if addr.ip().is_loopback() {
+                                                    route_connection(stream, ws_state, false, &theme_css_vars, addr, false, guard, &ws_counter, &gate, knocked, in_allow_list).await;
+                                                } else {
+                                                    redirect_http_to_https(stream, server_port, false, in_allow_list, knocked, &gate, &client_ip).await;
+                                                }
                                                 return;
                                             }
                                             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
@@ -1435,10 +1442,17 @@ pub async fn start_https_server(
                                             stream.peek(&mut peek),
                                         ).await {
                                             Ok(Ok(1)) if peek[0] != 0x16 => {
-                                                // Not a TLS ClientHello — redirect HTTP to HTTPS
-                                                // (D2/D6: reuses decide_route via gate/in_allow_list,
-                                                // see redirect_http_to_https doc comment)
-                                                redirect_http_to_https(stream, server_port, addr.ip().is_loopback(), in_allow_list, knocked, &gate, &client_ip).await;
+                                                // Not a TLS ClientHello. Localhost is always
+                                                // served plain — no TLS handshake, no cert
+                                                // prompt (desktop GUI WebView, local browser).
+                                                // Remote clients get redirected to HTTPS (D2/D6:
+                                                // reuses decide_route via gate/in_allow_list, see
+                                                // redirect_http_to_https doc comment).
+                                                if addr.ip().is_loopback() {
+                                                    route_connection(stream, ws_state, false, &theme_css_vars, addr, false, guard, &ws_counter, &gate, knocked, in_allow_list).await;
+                                                } else {
+                                                    redirect_http_to_https(stream, server_port, false, in_allow_list, knocked, &gate, &client_ip).await;
+                                                }
                                                 return;
                                             }
                                             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,

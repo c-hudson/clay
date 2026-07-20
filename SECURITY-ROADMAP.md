@@ -354,6 +354,65 @@ decrypt-only fallback, now logged when it fires so stale blobs get re-encrypted)
 `with_no_client_auth()` on Clay's own server (correct — Clay authenticates by
 password/knock, not client certs).
 
+### D8. Always-secure web server, auto-cert in settings.dat, localhost always plain
+(added 2026-07-20)
+
+**Goal:** remove the Protocol (Secure/Non-Secure) choice from `/web` — new users
+shouldn't have to understand TLS to be reachable remotely. The server is now always
+TLS-capable for remote clients; `web_secure` is no longer read to select HTTP vs HTTPS
+(kept in `Settings`/`GlobalSettingsMsg`/settings.dat only for wire/import compat — always
+sent as `true`, never meaningfully toggled by any UI).
+
+**Localhost is always plain, remote is always TLS on the same port.** In the HTTPS accept
+loop (`http.rs`, both native-tls and rustls variants), the existing first-byte peek that
+disambiguates a plain HTTP request from a TLS ClientHello now branches on
+`addr.ip().is_loopback()`: a loopback connection is served plain via `route_connection`
+(no cert, no handshake — same call `start_http_server` already makes), everything else
+still gets the existing redirect-to-HTTPS. This means the desktop GUI WebView (which
+talks to `ws://127.0.0.1`) never sees a certificate prompt, while a remote browser or
+Clay instance on the same port always gets TLS. `start_http_server`/plain-HTTP-only mode
+is no longer used by the single-user startup paths or `restart_http_server` — only by the
+`--multiuser` daemon (`daemon.rs`), which is untouched by this change and keeps its own
+`web_secure` toggle and manual cert config; it isn't reachable from the `/web` popup.
+
+**Auto-generated cert is now canonically stored in settings.dat, not just on disk.**
+`resolve_web_cert_files()` (main.rs) resolves, in order: (1) a user-provided cert
+(`websocket_cert_file`/`websocket_key_file`, unchanged from D7 — "Custom Cert File: Yes"
+in the popup), else (2) the auto-generated cert, whose PEM content now lives in two new
+encrypted-settings fields, `web_cert_pem` (cleartext, base64'd only to stay on one INI
+line — it's public) and `web_key_pem` (base64'd then run through the existing
+`secret()`/`encrypt_password()` at-rest encryption, same mechanism as
+`websocket_auth_key`/world passwords). The resolver materializes/refreshes
+`~/.clay/cert.pem`/`key.pem` on disk (a derived cache the file-based TLS server APIs
+still read) and re-syncs settings.dat whenever `generate_self_signed_cert()` runs. Net
+effect: the private key never leaves this machine's `secure.key`-encrypted blob, and if
+`settings.dat` is `/import`ed to another machine the key silently fails to decrypt there
+and gets regenerated rather than leaking across machines.
+
+**Auto-approval on the Clay↔Clay path was already solved — no new work needed.** The
+D7 `TofuVerifier`/`known_hosts.dat` pinning already gives every Clay-to-Clay connection
+(remote console, another instance's WebView proxy, the Android app) silent trust-on-first-
+connect and a blocking cert-mismatch prompt only if the fingerprint later changes. D8
+only had to make the *server* side always present a cert for that to kick in on every
+remote connection, not just when a user had manually flipped Protocol to Secure before.
+A plain browser (which does full CA validation, not TOFU) still sees a one-time
+self-signed-cert warning unless the user supplies a CA-signed cert via Custom Cert File.
+
+**GlobalSettingsMsg never carries the private key.** `web_cert_pem`/`web_key_pem` were
+deliberately *not* added to the WS wire struct; only the existing `tls_configured`
+boolean (now meaning "a custom/user cert is configured") and `ws_cert_file`/`ws_key_file`
+(user-provided paths only — empty when using the auto-cert) travel over the wire, matching
+the pre-existing "server never sends the auth key/password to unauthenticated clients"
+posture.
+
+**Not changed:** the pre-existing "remote WS clients can set but not clear
+`ws_cert_file`/`ws_key_file` via `UpdateGlobalSettings`" asymmetry (`main.rs`/`daemon.rs`
+only apply that message's cert fields when non-empty, by original design — "remote clients
+send empty for security"). Toggling Custom Cert File from Yes back to No is fully correct
+through the popups' own Save path (`apply_web_settings`, unconditional) in all three UIs;
+only the narrower case of clearing it from a genuinely separate remote console session
+inherits this older limitation, unrelated to D8.
+
 ---
 
 ## Phase 0 — Refactor and plumbing (no behavior change)

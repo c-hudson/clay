@@ -655,27 +655,19 @@
                         <div class="settings-section" id="settings-web">
                             <div class="popup-body">
                                 <div class="setting-row">
-                                    <span class="setting-label">Protocol</span>
+                                    <span class="setting-label" title="Disabled turns the web server off. 9000 is the default port. Custom lets you pick your own (shown below). Remote connections are always TLS-encrypted (auto-generated certificate, or your own — see Custom Cert File below); this same machine (localhost) is always unencrypted.">Port</span>
                                     <div class="setting-value">
-                                        <select id="web-protocol-select" class="form-select">
-                                            <option value="non-secure">Non-Secure</option>
-                                            <option value="secure">Secure</option>
+                                        <select id="web-port-select" class="form-select">
+                                            <option value="disabled">Disabled</option>
+                                            <option value="9000">9000</option>
+                                            <option value="custom">Custom</option>
                                         </select>
                                     </div>
                                 </div>
-                                <div class="setting-row">
-                                    <span class="setting-label" id="http-label">HTTP enabled</span>
+                                <div class="setting-row" id="web-custom-port-field" style="display: none;">
+                                    <span class="setting-label">Custom Port</span>
                                     <div class="setting-value">
-                                        <select id="web-http-enabled-select" class="form-select">
-                                            <option value="off">off</option>
-                                            <option value="on">on</option>
-                                        </select>
-                                    </div>
-                                </div>
-                                <div class="setting-row">
-                                    <span class="setting-label" id="http-port-label">HTTP port</span>
-                                    <div class="setting-value">
-                                        <input type="text" id="web-http-port" autocomplete="off" class="web-input">
+                                        <input type="text" id="web-custom-port" autocomplete="off" class="web-input">
                                     </div>
                                 </div>
                                 <div class="setting-row">
@@ -697,22 +689,31 @@
                                     </div>
                                 </div>
                                 <div class="setting-row">
-                                    <span class="setting-label">Auth Key</span>
-                                    <div class="setting-value" style="display: flex; gap: 4px; align-items: center;">
-                                        <input type="text" id="web-auth-key" autocomplete="off" class="web-input" style="font-family: monospace; font-size: 0.8em; flex: 1;">
-                                        <button id="web-auth-key-regen" class="stepper-btn" title="Regenerate" style="padding: 2px 8px; white-space: nowrap;">Regen</button>
+                                    <span class="setting-label" title="No (default) uses an automatically generated, self-signed certificate — nothing to configure. Yes lets you supply your own cert/key PEM files (e.g. a CA-signed certificate) instead.">Custom Cert File</span>
+                                    <div class="setting-value">
+                                        <select id="web-custom-cert-select" class="form-select">
+                                            <option value="no">No</option>
+                                            <option value="yes">Yes</option>
+                                        </select>
                                     </div>
                                 </div>
                                 <div class="setting-row tls-field" id="tls-cert-field" style="display: none;">
-                                    <span class="setting-label">TLS cert file</span>
+                                    <span class="setting-label">Cert File</span>
                                     <div class="setting-value">
                                         <input type="text" id="web-cert-file" autocomplete="off" class="web-input" placeholder="/path/to/cert.pem">
                                     </div>
                                 </div>
                                 <div class="setting-row tls-field" id="tls-key-field" style="display: none;">
-                                    <span class="setting-label">TLS key file</span>
+                                    <span class="setting-label">Key File</span>
                                     <div class="setting-value">
                                         <input type="text" id="web-key-file" autocomplete="off" class="web-input" placeholder="/path/to/key.pem">
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label" title="Device authentication key for passwordless login from the Android app or trusted devices. Read-only — use Modify Key to copy, regenerate, or delete it. Regen/delete take effect immediately.">Auth Key</span>
+                                    <div class="setting-value" style="display: flex; gap: 4px; align-items: center;">
+                                        <input type="text" id="web-auth-key" autocomplete="off" readonly class="web-input" style="font-family: monospace; font-size: 0.8em; flex: 1;">
+                                        <button id="web-modify-key-btn" class="stepper-btn" title="Copy, regenerate, or delete" style="padding: 2px 8px; white-space: nowrap;">Modify Key</button>
                                     </div>
                                 </div>
                             </div>

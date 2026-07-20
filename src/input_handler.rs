@@ -420,7 +420,8 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 // Web-only editors: show URL hint in console
                 if cmd == "/theme-editor" || cmd == "/keybind-editor" {
                     let page = cmd.trim_start_matches('/');
-                    let proto = if app.settings.web_secure { "https" } else { "http" };
+                    // Localhost is always served plain (see http::route_connection).
+                    let proto = "http";
                     if app.settings.http_enabled {
                         app.add_output(&format!("Open in browser: {}://localhost:{}/{}", proto, app.settings.http_port, page));
                     } else {
@@ -649,12 +650,12 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     let mut def = create_allow_list_warning_dialog();
                     // Store settings in custom_data for retrieval on confirm
                     def.custom_data.insert("web_save".to_string(), "1".to_string());
-                    def.custom_data.insert("web_secure".to_string(), settings.web_secure.to_string());
                     def.custom_data.insert("http_enabled".to_string(), settings.http_enabled.to_string());
                     def.custom_data.insert("http_port".to_string(), settings.http_port);
                     def.custom_data.insert("web_path".to_string(), settings.web_path);
                     def.custom_data.insert("ws_password".to_string(), settings.ws_password);
                     def.custom_data.insert("ws_allow_list".to_string(), settings.ws_allow_list);
+                    def.custom_data.insert("custom_cert".to_string(), settings.custom_cert.to_string());
                     def.custom_data.insert("ws_cert_file".to_string(), settings.ws_cert_file);
                     def.custom_data.insert("ws_key_file".to_string(), settings.ws_key_file);
                     app.popup_manager.open(def);

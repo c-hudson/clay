@@ -178,8 +178,14 @@ pub fn run_master_webgui() -> io::Result<()> {
     };
 
     // Detect duplicate instances: probe the port before spawning anything.
-    // Skip the probe during hot-reload (CLAY_HTTP_LISTENER means we inherited the socket).
-    let is_reload = std::env::var("CLAY_HTTP_LISTENER").is_ok();
+    // Skip the probe during hot-reload — the old process's listener may still be
+    // bound at this instant (it releases the port on exit, which the new server's
+    // own bind-retry-with-backoff loop tolerates), so this probe would otherwise
+    // false-positive as "already running". Was gated on CLAY_HTTP_LISTENER (Windows
+    // socket-handle-passing, no longer wired up now that the GUI always uses the
+    // always-TLS-capable start_https_server — see SECURITY-ROADMAP.md D8); the
+    // --reload flag is set on every reload exec regardless of platform, so use that.
+    let is_reload = std::env::args().any(|a| a == "--reload");
     if !is_reload {
         if let Err(e) = std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
             let msg = if e.kind() == io::ErrorKind::AddrInUse {

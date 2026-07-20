@@ -182,20 +182,17 @@
         worldEditSaveBtn: document.getElementById('world-edit-save-btn'),
         worldEditConnectBtn: document.getElementById('world-edit-connect-btn'),
         // Web settings fields (inside combined settings modal)
-        webProtocolSelect: document.getElementById('web-protocol-select'),
-        webHttpEnabledSelect: document.getElementById('web-http-enabled-select'),
-        webHttpPort: document.getElementById('web-http-port'),
+        webPortSelect: document.getElementById('web-port-select'),
+        webCustomPortField: document.getElementById('web-custom-port-field'),
+        webCustomPort: document.getElementById('web-custom-port'),
         webPath: document.getElementById('web-path'),
         webAllowList: document.getElementById('web-allow-list'),
         webWsPassword: document.getElementById('web-ws-password'),
+        webCustomCertSelect: document.getElementById('web-custom-cert-select'),
         webCertFile: document.getElementById('web-cert-file'),
         webKeyFile: document.getElementById('web-key-file'),
         tlsCertField: document.getElementById('tls-cert-field'),
         tlsKeyField: document.getElementById('tls-key-field'),
-        httpLabel: document.getElementById('http-label'),
-        httpPortLabel: document.getElementById('http-port-label'),
-        // wsLabel removed — WS shares HTTP port
-        // wsPortLabel removed — WS shares HTTP port
         // Combined settings popup (/setup + /web)
         settingsModal: document.getElementById('settings-modal'),
         settingsCloseBtn: document.getElementById('settings-close-btn'),
@@ -207,7 +204,7 @@
         settingsWebSection: document.getElementById('settings-web'),
         settingsClayServerSection: document.getElementById('settings-clay-server'),
         webAuthKey: document.getElementById('web-auth-key'),
-        webAuthKeyRegen: document.getElementById('web-auth-key-regen'),
+        webModifyKeyBtn: document.getElementById('web-modify-key-btn'),
         // Setup fields (inside combined settings modal)
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
@@ -420,7 +417,9 @@
     // Web settings popup state (global state from server)
     let settingsPopupOpen = false;
     let settingsActiveTab = 'general';
-    let webSecure = false;
+    // web_secure is no longer user-facing (the server is always TLS-capable for
+    // remote clients; localhost is always plain — see http::route_connection).
+    // Still synced from/to the server for wire compat with GlobalSettingsMsg.
     let httpEnabled = false;
     let httpPort = 9000;
     let webPath = 'clay';
@@ -430,7 +429,7 @@
     let wsCertFile = '';
     let wsKeyFile = '';
     let wsPassword = '';
-    let tlsConfigured = false;  // True if server has TLS cert+key configured
+    let tlsConfigured = false;  // True if server has a custom (user-provided) TLS cert+key configured
     let serverAuthKey = '';  // Auth key from server (for display in web settings)
     // Guards against pushing a full UpdateGlobalSettings snapshot before this client
     // has received the server's real values (InitialState / GlobalSettingsUpdated).
@@ -438,8 +437,8 @@
     // and persist over the server's real setting. See settings-audit investigation.
     let settingsSynced = false;
     // Temporary editing state for web popup (only saved on Save button)
-    let editWebSecure = false;
-    let editHttpEnabled = false;
+    let editPortMode = 'disabled';  // 'disabled' | '9000' | 'custom'
+    let editCustomCert = false;
     let editWsEnabled = false;
     let selectedWorldIndex = -1;
     let selectedWorldsRowIndex = -1; // For worlds list popup (/connections)
@@ -1789,6 +1788,10 @@
                     if (elements.webAuthKey) {
                         elements.webAuthKey.value = msg.auth_key;
                     }
+                    // Refresh the Modify Key dialog if it's the one that requested this
+                    if (isModifyKeyDialogOpen()) {
+                        renderModifyKeyDialog(document.getElementById('modify-key-dialog'));
+                    }
                 }
                 break;
 
@@ -1921,10 +1924,7 @@
                     if (msg.settings.spell_check_enabled !== undefined) {
                         spellCheckEnabled = msg.settings.spell_check_enabled;
                     }
-                    // Web settings
-                    if (msg.settings.web_secure !== undefined) {
-                        webSecure = msg.settings.web_secure;
-                    }
+                    // Web settings (web_secure no longer read — see declaration above)
                     if (msg.settings.http_enabled !== undefined) {
                         httpEnabled = msg.settings.http_enabled;
                     }
@@ -2473,10 +2473,7 @@
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
                     }
-                    // Web settings
-                    if (msg.settings.web_secure !== undefined) {
-                        webSecure = msg.settings.web_secure;
-                    }
+                    // Web settings (web_secure no longer read — see declaration above)
                     if (msg.settings.http_enabled !== undefined) {
                         httpEnabled = msg.settings.http_enabled;
                     }
@@ -6272,8 +6269,8 @@
         setupColorOffset = colorOffsetPercent;
         setupTransparency = guiTransparency;
         // Load web edit state
-        editWebSecure = webSecure;
-        editHttpEnabled = httpEnabled;
+        editPortMode = !httpEnabled ? 'disabled' : (httpPort === 9000 ? '9000' : 'custom');
+        editCustomCert = tlsConfigured;
         // Load font edit state
         fontEditName = fontName;
         fontEditSizePhone = Math.round(webFontSizePhone);
@@ -6394,7 +6391,9 @@
             web_font_letter_spacing: webFontLetterSpacing,
             web_font_word_spacing: webFontWordSpacing,
             ws_allow_list: wsAllowList,
-            web_secure: webSecure,
+            // Always true now — the server is always TLS-capable for remote clients
+            // (auto cert or user-provided); kept only for GlobalSettingsMsg wire compat.
+            web_secure: true,
             http_enabled: httpEnabled,
             http_port: httpPort,
             web_path: webPath,
@@ -6502,14 +6501,14 @@
 
         // Save web settings (skip if multiuser)
         if (!multiuserMode) {
-            webSecure = editWebSecure;
-            httpEnabled = editHttpEnabled;
-            httpPort = parseInt(elements.webHttpPort.value) || 9000;
+            httpEnabled = editPortMode !== 'disabled';
+            httpPort = editPortMode === 'custom' ? (parseInt(elements.webCustomPort.value) || 9000) : 9000;
             webPath = elements.webPath ? elements.webPath.value.replace(/^\/+|\/+$/g, '').replace(/[^A-Za-z0-9_-]/g, '') : webPath;
             wsAllowList = elements.webAllowList.value;
             wsPassword = elements.webWsPassword ? elements.webWsPassword.value : wsPassword;
-            wsCertFile = elements.webCertFile.value;
-            wsKeyFile = elements.webKeyFile.value;
+            tlsConfigured = editCustomCert;
+            wsCertFile = editCustomCert ? elements.webCertFile.value : '';
+            wsKeyFile = editCustomCert ? elements.webKeyFile.value : '';
         }
 
         // Save font settings
@@ -6528,21 +6527,18 @@
     }
 
     function updateWebPopupUI() {
-        // Update protocol select (use edit state)
-        elements.webProtocolSelect.value = editWebSecure ? 'secure' : 'non-secure';
+        // Update Port select (use edit state)
+        elements.webPortSelect.value = editPortMode;
+        elements.webCustomPortField.style.display = editPortMode === 'custom' ? 'flex' : 'none';
+        elements.webCustomPort.value = httpPort;
 
-        // Update labels based on protocol
-        elements.httpLabel.textContent = editWebSecure ? 'HTTPS enabled' : 'HTTP enabled';
-        elements.httpPortLabel.textContent = editWebSecure ? 'HTTPS port' : 'HTTP port';
-        // Update select dropdowns (use edit state)
-        elements.webHttpEnabledSelect.value = editHttpEnabled ? 'on' : 'off';
-
-        // Update input fields (from global state - text fields are read on save)
-        elements.webHttpPort.value = httpPort;
         if (elements.webPath) elements.webPath.value = webPath;
         elements.webAllowList.value = wsAllowList;
         if (elements.webWsPassword) elements.webWsPassword.value = wsPassword;
-        // Show placeholder if TLS configured but paths not sent from server
+
+        // Custom Cert File select (use edit state)
+        elements.webCustomCertSelect.value = editCustomCert ? 'yes' : 'no';
+        // Show placeholder if a custom cert is configured but paths not sent from server
         if (tlsConfigured && !wsCertFile) {
             elements.webCertFile.value = '';
             elements.webCertFile.placeholder = 'Configured';
@@ -6558,11 +6554,11 @@
             elements.webKeyFile.placeholder = '';
         }
 
-        // Show/hide TLS fields based on protocol
-        elements.tlsCertField.style.display = editWebSecure ? 'flex' : 'none';
-        elements.tlsKeyField.style.display = editWebSecure ? 'flex' : 'none';
+        // Show/hide cert/key fields based on Custom Cert File selection
+        elements.tlsCertField.style.display = editCustomCert ? 'flex' : 'none';
+        elements.tlsKeyField.style.display = editCustomCert ? 'flex' : 'none';
 
-        // Populate auth key field
+        // Populate auth key field (read-only — use Modify Key to change it)
         if (elements.webAuthKey) {
             elements.webAuthKey.value = serverAuthKey || '';
         }
@@ -9043,18 +9039,18 @@
         }
 
         // Web settings popup (use edit state, not global state)
-        elements.webProtocolSelect.onchange = function() {
-            editWebSecure = this.value === 'secure';
+        elements.webPortSelect.onchange = function() {
+            editPortMode = this.value;
             updateWebPopupUI();
         };
-        elements.webHttpEnabledSelect.onchange = function() {
-            editHttpEnabled = this.value === 'on';
+        elements.webCustomCertSelect.onchange = function() {
+            editCustomCert = this.value === 'yes';
             updateWebPopupUI();
         };
-        // Auth key regenerate button
-        if (elements.webAuthKeyRegen) {
-            elements.webAuthKeyRegen.onclick = function() {
-                send({ type: 'RegenerateAuthKey' });
+        // Modify Key button — opens the copy/regen/delete dialog
+        if (elements.webModifyKeyBtn) {
+            elements.webModifyKeyBtn.onclick = function() {
+                showModifyKeyDialog();
             };
         }
         // Web save/cancel/close handled by unified settings buttons above
@@ -9373,6 +9369,85 @@
         if (dlg) {
             dlg.style.display = 'none';
         }
+    }
+
+    // Modify Auth Key dialog (opened from the web settings Auth Key row, which is
+    // read-only — this is the only place the key can be changed). Same pattern as
+    // showCertMismatchDialog above: a dynamically created full-screen overlay, styled
+    // inline, content run through sanitizeHtml/escapeHtml. Regen/Delete take effect
+    // immediately (server persists and broadcasts to every connected client), so this
+    // dialog doesn't wait for the settings popup's own Save button.
+    function copyTextToClipboard(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(function() {});
+            return;
+        }
+        // Fallback for contexts without the async clipboard API
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); } catch (e) { /* best effort */ }
+        document.body.removeChild(ta);
+    }
+
+    function showModifyKeyDialog() {
+        let dlg = document.getElementById('modify-key-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'modify-key-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            document.body.appendChild(dlg);
+        }
+        renderModifyKeyDialog(dlg);
+        dlg.style.display = 'flex';
+    }
+
+    function renderModifyKeyDialog(dlg) {
+        const keyText = serverAuthKey || '';
+        const safeKey = escapeHtml(keyText || '(none)');
+        dlg.innerHTML = sanitizeHtml(`
+            <div style="background:#1a1a1a;color:#eee;border:2px solid #555;border-radius:8px;padding:20px;max-width:480px;width:90%;">
+                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;">Modify Auth Key</div>
+                <div style="font-family:monospace;font-size:0.85em;word-break:break-all;margin-bottom:16px;opacity:0.9;">${safeKey}</div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
+                    <button id="modify-key-close" style="padding:8px 16px;">Close</button>
+                    <button id="modify-key-delete" style="padding:8px 16px;background:#c00;color:#fff;border:none;border-radius:4px;">Delete</button>
+                    <button id="modify-key-regen" style="padding:8px 16px;">Regen</button>
+                    <button id="modify-key-copy" style="padding:8px 16px;">Copy</button>
+                </div>
+            </div>
+        `);
+        document.getElementById('modify-key-close').onclick = function() {
+            hideModifyKeyDialog();
+        };
+        document.getElementById('modify-key-copy').onclick = function() {
+            if (keyText) copyTextToClipboard(keyText);
+        };
+        document.getElementById('modify-key-regen').onclick = function() {
+            send({ type: 'RegenerateAuthKey' });
+            // Dialog content refreshes when the KeyGenerated response arrives.
+        };
+        document.getElementById('modify-key-delete').onclick = function() {
+            send({ type: 'RevokeKey', auth_key: keyText });
+            serverAuthKey = '';
+            if (elements.webAuthKey) elements.webAuthKey.value = '';
+            hideModifyKeyDialog();
+        };
+    }
+
+    function hideModifyKeyDialog() {
+        const dlg = document.getElementById('modify-key-dialog');
+        if (dlg) {
+            dlg.style.display = 'none';
+        }
+    }
+
+    function isModifyKeyDialogOpen() {
+        const dlg = document.getElementById('modify-key-dialog');
+        return !!(dlg && dlg.style.display !== 'none');
     }
 
     // /import dialogs (plan i-d-like-to-make-snuggly-rain.md, step 7). Same pattern as

@@ -153,6 +153,31 @@ Design record: `SECURITY-ROADMAP.md` (decision D7).
 
 ---
 
+# Always-secure web server, no more Protocol setting
+
+The `/web` settings no longer have a Protocol (Secure/Non-Secure) choice — the server is
+now always TLS-encrypted for anyone connecting from outside this machine, automatically.
+
+- **Nothing to configure.** On first use, Clay generates its own self-signed certificate
+  and stores it (encrypted) in `settings.dat`, alongside your other settings.
+- **Other Clay instances just work.** The remote console, another Clay's WebView, and
+  the Android app all use the same trust-on-first-use pinning described above — they
+  silently trust the certificate the first time and only ask you to confirm if it later
+  changes. There's no extra step for this to work.
+- **This machine (localhost) is never encrypted.** The desktop app's own window talks to
+  the server over plain, unencrypted loopback — the same machine, so there's no network
+  to intercept — which means it never shows you a certificate warning.
+- **A plain web browser** connecting remotely will show a one-time "not secure" warning
+  the first time, same as any self-signed certificate — that's expected. If you'd rather
+  not see that, set **Custom Cert File** to Yes and point it at a CA-signed certificate.
+- **The Auth Key field is now read-only** in `/web` settings; use the new **Modify Key**
+  button to copy, regenerate, or delete it. Regenerating or deleting takes effect
+  immediately, same as before.
+
+Design record: `SECURITY-ROADMAP.md` (decision D8).
+
+---
+
 # Standalone (on-device) Android mode
 
 The Android app can now run its own bundled Clay server on the phone instead of
