@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+*.png      binary
+*.ico      binary
+*.wav      binary
+*.apk      binary
+*.aab      binary
+*.idsig    binary
+*.keystore binary
+*.jar      binary
+*.so       binary
+*.dll      binary
+*.exe      binary

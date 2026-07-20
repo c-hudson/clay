@@ -20,7 +20,9 @@ fn main() {
         if let Ok(mut file) = fs::File::open(file_path) {
             let mut contents = Vec::new();
             if file.read_to_end(&mut contents).is_ok() {
-                hasher.update(&contents);
+                // Normalize CRLF -> LF so a Windows checkout (core.autocrlf) hashes
+                // the same as a Unix LF checkout of the same commit.
+                hasher.update(&strip_crlf(&contents));
             }
         }
         if let Ok(metadata) = fs::metadata(file_path) {
@@ -370,6 +372,22 @@ fn copy_webview2_dll_if_needed() {
     }
 
     eprintln!("cargo:warning=WebView2Loader.dll not found in cargo registry. clay.exe will not run without it.");
+}
+
+/// Collapse every `\r\n` to `\n`. Lone `\r` and raw binary bytes (e.g. clay2.png)
+/// are left untouched, so this only cancels git's autocrlf conversion.
+fn strip_crlf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            // skip the '\r', keep the following '\n'
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    out
 }
 
 fn collect_source_files(dir: &Path, files: &mut BTreeSet<String>) {
