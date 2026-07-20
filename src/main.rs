@@ -3509,6 +3509,17 @@ impl App {
         if !settings.ws_key_file.is_empty() {
             self.settings.websocket_key_file = settings.ws_key_file.clone();
         }
+        // WS password and auth key are sent by the master for display in /web; apply
+        // them so the remote's web-settings popup matches the master (previously dropped).
+        self.settings.websocket_password = settings.ws_password.clone();
+        self.settings.websocket_auth_key = if settings.auth_key.is_empty() {
+            None
+        } else {
+            Some(AuthKey::new(settings.auth_key.clone()))
+        };
+        // Keep the shared auth-key mirror in sync (same invariant as persistence.rs load).
+        *self.ws_auth_key_shared.write().unwrap() =
+            self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
         self.settings.tls_proxy_enabled = settings.tls_proxy_enabled;
         self.settings.dictionary_path = settings.dictionary_path.clone();
         self.settings.mouse_enabled = settings.mouse_enabled;
