@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_render_ssh_error_variants_distinguishable() {
-        let variants = vec![
+        let variants = [
             SshError::Connect(io::Error::other("boom")),
             SshError::Handshake("boom".to_string()),
             SshError::HostKeyMismatch { host_port: "ssh:h:22".to_string(), old: "aaaa".to_string(), new: "bbbb".to_string() },
