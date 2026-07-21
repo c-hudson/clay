@@ -261,6 +261,18 @@ pub fn parse_ssh_target(spec: &str) -> Result<SshTarget, String> {
     Ok(SshTarget { user, host: host.to_string(), clay_port, ssh_port })
 }
 
+/// Heuristic check for `--console=`/`--gui=` addresses passed without `--ssh`: the
+/// direct (non-SSH) grammar is always `[ws://|wss://]host[:port]` - a bare host, at
+/// most one port, never a `user@` prefix. A `[user@]host[:clayport[:sshport]]`
+/// argument typed without `--ssh` would otherwise fall through into the direct
+/// connect path and fail with a low-level, confusing error (e.g. tungstenite's
+/// "HTTP format error: invalid authority" from an `@` in the WS URL) instead of a
+/// clear "did you forget --ssh?" message.
+pub fn looks_like_ssh_target(addr: &str) -> bool {
+    let stripped = addr.strip_prefix("wss://").or_else(|| addr.strip_prefix("ws://")).unwrap_or(addr);
+    stripped.contains('@') || stripped.matches(':').count() >= 2
+}
+
 /// The local OS username, used as the default SSH user when `[user@]` is
 /// omitted - mirrors what a real `ssh`/`scp` client does.
 pub fn local_os_username() -> String {
@@ -689,6 +701,22 @@ mod tests {
     #[test]
     fn test_parse_rejects_too_many_fields() {
         assert!(parse_ssh_target("example.com:9001:2222:extra").is_err());
+    }
+
+    #[test]
+    fn test_looks_like_ssh_target() {
+        // Valid direct (non-SSH) addresses: never flagged.
+        assert!(!looks_like_ssh_target("example.com"));
+        assert!(!looks_like_ssh_target("example.com:9000"));
+        assert!(!looks_like_ssh_target("ws://example.com:9000"));
+        assert!(!looks_like_ssh_target("wss://example.com:9000"));
+        assert!(!looks_like_ssh_target("192.168.2.6"));
+        assert!(!looks_like_ssh_target("192.168.2.6:9000"));
+        // SSH-style addresses (typed without --ssh): flagged.
+        assert!(looks_like_ssh_target("adrick@192.168.2.6:9000:22"));
+        assert!(looks_like_ssh_target("adrick@192.168.2.6"));
+        assert!(looks_like_ssh_target("192.168.2.6:9000:22"));
+        assert!(looks_like_ssh_target("wss://adrick@192.168.2.6:9000:22"));
     }
 
     #[test]

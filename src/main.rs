@@ -12227,6 +12227,23 @@ async fn main() -> io::Result<()> {
         eprintln!("Error: --ssh requires --console=<target> or --gui=<target>.");
         std::process::exit(1);
     }
+    // Catch a [user@]host:clayport:sshport address typed without --ssh early, with a
+    // clear message - otherwise it falls through into the direct-connect path and fails
+    // with a low-level, confusing error (an '@'/extra ':' isn't valid in a plain
+    // host[:port] address).
+    if !ssh_mode {
+        let addr_to_check = match (&console_arg, &gui_arg) {
+            (Some(Some(addr)), _) => Some(addr.as_str()),
+            (_, Some(Some(addr))) => Some(addr.as_str()),
+            _ => None,
+        };
+        if let Some(addr) = addr_to_check {
+            if ssh::looks_like_ssh_target(addr) {
+                eprintln!("Error: '{addr}' looks like an SSH target ([user@]host:clayport:sshport). Did you forget --ssh?");
+                std::process::exit(1);
+            }
+        }
+    }
     #[cfg(not(feature = "ssh-transport"))]
     if ssh_mode {
         eprintln!("clay: --ssh requires the 'ssh-transport' feature.");
