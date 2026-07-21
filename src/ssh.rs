@@ -432,7 +432,11 @@ async fn authenticate(
     creds: &SshCredentials,
     ctx: AuthContext,
 ) -> Result<(), SshError> {
-    // 1. SSH agent, if requested and reachable.
+    // 1. SSH agent, if requested and reachable. connect_env() (the SSH_AUTH_SOCK-based
+    // Unix agent protocol) is #[cfg(unix)] in russh - there's no equivalent on Windows
+    // (that would be Pageant or the OpenSSH-for-Windows named-pipe agent, neither wired
+    // up here yet), so this step is a no-op there and falls through to key files/password.
+    #[cfg(unix)]
     if creds.use_agent {
         if let Ok(mut agent) = keys::agent::client::AgentClient::connect_env().await {
             if let Ok(identities) = agent.request_identities().await {
