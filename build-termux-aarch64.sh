@@ -60,7 +60,7 @@ export AR_aarch64_linux_android="$TOOLCHAIN/bin/llvm-ar"
 
 echo "Building clay for aarch64-linux-android (API $API)..."
 cargo build --release --target aarch64-linux-android \
-    --no-default-features --features rustls-backend
+    --no-default-features --features rustls-backend,ssh-transport
 
 BIN="target/aarch64-linux-android/release/clay"
 OUT="/tmp/clay-termux-aarch64-nogui"

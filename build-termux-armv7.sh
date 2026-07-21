@@ -48,7 +48,7 @@ export AR_armv7_linux_androideabi="$TOOLCHAIN/bin/llvm-ar"
 
 echo "Building clay for armv7-linux-androideabi (API $API)..."
 cargo build --release --target armv7-linux-androideabi \
-    --no-default-features --features rustls-backend
+    --no-default-features --features rustls-backend,ssh-transport
 
 BIN="target/armv7-linux-androideabi/release/clay"
 OUT="/tmp/clay-termux-armv7-32bit-nogui"

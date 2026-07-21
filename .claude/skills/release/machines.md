@@ -18,7 +18,7 @@ No SSH required — commands run directly.
 
 ### Linux musl (x86_64)
 ```bash
-cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
+cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend,ssh-transport
 ```
 - Binary: `target/x86_64-unknown-linux-musl/release/clay`
 - Release asset name: `clay-linux-x86_64-musl`
@@ -207,7 +207,7 @@ above once this stopped being true for it).
 cd ~/clay
 git pull
 ./patches/apply-patches.sh
-PKG_CONFIG_PATH=/data/data/com.termux/files/usr/lib/pkgconfig RUSTFLAGS="-L /system/lib64 -C link-arg=-Wl,-rpath,/system/lib64" cargo build --release --no-default-features --features rustls-backend,webview-gui
+PKG_CONFIG_PATH=/data/data/com.termux/files/usr/lib/pkgconfig RUSTFLAGS="-L /system/lib64 -C link-arg=-Wl,-rpath,/system/lib64" cargo build --release --no-default-features --features rustls-backend,webview-gui,ssh-transport
 patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/release/clay
 ```
 - Binary: `~/clay/target/release/clay`
