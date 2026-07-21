@@ -4246,3 +4246,54 @@ if you're more curious.\"";
         assert!(matches!(world.settings.keep_alive_type, KeepAliveType::Nop));
     }
 
+    /// Regression test for the bug where a daemon with many worlds could send an
+    /// InitialState message exceeding the WebSocket size cap (websocket.rs's ws_config),
+    /// causing ws_sink.send(...) to fail and silently drop a freshly-authenticated remote
+    /// console/GUI connection. build_initial_state() must bound the TOTAL visible-line
+    /// count across all worlds combined, not just cap each world independently - otherwise
+    /// InitialState size scales with world_count * remote_initial_lines with no ceiling.
+    #[test]
+    fn test_build_initial_state_caps_total_lines_across_many_worlds() {
+        let mut app = App::new();
+        app.worlds.clear();
+
+        // remote_initial_lines defaults to 100; with enough worlds, a per-world-only cap
+        // would let this message grow unbounded. Use 20 worlds, each with far more than
+        // the per-world cap's worth of lines, to exercise the aggregate budget.
+        let world_count = 20;
+        for i in 0..world_count {
+            let mut world = World::new(&format!("world{i}"));
+            for line in 0..300 {
+                world.output_lines.push(OutputLine::new(format!("line {line}"), line as u64));
+            }
+            app.worlds.push(world);
+        }
+        app.current_world_index = 0;
+
+        let per_world_cap = app.settings.remote_initial_lines.max(1) as usize;
+        let expected_total_budget = per_world_cap.max(500);
+
+        let initial_state = app.build_initial_state();
+        let WsMessage::InitialState { worlds, .. } = initial_state else {
+            panic!("build_initial_state() must return WsMessage::InitialState");
+        };
+
+        assert_eq!(worlds.len(), world_count, "all worlds should still be represented");
+        let total_lines: usize = worlds.iter().map(|w| w.output_lines_ts.len()).sum();
+        assert!(
+            total_lines <= expected_total_budget,
+            "total InitialState lines across all worlds ({total_lines}) must not exceed \
+             the aggregate budget ({expected_total_budget}) - got {total_lines} from {world_count} \
+             worlds with a per-world cap of {per_world_cap}"
+        );
+        // The first few worlds (in order) should still get their full per-world cap out of
+        // the shared budget - only later worlds are starved once it runs out.
+        assert_eq!(worlds[0].output_lines_ts.len(), per_world_cap,
+            "the first world should get its full per-world cap while budget remains");
+        // With a 500-line budget and a 100-line per-world cap, only 5 worlds fit before
+        // the budget is exhausted; the rest get zero additional lines (they still backfill
+        // immediately via RequestScrollback, same as any world's older history).
+        assert_eq!(worlds[world_count - 1].output_lines_ts.len(), 0,
+            "a world past the aggregate budget should get zero lines in InitialState, not a per-world floor");
+    }
+

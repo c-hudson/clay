@@ -9049,9 +9049,23 @@ impl App {
     fn build_initial_state(&self) -> WsMessage {
         // Send only the most recent lines in InitialState for fast initial load.
         // Clients backfill remaining history via RequestScrollback after rendering.
-        let max_initial_lines = self.settings.remote_initial_lines.max(1) as usize;
+        let per_world_cap = self.settings.remote_initial_lines.max(1) as usize;
+        // Hard aggregate budget across ALL worlds combined, not just per-world: without
+        // this, a daemon with many worlds sends up to world_count * remote_initial_lines
+        // lines in one InitialState message, which can exceed the WebSocket message size
+        // cap in websocket.rs's ws_config and make the send fail there - previously
+        // silently (that failure is now logged too, but the real fix is not producing an
+        // oversized message in the first place). Once the budget is exhausted, later
+        // worlds simply get 0 additional lines here - they still backfill immediately via
+        // the existing RequestScrollback mechanism, exactly as any world's older history
+        // beyond remote_initial_lines already does. This must stay a hard ceiling (total
+        // lines actually included can never exceed total_line_budget) - no per-world floor
+        // on top of it, or the bound stops being a bound as world count grows.
+        let total_line_budget = per_world_cap.max(500);
+        let mut budget_remaining = total_line_budget;
 
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
+            let max_initial_lines = per_world_cap.min(budget_remaining);
             // Create timestamped versions (add sparkle prefix for client-generated messages)
             // Only include output_lines - pending_lines stay on the server and are
             // released via PgDn/Tab, then broadcast to clients normally.
@@ -9064,8 +9078,14 @@ impl App {
                 world.output_lines.len()
             };
             // Find skip index so that at least MAX_INITIAL_LINES *visible* (non-gagged) lines
-            // are included. Walk backwards counting visible lines.
-            let skip = {
+            // are included. Walk backwards counting visible lines. max_initial_lines == 0
+            // (this world's share of the aggregate budget above ran out) must yield zero
+            // lines, not one - the loop below only breaks *after* counting a line, so
+            // without this guard `visible_count >= 0` is trivially true right after the
+            // first line and one line slips through per exhausted world.
+            let skip = if max_initial_lines == 0 {
+                total_lines
+            } else {
                 let mut visible_count = 0;
                 let mut start = total_lines;
                 for i in (0..total_lines).rev() {
@@ -9102,6 +9122,7 @@ impl App {
                 })
                 .collect();
             let output_len = output_lines_ts.len();
+            budget_remaining = budget_remaining.saturating_sub(output_len);
             let pending_lines_ts: Vec<TimestampedLine> = Vec::new();
             WorldStateMsg {
                 index: idx,

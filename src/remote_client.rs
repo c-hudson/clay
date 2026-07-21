@@ -899,12 +899,22 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             break;
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => {
+                    Some(Ok(Message::Close(frame))) => {
+                        disable_raw_mode()?;
+                        println!();
+                        match frame.map(|f| f.reason.to_string()).filter(|r| !r.is_empty()) {
+                            Some(reason) => eprintln!("Connection closed: {reason}"),
+                            None => eprintln!("Connection closed"),
+                        }
+                        return Ok(());
+                    }
+                    None => {
                         disable_raw_mode()?;
                         println!();
                         eprintln!("Connection closed");
                         return Ok(());
                     }
+                    // Ping/Pong/Binary/etc. and transport errors: not a close, keep waiting.
                     _ => {}
                 }
             }
@@ -932,50 +942,75 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 
     // Wait for InitialState
     loop {
-        if let Some(Ok(Message::Text(text))) = ws_read.next().await {
-            if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                match ws_msg {
-                    WsMessage::AuthResponse { success, error, .. } => {
-                        if !success {
-                            disable_raw_mode()?;
-                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                            eprintln!("Authentication failed: {}", error.unwrap_or_default());
-                            return Ok(());
+        match ws_read.next().await {
+            Some(Ok(Message::Text(text))) => {
+                if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                    match ws_msg {
+                        WsMessage::AuthResponse { success, error, .. } => {
+                            if !success {
+                                disable_raw_mode()?;
+                                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                                eprintln!("Authentication failed: {}", error.unwrap_or_default());
+                                return Ok(());
+                            }
+                            // Auth success - continue waiting for InitialState
                         }
-                        // Auth success - continue waiting for InitialState
+                        WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, .. } => {
+                            // Save world totals for backfill before consuming worlds vec
+                            let world_totals: Vec<(usize, usize)> = worlds.iter()
+                                .map(|w| (w.index, w.total_output_lines))
+                                .collect();
+                            // Initialize app state from server
+                            app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
+                            // Initialize backfill queue
+                            app.init_backfill(&world_totals);
+                            // Declare client type to server (RemoteConsole for TUI clients)
+                            let _ = ws_tx.send(WsMessage::ClientTypeDeclaration {
+                                client_type: websocket::RemoteClientType::RemoteConsole,
+                            });
+                            // Send initial view state for more-mode sync
+                            let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                            let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
+                            let _ = ws_tx.send(WsMessage::UpdateViewState {
+                                world_index: current_world_index,
+                                visible_lines,
+                                visible_columns: Some(width as usize),
+                            });
+                            break;
+                        }
+                        _ => {}
                     }
-                    WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, .. } => {
-                        // Save world totals for backfill before consuming worlds vec
-                        let world_totals: Vec<(usize, usize)> = worlds.iter()
-                            .map(|w| (w.index, w.total_output_lines))
-                            .collect();
-                        // Initialize app state from server
-                        app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
-                        // Initialize backfill queue
-                        app.init_backfill(&world_totals);
-                        // Declare client type to server (RemoteConsole for TUI clients)
-                        let _ = ws_tx.send(WsMessage::ClientTypeDeclaration {
-                            client_type: websocket::RemoteClientType::RemoteConsole,
-                        });
-                        // Send initial view state for more-mode sync
-                        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
-                        let _ = ws_tx.send(WsMessage::UpdateViewState {
-                            world_index: current_world_index,
-                            visible_lines,
-                            visible_columns: Some(width as usize),
-                        });
-                        break;
-                    }
-                    _ => {}
                 }
             }
-        } else {
-            disable_raw_mode()?;
-            let _ = execute!(terminal.backend_mut(), crossterm::event::DisableBracketedPaste);
-            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-            eprintln!("Connection closed while waiting for initial state");
-            return Ok(());
+            // Keepalive frames, not a close - tungstenite surfaces these on the read
+            // stream while we're waiting; treating them as "connection closed" (as a
+            // blanket catch-all previously did) would wrongly abort a live connection.
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(frame))) => {
+                disable_raw_mode()?;
+                let _ = execute!(terminal.backend_mut(), crossterm::event::DisableBracketedPaste);
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                match frame.map(|f| f.reason.to_string()).filter(|r| !r.is_empty()) {
+                    Some(reason) => eprintln!("Connection closed while waiting for initial state: {reason}"),
+                    None => eprintln!("Connection closed while waiting for initial state"),
+                }
+                return Ok(());
+            }
+            Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
+            Some(Err(e)) => {
+                disable_raw_mode()?;
+                let _ = execute!(terminal.backend_mut(), crossterm::event::DisableBracketedPaste);
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                eprintln!("Connection error while waiting for initial state: {e}");
+                return Ok(());
+            }
+            None => {
+                disable_raw_mode()?;
+                let _ = execute!(terminal.backend_mut(), crossterm::event::DisableBracketedPaste);
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                eprintln!("Connection closed while waiting for initial state");
+                return Ok(());
+            }
         }
     }
 

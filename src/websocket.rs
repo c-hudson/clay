@@ -8,7 +8,7 @@ use sha2::{Sha256, Digest};
 use tokio_tungstenite::{accept_async_with_config, tungstenite::Message as WsRawMessage, tungstenite::protocol::WebSocketConfig};
 
 // Import AppEvent and Action from the main crate
-use crate::{AppEvent, Action, BanList};
+use crate::{AppEvent, Action, BanList, debug_log, is_debug_enabled};
 use crate::ansi_music::MusicNote;
 use crate::http::log_ws_auth;
 
@@ -1507,11 +1507,20 @@ where
     };
     // B1 (security remediation): cap message/frame size so an unauthenticated client
     // can't pin large buffers pre-auth (the whole frame is buffered and serde_json-parsed
-    // before AuthRequest is checked, below). 256 KiB is comfortably above any legitimate
-    // client message (commands, settings pushes) while bounding per-connection memory.
+    // before AuthRequest is checked, below). NOTE: tungstenite enforces this cap
+    // symmetrically - it also bounds the daemon's own OUTBOUND sends on this same
+    // WebSocketConfig, including InitialState (see build_initial_state / ws_send_
+    // initial_state_and_mark). The original 256 KiB was sized only against small
+    // legitimate *inbound* client messages (commands, settings pushes) and didn't
+    // account for that; a busy multi-world daemon's InitialState can genuinely exceed
+    // it, which made ws_sink.send(...) fail and silently kill the connection right
+    // after a successful auth (see the WS-SEND-FAIL logging below). 2 MiB/256 KiB still
+    // bounds per-connection memory for a pre-auth sender comfortably (and is backed by
+    // build_initial_state's own aggregate line budget, which keeps InitialState well
+    // under this regardless of world count).
     let ws_config = WebSocketConfig {
-        max_message_size: Some(256 * 1024),
-        max_frame_size: Some(64 * 1024),
+        max_message_size: Some(2 * 1024 * 1024),
+        max_frame_size: Some(256 * 1024),
         ..Default::default()
     };
     let ws_stream = match accept_async_with_config(stream, Some(ws_config)).await {
@@ -1608,7 +1617,15 @@ where
         tokio::select! {
             Some(msg) = rx.recv() => {
                 if let Ok(json) = serde_json::to_string(&msg) {
-                    if ws_sink.send(WsRawMessage::Text(json)).await.is_err() {
+                    let msg_len = json.len();
+                    if let Err(e) = ws_sink.send(WsRawMessage::Text(json)).await {
+                        // Was previously silent - a send failure here (e.g. exceeding
+                        // ws_config's max_message_size above) killed the connection right
+                        // after a successful auth with zero trace in either log.
+                        crate::http::log_remote_event("WS-SEND-FAIL", &client_ip,
+                            &format!("{} bytes: {}", msg_len, e));
+                        debug_log(is_debug_enabled(), &format!(
+                            "WS-SEND-FAIL: client={} {} bytes: {}", client_ip, msg_len, e));
                         break;
                     }
                 }
@@ -1831,7 +1848,8 @@ where
                     crate::http::log_remote_event("WS-DEAD", &client_ip, "no pong response to keepalive");
                     break;
                 } else {
-                    if ws_sink.send(WsRawMessage::Ping(Vec::new())).await.is_err() {
+                    if let Err(e) = ws_sink.send(WsRawMessage::Ping(Vec::new())).await {
+                        crate::http::log_remote_event("WS-SEND-FAIL", &client_ip, &format!("keepalive ping: {}", e));
                         break;
                     }
                     awaiting_pong = true;
