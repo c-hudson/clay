@@ -119,4 +119,4 @@ PATCH
 fi
 
 echo ""
-echo "All patches applied. Ready to build with: cargo build --no-default-features --features rustls-backend,webview-gui"
+echo "All patches applied. Ready to build with: cargo build --no-default-features --features rustls-backend,webview-gui,ssh-transport"

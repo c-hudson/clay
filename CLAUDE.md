@@ -23,10 +23,10 @@ Debug output interferes with the TUI and corrupts the terminal display *once the
 
 ```bash
 # Default build command (always use this)
-cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
+cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend,ssh-transport
 # Output: target/x86_64-unknown-linux-musl/debug/clay
 
-cargo build --features webview-gui   # Build with webview GUI client
+cargo build --features webview-gui   # Build with webview GUI client (ssh-transport included via defaults)
 cargo test                           # Run all tests
 cargo test test_name                 # Run a single test
 cargo clippy                         # Lint
@@ -34,10 +34,12 @@ cargo clippy                         # Lint
 
 **Why musl:** glibc static builds cause SIGFPE crashes during DNS resolution. **Why rustls:** native-tls requires OpenSSL cross-compilation for musl.
 
+**`ssh-transport`** (SSH-tunneled `--console`/`--gui`, see `src/ssh.rs`) is in `[features] default` in `Cargo.toml`, so any build WITHOUT `--no-default-features` gets it automatically. Any `--no-default-features` invocation must add it back explicitly or the binary silently loses `--ssh`/`--ssh-proxy` support (`--ssh` exits with "requires the 'ssh-transport' feature" instead of erroring on something more obviously wrong) - this bit us once already; if you add a new `--no-default-features` build command anywhere (a script, this doc, CI), include `,ssh-transport`.
+
 ### Cross-Platform Builds
 
-- **Termux:** `cargo build --no-default-features --features rustls-backend` (no musl target). GUI requires X11 patches via `./patches/apply-patches.sh`. No hot reload, TLS proxy, or Ctrl+Z on Android.
-- **macOS:** `cargo build --no-default-features --features rustls-backend` (no musl). Universal binary via `lipo` combining x86_64-apple-darwin and aarch64-apple-darwin targets.
+- **Termux:** `cargo build --no-default-features --features rustls-backend,ssh-transport` (no musl target). GUI requires X11 patches via `./patches/apply-patches.sh`. No hot reload, TLS proxy, or Ctrl+Z on Android.
+- **macOS:** `cargo build --no-default-features --features rustls-backend,ssh-transport` (no musl). Universal binary via `lipo` combining x86_64-apple-darwin and aarch64-apple-darwin targets.
 - **Windows:** `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo build --release --features webview-gui` (MSVC, not cross-compiled)
 
 ## Architecture

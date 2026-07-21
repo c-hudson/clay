@@ -83,7 +83,7 @@ chmod +x clay
 ```bash
 # Static binary for any Linux (TUI only, no GUI)
 rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
+cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend,ssh-transport
 
 # Build with WebView GUI + audio (requires GTK/WebKit dev libraries)
 sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev
@@ -119,7 +119,7 @@ cargo build --release --features webview-gui
 pkg install rust
 
 # Build TUI only (no GUI on Android)
-cargo build --release --no-default-features --features rustls-backend
+cargo build --release --no-default-features --features rustls-backend,ssh-transport
 ```
 
 ## Usage

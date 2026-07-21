@@ -79,6 +79,12 @@ echo "Detecting available features..."
 FEATURES="rustls-backend"
 echo "  [+] rustls-backend (TLS)"
 
+# --- SSH-tunneled transport (--ssh) ---
+# Pure Rust (russh + RustCrypto), no system library dependencies - unlike
+# webview-gui/native-audio below, always included, same as rustls-backend.
+FEATURES="$FEATURES,ssh-transport"
+echo "  [+] ssh-transport (--ssh tunneling)"
+
 # --- musl static linking (Linux only) ---
 if [ "$OS" = "linux" ]; then
     MUSL_TARGET="x86_64-unknown-linux-musl"
@@ -292,9 +298,9 @@ fi
 if ! $BUILD_OK && [ "$OS" = "linux" ] && $HAS_MUSL; then
     echo ""
     echo "Build failed. Retrying with musl static build..."
-    if build_with_fallback "rustls-backend" "--target x86_64-unknown-linux-musl --no-default-features" "" "musl static (rustls-backend only)"; then
+    if build_with_fallback "rustls-backend,ssh-transport" "--target x86_64-unknown-linux-musl --no-default-features" "" "musl static (rustls-backend,ssh-transport only)"; then
         BUILD_OK=true
-        FEATURES="rustls-backend"
+        FEATURES="rustls-backend,ssh-transport"
         BUILD_TARGET="--target x86_64-unknown-linux-musl --no-default-features"
     fi
 fi
@@ -303,9 +309,9 @@ fi
 if ! $BUILD_OK; then
     echo ""
     echo "All attempts failed. Trying minimal build..."
-    if build_with_fallback "rustls-backend" "--no-default-features" "" "minimal (rustls-backend only)"; then
+    if build_with_fallback "rustls-backend,ssh-transport" "--no-default-features" "" "minimal (rustls-backend,ssh-transport only)"; then
         BUILD_OK=true
-        FEATURES="rustls-backend"
+        FEATURES="rustls-backend,ssh-transport"
     fi
 fi
 

@@ -13,8 +13,8 @@ written (July 2026); line numbers may drift — anchor on the named functions.
 Build/verify after every phase:
 
 ```bash
-cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
-cargo test --no-default-features --features rustls-backend
+cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend,ssh-transport
+cargo test --no-default-features --features rustls-backend,ssh-transport
 ```
 
 Also compile-check the native-tls and plain variants when touching src/http.rs — all
