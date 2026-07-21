@@ -36,9 +36,9 @@
             </div>
             <div class="status-spacer"></div>
             <div class="font-slider-group status-font-slider">
-                <span class="font-slider-label">A</span>
+                <span class="font-slider-label" id="font-slider-label" title="Decrease font size">A</span>
                 <input type="range" class="font-slider" id="font-slider" min="9" max="20" value="14" title="Font size">
-                <span class="font-slider-val" id="font-slider-val">14</span>
+                <span class="font-slider-val" id="font-slider-val" title="Increase font size">14</span>
             </div>
             <div class="status-time" id="status-time"></div>
         </div>
@@ -51,9 +51,9 @@
             <button class="nav-btn" id="nav-pgup-btn">PgUp</button>
             <button class="nav-btn" id="nav-pgdn-btn">PgDn</button>
             <div class="font-slider-group nav-font-slider">
-                <span class="font-slider-label">A</span>
+                <span class="font-slider-label" id="nav-font-slider-label" title="Decrease font size">A</span>
                 <input type="range" class="font-slider" id="nav-font-slider" min="9" max="20" value="14" title="Font size">
-                <span class="font-slider-val" id="nav-font-slider-val">14</span>
+                <span class="font-slider-val" id="nav-font-slider-val" title="Increase font size">14</span>
             </div>
             <div class="nav-spacer"></div>
             <button class="nav-btn" id="nav-up-btn" title="Previous World">&#9650;</button>
@@ -571,6 +571,12 @@
                                             <span id="setup-wrapspace-value" class="stepper-value">0</span>
                                             <button id="setup-wrapspace-plus" class="stepper-btn">+</button>
                                         </div>
+                                    </div>
+                                </div>
+                                <div class="setting-row" title="Lines of scrollback sent to web/remote clients on initial connect (10-5000)">
+                                    <span class="setting-label">Remote Lines</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="setup-remote-lines-input" autocomplete="off" class="web-input" style="width:80px;text-align:center">
                                     </div>
                                 </div>
                                 <div class="setting-row" id="setup-transparency-row" style="display:none">

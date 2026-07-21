@@ -233,6 +233,8 @@ pub enum WsMessage {
         color_offset_percent: u8,
         #[serde(default)]
         wrapspace: u8,
+        #[serde(default = "default_remote_initial_lines")]
+        remote_initial_lines: u16,
         input_height: u16,
         font_name: String,
         font_size: f32,
@@ -521,6 +523,10 @@ pub struct GlobalSettingsMsg {
     pub color_offset_percent: u8,
     #[serde(default)]
     pub wrapspace: u8,
+    /// Number of visible (non-gagged) lines sent to a remote/web/GUI client per world
+    /// on initial connect. See App::build_initial_state.
+    #[serde(default = "default_remote_initial_lines")]
+    pub remote_initial_lines: u16,
     pub input_height: u16,
     pub font_name: String,
     pub font_size: f32,
@@ -589,6 +595,10 @@ fn default_gui_transparency() -> f32 {
 
 fn default_web_path() -> String {
     "clay".to_string()
+}
+
+fn default_remote_initial_lines() -> u16 {
+    100
 }
 
 fn default_web_font_size_phone() -> f32 {

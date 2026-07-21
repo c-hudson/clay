@@ -98,6 +98,7 @@
         menuDropdown: document.getElementById('menu-dropdown'),
         // Font slider (status bar)
         fontSliderInput: document.getElementById('font-slider'),
+        fontSliderLabel: document.getElementById('font-slider-label'),
         fontSliderVal: document.getElementById('font-slider-val'),
         // Nav bar (tablet/phone)
         navBar: document.getElementById('nav-bar'),
@@ -107,6 +108,7 @@
         navUpBtn: document.getElementById('nav-up-btn'),
         navDownBtn: document.getElementById('nav-down-btn'),
         navFontSlider: document.getElementById('nav-font-slider'),
+        navFontSliderLabel: document.getElementById('nav-font-slider-label'),
         navFontSliderVal: document.getElementById('nav-font-slider-val'),
         // Actions List popup
         actionsListModal: document.getElementById('actions-list-modal'),
@@ -225,6 +227,7 @@
         setupWrapspaceValue: document.getElementById('setup-wrapspace-value'),
         setupWrapspaceMinus: document.getElementById('setup-wrapspace-minus'),
         setupWrapspacePlus: document.getElementById('setup-wrapspace-plus'),
+        setupRemoteLinesInput: document.getElementById('setup-remote-lines-input'),
         setupThemeSelect: document.getElementById('setup-theme-select'),
         setupTransparencyRow: document.getElementById('setup-transparency-row'),
         setupTransparencySlider: document.getElementById('setup-transparency-slider'),
@@ -397,6 +400,10 @@
 
     // Wrapspace: hanging indent (in spaces) for wrapped output continuation rows (0 = off)
     let wrapspace = 0;
+
+    // Remote Lines: lines of scrollback sent to this/other remote clients per world
+    // on initial connect (server-side setting, applies to future connects)
+    let remoteInitialLines = 100;
 
     // Command completion state
     let lastCompletionPrefix = '';
@@ -1995,6 +2002,9 @@
                         wrapspace = msg.settings.wrapspace;
                         applyWrapspace(wrapspace);
                     }
+                    if (msg.settings.remote_initial_lines !== undefined) {
+                        remoteInitialLines = msg.settings.remote_initial_lines;
+                    }
                     if (msg.settings.gui_transparency !== undefined) {
                         applyTransparency(msg.settings.gui_transparency);
                     }
@@ -2540,6 +2550,9 @@
                     if (msg.settings.wrapspace !== undefined) {
                         wrapspace = msg.settings.wrapspace;
                         applyWrapspace(wrapspace); // pure CSS reflow, no re-render needed
+                    }
+                    if (msg.settings.remote_initial_lines !== undefined) {
+                        remoteInitialLines = msg.settings.remote_initial_lines;
                     }
                     if (msg.settings.gui_transparency !== undefined) {
                         applyTransparency(msg.settings.gui_transparency);
@@ -6265,6 +6278,9 @@
         setupArchive = scrollbackEnabled;
         setupInputHeightValue = inputHeight;
         setupWrapspace = wrapspace;
+        if (elements.setupRemoteLinesInput) {
+            elements.setupRemoteLinesInput.value = remoteInitialLines;
+        }
         setupGuiTheme = guiTheme;
         setupColorOffset = colorOffsetPercent;
         setupTransparency = guiTransparency;
@@ -6352,6 +6368,7 @@
         elements.setupInputHeightValue.textContent = setupInputHeightValue;
         // Wrap space stepper
         elements.setupWrapspaceValue.textContent = setupWrapspace;
+        // Remote lines: plain text input, value set once on popup open (see openSettingsPopup)
         // Color offset stepper
         elements.setupColorOffsetValue.textContent = setupColorOffset === 0 ? 'OFF' : setupColorOffset + '%';
         // Theme dropdown
@@ -6381,6 +6398,7 @@
             gui_transparency: guiTransparency,
             color_offset_percent: colorOffsetPercent,
             wrapspace: wrapspace,
+            remote_initial_lines: remoteInitialLines,
             font_name: fontName,
             font_size: guiFontSize,
             web_font_size_phone: webFontSizePhone,
@@ -6480,6 +6498,9 @@
         if (setupColorOffset > 100) setupColorOffset = 100;
         if (setupWrapspace < 0) setupWrapspace = 0;
         if (setupWrapspace > 20) setupWrapspace = 20;
+        var setupRemoteInitialLines = parseInt(elements.setupRemoteLinesInput ? elements.setupRemoteLinesInput.value : '', 10);
+        if (!Number.isFinite(setupRemoteInitialLines)) setupRemoteInitialLines = 100;
+        setupRemoteInitialLines = Math.max(10, Math.min(5000, setupRemoteInitialLines));
 
         moreModeEnabled = setupMoreMode;
         worldSwitchMode = setupWorldSwitchMode;
@@ -6493,6 +6514,7 @@
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
         wrapspace = setupWrapspace;
+        remoteInitialLines = setupRemoteInitialLines;
         applyTheme(guiTheme);
         setInputHeight(setupInputHeightValue);
         applyTransparency(setupTransparency);
@@ -7970,6 +7992,38 @@
             });
             elements.navFontSlider.addEventListener('click', function(e) {
                 e.stopPropagation();
+            });
+        }
+
+        // Font size "A" label - click to decrease by one (status bar)
+        if (elements.fontSliderLabel) {
+            elements.fontSliderLabel.addEventListener('click', function(e) {
+                e.stopPropagation();
+                setFontSize(currentFontSize - 1);
+            });
+        }
+
+        // Font size "A" label - click to decrease by one (nav bar)
+        if (elements.navFontSliderLabel) {
+            elements.navFontSliderLabel.addEventListener('click', function(e) {
+                e.stopPropagation();
+                setFontSize(currentFontSize - 1);
+            });
+        }
+
+        // Font size value label - click to increase by one (status bar)
+        if (elements.fontSliderVal) {
+            elements.fontSliderVal.addEventListener('click', function(e) {
+                e.stopPropagation();
+                setFontSize(currentFontSize + 1);
+            });
+        }
+
+        // Font size value label - click to increase by one (nav bar)
+        if (elements.navFontSliderVal) {
+            elements.navFontSliderVal.addEventListener('click', function(e) {
+                e.stopPropagation();
+                setFontSize(currentFontSize + 1);
             });
         }
 

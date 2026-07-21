@@ -325,6 +325,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
+    writeln!(file, "remote_initial_lines={}", app.settings.remote_initial_lines)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
     writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
@@ -871,6 +872,11 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         // at render time, so any u8 value is safe to store as-is.
                         if let Ok(p) = value.parse::<u8>() {
                             app.settings.wrapspace = p;
+                        }
+                    }
+                    "remote_initial_lines" => {
+                        if let Ok(n) = value.parse::<u16>() {
+                            app.settings.remote_initial_lines = n.clamp(10, 5000);
                         }
                     }
                     "web_secure" => {
@@ -1641,6 +1647,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
+    writeln!(file, "remote_initial_lines={}", app.settings.remote_initial_lines)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
     writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
@@ -2281,6 +2288,11 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             app.settings.wrapspace = p;
                         }
                     }
+                    "remote_initial_lines" => {
+                        if let Ok(n) = value.parse::<u16>() {
+                            app.settings.remote_initial_lines = n.clamp(10, 5000);
+                        }
+                    }
                     "web_secure" => {
                         app.settings.web_secure = value == "true";
                     }
@@ -2657,6 +2669,7 @@ mod tests {
             gui_transparency: 0.7,             // default: 1.0
             color_offset_percent: 42,          // default: 0
             wrapspace: 7,                      // default: 0
+            remote_initial_lines: 250,         // default: 100
             font_name: "TestFont".to_string(), // default: ""
             font_size: 18.0,                   // default: 14.0
             web_font_size_phone: 12.0,         // default: 10.0
@@ -2754,6 +2767,7 @@ mod tests {
         assert_eq!(a.gui_transparency, b.gui_transparency, "{context}: gui_transparency");
         assert_eq!(a.color_offset_percent, b.color_offset_percent, "{context}: color_offset_percent");
         assert_eq!(a.wrapspace, b.wrapspace, "{context}: wrapspace");
+        assert_eq!(a.remote_initial_lines, b.remote_initial_lines, "{context}: remote_initial_lines");
         assert_eq!(a.font_name, b.font_name, "{context}: font_name");
         assert_eq!(a.font_size, b.font_size, "{context}: font_size");
         assert_eq!(a.web_font_size_phone, b.web_font_size_phone, "{context}: web_font_size_phone");
@@ -3101,6 +3115,7 @@ pattern=foo
         assert_ne!(non_default.gui_transparency, default.gui_transparency, "gui_transparency should differ");
         assert_ne!(non_default.color_offset_percent, default.color_offset_percent, "color_offset_percent should differ");
         assert_ne!(non_default.wrapspace, default.wrapspace, "wrapspace should differ");
+        assert_ne!(non_default.remote_initial_lines, default.remote_initial_lines, "remote_initial_lines should differ");
         assert_ne!(non_default.font_name, default.font_name, "font_name should differ");
         assert_ne!(non_default.font_size, default.font_size, "font_size should differ");
         assert_ne!(non_default.web_font_size_phone, default.web_font_size_phone, "web_font_size_phone should differ");

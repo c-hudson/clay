@@ -354,6 +354,12 @@ body {
     color: var(--theme-fg-muted, #6e6479);
     letter-spacing: 0.3px;
     text-transform: uppercase;
+    cursor: pointer;
+    user-select: none;
+}
+
+.font-slider-label:hover {
+    color: var(--accent-color);
 }
 
 .font-slider {
@@ -400,6 +406,12 @@ body {
     min-width: 18px;
     text-align: center;
     font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    user-select: none;
+}
+
+.font-slider-val:hover {
+    color: var(--accent-color);
 }
 
 /* ─── Mobile Navigation Bar ─── */

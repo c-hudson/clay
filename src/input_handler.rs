@@ -640,6 +640,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.settings.wrapspace = new_wrapspace;
                     app.needs_output_redraw = true;
                 }
+                app.settings.remote_initial_lines = settings.remote_initial_lines.clamp(10, 5000) as u16;
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }

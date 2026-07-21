@@ -1421,6 +1421,7 @@ pub(crate) fn handle_remote_client_key(
                 // master (which owns rendering for its own TUI) applies its own redraw when
                 // it processes the resulting UpdateGlobalSettings message below.
                 app.settings.wrapspace = settings.wrapspace.clamp(0, 20) as u8;
+                app.settings.remote_initial_lines = settings.remote_initial_lines.clamp(10, 5000) as u16;
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -1437,6 +1438,8 @@ pub(crate) fn handle_remote_client_key(
                     color_offset_percent: app.settings.color_offset_percent,
                     // app.settings.wrapspace was already updated from the popup above.
                     wrapspace: app.settings.wrapspace,
+                    // app.settings.remote_initial_lines was already updated from the popup above.
+                    remote_initial_lines: app.settings.remote_initial_lines,
                     input_height: app.input_height,
                     font_name: app.settings.font_name.clone(),
                     font_size: app.settings.font_size,
@@ -2226,6 +2229,7 @@ pub(crate) fn apply_remote_web_settings(
         gui_transparency: app.settings.gui_transparency,
         color_offset_percent: app.settings.color_offset_percent,
         wrapspace: app.settings.wrapspace,  // unchanged — this function only touches web settings
+        remote_initial_lines: app.settings.remote_initial_lines,  // unchanged — this function only touches web settings
         input_height: app.input_height,
         font_name: app.settings.font_name.clone(),
         font_size: app.settings.font_size,

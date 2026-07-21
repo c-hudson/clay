@@ -1581,6 +1581,10 @@ pub struct Settings {
     pub tts_speak_mode: tts::TtsSpeakMode,
     pub tts_muted: bool,  // Runtime-only, toggled by F9
     pub scrollback_enabled: bool,
+    // Number of visible (non-gagged) lines of scrollback sent to a remote/web/GUI
+    // client per world on initial connect. Older history is backfilled on demand
+    // via RequestScrollback. See build_initial_state().
+    pub remote_initial_lines: u16,
 }
 
 impl Default for Settings {
@@ -1630,6 +1634,7 @@ impl Default for Settings {
             tts_speak_mode: tts::TtsSpeakMode::All,
             tts_muted: false,
             scrollback_enabled: false,
+            remote_initial_lines: 100,
         }
     }
 }
@@ -3510,6 +3515,7 @@ impl App {
             gui_transparency: self.settings.gui_transparency,
             color_offset_percent: self.settings.color_offset_percent,
             wrapspace: self.settings.wrapspace,
+            remote_initial_lines: self.settings.remote_initial_lines,
             input_height: self.input_height,
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
@@ -3561,6 +3567,7 @@ impl App {
         self.settings.gui_transparency = settings.gui_transparency;
         self.settings.color_offset_percent = settings.color_offset_percent;
         self.settings.wrapspace = settings.wrapspace;
+        self.settings.remote_initial_lines = settings.remote_initial_lines;
         self.input_height = settings.input_height;
         self.input.visible_height = self.input_height;
         self.settings.font_name = settings.font_name.clone();
@@ -3975,6 +3982,7 @@ impl App {
             self.settings.tts_speak_mode.name(),
             self.settings.scrollback_enabled,
             self.settings.wrapspace as i64,
+            self.settings.remote_initial_lines as i64,
         );
         self.popup_manager.open(def);
 
@@ -8294,7 +8302,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -8318,6 +8326,7 @@ impl App {
                     self.settings.wrapspace = wrapspace;
                     self.needs_output_redraw = true;
                 }
+                self.settings.remote_initial_lines = remote_initial_lines.clamp(10, 5000);
                 self.input_height = input_height.clamp(1, 15);
                 self.input.visible_height = self.input_height;
                 self.settings.font_name = font_name;
@@ -9039,7 +9048,7 @@ impl App {
     fn build_initial_state(&self) -> WsMessage {
         // Send only the most recent lines in InitialState for fast initial load.
         // Clients backfill remaining history via RequestScrollback after rendering.
-        const MAX_INITIAL_LINES: usize = 100;
+        let max_initial_lines = self.settings.remote_initial_lines.max(1) as usize;
 
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
             // Create timestamped versions (add sparkle prefix for client-generated messages)
@@ -9062,7 +9071,7 @@ impl App {
                     start = i;
                     if !world.output_lines[i].gagged {
                         visible_count += 1;
-                        if visible_count >= MAX_INITIAL_LINES {
+                        if visible_count >= max_initial_lines {
                             break;
                         }
                     }
@@ -9537,11 +9546,13 @@ impl App {
             world.output_lines.splice(0..0, prepend);
             world.scroll_offset += inserted;
 
-            // Cap buffer size: keep the newest 10_000 lines to avoid unbounded growth
+            // Cap buffer size: keep the newest 10_000 lines to avoid unbounded growth.
+            // output_lines is ordered oldest→newest, so drain from the FRONT (oldest).
             const MAX_LINES: usize = 10_000;
             if world.output_lines.len() > MAX_LINES {
                 let excess = world.output_lines.len() - MAX_LINES;
-                world.output_lines.drain(world.output_lines.len() - excess..);
+                world.output_lines.drain(0..excess);
+                world.scroll_offset = world.scroll_offset.saturating_sub(excess);
             }
         }
 
@@ -10117,6 +10128,7 @@ pub(crate) struct SetupSettings {
     pub(crate) tts_speak_mode: String,
     pub(crate) scrollback: bool,
     pub(crate) wrapspace: i64,
+    pub(crate) remote_initial_lines: i64,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -10263,7 +10275,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
-        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE,
+        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_REMOTE_LINES,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -10512,6 +10524,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
                     scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
                     wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
+                    remote_initial_lines: state.get_text(SETUP_FIELD_REMOTE_LINES)
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(100),
                 }
             };
 
