@@ -3001,12 +3001,18 @@
         backfillWorldQueue = [];
         backfillCurrentWorld = null;
 
-        // Build queue: current world first, then others
+        // Build queue: current world first, then others. A world with total >
+        // received always has something worth fetching, even when _oldest_seq is
+        // null (e.g. build_initial_state's aggregate line budget ran out before
+        // reaching it, even though the world has real history server-side) -
+        // requestBackfillChunk sends before_seq: null in that case, which the
+        // daemon already handles as "send the last N lines". Do not skip these
+        // worlds here, or they stay permanently empty.
         const queue = [];
         worlds.forEach((world, idx) => {
             const total = world.total_output_lines || 0;
             const received = world.output_lines ? world.output_lines.length : 0;
-            if (total > received && world._oldest_seq !== null) {
+            if (total > received) {
                 if (idx === currentWorldIndex) {
                     queue.unshift(idx);
                 } else {
@@ -3039,11 +3045,14 @@
     // Send a RequestScrollback for the given world
     function requestBackfillChunk(worldIndex) {
         const world = worlds[worldIndex];
-        if (!world || world._oldest_seq === null) {
-            // Nothing to backfill, skip to next world
+        if (!world) {
+            // World no longer exists (e.g. removed since being queued), skip it.
             backfillNextWorld();
             return;
         }
+        // before_seq may legitimately be null here (a world that received zero
+        // lines in InitialState despite having real history) - the daemon handles
+        // that as "send the last N lines", so send it through rather than skipping.
         send({
             type: 'RequestScrollback',
             world_index: worldIndex,

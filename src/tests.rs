@@ -4297,3 +4297,49 @@ if you're more curious.\"";
             "a world past the aggregate budget should get zero lines in InitialState, not a per-world floor");
     }
 
+    /// Regression test for the follow-on bug where a budget-starved world (real history
+    /// server-side, but zero lines locally after InitialState - see the aggregate-budget
+    /// test above) was silently dropped from the auto-backfill queue instead of being
+    /// requested with before_seq: None, leaving it permanently empty until the user
+    /// manually focused and scrolled it.
+    #[test]
+    fn test_backfill_advance_to_next_does_not_skip_budget_starved_worlds() {
+        let mut app = App::new();
+        app.worlds.clear();
+
+        // World 0: already has some local lines (the ordinary "backfill older history"
+        // case, unaffected by the bug/fix - included here to confirm it still works).
+        let mut world0 = World::new("world0");
+        for line in 0..10 {
+            world0.output_lines.push(OutputLine::new(format!("line {line}"), line as u64));
+        }
+        app.worlds.push(world0);
+
+        // World 1: budget-starved - InitialState reported total_output_lines=50 for it,
+        // but it has zero lines locally (the aggregate budget in build_initial_state ran
+        // out before reaching it).
+        let world1 = World::new("world1");
+        app.worlds.push(world1);
+
+        app.current_world_index = 0;
+
+        // Mirrors what InitialState's world_totals looks like: (world_index, total_output_lines).
+        let world_totals = vec![(0, 20), (1, 50)];
+        app.init_backfill(&world_totals);
+        assert_eq!(app.backfill_queue, vec![(0, 20), (1, 50)],
+            "both worlds have total > received and should be queued, current world first");
+
+        // World 0 has local lines: backfill_next should anchor on its oldest seq.
+        app.backfill_advance_to_next();
+        assert_eq!(app.backfill_next, Some((0, Some(0))),
+            "world 0 already has local lines, should backfill older history from its oldest seq");
+
+        // World 1 is budget-starved (zero local lines): must still be queued for backfill,
+        // not silently dropped. before_seq: None is the correct request - the daemon
+        // handles it as "send the last N lines".
+        app.backfill_advance_to_next();
+        assert_eq!(app.backfill_next, Some((1, None)),
+            "a budget-starved world (real history, zero local lines) must still be requested \
+             via RequestScrollback{{before_seq: None}}, not silently dropped from the queue");
+    }
+

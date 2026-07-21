@@ -4714,11 +4714,20 @@ impl App {
         while let Some((world_idx, _total)) = self.backfill_queue.first().copied() {
             self.backfill_queue.remove(0);
             if let Some(world) = self.worlds.get(world_idx) {
+                // oldest_seq is None for a world that received zero lines in InitialState
+                // (e.g. build_initial_state's aggregate line budget ran out before reaching
+                // it, even though the world has real history server-side - see
+                // init_backfill, which only queues a world when total > received, so
+                // anything reached here is guaranteed to have something worth fetching).
+                // RequestScrollback{before_seq: None} is already handled correctly by the
+                // daemon as "send the last N lines" - do NOT skip these worlds (as a prior
+                // version of this function did via an `if oldest_seq.is_some()` guard), or
+                // they stay permanently empty until the user manually focuses + scrolls
+                // them. Only a genuinely missing world (removed since being queued) falls
+                // through to try the next queue entry below.
                 let oldest_seq = world.output_lines.first().map(|l| l.seq);
-                if oldest_seq.is_some() {
-                    self.backfill_next = Some((world_idx, oldest_seq));
-                    return;
-                }
+                self.backfill_next = Some((world_idx, oldest_seq));
+                return;
             }
         }
         // Queue empty - backfill complete
