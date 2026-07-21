@@ -54,6 +54,15 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_RUN_MODE = "runMode";
     private static final String RUN_MODE_LOCAL = "local";
     private static final String RUN_MODE_REMOTE = "remote";
+    // SSH tunnel option for remote mode (see SshProxyManager) — reuses KEY_SERVER_HOST/
+    // KEY_SERVER_PORT as the SSH target host and the Clay port reached through the tunnel;
+    // no separate "SSH host" field, since the box you SSH into is the box running the daemon.
+    private static final String KEY_SSH_ENABLED = "sshEnabled";
+    private static final String KEY_SSH_USER = "sshUser";
+    private static final String KEY_SSH_PORT = "sshPort";
+    private static final String KEY_SSH_PRIVATE_KEY = "sshPrivateKey";
+    private static final String KEY_SSH_KEY_PASSPHRASE = "sshKeyPassphrase";
+    private static final String KEY_SSH_PASSWORD = "sshPassword";
 
     // Minimal first-launch page — loads instantly, immediately hands off to the full app
     private static final String FIRST_LAUNCH_HTML =
@@ -117,6 +126,11 @@ public class MainActivity extends AppCompatActivity {
     private boolean interfaceLoaded = false;
     private String loadedInterfaceUrl = null;
     private LocalServerManager localServerManager;
+    private SshProxyManager sshProxyManager;
+    // Snapshot of the SSH settings last applied to a running sshProxyManager (null when SSH
+    // wasn't in use), so reloadInterfaceRespectingRunMode() can detect a credential/target
+    // change even when KEY_SSH_ENABLED itself didn't flip — see that method.
+    private String lastAppliedSshConfigSnapshot = null;
     // Removed duplicate screenOffWakeLock - ClayForegroundService already holds one
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
@@ -315,6 +329,101 @@ public class MainActivity extends AppCompatActivity {
             String sanitized = RUN_MODE_LOCAL.equals(mode) ? RUN_MODE_LOCAL : RUN_MODE_REMOTE;
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString(KEY_RUN_MODE, sanitized).apply();
+        }
+
+        // SSH tunnel option (remote mode only) — see SshProxyManager and
+        // MainActivity#buildVarInjectionScript's SSH branch. Credentials (key/passphrase/
+        // password) are stored in the same plain SharedPreferences as the existing saved
+        // Clay password/auth key (KEY_SAVED_PASSWORD/KEY_AUTH_KEY) — consistent with current
+        // practice for this app, not a new weakness.
+        @JavascriptInterface
+        public boolean getSshEnabled() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getBoolean(KEY_SSH_ENABLED, false);
+        }
+
+        @JavascriptInterface
+        public void saveSshEnabled(boolean enabled) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_SSH_ENABLED, enabled).apply();
+        }
+
+        @JavascriptInterface
+        public String getSshUser() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_SSH_USER, "");
+        }
+
+        @JavascriptInterface
+        public void saveSshUser(String user) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_SSH_USER, user != null ? user.trim() : "").apply();
+        }
+
+        @JavascriptInterface
+        public int getSshPort() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getInt(KEY_SSH_PORT, 22);
+        }
+
+        @JavascriptInterface
+        public void saveSshPort(int port) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putInt(KEY_SSH_PORT, port > 0 ? port : 22).apply();
+        }
+
+        @JavascriptInterface
+        public String getSshPrivateKey() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_SSH_PRIVATE_KEY, "");
+        }
+
+        @JavascriptInterface
+        public void saveSshPrivateKey(String key) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_SSH_PRIVATE_KEY, key != null ? key : "").apply();
+        }
+
+        @JavascriptInterface
+        public void clearSshPrivateKey() {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .remove(KEY_SSH_PRIVATE_KEY).apply();
+        }
+
+        @JavascriptInterface
+        public String getSshKeyPassphrase() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_SSH_KEY_PASSPHRASE, "");
+        }
+
+        @JavascriptInterface
+        public void saveSshKeyPassphrase(String passphrase) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_SSH_KEY_PASSPHRASE, passphrase != null ? passphrase : "").apply();
+        }
+
+        @JavascriptInterface
+        public void clearSshKeyPassphrase() {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .remove(KEY_SSH_KEY_PASSPHRASE).apply();
+        }
+
+        @JavascriptInterface
+        public String getSshPassword() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_SSH_PASSWORD, "");
+        }
+
+        @JavascriptInterface
+        public void saveSshPassword(String password) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_SSH_PASSWORD, password != null ? password : "").apply();
+        }
+
+        @JavascriptInterface
+        public void clearSshPassword() {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .remove(KEY_SSH_PASSWORD).apply();
         }
 
         @JavascriptInterface
@@ -682,7 +791,56 @@ public class MainActivity extends AppCompatActivity {
 
     private void loadInterfaceForRemoteMode() {
         lastAppliedRunMode = RUN_MODE_REMOTE;
-        loadInterface();
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (prefs.getBoolean(KEY_SSH_ENABLED, false)) {
+            startSshProxyThenLoadInterface();
+        } else {
+            lastAppliedSshConfigSnapshot = null;
+            loadInterface();
+        }
+    }
+
+    // Establishes the SSH tunnel (spawn + readiness poll, both blocking) on a worker thread,
+    // then loads the WebView pointed at the local proxy port — mirrors
+    // startLocalServerThenLoadInterface()'s structure exactly; buildVarInjectionScript() reads
+    // sshProxyManager's local port once it's running, so the WebView must not load before this
+    // completes. Proceeds to loadInterface() either way; if the tunnel failed to start, app.js
+    // will simply fail to connect (see the proxy's log at clay-ssh-proxy.log for why), the same
+    // UX as an unreachable remote host.
+    private void startSshProxyThenLoadInterface() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        lastAppliedSshConfigSnapshot = sshConfigSnapshot(prefs);
+        if (sshProxyManager == null) {
+            sshProxyManager = new SshProxyManager(this);
+        }
+        final SshProxyManager manager = sshProxyManager;
+        final String sshUser = prefs.getString(KEY_SSH_USER, "");
+        final String sshHost = prefs.getString(KEY_SERVER_HOST, "");
+        final int sshPort = prefs.getInt(KEY_SSH_PORT, 22);
+        final int clayPort = prefs.getInt(KEY_SERVER_PORT, 9000);
+        final String privateKeyPem = prefs.getString(KEY_SSH_PRIVATE_KEY, "");
+        final String keyPassphrase = prefs.getString(KEY_SSH_KEY_PASSPHRASE, "");
+        final String password = prefs.getString(KEY_SSH_PASSWORD, "");
+        runOnUiThread(() -> showConnectingOverlay("Establishing SSH tunnel..."));
+        new Thread(() -> {
+            boolean ready = manager.start(sshUser, sshHost, sshPort, clayPort,
+                privateKeyPem, keyPassphrase, password);
+            android.util.Log.i("Clay", "SSH proxy " + (ready ? "ready" : "FAILED to start")
+                + " on port " + manager.getLocalPort());
+            runOnUiThread(this::loadInterface);
+        }, "ClaySshProxyStart").start();
+    }
+
+    // Fingerprint of everything that determines the running SshProxyManager's target/creds —
+    // used by reloadInterfaceRespectingRunMode() to detect a settings change that requires
+    // killing and restarting the tunnel (unlike plain remote mode, where a host/port change
+    // just needs a normal WS reconnect with fresh vars — the SSH tunnel is a subprocess that
+    // can't be redirected without a fresh --target=/env).
+    private String sshConfigSnapshot(SharedPreferences prefs) {
+        return prefs.getString(KEY_SSH_USER, "") + "|" + prefs.getString(KEY_SERVER_HOST, "") + "|"
+            + prefs.getInt(KEY_SSH_PORT, 22) + "|" + prefs.getInt(KEY_SERVER_PORT, 9000) + "|"
+            + prefs.getString(KEY_SSH_PRIVATE_KEY, "") + "|" + prefs.getString(KEY_SSH_KEY_PASSPHRASE, "") + "|"
+            + prefs.getString(KEY_SSH_PASSWORD, "");
     }
 
     // Starts the bundled Clay server (spawn + readiness poll, both blocking) on a worker thread,
@@ -1040,6 +1198,8 @@ public class MainActivity extends AppCompatActivity {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         boolean isLocalMode = RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))
             && localServerManager != null && localServerManager.isRunning();
+        boolean isSshProxyMode = !isLocalMode && prefs.getBoolean(KEY_SSH_ENABLED, false)
+            && sshProxyManager != null && sshProxyManager.isRunning();
 
         String localHost;
         String remoteHost;
@@ -1056,6 +1216,20 @@ public class MainActivity extends AppCompatActivity {
             // Leave window.WEB_PATH unset (not the possibly-stale value saved from a previous
             // remote server) — the local server always uses the default "clay" web_path, and
             // wsPathCandidates() already probes /clay/ws then /ws when WEB_PATH is unset.
+            webPathScript = "";
+        } else if (isSshProxyMode) {
+            // The WebView connects to the local SSH-forwarding proxy, not the real remote host
+            // directly — identical shape to local mode (loopback, unencrypted locally, since SSH
+            // already encrypts everything up to that point; no remote candidate to race
+            // against). Unlike local mode, NO auto-password: Clay's own WS password/auth-key is
+            // still required over the tunnel (nothing about that authentication changes), so the
+            // normal saved-password/auth-key flow in connectWebSocket() applies exactly as it
+            // would for a direct remote connection.
+            localHost = jsStr("127.0.0.1");
+            remoteHost = jsStr("");
+            port = sshProxyManager.getLocalPort();
+            mode = jsStr("non_secure");
+            autoPasswordScript = "";
             webPathScript = "";
         } else {
             localHost = jsStr(prefs.getString(KEY_SERVER_HOST, ""));
@@ -1142,21 +1316,34 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // Reloads the WebView. If the run mode changed since it was last applied (from either
-    // SettingsActivity or the web settings popup's "clay-server" tab — see reloadPage() below),
-    // tears down the old local server / WebSockets first and re-enters the run-mode decision
-    // fresh via proceedAfterPermissions(). Otherwise this is just a normal reload (e.g. a manual
-    // resync, or unrelated remote-settings changes) — the fast path, since restarting an
-    // already-running local server would lose its in-memory world state for no reason.
+    // Reloads the WebView. If the run mode changed since it was last applied, or the SSH tunnel
+    // target/creds changed while still in use (from either SettingsActivity or the web settings
+    // popup's "clay-server" tab — see reloadPage() below), tears down the old local server/SSH
+    // proxy/WebSockets first and re-enters the run-mode decision fresh via
+    // proceedAfterPermissions(). Otherwise this is just a normal reload (e.g. a manual resync,
+    // or an unrelated remote-settings change) — the fast path, since restarting an
+    // already-running local server or SSH tunnel would lose its in-memory world state / drop
+    // the session for no reason.
     private void reloadInterfaceRespectingRunMode() {
         interfaceLoaded = false;
         loadedInterfaceUrl = null;
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String currentMode = prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE);
-        if (lastAppliedRunMode != null && !currentMode.equals(lastAppliedRunMode)) {
-            android.util.Log.i("Clay", "Run mode changed (" + lastAppliedRunMode + " -> " + currentMode + "), reloading");
+        boolean modeChanged = lastAppliedRunMode != null && !currentMode.equals(lastAppliedRunMode);
+
+        boolean sshEnabledNow = RUN_MODE_REMOTE.equals(currentMode) && prefs.getBoolean(KEY_SSH_ENABLED, false);
+        String currentSshSnapshot = sshEnabledNow ? sshConfigSnapshot(prefs) : null;
+        boolean sshChanged = lastAppliedSshConfigSnapshot != null
+            ? !lastAppliedSshConfigSnapshot.equals(currentSshSnapshot)
+            : currentSshSnapshot != null;
+
+        if (modeChanged || sshChanged) {
+            android.util.Log.i("Clay", "Run mode or SSH config changed, reloading");
             if (localServerManager != null) {
                 localServerManager.stop();
+            }
+            if (sshProxyManager != null) {
+                sshProxyManager.stop();
             }
             runModeFlowStarted = false;
             proceedAfterPermissions();
@@ -1227,6 +1414,9 @@ public class MainActivity extends AppCompatActivity {
         cancelBackgroundShutdownTimer();
         if (localServerManager != null) {
             localServerManager.stop();
+        }
+        if (sshProxyManager != null) {
+            sshProxyManager.stop();
         }
         super.onDestroy();
     }

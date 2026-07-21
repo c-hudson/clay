@@ -841,6 +841,48 @@
                                         <input type="text" id="cs-port" autocomplete="off" class="web-input" placeholder="9000">
                                     </div>
                                 </div>
+                                <div class="setting-row" title="Tunnel the connection to Host:Port through SSH instead of connecting directly">
+                                    <span class="setting-label">SSH</span>
+                                    <div class="setting-value">
+                                        <select id="cs-ssh-enabled" class="web-input">
+                                            <option value="no">No</option>
+                                            <option value="yes">Yes</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div id="cs-ssh-fields" style="display:none;">
+                                <div class="setting-row">
+                                    <span class="setting-label">SSH User</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="cs-ssh-user" autocomplete="off" class="web-input">
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">SSH Port</span>
+                                    <div class="setting-value">
+                                        <input type="text" id="cs-ssh-port" autocomplete="off" class="web-input" placeholder="22">
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">SSH Private Key</span>
+                                    <div class="setting-value">
+                                        <textarea id="cs-ssh-key" autocomplete="off" class="web-input" rows="4" placeholder="Paste PEM private key (optional if using a password)" style="font-family:monospace;font-size:0.78em;resize:vertical"></textarea>
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">Key Passphrase</span>
+                                    <div class="setting-value">
+                                        <input type="password" id="cs-ssh-key-passphrase" autocomplete="off" class="web-input">
+                                    </div>
+                                </div>
+                                <div class="setting-row">
+                                    <span class="setting-label">SSH Password</span>
+                                    <div class="setting-value">
+                                        <input type="password" id="cs-ssh-password" autocomplete="off" class="web-input">
+                                    </div>
+                                </div>
+                                </div>
+                                <!-- end cs-ssh-fields -->
                                 <div class="setting-row">
                                     <span class="setting-label">Remote Host</span>
                                     <div class="setting-value">

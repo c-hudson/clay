@@ -20,6 +20,7 @@ pub mod audio;
 pub mod platform;
 pub mod commands;
 pub mod remote_client;
+pub mod ssh;
 pub mod tts;
 pub mod scrollback;
 #[cfg(feature = "webview-gui")]
@@ -11976,6 +11977,12 @@ async fn main() -> io::Result<()> {
     let mut tls_proxy_config: Option<String> = None;
     let mut console_arg: Option<Option<String>> = None;  // None=not set, Some(None)=bare, Some(Some(addr))=with addr
     let mut gui_arg: Option<Option<String>> = None;
+    let mut ssh_mode = false;
+    let mut ssh_proxy_mode = false;
+    #[allow(unused_variables)]
+    let mut ssh_proxy_target: Option<String> = None;
+    #[allow(unused_variables)]
+    let mut ssh_proxy_listen_port: Option<u16> = None;
     let mut grep_arg: Option<String> = None;
     let mut grep_extra_args: Vec<String> = Vec::new();
     let mut grep_archive_mode = false;
@@ -12013,9 +12020,21 @@ async fn main() -> io::Result<()> {
                 "--crash" => is_crash_arg = true,
                 "--console" => console_arg = Some(None),
                 "--gui" => gui_arg = Some(None),
+                "--ssh" => ssh_mode = true,
+                "--ssh-proxy" => ssh_proxy_mode = true,
                 "--dump" => dump_mode = true,
                 _ if arg.starts_with("--dump=") => { dump_mode = true; dump_out_dir = Some(arg[7..].to_string()); },
                 _ if arg.starts_with("--conf=") => conf_path = Some(arg[7..].to_string()),
+                _ if arg.starts_with("--target=") => ssh_proxy_target = Some(arg[9..].to_string()),
+                _ if arg.starts_with("--listen-port=") => {
+                    match arg[14..].parse::<u16>() {
+                        Ok(p) => ssh_proxy_listen_port = Some(p),
+                        Err(_) => {
+                            eprintln!("Error: invalid --listen-port value '{}'. Use -h for help.", &arg[14..]);
+                            std::process::exit(1);
+                        }
+                    }
+                },
                 _ if arg.starts_with("--port=") => {
                     match arg[7..].parse::<u16>() {
                         Ok(p) => local_server_port = Some(p),
@@ -12048,12 +12067,26 @@ async fn main() -> io::Result<()> {
         println!("    --console=host[:port] Connect to a Clay server via console (default port: 9000)");
         println!("    --gui                Run in GUI (webview) mode");
         println!("    --gui=host[:port]    Connect to a Clay server via GUI (default port: 9000)");
+        println!("    --ssh                Tunnel --console=/--gui= through SSH instead of connecting");
+        println!("                         directly. Target grammar becomes:");
+        println!("                           [user@]host[:clayport[:sshport]]");
+        println!("                         clayport defaults to 9000, sshport to 22, user to");
+        println!("                         the local OS username. Tries ssh-agent, then the");
+        println!("                         default ~/.ssh/id_* key files (console mode may");
+        println!("                         prompt for a passphrase; GUI mode fails closed).");
         println!("    -D                   Run as headless daemon server");
         println!("    --multiuser          Run as multiuser server");
         println!("    --local-server       Run headless, loopback-only, for an embedding client");
         println!("                         (e.g. the Android app's bundled instance).");
         println!("                         Requires CLAY_WS_PASSWORD to be set.");
         println!("    --port=<N>           Override the listen port (used with --local-server)");
+        println!("    --ssh-proxy          Run headless: forward 127.0.0.1:<listen-port> to a");
+        println!("                         remote Clay daemon over SSH, for an embedding client");
+        println!("                         (e.g. the Android app's SshProxyManager).");
+        println!("    --target=[user@]host:clayport:sshport  Remote to reach (with --ssh-proxy)");
+        println!("    --listen-port=<N>    Local port to accept on (with --ssh-proxy)");
+        println!("                         Credentials via CLAY_SSH_KEY/CLAY_SSH_KEY_PASSPHRASE/");
+        println!("                         CLAY_SSH_PASSWORD env vars (at least one required).");
         println!("    --conf=<path>        Use custom config file (default: ~/.clay/settings.dat)");
         println!("    --grep=host[:port] <pattern>  Search world output (default port: 9000)");
         println!("      -w <world>              Limit to specific world");
@@ -12169,6 +12202,22 @@ async fn main() -> io::Result<()> {
         eprintln!("Error: -D/--multiuser cannot be combined with --console/--gui.");
         std::process::exit(1);
     }
+    if ssh_mode && !matches!(console_arg, Some(Some(_))) && !matches!(gui_arg, Some(Some(_))) {
+        eprintln!("Error: --ssh requires --console=<target> or --gui=<target>.");
+        std::process::exit(1);
+    }
+    #[cfg(not(feature = "ssh-transport"))]
+    if ssh_mode {
+        eprintln!("clay: --ssh requires the 'ssh-transport' feature.");
+        eprintln!("clay: rebuild with: cargo build --features ssh-transport");
+        std::process::exit(1);
+    }
+    if ssh_proxy_mode && (console_arg.is_some() || gui_arg.is_some() || ssh_mode || daemon_mode
+        || multiuser_mode || local_server_mode || grep_arg.is_some() || grep_archive_mode || dump_mode)
+    {
+        eprintln!("Error: --ssh-proxy cannot be combined with other modes.");
+        std::process::exit(1);
+    }
     if grep_arg.is_some() && (console_arg.is_some() || gui_arg.is_some() || daemon_mode || multiuser_mode) {
         eprintln!("Error: --grep cannot be combined with --console/--gui/-D/--multiuser.");
         std::process::exit(1);
@@ -12278,6 +12327,30 @@ async fn main() -> io::Result<()> {
         return daemon::run_local_server(local_server_port).await;
     }
 
+    // Handle --ssh-proxy mode (headless, loopback-only, SSH-tunneling forwarder for an
+    // embedding client - the Android app's SshProxyManager.java launches this the same way
+    // LocalServerManager.java launches --local-server; see src/ssh.rs's run_ssh_proxy_mode
+    // doc comment)
+    if ssh_proxy_mode {
+        #[cfg(feature = "ssh-transport")]
+        {
+            let target = ssh_proxy_target.as_deref().unwrap_or_else(|| {
+                eprintln!("Error: --ssh-proxy requires --target=<[user@]host:clayport:sshport>.");
+                std::process::exit(1);
+            });
+            let listen_port = ssh_proxy_listen_port.unwrap_or_else(|| {
+                eprintln!("Error: --ssh-proxy requires --listen-port=<N>.");
+                std::process::exit(1);
+            });
+            return ssh::run_ssh_proxy_mode(target, listen_port).await;
+        }
+        #[cfg(not(feature = "ssh-transport"))]
+        {
+            eprintln!("clay: --ssh-proxy requires the 'ssh-transport' feature.");
+            std::process::exit(1);
+        }
+    }
+
     // Handle --multiuser mode
     if multiuser_mode {
         return run_multiuser_server().await;
@@ -12312,6 +12385,26 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    // Parse the --ssh tunnel target, if requested. Validated above to require
+    // remote_addr to be Some(_) whenever ssh_mode is set. SshTarget/parse_ssh_target
+    // have no russh dependency, so this is always available regardless of whether
+    // the ssh-transport feature (gated above) is compiled in; ssh_mode can only be
+    // true here if that feature IS available (see the exit-early check above).
+    let ssh_target: Option<ssh::SshTarget> = if ssh_mode {
+        match remote_addr.as_deref() {
+            Some(addr) => match ssh::parse_ssh_target(addr) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("Error: invalid --ssh target: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => unreachable!("validated above: --ssh requires a --console=/--gui= target"),
+        }
+    } else {
+        None
+    };
+
     // On Windows, detach from the console window when running in GUI mode
     #[cfg(windows)]
     if use_gui {
@@ -12327,11 +12420,12 @@ async fn main() -> io::Result<()> {
         (true, Some(ref addr)) => {
             #[cfg(feature = "webview-gui")]
             {
-                return webview_gui::run_remote_webgui(addr);
+                return webview_gui::run_remote_webgui(addr, ssh_target);
             }
             #[cfg(not(feature = "webview-gui"))]
             {
                 let _ = addr;
+                let _ = ssh_target;
                 unreachable!("use_gui should be false when webview-gui feature is not available");
             }
         }
@@ -12348,7 +12442,7 @@ async fn main() -> io::Result<()> {
         }
         // Remote console: connect to a running Clay instance via WebSocket
         (false, Some(ref addr)) => {
-            return remote_client::run_console_client(addr).await;
+            return remote_client::run_console_client(addr, ssh_target).await;
         }
         // Master console: default TUI mode (falls through to existing code below)
         (false, None) => {}

@@ -291,7 +291,7 @@ pub fn run_master_webgui() -> io::Result<()> {
 /// First tries direct ws:// connection (WebKit handles plain WebSocket fine).
 /// If the remote server only accepts wss://, falls back to a local WS proxy
 /// that handles TLS with self-signed cert support (WebKit rejects self-signed certs).
-pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
+pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::Result<()> {
     // Check for display server availability (Linux only)
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -312,6 +312,49 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
         std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+    }
+
+    // --ssh: the remote clay_port is only reachable through the SSH tunnel, never
+    // directly, so always use the local loopback proxy (skip the ws:// auto-probe
+    // below entirely) and hand ws_proxy_bridge the SSH target instead of a
+    // wss/ws URL pair. The WebView-facing side is identical to the wss:// proxy
+    // case: it always talks plain ws://127.0.0.1:<local> either way.
+    if let Some(target) = ssh {
+        let runtime = tokio::runtime::Runtime::new()?;
+        let _guard = runtime.enter();
+
+        let local_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let local_port = local_listener.local_addr()?.port();
+        local_listener.set_nonblocking(true)?;
+        let tokio_listener = tokio::net::TcpListener::from_std(local_listener)?;
+
+        let server_host = target.host.clone();
+        let server_port = target.clay_port;
+
+        runtime.handle().spawn(async move {
+            loop {
+                let Ok((local_stream, _)) = tokio_listener.accept().await else { continue };
+                let target = target.clone();
+                tokio::spawn(async move {
+                    let _ = ws_proxy_bridge(local_stream, "", "", Some(target)).await;
+                });
+            }
+        });
+
+        let params = WebViewParams {
+            ws_host: "127.0.0.1".to_string(),
+            ws_port: local_port,
+            ws_protocol: "ws".to_string(),
+            auto_password: None,
+            theme_css: load_user_theme_css(),
+            server_host: Some(server_host),
+            server_port: Some(server_port),
+            server_secure: true,
+        };
+
+        let result = create_webview_window("Clay", &params, None);
+        runtime.shutdown_background();
+        return result;
     }
 
     // Strip protocol prefix if provided
@@ -364,7 +407,7 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
                 let wss = remote_wss.clone();
                 let ws = remote_ws.clone();
                 tokio::spawn(async move {
-                    let _ = ws_proxy_bridge(local_stream, &wss, &ws).await;
+                    let _ = ws_proxy_bridge(local_stream, &wss, &ws, None).await;
                 });
             }
         });
@@ -452,13 +495,22 @@ fn probe_ws_connection(host: &str, port: u16) -> bool {
     }
 }
 
+/// Boxed remote-side halves - the common type the direct (TCP+TLS) and
+/// `--ssh`-tunneled remote-dial paths converge to below, since their underlying
+/// stream generics differ (`MaybeTlsStream<TcpStream>` vs. `ssh::SshTunnel`).
+type BoxedRemoteSink = Box<dyn futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send>;
+type BoxedRemoteSource = Box<dyn futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send>;
+
 /// Bridge a local WebSocket connection to a remote WebSocket server.
-/// Tries WSS first (with self-signed cert support), falls back to WS.
+/// Tries WSS first (with self-signed cert support), falls back to WS - unless
+/// `ssh` is set, in which case the remote is reached through an SSH tunnel
+/// instead (see `crate::ssh`) and `wss_url`/`ws_url` are ignored.
 /// Forwards messages bidirectionally until either side disconnects.
 async fn ws_proxy_bridge(
     local_stream: tokio::net::TcpStream,
     wss_url: &str,
     ws_url: &str,
+    ssh: Option<crate::ssh::SshTarget>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures::{SinkExt, StreamExt};
 
@@ -466,51 +518,74 @@ async fn ws_proxy_bridge(
     let local_ws = tokio_tungstenite::accept_async(local_stream).await?;
     let (mut local_sink, mut local_source) = local_ws.split();
 
-    // Try WSS first with trust-on-first-use pinned cert support, fall back to WS.
-    let remote_ws = {
-        #[cfg(feature = "rustls-backend")]
+    let (mut remote_sink, mut remote_source): (BoxedRemoteSink, BoxedRemoteSource) = if let Some(target) = ssh {
+        #[cfg(feature = "ssh-transport")]
         {
-            let host_port_key = wss_url.trim_start_matches("wss://").trim_start_matches("ws://").to_string();
-            let tls_config = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(std::sync::Arc::new(
-                    crate::platform::danger_rustls::TofuVerifier::new(host_port_key.clone())
-                ))
-                .with_no_client_auth();
-            let connector = tokio_tungstenite::Connector::Rustls(
-                std::sync::Arc::new(tls_config)
-            );
-            match tokio_tungstenite::connect_async_tls_with_config(
-                wss_url, None, false, Some(connector),
-            ).await {
-                Ok((ws, _)) => ws,
-                Err(e) => {
-                    // Do NOT silently fall back to plaintext ws:// if the WSS failure was a
-                    // pinned-certificate mismatch — that's exactly the MITM scenario pinning
-                    // exists to catch, and downgrading to plaintext would defeat it entirely.
-                    if let Some(mismatch) = crate::platform::danger::take_cert_mismatch() {
-                        return Err(format!(
-                            "TLS certificate for {} changed (was {}, now {}); refusing to fall back to an unencrypted connection. \
-                             Delete its entry from ~/.clay/known_hosts.dat if you trust the new certificate.",
-                            mismatch.host, mismatch.old_fingerprint, mismatch.new_fingerprint
-                        ).into());
+            let creds = crate::ssh::SshCredentials::desktop_default();
+            let tunnel = crate::ssh::establish_tunnel(&target, &creds, crate::ssh::AuthContext::NonInteractive)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { crate::ssh::render_ssh_error(&e).into() })?;
+            // Plaintext ws:// inside the tunnel - see src/ssh.rs's module doc comment.
+            let tunnel_ws_url = format!("ws://127.0.0.1:{}/", target.clay_port);
+            let (ws, _) = tokio_tungstenite::client_async(tunnel_ws_url.as_str(), tunnel).await?;
+            let (s, r) = ws.split();
+            (Box::new(s), Box::new(r))
+        }
+        #[cfg(not(feature = "ssh-transport"))]
+        {
+            // Unreachable in practice: run_remote_webgui only sets `ssh` when this
+            // feature is compiled in.
+            let _ = target;
+            return Err("clay: --ssh requires the 'ssh-transport' feature.".into());
+        }
+    } else {
+        // Try WSS first with trust-on-first-use pinned cert support, fall back to WS.
+        let remote_ws = {
+            #[cfg(feature = "rustls-backend")]
+            {
+                let host_port_key = wss_url.trim_start_matches("wss://").trim_start_matches("ws://").to_string();
+                let tls_config = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(std::sync::Arc::new(
+                        crate::platform::danger_rustls::TofuVerifier::new(host_port_key.clone())
+                    ))
+                    .with_no_client_auth();
+                let connector = tokio_tungstenite::Connector::Rustls(
+                    std::sync::Arc::new(tls_config)
+                );
+                match tokio_tungstenite::connect_async_tls_with_config(
+                    wss_url, None, false, Some(connector),
+                ).await {
+                    Ok((ws, _)) => ws,
+                    Err(e) => {
+                        // Do NOT silently fall back to plaintext ws:// if the WSS failure was a
+                        // pinned-certificate mismatch — that's exactly the MITM scenario pinning
+                        // exists to catch, and downgrading to plaintext would defeat it entirely.
+                        if let Some(mismatch) = crate::platform::danger::take_cert_mismatch() {
+                            return Err(format!(
+                                "TLS certificate for {} changed (was {}, now {}); refusing to fall back to an unencrypted connection. \
+                                 Delete its entry from ~/.clay/known_hosts.dat if you trust the new certificate.",
+                                mismatch.host, mismatch.old_fingerprint, mismatch.new_fingerprint
+                            ).into());
+                        }
+                        let _ = e;
+                        // WSS failed for an ordinary reason (no listener, no rustls support, etc.), try plain WS
+                        tokio_tungstenite::connect_async(ws_url).await?.0
                     }
-                    let _ = e;
-                    // WSS failed for an ordinary reason (no listener, no rustls support, etc.), try plain WS
-                    tokio_tungstenite::connect_async(ws_url).await?.0
                 }
             }
-        }
-        #[cfg(not(feature = "rustls-backend"))]
-        {
-            // Without rustls, try plain connect (handles both ws:// and wss://)
-            match tokio_tungstenite::connect_async(wss_url).await {
-                Ok((ws, _)) => ws,
-                Err(_) => tokio_tungstenite::connect_async(ws_url).await?.0,
+            #[cfg(not(feature = "rustls-backend"))]
+            {
+                // Without rustls, try plain connect (handles both ws:// and wss://)
+                match tokio_tungstenite::connect_async(wss_url).await {
+                    Ok((ws, _)) => ws,
+                    Err(_) => tokio_tungstenite::connect_async(ws_url).await?.0,
+                }
             }
-        }
+        };
+        let (s, r) = remote_ws.split();
+        (Box::new(s), Box::new(r))
     };
-    let (mut remote_sink, mut remote_source) = remote_ws.split();
 
     // Forward messages in both directions
     let local_to_remote = async {

@@ -12,9 +12,14 @@
 # Android's public linker namespace), so no rpath patching is needed the way
 # the Termux builds require for Termux's separate userland.
 #
-# No-GUI only (rustls-backend): the local-server mode never opens a native
+# No-GUI (rustls-backend): the local-server mode never opens a native
 # WebView (the Android app's own WebView is the client), so webview-gui
 # (wry/tao/webkit2gtk/X11) is neither needed nor available for this target.
+# ssh-transport IS included: the same binary also serves as the --ssh-proxy
+# subprocess SshProxyManager.java launches for the Connection Settings SSH
+# tunnel option (see src/ssh.rs's run_ssh_proxy_mode doc comment) - it's the
+# identical "app execs its own bundled .so" mechanism --local-server already
+# uses, just with different arguments, so no separate binary is needed.
 #
 # One-time setup (see .claude/skills/release/machines.md for details):
 #   - Android NDK r26d unpacked at $ANDROID_NDK_HOME (default: ~/Android/Sdk/ndk/26.3.11579264)
@@ -53,7 +58,7 @@ export AR_aarch64_linux_android="$TOOLCHAIN/bin/llvm-ar"
 
 echo "Building clay for aarch64-linux-android (API $API)..."
 cargo build --release --target aarch64-linux-android \
-    --no-default-features --features rustls-backend
+    --no-default-features --features rustls-backend,ssh-transport
 
 BIN="target/aarch64-linux-android/release/clay"
 OUT_DIR="android/app/src/main/jniLibs/arm64-v8a"

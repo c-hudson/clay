@@ -5790,6 +5790,23 @@
                 runModeEl.value = runMode;
                 if (remoteFields) remoteFields.style.display = (runMode === 'local') ? 'none' : '';
             }
+            var sshEnabledEl = document.getElementById('cs-ssh-enabled');
+            var sshFields = document.getElementById('cs-ssh-fields');
+            if (sshEnabledEl && typeof window.Android.getSshEnabled === 'function') {
+                var sshEnabled = !!window.Android.getSshEnabled();
+                sshEnabledEl.value = sshEnabled ? 'yes' : 'no';
+                if (sshFields) sshFields.style.display = sshEnabled ? '' : 'none';
+            }
+            var sshUserEl = document.getElementById('cs-ssh-user');
+            if (sshUserEl) sshUserEl.value = (typeof window.Android.getSshUser === 'function') ? window.Android.getSshUser() : '';
+            var sshPortEl = document.getElementById('cs-ssh-port');
+            if (sshPortEl) sshPortEl.value = (typeof window.Android.getSshPort === 'function') ? (window.Android.getSshPort() || 22) : 22;
+            var sshKeyEl = document.getElementById('cs-ssh-key');
+            if (sshKeyEl) sshKeyEl.value = (typeof window.Android.getSshPrivateKey === 'function') ? window.Android.getSshPrivateKey() : '';
+            var sshKeyPassEl = document.getElementById('cs-ssh-key-passphrase');
+            if (sshKeyPassEl) sshKeyPassEl.value = (typeof window.Android.getSshKeyPassphrase === 'function') ? window.Android.getSshKeyPassphrase() : '';
+            var sshPassEl = document.getElementById('cs-ssh-password');
+            if (sshPassEl) sshPassEl.value = (typeof window.Android.getSshPassword === 'function') ? window.Android.getSshPassword() : '';
             var dlBtn = document.getElementById('cs-auth-key-download');
             if (dlBtn) dlBtn.textContent = 'Download';
             var errEl = document.getElementById('cs-auth-key-error');
@@ -6486,6 +6503,33 @@
             }
             var connectionMode = ((document.getElementById('cs-connection-mode') || {}).value || 'auto').trim();
             if (typeof window.Android.saveConnectionMode === 'function') window.Android.saveConnectionMode(connectionMode);
+
+            var sshEnabled = ((document.getElementById('cs-ssh-enabled') || {}).value === 'yes');
+            if (typeof window.Android.saveSshEnabled === 'function') window.Android.saveSshEnabled(sshEnabled);
+            var sshUser = ((document.getElementById('cs-ssh-user') || {}).value || '').trim();
+            if (typeof window.Android.saveSshUser === 'function') window.Android.saveSshUser(sshUser);
+            var sshPort = parseInt((document.getElementById('cs-ssh-port') || {}).value, 10);
+            if (!Number.isFinite(sshPort) || sshPort <= 0) sshPort = 22;
+            if (typeof window.Android.saveSshPort === 'function') window.Android.saveSshPort(sshPort);
+            var sshKey = (document.getElementById('cs-ssh-key') || {}).value || '';
+            if (sshKey.trim()) {
+                if (typeof window.Android.saveSshPrivateKey === 'function') window.Android.saveSshPrivateKey(sshKey);
+            } else if (typeof window.Android.clearSshPrivateKey === 'function') {
+                window.Android.clearSshPrivateKey();
+            }
+            var sshKeyPassphrase = (document.getElementById('cs-ssh-key-passphrase') || {}).value || '';
+            if (sshKeyPassphrase) {
+                if (typeof window.Android.saveSshKeyPassphrase === 'function') window.Android.saveSshKeyPassphrase(sshKeyPassphrase);
+            } else if (typeof window.Android.clearSshKeyPassphrase === 'function') {
+                window.Android.clearSshKeyPassphrase();
+            }
+            var sshPassword = (document.getElementById('cs-ssh-password') || {}).value || '';
+            if (sshPassword) {
+                if (typeof window.Android.saveSshPassword === 'function') window.Android.saveSshPassword(sshPassword);
+            } else if (typeof window.Android.clearSshPassword === 'function') {
+                window.Android.clearSshPassword();
+            }
+
             // Reload triggers a full reconnect with the new settings
             if (typeof window.Android.reloadPage === 'function') window.Android.reloadPage();
             return;
@@ -9089,6 +9133,15 @@
             csRunModeEl.onchange = function() {
                 var remoteFields = document.getElementById('cs-remote-fields');
                 if (remoteFields) remoteFields.style.display = (this.value === 'local') ? 'none' : '';
+            };
+        }
+
+        // Clay Server tab (Android only): toggle SSH fields live when the SSH option changes.
+        var csSshEnabledEl = document.getElementById('cs-ssh-enabled');
+        if (csSshEnabledEl) {
+            csSshEnabledEl.onchange = function() {
+                var sshFields = document.getElementById('cs-ssh-fields');
+                if (sshFields) sshFields.style.display = (this.value === 'yes') ? '' : 'none';
             };
         }
 

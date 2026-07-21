@@ -1628,10 +1628,16 @@ pub fn exec_relaunch(connect_addr: Option<&str>, use_gui: bool) -> io::Result<()
     ));
 
     // Keep the existing argv (e.g. --conf=...) but drop any previous mode/reload flags —
-    // detaching/switching must not carry over a stale --console=/--gui= target.
+    // detaching/switching must not carry over a stale --console=/--gui= target. --ssh is
+    // dropped for the same reason: it's meaningless without a target (detach case), and
+    // would otherwise silently keep applying to whatever new target this relaunch is for
+    // (switch case) even though the user didn't ask for an SSH tunnel to it. A `/connect`
+    // to an SSH-reachable target starts a fresh direct connection unless re-specified;
+    // `/reload` (a separate code path using the full original argv) correctly preserves
+    // --ssh, since a reload should resume the same SSH-tunneled session.
     let mut args: Vec<String> = std::env::args().skip(1).filter(|a| {
         a != "--reload" && a != "--crash"
-            && a != "--console" && a != "--gui"
+            && a != "--console" && a != "--gui" && a != "--ssh"
             && !a.starts_with("--console=") && !a.starts_with("--gui=")
     }).collect();
     let mode_flag = match (use_gui, connect_addr) {

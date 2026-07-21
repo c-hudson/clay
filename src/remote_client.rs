@@ -616,114 +616,165 @@ pub(crate) async fn run_import_client(
 
 /// Run as console client connecting to remote daemon (--console=host:port)
 /// Uses the same App struct and ui() function as the normal console interface
-pub(crate) async fn run_console_client(addr: &str) -> io::Result<()> {
+/// Boxed WebSocket sink/stream halves - the common type both the direct (TCP+TLS)
+/// and `--ssh`-tunneled connect paths converge to, since their underlying stream
+/// generics differ (`MaybeTlsStream<TcpStream>` vs. `ssh::SshTunnel`). Everything
+/// past the connect (the `WsMessage` protocol, the read/write loop) is transport-
+/// agnostic and untouched by which path was taken.
+type BoxedWsWrite = Box<dyn futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send>;
+type BoxedWsRead = Box<dyn futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send>;
+
+pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::Result<()> {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use futures::SinkExt;
 
-    // Parse address - add default port 9000 if not specified, then wss:// prefix
-    let addr_with_port = if addr.starts_with("ws://") || addr.starts_with("wss://") {
-        addr.to_string()
-    } else if addr.contains(':') {
-        // Host:port already specified
-        addr.to_string()
-    } else {
-        // No port specified - default to 9000 (same as --gui)
-        format!("{}:9000", addr)
-    };
-
-    let (ws_url, try_fallback) = if addr_with_port.starts_with("ws://") || addr_with_port.starts_with("wss://") {
-        (addr_with_port.clone(), false)
-    } else {
-        // Default to wss:// for security, will fall back to ws:// if it fails
-        (format!("wss://{}", addr_with_port), true)
-    };
-
-    println!("Connecting to {}...", ws_url);
-
-    let host_port_key = addr_with_port
-        .trim_start_matches("wss://")
-        .trim_start_matches("ws://")
-        .to_string();
-
-    // Connect to WebSocket server - for wss:// we need to configure TLS to accept self-signed
-    // certs (trust-on-first-use pinned via ~/.clay/known_hosts.dat, see platform::danger_rustls).
-    #[cfg(feature = "rustls-backend")]
-    async fn try_wss(ws_url: &str, host_port_key: &str) -> Result<
-        (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-         tokio_tungstenite::tungstenite::handshake::client::Response),
-        tokio_tungstenite::tungstenite::Error,
-    > {
-        let tls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.to_string())))
-            .with_no_client_auth();
-        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
-        tokio_tungstenite::connect_async_tls_with_config(
-            ws_url,
-            None,
-            false,
-            Some(connector),
-        ).await
-    }
-
-    #[cfg(feature = "rustls-backend")]
-    let connect_result = if ws_url.starts_with("wss://") {
-        match try_wss(&ws_url, &host_port_key).await {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                // If this failed because the pinned certificate changed (as opposed to an
-                // ordinary network error), prompt interactively rather than silently
-                // falling back to plaintext ws:// (which would mask a possible MITM).
-                if let Some(mismatch) = platform::danger::take_cert_mismatch() {
-                    eprintln!();
-                    eprintln!("*** TLS CERTIFICATE FOR {} HAS CHANGED ***", mismatch.host);
-                    eprintln!("  old fingerprint: {}", mismatch.old_fingerprint);
-                    eprintln!("  new fingerprint: {}", mismatch.new_fingerprint);
-                    eprintln!("This could mean the server was reinstalled, or that someone is intercepting your connection.");
-                    eprint!("Trust the new certificate and reconnect? [y/N] ");
-                    let _ = io::stdout().flush();
-                    let mut answer = String::new();
-                    let _ = io::stdin().read_line(&mut answer);
-                    if answer.trim().eq_ignore_ascii_case("y") {
-                        persistence::replace_pin(&mismatch.host, &mismatch.new_fingerprint);
-                        try_wss(&ws_url, &host_port_key).await
-                    } else {
-                        eprintln!("Not trusting new certificate; aborting connection.");
-                        Err(e)
-                    }
-                } else {
-                    Err(e)
+    let (mut ws_write, mut ws_read): (BoxedWsWrite, BoxedWsRead) = if let Some(target) = ssh {
+        // --ssh: tunnel through an embedded SSH client instead of connecting
+        // directly. Must happen before any TUI setup (this whole branch runs in
+        // the same plain-stdio region as the println!/prompt calls below it) so
+        // an encrypted-key passphrase prompt is safe here - see CLAUDE.md's
+        // no-println!-after-TUI-init rule and src/ssh.rs's module doc comment.
+        #[cfg(feature = "ssh-transport")]
+        {
+            println!("Establishing SSH tunnel to {}@{}:{}...", target.user, target.host, target.ssh_port);
+            let creds = crate::ssh::SshCredentials::desktop_default();
+            let tunnel = match crate::ssh::establish_tunnel(&target, &creds, crate::ssh::AuthContext::InteractiveTerminal).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{}", crate::ssh::render_ssh_error(&e));
+                    return Ok(());
                 }
-            }
-        }
-    } else {
-        connect_async(&ws_url).await
-    };
-
-    #[cfg(not(feature = "rustls-backend"))]
-    let connect_result = connect_async(&ws_url).await;
-
-    let (ws_stream, _) = match connect_result {
-        Ok(result) => result,
-        Err(_) if try_fallback => {
-            // wss:// failed, try ws:// fallback
-            let fallback_url = format!("ws://{}", addr_with_port);
-            eprintln!("Secure connection failed, trying {}...", fallback_url);
-            match connect_async(&fallback_url).await {
-                Ok(result) => result,
-                Err(e2) => {
-                    eprintln!("Failed to connect to {}: {}", fallback_url, e2);
+            };
+            // Plaintext ws:// inside the tunnel: SSH already encrypts everything,
+            // and the daemon's loopback listener (which is where this direct-tcpip
+            // channel lands) never presents a TLS cert - see src/ssh.rs's doc comment.
+            let ws_url = format!("ws://127.0.0.1:{}/", target.clay_port);
+            println!("Connecting to {} (via SSH tunnel)...", ws_url);
+            match tokio_tungstenite::client_async(ws_url.as_str(), tunnel).await {
+                Ok((ws_stream, _)) => {
+                    let (w, r) = ws_stream.split();
+                    (Box::new(w), Box::new(r))
+                }
+                Err(e) => {
+                    eprintln!("WebSocket handshake over SSH tunnel failed: {e}");
                     return Ok(());
                 }
             }
         }
-        Err(e) => {
-            eprintln!("Failed to connect to {}: {}", ws_url, e);
+        #[cfg(not(feature = "ssh-transport"))]
+        {
+            // Unreachable in practice: main.rs already refuses --ssh when this
+            // feature isn't compiled in, before it ever reaches here.
+            eprintln!("clay: --ssh requires the 'ssh-transport' feature.");
             return Ok(());
         }
-    };
+    } else {
+        // Parse address - add default port 9000 if not specified, then wss:// prefix
+        let addr_with_port = if addr.starts_with("ws://") || addr.starts_with("wss://") {
+            addr.to_string()
+        } else if addr.contains(':') {
+            // Host:port already specified
+            addr.to_string()
+        } else {
+            // No port specified - default to 9000 (same as --gui)
+            format!("{}:9000", addr)
+        };
 
-    let (mut ws_write, mut ws_read) = ws_stream.split();
+        let (ws_url, try_fallback) = if addr_with_port.starts_with("ws://") || addr_with_port.starts_with("wss://") {
+            (addr_with_port.clone(), false)
+        } else {
+            // Default to wss:// for security, will fall back to ws:// if it fails
+            (format!("wss://{}", addr_with_port), true)
+        };
+
+        println!("Connecting to {}...", ws_url);
+
+        let host_port_key = addr_with_port
+            .trim_start_matches("wss://")
+            .trim_start_matches("ws://")
+            .to_string();
+
+        // Connect to WebSocket server - for wss:// we need to configure TLS to accept self-signed
+        // certs (trust-on-first-use pinned via ~/.clay/known_hosts.dat, see platform::danger_rustls).
+        #[cfg(feature = "rustls-backend")]
+        async fn try_wss(ws_url: &str, host_port_key: &str) -> Result<
+            (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+             tokio_tungstenite::tungstenite::handshake::client::Response),
+            tokio_tungstenite::tungstenite::Error,
+        > {
+            let tls_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(platform::danger_rustls::TofuVerifier::new(host_port_key.to_string())))
+                .with_no_client_auth();
+            let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+            tokio_tungstenite::connect_async_tls_with_config(
+                ws_url,
+                None,
+                false,
+                Some(connector),
+            ).await
+        }
+
+        #[cfg(feature = "rustls-backend")]
+        let connect_result = if ws_url.starts_with("wss://") {
+            match try_wss(&ws_url, &host_port_key).await {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    // If this failed because the pinned certificate changed (as opposed to an
+                    // ordinary network error), prompt interactively rather than silently
+                    // falling back to plaintext ws:// (which would mask a possible MITM).
+                    if let Some(mismatch) = platform::danger::take_cert_mismatch() {
+                        eprintln!();
+                        eprintln!("*** TLS CERTIFICATE FOR {} HAS CHANGED ***", mismatch.host);
+                        eprintln!("  old fingerprint: {}", mismatch.old_fingerprint);
+                        eprintln!("  new fingerprint: {}", mismatch.new_fingerprint);
+                        eprintln!("This could mean the server was reinstalled, or that someone is intercepting your connection.");
+                        eprint!("Trust the new certificate and reconnect? [y/N] ");
+                        let _ = io::stdout().flush();
+                        let mut answer = String::new();
+                        let _ = io::stdin().read_line(&mut answer);
+                        if answer.trim().eq_ignore_ascii_case("y") {
+                            persistence::replace_pin(&mismatch.host, &mismatch.new_fingerprint);
+                            try_wss(&ws_url, &host_port_key).await
+                        } else {
+                            eprintln!("Not trusting new certificate; aborting connection.");
+                            Err(e)
+                        }
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        } else {
+            connect_async(&ws_url).await
+        };
+
+        #[cfg(not(feature = "rustls-backend"))]
+        let connect_result = connect_async(&ws_url).await;
+
+        let (ws_stream, _) = match connect_result {
+            Ok(result) => result,
+            Err(_) if try_fallback => {
+                // wss:// failed, try ws:// fallback
+                let fallback_url = format!("ws://{}", addr_with_port);
+                eprintln!("Secure connection failed, trying {}...", fallback_url);
+                match connect_async(&fallback_url).await {
+                    Ok(result) => result,
+                    Err(e2) => {
+                        eprintln!("Failed to connect to {}: {}", fallback_url, e2);
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to connect to {}: {}", ws_url, e);
+                return Ok(());
+            }
+        };
+
+        let (w, r) = ws_stream.split();
+        (Box::new(w), Box::new(r))
+    };
 
     // Create a channel for sending messages to the WebSocket
     let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsMessage>();
