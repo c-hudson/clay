@@ -618,7 +618,17 @@ pub async fn run_ssh_proxy_mode(target_spec: &str, listen_port: u16) -> io::Resu
                     let _ = tokio::io::copy_bidirectional(&mut local_stream, &mut tunnel).await;
                 }
                 Err(e) => {
-                    eprintln!("clay: failed to open SSH tunnel for a local connection: {}", render_ssh_error(&e));
+                    // A failed direct-tcpip open almost always means the SSH session/transport
+                    // itself is dead (network change, remote drop) rather than a one-off - and
+                    // this loop has no way to distinguish that from "session fine, remote Clay
+                    // port refused" anyway. Exit rather than keep accepting local connections
+                    // over a session that can't forward them: this is what makes
+                    // Process.isAlive() (Android's SshProxyManager.isRunning()) an honest signal
+                    // again, so the client's network-change/resume watchdog can detect this and
+                    // restart the tunnel instead of silently failing forever. See
+                    // MainActivity.restartSshTunnel() on the Android side.
+                    eprintln!("clay: failed to open SSH tunnel for a local connection: {} - SSH session appears dead, exiting so the client can restart it", render_ssh_error(&e));
+                    std::process::exit(1);
                 }
             }
         });

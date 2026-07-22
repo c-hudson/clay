@@ -9772,6 +9772,16 @@
     window.connect = connect;
     window.openSettingsPopup = openSettingsPopup;
 
+    // Called by Android when it silently restarts a dead SSH tunnel (network change/resume
+    // watchdog - see MainActivity.restartSshTunnel()) and the new tunnel landed on a different
+    // local port (SshProxyManager always picks a fresh ephemeral port on restart). Updates the
+    // port we dial and reconnects - buildCandidates() already reads window.WS_PORT fresh on
+    // every call, so this is all that's needed; no other reconnect-path changes required.
+    window.updateSshTunnelPort = function(newPort) {
+        window.WS_PORT = newPort;
+        forceReconnect();
+    };
+
     // Called by native WebView GUI to show update status messages
     window.showUpdateStatus = function(msg) {
         appendClientLine(msg);

@@ -9,6 +9,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
@@ -135,6 +137,13 @@ public class MainActivity extends AppCompatActivity {
     // wasn't in use), so reloadInterfaceRespectingRunMode() can detect a credential/target
     // change even when KEY_SSH_ENABLED itself didn't flip — see that method.
     private String lastAppliedSshConfigSnapshot = null;
+    // Registered in onResume()/unregistered in onPause() (only while in SSH remote mode) so a
+    // WiFi<->cellular handoff (or any other default-network change) triggers an unconditional
+    // SSH tunnel restart - see restartSshTunnel(). Non-null only while registered.
+    private ConnectivityManager.NetworkCallback sshNetworkCallback;
+    // Debounces restartSshTunnel() so a resume and a near-simultaneous network-change callback
+    // don't both kick off a full restart at once.
+    private volatile long lastSshTunnelRestartAt = 0;
     // Removed duplicate screenOffWakeLock - ClayForegroundService already holds one
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
@@ -977,6 +986,136 @@ public class MainActivity extends AppCompatActivity {
             .show();
     }
 
+    // --- SSH tunnel self-heal (network change / resume watchdog) ---
+    //
+    // The initial-connect flow above (startSshProxyThenLoadInterface/raceSshProxyStart) only
+    // ever runs once, at launch or after a settings change. Nothing previously re-checked the
+    // tunnel afterward, so a network change, sleep, or the remote SSH session simply dying left
+    // the WebView redialing a dead 127.0.0.1:<port> forever with no way to notice or recover -
+    // see ssh.rs's run_ssh_proxy_mode, which now exits the proxy process when a forward attempt
+    // fails, making SshProxyManager.isRunning() an honest signal for the checks below.
+
+    // Registered in onResume(), unregistered in onPause() - only while in SSH remote mode.
+    // onAvailable() fires when the system's default network changes (e.g. WiFi->cellular
+    // handoff, or reconnecting after being fully offline) and is itself strong enough evidence
+    // that the old tunnel is stale to restart unconditionally, without waiting to see whether
+    // isRunning() has caught up yet (it might not have: nothing has necessarily tried to use the
+    // tunnel since the network changed, so the proxy process may not have noticed and exited).
+    private void registerSshNetworkCallbackIfNeeded() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        boolean sshActive = RUN_MODE_REMOTE.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))
+            && prefs.getBoolean(KEY_SSH_ENABLED, false);
+        if (!sshActive) {
+            return;
+        }
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm == null) {
+            return;
+        }
+        sshNetworkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(Network network) {
+                android.util.Log.i("Clay", "Default network changed - restarting SSH tunnel");
+                restartSshTunnel(true);
+            }
+            // onLost() deliberately does nothing - there's nothing useful to reconnect to until
+            // some network becomes the default again, which is what onAvailable() is for.
+        };
+        try {
+            cm.registerDefaultNetworkCallback(sshNetworkCallback);
+        } catch (RuntimeException e) {
+            android.util.Log.w("Clay", "Could not register network callback", e);
+            sshNetworkCallback = null;
+        }
+    }
+
+    private void unregisterSshNetworkCallback() {
+        if (sshNetworkCallback == null) {
+            return;
+        }
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm != null) {
+            try {
+                cm.unregisterNetworkCallback(sshNetworkCallback);
+            } catch (RuntimeException e) {
+                // Already unregistered, or registration itself never actually succeeded - fine.
+            }
+        }
+        sshNetworkCallback = null;
+    }
+
+    /**
+     * Checks/restarts the SSH tunnel outside the normal user-initiated connect flow.
+     * unconditional=true (network change): restart regardless of isRunning() - a network change
+     * is strong enough evidence the old tunnel is stale even if the proxy process hasn't
+     * technically exited yet. unconditional=false (app resume): only restart if isRunning() is
+     * already false - avoids unnecessarily tearing down a tunnel that's still perfectly fine
+     * just because the app came back to the foreground.
+     *
+     * Deliberately a single attempt, not the 3x retry loop startSshProxyThenLoadInterface() uses
+     * for the user-visible initial connect - this is a background self-heal; if it fails, the
+     * next network-change or resume event tries again, avoiding a tight retry loop against a
+     * still-unreachable remote. Silent either way (Toast on success only, log-only on failure)
+     * per the initial-connect dialog being reserved for that user-visible flow.
+     */
+    private void restartSshTunnel(boolean unconditional) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (!RUN_MODE_REMOTE.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))
+            || !prefs.getBoolean(KEY_SSH_ENABLED, false)) {
+            return; // not in SSH mode - nothing to watch/restart
+        }
+        if (sshProxyManager == null) {
+            return; // never started (still on the first-connect flow) - nothing to restart
+        }
+        if (!unconditional && sshProxyManager.isRunning()) {
+            return; // still healthy
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastSshTunnelRestartAt < 2000) {
+            android.util.Log.i("Clay", "SSH tunnel restart debounced");
+            return;
+        }
+        lastSshTunnelRestartAt = now;
+
+        final String sshUser = prefs.getString(KEY_SSH_USER, "");
+        final String sshHost = prefs.getString(KEY_SERVER_HOST, "");
+        final String sshRemoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
+        final int sshPort = prefs.getInt(KEY_SSH_PORT, 22);
+        final int clayPort = prefs.getInt(KEY_SERVER_PORT, 9000);
+        final String privateKeyPem = prefs.getString(KEY_SSH_PRIVATE_KEY, "");
+        final String keyPassphrase = prefs.getString(KEY_SSH_KEY_PASSPHRASE, "");
+        final String password = prefs.getString(KEY_SSH_PASSWORD, "");
+
+        android.util.Log.i("Clay", "SSH tunnel watchdog: restarting (unconditional=" + unconditional + ")");
+        // Tear down whatever's there first - required for the unconditional case (the manager
+        // may still report isRunning()==true, and raceSshProxyStart()'s single-candidate path
+        // would otherwise short-circuit via SshProxyManager.start()'s own "already running"
+        // check and skip restarting entirely) and harmless/idempotent otherwise.
+        sshProxyManager.stop();
+
+        new Thread(() -> {
+            SshRaceResult result = raceSshProxyStart(sshUser, sshHost, sshRemoteHost, sshPort,
+                clayPort, privateKeyPem, keyPassphrase, password);
+            if (result.winner != null) {
+                sshProxyManager = result.winner;
+                final int newPort = result.winner.getLocalPort();
+                android.util.Log.i("Clay", "SSH tunnel watchdog: restarted OK on port " + newPort);
+                runOnUiThread(() -> {
+                    Toast.makeText(this, "SSH tunnel reconnected", Toast.LENGTH_SHORT).show();
+                    if (webView != null) {
+                        webView.evaluateJavascript(
+                            "if (typeof updateSshTunnelPort === 'function') updateSshTunnelPort(" + newPort + ");",
+                            null);
+                    }
+                });
+            } else {
+                android.util.Log.w("Clay", "SSH tunnel watchdog: restart failed: " + result.errors);
+                // Silent - no dialog/toast for a background self-heal failure (that's reserved
+                // for the initial-connect flow); the next network-change or resume event retries.
+            }
+        }, "ClaySshWatchdogRestart").start();
+    }
+
     // Fingerprint of everything that determines the running SshProxyManager's target/creds —
     // used by reloadInterfaceRespectingRunMode() to detect a settings change that requires
     // killing and restarting the tunnel (unlike plain remote mode, where a host/port change
@@ -1507,6 +1646,12 @@ public class MainActivity extends AppCompatActivity {
         // Cancel background shutdown timer since user is back
         cancelBackgroundShutdownTimer();
 
+        // Watch for network changes (WiFi<->cellular etc.) while in the foreground, and check
+        // whether the SSH tunnel survived whatever happened while we were paused/asleep - both
+        // feed into restartSshTunnel(). See that method and the field doc on sshNetworkCallback.
+        registerSshNetworkCallbackIfNeeded();
+        restartSshTunnel(false);
+
         // Always resume WebView timers/JS execution (may have been paused in onPause)
         if (webView != null) {
             webView.onResume();
@@ -1540,6 +1685,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        unregisterSshNetworkCallback();
         // Don't pause WebView if connected - we want to keep receiving notifications
         // The WebView will continue running in the background with the foreground service
         if (!isConnected && webView != null) {
@@ -1560,6 +1706,7 @@ public class MainActivity extends AppCompatActivity {
         stopKeepalive();
         stopHeartbeat();
         cancelBackgroundShutdownTimer();
+        unregisterSshNetworkCallback(); // normally already done in onPause(); safe/idempotent
         if (localServerManager != null) {
             localServerManager.stop();
         }
