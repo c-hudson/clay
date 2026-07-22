@@ -2381,6 +2381,11 @@ pub struct OutputLine {
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
 const MAX_LINE_LENGTH: usize = 10_000;
 
+/// Remote client backfill: phase 2 (background round-robin deep fill) chunk size.
+/// Kept small and round-robin (one chunk per world per cycle) rather than draining
+/// one world fully, so a world with deep history doesn't block others from filling.
+const BACKFILL_PHASE2_CHUNK_SIZE: usize = 200;
+
 impl OutputLine {
     /// Truncate text if it exceeds MAX_LINE_LENGTH to prevent performance issues
     fn truncate_if_needed(text: String) -> String {
@@ -3338,10 +3343,24 @@ pub struct App {
     pub pending_remote_switch: Option<String>,
     /// Activity count from server (used in remote client mode, i.e. --console)
     pub server_activity_count: usize,
-    /// Remote client backfill: queue of (world_index, total_output_lines) to backfill
-    pub backfill_queue: Vec<(usize, usize)>,
-    /// Remote client backfill: next request to send (world_index, before_seq)
-    pub backfill_next: Option<(usize, Option<u64>)>,
+    /// Remote client backfill: current phase (1 = fast per-world screenful pass,
+    /// 2 = round-robin deep fill up to backfill_total_target). See backfill_advance_to_next.
+    pub backfill_phase: u8,
+    /// Remote client backfill: phase 1 per-world target line count (a guaranteed screenful -
+    /// max(75, visible viewport rows)), computed once at connect by init_backfill.
+    pub backfill_phase1_target: usize,
+    /// Remote client backfill: phase 2 per-world total target line count (the "Remote Lines"
+    /// setting, or backfill_phase1_target if larger) - backfill stops for a world once its
+    /// local line count reaches this, even if more history exists server-side.
+    pub backfill_total_target: usize,
+    /// Remote client backfill: queue of world indices awaiting a backfill request in the
+    /// current phase. Phase 2 re-appends a world here after each chunk if it still needs more.
+    pub backfill_queue: Vec<usize>,
+    /// Remote client backfill: worlds whose history is known exhausted (server returned fewer
+    /// lines than requested for a prior chunk) - stops phase 2 from re-queuing them forever.
+    pub backfill_exhausted: std::collections::HashSet<usize>,
+    /// Remote client backfill: next request to send (world_index, before_seq, count)
+    pub backfill_next: Option<(usize, Option<u64>, usize)>,
     /// Master GUI mode: channel to send messages to the embedded GUI
     pub gui_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Master GUI mode: callback to wake the GUI for immediate repaint
@@ -3446,7 +3465,11 @@ impl App {
             pending_remote_detach: false,
             pending_remote_switch: None,
             server_activity_count: 0, // Activity count from server (remote client mode)
+            backfill_phase: 1,
+            backfill_phase1_target: 75,
+            backfill_total_target: 100,
             backfill_queue: Vec::new(),
+            backfill_exhausted: std::collections::HashSet::new(),
             backfill_next: None,
             gui_tx: None, // Set when running in master GUI mode (--gui)
             gui_repaint: None,
@@ -4575,17 +4598,24 @@ impl App {
                     world.scroll_offset += prepended_count;
                     self.needs_output_redraw = true;
                 }
-                // Track backfill progress for remote console
-                if !backfill_complete {
-                    // More lines available - request next chunk
-                    if let Some(world) = self.worlds.get(world_index) {
-                        let oldest_seq = world.output_lines.first().map(|l| l.seq);
-                        self.backfill_next = Some((world_index, oldest_seq));
-                    }
-                } else {
-                    // This world is done - advance to next world in queue
-                    self.backfill_advance_to_next();
+                // Track backfill progress for remote console.
+                // Phase 1 is one chunk per world - always advance to the next world in
+                // the queue regardless of backfill_complete (see backfill_advance_to_next).
+                // Phase 2 is round-robin - re-queue this world at the back if it still
+                // needs more (and history isn't exhausted), then advance to whichever
+                // world is now at the front (may be a different one).
+                if backfill_complete {
+                    self.backfill_exhausted.insert(world_index);
                 }
+                if self.backfill_phase == 2 {
+                    if let Some(world) = self.worlds.get(world_index) {
+                        let received = world.output_lines.len();
+                        if received < self.backfill_total_target && !self.backfill_exhausted.contains(&world_index) {
+                            self.backfill_queue.push(world_index);
+                        }
+                    }
+                }
+                self.backfill_advance_to_next();
             }
             WsMessage::GlobalSettingsUpdated { settings, input_height: _ } => {
                 // Master or another client updated global settings - sync our local copy
@@ -4708,10 +4738,11 @@ impl App {
         }
     }
 
-    /// Advance backfill to the next world in the queue.
-    /// Sets backfill_next so the main loop can send the request.
+    /// Advance backfill to the next world in the queue (current phase).
+    /// Sets backfill_next so the main loop can send the request. When the phase 1
+    /// queue drains, automatically starts phase 2 and continues from there.
     fn backfill_advance_to_next(&mut self) {
-        while let Some((world_idx, _total)) = self.backfill_queue.first().copied() {
+        while let Some(world_idx) = self.backfill_queue.first().copied() {
             self.backfill_queue.remove(0);
             if let Some(world) = self.worlds.get(world_idx) {
                 // oldest_seq is None for a world that received zero lines in InitialState
@@ -4726,32 +4757,97 @@ impl App {
                 // them. Only a genuinely missing world (removed since being queued) falls
                 // through to try the next queue entry below.
                 let oldest_seq = world.output_lines.first().map(|l| l.seq);
-                self.backfill_next = Some((world_idx, oldest_seq));
+                let received = world.output_lines.len();
+                let count = if self.backfill_phase == 1 {
+                    self.backfill_phase1_target.saturating_sub(received).max(1)
+                } else {
+                    // Clamp to what's still needed so the final chunk for a world
+                    // never overshoots backfill_total_target - a world only enters
+                    // the phase 2 queue while received < target, so this is always >= 1.
+                    self.backfill_total_target.saturating_sub(received).clamp(1, BACKFILL_PHASE2_CHUNK_SIZE)
+                };
+                self.backfill_next = Some((world_idx, oldest_seq, count));
                 return;
             }
         }
-        // Queue empty - backfill complete
+        // This phase's queue is empty. Phase 1 -> phase 2 automatically; phase 2
+        // draining means backfill is fully complete.
+        if self.backfill_phase == 1 {
+            self.start_backfill_phase2();
+            if !self.backfill_queue.is_empty() {
+                self.backfill_advance_to_next();
+                return;
+            }
+        }
         self.backfill_next = None;
     }
 
-    /// Initialize backfill queue from InitialState worlds data.
-    /// Called after init_from_initial_state() with the original WorldStateMsg data.
-    fn init_backfill(&mut self, world_totals: &[(usize, usize)]) {
-        self.backfill_queue.clear();
-        self.backfill_next = None;
-        // Current world first for best UX, then others
-        let mut queue: Vec<(usize, usize)> = Vec::new();
-        for &(idx, total) in world_totals {
-            let received = self.worlds.get(idx).map(|w| w.output_lines.len()).unwrap_or(0);
-            if total > received {
-                if idx == self.current_world_index {
-                    queue.insert(0, (idx, total));
+    /// Build the phase 2 round-robin queue: every world still short of
+    /// backfill_total_target (and not already known to be exhausted), current
+    /// world first. Each cycle through the queue sends one chunk per world -
+    /// see the ScrollbackLines handler, which re-appends a world here after each
+    /// chunk if it still needs more, rather than draining it in one go.
+    fn start_backfill_phase2(&mut self) {
+        self.backfill_phase = 2;
+        let current = self.current_world_index;
+        let mut queue: Vec<usize> = Vec::new();
+        for (idx, world) in self.worlds.iter().enumerate() {
+            let received = world.output_lines.len();
+            if received < self.backfill_total_target && !self.backfill_exhausted.contains(&idx) {
+                if idx == current {
+                    queue.insert(0, idx);
                 } else {
-                    queue.push((idx, total));
+                    queue.push(idx);
                 }
             }
         }
         self.backfill_queue = queue;
+    }
+
+    /// Initialize backfill queue from InitialState worlds data.
+    /// Called after init_from_initial_state() with the original WorldStateMsg data.
+    /// `phase1_target` is the caller's guaranteed-screenful line count
+    /// (max(75, visible viewport rows) - the caller computes the viewport part,
+    /// since only it knows the terminal/window size).
+    fn init_backfill(&mut self, world_totals: &[(usize, usize)], phase1_target: usize) {
+        self.backfill_queue.clear();
+        self.backfill_next = None;
+        self.backfill_exhausted.clear();
+        self.backfill_phase = 1;
+        self.backfill_phase1_target = phase1_target.max(1);
+        let per_world_cap = self.settings.remote_initial_lines.max(1) as usize;
+        self.backfill_total_target = per_world_cap.max(self.backfill_phase1_target);
+
+        // Build the phase 1 queue: current world first, then others. Only worlds
+        // still short of a screenful belong in phase 1 - a world that already has
+        // >= backfill_phase1_target lines locally (but still has more total
+        // history) skips straight to phase 2 instead of getting a wasteful
+        // near-empty request here.
+        let mut queue: Vec<usize> = Vec::new();
+        for &(idx, total) in world_totals {
+            let received = self.worlds.get(idx).map(|w| w.output_lines.len()).unwrap_or(0);
+            if total > received && received < self.backfill_phase1_target {
+                if idx == self.current_world_index {
+                    queue.insert(0, idx);
+                } else {
+                    queue.push(idx);
+                }
+            }
+        }
+        self.backfill_queue = queue;
+    }
+
+    /// True if any world still needs backfilling in either phase - i.e. it's worth
+    /// starting/continuing the backfill timer. A phase 1 queue that's already empty
+    /// does NOT mean nothing is needed: a world can be phase-1-satisfied (has its
+    /// screenful) while still short of backfill_total_target, which only phase 2
+    /// (built lazily by start_backfill_phase2 once phase 1 drains) would catch -
+    /// checking backfill_queue alone here would silently skip phase 2 entirely.
+    pub fn backfill_needed(&self) -> bool {
+        !self.backfill_queue.is_empty()
+            || self.worlds.iter().enumerate().any(|(idx, w)| {
+                w.output_lines.len() < self.backfill_total_target && !self.backfill_exhausted.contains(&idx)
+            })
     }
 
     /// Find world index by name (case-insensitive), also checks reader_name for renamed worlds

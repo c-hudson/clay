@@ -962,15 +962,18 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 .collect();
                             // Initialize app state from server
                             app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
-                            // Initialize backfill queue
-                            app.init_backfill(&world_totals);
+                            // Initialize backfill queue. Phase 1 target is a guaranteed
+                            // screenful (max(75, visible rows)) so switching to any world
+                            // shows content immediately; phase 2 then tops each world up
+                            // to the "Remote Lines" setting, round-robin (see init_backfill).
+                            let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                            let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
+                            app.init_backfill(&world_totals, visible_lines.max(75));
                             // Declare client type to server (RemoteConsole for TUI clients)
                             let _ = ws_tx.send(WsMessage::ClientTypeDeclaration {
                                 client_type: websocket::RemoteClientType::RemoteConsole,
                             });
                             // Send initial view state for more-mode sync
-                            let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-                            let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
                             let _ = ws_tx.send(WsMessage::UpdateViewState {
                                 world_index: current_world_index,
                                 visible_lines,
@@ -1020,7 +1023,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
 
     // Backfill timer: fires after initial delay to start requesting scrollback history
     let mut backfill_timer = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_millis(500)));
-    let mut backfill_timer_active = !app.backfill_queue.is_empty();
+    let mut backfill_timer_active = app.backfill_needed();
 
     // Channel for local /update results
     let (update_tx, mut update_rx) = mpsc::channel::<Result<UpdateSuccess, String>>(1);
@@ -1254,10 +1257,10 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                         if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                             app.handle_remote_ws_message(ws_msg);
                             // After processing ScrollbackLines, backfill_next may be set
-                            if let Some((world_idx, before_seq)) = app.backfill_next.take() {
+                            if let Some((world_idx, before_seq, count)) = app.backfill_next.take() {
                                 let _ = ws_tx.send(WsMessage::RequestScrollback {
                                     world_index: world_idx,
-                                    count: 500,
+                                    count,
                                     before_seq,
                                 });
                             }
@@ -1343,10 +1346,10 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                 backfill_timer_active = false;
                 // Start backfill from the first world in the queue
                 app.backfill_advance_to_next();
-                if let Some((world_idx, before_seq)) = app.backfill_next.take() {
+                if let Some((world_idx, before_seq, count)) = app.backfill_next.take() {
                     let _ = ws_tx.send(WsMessage::RequestScrollback {
                         world_index: world_idx,
-                        count: 500,
+                        count,
                         before_seq,
                     });
                 }

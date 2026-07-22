@@ -353,10 +353,18 @@
     let splashLines = [];  // Splash screen lines for multiuser mode
 
     // Lazy backfill state
+    // Two phases: Phase 1 is a fast breadth-first pass giving every world a
+    // screenful (current world first) so switching worlds shows content
+    // immediately. Phase 2 tops each world up to its per-world total target,
+    // round-robin (one chunk per world per cycle) so no single world's deep
+    // history blocks the others from filling.
     let backfillInProgress = false;
+    let backfillPhase = 1; // 1 = fast screenful pass, 2 = round-robin deep fill
     let backfillWorldQueue = [];
     let backfillCurrentWorld = null;
-    const BACKFILL_CHUNK_SIZE = 500;
+    let backfillPhase1Target = 75; // recomputed per-connect: max(75, viewport lines)
+    let backfillTotalTarget = 100; // recomputed per-connect: max(remoteInitialLines, phase1Target)
+    const BACKFILL_PHASE2_CHUNK_SIZE = 200;
     const BACKFILL_DELAY_MS = 200;
 
     // Cached rendered output per world (array of DOM elements)
@@ -1867,6 +1875,10 @@
                     }
                     // Track oldest seq for backfill deduplication
                     world._oldest_seq = null;
+                    // Track whether this world's history is known exhausted
+                    // (server returned fewer lines than requested) - stops phase 2
+                    // from re-queuing a world that has nothing left to give.
+                    world._backfill_exhausted = false;
                     if (world.output_lines.length > 0) {
                         let minSeq = Infinity;
                         for (const line of world.output_lines) {
@@ -2876,12 +2888,27 @@
                         }
                     }
                 }
-                // Continue or finish backfill
-                if (msg.backfill_complete) {
-                    backfillNextWorld();
-                } else {
-                    scheduleNextBackfillChunk();
+                // Continue or finish backfill.
+                // Phase 1 is one chunk per world - always advance to the next
+                // world in the queue regardless of backfill_complete.
+                // Phase 2 is round-robin - re-queue this world at the back if it
+                // still needs more (and history isn't exhausted), then advance
+                // to whichever world is now at the front (may be a different one).
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    const world = worlds[msg.world_index];
+                    if (msg.backfill_complete) {
+                        world._backfill_exhausted = true;
+                    }
+                    if (backfillPhase === 2) {
+                        const received = world.output_lines ? world.output_lines.length : 0;
+                        if (received < backfillTotalTarget && !world._backfill_exhausted) {
+                            backfillWorldQueue.push(msg.world_index);
+                        }
+                    }
                 }
+                setTimeout(function() {
+                    backfillNextWorld();
+                }, backfillPhase === 1 ? 0 : BACKFILL_DELAY_MS);
                 break;
 
             case 'ServerReloading':
@@ -2995,15 +3022,26 @@
     // --- Lazy Backfill Orchestration ---
 
     // Start backfill after InitialState is processed.
-    // Builds a queue of worlds that need backfill (current world first).
+    // Phase 1: give every under-filled world a screenful, current world first,
+    // one request per world, no waiting for full history.
+    // Phase 2 (started automatically once phase 1 drains): round-robin the
+    // remaining worlds in 200-line chunks until each hits backfillTotalTarget
+    // lines or the server reports its history is exhausted.
     function startBackfill() {
         backfillInProgress = false;
         backfillWorldQueue = [];
         backfillCurrentWorld = null;
+        backfillPhase = 1;
+        backfillPhase1Target = Math.max(75, getVisibleLineCount());
+        backfillTotalTarget = Math.max(remoteInitialLines || 100, backfillPhase1Target);
 
-        // Build queue: current world first, then others. A world with total >
-        // received always has something worth fetching, even when _oldest_seq is
-        // null (e.g. build_initial_state's aggregate line budget ran out before
+        // Build the phase 1 queue: current world first, then others. Only
+        // worlds still short of a screenful belong in phase 1 - a world that
+        // already has >= backfillPhase1Target lines locally (but still has
+        // more total history) skips straight to phase 2 instead of getting a
+        // wasteful near-empty request here. A world with total > received
+        // always has something worth fetching, even when _oldest_seq is null
+        // (e.g. build_initial_state's aggregate line budget ran out before
         // reaching it, even though the world has real history server-side) -
         // requestBackfillChunk sends before_seq: null in that case, which the
         // daemon already handles as "send the last N lines". Do not skip these
@@ -3012,7 +3050,7 @@
         worlds.forEach((world, idx) => {
             const total = world.total_output_lines || 0;
             const received = world.output_lines ? world.output_lines.length : 0;
-            if (total > received) {
+            if (total > received && received < backfillPhase1Target) {
                 if (idx === currentWorldIndex) {
                     queue.unshift(idx);
                 } else {
@@ -3021,19 +3059,26 @@
             }
         });
 
-        if (queue.length === 0) return;
-
         backfillWorldQueue = queue;
         backfillInProgress = true;
         // Delay before first request to let UI settle
         setTimeout(function() {
-            backfillNextWorld();
+            if (backfillWorldQueue.length === 0) {
+                startBackfillPhase2();
+            } else {
+                backfillNextWorld();
+            }
         }, 500);
     }
 
-    // Move to the next world in the backfill queue
+    // Move to the next world in the backfill queue (phase 1), or start/continue
+    // the round-robin phase 2 queue once phase 1 has drained.
     function backfillNextWorld() {
         if (backfillWorldQueue.length === 0) {
+            if (backfillPhase === 1) {
+                startBackfillPhase2();
+                return;
+            }
             backfillInProgress = false;
             backfillCurrentWorld = null;
             return;
@@ -3042,7 +3087,34 @@
         requestBackfillChunk(backfillCurrentWorld);
     }
 
-    // Send a RequestScrollback for the given world
+    // Build the phase 2 round-robin queue: every world still short of
+    // backfillTotalTarget (and not already known to be exhausted), current
+    // world first. Each cycle through the queue sends one chunk per world.
+    function startBackfillPhase2() {
+        backfillPhase = 2;
+        const queue = [];
+        worlds.forEach((world, idx) => {
+            const received = world.output_lines ? world.output_lines.length : 0;
+            if (received < backfillTotalTarget && !world._backfill_exhausted) {
+                if (idx === currentWorldIndex) {
+                    queue.unshift(idx);
+                } else {
+                    queue.push(idx);
+                }
+            }
+        });
+        if (queue.length === 0) {
+            backfillInProgress = false;
+            backfillCurrentWorld = null;
+            return;
+        }
+        backfillWorldQueue = queue;
+        backfillNextWorld();
+    }
+
+    // Send a RequestScrollback for the given world. Phase 1 asks for just enough
+    // to reach a screenful; phase 2 asks for a round-robin chunk, clamped so the
+    // final chunk for a world never overshoots backfillTotalTarget.
     function requestBackfillChunk(worldIndex) {
         const world = worlds[worldIndex];
         if (!world) {
@@ -3050,26 +3122,19 @@
             backfillNextWorld();
             return;
         }
+        const received = world.output_lines ? world.output_lines.length : 0;
+        const count = backfillPhase === 1
+            ? Math.max(1, backfillPhase1Target - received)
+            : Math.max(1, Math.min(BACKFILL_PHASE2_CHUNK_SIZE, backfillTotalTarget - received));
         // before_seq may legitimately be null here (a world that received zero
         // lines in InitialState despite having real history) - the daemon handles
         // that as "send the last N lines", so send it through rather than skipping.
         send({
             type: 'RequestScrollback',
             world_index: worldIndex,
-            count: BACKFILL_CHUNK_SIZE,
+            count: count,
             before_seq: world._oldest_seq
         });
-    }
-
-    // Schedule the next chunk after a short delay
-    function scheduleNextBackfillChunk() {
-        if (backfillCurrentWorld === null) return;
-        const worldIdx = backfillCurrentWorld;
-        setTimeout(function() {
-            if (backfillCurrentWorld === worldIdx) {
-                requestBackfillChunk(worldIdx);
-            }
-        }, BACKFILL_DELAY_MS);
     }
 
     // Try to authenticate with saved auth key (passwordless)

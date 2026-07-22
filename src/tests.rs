@@ -4301,7 +4301,8 @@ if you're more curious.\"";
     /// server-side, but zero lines locally after InitialState - see the aggregate-budget
     /// test above) was silently dropped from the auto-backfill queue instead of being
     /// requested with before_seq: None, leaving it permanently empty until the user
-    /// manually focused and scrolled it.
+    /// manually focused and scrolled it. Also covers phase 1's per-world chunk sizing
+    /// (request exactly enough to reach a screenful, not a fixed 500).
     #[test]
     fn test_backfill_advance_to_next_does_not_skip_budget_starved_worlds() {
         let mut app = App::new();
@@ -4325,21 +4326,136 @@ if you're more curious.\"";
 
         // Mirrors what InitialState's world_totals looks like: (world_index, total_output_lines).
         let world_totals = vec![(0, 20), (1, 50)];
-        app.init_backfill(&world_totals);
-        assert_eq!(app.backfill_queue, vec![(0, 20), (1, 50)],
-            "both worlds have total > received and should be queued, current world first");
+        app.init_backfill(&world_totals, 75); // phase1_target = 75 (screenful)
+        assert_eq!(app.backfill_queue, vec![0, 1],
+            "both worlds have total > received and are under the phase 1 target, so both \
+             should be queued for phase 1, current world first");
 
-        // World 0 has local lines: backfill_next should anchor on its oldest seq.
+        // World 0 has local lines: backfill_next should anchor on its oldest seq and ask
+        // for just enough to reach the phase 1 target (75 - 10 = 65), not a fixed chunk.
         app.backfill_advance_to_next();
-        assert_eq!(app.backfill_next, Some((0, Some(0))),
-            "world 0 already has local lines, should backfill older history from its oldest seq");
+        assert_eq!(app.backfill_next, Some((0, Some(0), 65)),
+            "world 0 already has local lines, should backfill older history from its oldest \
+             seq, requesting only enough to reach the phase 1 target");
 
         // World 1 is budget-starved (zero local lines): must still be queued for backfill,
         // not silently dropped. before_seq: None is the correct request - the daemon
-        // handles it as "send the last N lines".
+        // handles it as "send the last N lines". It needs the full phase 1 target (75).
         app.backfill_advance_to_next();
-        assert_eq!(app.backfill_next, Some((1, None)),
+        assert_eq!(app.backfill_next, Some((1, None, 75)),
             "a budget-starved world (real history, zero local lines) must still be requested \
              via RequestScrollback{{before_seq: None}}, not silently dropped from the queue");
+    }
+
+    /// Regression/behavior test for the two-phase backfill redesign: phase 1 gives every
+    /// under-filled world a single fast chunk (current world first) before phase 2 starts;
+    /// phase 2 then round-robins 200-line chunks across worlds (one chunk per world per
+    /// cycle, not draining one world before moving to the next) and stops each world at
+    /// backfill_total_target - both because it's had enough (target reached) and because
+    /// the daemon can report a world's history as exhausted before it reaches home target.
+    #[test]
+    fn test_backfill_phase2_is_round_robin_and_stops_at_total_target() {
+        let mut app = App::new();
+        app.worlds.clear();
+        // Total target set well past phase1_target + one phase 2 chunk (75 + 200 = 275)
+        // so each world needs two round-robin cycles (200 then 50) to reach it - this is
+        // what actually exercises round-robin ordering rather than finishing in one pass.
+        app.settings.remote_initial_lines = 325;
+
+        // Three worlds, all starting empty with plenty of server-side history.
+        for name in ["world0", "world1", "world2"] {
+            app.worlds.push(World::new(name));
+        }
+        app.current_world_index = 0;
+
+        let world_totals = vec![(0, 1000), (1, 1000), (2, 1000)];
+        app.init_backfill(&world_totals, 75);
+        assert_eq!(app.backfill_total_target, 325,
+            "total target should be max(remote_initial_lines, phase1_target) = max(325, 75)");
+
+        // Drive phase 1 to completion: one chunk per world, each landing exactly on the
+        // phase 1 target (75) since the simulated daemon always has enough to give. Each
+        // loop iteration mirrors one round-trip: advance_to_next sets backfill_next (what
+        // the main loop would send as a RequestScrollback), then we simulate the reply by
+        // prepending lines directly - no further advance needed until the next iteration.
+        for expected_world in [0usize, 1, 2] {
+            app.backfill_advance_to_next();
+            let (world_idx, before_seq, count) = app.backfill_next.take()
+                .expect("phase 1 should still be issuing requests");
+            assert_eq!(world_idx, expected_world, "phase 1 should proceed in queue order");
+            assert_eq!(count, 75, "phase 1 chunk for an empty world should request the full target");
+            // Simulate the daemon's ScrollbackLines reply: full chunk, more available.
+            let lines: Vec<OutputLine> = (0..count as u64)
+                .map(|i| OutputLine::new(format!("line {i}"), before_seq.unwrap_or(1000).wrapping_sub(i + 1)))
+                .collect();
+            let mut combined = lines;
+            combined.append(&mut app.worlds[world_idx].output_lines);
+            app.worlds[world_idx].output_lines = combined;
+        }
+        assert!(app.backfill_queue.is_empty(), "phase 1 queue should be fully drained");
+
+        // Drive the rest via backfill_advance_to_next alone (same as the real
+        // ScrollbackLines handler would, minus the network round-trip): the first call
+        // below finds the phase 1 queue empty and auto-transitions to phase 2 via
+        // start_backfill_phase2, then returns the first phase 2 request already.
+        let mut requests: Vec<usize> = Vec::new();
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 100, "backfill should terminate, not loop forever");
+            app.backfill_advance_to_next();
+            let Some((world_idx, before_seq, count)) = app.backfill_next.take() else {
+                break; // backfill fully complete
+            };
+            assert_eq!(app.backfill_phase, 2, "should have auto-transitioned to phase 2");
+            requests.push(world_idx);
+            let received_before = app.worlds[world_idx].output_lines.len();
+            let remaining_to_target = app.backfill_total_target - received_before;
+            // Phase 2 requests are clamped to min(BACKFILL_PHASE2_CHUNK_SIZE, remaining) so a
+            // world's final chunk never overshoots the target - so count should always equal
+            // exactly what's still needed, capped at the round-robin chunk size.
+            assert_eq!(count, remaining_to_target.min(200),
+                "phase 2 chunk size should be clamped to what's still needed, capped at 200");
+
+            // Simulate the daemon: ample history, so it always returns the full requested
+            // count (never less) - backfill_complete only fires when a world's real history
+            // runs out before reaching the target, which this scenario doesn't exercise.
+            let give = count;
+            let backfill_complete = give < count;
+            let lines: Vec<OutputLine> = (0..give as u64)
+                .map(|i| OutputLine::new(format!("line {i}"), before_seq.unwrap_or(1000).wrapping_sub(i + 1)))
+                .collect();
+            let mut combined = lines;
+            combined.append(&mut app.worlds[world_idx].output_lines);
+            app.worlds[world_idx].output_lines = combined;
+
+            if backfill_complete {
+                app.backfill_exhausted.insert(world_idx);
+            }
+            if app.backfill_phase == 2 {
+                let received = app.worlds[world_idx].output_lines.len();
+                if received < app.backfill_total_target && !app.backfill_exhausted.contains(&world_idx) {
+                    app.backfill_queue.push(world_idx);
+                }
+            }
+        }
+
+        // Round-robin: with three equally-starved worlds, no world should receive a second
+        // phase 2 chunk before the other two have each received one.
+        assert!(requests.len() >= 6, "expected multiple round-robin cycles, got {requests:?}");
+        assert_eq!(&requests[0..3], &[0, 1, 2],
+            "first cycle should visit every world once in queue order: {requests:?}");
+        assert_eq!(&requests[3..6], &[0, 1, 2],
+            "second cycle should also visit every world once before any gets a third \
+             chunk: {requests:?}");
+
+        // Every world should be capped at backfill_total_target, never exceeding it.
+        for (idx, world) in app.worlds.iter().enumerate() {
+            assert!(world.output_lines.len() <= app.backfill_total_target,
+                "world {idx} has {} lines, exceeding backfill_total_target {}",
+                world.output_lines.len(), app.backfill_total_target);
+            assert_eq!(world.output_lines.len(), app.backfill_total_target,
+                "world {idx} should be filled all the way to the target (ample history was simulated)");
+        }
     }
 
