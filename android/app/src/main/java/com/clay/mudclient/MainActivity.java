@@ -34,6 +34,10 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
 public class MainActivity extends AppCompatActivity {
     private static final String PREFS_NAME = "ClayPrefs";
     private static final String KEY_SERVER_HOST = "serverHost";
@@ -800,22 +804,30 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // How many total SSH connect attempts (each attempt = one raceSshProxyStart() call, itself
+    // possibly racing two candidate hosts) before giving up and showing showSshFailedDialog().
+    // No added delay between attempts - each attempt already has its own internal readiness
+    // timeout (SshProxyManager.READY_TIMEOUT_MS), so a genuinely unreachable host still takes a
+    // while overall, but nothing artificial is added on top of that.
+    private static final int SSH_MAX_ATTEMPTS = 3;
+
     // Establishes the SSH tunnel (spawn + readiness poll, both blocking) on a worker thread,
     // then loads the WebView pointed at the local proxy port — mirrors
     // startLocalServerThenLoadInterface()'s structure exactly; buildVarInjectionScript() reads
     // sshProxyManager's local port once it's running, so the WebView must not load before this
-    // completes. Proceeds to loadInterface() either way; if the tunnel failed to start, app.js
-    // will simply fail to connect (see the proxy's log at clay-ssh-proxy.log for why), the same
-    // UX as an unreachable remote host.
+    // completes. When "Remote Hostname" (the same Advanced field the direct/non-SSH path races
+    // against "Server Host") is set and differs from "Server Host", races an SSH tunnel to BOTH
+    // simultaneously via raceSshProxyStart() and keeps whichever comes up first — mirroring the
+    // direct path's parallel host race in app.js (buildCandidates()/connect()/handleAttemptWin()).
+    // Retries up to SSH_MAX_ATTEMPTS times; on total failure, does NOT fall back to a direct
+    // connection (SSH being enabled means only SSH is ever attempted) - instead shows
+    // showSshFailedDialog() with a real error and Retry/Cancel actions.
     private void startSshProxyThenLoadInterface() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         lastAppliedSshConfigSnapshot = sshConfigSnapshot(prefs);
-        if (sshProxyManager == null) {
-            sshProxyManager = new SshProxyManager(this);
-        }
-        final SshProxyManager manager = sshProxyManager;
         final String sshUser = prefs.getString(KEY_SSH_USER, "");
         final String sshHost = prefs.getString(KEY_SERVER_HOST, "");
+        final String sshRemoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
         final int sshPort = prefs.getInt(KEY_SSH_PORT, 22);
         final int clayPort = prefs.getInt(KEY_SERVER_PORT, 9000);
         final String privateKeyPem = prefs.getString(KEY_SSH_PRIVATE_KEY, "");
@@ -823,21 +835,157 @@ public class MainActivity extends AppCompatActivity {
         final String password = prefs.getString(KEY_SSH_PASSWORD, "");
         runOnUiThread(() -> showConnectingOverlay("Establishing SSH tunnel..."));
         new Thread(() -> {
-            boolean ready = manager.start(sshUser, sshHost, sshPort, clayPort,
-                privateKeyPem, keyPassphrase, password);
-            android.util.Log.i("Clay", "SSH proxy " + (ready ? "ready" : "FAILED to start")
-                + " on port " + manager.getLocalPort());
-            runOnUiThread(this::loadInterface);
+            SshProxyManager winner = null;
+            SshRaceResult lastResult = null;
+            for (int attempt = 1; attempt <= SSH_MAX_ATTEMPTS && winner == null; attempt++) {
+                lastResult = raceSshProxyStart(sshUser, sshHost, sshRemoteHost, sshPort,
+                    clayPort, privateKeyPem, keyPassphrase, password);
+                winner = lastResult.winner;
+                if (winner == null) {
+                    android.util.Log.w("Clay", "SSH connect attempt " + attempt + "/"
+                        + SSH_MAX_ATTEMPTS + " failed: " + lastResult.errors);
+                }
+            }
+            if (winner != null) {
+                sshProxyManager = winner;
+                android.util.Log.i("Clay", "SSH proxy ready on port " + winner.getLocalPort());
+                runOnUiThread(this::loadInterface);
+            } else {
+                sshProxyManager = null;
+                final String message = summarizeSshErrors(lastResult.errors);
+                runOnUiThread(() -> {
+                    hideConnectingOverlay();
+                    showSshFailedDialog(message);
+                });
+            }
         }, "ClaySshProxyStart").start();
+    }
+
+    /** Winning manager (or null) plus per-candidate error strings from a raceSshProxyStart() call. */
+    private static class SshRaceResult {
+        final SshProxyManager winner;
+        final java.util.List<String> errors;
+        SshRaceResult(SshProxyManager winner, java.util.List<String> errors) {
+            this.winner = winner;
+            this.errors = errors;
+        }
+    }
+
+    /**
+     * Races SSH tunnel startup against up to two candidate hosts - "Server Host" and, when it's
+     * set and differs, "Remote Hostname" - and returns whichever SshProxyManager comes up first,
+     * having told the other to cancel(); on total failure, includes each candidate's
+     * SshProxyManager.getLastError() for showSshFailedDialog(). Blocking - must be called off the
+     * main thread (each SshProxyManager.start() call blocks internally).
+     */
+    private SshRaceResult raceSshProxyStart(String user, String hostA, String hostB, int sshPort,
+                                             int clayPort, String key, String keyPass, String password) {
+        boolean hasSecondCandidate = hostB != null && !hostB.isEmpty() && !hostB.equals(hostA);
+        if (!hasSecondCandidate) {
+            // No race needed - reuse the existing manager exactly as before this change (a
+            // still-running instance with a matching target is a no-op inside start()).
+            if (sshProxyManager == null) {
+                sshProxyManager = new SshProxyManager(this);
+            }
+            SshProxyManager manager = sshProxyManager;
+            boolean ok = manager.start(user, hostA, sshPort, clayPort, key, keyPass, password);
+            if (ok) {
+                return new SshRaceResult(manager, null);
+            }
+            return new SshRaceResult(null,
+                java.util.Collections.singletonList(hostA + ": " + manager.getLastError()));
+        }
+
+        SshProxyManager mgrA = new SshProxyManager(this);
+        SshProxyManager mgrB = new SshProxyManager(this);
+        AtomicReference<SshProxyManager> winnerRef = new AtomicReference<>();
+        CountDownLatch latch = new CountDownLatch(2);
+        final String[] errorA = new String[1];
+        final String[] errorB = new String[1];
+
+        Runnable attemptA = () -> {
+            try {
+                if (mgrA.start(user, hostA, sshPort, clayPort, key, keyPass, password)) {
+                    if (winnerRef.compareAndSet(null, mgrA)) {
+                        mgrB.cancel();
+                    } else {
+                        mgrA.stop(); // lost a near-simultaneous tie, don't leak it
+                    }
+                } else {
+                    errorA[0] = mgrA.getLastError();
+                }
+            } finally {
+                latch.countDown();
+            }
+        };
+        Runnable attemptB = () -> {
+            try {
+                if (mgrB.start(user, hostB, sshPort, clayPort, key, keyPass, password)) {
+                    if (winnerRef.compareAndSet(null, mgrB)) {
+                        mgrA.cancel();
+                    } else {
+                        mgrB.stop();
+                    }
+                } else {
+                    errorB[0] = mgrB.getLastError();
+                }
+            } finally {
+                latch.countDown();
+            }
+        };
+        new Thread(attemptA, "ClaySshProxyRaceA").start();
+        new Thread(attemptB, "ClaySshProxyRaceB").start();
+        try {
+            // Defensive bound only - start() itself can't block longer than its own
+            // READY_TIMEOUT_MS per candidate (a hung/unreachable connect just times out and
+            // self-stops), so both threads should always finish well within this.
+            latch.await(15, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        SshProxyManager winner = winnerRef.get();
+        if (winner != null) {
+            return new SshRaceResult(winner, null);
+        }
+        java.util.List<String> errors = new java.util.ArrayList<>();
+        errors.add(hostA + ": " + (errorA[0] != null ? errorA[0] : "unknown"));
+        errors.add(hostB + ": " + (errorB[0] != null ? errorB[0] : "unknown"));
+        return new SshRaceResult(null, errors);
+    }
+
+    /** Joins a raceSshProxyStart() failure's per-candidate errors into one dialog message. */
+    private String summarizeSshErrors(java.util.List<String> errors) {
+        if (errors == null || errors.isEmpty()) {
+            return "SSH connection failed.";
+        }
+        return "Could not establish an SSH connection after " + SSH_MAX_ATTEMPTS + " attempts:\n\n"
+            + String.join("\n\n", errors);
+    }
+
+    // Shown after every SSH attempt (all candidates, all SSH_MAX_ATTEMPTS retries) has failed.
+    // Deliberately does NOT offer a "connect directly instead" option - SSH being enabled means
+    // only SSH is ever attempted, matching the rest of this method's callers. Not cancelable
+    // (back button) so the app doesn't end up in a half-connected, silently-blank state.
+    private void showSshFailedDialog(String message) {
+        new AlertDialog.Builder(this)
+            .setTitle("SSH Connection Failed")
+            .setMessage(message)
+            .setCancelable(false)
+            .setPositiveButton("Retry", (dialog, which) -> startSshProxyThenLoadInterface())
+            .setNegativeButton("Cancel", (dialog, which) ->
+                startActivity(new Intent(this, SettingsActivity.class)))
+            .show();
     }
 
     // Fingerprint of everything that determines the running SshProxyManager's target/creds —
     // used by reloadInterfaceRespectingRunMode() to detect a settings change that requires
     // killing and restarting the tunnel (unlike plain remote mode, where a host/port change
     // just needs a normal WS reconnect with fresh vars — the SSH tunnel is a subprocess that
-    // can't be redirected without a fresh --target=/env).
+    // can't be redirected without a fresh --target=/env). Includes KEY_REMOTE_HOSTNAME since
+    // raceSshProxyStart() now races it as a second SSH candidate alongside KEY_SERVER_HOST.
     private String sshConfigSnapshot(SharedPreferences prefs) {
         return prefs.getString(KEY_SSH_USER, "") + "|" + prefs.getString(KEY_SERVER_HOST, "") + "|"
+            + prefs.getString(KEY_REMOTE_HOSTNAME, "") + "|"
             + prefs.getInt(KEY_SSH_PORT, 22) + "|" + prefs.getInt(KEY_SERVER_PORT, 9000) + "|"
             + prefs.getString(KEY_SSH_PRIVATE_KEY, "") + "|" + prefs.getString(KEY_SSH_KEY_PASSPHRASE, "") + "|"
             + prefs.getString(KEY_SSH_PASSWORD, "");
