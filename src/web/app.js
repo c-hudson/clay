@@ -2862,6 +2862,13 @@
                 if (msg.world_index !== undefined && worlds[msg.world_index] && msg.lines && msg.lines.length > 0) {
                     const world = worlds[msg.world_index];
                     const wasBottom = isAtBottom();
+                    // Whether this world already had enough lines to fill the viewport
+                    // BEFORE this chunk - only then is newly-prepended content genuinely
+                    // off-screen above the fold. A world that's still empty/near-empty
+                    // (e.g. mid phase 1 backfill) is trivially "at bottom" with nothing to
+                    // scroll, but the new content directly extends what should be visible,
+                    // so that case must always render regardless of wasBottom.
+                    const hadFullScreen = world.output_lines.length >= getVisibleLineCount();
                     const container = elements.outputContainer;
                     const oldScrollHeight = container.scrollHeight;
 
@@ -2875,11 +2882,12 @@
                     }
                     if (minSeq !== Infinity) world._oldest_seq = minSeq;
 
-                    // Re-render only if user has scrolled up into history.
-                    // Backfill lines are old content at the top — not visible when at bottom.
-                    // Skipping renderOutput() avoids restarting CSS animations (e.g. blink).
-                    // In grep mode, always re-render to show newly available matching lines.
-                    if (msg.world_index === currentWorldIndex && (!wasBottom || grepRegex)) {
+                    // Re-render if the user has scrolled up into history, in grep mode, or
+                    // this world didn't already fill the viewport (so the new lines aren't
+                    // actually off-screen). Backfill lines are old content at the top - not
+                    // visible when genuinely at bottom of a long buffer - so skipping
+                    // renderOutput() there avoids restarting CSS animations (e.g. blink).
+                    if (msg.world_index === currentWorldIndex && (!wasBottom || grepRegex || !hadFullScreen)) {
                         renderOutput();
                         // Adjust scrollTop by the height difference (new content at top)
                         {
