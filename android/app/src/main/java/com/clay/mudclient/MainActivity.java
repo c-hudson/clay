@@ -551,6 +551,31 @@ public class MainActivity extends AppCompatActivity {
             return true;
         }
 
+        // Called by app.js's connect() before every SSH-mode WS dial (see window.SSH_MODE,
+        // injected by buildVarInjectionScript()). Returns true only if the tunnel process is
+        // actually alive right now; if it's dead, kicks off restartSshTunnel() (fresh
+        // ephemeral port pushed back via updateSshTunnelPort() -> forceReconnect()) and
+        // returns false so app.js defers this cycle instead of dialing a dead port. Must stay
+        // cheap/non-blocking — isRunning() is just a process.isAlive() check, no TCP probe
+        // here (that would risk NetworkOnMainThread / adding latency to every reconnect
+        // attempt). restartSshTunnel() is already safe to call off the UI thread (see its
+        // other callers: the network-change callback above calls it directly too), so no
+        // runOnUiThread hop is needed.
+        @JavascriptInterface
+        public boolean ensureSshTunnelReady() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            if (!RUN_MODE_REMOTE.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))
+                || !prefs.getBoolean(KEY_SSH_ENABLED, false)) {
+                return true; // not in SSH mode - nothing to gate
+            }
+            if (sshProxyManager != null && sshProxyManager.isRunning()) {
+                return true;
+            }
+            android.util.Log.i("Clay", "ensureSshTunnelReady: tunnel down, triggering restart");
+            restartSshTunnel(true);
+            return false;
+        }
+
         @JavascriptInterface
         public boolean isSettingsConfigured() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -1541,6 +1566,11 @@ public class MainActivity extends AppCompatActivity {
                "window.WS_PORT=" + port + ";" +
                "window.WS_PROTOCOL='wss';" +
                "window.CONNECTION_MODE=" + mode + ";" +
+               // Tells app.js's connect() to gate each dial on Android.ensureSshTunnelReady()
+               // before opening a socket to the tunneled loopback port — explicit boolean
+               // (not just inferred from CONNECTION_MODE/host) so a stale true never survives
+               // a switch back to local/remote mode across reloads.
+               "window.SSH_MODE=" + isSshProxyMode + ";" +
                "window.SHOW_CONNECTION_WINDOW=true;" +
                webPathScript +
                autoPasswordScript +

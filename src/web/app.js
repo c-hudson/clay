@@ -1388,6 +1388,14 @@
 
         if (pendingAttempts.size === 0 && winnerAttemptId === null) {
             connectInProgress = false;
+            // A stray/leftover cycle can lose its race after a different cycle already
+            // won and authenticated - don't let it pop the failure dialog back up over
+            // a connection that's actually fine (that's the "stuck dialog despite a
+            // working connection" bug).
+            if (authenticated && ws && ws.readyState === WebSocket.OPEN) {
+                debugLog('handleAttemptFailure: already connected+authenticated elsewhere, suppressing');
+                return;
+            }
             connectionFailures++;
             if (window.Android && window.Android.stopBackgroundService) {
                 window.Android.stopBackgroundService();
@@ -1652,6 +1660,13 @@
             return;
         }
 
+        // A stray connect() call (e.g. the resync fallback, app.js ~7945) must never orphan
+        // a live, authenticated socket - only forceReconnect() is allowed to tear that down.
+        if (authenticated && ws && ws.readyState === WebSocket.OPEN) {
+            debugLog('connect(): already connected and authenticated, skipping');
+            return;
+        }
+
         if (window.Android && typeof window.Android.isSettingsConfigured === 'function') {
             if (!window.Android.isSettingsConfigured()) {
                 openSettingsPopup('clay-server');
@@ -1660,6 +1675,44 @@
         } else if (window.SKIP_CONNECT) {
             return;
         }
+
+        // SSH-tunnel mode (Android only): verify the local tunnel process is actually up
+        // before dialing it. If it's dead, Android kicks off a restart (fresh ephemeral
+        // port) and pushes it to us via updateSshTunnelPort() -> forceReconnect(); defer
+        // this cycle rather than hammering a dead port until the next watchdog event.
+        if (window.SSH_MODE && window.Android &&
+            typeof window.Android.ensureSshTunnelReady === 'function') {
+            let tunnelReady = true;
+            try { tunnelReady = window.Android.ensureSshTunnelReady(); } catch (e) {}
+            if (!tunnelReady) {
+                debugLog('connect(): SSH tunnel not ready, deferring (restart in progress)');
+                return;
+            }
+        }
+
+        // Starting a fresh cycle - a stale winner, leftover pending attempts, or leftover
+        // connection-log rows from a prior cycle must not bleed into this one (avoids
+        // spurious "(lost)" rows and the dialog re-appearing populated with stale entries
+        // after a healthy reconnect). Normally pendingAttempts is already empty by now
+        // (the winning/failing paths clear it), so this is just a defensive sweep.
+        winnerAttemptId = null;
+        if (pendingAttempts.size > 0) {
+            pendingAttempts.forEach(function(a, aid) {
+                if (a.timeout) clearTimeout(a.timeout);
+                if (a.isNative) {
+                    if (window.Android) try { window.Android.closeWebSocket(aid); } catch(e) {}
+                } else if (a.socket) {
+                    a.socket.onclose = null; a.socket.onerror = null;
+                    a.socket.onopen = null; a.socket.onmessage = null;
+                    try { a.socket.close(); } catch(e) {}
+                }
+            });
+            pendingAttempts.clear();
+        }
+        var staleLogList = document.getElementById('connection-log-list');
+        if (staleLogList) staleLogList.innerHTML = '';
+        var staleLogRetryBtn = document.getElementById('connection-log-retry-btn');
+        if (staleLogRetryBtn) staleLogRetryBtn.disabled = true;
 
         const candidates = buildCandidates();
         if (!candidates.length || !candidates[0].host) {
@@ -5701,6 +5754,12 @@
     function hideConnectionLog() {
         var modal = document.getElementById('connection-log-modal');
         if (modal) modal.style.display = 'none';
+        // Clear rows on hide so a later legitimate re-show (a real subsequent failure)
+        // never surfaces stale (lost)/(canceled)/success rows from this cycle.
+        var list = document.getElementById('connection-log-list');
+        if (list) list.innerHTML = '';
+        var retryBtn = document.getElementById('connection-log-retry-btn');
+        if (retryBtn) retryBtn.disabled = true;
     }
 
     function addConnectionAttempt(url, id) {
