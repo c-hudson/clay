@@ -4006,7 +4006,6 @@ impl App {
             self.settings.tts_speak_mode.name(),
             self.settings.scrollback_enabled,
             self.settings.wrapspace as i64,
-            self.settings.remote_initial_lines as i64,
         );
         self.popup_manager.open(def);
 
@@ -4033,6 +4032,7 @@ impl App {
             &self.settings.websocket_cert_file,
             &self.settings.websocket_key_file,
             &auth_key_str,
+            self.settings.remote_initial_lines as i64,
         );
         self.popup_manager.open(def);
 
@@ -8954,12 +8954,12 @@ impl App {
                     }
                 }
             }
-            WsMessage::RequestScrollback { world_index, count, before_seq } => {
+            WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
                 // Console client requests scrollback from master
                 if world_index < self.worlds.len() {
                     let world = &self.worlds[world_index];
 
-                    // Find lines to send based on before_seq
+                    // Find lines to send based on before_seq/after_seq
                     let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
                         // Send lines with seq < before_seq (older than what client has)
                         let eligible: Vec<_> = world.output_lines.iter()
@@ -8984,8 +8984,35 @@ impl App {
                                 }
                             })
                             .collect()
+                    } else if let Some(seq) = after_seq {
+                        // Reconnect gap-fill: the client kept its buffer across the
+                        // reconnect and only wants lines newer than the highest seq it
+                        // already has. Oldest-first (unlike before_seq's newest-first
+                        // slice) so the client can append+dedup in order.
+                        let eligible: Vec<_> = world.output_lines.iter()
+                            .filter(|l| l.seq > seq)
+                            .collect();
+                        let take = count.min(eligible.len());
+                        eligible[..take].iter()
+                            .map(|line| {
+                                let ts = line.timestamp
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                TimestampedLine {
+                                    text: line.text.clone(),
+                                    ts,
+                                    gagged: line.gagged,
+                                    from_server: line.from_server,
+                                    seq: line.seq,
+                                    highlight_color: line.highlight_color.clone(),
+                                    marked_new: line.marked_new,
+                                    from_archive: line.from_archive,
+                                }
+                            })
+                            .collect()
                     } else {
-                        // No before_seq - send last N lines (backwards compatible)
+                        // No before_seq/after_seq - send last N lines (backwards compatible)
                         let total_lines = world.output_lines.len();
                         let start = total_lines.saturating_sub(count);
                         world.output_lines[start..].iter()
@@ -9008,6 +9035,11 @@ impl App {
                             .collect()
                     };
 
+                    // Works for both directions: before_seq slices the newest `count`
+                    // eligible lines (so `lines.len() < count` means we ran out of
+                    // older history); after_seq takes `count.min(eligible.len())` (so
+                    // `lines.len() < count` means we returned every newer line
+                    // available, i.e. the gap is fully closed).
                     let backfill_complete = lines.len() < count;
                     self.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
                         world_index,
@@ -10255,7 +10287,6 @@ pub(crate) struct SetupSettings {
     pub(crate) tts_speak_mode: String,
     pub(crate) scrollback: bool,
     pub(crate) wrapspace: i64,
-    pub(crate) remote_initial_lines: i64,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -10273,6 +10304,7 @@ pub(crate) struct WebSettings {
     pub(crate) custom_cert: bool,
     pub(crate) ws_cert_file: String,
     pub(crate) ws_key_file: String,
+    pub(crate) remote_initial_lines: i64,
 }
 
 /// Apply web settings to app and save to disk
@@ -10296,6 +10328,7 @@ pub(crate) fn apply_web_settings(app: &mut App, settings: &WebSettings) {
     app.settings.websocket_allow_list = settings.ws_allow_list.clone();
     app.settings.websocket_cert_file = new_cert_file;
     app.settings.websocket_key_file = new_key_file;
+    app.settings.remote_initial_lines = settings.remote_initial_lines.clamp(10, 5000) as u16;
 
     // Update the running server's allow list and password immediately (no reload needed)
     if let Some(ref server) = app.ws_server {
@@ -10326,6 +10359,9 @@ pub(crate) fn web_settings_from_custom_data(data: &std::collections::HashMap<Str
         custom_cert: data.get("custom_cert").map(|v| v == "true").unwrap_or(false),
         ws_cert_file: data.get("ws_cert_file").cloned().unwrap_or_default(),
         ws_key_file: data.get("ws_key_file").cloned().unwrap_or_default(),
+        remote_initial_lines: data.get("remote_initial_lines")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(100),
     }
 }
 
@@ -10402,13 +10438,14 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
-        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_REMOTE_LINES,
+        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
         WEB_FIELD_PORT, WEB_FIELD_CUSTOM_PORT, WEB_FIELD_WEB_PATH,
         WEB_FIELD_WS_PASSWORD, WEB_FIELD_AUTH_KEY,
         WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_CUSTOM_CERT, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
+        WEB_FIELD_REMOTE_LINES,
         WEB_BTN_SAVE, WEB_BTN_CANCEL, WEB_BTN_MODIFY_KEY,
         update_web_visibility,
     };
@@ -10651,9 +10688,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
                     scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
                     wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
-                    remote_initial_lines: state.get_text(SETUP_FIELD_REMOTE_LINES)
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                        .unwrap_or(100),
                 }
             };
 
@@ -10805,6 +10839,9 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     custom_cert: state.get_selected(WEB_FIELD_CUSTOM_CERT) == Some("yes"),
                     ws_cert_file: state.get_text(WEB_FIELD_WS_CERT_FILE).unwrap_or("").to_string(),
                     ws_key_file: state.get_text(WEB_FIELD_WS_KEY_FILE).unwrap_or("").to_string(),
+                    remote_initial_lines: state.get_text(WEB_FIELD_REMOTE_LINES)
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(100),
                 }
             };
 

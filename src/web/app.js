@@ -366,8 +366,28 @@
     let backfillCurrentWorld = null;
     let backfillPhase1Target = 75; // recomputed per-connect: max(75, viewport lines)
     let backfillTotalTarget = 100; // recomputed per-connect: max(remoteInitialLines, phase1Target)
-    const BACKFILL_PHASE2_CHUNK_SIZE = 200;
-    const BACKFILL_DELAY_MS = 200;
+    // Chunk size and inter-chunk delay are purely client-side pacing - the daemon
+    // does no throttling of its own (RequestScrollback is a cheap in-memory slice).
+    // 500 lines comfortably fits under the WebSocket max_frame_size (256 KiB, see
+    // websocket.rs) given MAX_LINE_LENGTH, so a bigger chunk trades a few more bytes
+    // per message for far fewer round trips. The delay only needs to be nonzero to
+    // yield to the event loop between requests, not to pace against the server.
+    const BACKFILL_PHASE2_CHUNK_SIZE = 500;
+    const BACKFILL_DELAY_MS = 30;
+
+    // Coalesced repaint for the current world while it's at the bottom during
+    // backfill (see the ScrollbackLines handler). A fast backfill can deliver many
+    // chunks within a few hundred ms; debouncing collapses a burst into a single
+    // renderOutput() once it quiets down instead of rebuilding the DOM per chunk.
+    let currentWorldRepaintTimer = null;
+    const CURRENT_WORLD_REPAINT_DEBOUNCE_MS = 120;
+    function scheduleCurrentWorldRepaint() {
+        if (currentWorldRepaintTimer !== null) clearTimeout(currentWorldRepaintTimer);
+        currentWorldRepaintTimer = setTimeout(function() {
+            currentWorldRepaintTimer = null;
+            requestAnimationFrame(renderOutput);
+        }, CURRENT_WORLD_REPAINT_DEBOUNCE_MS);
+    }
 
     // Cached rendered output per world (array of DOM elements)
     let worldOutputCache = [];
@@ -1071,6 +1091,12 @@
         applyTransparency(guiTransparency);  // Set initial #app background in webview mode
         updateTime();
         setInterval(updateTime, 1000);
+        // Kick off the persistent scrollback cache read as early as possible so it
+        // has time to finish before InitialState arrives (see the "Reconnect
+        // gap-fill and bounded scrollback cache" section below) - this is a local
+        // IndexedDB read, normally much faster than the network round trip to
+        // connect and authenticate.
+        preloadWorldCacheForServer(getServerIdentity());
         // On Android, never auto-connect from init() — Java calls connect() via
         // evaluateJavascript in onPageFinished() after verifying settings exist.
         if (!window.Android) {
@@ -1894,6 +1920,22 @@
                 break;
 
             case 'InitialState':
+                // Preserve already-downloaded scrollback across a reconnect instead
+                // of discarding it: the WebSocket may drop and reconnect (network
+                // change, resume) while the JS heap survives (always true for
+                // Android/webview backgrounding), so capture the in-memory buffers
+                // from before this InitialState - by world name - while `worlds`
+                // still refers to the old array. See requestGapFill()/
+                // scheduleWorldCacheSave() above for the other half of this.
+                var priorWorldsByName = {};
+                if (hasReceivedInitialState) {
+                    worlds.forEach((w) => {
+                        if (w && w.name && w.output_lines && w.output_lines.length > 0) {
+                            priorWorldsByName[w.name] = w;
+                        }
+                    });
+                }
+
                 worlds = msg.worlds || [];
                 // On first connection, use server's world index. On resync, preserve local world.
                 if (!hasReceivedInitialState) {
@@ -1917,8 +1959,25 @@
                 // Ensure output_lines arrays exist, prefer timestamped versions
                 const currentTs = Math.floor(Date.now() / 1000);
                 worlds.forEach((world) => {
-                    // Use output_lines_ts if available (has timestamps)
-                    if (world.output_lines_ts && world.output_lines_ts.length > 0) {
+                    const priorWorld = world.name ? priorWorldsByName[world.name] : null;
+                    const cachedWorld = (!priorWorld && world.name) ? worldCacheLoaded[world.name] : null;
+                    // Whether this world was seeded from a local buffer (in-memory
+                    // reconnect or persistent cache) rather than the server's
+                    // freshly-sent slice - startBackfill() uses this to gap-fill
+                    // instead of doing a full backfill for this world.
+                    world._hydratedFromLocal = !!(priorWorld || (cachedWorld && cachedWorld.lines && cachedWorld.lines.length > 0));
+                    if (priorWorld) {
+                        // Reconnect: keep what we already had in memory - it's at
+                        // least as complete as the fresh InitialState's front-loaded
+                        // slice, and losing it is exactly the bug this preserves.
+                        world.output_lines = priorWorld.output_lines;
+                    } else if (cachedWorld && cachedWorld.lines && cachedWorld.lines.length > 0) {
+                        // Cold start / full reload with a persistent cache hit: seed
+                        // from the cache, then gap-fill (see startBackfill()) to pick
+                        // up whatever arrived on the server while we were gone.
+                        world.output_lines = cachedWorld.lines.slice();
+                    } else if (world.output_lines_ts && world.output_lines_ts.length > 0) {
+                        // Use output_lines_ts if available (has timestamps)
                         world.output_lines = world.output_lines_ts;
                     } else if (world.output_lines) {
                         // Convert plain strings to objects with current timestamp
@@ -1934,6 +1993,7 @@
                     // (server returned fewer lines than requested) - stops phase 2
                     // from re-queuing a world that has nothing left to give.
                     world._backfill_exhausted = false;
+                    world._gapFillPending = false;
                     if (world.output_lines.length > 0) {
                         let minSeq = Infinity;
                         for (const line of world.output_lines) {
@@ -2320,6 +2380,7 @@
                         if (msg.flush && msg.world_index === currentWorldIndex) {
                             renderOutput();
                         }
+                        if (appendedLineCount > 0) scheduleWorldCacheSave(msg.world_index);
                     }
                 }
                 break;
@@ -2619,7 +2680,17 @@
                         applyWrapspace(wrapspace); // pure CSS reflow, no re-render needed
                     }
                     if (msg.settings.remote_initial_lines !== undefined) {
+                        const remoteLinesChanged = remoteInitialLines !== msg.settings.remote_initial_lines;
                         remoteInitialLines = msg.settings.remote_initial_lines;
+                        // Re-trim the persistent scrollback cache to the new cap right
+                        // away (scheduleWorldCacheSave reads remoteInitialLines fresh
+                        // when it actually writes) rather than waiting for the next
+                        // line of output to happen to trigger a save - otherwise a
+                        // lowered setting wouldn't shrink an existing cache until a
+                        // world got new traffic.
+                        if (remoteLinesChanged) {
+                            worlds.forEach((w, idx) => { if (w && w.name) scheduleWorldCacheSave(idx); });
+                        }
                     }
                     if (msg.settings.gui_transparency !== undefined) {
                         applyTransparency(msg.settings.gui_transparency);
@@ -2913,17 +2984,52 @@
                 break;
 
             case 'ScrollbackLines':
+                // A world with _gapFillPending is catching up after a reconnect (see
+                // requestGapFill()) - these lines are NEWER than what we have (an
+                // after_seq request), so they're appended and deduped, and the
+                // response is handled entirely separately from the ordinary phase 1/2
+                // backfill machinery below (no queue, no progress bar - a gap-fill is
+                // normally tiny and finishes in one or two requests).
+                if (msg.world_index !== undefined && worlds[msg.world_index] && worlds[msg.world_index]._gapFillPending) {
+                    const world = worlds[msg.world_index];
+                    const wasBottom = isAtBottom();
+                    const container = elements.outputContainer;
+                    const oldScrollHeight = container.scrollHeight;
+                    let appended = false;
+
+                    (msg.lines || []).forEach((line) => {
+                        if (line.seq === undefined || !world._max_seq || line.seq > world._max_seq) {
+                            world.output_lines.push(line);
+                            if (line.seq !== undefined) world._max_seq = Math.max(world._max_seq || 0, line.seq);
+                            appended = true;
+                        }
+                    });
+
+                    if (appended && msg.world_index === currentWorldIndex) {
+                        if (!wasBottom || grepRegex) {
+                            renderOutput();
+                            const newScrollHeight = container.scrollHeight;
+                            container.scrollTop += (newScrollHeight - oldScrollHeight);
+                        } else {
+                            scheduleCurrentWorldRepaint();
+                        }
+                    }
+                    if (appended) scheduleWorldCacheSave(msg.world_index);
+
+                    if (msg.backfill_complete) {
+                        world._gapFillPending = false;
+                    } else {
+                        // Gap is bigger than one chunk - keep pulling from the new
+                        // high-water mark until the daemon says we're caught up.
+                        requestGapFill(msg.world_index);
+                    }
+                    break;
+                }
+
                 // Response to RequestScrollback - prepend lines to output
                 if (msg.world_index !== undefined && worlds[msg.world_index] && msg.lines && msg.lines.length > 0) {
                     const world = worlds[msg.world_index];
                     const wasBottom = isAtBottom();
-                    // Whether this world already had enough lines to fill the viewport
-                    // BEFORE this chunk - only then is newly-prepended content genuinely
-                    // off-screen above the fold. A world that's still empty/near-empty
-                    // (e.g. mid phase 1 backfill) is trivially "at bottom" with nothing to
-                    // scroll, but the new content directly extends what should be visible,
-                    // so that case must always render regardless of wasBottom.
-                    const hadFullScreen = world.output_lines.length >= getVisibleLineCount();
                     const container = elements.outputContainer;
                     const oldScrollHeight = container.scrollHeight;
 
@@ -2937,19 +3043,29 @@
                     }
                     if (minSeq !== Infinity) world._oldest_seq = minSeq;
 
-                    // Re-render if the user has scrolled up into history, in grep mode, or
-                    // this world didn't already fill the viewport (so the new lines aren't
-                    // actually off-screen). Backfill lines are old content at the top - not
-                    // visible when genuinely at bottom of a long buffer - so skipping
-                    // renderOutput() there avoids restarting CSS animations (e.g. blink).
-                    if (msg.world_index === currentWorldIndex && (!wasBottom || grepRegex || !hadFullScreen)) {
-                        renderOutput();
-                        // Adjust scrollTop by the height difference (new content at top)
-                        {
+                    if (msg.world_index === currentWorldIndex) {
+                        if (!wasBottom || grepRegex) {
+                            // Scrolled up into history, or grep mode: the user needs to
+                            // see the new content immediately, so render synchronously
+                            // and correct scrollTop for the height added above.
+                            renderOutput();
                             const newScrollHeight = container.scrollHeight;
                             container.scrollTop += (newScrollHeight - oldScrollHeight);
+                        } else {
+                            // At the bottom: the backfilled lines are old content added
+                            // above the fold, not currently visible, so there's no rush
+                            // to paint this exact chunk - but skipping the repaint
+                            // entirely (as this used to do whenever the world already had
+                            // a full screen) left the current/initial world's history
+                            // unreachable by scrolling until something else forced a
+                            // renderOutput() (e.g. a world switch). Coalesce instead: a
+                            // fast backfill can deliver many chunks in quick succession,
+                            // and rebuilding the DOM on every single one would restart
+                            // CSS animations (e.g. blink) on whatever's currently visible.
+                            scheduleCurrentWorldRepaint();
                         }
                     }
+                    scheduleWorldCacheSave(msg.world_index);
                 }
                 // Continue or finish backfill.
                 // Phase 1 is one chunk per world - always advance to the next
@@ -3099,6 +3215,22 @@
         backfillPhase1Target = Math.max(75, getVisibleLineCount());
         backfillTotalTarget = Math.max(remoteInitialLines || 100, backfillPhase1Target);
 
+        // A world hydrated from a local buffer (in-memory reconnect, or the
+        // persistent cache on a cold start - see the InitialState handler's
+        // _hydratedFromLocal flag) doesn't need a backfill at all: it already has
+        // its history, it just needs to catch up on whatever accumulated on the
+        // server since we last had it. Gap-fill it directly instead of queuing.
+        // A world that's NOT hydrated from local (fresh connect, no cache) always
+        // goes through the normal queue below, even if InitialState front-loaded
+        // it with real lines - those are the newest lines, not a local buffer to
+        // extend, so requesting an "everything since" gap-fill for it would be a
+        // wasted round trip (the server has nothing newer to send).
+        worlds.forEach((world, idx) => {
+            if (world._hydratedFromLocal && world._max_seq) {
+                requestGapFill(idx);
+            }
+        });
+
         // Build the phase 1 queue: current world first, then others. Only
         // worlds still short of a screenful belong in phase 1 - a world that
         // already has >= backfillPhase1Target lines locally (but still has
@@ -3109,7 +3241,10 @@
         // reaching it, even though the world has real history server-side) -
         // requestBackfillChunk sends before_seq: null in that case, which the
         // daemon already handles as "send the last N lines". Do not skip these
-        // worlds here, or they stay permanently empty.
+        // worlds here, or they stay permanently empty. Hydrated-from-local worlds
+        // are excluded here too (handled above) unless they're still short of a
+        // screenful even after being seeded locally, in which case they still
+        // want older history on top of the gap-fill.
         const queue = [];
         worlds.forEach((world, idx) => {
             const total = world.total_output_lines || 0;
@@ -3232,6 +3367,167 @@
             count: count,
             before_seq: world._oldest_seq
         });
+    }
+
+    // ============================================================================
+    // Reconnect gap-fill and bounded scrollback cache
+    // ============================================================================
+    // Two complementary mechanisms avoid re-downloading the whole scrollback on
+    // reconnect:
+    //  - In-memory: the InitialState handler no longer wipes worlds[] on a resync
+    //    (see the hasReceivedInitialState branch there) - it merges by name and
+    //    keeps each world's existing output_lines/_max_seq. This alone covers the
+    //    common case on Android, where backgrounding/resuming/network changes
+    //    reconnect the WebSocket but never destroy the WebView's JS heap.
+    //  - Persistent (IndexedDB): a bounded per-world cache, capped at
+    //    remoteInitialLines lines, so a cold start / full page reload / process
+    //    death can also gap-fill instead of doing a full backfill. Capped so it
+    //    never grows unbounded no matter how long a world has been open.
+    // Both funnel through requestGapFill(), which issues a RequestScrollback with
+    // after_seq (the newest seq we already have - added alongside the existing
+    // before_seq direction, see websocket.rs) instead of a full backfill. Because
+    // per-world seq numbers are monotonic and persisted across daemon restarts
+    // and /flush (see RequestScrollback in daemon.rs/main.rs), an after_seq
+    // request is always correct - there's no discontinuity case to guard against.
+
+    const WORLD_CACHE_DB_NAME = 'clay-scrollback-cache';
+    const WORLD_CACHE_STORE = 'worlds';
+    let worldCacheDbPromise = null;
+    let worldCacheServerId = null;
+    // Populated best-effort by preloadWorldCacheForServer(), which is called from
+    // init() - well before InitialState typically arrives. A world not in here by
+    // the time InitialState is processed just falls back to a normal backfill;
+    // this is an optimization, never a correctness dependency.
+    let worldCacheLoaded = {};
+
+    // Identify "which server" for the cache key. On Android, the WebSocket may
+    // connect to a different local port on every SSH-tunnel restart (the tunnel
+    // uses a random ephemeral local port), so the actually-connected host:port is
+    // not a stable key. The user-configured remote host (SSH target, or the
+    // direct host when not tunneling) is stable across those restarts and is
+    // what "the same server" means to the user. Non-Android clients have no such
+    // indirection, so the page's own origin is already stable.
+    function getServerIdentity() {
+        try {
+            if (window.Android && typeof window.Android.getConnectionInfo === 'function') {
+                const info = JSON.parse(window.Android.getConnectionInfo());
+                const host = info.remoteHost || info.localHost || 'unknown';
+                return host + ':' + (info.port || '');
+            }
+        } catch (e) { /* fall through to origin-based identity */ }
+        return (typeof location !== 'undefined' && location.host) ? location.host : 'local';
+    }
+
+    function openWorldCacheDb() {
+        if (worldCacheDbPromise) return worldCacheDbPromise;
+        worldCacheDbPromise = new Promise((resolve) => {
+            if (typeof indexedDB === 'undefined') { resolve(null); return; }
+            try {
+                const req = indexedDB.open(WORLD_CACHE_DB_NAME, 1);
+                req.onupgradeneeded = function() {
+                    const db = req.result;
+                    if (!db.objectStoreNames.contains(WORLD_CACHE_STORE)) {
+                        db.createObjectStore(WORLD_CACHE_STORE);
+                    }
+                };
+                req.onsuccess = function() { resolve(req.result); };
+                req.onerror = function() { resolve(null); };
+            } catch (e) { resolve(null); }
+        });
+        return worldCacheDbPromise;
+    }
+
+    function worldCacheKey(serverId, worldName) {
+        return serverId + '|' + worldName;
+    }
+
+    // Load every cached world for this server in one pass (world names aren't
+    // known yet at connect time - InitialState hasn't arrived). Call this as
+    // early as possible so the read has time to finish before InitialState is
+    // processed; it's best-effort and never blocks anything.
+    function preloadWorldCacheForServer(serverId) {
+        worldCacheServerId = serverId;
+        worldCacheLoaded = {};
+        openWorldCacheDb().then((db) => {
+            if (!db) return;
+            try {
+                const tx = db.transaction(WORLD_CACHE_STORE, 'readonly');
+                const store = tx.objectStore(WORLD_CACHE_STORE);
+                const prefix = serverId + '|';
+                const range = IDBKeyRange.bound(prefix, prefix + '￿');
+                const req = store.openCursor(range);
+                req.onsuccess = function() {
+                    const cursor = req.result;
+                    if (!cursor) return;
+                    const worldName = String(cursor.primaryKey).slice(prefix.length);
+                    if (cursor.value && cursor.value.lines && cursor.value.lines.length > 0) {
+                        worldCacheLoaded[worldName] = cursor.value;
+                    }
+                    cursor.continue();
+                };
+            } catch (e) { /* ignore - cache is best-effort */ }
+        });
+    }
+
+    // Debounced, capped save of a world's tail to the cache. Capped at
+    // remoteInitialLines (the same setting that bounds the backfill target) so
+    // the cache can never grow past what a fresh connect would download anyway.
+    let worldCacheSaveTimers = {};
+    const WORLD_CACHE_SAVE_DEBOUNCE_MS = 2000;
+    function scheduleWorldCacheSave(worldIndex) {
+        const world = worlds[worldIndex];
+        if (!world || !world.name || !worldCacheServerId) return;
+        const name = world.name;
+        if (worldCacheSaveTimers[name]) clearTimeout(worldCacheSaveTimers[name]);
+        worldCacheSaveTimers[name] = setTimeout(function() {
+            delete worldCacheSaveTimers[name];
+            const w = worlds[worldIndex];
+            if (!w || w.name !== name) return; // world list changed under us
+            const cap = Math.max(10, remoteInitialLines || 100);
+            const lines = (w.output_lines || []).slice(-cap);
+            const maxSeq = w._max_seq || 0;
+            openWorldCacheDb().then((db) => {
+                if (!db) return;
+                try {
+                    const tx = db.transaction(WORLD_CACHE_STORE, 'readwrite');
+                    tx.objectStore(WORLD_CACHE_STORE).put({ lines: lines, maxSeq: maxSeq }, worldCacheKey(worldCacheServerId, name));
+                } catch (e) { /* ignore */ }
+            });
+        }, WORLD_CACHE_SAVE_DEBOUNCE_MS);
+    }
+
+    // Issue a gap-fill request for a world that already has a buffer (from
+    // memory or the persistent cache), asking only for lines newer than its
+    // highest known seq. Falls back to a normal backfill if the world has
+    // nothing to gap-fill from.
+    function requestGapFill(worldIndex) {
+        const world = worlds[worldIndex];
+        if (!world) return;
+        if (!world._max_seq) {
+            queueNormalBackfill(worldIndex);
+            return;
+        }
+        world._gapFillPending = true;
+        send({
+            type: 'RequestScrollback',
+            world_index: worldIndex,
+            count: BACKFILL_PHASE2_CHUNK_SIZE,
+            after_seq: world._max_seq
+        });
+    }
+
+    // Fold a single world into the normal backfill queue (used as a fallback
+    // when gap-fill isn't applicable). Safe to call whether or not a backfill
+    // pass is already under way for other worlds.
+    function queueNormalBackfill(worldIndex) {
+        if (!backfillWorldQueue.includes(worldIndex)) {
+            backfillWorldQueue.push(worldIndex);
+        }
+        if (!backfillInProgress) {
+            backfillInProgress = true;
+            updateScrollbackProgress();
+            backfillNextWorld();
+        }
     }
 
     // Try to authenticate with saved auth key (passwordless)
@@ -6474,15 +6770,15 @@
         setupArchive = scrollbackEnabled;
         setupInputHeightValue = inputHeight;
         setupWrapspace = wrapspace;
-        if (elements.setupRemoteLinesInput) {
-            elements.setupRemoteLinesInput.value = remoteInitialLines;
-        }
         setupGuiTheme = guiTheme;
         setupColorOffset = colorOffsetPercent;
         setupTransparency = guiTransparency;
         // Load web edit state
         editPortMode = !httpEnabled ? 'disabled' : (httpPort === 9000 ? '9000' : 'custom');
         editCustomCert = tlsConfigured;
+        if (elements.setupRemoteLinesInput) {
+            elements.setupRemoteLinesInput.value = remoteInitialLines;
+        }
         // Load font edit state
         fontEditName = fontName;
         fontEditSizePhone = Math.round(webFontSizePhone);
@@ -6721,9 +7017,6 @@
         if (setupColorOffset > 100) setupColorOffset = 100;
         if (setupWrapspace < 0) setupWrapspace = 0;
         if (setupWrapspace > 20) setupWrapspace = 20;
-        var setupRemoteInitialLines = parseInt(elements.setupRemoteLinesInput ? elements.setupRemoteLinesInput.value : '', 10);
-        if (!Number.isFinite(setupRemoteInitialLines)) setupRemoteInitialLines = 100;
-        setupRemoteInitialLines = Math.max(10, Math.min(5000, setupRemoteInitialLines));
 
         moreModeEnabled = setupMoreMode;
         worldSwitchMode = setupWorldSwitchMode;
@@ -6737,7 +7030,6 @@
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
         wrapspace = setupWrapspace;
-        remoteInitialLines = setupRemoteInitialLines;
         applyTheme(guiTheme);
         setInputHeight(setupInputHeightValue);
         applyTransparency(setupTransparency);
@@ -6754,6 +7046,10 @@
             tlsConfigured = editCustomCert;
             wsCertFile = editCustomCert ? elements.webCertFile.value : '';
             wsKeyFile = editCustomCert ? elements.webKeyFile.value : '';
+
+            var setupRemoteInitialLines = parseInt(elements.setupRemoteLinesInput ? elements.setupRemoteLinesInput.value : '', 10);
+            if (!Number.isFinite(setupRemoteInitialLines)) setupRemoteInitialLines = 100;
+            remoteInitialLines = Math.max(10, Math.min(5000, setupRemoteInitialLines));
         }
 
         // Save font settings

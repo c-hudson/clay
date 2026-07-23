@@ -1858,12 +1858,12 @@ pub async fn handle_daemon_ws_message(
                 }
             }
         }
-        WsMessage::RequestScrollback { world_index, count, before_seq } => {
+        WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
             // Console client requests scrollback from master
             if world_index < app.worlds.len() {
                 let world = &app.worlds[world_index];
 
-                // Find lines to send based on before_seq
+                // Find lines to send based on before_seq/after_seq
                 let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
                     // Send lines with seq < before_seq (older than what client has)
                     let eligible: Vec<_> = world.output_lines.iter()
@@ -1888,8 +1888,35 @@ pub async fn handle_daemon_ws_message(
                             }
                         })
                         .collect()
+                } else if let Some(seq) = after_seq {
+                    // Reconnect gap-fill: the client kept its buffer across the
+                    // reconnect and only wants lines newer than the highest seq it
+                    // already has. Oldest-first (unlike before_seq's newest-first
+                    // slice) so the client can append+dedup in order.
+                    let eligible: Vec<_> = world.output_lines.iter()
+                        .filter(|l| l.seq > seq)
+                        .collect();
+                    let take = count.min(eligible.len());
+                    eligible[..take].iter()
+                        .map(|line| {
+                            let ts = line.timestamp
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            TimestampedLine {
+                                text: line.text.clone(),
+                                ts,
+                                gagged: line.gagged,
+                                from_server: line.from_server,
+                                seq: line.seq,
+                                highlight_color: line.highlight_color.clone(),
+                                marked_new: line.marked_new,
+                                from_archive: line.from_archive,
+                            }
+                        })
+                        .collect()
                 } else {
-                    // No before_seq - send last N lines (backwards compatible)
+                    // No before_seq/after_seq - send last N lines (backwards compatible)
                     let total_lines = world.output_lines.len();
                     let start = total_lines.saturating_sub(count);
                     world.output_lines[start..].iter()
@@ -1912,6 +1939,11 @@ pub async fn handle_daemon_ws_message(
                         .collect()
                 };
 
+                // Works for both directions: before_seq slices the newest `count`
+                // eligible lines (so `lines.len() < count` means we ran out of older
+                // history); after_seq takes `count.min(eligible.len())` (so
+                // `lines.len() < count` means we returned every newer line available,
+                // i.e. the gap is fully closed).
                 let backfill_complete = lines.len() < count;
                 app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
                     world_index,

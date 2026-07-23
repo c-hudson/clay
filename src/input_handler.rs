@@ -640,7 +640,6 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.settings.wrapspace = new_wrapspace;
                     app.needs_output_redraw = true;
                 }
-                app.settings.remote_initial_lines = settings.remote_initial_lines.clamp(10, 5000) as u16;
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }
@@ -659,6 +658,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     def.custom_data.insert("custom_cert".to_string(), settings.custom_cert.to_string());
                     def.custom_data.insert("ws_cert_file".to_string(), settings.ws_cert_file);
                     def.custom_data.insert("ws_key_file".to_string(), settings.ws_key_file);
+                    def.custom_data.insert("remote_initial_lines".to_string(), settings.remote_initial_lines.to_string());
                     app.popup_manager.open(def);
                 } else {
                     apply_web_settings(app, &settings);

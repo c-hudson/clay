@@ -337,6 +337,7 @@ pub(crate) async fn run_grep_client(
                 world_index,
                 count: 10000,
                 before_seq: None,
+                after_seq: None,
             });
         }
 
@@ -373,6 +374,7 @@ pub(crate) async fn run_grep_client(
                                         world_index,
                                         count: 10000,
                                         before_seq: min_seq,
+                                        after_seq: None,
                                     });
                                 }
                             }
@@ -1262,6 +1264,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     world_index: world_idx,
                                     count,
                                     before_seq,
+                                    after_seq: None,
                                 });
                             }
                             // Check if an /update was requested via ExecuteLocalCommand
@@ -1351,6 +1354,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                         world_index: world_idx,
                         count,
                         before_seq,
+                        after_seq: None,
                     });
                 }
             }
@@ -1510,7 +1514,6 @@ pub(crate) fn handle_remote_client_key(
                 // master (which owns rendering for its own TUI) applies its own redraw when
                 // it processes the resulting UpdateGlobalSettings message below.
                 app.settings.wrapspace = settings.wrapspace.clamp(0, 20) as u8;
-                app.settings.remote_initial_lines = settings.remote_initial_lines.clamp(10, 5000) as u16;
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -1527,7 +1530,9 @@ pub(crate) fn handle_remote_client_key(
                     color_offset_percent: app.settings.color_offset_percent,
                     // app.settings.wrapspace was already updated from the popup above.
                     wrapspace: app.settings.wrapspace,
-                    // app.settings.remote_initial_lines was already updated from the popup above.
+                    // remote_initial_lines now lives on the web popup, not setup — this
+                    // message always carries the current value regardless of which popup
+                    // last changed it.
                     remote_initial_lines: app.settings.remote_initial_lines,
                     input_height: app.input_height,
                     font_name: app.settings.font_name.clone(),
@@ -1573,6 +1578,7 @@ pub(crate) fn handle_remote_client_key(
                     def.custom_data.insert("custom_cert".to_string(), settings.custom_cert.to_string());
                     def.custom_data.insert("ws_cert_file".to_string(), settings.ws_cert_file);
                     def.custom_data.insert("ws_key_file".to_string(), settings.ws_key_file);
+                    def.custom_data.insert("remote_initial_lines".to_string(), settings.remote_initial_lines.to_string());
                     app.popup_manager.open(def);
                 } else {
                     apply_remote_web_settings(app, &settings, ws_tx);
@@ -2131,6 +2137,7 @@ pub(crate) fn dispatch_remote_action(
                     world_index: app.current_world_index,
                     count: scroll_amount.max(1),
                     before_seq,
+                    after_seq: None,
                 });
             }
             app.needs_output_redraw = true;
@@ -2304,6 +2311,7 @@ pub(crate) fn apply_remote_web_settings(
         app.settings.websocket_cert_file = String::new();
         app.settings.websocket_key_file = String::new();
     }
+    app.settings.remote_initial_lines = settings.remote_initial_lines.clamp(10, 5000) as u16;
 
     let _ = ws_tx.send(crate::websocket::WsMessage::UpdateGlobalSettings {
         more_mode_enabled: app.settings.more_mode_enabled,
@@ -2318,7 +2326,9 @@ pub(crate) fn apply_remote_web_settings(
         gui_transparency: app.settings.gui_transparency,
         color_offset_percent: app.settings.color_offset_percent,
         wrapspace: app.settings.wrapspace,  // unchanged — this function only touches web settings
-        remote_initial_lines: app.settings.remote_initial_lines,  // unchanged — this function only touches web settings
+        // app.settings.remote_initial_lines was already updated from the popup above —
+        // Remote Lines now lives on the web popup.
+        remote_initial_lines: app.settings.remote_initial_lines,
         input_height: app.input_height,
         font_name: app.settings.font_name.clone(),
         font_size: app.settings.font_size,

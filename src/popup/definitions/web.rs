@@ -20,6 +20,7 @@ pub const WEB_FIELD_WS_CERT_FILE: FieldId = FieldId(8);
 pub const WEB_FIELD_WS_KEY_FILE: FieldId = FieldId(9);
 pub const WEB_FIELD_AUTH_KEY: FieldId = FieldId(10);
 pub const WEB_FIELD_WEB_PATH: FieldId = FieldId(11);
+pub const WEB_FIELD_REMOTE_LINES: FieldId = FieldId(12);
 
 // Button IDs
 pub const WEB_BTN_SAVE: ButtonId = ButtonId(1);
@@ -56,6 +57,7 @@ pub fn create_web_popup(
     ws_cert_file: &str,
     ws_key_file: &str,
     auth_key: &str,
+    remote_initial_lines: i64,
 ) -> PopupDefinition {
     let port_selected = if !http_enabled {
         "disabled"
@@ -83,6 +85,11 @@ pub fn create_web_popup(
             WEB_FIELD_WEB_PATH,
             "Web Path",
             FieldKind::text(web_path),
+        ))
+        .with_field(Field::new(
+            WEB_FIELD_REMOTE_LINES,
+            "Remote Lines",
+            FieldKind::text(remote_initial_lines.to_string()),
         ))
         .with_field(Field::new(
             WEB_FIELD_WS_PASSWORD,
@@ -180,6 +187,11 @@ fn web_help_text() -> Vec<String> {
         "  a knock, non-localhost devices need to be on the WS",
         "  Allow List.",
         "",
+        "Remote Lines: Number of scrollback lines sent to web/",
+        "  remote clients on initial connect (10-5000, default",
+        "  100). Older history is loaded on demand as you scroll",
+        "  up.",
+        "",
         "Password: Required for WebSocket clients (web,",
         "  mobile, remote console) to connect. Accepted",
         "  from any address when the Allow List is empty; when",
@@ -271,18 +283,19 @@ mod tests {
             true, 9000, "clay",
             "secret", "",
             "/path/to/cert", "/path/to/key",
-            "testkey123",
+            "testkey123", 100,
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("web"));
         assert_eq!(state.definition.title, "Web Settings");
+        assert_eq!(state.definition.fields.len(), 10);
     }
 
     #[test]
     fn test_web_popup_port_selection() {
         // Disabled
-        let def = create_web_popup(false, 9000, "clay", "", "", "", "", "");
+        let def = create_web_popup(false, 9000, "clay", "", "", "", "", "", 100);
         assert_eq!(
             def.get_field(WEB_FIELD_PORT).and_then(|f| if let FieldKind::Select { options, selected_index } = &f.kind {
                 Some(options[*selected_index].value.clone())
@@ -292,32 +305,39 @@ mod tests {
         assert!(!def.get_field(WEB_FIELD_CUSTOM_PORT).unwrap().visible);
 
         // Default port
-        let def = create_web_popup(true, 9000, "clay", "", "", "", "", "");
+        let def = create_web_popup(true, 9000, "clay", "", "", "", "", "", 100);
         assert!(!def.get_field(WEB_FIELD_CUSTOM_PORT).unwrap().visible);
 
         // Custom port
-        let def = create_web_popup(true, 1234, "clay", "", "", "", "", "");
+        let def = create_web_popup(true, 1234, "clay", "", "", "", "", "", 100);
         assert!(def.get_field(WEB_FIELD_CUSTOM_PORT).unwrap().visible);
     }
 
     #[test]
     fn test_web_popup_cert_visibility() {
         // No custom cert configured — fields hidden
-        let def = create_web_popup(true, 9000, "clay", "secret", "", "", "", "");
+        let def = create_web_popup(true, 9000, "clay", "secret", "", "", "", "", 100);
         let state = PopupState::new(def);
         assert!(!state.field(WEB_FIELD_WS_CERT_FILE).unwrap().visible);
         assert!(!state.field(WEB_FIELD_WS_KEY_FILE).unwrap().visible);
 
         // Custom cert configured — fields visible
-        let def = create_web_popup(true, 9000, "clay", "secret", "", "/c", "/k", "");
+        let def = create_web_popup(true, 9000, "clay", "secret", "", "/c", "/k", "", 100);
         let state = PopupState::new(def);
         assert!(state.field(WEB_FIELD_WS_CERT_FILE).unwrap().visible);
         assert!(state.field(WEB_FIELD_WS_KEY_FILE).unwrap().visible);
     }
 
     #[test]
+    fn test_web_popup_remote_lines() {
+        let def = create_web_popup(true, 9000, "clay", "", "", "", "", "", 250);
+        let state = PopupState::new(def);
+        assert_eq!(state.get_text(WEB_FIELD_REMOTE_LINES), Some("250"));
+    }
+
+    #[test]
     fn test_web_popup_auth_key_readonly() {
-        let def = create_web_popup(true, 9000, "clay", "", "", "", "", "testkey");
+        let def = create_web_popup(true, 9000, "clay", "", "", "", "", "testkey", 100);
         let field = def.get_field(WEB_FIELD_AUTH_KEY).unwrap();
         assert!(!field.is_focusable(), "Auth Key must be read-only (not focusable)");
     }

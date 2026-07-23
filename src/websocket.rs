@@ -338,7 +338,16 @@ pub enum WsMessage {
     CycleWorld { direction: String },  // "up" or "down"
     /// Request scrollback lines from master (console clients only)
     /// before_seq: oldest sequence number the client has (server sends lines with seq < before_seq)
-    RequestScrollback { world_index: usize, count: usize, #[serde(default)] before_seq: Option<u64> },
+    /// after_seq: newest sequence number the client already has (server sends lines with
+    /// seq > after_seq) - used for the reconnect gap-fill path, where the client kept its
+    /// buffer across the reconnect and only wants what accumulated while it was away.
+    /// At most one of before_seq/after_seq should be set; before_seq takes precedence.
+    RequestScrollback {
+        world_index: usize,
+        count: usize,
+        #[serde(default)] before_seq: Option<u64>,
+        #[serde(default)] after_seq: Option<u64>,
+    },
 
     // Remote instance handling (server -> client)
     /// Batch of output lines for a world (initial or incremental)
