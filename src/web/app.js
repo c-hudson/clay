@@ -59,6 +59,8 @@
         moreCount: document.getElementById('more-count'),
         activityIndicator: document.getElementById('activity-indicator'),
         activityCount: document.getElementById('activity-count'),
+        statusScrollback: document.getElementById('status-scrollback'),
+        statusScrollbackPct: document.getElementById('status-scrollback-pct'),
         statusTime: document.getElementById('status-time'),
         statusBar: document.getElementById('status-bar'),
         inputContainer: document.getElementById('input-container'),
@@ -2967,6 +2969,7 @@
                         }
                     }
                 }
+                updateScrollbackProgress();
                 setTimeout(function() {
                     backfillNextWorld();
                 }, backfillPhase === 1 ? 0 : BACKFILL_DELAY_MS);
@@ -3122,6 +3125,7 @@
 
         backfillWorldQueue = queue;
         backfillInProgress = true;
+        updateScrollbackProgress();
         // Delay before first request to let UI settle
         setTimeout(function() {
             if (backfillWorldQueue.length === 0) {
@@ -3142,6 +3146,7 @@
             }
             backfillInProgress = false;
             backfillCurrentWorld = null;
+            updateScrollbackProgress();
             return;
         }
         backfillCurrentWorld = backfillWorldQueue.shift();
@@ -3167,10 +3172,41 @@
         if (queue.length === 0) {
             backfillInProgress = false;
             backfillCurrentWorld = null;
+            updateScrollbackProgress();
             return;
         }
         backfillWorldQueue = queue;
         backfillNextWorld();
+    }
+
+    // Aggregate scrollback-download indicator for the status bar - shows while
+    // backfillInProgress is true (spans both phases, see startBackfill/
+    // startBackfillPhase2/backfillNextWorld above), hides the moment it goes
+    // false (backfill fully drained). Global across all worlds, not just the
+    // current one, so it doesn't jump around as you switch worlds mid-backfill.
+    // Percentage is floored to a multiple of 10, so it never claims more
+    // progress than has actually landed.
+    function updateScrollbackProgress() {
+        if (!elements.statusScrollback) return;
+        if (!backfillInProgress) {
+            elements.statusScrollback.style.display = 'none';
+            return;
+        }
+        let totalReceived = 0;
+        let totalGoal = 0;
+        worlds.forEach((world) => {
+            const goal = Math.min(backfillTotalTarget, world.total_output_lines || 0);
+            const received = world.output_lines ? world.output_lines.length : 0;
+            totalGoal += goal;
+            totalReceived += Math.min(received, goal);
+        });
+        if (totalGoal <= 0) {
+            elements.statusScrollback.style.display = 'none';
+            return;
+        }
+        const pct = Math.floor((totalReceived / totalGoal) * 100 / 10) * 10;
+        elements.statusScrollback.style.display = '';
+        elements.statusScrollbackPct.textContent = pct + '%';
     }
 
     // Send a RequestScrollback for the given world. Phase 1 asks for just enough
@@ -5715,6 +5751,8 @@
             elements.activityIndicator.style.display = 'none';
             elements.activityIndicator.title = '';
         }
+
+        updateScrollbackProgress();
     }
 
     // Update time (12-hour format H:MM, no AM/PM)
