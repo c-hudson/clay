@@ -1080,8 +1080,9 @@ public class MainActivity extends AppCompatActivity {
      * Deliberately a single attempt, not the 3x retry loop startSshProxyThenLoadInterface() uses
      * for the user-visible initial connect - this is a background self-heal; if it fails, the
      * next network-change or resume event tries again, avoiding a tight retry loop against a
-     * still-unreachable remote. Silent either way (Toast on success only, log-only on failure)
-     * per the initial-connect dialog being reserved for that user-visible flow.
+     * still-unreachable remote. Fully silent either way (log-only on both success and failure)
+     * per the initial-connect dialog being reserved for that user-visible flow - a self-heal
+     * shouldn't interrupt the user with a Toast every time the tunnel quietly recovers.
      */
     private void restartSshTunnel(boolean unconditional) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -1125,8 +1126,10 @@ public class MainActivity extends AppCompatActivity {
                 sshProxyManager = result.winner;
                 final int newPort = result.winner.getLocalPort();
                 android.util.Log.i("Clay", "SSH tunnel watchdog: restarted OK on port " + newPort);
+                // No Toast here (removed - a background self-heal shouldn't interrupt the user
+                // with a "reconnected" notification every time; the log line above is enough for
+                // debugging). Still need to hop onto the UI thread for the JS call below.
                 runOnUiThread(() -> {
-                    Toast.makeText(this, "SSH tunnel reconnected", Toast.LENGTH_SHORT).show();
                     if (webView != null) {
                         webView.evaluateJavascript(
                             "if (typeof updateSshTunnelPort === 'function') updateSshTunnelPort(" + newPort + ");",
