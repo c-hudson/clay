@@ -305,7 +305,6 @@
     let authKeyPending = false;  // True when trying key-based auth (to fall back to password on failure)
     let keyAuthFailed = false;   // Set after key rejection so reconnect skips key auth and shows password prompt
     let serverChallenge = '';  // Challenge from ServerHello for challenge-response auth
-    let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
 
@@ -1444,7 +1443,6 @@
         if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
         if (ws && !(ws instanceof WebSocket)) ws.readyState = WebSocket.CLOSED;
         authenticated = false;
-        hasReceivedInitialState = false;
         winnerAttemptId = null;
 
         if (reloadReconnect) {
@@ -1908,7 +1906,6 @@
                 actions = [];
                 splashLines = [];
                 authenticated = false;
-                hasReceivedInitialState = false;
                 // Clear output display
                 if (elements.output) {
                     elements.output.innerHTML = '';
@@ -1927,8 +1924,19 @@
                 // from before this InitialState - by world name - while `worlds`
                 // still refers to the old array. See requestGapFill()/
                 // scheduleWorldCacheSave() above for the other half of this.
+                //
+                // `worlds.length > 0` (checked here, before reassignment) is the
+                // signal for "do we have real prior session data worth preserving".
+                // `worlds` itself is never cleared except by an explicit
+                // user-initiated LoggedOut, never by a mere disconnect, so it
+                // correctly distinguishes a live resync from a genuinely fresh
+                // session - unlike a flag that gets reset on every disconnect
+                // (which is what used to gate this, and silently broke both this
+                // capture and world-focus preservation below on every reconnect).
                 var priorWorldsByName = {};
-                if (hasReceivedInitialState) {
+                var priorCurrentWorldName = (worlds[currentWorldIndex] && worlds[currentWorldIndex].name) || null;
+                var isResync = worlds.length > 0;
+                if (isResync) {
                     worlds.forEach((w) => {
                         if (w && w.name && w.output_lines && w.output_lines.length > 0) {
                             priorWorldsByName[w.name] = w;
@@ -1937,16 +1945,37 @@
                 }
 
                 worlds = msg.worlds || [];
-                // On first connection, use server's world index. On resync, preserve local world.
-                if (!hasReceivedInitialState) {
-                    currentWorldIndex = msg.current_world_index !== undefined ? msg.current_world_index : 0;
-                    hasReceivedInitialState = true;
-                } else {
-                    // Resync - preserve current world, but validate it's still valid
-                    if (currentWorldIndex >= worlds.length) {
-                        currentWorldIndex = Math.max(0, worlds.length - 1);
+
+                // Which world should be focused after this InitialState? Resolved by
+                // world name (the stable identity used elsewhere, e.g. the scrollback
+                // cache) rather than index, since indices can shift if worlds were
+                // added/removed on the server between sessions. Priority order:
+                //  1. The world we were actually looking at a moment ago, in memory -
+                //     covers any live reconnect where the JS heap survived (network
+                //     blip, Android background/resume, SSH tunnel restart).
+                //  2. The last world persisted to localStorage - covers a genuinely
+                //     cold start (page reload, app/process restart) where nothing
+                //     survived in memory. See persistLastActiveWorld() below.
+                //  3. The server's current_world_index - the only sane default for a
+                //     truly first-ever connection, where neither of the above exists.
+                // The URL-lock mechanism (lockedWorldName, checked further down) still
+                // force-switches after this and takes final precedence regardless.
+                var resolvedWorldIndex = -1;
+                if (isResync && priorCurrentWorldName) {
+                    resolvedWorldIndex = worlds.findIndex((w) => w.name === priorCurrentWorldName);
+                }
+                if (resolvedWorldIndex < 0) {
+                    var persistedWorldName = null;
+                    try { persistedWorldName = localStorage.getItem(lastWorldStorageKey()); } catch (e) {}
+                    if (persistedWorldName) {
+                        resolvedWorldIndex = worlds.findIndex((w) => w.name === persistedWorldName);
                     }
                 }
+                if (resolvedWorldIndex < 0) {
+                    resolvedWorldIndex = msg.current_world_index !== undefined ? msg.current_world_index : 0;
+                }
+                currentWorldIndex = Math.max(0, Math.min(resolvedWorldIndex, worlds.length - 1));
+
                 actions = msg.actions || [];
                 splashLines = msg.splash_lines || [];
                 // Reset client-side more-mode state (each client handles more locally)
@@ -3316,11 +3345,21 @@
 
     // Aggregate scrollback-download indicator for the status bar - shows while
     // backfillInProgress is true (spans both phases, see startBackfill/
-    // startBackfillPhase2/backfillNextWorld above), hides the moment it goes
-    // false (backfill fully drained). Global across all worlds, not just the
-    // current one, so it doesn't jump around as you switch worlds mid-backfill.
-    // Percentage is floored to a multiple of 10, so it never claims more
-    // progress than has actually landed.
+    // startBackfillPhase2/backfillNextWorld above) AND there's an actual gap left
+    // to fetch. Global across all worlds, not just the current one, so it doesn't
+    // jump around as you switch worlds mid-backfill.
+    // Percentage is floored to a multiple of 10, so it can only ever read "100%"
+    // at true completion - which means the moment the numbers reach that point,
+    // there's nothing left to communicate and the badge should already be gone,
+    // not still sitting on screen. Hiding is therefore driven directly by
+    // totalReceived reaching totalGoal, not by backfillInProgress alone: the
+    // phase-transition state machine (startBackfill's 500ms settle delay, the
+    // backfillNextWorld()/startBackfillPhase2() empty-queue checks) can take a
+    // while longer to formally flip that flag to false, and this indicator
+    // shouldn't visibly linger for that bookkeeping to catch up - it was most
+    // noticeable right after a reconnect where a world is already fully
+    // hydrated from memory/cache: the ratio reads 100% immediately, so it must
+    // hide immediately too.
     function updateScrollbackProgress() {
         if (!elements.statusScrollback) return;
         if (!backfillInProgress) {
@@ -3335,7 +3374,7 @@
             totalGoal += goal;
             totalReceived += Math.min(received, goal);
         });
-        if (totalGoal <= 0) {
+        if (totalGoal <= 0 || totalReceived >= totalGoal) {
             elements.statusScrollback.style.display = 'none';
             return;
         }
@@ -3375,8 +3414,8 @@
     // Two complementary mechanisms avoid re-downloading the whole scrollback on
     // reconnect:
     //  - In-memory: the InitialState handler no longer wipes worlds[] on a resync
-    //    (see the hasReceivedInitialState branch there) - it merges by name and
-    //    keeps each world's existing output_lines/_max_seq. This alone covers the
+    //    (see the `isResync`/`worlds.length > 0` check there) - it merges by name
+    //    and keeps each world's existing output_lines/_max_seq. This alone covers the
     //    common case on Android, where backgrounding/resuming/network changes
     //    reconnect the WebSocket but never destroy the WebView's JS heap.
     //  - Persistent (IndexedDB): a bounded per-world cache, capped at
@@ -3416,6 +3455,36 @@
             }
         } catch (e) { /* fall through to origin-based identity */ }
         return (typeof location !== 'undefined' && location.host) ? location.host : 'local';
+    }
+
+    // Last-active-world persistence: a synchronous localStorage read/write (unlike
+    // the IndexedDB scrollback cache above, this needs to resolve immediately when
+    // InitialState is processed, with no async preload/race to manage) so a cold
+    // start (page reload, app/process restart) can restore the world the user was
+    // actually looking at instead of defaulting to the server's current_world_index
+    // - see the InitialState handler. Scoped per-server via getServerIdentity(),
+    // same as the scrollback cache, so switching servers doesn't restore the wrong
+    // world. localStorage is already relied on transitively in this WebView (the
+    // scrollback cache's IndexedDB requires the same "DOM storage enabled" setting),
+    // so this doesn't introduce a new capability dependency - but every call is
+    // still wrapped in try/catch since storage can be unavailable or full and that
+    // must never break the app.
+    let lastPersistedWorldName = null;
+    function lastWorldStorageKey() {
+        return 'clay_last_world_' + getServerIdentity();
+    }
+    function persistLastActiveWorld() {
+        const world = worlds[currentWorldIndex];
+        const name = (world && world.name) || null;
+        if (name === lastPersistedWorldName) return;
+        lastPersistedWorldName = name;
+        try {
+            if (name) {
+                localStorage.setItem(lastWorldStorageKey(), name);
+            } else {
+                localStorage.removeItem(lastWorldStorageKey());
+            }
+        } catch (e) { /* storage unavailable/full - non-critical, ignore */ }
     }
 
     function openWorldCacheDb() {
@@ -6001,6 +6070,13 @@
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
 
+        // Remember the focused world so a cold start can restore it (see
+        // persistLastActiveWorld() / the InitialState handler). This is the single
+        // choke point called after every real focus change (switchWorldLocal,
+        // WorldSwitchResult, WorldRemoved, InitialState itself), so no other call
+        // site needs to persist separately. Cheap no-op unless the name changed.
+        persistLastActiveWorld();
+
         // Connection dot and world name
         if (world && world.name && world.was_connected) {
             elements.statusDot.className = 'status-dot' + (world.connected ? '' : ' off');
@@ -8337,7 +8413,6 @@
                     // Small delay then reconnect
                     setTimeout(function() {
                         authenticated = false;
-                        hasReceivedInitialState = false;
                         connect();
                     }, 500);
                 } else {
@@ -10189,7 +10264,6 @@
     window.onBackgroundTimeout = function() {
         debugLog('Background timeout - connection closed by Android');
         authenticated = false;
-        hasReceivedInitialState = false;
         connectionFailures = 0;
         winnerAttemptId = null;
         pendingAttempts.clear();
