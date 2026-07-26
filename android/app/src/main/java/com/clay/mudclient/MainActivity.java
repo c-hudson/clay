@@ -1085,6 +1085,13 @@ public class MainActivity extends AppCompatActivity {
      * shouldn't interrupt the user with a Toast every time the tunnel quietly recovers.
      */
     private void restartSshTunnel(boolean unconditional) {
+        restartSshTunnel(unconditional, false);
+    }
+
+    // isRetryAttempt=true marks the one bounded follow-up scheduled below on failure - it must
+    // NOT itself schedule another follow-up, or a genuinely unreachable remote turns this into
+    // an unbounded retry loop (exactly what the single-attempt design above is meant to avoid).
+    private void restartSshTunnel(boolean unconditional, boolean isRetryAttempt) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         if (!RUN_MODE_REMOTE.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))
             || !prefs.getBoolean(KEY_SSH_ENABLED, false)) {
@@ -1140,6 +1147,16 @@ public class MainActivity extends AppCompatActivity {
                 android.util.Log.w("Clay", "SSH tunnel watchdog: restart failed: " + result.errors);
                 // Silent - no dialog/toast for a background self-heal failure (that's reserved
                 // for the initial-connect flow); the next network-change or resume event retries.
+                if (!isRetryAttempt) {
+                    // One bounded follow-up, not a loop (isRetryAttempt above prevents this
+                    // retry from scheduling another) - covers the common "radio still
+                    // re-associating right at resume" case, where the very first attempt is
+                    // likely to fail transiently even though the remote is genuinely reachable.
+                    // Handler(Looper.getMainLooper()) can be constructed from any thread; the
+                    // posted callback itself runs on the main looper.
+                    new Handler(Looper.getMainLooper()).postDelayed(
+                        () -> restartSshTunnel(true, true), 8000);
+                }
             }
         }, "ClaySshWatchdogRestart").start();
     }
@@ -1313,6 +1330,14 @@ public class MainActivity extends AppCompatActivity {
                     // Close all WebSocket connections
                     for (NativeWebSocket ws : nativeWebSockets.values()) { ws.clearCallback(); ws.close(); }
                     nativeWebSockets.clear();
+
+                    // Also tear down the SSH tunnel (if any) rather than leaving it running
+                    // unmanaged for the whole backgrounded period - matches the "disconnecting
+                    // to save power" intent above, and avoids a zombie tunnel that isRunning()
+                    // would report as healthy on resume (see restartSshTunnel()'s doc comment).
+                    if (sshProxyManager != null) {
+                        sshProxyManager.stop();
+                    }
 
                     // Notify JavaScript that we disconnected due to timeout
                     if (webView != null) {
@@ -1668,7 +1693,22 @@ public class MainActivity extends AppCompatActivity {
             runModeFlowStarted = false;
             proceedAfterPermissions();
         } else {
-            loadInterface();
+            // SSH config is unchanged, but the tunnel itself may have died since it was last
+            // started (e.g. a background-idle drop) - buildVarInjectionScript() decides
+            // isSshProxyMode from sshProxyManager.isRunning() at page-load time, so calling
+            // loadInterface() straight through here would silently fall back to a direct
+            // (non-SSH) connection instead of reconnecting the tunnel. Route through the same
+            // 3x-retry startup flow a fresh launch uses instead, so resync repairs the tunnel
+            // (with its existing "Retry" dialog on genuine failure) rather than abandoning it.
+            boolean sshNeedsRestart = sshEnabledNow
+                && (sshProxyManager == null || !sshProxyManager.isRunning());
+            if (sshNeedsRestart) {
+                android.util.Log.i("Clay", "SSH enabled but tunnel not running, restarting before reload");
+                runModeFlowStarted = false;
+                proceedAfterPermissions();
+            } else {
+                loadInterface();
+            }
         }
     }
 

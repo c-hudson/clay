@@ -20,7 +20,7 @@ use crate::{
     WsMessage, WriteCommand, StreamReader, StreamWriter,
     Encoding, AutoConnectType,
     parse_command, get_version_string,
-    split_action_commands, substitute_action_args, execute_recall,
+    split_action_commands, substitute_action_args,
     find_invocable_action,
     format_duration_short, current_timestamp_secs,
     generate_test_music_notes,
@@ -2826,11 +2826,13 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         app.sync_tf_world_info();
                         match app.tf_engine.execute(&cmd_str) {
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                app.add_tf_output(&msg);
+                                let world_idx = app.current_world_index;
+                                app.emit_client_text(world_idx, &msg, false);
                             }
                             tf::TfCommandResult::Success(None) => {}
                             tf::TfCommandResult::Error(err) => {
-                                app.add_tf_output(&format!("✨ {}", err));
+                                let world_idx = app.current_world_index;
+                                app.emit_tf_error(world_idx, &err, false);
                             }
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(tx) = &app.current_world().command_tx {
@@ -2844,29 +2846,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 Box::pin(handle_command(&clay_cmd, app, event_tx.clone())).await;
                             }
                             tf::TfCommandResult::Recall(opts) => {
-                                let fallback = app.current_world_index;
-                                match app.recall_source_lines(&opts, fallback) {
-                                    Ok(output_lines) => {
-                                        let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                        if !opts.quiet {
-                                            if let Some(h) = header {
-                                                app.add_output(&h);
-                                            }
-                                        }
-                                        if matches.is_empty() {
-                                            app.add_output(&format!("No matches for '{}'", pattern_str));
-                                        } else {
-                                            for m in matches {
-                                                app.add_output(&m);
-                                            }
-                                        }
-                                        if !opts.quiet {
-                                            app.add_output("================= Recall end =================");
-                                        }
-                                    }
-                                    Err(e) => app.add_output(&format!("✨ {}", e)),
-                                }
+                                let world_idx = app.current_world_index;
+                                app.emit_recall(&opts, world_idx, false);
                             }
                             tf::TfCommandResult::Quote { lines, disposition, .. } => {
                                 match disposition {
@@ -2913,11 +2894,13 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 app.sync_tf_world_info();
                 match app.tf_engine.execute(cmd) {
                     tf::TfCommandResult::Success(Some(msg)) => {
-                        app.add_tf_output(&msg);
+                        let world_idx = app.current_world_index;
+                        app.emit_client_text(world_idx, &msg, false);
                     }
                     tf::TfCommandResult::Success(None) => {}
                     tf::TfCommandResult::Error(err) => {
-                        app.add_tf_output(&format!("Error: {}", err));
+                        let world_idx = app.current_world_index;
+                        app.emit_tf_error(world_idx, &err, false);
                     }
                     tf::TfCommandResult::SendToMud(text) => {
                         if let Some(tx) = &app.current_world().command_tx {
@@ -2930,29 +2913,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         app.add_output(&format!("Unknown command: {}", name));
                     }
                     tf::TfCommandResult::Recall(opts) => {
-                        let fallback = app.current_world_index;
-                        match app.recall_source_lines(&opts, fallback) {
-                            Ok(output_lines) => {
-                                let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                if !opts.quiet {
-                                    if let Some(h) = header {
-                                        app.add_output(&h);
-                                    }
-                                }
-                                if matches.is_empty() {
-                                    app.add_output(&format!("No matches for '{}'", pattern_str));
-                                } else {
-                                    for m in &matches {
-                                        app.add_output(m);
-                                    }
-                                }
-                                if !opts.quiet {
-                                    app.add_output("================= Recall end =================");
-                                }
-                            }
-                            Err(e) => app.add_output(&format!("✨ {}", e)),
-                        }
+                        let world_idx = app.current_world_index;
+                        app.emit_recall(&opts, world_idx, false);
                     }
                     tf::TfCommandResult::RepeatProcess(process) => {
                         app.tf_engine.processes.push(process);

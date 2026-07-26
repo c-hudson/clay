@@ -404,7 +404,17 @@ pub async fn establish_session(
     let addr = format!("{}:{}", target.host, target.ssh_port);
     let tcp = tokio::net::TcpStream::connect(&addr).await.map_err(SshError::Connect)?;
 
-    let config = Arc::new(client::Config::default());
+    // Default russh Config has no keepalive and no inactivity timeout, so a
+    // silently-blackholed connection (e.g. a mobile carrier NAT idle-dropping
+    // an SSH session while the app is backgrounded) is never detected - the
+    // session just hangs forever, and run_ssh_proxy_mode's liveness check
+    // below only fires lazily, on the next open_tunnel() attempt. An active
+    // keepalive makes deadness detectable within a bounded time (~4 missed
+    // 30s intervals, russh's own keepalive_max default of 3) instead of never.
+    let config = Arc::new(client::Config {
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        ..Default::default()
+    });
     let pin_key = host_key_pin_key(&target.host, target.ssh_port);
     let handler = TofuHandler { pin_key };
 

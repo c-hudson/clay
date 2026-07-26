@@ -1712,6 +1712,11 @@
             try { tunnelReady = window.Android.ensureSshTunnelReady(); } catch (e) {}
             if (!tunnelReady) {
                 debugLog('connect(): SSH tunnel not ready, deferring (restart in progress)');
+                // Match every other bail-out path in this function (see the setTimeout(connect, ...)
+                // calls above) - without this, a restart that Android never gets around to kicking
+                // off (or one whose updateSshTunnelPort() callback gets lost, e.g. to the
+                // forceReconnect() debounce) leaves nothing to ever call connect() again.
+                setTimeout(connect, 2000);
                 return;
             }
         }
@@ -2004,7 +2009,18 @@
                         // Cold start / full reload with a persistent cache hit: seed
                         // from the cache, then gap-fill (see startBackfill()) to pick
                         // up whatever arrived on the server while we were gone.
-                        world.output_lines = cachedWorld.lines.slice();
+                        //
+                        // One-time migration: caches written before the display-time
+                        // prefix change hold snapshot-baked "✨ " text (the server used
+                        // to bake it into build_initial_state's output). Post-change
+                        // snapshots never do, so this is a no-op from then on - strip
+                        // it here rather than bumping the cache DB version, which
+                        // would silently discard every user's cached scrollback.
+                        world.output_lines = cachedWorld.lines.map(l =>
+                            (l && l.from_server === false && typeof l.text === 'string'
+                                && l.text.startsWith(CLIENT_LINE_PREFIX))
+                                ? Object.assign({}, l, { text: l.text.slice(CLIENT_LINE_PREFIX.length) })
+                                : l);
                     } else if (world.output_lines_ts && world.output_lines_ts.length > 0) {
                         // Use output_lines_ts if available (has timestamps)
                         world.output_lines = world.output_lines_ts;
@@ -2389,9 +2405,9 @@
                                 } else if (!hasRealSeq && isFromServer) {
                                     // Released pending lines (seq=0, from_server=true) bypass local
                                     // more-mode to avoid flickering the More indicator
-                                    appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew);
+                                    appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer);
                                 } else {
-                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew);
+                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer);
                                 }
                             }
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
@@ -2912,9 +2928,10 @@
                 break;
 
             case 'ConnectionsListResponse':
-                // Prefix each line with the client-generated marker to match the console,
-                // which adds this at render time (rendering.rs) for from_server:false lines.
-                addRawOutputLines((msg.lines || []).map(line => '✨ ' + line), currentWorldIndex);
+                // addRawOutputLines stores these as from_server: false, so
+                // appendNewLine/renderOutput add the client-generated marker
+                // at display time - same as the console does.
+                addRawOutputLines(msg.lines || [], currentWorldIndex);
                 redisplayCurrentPrompt();
                 break;
 
@@ -3131,7 +3148,7 @@
     }
 
     // Handle incoming line with more-mode logic
-    function handleIncomingLine(text, ts, worldIndex, lineIndex, markedNew) {
+    function handleIncomingLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true) {
         if (text === undefined || text === null) return;
 
         const visibleLines = getVisibleLineCount();
@@ -3139,19 +3156,19 @@
 
         if (paused) {
             // Already paused, queue the line info
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer });
             updateStatusBar();
         } else if (moreModeEnabled && linesSincePause >= threshold) {
             // Trigger pause
             paused = true;
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer });
             // Scroll to bottom to show what we have so far
             scrollToBottom();
             updateStatusBar();
         } else {
             // Normal display - append the line
             linesSincePause++;
-            appendNewLine(text, ts, worldIndex, lineIndex, markedNew);
+            appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer);
         }
     }
 
@@ -3208,7 +3225,7 @@
         const released = pendingLines.splice(0, toRelease);
 
         released.forEach(item => {
-            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew);
+            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew, item.fromServer);
         });
 
         if (pendingLines.length === 0) {
@@ -4914,6 +4931,19 @@
         elements.output.innerHTML = htmlParts.join('<br>');
     }
 
+    // Display-time marker for client-generated lines. Mirrors
+    // rendering.rs::process_output_line (src/rendering.rs:400-406): the prefix
+    // is added AFTER the visually-empty early-return and BEFORE stripMudTag(),
+    // and is never stored. world.output_lines[].text, the IndexedDB cache,
+    // grep/filter matching, and the /quote backtick re-capture all stay
+    // prefix-free, exactly as OutputLine.text does on the Rust side.
+    const CLIENT_LINE_PREFIX = '✨ ';
+    function applyClientPrefix(text, fromServer) {
+        if (fromServer !== false) return text; // default true, like the Rust flag
+        if (!text || stripAnsiForFilter(text).trim() === '') return text; // is_visually_empty()
+        return CLIENT_LINE_PREFIX + text;
+    }
+
     function renderOutput() {
         const world = worlds[currentWorldIndex];
 
@@ -4970,6 +5000,7 @@
             const lineHighlightColor = typeof lineObj === 'object' ? lineObj.highlight_color : null;
             const lineMarkedNew = typeof lineObj === 'object' ? lineObj.marked_new : false;
             const lineFromArchive = typeof lineObj === 'object' ? lineObj.from_archive : false;
+            const lineFromServer = typeof lineObj === 'object' ? lineObj.from_server : true;
 
             // Skip gagged lines unless showTags is enabled (F2)
             if (lineGagged && !showTags) {
@@ -5000,7 +5031,8 @@
             // Format timestamp prefix if showTags is enabled
             const tsPrefix = showTags && lineTs ? `<span class="timestamp">${formatTimestamp(lineTs)}</span>` : '';
 
-            const strippedText = showTags ? cleanLine : stripMudTag(cleanLine);
+            const prefixedLine = applyClientPrefix(cleanLine, lineFromServer);
+            const strippedText = showTags ? prefixedLine : stripMudTag(prefixedLine);
             const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
             // Skip Discord emoji conversion when showTags is enabled so users can see original text
             const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
@@ -5035,26 +5067,13 @@
         world.unseen_lines = 0;
     }
 
-    // Create cached HTML for a line
-    function cacheLineHtml(worldIndex, lineIndex, text) {
-        if (!worldOutputCache[worldIndex]) {
-            worldOutputCache[worldIndex] = [];
-        }
-        const strippedText = showTags ? text : stripMudTag(text);
-        const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
-        // Skip Discord emoji conversion when showTags is enabled so users can see original text
-        const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
-        const html = sanitizeHtml(showTags ? processed : convertDiscordEmojis(processed));
-        worldOutputCache[worldIndex][lineIndex] = { html, showTags };
-        return html;
-    }
-
     // Append a client-generated message to output
-    // style: 'info' (✨ prefix) or 'system' (yellow %% prefix)
+    // style: 'info' (✨ prefix, applied at display time by appendNewLine) or
+    // 'system' (yellow color, ✨ still applies since these are from_server: false)
     function appendClientLine(text, worldIndex = currentWorldIndex, style = 'info') {
         const prefixes = {
-            info: '✨ ',
-            system: '\x1b[33m%% '
+            info: '',
+            system: '\x1b[33m'
         };
         const suffixes = {
             info: '',
@@ -5068,20 +5087,21 @@
             const lineIndex = worlds[worldIndex].output_lines.length;
             worlds[worldIndex].output_lines.push({ text: clientText, ts: ts, from_server: false });
             if (worldIndex === currentWorldIndex) {
-                appendNewLine(clientText, ts, worldIndex, lineIndex);
+                appendNewLine(clientText, ts, worldIndex, lineIndex, false, false);
             }
         }
     }
 
     // Append a new line to current world's output (already visible)
-    function appendNewLine(text, ts, worldIndex, lineIndex, markedNew) {
+    function appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true) {
         // Strip newlines/carriage returns
         const cleanText = String(text).replace(/[\r\n]+/g, '');
 
         // Format timestamp prefix if showTags is enabled
         const tsPrefix = showTags && ts ? `<span class="timestamp">${formatTimestamp(ts)}</span>` : '';
 
-        const strippedText = showTags ? cleanText : stripMudTag(cleanText);
+        const prefixedText = applyClientPrefix(cleanText, fromServer);
+        const strippedText = showTags ? prefixedText : stripMudTag(prefixedText);
         const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
         // Skip Discord emoji conversion when showTags is enabled so users can see original text
         const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
@@ -7322,7 +7342,7 @@
                 const lineIndex = worlds[worldIndex].output_lines.length;
                 worlds[worldIndex].output_lines.push({ text: line, ts: ts, from_server: false });
                 if (worldIndex === currentWorldIndex) {
-                    appendNewLine(line, ts, worldIndex, lineIndex);
+                    appendNewLine(line, ts, worldIndex, lineIndex, false, false);
                 }
             });
         }

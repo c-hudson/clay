@@ -1251,14 +1251,14 @@ fn resolve_web_cert_files(app: &mut App) -> Option<(String, String)> {
     let needs_regen = !needs_gen && cert_needs_regeneration(&cert_path);
     if needs_gen || needs_regen {
         if needs_regen {
-            app.add_output("\u{2728} IP address changed, regenerating TLS certificate...");
+            app.add_output("IP address changed, regenerating TLS certificate...");
         }
         match generate_self_signed_cert(&cert_path, &key_path) {
             Ok(()) => {
-                app.add_output("\u{2728} Generated self-signed TLS certificate.");
+                app.add_output("Generated self-signed TLS certificate.");
             }
             Err(e) => {
-                app.add_output(&format!("\u{2728} Failed to generate TLS certificate: {}", e));
+                app.add_output(&format!("Failed to generate TLS certificate: {}", e));
                 return None;
             }
         }
@@ -2386,6 +2386,10 @@ const MAX_LINE_LENGTH: usize = 10_000;
 /// one world fully, so a world with deep history doesn't block others from filling.
 const BACKFILL_PHASE2_CHUNK_SIZE: usize = 200;
 
+/// Footer line printed after non-quiet /recall output, shared by every emitter
+/// via `App::emit_recall`.
+const RECALL_END_BANNER: &str = "================= Recall end =================";
+
 impl OutputLine {
     /// Truncate text if it exceeds MAX_LINE_LENGTH to prevent performance issues
     fn truncate_if_needed(text: String) -> String {
@@ -2831,12 +2835,29 @@ impl World {
             let should_filter = (completed_line.contains("###_idler_message_") && completed_line.contains("_###"))
                 || is_visually_empty(completed_line);
 
+            // The line being replaced/removed was counted into lines_since_pause
+            // once already when the partial was first added (unless it was in
+            // pending_lines, which is never counted). Track its old visual-row
+            // cost so we can correct the delta below instead of silently
+            // over/under-counting the budget.
+            let width = (output_width as usize).max(1);
+            let nli = settings.new_line_indicator;
+            let wrapspace = settings.wrapspace as usize;
+            let old_visual = if partial_was_in_pending {
+                0
+            } else {
+                self.output_lines.last()
+                    .map(|l| nli_visual_rows(&l.text, width, l.marked_new, nli, wrapspace))
+                    .unwrap_or(0)
+            };
+
             if should_filter {
                 // Remove the partial line instead of updating it
                 if partial_was_in_pending {
                     self.pending_lines.pop();
                 } else {
                     self.output_lines.pop();
+                    self.lines_since_pause = self.lines_since_pause.saturating_sub(old_visual);
                     // Invalidate tracked index if we popped the last marked_new line
                     if let Some(idx) = self.first_marked_new_index {
                         if self.output_lines.len() <= idx {
@@ -2852,6 +2873,13 @@ impl World {
                     }
                 } else if let Some(last) = self.output_lines.last_mut() {
                     last.text = completed_line.to_string();
+                    let new_visual = nli_visual_rows(&last.text, width, last.marked_new, nli, wrapspace);
+                    // Re-count at the completed line's final wrapped height. Does
+                    // NOT retroactively trigger a pause even if this pushes over
+                    // budget — the very next line will pause correctly, and
+                    // pausing mid-completion here would be a riskier UX change
+                    // than the accounting fix itself.
+                    self.lines_since_pause = (self.lines_since_pause + new_visual).saturating_sub(old_visual);
                 }
             }
 
@@ -2902,7 +2930,7 @@ impl World {
             // with the same effective width the renderer uses (reduced by NLI_PREFIX_WIDTH
             // when the NLI setting is on and the line is marked_new), so that
             // pause/partial-display budgeting stays in sync with what's drawn.
-            let visual_lines = nli_visual_rows(line, output_width as usize, !is_current, settings.new_line_indicator, settings.wrapspace as usize);
+            let visual_lines = nli_visual_rows(line, (output_width as usize).max(1), !is_current, settings.new_line_indicator, settings.wrapspace as usize);
 
             // Track if this line goes to pending (for partial tracking)
             let goes_to_pending = self.paused && settings.more_mode_enabled;
@@ -4394,7 +4422,7 @@ impl App {
                         world.output_lines.push(OutputLine {
                             text: tl.text,
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
-                            from_server: true,
+                            from_server: tl.from_server,
                             gagged: tl.gagged,
                             seq,
                             highlight_color: tl.highlight_color,
@@ -5295,24 +5323,17 @@ impl App {
         false
     }
 
-    /// Add TF command output (does NOT get % prefix, but is client-generated so Ctrl+L filters it)
+    /// Add TF command output to the current world (does NOT get % prefix, but
+    /// is client-generated so Ctrl+L filters it). Goes through the same
+    /// more-mode gate and single-broadcast contract as server output
+    /// (`emit_client_lines`) — previously this never broadcast to any WS
+    /// client at all, making TF command output invisible on web/GUI/Android.
+    /// Prefer `emit_client_text(world_idx, …)` directly when the caller
+    /// already knows which world the output belongs to (it may not be the
+    /// current one, e.g. background-world trigger output).
     fn add_tf_output(&mut self, text: &str) {
-        let is_current = true;
-        let settings = self.settings.clone();
-        let output_height = self.output_height;
-        let console_width = self.output_width;
         let world_idx = self.current_world_index;
-        let output_width = self.min_viewer_width(world_idx)
-            .map(|w| console_width.min(w as u16))
-            .unwrap_or(console_width);
-        let text_with_newline = if text.ends_with('\n') || text.is_empty() {
-            text.to_string()
-        } else {
-            format!("{}\n", text)
-        };
-        self.current_world_mut()
-            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
-        self.needs_output_redraw = true;
+        self.emit_client_text(world_idx, text, false);
     }
 
     /// Check whether the most recent connection failure for `world_idx` was caused
@@ -5371,6 +5392,167 @@ impl App {
         if world_idx == self.current_world_index {
             self.needs_output_redraw = true;
         }
+    }
+
+    /// Append a block of client-generated lines (e.g. /recall output) to
+    /// `world_idx` through the SAME more-mode gate as server output, and
+    /// broadcast only what actually landed in `output_lines`. Lines diverted
+    /// into `pending_lines` are broadcast later by the existing release paths
+    /// (`release_pending_screenful`, the WS `ReleasePending`/Tab handling) —
+    /// broadcasting them here too would duplicate them on release.
+    ///
+    /// Mirrors the add-output/broadcast half of `process_server_data`, minus
+    /// the parts that don't apply to client-generated text (splash-clear,
+    /// highlight-map, gagged-line handling, TTS). Keep in sync with that
+    /// function if the broadcast contract changes.
+    pub(crate) fn emit_client_lines(&mut self, world_idx: usize, lines: &[String], is_daemon_mode: bool) {
+        if world_idx >= self.worlds.len() || lines.is_empty() {
+            return;
+        }
+        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let settings = self.settings.clone();
+        let console_height = self.output_height;
+        let console_width = self.output_width;
+        let (output_height, output_width) =
+            self.viewer_output_dims(world_idx, console_height, console_width, is_daemon_mode);
+
+        let pending_before = self.worlds[world_idx].pending_lines.len();
+        let output_before = self.worlds[world_idx].output_lines.len();
+        let unseen_before = self.worlds[world_idx].unseen_lines;
+
+        // If there's a partial (unterminated) line already in output_lines —
+        // e.g. an outstanding MUD prompt with no trailing newline — it was
+        // never broadcast yet (partials are excluded from broadcasts). Our
+        // block will complete it in place rather than appending, so we need
+        // to shift the broadcast range back by one to include it. Mirrors
+        // process_server_data's had_partial_in_output handling.
+        let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
+            && !self.worlds[world_idx].partial_in_pending;
+
+        // Recall output always ends with a trailing newline (each entry is a
+        // complete line), so this call never leaves a NEW partial behind —
+        // unlike process_server_data, there's no has_partial_in_output
+        // exclusion needed on the way out.
+        let text = lines.join("\n") + "\n";
+        self.worlds[world_idx]
+            .add_output(&text, is_current, &settings, output_height, output_width, false, false);
+
+        let output_after = self.worlds[world_idx].output_lines.len();
+        let pending_after = self.worlds[world_idx].pending_lines.len();
+        let lines_to_pending = pending_after.saturating_sub(pending_before);
+
+        let mut skip_count = output_before;
+        let mut lines_to_output = output_after.saturating_sub(output_before);
+        if had_partial_in_output && skip_count > 0 {
+            skip_count -= 1;
+            lines_to_output = output_after.saturating_sub(skip_count);
+        }
+
+        if lines_to_output > 0 {
+            let first_seq = self.worlds[world_idx]
+                .output_lines
+                .get(skip_count)
+                .map(|l| l.seq)
+                .unwrap_or(0);
+            let data: String = self.worlds[world_idx]
+                .output_lines
+                .iter()
+                .skip(skip_count)
+                .take(lines_to_output)
+                .map(|line| line.text.replace('\r', ""))
+                .collect::<Vec<_>>()
+                .join("\n") + "\n";
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data,
+                is_viewed: is_current,
+                ts: current_timestamp_secs(),
+                from_server: false,
+                seq: first_seq,
+                marked_new: !is_current,
+                flush: false, gagged: false,
+            });
+        }
+
+        if lines_to_pending > 0 || pending_after != pending_before {
+            self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
+        }
+
+        let unseen_after = self.worlds[world_idx].unseen_lines;
+        if unseen_after != unseen_before {
+            self.ws_broadcast(WsMessage::UnseenUpdate { world_index: world_idx, count: unseen_after });
+        }
+        self.broadcast_activity();
+
+        if world_idx == self.current_world_index {
+            self.needs_output_redraw = true;
+        }
+    }
+
+    /// String-shaped sibling of `emit_client_lines`. Splits `text` on '\n'
+    /// (a single trailing newline is not significant) and emits the whole
+    /// thing as ONE more-mode-gated block with ONE broadcast.
+    ///
+    /// Callers must pass PREFIX-FREE text: the "✨ " client marker is added
+    /// at render time by `rendering::process_output_line` (console/remote
+    /// console) and by `applyClientPrefix()` in `web/app.js` (web/GUI/
+    /// Android). Baking it in here would produce "✨ ✨ ".
+    pub(crate) fn emit_client_text(&mut self, world_idx: usize, text: &str, is_daemon_mode: bool) {
+        if text.is_empty() {
+            return; // matches add_output/add_tf_output: empty text adds nothing
+        }
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        let lines: Vec<String> = body.split('\n').map(str::to_string).collect();
+        self.emit_client_lines(world_idx, &lines, is_daemon_mode);
+    }
+
+    /// `TfCommandResult::Error(err)` rendering. Centralizes the "Error: "
+    /// wording most error arms already used independently.
+    pub(crate) fn emit_tf_error(&mut self, world_idx: usize, err: &str, is_daemon_mode: bool) {
+        self.emit_client_text(world_idx, &format!("Error: {}", err), is_daemon_mode);
+    }
+
+    /// Run a /recall against `world_idx`'s history (or the -w/-g/-D source in
+    /// `opts`) and return (matches, header). Shared by `emit_recall` and the
+    /// `/quote` backtick-recall paths (which need matches but must not
+    /// display them — they feed a command list instead).
+    pub(crate) fn recall_matches(
+        &self,
+        opts: &tf::RecallOptions,
+        world_idx: usize,
+    ) -> Result<(Vec<String>, Option<String>), String> {
+        let lines = self.recall_source_lines(opts, world_idx)?;
+        Ok(execute_recall(opts, &lines, self.show_tags))
+    }
+
+    /// Render a /recall (or the /N shorthand, which is rewritten to /recall
+    /// internally) into `world_idx`'s output, gated by more-mode and
+    /// broadcast to every attached interface (console, remote console, web,
+    /// GUI). `world_idx` is both the default history source (overridden by
+    /// -w/-g/-D inside `opts`) and the destination for the rendered output.
+    pub(crate) fn emit_recall(&mut self, opts: &tf::RecallOptions, world_idx: usize, is_daemon_mode: bool) {
+        let block: Vec<String> = match self.recall_matches(opts, world_idx) {
+            Ok((matches, header)) => {
+                let mut block = Vec::with_capacity(matches.len() + 2);
+                if !opts.quiet {
+                    if let Some(h) = header {
+                        block.push(h);
+                    }
+                }
+                if matches.is_empty() {
+                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                    block.push(format!("No matches for '{}'", pattern_str));
+                } else {
+                    block.extend(matches);
+                }
+                if !opts.quiet {
+                    block.push(RECALL_END_BANNER.to_string());
+                }
+                block
+            }
+            Err(e) => vec![e],
+        };
+        self.emit_client_lines(world_idx, &block, is_daemon_mode);
     }
 
     /// Handle GMCP Client.Media.* messages (MCMP protocol)
@@ -5792,6 +5974,64 @@ impl App {
 
     /// Process incoming server data - shared logic for both console and daemon modes
     /// Returns commands that need to be executed (for trigger processing)
+    /// Resolve the effective (height, width) to budget more-mode pagination and
+    /// wrap output against for `world_idx`, as the minimum across all viewers
+    /// (console + any WS clients currently viewing it). Shared by
+    /// `process_server_data` (server output) and `emit_client_lines`
+    /// (client-generated output like /recall) so both budget identically.
+    fn viewer_output_dims(
+        &self,
+        world_idx: usize,
+        console_height: u16,
+        console_width: u16,
+        is_daemon_mode: bool,
+    ) -> (u16, u16) {
+        // Calculate minimum visible lines among all viewers for synchronized more-mode
+        // Console counts as a viewer if it's viewing this world (unless daemon mode)
+        let console_viewing = !is_daemon_mode && world_idx == self.current_world_index;
+        let ws_min = self.min_viewer_lines(world_idx);
+        let output_height = match (console_viewing, ws_min) {
+            (true, Some(ws)) => console_height.min(ws as u16),
+            (true, None) => console_height,
+            (false, Some(ws)) => ws as u16,
+            (false, None) => {
+                if is_daemon_mode {
+                    // Daemon mode with no viewers - use min of all WS clients or default
+                    self.ws_client_worlds.values()
+                        .map(|s| s.visible_lines)
+                        .filter(|&v| v > 0)
+                        .min()
+                        .unwrap_or(24) as u16
+                } else {
+                    // Non-current world in console mode: use console height
+                    // so more-mode triggers at the right point for when user switches
+                    console_height
+                }
+            }
+        };
+
+        // Calculate minimum visible columns among all viewers for wrap width
+        let ws_min_width = self.min_viewer_width(world_idx);
+        let output_width = match (console_viewing, ws_min_width) {
+            (true, Some(ws_w)) => console_width.min(ws_w as u16),
+            (true, None) => console_width,
+            (false, Some(ws_w)) => ws_w as u16,
+            (false, None) => {
+                if is_daemon_mode {
+                    self.ws_client_worlds.values()
+                        .map(|s| s.visible_columns)
+                        .filter(|&v| v > 0)
+                        .min()
+                        .unwrap_or(200) as u16
+                } else {
+                    console_width
+                }
+            }
+        };
+
+        (output_height, output_width)
+    }
+
     pub fn process_server_data(
         &mut self,
         world_idx: usize,
@@ -5967,7 +6207,7 @@ impl App {
                     let world_name = self.worlds[world_idx].name.clone();
                     let user = self.worlds[world_idx].settings.user.clone();
                     let password = self.worlds[world_idx].settings.password.clone();
-                    self.add_tf_output(&format!("Portal detected: {} ({}:{})", portal.name, portal.host, portal.port));
+                    self.emit_client_text(world_idx, &format!("Portal detected: {} ({}:{})", portal.name, portal.host, portal.port), is_daemon_mode);
                     if bamf_val == "1" {
                         // Disconnect current world first
                         commands_to_execute.push(format!("/disconnect {}", world_name));
@@ -6027,48 +6267,8 @@ impl App {
         if !filtered_data.is_empty() {
             let settings = self.settings.clone();
 
-            // Calculate minimum visible lines among all viewers for synchronized more-mode
-            // Console counts as a viewer if it's viewing this world (unless daemon mode)
-            let console_viewing = !is_daemon_mode && world_idx == self.current_world_index;
-            let ws_min = self.min_viewer_lines(world_idx);
-            let output_height = match (console_viewing, ws_min) {
-                (true, Some(ws)) => console_height.min(ws as u16),
-                (true, None) => console_height,
-                (false, Some(ws)) => ws as u16,
-                (false, None) => {
-                    if is_daemon_mode {
-                        // Daemon mode with no viewers - use min of all WS clients or default
-                        self.ws_client_worlds.values()
-                            .map(|s| s.visible_lines)
-                            .filter(|&v| v > 0)
-                            .min()
-                            .unwrap_or(24) as u16
-                    } else {
-                        // Non-current world in console mode: use console height
-                        // so more-mode triggers at the right point for when user switches
-                        console_height
-                    }
-                }
-            };
-
-            // Calculate minimum visible columns among all viewers for wrap width
-            let ws_min_width = self.min_viewer_width(world_idx);
-            let output_width = match (console_viewing, ws_min_width) {
-                (true, Some(ws_w)) => console_width.min(ws_w as u16),
-                (true, None) => console_width,
-                (false, Some(ws_w)) => ws_w as u16,
-                (false, None) => {
-                    if is_daemon_mode {
-                        self.ws_client_worlds.values()
-                            .map(|s| s.visible_columns)
-                            .filter(|&v| v > 0)
-                            .min()
-                            .unwrap_or(200) as u16
-                    } else {
-                        console_width
-                    }
-                }
-            };
+            let (output_height, output_width) =
+                self.viewer_output_dims(world_idx, console_height, console_width, is_daemon_mode);
 
             // Track pending count before add_output for synchronized more-mode
             let pending_before = self.worlds[world_idx].pending_lines.len();
@@ -6285,7 +6485,7 @@ impl App {
 
         // Display TF trigger messages (from /echo commands)
         for msg in tf_messages {
-            self.add_tf_output(&msg);
+            self.emit_client_text(world_idx, &msg, is_daemon_mode);
         }
 
         // Merge TF commands into commands_to_execute
@@ -6943,29 +7143,11 @@ impl App {
                                 self.sync_tf_world_info();
                                 match self.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::Success(Some(msg)) => {
-                                        self.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: msg,
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                            seq: 0,
-                                            marked_new: false,
-                                            flush: false, gagged: false,
-                                        });
+                                        self.emit_client_text(world_index, &msg, false);
                                     }
                                     tf::TfCommandResult::Success(None) => {}
                                     tf::TfCommandResult::Error(err) => {
-                                        self.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("Error: {}", err),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                            seq: 0,
-                                            marked_new: false,
-                                            flush: false, gagged: false,
-                                        });
+                                        self.emit_tf_error(world_index, &err, false);
                                     }
                                     tf::TfCommandResult::SendToMud(text) => {
                                         if world_index < self.worlds.len() {
@@ -6979,33 +7161,7 @@ impl App {
                                         self.dispatch_ws_clay_command(client_id, clay_cmd, event_tx);
                                     }
                                     tf::TfCommandResult::Recall(opts) => {
-                                        if world_index < self.worlds.len() {
-                                            let ts = current_timestamp_secs();
-                                            match self.recall_source_lines(&opts, world_index) {
-                                                Ok(output_lines) => {
-                                                    let (matches, header) = execute_recall(&opts, &output_lines, self.show_tags);
-                                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                    if !opts.quiet {
-                                                        if let Some(h) = header {
-                                                            self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                        }
-                                                    }
-                                                    if matches.is_empty() {
-                                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                    } else {
-                                                        for m in matches {
-                                                            self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                        }
-                                                    }
-                                                    if !opts.quiet {
-                                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} {}", e), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                }
-                                            }
-                                        }
+                                        self.emit_recall(&opts, world_index, false);
                                     }
                                     tf::TfCommandResult::RepeatProcess(process) => {
                                         self.tf_engine.processes.push(process);
@@ -7034,23 +7190,11 @@ impl App {
                     self.sync_tf_world_info();
                     match self.tf_engine.execute(command) {
                         tf::TfCommandResult::Success(Some(msg)) => {
-                            self.ws_broadcast(WsMessage::ServerData {
-                                world_index, data: msg, is_viewed: false,
-                                ts: current_timestamp_secs(), from_server: false,
-                                seq: 0,
-                                marked_new: false,
-                                flush: false, gagged: false,
-                            });
+                            self.emit_client_text(world_index, &msg, false);
                         }
                         tf::TfCommandResult::Success(None) => {}
                         tf::TfCommandResult::Error(err) => {
-                            self.ws_broadcast(WsMessage::ServerData {
-                                world_index, data: format!("Error: {}", err), is_viewed: false,
-                                ts: current_timestamp_secs(), from_server: false,
-                                seq: 0,
-                                marked_new: false,
-                                flush: false, gagged: false,
-                            });
+                            self.emit_tf_error(world_index, &err, false);
                         }
                         tf::TfCommandResult::SendToMud(text) => {
                             if world_index < self.worlds.len() {
@@ -7064,33 +7208,7 @@ impl App {
                             self.dispatch_ws_clay_command(client_id, clay_cmd, event_tx);
                         }
                         tf::TfCommandResult::Recall(opts) => {
-                            if world_index < self.worlds.len() {
-                                let ts = current_timestamp_secs();
-                                match self.recall_source_lines(&opts, world_index) {
-                                    Ok(output_lines) => {
-                                        let (matches, header) = execute_recall(&opts, &output_lines, self.show_tags);
-                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                        if !opts.quiet {
-                                            if let Some(h) = header {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                            }
-                                        }
-                                        if matches.is_empty() {
-                                            self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                        } else {
-                                            for m in matches {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                            }
-                                        }
-                                        if !opts.quiet {
-                                            self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} {}", e), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                    }
-                                }
-                            }
+                            self.emit_recall(&opts, world_index, false);
                         }
                         tf::TfCommandResult::RepeatProcess(process) => {
                             self.tf_engine.processes.push(process);
@@ -7886,9 +8004,8 @@ impl App {
         // If this is a /quote with backtick /recall, execute the recall now
         if let Some((opts, recall_prefix)) = recall_opts {
             if world_index < self.worlds.len() {
-                match self.recall_source_lines(&opts, world_index) {
-                    Ok(output_lines) => {
-                        let (matches, _header) = execute_recall(&opts, &output_lines, self.show_tags);
+                match self.recall_matches(&opts, world_index) {
+                    Ok((matches, _header)) => {
                         *lines = matches.iter()
                             .map(|line| {
                                 let raw = format!("{}{}", recall_prefix, line);
@@ -7906,7 +8023,7 @@ impl App {
                     }
                     Err(e) => {
                         self.ws_broadcast(WsMessage::ServerData {
-                            world_index, data: format!("\u{2728} {}", e),
+                            world_index, data: e,
                             is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
                             flush: false, gagged: false,
                         });
@@ -7955,6 +8072,12 @@ impl App {
             }
         } else {
             // Send immediately (no delay or single line)
+            // Echo lines are buffered and flushed as a single emit_client_lines
+            // call after the loop, rather than one broadcast per line - one
+            // block, one budget computation, one broadcast (same reasoning as
+            // emit_recall). Send/Exec still act per-line since each can have
+            // its own side effect (a MUD write, a nested TF command).
+            let mut echo_batch: Vec<String> = Vec::new();
             for line in lines.drain(..) {
                 match disposition {
                     tf::QuoteDisposition::Send => {
@@ -7975,11 +8098,7 @@ impl App {
                         }
                     }
                     tf::QuoteDisposition::Echo => {
-                        self.ws_broadcast(WsMessage::ServerData {
-                            world_index, data: line,
-                            is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false, gagged: false,
-                        });
+                        echo_batch.push(line);
                     }
                     tf::QuoteDisposition::Exec => {
                         // Execute each line as a TF command
@@ -7994,23 +8113,18 @@ impl App {
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                self.ws_broadcast(WsMessage::ServerData {
-                                    world_index, data: msg,
-                                    is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false, gagged: false,
-                                });
+                                self.emit_client_text(world_index, &msg, false);
                             }
                             tf::TfCommandResult::Error(err) => {
-                                self.ws_broadcast(WsMessage::ServerData {
-                                    world_index, data: format!("Error: {}", err),
-                                    is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false, gagged: false,
-                                });
+                                self.emit_tf_error(world_index, &err, false);
                             }
                             _ => {}
                         }
                     }
                 }
+            }
+            if !echo_batch.is_empty() {
+                self.emit_client_lines(world_index, &echo_batch, false);
             }
         }
     }
@@ -9240,14 +9354,12 @@ impl App {
                 .skip(skip)
                 .take(total_lines - skip)
                 .map(|s| {
-                    let text = s.text.replace('\r', "");
-                    let text = if !s.from_server {
-                        format!("✨ {}", text)
-                    } else {
-                        text
-                    };
+                    // Text stays prefix-free here, same as live ServerData broadcasts -
+                    // the "✨ " client-line marker is added at display time only
+                    // (rendering.rs::process_output_line for console/remote console,
+                    // applyClientPrefix() in web/app.js), keyed on `from_server` below.
                     TimestampedLine {
-                        text,
+                        text: s.text.replace('\r', ""),
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
                         from_server: s.from_server,
@@ -9933,12 +10045,16 @@ impl App {
             logical_count = 1;
         }
 
-        // Collect per-line text and marked_new for broadcasting
-        let lines_with_flags: Vec<(String, bool)> = self.worlds[world_idx]
+        // Collect per-line text, marked_new, and from_server for broadcasting.
+        // from_server must travel with each line rather than being assumed true:
+        // pending_lines can hold a mix of real server output and client-generated
+        // content (e.g. a /recall that overflowed a screenful while paused), and
+        // clients key the "✨ " marker off this exact flag.
+        let lines_with_flags: Vec<(String, bool, bool)> = self.worlds[world_idx]
             .pending_lines
             .iter()
             .take(logical_count)
-            .map(|line| (line.text.replace('\r', ""), line.marked_new))
+            .map(|line| (line.text.replace('\r', ""), line.marked_new, line.from_server))
             .collect();
 
         let pending_before = self.worlds[world_idx].pending_lines.len();
@@ -9948,26 +10064,29 @@ impl App {
         let released = pending_before - self.worlds[world_idx].pending_lines.len();
 
         // Broadcast released lines to clients viewing this world.
-        // Group consecutive lines by marked_new so each gets the correct indicator.
+        // Group consecutive lines by (marked_new, from_server) so each batch gets
+        // the correct indicator and the correct client-line marker.
         if !lines_with_flags.is_empty() {
             let ts = current_timestamp_secs();
             let mut batch: Vec<&str> = Vec::new();
             let mut batch_marked_new = lines_with_flags[0].1;
-            for (text, marked_new) in &lines_with_flags {
-                if *marked_new != batch_marked_new && !batch.is_empty() {
+            let mut batch_from_server = lines_with_flags[0].2;
+            for (text, marked_new, from_server) in &lines_with_flags {
+                if (*marked_new != batch_marked_new || *from_server != batch_from_server) && !batch.is_empty() {
                     let ws_data = batch.join("\n") + "\n";
                     self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                         world_index: world_idx,
                         data: ws_data,
                         is_viewed: true,
                         ts,
-                        from_server: true,
+                        from_server: batch_from_server,
                         seq: 0,
                         marked_new: batch_marked_new,
                         flush: false, gagged: false,
                     });
                     batch.clear();
                     batch_marked_new = *marked_new;
+                    batch_from_server = *from_server;
                 }
                 batch.push(text);
             }
@@ -9978,7 +10097,7 @@ impl App {
                     data: ws_data,
                     is_viewed: true,
                     ts,
-                    from_server: true,
+                    from_server: batch_from_server,
                     seq: 0,
                     marked_new: batch_marked_new,
                     flush: false, gagged: false,
@@ -13949,35 +14068,10 @@ pub async fn run_app_headless(
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                app.worlds[world_idx].output_lines.push(OutputLine::new_client(msg.clone(), seq));
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: format!("{}\n", msg),
-                                    is_viewed: true,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0,
-                                    marked_new: false,
-                                    flush: false, gagged: false,
-                                });
+                                app.emit_client_text(world_idx, &msg, true);
                             }
                             tf::TfCommandResult::Error(err) => {
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                let err_msg = format!("Error: {}", err);
-                                app.worlds[world_idx].output_lines.push(OutputLine::new_client(err_msg.clone(), seq));
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: format!("{}\n", err_msg),
-                                    is_viewed: true,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0,
-                                    marked_new: false,
-                                    flush: false, gagged: false,
-                                });
+                                app.emit_tf_error(world_idx, &err, true);
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
                                 app.tf_engine.processes.push(process);
@@ -15453,32 +15547,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             let recall_cmd = format!("/recall /{} {}", num_part, pattern);
                                             match app.tf_engine.execute(&recall_cmd) {
                                                 tf::TfCommandResult::Recall(opts) => {
-                                                    let fallback = app.current_world_index;
-                                                    match app.recall_source_lines(&opts, fallback) {
-                                                        Ok(output_lines) => {
-                                                            let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                            if !opts.quiet {
-                                                                if let Some(h) = header {
-                                                                    app.add_tf_output(&h);
-                                                                }
-                                                            }
-                                                            if matches.is_empty() {
-                                                                app.add_tf_output(&format!("No matches for '{}'", pattern_str));
-                                                            } else {
-                                                                for m in &matches {
-                                                                    app.add_tf_output(m);
-                                                                }
-                                                            }
-                                                            if !opts.quiet {
-                                                                app.add_tf_output("================= Recall end =================");
-                                                            }
-                                                        }
-                                                        Err(e) => app.add_tf_output(&format!("✨ {}", e)),
-                                                    }
+                                                    let world_idx = app.current_world_index;
+                                                    app.emit_recall(&opts, world_idx, false);
                                                 }
                                                 tf::TfCommandResult::Error(err) => {
-                                                    app.add_tf_output(&format!("Error: {}", err));
+                                                    let world_idx = app.current_world_index;
+                                                    app.emit_tf_error(world_idx, &err, false);
                                                 }
                                                 _ => {}
                                             }
@@ -15494,13 +15568,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::Success(Some(msg)) => {
-                                        app.add_tf_output(&msg);
+                                        let world_idx = app.current_world_index;
+                                        app.emit_client_text(world_idx, &msg, false);
                                     }
                                     tf::TfCommandResult::Success(None) => {
                                         // Silent success
                                     }
                                     tf::TfCommandResult::Error(err) => {
-                                        app.add_tf_output(&format!("Error: {}", err));
+                                        let world_idx = app.current_world_index;
+                                        app.emit_tf_error(world_idx, &err, false);
                                     }
                                     tf::TfCommandResult::SendToMud(text) => {
                                         if app.current_world().connected {
@@ -15526,29 +15602,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     tf::TfCommandResult::Recall(opts) => {
-                                        let fallback = app.current_world_index;
-                                        match app.recall_source_lines(&opts, fallback) {
-                                            Ok(output_lines) => {
-                                                let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                if !opts.quiet {
-                                                    if let Some(h) = header {
-                                                        app.add_output(&h);
-                                                    }
-                                                }
-                                                if matches.is_empty() {
-                                                    app.add_output(&format!("No matches for '{}'", pattern_str));
-                                                } else {
-                                                    for m in &matches {
-                                                        app.add_output(m);
-                                                    }
-                                                }
-                                                if !opts.quiet {
-                                                    app.add_output("================= Recall end =================");
-                                                }
-                                            }
-                                            Err(e) => app.add_output(&format!("✨ {}", e)),
-                                        }
+                                        let world_idx = app.current_world_index;
+                                        app.emit_recall(&opts, world_idx, false);
                                     }
                                     tf::TfCommandResult::RepeatProcess(process) => {
                                         let id = process.id;
@@ -15562,9 +15617,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // If this is a /quote with backtick /recall, execute the recall now
                                         if let Some((opts, recall_prefix)) = recall_opts {
                                             let fallback = app.current_world_index;
-                                            match app.recall_source_lines(&opts, fallback) {
-                                                Ok(output_lines) => {
-                                                    let (matches, _header) = execute_recall(&opts, &output_lines, app.show_tags);
+                                            match app.recall_matches(&opts, fallback) {
+                                                Ok((matches, _header)) => {
                                                     lines = matches.iter()
                                                         .map(|line| {
                                                             let raw = format!("{}{}", recall_prefix, line);
@@ -15577,7 +15631,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    app.add_tf_output(&format!("✨ {}", e));
+                                                    app.add_tf_output(&format!("Error: {}", e));
                                                 }
                                             }
                                         }
@@ -15899,7 +15953,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let commands_to_execute = tr.send_commands;
                             let tf_commands_to_execute = tr.clay_commands;
                             for msg in &tr.messages {
-                                app.add_tf_output(msg);
+                                app.emit_client_text(world_idx, msg, false);
                             }
 
                             let data = format!("{}\n", message);
@@ -16517,35 +16571,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                app.worlds[world_idx].output_lines.push(OutputLine::new_client(msg.clone(), seq));
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: msg,
-                                    is_viewed: true,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0,
-                                    marked_new: false,
-                                    flush: false, gagged: false,
-                                });
+                                app.emit_client_text(world_idx, &msg, false);
                             }
                             tf::TfCommandResult::Error(err) => {
-                                let err_msg = format!("Error: {}", err);
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                app.worlds[world_idx].output_lines.push(OutputLine::new_client(err_msg.clone(), seq));
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: err_msg,
-                                    is_viewed: true,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0,
-                                    marked_new: false,
-                                    flush: false, gagged: false,
-                                });
+                                app.emit_tf_error(world_idx, &err, false);
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                 if handle_command(&clay_cmd, &mut app, event_tx.clone()).await {
@@ -16864,7 +16893,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let commands_to_execute = tr.send_commands;
                         let tf_commands_to_execute = tr.clay_commands;
                         for msg in &tr.messages {
-                            app.add_tf_output(msg);
+                            app.emit_client_text(world_idx, msg, false);
                         }
 
                         let data = format!("{}\n", message);

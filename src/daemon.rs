@@ -16,7 +16,7 @@ use crate::{
     get_multiuser_settings_path,
     enable_tcp_keepalive, parse_command, current_timestamp_secs,
 };
-use crate::actions::{split_action_commands, substitute_action_args, execute_recall,
+use crate::actions::{split_action_commands, substitute_action_args,
     find_invocable_action, rewrite_slashless_action};
 use crate::util::local_time_from_epoch;
 use crate::websocket::{TimestampedLine, RemoteClientType};
@@ -208,28 +208,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: msg,
-                                    is_viewed: true,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0,
-                                marked_new: false,
-                                flush: false, gagged: false,
-                                });
+                                app.emit_client_text(world_idx, &msg, true);
                             }
                             tf::TfCommandResult::Error(err) => {
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: format!("Error: {}", err),
-                                    is_viewed: true,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0,
-                                marked_new: false,
-                                flush: false, gagged: false,
-                                });
+                                app.emit_tf_error(world_idx, &err, true);
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
                                 app.tf_engine.processes.push(process);
@@ -465,7 +447,7 @@ pub async fn handle_daemon_ws_message(
                         if !action.enabled {
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index,
-                                data: format!("\u{2728} Action '{}' is disabled.", action.name),
+                                data: format!("Action '{}' is disabled.", action.name),
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
@@ -486,29 +468,11 @@ pub async fn handle_daemon_ws_message(
                                 if cmd.starts_with('/') {
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::Success(Some(msg)) => {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: msg,
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                                seq: 0,
-                                            marked_new: false,
-                                            flush: false, gagged: false,
-                                            });
+                                            app.emit_client_text(world_index, &msg, true);
                                         }
                                         tf::TfCommandResult::Success(None) => {}
                                         tf::TfCommandResult::Error(err) => {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("Error: {}", err),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                                seq: 0,
-                                            marked_new: false,
-                                            flush: false, gagged: false,
-                                            });
+                                            app.emit_tf_error(world_index, &err, true);
                                         }
                                         tf::TfCommandResult::SendToMud(text) => {
                                             if world_index < app.worlds.len() {
@@ -522,33 +486,7 @@ pub async fn handle_daemon_ws_message(
                                             app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
                                         }
                                         tf::TfCommandResult::Recall(opts) => {
-                                            if world_index < app.worlds.len() {
-                                                let ts = current_timestamp_secs();
-                                                match app.recall_source_lines(&opts, world_index) {
-                                                    Ok(output_lines) => {
-                                                        let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                        if !opts.quiet {
-                                                            if let Some(h) = header {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                            }
-                                                        }
-                                                        if matches.is_empty() {
-                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                        } else {
-                                                            for m in matches {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                            }
-                                                        }
-                                                        if !opts.quiet {
-                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} {}", e), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                    }
-                                                }
-                                            }
+                                            app.emit_recall(&opts, world_index, true);
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
                                             app.tf_engine.processes.push(process);
@@ -572,23 +510,11 @@ pub async fn handle_daemon_ws_message(
                         app.sync_tf_world_info();
                         match app.tf_engine.execute(&command) {
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index, data: msg, is_viewed: false,
-                                    ts: current_timestamp_secs(), from_server: false,
-                                    seq: 0,
-                                marked_new: false,
-                                flush: false, gagged: false,
-                                });
+                                app.emit_client_text(world_index, &msg, true);
                             }
                             tf::TfCommandResult::Success(None) => {}
                             tf::TfCommandResult::Error(err) => {
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index, data: format!("Error: {}", err), is_viewed: false,
-                                    ts: current_timestamp_secs(), from_server: false,
-                                    seq: 0,
-                                marked_new: false,
-                                flush: false, gagged: false,
-                                });
+                                app.emit_tf_error(world_index, &err, true);
                             }
                             tf::TfCommandResult::SendToMud(text) => {
                                 if world_index < app.worlds.len() {
@@ -602,33 +528,7 @@ pub async fn handle_daemon_ws_message(
                                 app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
                             }
                             tf::TfCommandResult::Recall(opts) => {
-                                if world_index < app.worlds.len() {
-                                    let ts = current_timestamp_secs();
-                                    match app.recall_source_lines(&opts, world_index) {
-                                        Ok(output_lines) => {
-                                            let (matches, header) = execute_recall(&opts, &output_lines, app.show_tags);
-                                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                            if !opts.quiet {
-                                                if let Some(h) = header {
-                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                }
-                                            }
-                                            if matches.is_empty() {
-                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                            } else {
-                                                for m in matches {
-                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                                }
-                                            }
-                                            if !opts.quiet {
-                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                            }
-                                        }
-                                        Err(e) => {
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} {}", e), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false, flush: false, gagged: false });
-                                        }
-                                    }
-                                }
+                                app.emit_recall(&opts, world_index, true);
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
                                 app.tf_engine.processes.push(process);
@@ -731,18 +631,7 @@ pub async fn handle_daemon_ws_message(
                             _ => format!("No help available for '{}'", topic),
                         }
                     };
-                    for line in help_text.lines() {
-                        app.ws_broadcast(WsMessage::ServerData {
-                            world_index,
-                            data: line.to_string(),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0,
-                            marked_new: false,
-                            flush: false, gagged: false,
-                        });
-                    }
+                    app.emit_client_text(world_index, &help_text, true);
                 }
                 Command::Unknown { cmd } => {
                     app.ws_broadcast(WsMessage::ServerData {
@@ -1669,36 +1558,65 @@ pub async fn handle_daemon_ws_message(
                     }
                     let to_release = logical_count.min(pending_count);
 
-                    // Get text and marked_new flag of lines that will be released
-                    let has_marked_new = app.worlds[world_index].pending_lines.iter()
-                        .take(to_release).any(|l| l.marked_new);
-                    let lines_to_broadcast: Vec<String> = app.worlds[world_index]
+                    // Get text, marked_new, and from_server of lines that will be released.
+                    // from_server must travel with each line (not be assumed true) - pending
+                    // can hold a mix of real server output and client-generated content
+                    // (e.g. a /recall that overflowed a screenful while paused), and clients
+                    // key the "✨ " marker off this exact flag.
+                    let lines_with_flags: Vec<(String, bool, bool)> = app.worlds[world_index]
                         .pending_lines
                         .iter()
                         .take(to_release)
-                        .map(|line| line.text.replace('\r', ""))
+                        .map(|line| (line.text.replace('\r', ""), line.marked_new, line.from_server))
                         .collect();
 
                     // Release the lines
                     app.worlds[world_index].release_pending(visual_budget, client_width, app.settings.new_line_indicator, app.settings.wrapspace as usize);
 
-                    // Broadcast the released lines to clients viewing this world,
-                    // but skip clients that already have these lines from InitialState
-                    if !lines_to_broadcast.is_empty() {
-                        let ws_data = lines_to_broadcast.join("\n") + "\n";
-                        app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                            world_index,
-                            data: ws_data,
-                            is_viewed: true,
-                            ts: current_timestamp_secs(),
-                            from_server: true,
-                            // Use seq 0 to bypass client-side dedup check. Released pending
-                            // lines have old seqs that may be lower than _max_seq if new data
-                            // arrived after reconnect, causing false duplicate detection.
-                            seq: 0,
-                            marked_new: has_marked_new,
-                            flush: false, gagged: false,
-                        });
+                    // Broadcast the released lines to clients viewing this world, but skip
+                    // clients that already have these lines from InitialState. Group
+                    // consecutive lines by (marked_new, from_server) so each batch gets the
+                    // correct indicator and the correct client-line marker.
+                    if !lines_with_flags.is_empty() {
+                        let ts = current_timestamp_secs();
+                        let mut batch: Vec<&str> = Vec::new();
+                        let mut batch_marked_new = lines_with_flags[0].1;
+                        let mut batch_from_server = lines_with_flags[0].2;
+                        for (text, marked_new, from_server) in &lines_with_flags {
+                            if (*marked_new != batch_marked_new || *from_server != batch_from_server) && !batch.is_empty() {
+                                let ws_data = batch.join("\n") + "\n";
+                                app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                                    world_index,
+                                    data: ws_data,
+                                    is_viewed: true,
+                                    ts,
+                                    from_server: batch_from_server,
+                                    // Use seq 0 to bypass client-side dedup check. Released pending
+                                    // lines have old seqs that may be lower than _max_seq if new data
+                                    // arrived after reconnect, causing false duplicate detection.
+                                    seq: 0,
+                                    marked_new: batch_marked_new,
+                                    flush: false, gagged: false,
+                                });
+                                batch.clear();
+                                batch_marked_new = *marked_new;
+                                batch_from_server = *from_server;
+                            }
+                            batch.push(text);
+                        }
+                        if !batch.is_empty() {
+                            let ws_data = batch.join("\n") + "\n";
+                            app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                                world_index,
+                                data: ws_data,
+                                is_viewed: true,
+                                ts,
+                                from_server: batch_from_server,
+                                seq: 0,
+                                marked_new: batch_marked_new,
+                                flush: false, gagged: false,
+                            });
+                        }
                     }
 
                     // Broadcast release event and updated pending count
@@ -2464,7 +2382,7 @@ keep_alive_type=Generic
                                 if let Some(ws) = &app.ws_server {
                                     ws.broadcast_to_owner(WsMessage::ServerData {
                                         world_index,
-                                        data: "\u{2728} Connection failed.\n".to_string(),
+                                        data: "Connection failed.\n".to_string(),
                                         is_viewed: true,
                                         ts: current_timestamp_secs(),
                                         from_server: false,
@@ -2493,14 +2411,18 @@ keep_alive_type=Generic
                                 conn.output_lines.push(OutputLine::new(line.to_string(), seq));
                             }
 
-                            // Send to this user's WebSocket clients only
+                            // Send to this user's WebSocket clients only. This is real MUD
+                            // server output (OutputLine::new above already defaults
+                            // from_server: true internally) - from_server must match here
+                            // too, or the client-line "✨ " marker would wrongly apply to
+                            // every line of MUD text once clients key off this flag.
                             if let Some(ws) = &app.ws_server {
                                 ws.broadcast_to_owner(WsMessage::ServerData {
                                     world_index,
                                     data: decoded,
                                     is_viewed: true,
                                     ts: current_timestamp_secs(),
-                                    from_server: false,
+                                    from_server: true,
                                     seq: 0,
                                     marked_new: false,
                                     flush: false, gagged: false,
@@ -3367,16 +3289,14 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
             let clean_pending: Vec<String> = pending_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
+            // Text stays prefix-free here, same as live ServerData broadcasts - the
+            // "✨ " client-line marker is added at display time only (rendering.rs::
+            // process_output_line for console/remote console, applyClientPrefix() in
+            // web/app.js), keyed on `from_server` below.
             let output_lines_ts: Vec<TimestampedLine> = output_lines.iter()
                 .map(|s| {
-                    let text = s.text.replace('\r', "");
-                    let text = if !s.from_server {
-                        format!("\u{2728} {}", text)
-                    } else {
-                        text
-                    };
                     TimestampedLine {
-                        text,
+                        text: s.text.replace('\r', ""),
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
                         from_server: s.from_server,
@@ -3389,14 +3309,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 .collect();
             let pending_lines_ts: Vec<TimestampedLine> = pending_lines.iter()
                 .map(|s| {
-                    let text = s.text.replace('\r', "");
-                    let text = if !s.from_server {
-                        format!("\u{2728} {}", text)
-                    } else {
-                        text
-                    };
                     TimestampedLine {
-                        text,
+                        text: s.text.replace('\r', ""),
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
                         from_server: s.from_server,

@@ -1797,6 +1797,438 @@
         assert_eq!(world.visual_line_offset, 0, "release_all_pending should clear visual_line_offset");
     }
 
+    // ---- /recall × more-mode interaction (App::emit_recall) ----
+    // Regression coverage for the bug where the WS/daemon Recall(opts) arms
+    // broadcast every matched line directly via ws_broadcast, never touching
+    // World::add_output, so more-mode pause never engaged for remote console /
+    // web / GUI / daemon clients. emit_recall() now funnels every /recall
+    // through the same gate as server output.
+
+    fn seed_recall_source(world: &mut World, count: usize) {
+        for i in 0..count {
+            let seq = world.next_seq;
+            world.next_seq += 1;
+            // OutputLine::new defaults from_server=true, which is required —
+            // execute_recall's default source (CurrentWorld) only matches
+            // from_server lines.
+            world.output_lines.push(OutputLine::new(format!("alpha {}", i), seq));
+        }
+    }
+
+    fn recall_opts_for_alpha() -> tf::RecallOptions {
+        tf::RecallOptions {
+            range: tf::RecallRange::Last(100),
+            pattern: Some("alpha".to_string()),
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        }
+    }
+
+    #[test]
+    fn test_recall_respects_more_mode() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+        app.output_height = 12; // max_lines = 10
+        app.output_width = 80;
+
+        seed_recall_source(&mut app.worlds[0], 100);
+        // Seeding output_lines directly (not via add_output) doesn't touch the
+        // more-mode budget, so start from a clean slate.
+        app.worlds[0].lines_since_pause = 0;
+
+        let opts = recall_opts_for_alpha();
+        app.emit_recall(&opts, 0, false);
+
+        // Block = 1 header + 100 matches + 1 footer = 102 rows of 1 visual
+        // line each, max_lines = 10: rows 1-10 fill the budget, row 11 trips
+        // triggers_pause (still shown), rows 12-102 divert to pending.
+        assert!(app.worlds[0].paused, "should be paused once /recall output exceeds a screenful");
+        assert_eq!(app.worlds[0].lines_since_pause, 11);
+        assert_eq!(app.worlds[0].output_lines.len(), 100 + 11);
+        assert_eq!(app.worlds[0].pending_lines.len(), 91);
+
+        // The bug this guards against: pre-fix, the WS/daemon arms broadcast
+        // one ServerData per matched line and never sent PendingLinesUpdate,
+        // so a remote console could never tell it should pause.
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
+        assert_eq!(server_data_count, 1, "the visible portion of a /recall block must be a single broadcast");
+        assert!(
+            log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { world_index: 0, count: 91 })),
+            "must broadcast PendingLinesUpdate so remote/web/GUI clients know to pause"
+        );
+    }
+
+    #[test]
+    fn test_recall_without_more_mode_emits_all() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = false;
+        app.output_height = 12;
+        app.output_width = 80;
+
+        seed_recall_source(&mut app.worlds[0], 100);
+        app.worlds[0].lines_since_pause = 0;
+
+        let opts = recall_opts_for_alpha();
+        app.emit_recall(&opts, 0, false);
+
+        assert!(!app.worlds[0].paused);
+        assert!(app.worlds[0].pending_lines.is_empty());
+        assert_eq!(app.worlds[0].output_lines.len(), 100 + 102);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
+        assert_eq!(server_data_count, 1, "the whole block should still be a single broadcast");
+        assert!(
+            !log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { .. })),
+            "nothing should be pending when more-mode is off"
+        );
+    }
+
+    #[test]
+    fn test_recall_while_paused_all_pending() {
+        // This is the exact scenario that produces today's duplicate-on-release
+        // bug for the console arms (they broadcast unconditionally per line,
+        // including lines that land in pending_lines, which then get
+        // broadcast AGAIN on release) — emit_recall must not broadcast
+        // anything that goes to pending_lines.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+        app.output_height = 12;
+        app.output_width = 80;
+
+        seed_recall_source(&mut app.worlds[0], 100);
+        app.worlds[0].lines_since_pause = 0;
+        app.worlds[0].paused = true; // already paused before /recall runs
+
+        let opts = recall_opts_for_alpha();
+        app.emit_recall(&opts, 0, false);
+
+        assert_eq!(app.worlds[0].pending_lines.len(), 102, "entire block should divert to pending");
+        assert_eq!(app.worlds[0].output_lines.len(), 100, "no /recall lines should reach output_lines");
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
+        assert_eq!(server_data_count, 0, "nothing landed in output_lines, so nothing should broadcast");
+        assert!(
+            log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { world_index: 0, count: 102 })),
+            "pending count changed and must still be announced"
+        );
+    }
+
+    // ---- World::add_output partial-line accounting (main.rs ~2806-2860) ----
+    // Regression coverage for the bug where completing or filtering a partial
+    // (unterminated) line never corrected lines_since_pause for the delta.
+
+    #[test]
+    fn test_add_output_recounts_completed_partial_line() {
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // Outstanding unterminated prompt: counted once as 1 visual row.
+        world.add_output("prompt> ", true, &settings, 24, 80, false, true);
+        assert_eq!(world.output_lines.len(), 1);
+        assert_eq!(world.lines_since_pause, 1);
+
+        // Complete it with enough text to wrap to multiple visual rows.
+        let long = "x".repeat(400);
+        world.add_output(&format!("{}\n", long), true, &settings, 24, 80, false, true);
+
+        let expected = nli_visual_rows(
+            &format!("prompt> {}", long),
+            80,
+            false,
+            settings.new_line_indicator,
+            settings.wrapspace as usize,
+        );
+        assert!(expected > 1, "test line must actually wrap to be meaningful");
+        assert_eq!(world.output_lines.len(), 1, "partial should complete in place, not append");
+        assert_eq!(
+            world.lines_since_pause, expected,
+            "completed partial must be re-counted at its final wrapped height, not left at 1"
+        );
+    }
+
+    #[test]
+    fn test_add_output_uncounts_filtered_partial_line() {
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // A whitespace-only partial is still counted as 1 visual row when added...
+        world.add_output("   ", true, &settings, 24, 80, false, true);
+        assert_eq!(world.lines_since_pause, 1);
+        let before = world.lines_since_pause;
+
+        // ...but when completed it's visually empty and gets popped (filtered),
+        // so the budget must be uncounted, not left stale.
+        world.add_output("\n", true, &settings, 24, 80, false, true);
+        assert!(world.output_lines.is_empty(), "filtered line should be removed, not kept");
+        assert_eq!(world.lines_since_pause, before - 1);
+    }
+
+    // ---- TF command output × more-mode / broadcast (App::emit_client_text) ----
+    // Regression coverage for two bugs found while unifying the "✨" client-line
+    // prefix across TUI/console/web: add_tf_output never broadcast to any WS
+    // client at all (invisible on web/GUI/Android), and several WS/daemon
+    // TfCommandResult::Success/Error arms broadcast directly without ever
+    // touching World::add_output (same bug class the /recall fix addressed).
+
+    #[test]
+    fn test_tf_message_broadcasts_through_gate() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        app.emit_client_text(0, "hello", false);
+
+        assert_eq!(app.worlds[0].output_lines.len(), 1);
+        assert_eq!(app.worlds[0].output_lines[0].text, "hello");
+        assert!(!app.worlds[0].output_lines[0].from_server);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data: Vec<_> = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).collect();
+        assert_eq!(server_data.len(), 1);
+        if let WsMessage::ServerData { data, from_server, .. } = server_data[0] {
+            assert_eq!(data, "hello\n");
+            assert!(!from_server);
+        } else {
+            panic!("expected ServerData");
+        }
+    }
+
+    #[test]
+    fn test_add_tf_output_now_broadcasts() {
+        // Pre-fix, add_tf_output had no ws_broadcast* call anywhere in its body -
+        // this log would be empty.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        app.add_tf_output("hello from TF");
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
+        assert_eq!(server_data_count, 1, "add_tf_output must broadcast, not just display locally");
+    }
+
+    #[test]
+    fn test_tf_error_uses_error_prefix() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        app.emit_tf_error(0, "boom", false);
+
+        assert_eq!(app.worlds[0].output_lines.len(), 1);
+        assert_eq!(app.worlds[0].output_lines[0].text, "Error: boom");
+    }
+
+    #[test]
+    fn test_tf_multiline_is_single_broadcast() {
+        // Guards the daemon.rs help-loop conversion: N ws_broadcast calls (one
+        // per line) collapsed into one emit_client_text call.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        let five_lines = "line1\nline2\nline3\nline4\nline5";
+        app.emit_client_text(0, five_lines, false);
+
+        assert_eq!(app.worlds[0].output_lines.len(), 5);
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
+        assert_eq!(server_data_count, 1, "a multi-line block must still be a single broadcast");
+    }
+
+    #[test]
+    fn test_tf_output_respects_more_mode() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+        app.output_height = 12; // max_lines = 10
+        app.output_width = 80;
+
+        let forty_lines: String = (0..40).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        app.emit_client_text(0, &forty_lines, false);
+
+        assert!(app.worlds[0].paused);
+        assert!(!app.worlds[0].pending_lines.is_empty());
+        assert_eq!(app.worlds[0].output_lines.len() + app.worlds[0].pending_lines.len(), 40);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
+        assert_eq!(server_data_count, 1, "the visible portion must be a single broadcast");
+        assert!(
+            log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { world_index: 0, .. })),
+            "must broadcast PendingLinesUpdate so remote/web/GUI clients know to pause"
+        );
+    }
+
+    #[test]
+    fn test_tf_output_while_paused_does_not_broadcast() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+        app.output_height = 12;
+        app.output_width = 80;
+        app.worlds[0].paused = true; // already paused
+
+        app.emit_client_text(0, "held back", false);
+
+        assert_eq!(app.worlds[0].pending_lines.len(), 1);
+        assert!(app.worlds[0].output_lines.is_empty());
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
+        assert_eq!(server_data_count, 0, "nothing landed in output_lines, so nothing should broadcast");
+    }
+
+    #[test]
+    fn test_emit_client_text_routes_to_named_world() {
+        // Regression guard: 4 call sites (portal detection, trigger messages)
+        // previously went through add_tf_output's implicit current_world_index
+        // even when they had a different, correct world_idx in scope.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("world0"));
+        app.worlds.push(World::new("world1"));
+        app.current_world_index = 0;
+
+        app.emit_client_text(1, "for world1", false);
+
+        assert!(app.worlds[0].output_lines.is_empty(), "must not land in the current world");
+        assert_eq!(app.worlds[1].output_lines.len(), 1);
+        assert_eq!(app.worlds[1].output_lines[0].text, "for world1");
+    }
+
+    #[test]
+    fn test_emit_client_text_ignores_empty() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        app.emit_client_text(0, "", false);
+
+        assert!(app.worlds[0].output_lines.is_empty());
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_client_line_text_has_no_sparkle_prefix() {
+        // The invariant this whole unification relies on: OutputLine.text (and
+        // every wire payload derived from it) stays prefix-free. The "✨ "
+        // marker is added exactly once, at display time, by each renderer.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        app.emit_client_text(0, "plain message", false);
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::World("does-not-exist".to_string()),
+            ..tf::RecallOptions::default()
+        };
+        app.emit_recall(&opts, 0, false); // exercises emit_recall's error path
+
+        for line in &app.worlds[0].output_lines {
+            assert!(!line.text.starts_with('\u{2728}'), "stored text must never carry the client-line prefix: {:?}", line.text);
+        }
+        let log = app.ws_broadcast_log.lock().unwrap();
+        for msg in log.iter() {
+            if let WsMessage::ServerData { data, .. } = msg {
+                assert!(!data.starts_with('\u{2728}'), "broadcast text must never carry the client-line prefix: {:?}", data);
+            }
+        }
+    }
+
+    #[test]
+    fn test_process_output_line_adds_exactly_one_prefix() {
+        use crate::rendering::process_output_line;
+        let cached_now = CachedNow::new();
+
+        let client_line = OutputLine::new_client("hello".to_string(), 1);
+        let rendered = process_output_line(&client_line, false, false, false, &cached_now).unwrap();
+        assert_eq!(rendered.matches('\u{2728}').count(), 1, "a client-generated line gets exactly one prefix");
+
+        let server_line = OutputLine::new("hello".to_string(), 2);
+        let rendered = process_output_line(&server_line, false, false, false, &cached_now).unwrap();
+        assert_eq!(rendered.matches('\u{2728}').count(), 0, "a server line gets no prefix");
+
+        let whitespace_client_line = OutputLine::new_client("   ".to_string(), 3);
+        let rendered = process_output_line(&whitespace_client_line, false, false, false, &cached_now).unwrap();
+        assert_eq!(rendered.matches('\u{2728}').count(), 0, "a visually-empty client line gets no prefix");
+    }
+
+    #[test]
+    fn test_initial_state_snapshot_matches_stored_text() {
+        // Regression guard for un-baking the "✨ " prefix from build_initial_state:
+        // the snapshot sent to a newly-connecting client must carry exactly the
+        // same text as what's stored, not a baked-in prefix (which would
+        // double up with the display-time prefix on both console and web).
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.worlds[0].output_lines.push(OutputLine::new_client("client line".to_string(), 1));
+        app.worlds[0].output_lines.push(OutputLine::new("server line".to_string(), 2));
+
+        let state = app.build_initial_state();
+        if let WsMessage::InitialState { worlds, .. } = state {
+            let ts_lines = &worlds[0].output_lines_ts;
+            assert_eq!(ts_lines.len(), 2);
+            assert_eq!(ts_lines[0].text, "client line");
+            assert_eq!(ts_lines[1].text, "server line");
+        } else {
+            panic!("expected InitialState");
+        }
+    }
+
+    #[test]
+    fn test_release_pending_preserves_from_server() {
+        // Regression guard: release_pending_screenful used to hardcode
+        // from_server: true on every released broadcast regardless of the
+        // actual per-line flag, which would strip the "✨ " marker from a
+        // released client-generated line (e.g. an overflowed /recall) on web
+        // while the TUI (which reads the real stored flag) rendered it fine.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.output_height = 12; // max_lines = 10
+        app.output_width = 80;
+
+        app.worlds[0].pending_lines.push(OutputLine::new("server line".to_string(), 1));
+        app.worlds[0].pending_lines.push(OutputLine::new_client("client line".to_string(), 2));
+        app.worlds[0].paused = true;
+
+        app.release_pending_screenful();
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data: Vec<_> = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { data, from_server, .. } = m { Some((data.clone(), *from_server)) } else { None }
+        }).collect();
+        assert!(server_data.iter().any(|(d, fs)| d.contains("server line") && *fs), "server line must broadcast with from_server: true");
+        assert!(server_data.iter().any(|(d, fs)| d.contains("client line") && !*fs), "client line must broadcast with from_server: false, not hardcoded true");
+    }
+
     #[test]
     fn test_more_mode_visual_line_offset_survives_gagged_lines() {
         // Regression test: gagged lines appended after add_output must not
