@@ -7129,6 +7129,10 @@ impl App {
             Command::ActionCommand { name, args } => {
                 // Execute action if it exists (respects the action's world field).
                 if let Some(action) = find_invocable_action(&self.settings.actions, &name, &world_name) {
+                    if !action.enabled {
+                        self.emit_client_text(world_index, &format!("Action '{}' is disabled.", action.name), false);
+                        return WsAsyncAction::Done;
+                    }
                     let commands = split_action_commands(&action.command);
                     let mut sent_to_server = false;
                     for cmd in commands {
