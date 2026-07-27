@@ -2271,32 +2271,19 @@ keep_alive_type=Generic
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                if let Some(ws) = &app.ws_server {
-                                    ws.broadcast_to_all(WsMessage::ServerData {
-                                        world_index: world_idx,
-                                        data: msg,
-                                        is_viewed: true,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                        seq: 0,
-                                    marked_new: false,
-                                    flush: false, gagged: false,
-                                    });
-                                }
+                                // This tick isn't actually per-user scoped - TF repeat
+                                // processes run against the shared app.tf_engine/app.worlds,
+                                // not any specific user's own UserConnection - so routing
+                                // through the regular gated path (like every other TF-result
+                                // site) is correct here, not the multiuser per-user broadcast
+                                // helpers. Was previously a raw ws.broadcast_to_all, fully
+                                // bypassing more-mode gating and never reaching output_lines
+                                // (so /recall could never find it, same bug class as the
+                                // original /recall fix).
+                                app.emit_client_text(world_idx, &msg, true);
                             }
                             tf::TfCommandResult::Error(err) => {
-                                if let Some(ws) = &app.ws_server {
-                                    ws.broadcast_to_all(WsMessage::ServerData {
-                                        world_index: world_idx,
-                                        data: format!("Error: {}", err),
-                                        is_viewed: true,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                        seq: 0,
-                                    marked_new: false,
-                                    flush: false, gagged: false,
-                                    });
-                                }
+                                app.emit_tf_error(world_idx, &err, true);
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
                                 app.tf_engine.processes.push(process);
