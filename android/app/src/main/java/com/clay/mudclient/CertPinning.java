@@ -29,8 +29,9 @@ import javax.net.ssl.X509ExtendedTrustManager;
  * TrustManager"/"Insecure HostnameVerifier" (CWE-295).
  *
  * Pins are stored per {@code "host:port"} in a dedicated SharedPreferences file so they survive
- * app restarts, and can be cleared from {@code SettingsActivity} ("Clear Pinned Certificates")
- * if a server's certificate legitimately rotates.
+ * app restarts, and can be cleared from the clay-server settings tab ("Clear Pinned
+ * Certificates", wired via {@link MainActivity}'s {@code clearAllPinnedCertificates()}) if a
+ * server's certificate legitimately rotates.
  *
  * As with the Rust TofuVerifier, this deliberately does not perform standard hostname/CA-chain
  * verification on top of pinning — many Clay servers (and MUDs) use ad hoc self-signed
@@ -55,7 +56,7 @@ final class CertPinning {
         }
     }
 
-    /** Wipes every stored pin (used by SettingsActivity's "Clear Pinned Certificates"). */
+    /** Wipes every stored pin (used by the clay-server tab's "Clear Pinned Certificates"). */
     static void clearAllPins(Context context) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply();
     }

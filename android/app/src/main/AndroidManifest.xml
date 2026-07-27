@@ -35,11 +35,6 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".SettingsActivity"
-            android:exported="false"
-            android:label="Settings" />
-
         <!-- Foreground service for background connection -->
         <service
             android:name=".ClayForegroundService"

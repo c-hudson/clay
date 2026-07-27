@@ -9882,6 +9882,18 @@
                 }, 2000);
             };
         }
+        // Migrated from the now-deleted SettingsActivity.java's "Clear Pinned
+        // Certificates" button - same CertPinning.clearAllPins() call, now reachable
+        // from the clay-server settings tab instead of the dead native Settings screen.
+        var csClearPinsBtn = document.getElementById('cs-clear-pins-btn');
+        if (csClearPinsBtn) {
+            csClearPinsBtn.onclick = function() {
+                if (!window.Android || !window.Android.clearAllPinnedCertificates) return;
+                window.Android.clearAllPinnedCertificates();
+                csClearPinsBtn.textContent = '✓ Cleared';
+                setTimeout(function() { csClearPinsBtn.textContent = 'Clear Pinned Certificates'; }, 2000);
+            };
+        }
         var csPassEl = document.getElementById('cs-password');
         if (csPassEl) {
             csPassEl.oninput = function() {

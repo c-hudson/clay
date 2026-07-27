@@ -266,6 +266,11 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public void clearAllPinnedCertificates() {
+            CertPinning.clearAllPins(MainActivity.this);
+        }
+
+        @JavascriptInterface
         public void saveUsername(String username) {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             prefs.edit().putString(KEY_SAVED_USERNAME, username).apply();
@@ -807,7 +812,7 @@ public class MainActivity extends AppCompatActivity {
 
     // First-launch chooser: run Clay's own server on this phone, or connect to one running
     // elsewhere. Not cancelable — the app needs an explicit choice before it can proceed.
-    // Also reachable later from Settings to change the choice (SettingsActivity).
+    // Also reachable later from the clay-server settings tab to change the choice.
     private void showRunModeChooser() {
         new AlertDialog.Builder(this)
             .setTitle("How do you want to run Clay?")
@@ -1006,8 +1011,17 @@ public class MainActivity extends AppCompatActivity {
             .setMessage(message)
             .setCancelable(false)
             .setPositiveButton("Retry", (dialog, which) -> startSshProxyThenLoadInterface())
-            .setNegativeButton("Cancel", (dialog, which) ->
-                startActivity(new Intent(this, SettingsActivity.class)))
+            .setNegativeButton("Cancel", (dialog, which) -> {
+                // SettingsActivity.java (a separate, drifted settings screen) is gone - and
+                // openSettingsPopup('clay-server') (what every other "need settings" path
+                // uses) isn't reachable yet either, since the WebView has no page loaded at
+                // this point in the SSH-tunnel-first startup flow (loadInterface() hasn't
+                // run). Load the real interface instead, same as loadFullApp() does; its own
+                // connection attempt will fail against the down tunnel and surface the
+                // existing connection-log dialog, whose "Settings" button reaches the same
+                // clay-server tab from there.
+                loadInterface();
+            })
             .show();
     }
 
@@ -1658,9 +1672,8 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        // Called when activity is brought to front via FLAG_ACTIVITY_CLEAR_TOP — notably this is
-        // how SettingsActivity returns after saveAndConnect(), reusing this same instance rather
-        // than a fresh onCreate().
+        // Called when activity is brought to front via FLAG_ACTIVITY_CLEAR_TOP (e.g. a
+        // notification tap), reusing this same instance rather than a fresh onCreate().
         android.util.Log.i("Clay", "onNewIntent called, checking if interface needs loading");
         if (interfaceLoaded) {
             reloadInterfaceRespectingRunMode();
@@ -1670,8 +1683,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // Reloads the WebView. If the run mode changed since it was last applied, or the SSH tunnel
-    // target/creds changed while still in use (from either SettingsActivity or the web settings
-    // popup's "clay-server" tab — see reloadPage() below), tears down the old local server/SSH
+    // target/creds changed while still in use (from the web settings popup's "clay-server" tab
+    // — see reloadPage() below), tears down the old local server/SSH
     // proxy/WebSockets first and re-enters the run-mode decision fresh via
     // proceedAfterPermissions(). Otherwise this is just a normal reload (e.g. a manual resync,
     // or an unrelated remote-settings change) — the fast path, since restarting an
