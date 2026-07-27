@@ -69,6 +69,11 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_SSH_PRIVATE_KEY = "sshPrivateKey";
     private static final String KEY_SSH_KEY_PASSPHRASE = "sshKeyPassphrase";
     private static final String KEY_SSH_PASSWORD = "sshPassword";
+    // Whether the web client should force the on-screen keyboard visible on phone/tablet
+    // layout (see keyboardForceEnabled()/setKeyboardForceActive() in app.js). Cached here
+    // so the activity can pick an initial windowSoftInputMode before the first WebSocket
+    // settings sync arrives — see setupWebView()/onCreate().
+    private static final String KEY_KEYBOARD_ALWAYS_VISIBLE = "keyboardAlwaysVisible";
 
     // Minimal first-launch page — loads instantly, immediately hands off to the full app
     private static final String FIRST_LAUNCH_HTML =
@@ -155,6 +160,18 @@ public class MainActivity extends AppCompatActivity {
     private Runnable heartbeatRunnable;
     private int missedHeartbeats = 0;
     private static final int HEARTBEAT_INTERVAL_MS = 30000; // 30 seconds
+
+    // Keyboard-force state (see setKeyboardForceActive() below). keyboardForceActive is the
+    // last value JS resolved via keyboardForceEnabled() and pushed down to us; it already
+    // accounts for the setting, device mode, AND hardware-keyboard presence, so we just obey
+    // it. Seeded from the cached SharedPreferences value in onCreate() so the very first
+    // frame (before any WebSocket settings sync) picks a reasonable soft-input mode instead
+    // of defaulting to "off". hardwareKeyboardAttached is tracked independently in Java
+    // (onConfigurationChanged is the only place that knows this) so that when JS tells us to
+    // stop forcing, we know whether that's because the user turned the setting off (leave the
+    // IME alone) or because a hardware keyboard just appeared (actively hide it).
+    private boolean keyboardForceActive = true;
+    private boolean hardwareKeyboardAttached = false;
 
     // JavaScript interface for communication between web and Android
     public class AndroidInterface {
@@ -347,6 +364,18 @@ public class MainActivity extends AppCompatActivity {
             String sanitized = RUN_MODE_LOCAL.equals(mode) ? RUN_MODE_LOCAL : RUN_MODE_REMOTE;
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString(KEY_RUN_MODE, sanitized).apply();
+        }
+
+        // Pushed by app.js's applyKeyboardForceState() whenever the resolved
+        // keyboardForceEnabled() verdict changes (setting toggled, device mode changed,
+        // or a hardware-keyboard notification round-tripped back through JS). `active`
+        // already folds in the setting, device mode, and hardware-keyboard state — Java
+        // just applies it. See applyKeyboardForce() below.
+        @JavascriptInterface
+        public void setKeyboardForceActive(boolean active) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_KEYBOARD_ALWAYS_VISIBLE, active).apply();
+            runOnUiThread(() -> applyKeyboardForce(active));
         }
 
         // SSH tunnel option (remote mode only) — see SshProxyManager and
@@ -729,11 +758,54 @@ public class MainActivity extends AppCompatActivity {
                 "if (typeof openSettingsPopup === 'function') openSettingsPopup('clay-server');",
                 null);
         });
+        // Seed the keyboard-force state before the WebView is even configured: the setting
+        // comes from cached prefs (real value arrives later via the first settings sync /
+        // setKeyboardForceActive() call), but hardware-keyboard presence is knowable right
+        // now from the current Configuration, so it's not left defaulting to "absent".
+        hardwareKeyboardAttached = isHardwareKeyboardAttached(getResources().getConfiguration());
+        keyboardForceActive = migratePrefs.getBoolean(KEY_KEYBOARD_ALWAYS_VISIBLE, true) && !hardwareKeyboardAttached;
+        applyKeyboardForce(keyboardForceActive);
+
         setupWebView();
 
         // Start permission flow - will call proceedAfterPermissions when done
         isInitialLoadPending = true;
         startPermissionFlow();
+    }
+
+    /** newConfig.keyboard != KEYBOARD_NOKEYS alone isn't enough — some devices report a
+     *  QWERTY "keyboard" type even with none physically attached; hardKeyboardHidden is the
+     *  actual "is it physically available right now" signal (NO = available/slid-out). */
+    private static boolean isHardwareKeyboardAttached(android.content.res.Configuration cfg) {
+        return cfg.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
+            && cfg.hardKeyboardHidden == android.content.res.Configuration.HARDKEYBOARDHIDDEN_NO;
+    }
+
+    /** Apply (or release) the forced-visible soft keyboard state. Must run on the UI thread.
+     *  `active` is the fully-resolved verdict from app.js's keyboardForceEnabled() (setting AND
+     *  device mode AND !hardwareKeyboardPresent already folded in) — this method just obeys it,
+     *  except it additionally actively hides the IME when force is off *because a hardware
+     *  keyboard is attached* (hardwareKeyboardAttached, tracked independently in Java), as
+     *  opposed to merely because the user turned the setting off, where the IME is left alone
+     *  rather than being yanked out from under someone mid-interaction. */
+    private void applyKeyboardForce(boolean active) {
+        keyboardForceActive = active;
+        if (webView == null) return;
+        androidx.core.view.WindowInsetsControllerCompat controller =
+            new androidx.core.view.WindowInsetsControllerCompat(getWindow(), webView);
+        if (active) {
+            getWindow().setSoftInputMode(
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
+                | android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+            controller.show(androidx.core.view.WindowInsetsCompat.Type.ime());
+        } else {
+            getWindow().setSoftInputMode(
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED
+                | android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+            if (hardwareKeyboardAttached) {
+                controller.hide(androidx.core.view.WindowInsetsCompat.Type.ime());
+            }
+        }
     }
 
     private void startPermissionFlow() {
@@ -1441,6 +1513,23 @@ public class MainActivity extends AppCompatActivity {
         // Add JavaScript interface for Android communication
         webView.addJavascriptInterface(new AndroidInterface(), "Android");
 
+        // Reliability fix for the Back-dismiss gap: dismissing the IME with the system Back
+        // button does NOT blur the WebView's focused <textarea> (the WebView keeps DOM focus
+        // the whole time), so nothing on the JS side can observe it happened and no JS refocus
+        // mechanism ever fires. This is the one piece JS structurally cannot do — react to the
+        // real window-insets IME-visibility signal and re-show it ourselves when force is on.
+        // isVisible(ime()) is only reliable on API 30+; below that, onWindowFocusChanged()
+        // below is the fallback re-show path.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(webView, (v, insets) -> {
+                if (keyboardForceActive && !insets.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())) {
+                    new androidx.core.view.WindowInsetsControllerCompat(getWindow(), webView)
+                        .show(androidx.core.view.WindowInsetsCompat.Type.ime());
+                }
+                return insets;
+            });
+        }
+
         final MainActivity activity = this;
 
         webView.setWebViewClient(new WebViewClient() {
@@ -1549,6 +1638,13 @@ public class MainActivity extends AppCompatActivity {
                 // Inject template variables that were NOT substituted at load time (loadUrl path)
                 String varScript = buildVarInjectionScript();
                 view.evaluateJavascript(varScript, unused -> {
+                    // Tell JS the current hardware-keyboard state right away, before the first
+                    // settings sync — otherwise app.js's hardwareKeyboardPresent stays at its
+                    // false default until the next onConfigurationChanged fires (which may
+                    // never happen this session if no keyboard is ever attached/detached).
+                    view.evaluateJavascript(
+                        "if (typeof window.onHardwareKeyboardChanged === 'function') window.onHardwareKeyboardChanged("
+                            + hardwareKeyboardAttached + ");", null);
                     // connect() AFTER vars are injected so buildCandidates() sees them
                     view.postDelayed(() -> view.evaluateJavascript(
                         "if (typeof connect === 'function') connect();", null), 300);
@@ -1841,6 +1937,38 @@ public class MainActivity extends AppCompatActivity {
         // WebView continues running if connected (foreground service keeps process alive)
         // Start background shutdown timer to save power after 1 hour
         startBackgroundShutdownTimer();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        // Replaces what the manifest's old stateAlwaysVisible used to guarantee on its own:
+        // re-show the IME whenever this window regains focus (e.g. returning from another app
+        // via the recents list), but only while force is actually active.
+        if (hasFocus && keyboardForceActive) {
+            applyKeyboardForce(true);
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // The manifest already declares configChanges="...|keyboard|keyboardHidden", which is
+        // what routes hardware keyboard attach/detach here instead of recreating the activity.
+        boolean attached = isHardwareKeyboardAttached(newConfig);
+        if (attached == hardwareKeyboardAttached) return;
+        hardwareKeyboardAttached = attached;
+        if (attached) {
+            // Hide immediately rather than waiting for JS to round-trip a new
+            // setKeyboardForceActive(false) call — the user just started typing on a real
+            // keyboard, the on-screen one should get out of the way now.
+            applyKeyboardForce(false);
+        }
+        if (webView != null) {
+            webView.evaluateJavascript(
+                "if (typeof window.onHardwareKeyboardChanged === 'function') window.onHardwareKeyboardChanged("
+                    + attached + ");", null);
+        }
     }
 
     @Override

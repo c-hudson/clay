@@ -618,6 +618,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_line_indicator = settings.new_line_indicator;
+                app.settings.keyboard_always_visible = settings.keyboard_always_visible;
                 let old_tts_mode = app.settings.tts_mode;
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);

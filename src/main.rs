@@ -1587,6 +1587,11 @@ pub struct Settings {
     // client per world on initial connect. Older history is backfilled on demand
     // via RequestScrollback. See build_initial_state().
     pub remote_initial_lines: u16,
+    // Force the on-screen keyboard visible on phone/tablet web clients (Android
+    // app included). When true, the web client aggressively refocuses the input
+    // to keep the IME up; when false, the OS decides. Always overridden off when
+    // a hardware keyboard is attached, regardless of this setting.
+    pub keyboard_always_visible: bool,
 }
 
 impl Default for Settings {
@@ -1637,6 +1642,7 @@ impl Default for Settings {
             tts_muted: false,
             scrollback_enabled: false,
             remote_initial_lines: 100,
+            keyboard_always_visible: true,
         }
     }
 }
@@ -3593,6 +3599,7 @@ impl App {
             tts_mode: self.settings.tts_mode.name().to_string(),
             tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
             scrollback_enabled: self.settings.scrollback_enabled,
+            keyboard_always_visible: self.settings.keyboard_always_visible,
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
@@ -3665,6 +3672,7 @@ impl App {
             self.settings.tts_muted = false;
         }
         self.settings.scrollback_enabled = settings.scrollback_enabled;
+        self.settings.keyboard_always_visible = settings.keyboard_always_visible;
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
             self.keybindings = keybindings::KeyBindings::from_json(&settings.keybindings_json);
@@ -4031,6 +4039,7 @@ impl App {
             self.settings.tts_speak_mode.name(),
             self.settings.scrollback_enabled,
             self.settings.wrapspace as i64,
+            self.settings.keyboard_always_visible,
         );
         self.popup_manager.open(def);
 
@@ -6054,6 +6063,7 @@ impl App {
         tts_mode: String,
         tts_speak_mode: String,
         scrollback_enabled: bool,
+        keyboard_always_visible: bool,
     ) {
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
@@ -6133,6 +6143,7 @@ impl App {
         if scrollback_changed {
             self.init_scrollback();
         }
+        self.settings.keyboard_always_visible = keyboard_always_visible;
         // Save settings to persist changes. Tag the (debug-mode-only) audit log
         // with which kind of client pushed this, so a future settings-loss report
         // can be traced back to its source (web/gui/console/android).
@@ -9136,7 +9147,7 @@ impl App {
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, keyboard_always_visible } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -9146,6 +9157,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                     mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
+                    keyboard_always_visible,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -10627,6 +10639,7 @@ pub(crate) struct SetupSettings {
     pub(crate) tts_speak_mode: String,
     pub(crate) scrollback: bool,
     pub(crate) wrapspace: i64,
+    pub(crate) keyboard_always_visible: bool,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -10778,7 +10791,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
-        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE,
+        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -11028,6 +11041,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
                     scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
                     wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
+                    keyboard_always_visible: state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE).unwrap_or(true),
                 }
             };
 

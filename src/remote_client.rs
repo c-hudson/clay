@@ -1508,6 +1508,7 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.new_line_indicator = settings.new_line_indicator;
+                app.settings.keyboard_always_visible = settings.keyboard_always_visible;
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.settings.scrollback_enabled = settings.scrollback;
                 // No local needs_output_redraw here — this is a remote console client; the
@@ -1562,6 +1563,7 @@ pub(crate) fn handle_remote_client_key(
                     tts_mode: app.settings.tts_mode.name().to_string(),
                     tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
                     scrollback_enabled: app.settings.scrollback_enabled,
+                    keyboard_always_visible: app.settings.keyboard_always_visible,
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -2357,6 +2359,7 @@ pub(crate) fn apply_remote_web_settings(
         tts_mode: app.settings.tts_mode.name().to_string(),
         tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
         scrollback_enabled: app.settings.scrollback_enabled,
+        keyboard_always_visible: app.settings.keyboard_always_visible,
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {

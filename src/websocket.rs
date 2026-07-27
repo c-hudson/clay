@@ -278,6 +278,8 @@ pub enum WsMessage {
         tts_speak_mode: String,
         #[serde(default)]
         scrollback_enabled: bool,
+        #[serde(default = "default_keyboard_always_visible")]
+        keyboard_always_visible: bool,
     },
 
     // Settings update confirmations (server -> client)
@@ -584,6 +586,10 @@ pub struct GlobalSettingsMsg {
     pub tts_speak_mode: String,
     #[serde(default)]
     pub scrollback_enabled: bool,
+    /// Force the on-screen keyboard visible on phone/tablet web clients (Android
+    /// app included); ignored when a hardware keyboard is attached.
+    #[serde(default = "default_keyboard_always_visible")]
+    pub keyboard_always_visible: bool,
     /// Theme colors from ~/.clay/theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
@@ -628,6 +634,10 @@ fn default_web_font_weight() -> u16 {
 
 fn default_web_font_line_height() -> f32 {
     1.2
+}
+
+fn default_keyboard_always_visible() -> bool {
+    true
 }
 
 /// Type of remote client connected via WebSocket

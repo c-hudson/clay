@@ -5126,7 +5126,7 @@ if you're more curious.\"";
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), ws_password.to_string(),
             false, String::new(), true, true, false,
-            "off".to_string(), "off".to_string(), false,
+            "off".to_string(), "off".to_string(), false, true,
         );
     }
 

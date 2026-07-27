@@ -217,6 +217,7 @@
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
+        setupKeyboardVisibleToggle: document.getElementById('setup-keyboard-visible-toggle'),
         setupDebugToggle: document.getElementById('setup-debug-toggle'),
         setupArchiveToggle: document.getElementById('setup-archive-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
@@ -496,6 +497,7 @@
     let setupTtsMode = 'Off';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
+    let setupKeyboardAlwaysVisible = true;
     let setupArchive = false;
     let setupDebug = false;
     let setupInputHeightValue = 1;
@@ -594,6 +596,8 @@
     let ttsMode = 'off';  // Will be synced from server settings ('off', 'local', 'edge')
     let ttsSpeakMode = 'all';  // 'all' or 'limit'
     let newLineIndicator = false;  // Will be synced from server settings
+    let keyboardAlwaysVisible = true;  // Will be synced from server settings
+    let hardwareKeyboardPresent = false;  // Set by Java via window.onHardwareKeyboardChanged
 
     // MCMP (MUD Client Media Protocol) state
     let mcmpDefaultUrl = '';
@@ -906,6 +910,33 @@
         }
     }
 
+    // Whether the web client should be actively forcing the on-screen keyboard
+    // visible right now: the user setting is on, we're on a phone/tablet layout,
+    // and no hardware keyboard is attached (hardwareKeyboardPresent is reported
+    // by Java via window.onHardwareKeyboardChanged; always false on non-Android
+    // clients, so this reduces to the old deviceMode check there).
+    function keyboardForceEnabled() {
+        return keyboardAlwaysVisible
+            && (deviceMode === 'phone' || deviceMode === 'tablet')
+            && !hardwareKeyboardPresent;
+    }
+
+    // Push the current keyboardForceEnabled() verdict to the native Android layer
+    // so it can apply/release windowSoftInputMode and show/hide the IME to match.
+    // No-op on non-Android clients (window.Android is undefined there).
+    function applyKeyboardForceState() {
+        if (!window.Android || typeof window.Android.setKeyboardForceActive !== 'function') return;
+        window.Android.setKeyboardForceActive(keyboardForceEnabled());
+    }
+
+    // Called by native Android code (MainActivity.onConfigurationChanged) whenever
+    // a hardware keyboard is attached or detached, so the force-visible decision
+    // stays correct without waiting for the next settings sync.
+    window.onHardwareKeyboardChanged = function(present) {
+        hardwareKeyboardPresent = !!present;
+        applyKeyboardForceState();
+    };
+
     // Custom dropdown for mobile (replaces native select with styled dropdown)
     let activeCustomDropdown = null;
 
@@ -1060,6 +1091,7 @@
         if (mode === 'phone' || mode === 'tablet') {
             document.body.classList.add('is-mobile');
         }
+        applyKeyboardForceState();
     }
 
     // Initialize
@@ -2091,6 +2123,10 @@
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
                     }
+                    if (msg.settings.keyboard_always_visible !== undefined) {
+                        keyboardAlwaysVisible = msg.settings.keyboard_always_visible;
+                    }
+                    applyKeyboardForceState();
                     if (msg.settings.tls_proxy_enabled !== undefined) {
                         tlsProxyEnabled = msg.settings.tls_proxy_enabled;
                     }
@@ -2641,6 +2677,10 @@
                             renderOutput();
                         }
                     }
+                    if (msg.settings.keyboard_always_visible !== undefined) {
+                        keyboardAlwaysVisible = msg.settings.keyboard_always_visible;
+                    }
+                    applyKeyboardForceState();
                     if (msg.settings.tls_proxy_enabled !== undefined) {
                         tlsProxyEnabled = msg.settings.tls_proxy_enabled;
                     }
@@ -4668,6 +4708,10 @@
             '  arrives. Keeps you from missing important text.', '',
             'TLS Proxy: Keeps a proxy alive during hot reload', '  so TLS connections survive.', '',
             'New Indicator: Show a marker on new lines arriving', '  while scrolled up in the output buffer.', '',
+            'Keyboard Visible: Force the on-screen keyboard to',
+            '  stay up on phones/tablets. Off lets the OS decide.',
+            '  Always ignored (keyboard hidden) when a hardware',
+            '  keyboard is attached.', '',
             'Debug: Enables debug logging to ~/.clay/debug.log.', '',
             'ANSI Music: Play ANSI music sequences from MUDs.', '',
             'ZWJ Sequence: For terminals that support combined',
@@ -6933,6 +6977,7 @@
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'edge' ? 'Edge' : 'Off';
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
+        setupKeyboardAlwaysVisible = keyboardAlwaysVisible;
         setupDebug = debugEnabled;
         setupArchive = scrollbackEnabled;
         setupInputHeightValue = inputHeight;
@@ -7009,6 +7054,11 @@
             elements.setupNewLineIndicatorToggle.classList.add('active');
         } else {
             elements.setupNewLineIndicatorToggle.classList.remove('active');
+        }
+        if (setupKeyboardAlwaysVisible) {
+            elements.setupKeyboardVisibleToggle.classList.add('active');
+        } else {
+            elements.setupKeyboardVisibleToggle.classList.remove('active');
         }
         if (setupDebug) {
             elements.setupDebugToggle.classList.add('active');
@@ -7087,7 +7137,8 @@
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
             dictionary_path: dictionaryPath,
-            scrollback_enabled: scrollbackEnabled
+            scrollback_enabled: scrollbackEnabled,
+            keyboard_always_visible: keyboardAlwaysVisible
         };
     }
 
@@ -7192,6 +7243,8 @@
         ttsMode = setupTtsMode.toLowerCase();
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
+        keyboardAlwaysVisible = setupKeyboardAlwaysVisible;
+        applyKeyboardForceState();
         debugEnabled = setupDebug;
         scrollbackEnabled = setupArchive;
         guiTheme = setupGuiTheme;
@@ -8987,8 +9040,11 @@
             }
         };
 
-        // On mobile, keep keyboard visible by refocusing input when it loses focus
-        if (deviceMode === 'phone' || deviceMode === 'tablet') {
+        // Keep keyboard visible on mobile by refocusing input when it loses focus.
+        // Listeners are always installed (device mode and the keyboard-visible
+        // setting can both change at runtime); each mechanism below consults
+        // keyboardForceEnabled() live rather than being gated once at setup time.
+        {
             // Helper to check if any modal or menu is open
             function isAnyModalOpen() {
                 return elements.authModal.classList.contains('visible') ||
@@ -9019,6 +9075,7 @@
 
             // Global touchend handler - refocus input after any touch interaction
             document.addEventListener('touchend', function(e) {
+                if (!keyboardForceEnabled()) return;
                 // Skip if mouse is interacting with output area (text selection)
                 if (outputPointerDown) return;
                 // Skip if touching interactive elements
@@ -9036,6 +9093,7 @@
                 }
                 // Refocus input after a very short delay
                 requestAnimationFrame(function() {
+                    if (!keyboardForceEnabled()) return;
                     if (!isAnyModalOpen() && document.activeElement !== elements.input) {
                         const sel = window.getSelection();
                         if (sel && sel.toString().length > 0) return;
@@ -9049,6 +9107,7 @@
             elements.input.addEventListener('blur', function() {
                 // Use requestAnimationFrame for fastest possible refocus
                 requestAnimationFrame(function() {
+                    if (!keyboardForceEnabled()) return;
                     // Don't refocus if mouse is interacting with output area (text selection)
                     if (outputPointerDown) return;
                     // Don't refocus if a modal is open or interacting with form elements
@@ -9071,6 +9130,7 @@
 
             // Periodic check to ensure input stays focused (every 500ms)
             setInterval(function() {
+                if (!keyboardForceEnabled()) return;
                 if (outputPointerDown) return;
                 const sel = window.getSelection();
                 if (sel && sel.toString().length > 0) return;
@@ -9711,6 +9771,10 @@
         };
         elements.setupNewLineIndicatorToggle.onclick = function() {
             setupNewLineIndicator = !setupNewLineIndicator;
+            updateSetupPopupUI();
+        };
+        elements.setupKeyboardVisibleToggle.onclick = function() {
+            setupKeyboardAlwaysVisible = !setupKeyboardAlwaysVisible;
             updateSetupPopupUI();
         };
         elements.setupDebugToggle.onclick = function() {
