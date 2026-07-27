@@ -2476,6 +2476,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::Unban { host } => {
             if app.ban_list.remove_ban(&host) {
+                // Save settings to persist the change (the WS/daemon copies already do this;
+                // without it, an unban from the console doesn't survive a restart).
+                let _ = persistence::save_settings(app);
                 app.add_output(&format!("Removed ban for: {}", host));
                 // Broadcast updated ban list to remote clients
                 app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
