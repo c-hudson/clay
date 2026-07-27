@@ -4,7 +4,7 @@ Single source of truth for all build targets and machine details.
 
 ## Remote checkouts are routinely dirty — sync deliberately
 
-Every remote (Mac, Windows VM, Termux, Linux test) tends to carry a modified `Cargo.lock`,
+Every remote (Mac, Windows VM, Termux) tends to carry a modified `Cargo.lock`,
 because `cargo build` rewrites the `clay` version line whenever the committed lock file
 lags the bumped `Cargo.toml`. A dirty tree makes `git pull` **abort**, and a `git pull &&
 cargo build` chain then builds the *old* checkout without an obvious error — this has
@@ -213,20 +213,3 @@ patchelf --set-rpath '/system/lib64:/data/data/com.termux/files/usr/lib' target/
 - Binary: `~/clay/target/release/clay`
 - Release asset name: `clay-termux-aarch64`
 - SCP back: `scp -P 8022 adrick@192.168.2.50:~/clay/target/release/clay /tmp/clay-termux-aarch64`
-
-## Linux Test (192.168.2.6) — VERIFICATION ONLY
-
-- User: `adrick`
-- SSH port: `22`
-- Path: `~/clay.build`
-- SSH command: `ssh adrick@192.168.2.6`
-
-### Build verification (NOT uploaded)
-```bash
-cd ~/clay.build
-git pull
-. ~/.cargo/env && cargo build --release --features webview-gui,native-audio
-```
-- This build is only to verify the code compiles on this machine (including GUI)
-- The binary is NOT included in the release assets
-- Report pass/fail in the summary
