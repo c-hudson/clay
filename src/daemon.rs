@@ -16,7 +16,7 @@ use crate::{
     get_multiuser_settings_path,
     enable_tcp_keepalive, parse_command, current_timestamp_secs,
 };
-use crate::actions::{split_action_commands, substitute_action_args,
+use crate::actions::{action_commands_to_run,
     find_invocable_action, rewrite_slashless_action};
 use crate::commands::{connect_slack, connect_discord};
 use crate::websocket::{TimestampedLine, RemoteClientType};
@@ -456,14 +456,8 @@ pub async fn handle_daemon_ws_message(
                             flush: false, gagged: false,
                             });
                         } else {
-                            let commands = split_action_commands(&action.command);
                             let mut sent_to_server = false;
-                            for cmd in commands {
-                                let cmd = substitute_action_args(&cmd, &args);
-
-                                if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
-                                    continue;
-                                }
+                            for cmd in action_commands_to_run(action, &args) {
                                 // Unified command system - route through TF parser
                                 if cmd.starts_with('/') {
                                     match app.tf_engine.execute(&cmd) {

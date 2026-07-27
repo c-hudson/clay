@@ -20,7 +20,7 @@ use crate::{
     WsMessage, WriteCommand, StreamReader, StreamWriter,
     Encoding, AutoConnectType,
     parse_command, get_version_string,
-    split_action_commands, substitute_action_args,
+    action_commands_to_run,
     find_invocable_action,
     format_duration_short, current_timestamp_secs,
     generate_test_music_notes,
@@ -2706,17 +2706,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     app.add_output(&format!("Action '{}' is disabled.", action.name));
                 } else {
                 // Execute the action's commands - process each individually
-                let commands = split_action_commands(&action.command);
                 let mut sent_to_server = false;
-                for cmd_str in commands {
-                    // Substitute $1-$9 and $* with arguments
-                    let cmd_str = substitute_action_args(&cmd_str, &args);
-
-                    // Skip /gag commands when invoked manually
-                    if cmd_str.eq_ignore_ascii_case("/gag") || cmd_str.to_lowercase().starts_with("/gag ") {
-                        continue;
-                    }
-
+                for cmd_str in action_commands_to_run(&action, &args) {
                     // Unified command system - route through TF parser
                     if cmd_str.starts_with('/') {
                         app.sync_tf_world_info();

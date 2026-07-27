@@ -107,6 +107,7 @@ pub use websocket::{
 pub use actions::{
     Action, MatchType, MatchPattern, ActionTriggerResult,
     split_action_commands, substitute_action_args, substitute_pattern_captures,
+    action_commands_to_run,
     wildcard_to_regex, execute_recall, check_action_triggers,
     compile_action_patterns, line_matches_compiled_patterns,
     compile_all_action_regexes,
@@ -7254,15 +7255,8 @@ impl App {
                         self.emit_client_text(world_index, &format!("Action '{}' is disabled.", action.name), false);
                         return WsAsyncAction::Done;
                     }
-                    let commands = split_action_commands(&action.command);
                     let mut sent_to_server = false;
-                    for cmd in commands {
-                            // Substitute $1-$9 and $* with arguments
-                            let cmd = substitute_action_args(&cmd, &args);
-
-                            if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
-                                continue;
-                            }
+                    for cmd in action_commands_to_run(action, &args) {
                             // Unified command system - route through TF parser
                             if cmd.starts_with('/') {
                                 self.sync_tf_world_info();

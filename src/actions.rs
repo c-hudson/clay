@@ -311,6 +311,21 @@ pub fn substitute_action_args(command: &str, args_str: &str) -> String {
     result
 }
 
+/// Splits an action's `command` field into sub-commands, substitutes `$1`-`$9`/`$*` with
+/// `args`, and filters out any resulting `/gag` invocation — manually invoking an action must
+/// never toggle a gag as a side effect. Shared by all three `Command::ActionCommand` dispatch
+/// sites (console/master-WS/daemon): each site still owns how it executes and displays the
+/// result of each returned command string, since that part differs by transport (TF result
+/// dispatch, `ClayCommand` handling, gating) — this only consolidates the identical
+/// preprocessing step that used to be hand-copied at each site.
+pub fn action_commands_to_run(action: &Action, args: &str) -> Vec<String> {
+    split_action_commands(&action.command)
+        .into_iter()
+        .map(|cmd| substitute_action_args(&cmd, args))
+        .filter(|cmd| !(cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ")))
+        .collect()
+}
+
 /// Substitute pattern captures ($0-$9) in a command string
 /// $0 is the entire match, $1-$9 are capture groups
 /// captures[0] is the full match, captures[1..] are the groups
@@ -1286,6 +1301,39 @@ mod tests {
     fn test_match_type_as_str() {
         assert_eq!(MatchType::Regexp.as_str(), "Regexp");
         assert_eq!(MatchType::Wildcard.as_str(), "Wildcard");
+    }
+
+    // --- action_commands_to_run ---
+
+    #[test]
+    fn test_action_commands_to_run_splits_substitutes_and_filters_gag() {
+        let action = Action {
+            command: "say hello $1; /gag; look $2".to_string(),
+            ..Action::default()
+        };
+        let result = action_commands_to_run(&action, "world here");
+        assert_eq!(result, vec!["say hello world".to_string(), "look here".to_string()]);
+    }
+
+    #[test]
+    fn test_action_commands_to_run_filters_gag_with_pattern_argument() {
+        let action = Action { command: "/gag foo; look".to_string(), ..Action::default() };
+        let result = action_commands_to_run(&action, "");
+        assert_eq!(result, vec!["look".to_string()]);
+    }
+
+    #[test]
+    fn test_action_commands_to_run_gag_check_is_case_insensitive() {
+        let action = Action { command: "/GAG; look".to_string(), ..Action::default() };
+        let result = action_commands_to_run(&action, "");
+        assert_eq!(result, vec!["look".to_string()]);
+    }
+
+    #[test]
+    fn test_action_commands_to_run_star_substitution() {
+        let action = Action { command: "say $*".to_string(), ..Action::default() };
+        let result = action_commands_to_run(&action, "all the words");
+        assert_eq!(result, vec!["say all the words".to_string()]);
     }
 
     // --- find_invocable_action / rewrite_slashless_action ---
