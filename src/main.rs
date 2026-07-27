@@ -5683,6 +5683,155 @@ impl App {
         self.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
     }
 
+    /// `WsMessage::UpdateGlobalSettings` handling — shared by master-WS and daemon (T37).
+    ///
+    /// Daemon's inline copy was missing a substantial amount of what master-WS's already did:
+    /// no `DEBUG_ENABLED.store(...)` (so toggling debug mode from a daemon-mode client never
+    /// actually took effect for `is_debug_enabled()`-gated logging, even though
+    /// `settings.debug_enabled` itself got set), no live `server.update_allow_list()`/
+    /// `server.update_password()` calls (settings were saved to disk but never applied to the
+    /// already-running WebSocket server until a restart), the `ws_password` field was destructured
+    /// as `_` and silently discarded entirely (the WS password could never be changed via this
+    /// message in daemon mode), no `input.visible_height` sync, and roughly ten missing
+    /// `.clamp(...)` calls (transparency, color offset, input height, font size/weight/spacing) —
+    /// meaning a daemon-mode client could push unvalidated values that main.rs would have
+    /// rejected/clamped.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_global_settings(
+        &mut self,
+        client_id: u64,
+        more_mode_enabled: bool,
+        spell_check_enabled: bool,
+        temp_convert_enabled: bool,
+        world_switch_mode: String,
+        show_tags: bool,
+        debug_enabled: bool,
+        ansi_music_enabled: bool,
+        console_theme: String,
+        gui_theme: String,
+        gui_transparency: f32,
+        color_offset_percent: u8,
+        wrapspace: u8,
+        remote_initial_lines: u16,
+        input_height: u16,
+        font_name: String,
+        font_size: f32,
+        web_font_size_phone: f32,
+        web_font_size_tablet: f32,
+        web_font_size_desktop: f32,
+        web_font_weight: u16,
+        web_font_line_height: f32,
+        web_font_letter_spacing: f32,
+        web_font_word_spacing: f32,
+        ws_allow_list: String,
+        web_secure: bool,
+        http_enabled: bool,
+        http_port: u16,
+        web_path: String,
+        ws_cert_file: String,
+        ws_key_file: String,
+        ws_password: String,
+        tls_proxy_enabled: bool,
+        dictionary_path: String,
+        mouse_enabled: bool,
+        zwj_enabled: bool,
+        new_line_indicator: bool,
+        tts_mode: String,
+        tts_speak_mode: String,
+        scrollback_enabled: bool,
+    ) {
+        self.settings.more_mode_enabled = more_mode_enabled;
+        self.settings.spell_check_enabled = spell_check_enabled;
+        self.settings.temp_convert_enabled = temp_convert_enabled;
+        self.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
+        self.show_tags = show_tags;
+        self.settings.debug_enabled = debug_enabled;
+        DEBUG_ENABLED.store(debug_enabled, Ordering::Relaxed);
+        self.settings.ansi_music_enabled = ansi_music_enabled;
+        // Console theme affects the TUI on the server
+        self.settings.theme = Theme::from_name(&console_theme);
+        // GUI theme is stored for sending back to GUI clients
+        self.settings.gui_theme = Theme::from_name(&gui_theme);
+        self.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
+        self.settings.color_offset_percent = color_offset_percent.min(100);
+        // No clamp on wrapspace itself — wrap_ansi_line/visual_line_count clamp the
+        // effective indent internally against whatever width is in play. Rewrap
+        // already-visible output immediately (mirrors a terminal resize) only when
+        // it actually changed, so an unrelated settings save doesn't force a redraw.
+        if self.settings.wrapspace != wrapspace {
+            self.settings.wrapspace = wrapspace;
+            self.needs_output_redraw = true;
+        }
+        self.settings.remote_initial_lines = remote_initial_lines.clamp(10, 5000);
+        self.input_height = input_height.clamp(1, 15);
+        self.input.visible_height = self.input_height;
+        self.settings.font_name = font_name;
+        self.settings.font_size = font_size.clamp(8.0, 48.0);
+        self.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
+        self.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
+        self.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
+        self.settings.web_font_weight = web_font_weight.clamp(1, 900);
+        self.settings.web_font_line_height = web_font_line_height.clamp(0.5, 3.0);
+        self.settings.web_font_letter_spacing = web_font_letter_spacing.clamp(-5.0, 10.0);
+        self.settings.web_font_word_spacing = web_font_word_spacing.clamp(-5.0, 20.0);
+        self.settings.websocket_allow_list = ws_allow_list.clone();
+        // Update the running WebSocket server's allow list
+        if let Some(ref server) = self.ws_server {
+            server.update_allow_list(&ws_allow_list);
+        }
+        // Update password (may be empty string to clear it)
+        self.settings.websocket_password = ws_password.clone();
+        if let Some(ref server) = self.ws_server {
+            server.update_password(&ws_password);
+        }
+        // Update web settings — flag a restart if server-affecting settings changed
+        let sanitized_web_path = sanitize_web_path(&web_path);
+        let web_changed = self.settings.web_secure != web_secure
+            || self.settings.http_enabled != http_enabled
+            || self.settings.http_port != http_port
+            || self.settings.web_path != sanitized_web_path;
+        self.settings.web_secure = web_secure;
+        self.settings.http_enabled = http_enabled;
+        self.settings.http_port = http_port;
+        self.settings.web_path = sanitized_web_path;
+        if web_changed { self.web_restart_needed = true; }
+        // ws_enabled and ws_port are legacy — ignored
+        // Only update cert/key if non-empty (remote clients send empty for security)
+        if !ws_cert_file.is_empty() {
+            self.settings.websocket_cert_file = ws_cert_file;
+        }
+        if !ws_key_file.is_empty() {
+            self.settings.websocket_key_file = ws_key_file;
+        }
+        self.settings.tls_proxy_enabled = tls_proxy_enabled;
+        self.settings.mouse_enabled = mouse_enabled;
+        self.settings.zwj_enabled = zwj_enabled;
+        self.settings.new_line_indicator = new_line_indicator;
+        self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
+        self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
+        if self.settings.dictionary_path != dictionary_path {
+            self.settings.dictionary_path = dictionary_path;
+            self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
+        }
+        let scrollback_changed = self.settings.scrollback_enabled != scrollback_enabled;
+        self.settings.scrollback_enabled = scrollback_enabled;
+        if scrollback_changed {
+            self.init_scrollback();
+        }
+        // Save settings to persist changes. Tag the (debug-mode-only) audit log
+        // with which kind of client pushed this, so a future settings-loss report
+        // can be traced back to its source (web/gui/console/android).
+        let save_source = self.ws_get_client_type(client_id).map(|t| t.label()).unwrap_or("web");
+        let _ = persistence::save_settings_with_source(self, save_source);
+        // Build settings message for broadcast (uses build_global_settings_msg to avoid leaking sensitive data)
+        let settings_msg = self.build_global_settings_msg();
+        // Broadcast update to all clients
+        self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+            settings: settings_msg,
+            input_height: self.input_height,
+        });
+    }
+
     /// `TfCommandResult::SendToMud(text)` handling for sites that don't need any bookkeeping
     /// beyond the send itself (fire-and-forget, e.g. GMCP/MSDP hook results, or action-trigger
     /// execution where a caller-side loop already owns any batching). Bounds-checked via
@@ -8587,97 +8736,16 @@ impl App {
                 );
             }
             WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
-                // Update global settings from remote client
-                self.settings.more_mode_enabled = more_mode_enabled;
-                self.settings.spell_check_enabled = spell_check_enabled;
-                self.settings.temp_convert_enabled = temp_convert_enabled;
-                self.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
-                self.show_tags = show_tags;
-                self.settings.debug_enabled = debug_enabled;
-                DEBUG_ENABLED.store(debug_enabled, Ordering::Relaxed);
-                self.settings.ansi_music_enabled = ansi_music_enabled;
-                // Console theme affects the TUI on the server
-                self.settings.theme = Theme::from_name(&console_theme);
-                // GUI theme is stored for sending back to GUI clients
-                self.settings.gui_theme = Theme::from_name(&gui_theme);
-                self.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
-                self.settings.color_offset_percent = color_offset_percent.min(100);
-                // No clamp on wrapspace itself — wrap_ansi_line/visual_line_count clamp the
-                // effective indent internally against whatever width is in play. Rewrap
-                // already-visible output immediately (mirrors a terminal resize) only when
-                // it actually changed, so an unrelated settings save doesn't force a redraw.
-                if self.settings.wrapspace != wrapspace {
-                    self.settings.wrapspace = wrapspace;
-                    self.needs_output_redraw = true;
-                }
-                self.settings.remote_initial_lines = remote_initial_lines.clamp(10, 5000);
-                self.input_height = input_height.clamp(1, 15);
-                self.input.visible_height = self.input_height;
-                self.settings.font_name = font_name;
-                self.settings.font_size = font_size.clamp(8.0, 48.0);
-                self.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
-                self.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
-                self.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
-                self.settings.web_font_weight = web_font_weight.clamp(1, 900);
-                self.settings.web_font_line_height = web_font_line_height.clamp(0.5, 3.0);
-                self.settings.web_font_letter_spacing = web_font_letter_spacing.clamp(-5.0, 10.0);
-                self.settings.web_font_word_spacing = web_font_word_spacing.clamp(-5.0, 20.0);
-                self.settings.websocket_allow_list = ws_allow_list.clone();
-                // Update the running WebSocket server's allow list
-                if let Some(ref server) = self.ws_server {
-                    server.update_allow_list(&ws_allow_list);
-                }
-                // Update password (may be empty string to clear it)
-                self.settings.websocket_password = ws_password.clone();
-                if let Some(ref server) = self.ws_server {
-                    server.update_password(&ws_password);
-                }
-                // Update web settings — flag a restart if server-affecting settings changed
-                let sanitized_web_path = sanitize_web_path(&web_path);
-                let web_changed = self.settings.web_secure != web_secure
-                    || self.settings.http_enabled != http_enabled
-                    || self.settings.http_port != http_port
-                    || self.settings.web_path != sanitized_web_path;
-                self.settings.web_secure = web_secure;
-                self.settings.http_enabled = http_enabled;
-                self.settings.http_port = http_port;
-                self.settings.web_path = sanitized_web_path;
-                if web_changed { self.web_restart_needed = true; }
-                // ws_enabled and ws_port are legacy — ignored
-                // Only update cert/key if non-empty (remote clients send empty for security)
-                if !ws_cert_file.is_empty() {
-                    self.settings.websocket_cert_file = ws_cert_file;
-                }
-                if !ws_key_file.is_empty() {
-                    self.settings.websocket_key_file = ws_key_file;
-                }
-                self.settings.tls_proxy_enabled = tls_proxy_enabled;
-                self.settings.mouse_enabled = mouse_enabled;
-                self.settings.zwj_enabled = zwj_enabled;
-                self.settings.new_line_indicator = new_line_indicator;
-                self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
-                self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
-                if self.settings.dictionary_path != dictionary_path {
-                    self.settings.dictionary_path = dictionary_path;
-                    self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
-                }
-                let scrollback_changed = self.settings.scrollback_enabled != scrollback_enabled;
-                self.settings.scrollback_enabled = scrollback_enabled;
-                if scrollback_changed {
-                    self.init_scrollback();
-                }
-                // Save settings to persist changes. Tag the (debug-mode-only) audit log
-                // with which kind of client pushed this, so a future settings-loss report
-                // can be traced back to its source (web/gui/console/android).
-                let save_source = self.ws_get_client_type(client_id).map(|t| t.label()).unwrap_or("web");
-                let _ = persistence::save_settings_with_source(self, save_source);
-                // Build settings message for broadcast (uses build_global_settings_msg to avoid leaking sensitive data)
-                let settings_msg = self.build_global_settings_msg();
-                // Broadcast update to all clients
-                self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
-                    settings: settings_msg,
-                    input_height: self.input_height,
-                });
+                self.update_global_settings(
+                    client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
+                    world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
+                    gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines,
+                    input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet,
+                    web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
+                    web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
+                    ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
+                    mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
+                );
             }
             WsMessage::UpdateActions { actions } => {
                 // Update actions from remote client; normalize migrates any legacy single-pattern fields
@@ -8853,16 +8921,7 @@ impl App {
             // receive a WsClientMessage (run_app's two loops, run_app_headless) — see
             // handle_import_result. See plan `i-d-like-to-make-snuggly-rain.md`.
             WsMessage::ImportSettings { addr, password, auth_key, allow_insecure } => {
-                let event_tx = event_tx.clone();
-                tokio::spawn(async move {
-                    let result = remote_client::run_import_client(
-                        &addr,
-                        password.as_deref(),
-                        auth_key.as_deref(),
-                        allow_insecure,
-                    ).await;
-                    let _ = event_tx.send(AppEvent::ImportResult(client_id, addr, result)).await;
-                });
+                spawn_import_settings(event_tx.clone(), client_id, addr, password, auth_key, allow_insecure);
             }
             // Theme editor messages
             WsMessage::RequestThemeEditorState => {

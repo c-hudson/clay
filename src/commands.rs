@@ -1063,6 +1063,29 @@ pub(crate) fn cap_text(s: String, max_len: usize) -> String {
     }
 }
 
+/// `WsMessage::ImportSettings` handling — shared by master-WS and daemon (T37). Spawns the
+/// import client and routes the result back via `AppEvent::ImportResult`. Confirmed genuinely
+/// identical between the two dispatch sites (unlike most of this audit's other findings) — no
+/// divergence to reconcile here, just duplication to remove.
+pub fn spawn_import_settings(
+    event_tx: mpsc::Sender<AppEvent>,
+    client_id: u64,
+    addr: String,
+    password: Option<String>,
+    auth_key: Option<String>,
+    allow_insecure: bool,
+) {
+    tokio::spawn(async move {
+        let result = crate::remote_client::run_import_client(
+            &addr,
+            password.as_deref(),
+            auth_key.as_deref(),
+            allow_insecure,
+        ).await;
+        let _ = event_tx.send(AppEvent::ImportResult(client_id, addr, result)).await;
+    });
+}
+
 /// Spawn an async API lookup task for /dict, /urban, /translate, or /tiny commands.
 /// Results are sent back via event_tx as ApiLookupResult for the main loop to route to the client.
 pub fn spawn_api_lookup(

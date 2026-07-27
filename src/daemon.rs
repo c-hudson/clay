@@ -1285,80 +1285,17 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password: _, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
-            app.settings.more_mode_enabled = more_mode_enabled;
-            app.settings.spell_check_enabled = spell_check_enabled;
-            app.settings.temp_convert_enabled = temp_convert_enabled;
-            app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
-            app.show_tags = show_tags;
-            app.settings.debug_enabled = debug_enabled;
-            app.settings.ansi_music_enabled = ansi_music_enabled;
-            app.input_height = input_height;
-            app.settings.theme = Theme::from_name(&console_theme);
-            app.settings.gui_theme = Theme::from_name(&gui_theme);
-            app.settings.gui_transparency = gui_transparency;
-            app.settings.color_offset_percent = color_offset_percent;
-            // No clamp on wrapspace itself — wrap_ansi_line/visual_line_count clamp the
-            // effective indent internally. Rewrap already-visible output immediately
-            // (mirrors a terminal resize) only when it actually changed.
-            if app.settings.wrapspace != wrapspace {
-                app.settings.wrapspace = wrapspace;
-                app.needs_output_redraw = true;
-            }
-            app.settings.remote_initial_lines = remote_initial_lines.clamp(10, 5000);
-            app.settings.font_name = font_name;
-            app.settings.font_size = font_size;
-            app.settings.web_font_size_phone = web_font_size_phone;
-            app.settings.web_font_size_tablet = web_font_size_tablet;
-            app.settings.web_font_size_desktop = web_font_size_desktop;
-            app.settings.web_font_weight = web_font_weight;
-            app.settings.web_font_line_height = web_font_line_height;
-            app.settings.web_font_letter_spacing = web_font_letter_spacing;
-            app.settings.web_font_word_spacing = web_font_word_spacing;
-            let sanitized_web_path = sanitize_web_path(&web_path);
-            let web_changed = app.settings.web_secure != web_secure
-                || app.settings.http_enabled != http_enabled
-                || app.settings.http_port != http_port
-                || app.settings.web_path != sanitized_web_path;
-            app.settings.websocket_allow_list = ws_allow_list;
-            app.settings.web_secure = web_secure;
-            app.settings.http_enabled = http_enabled;
-            app.settings.http_port = http_port;
-            app.settings.web_path = sanitized_web_path;
-            if web_changed { app.web_restart_needed = true; }
-            // Only update cert/key if non-empty (remote clients send empty for security)
-            if !ws_cert_file.is_empty() {
-                app.settings.websocket_cert_file = ws_cert_file;
-            }
-            if !ws_key_file.is_empty() {
-                app.settings.websocket_key_file = ws_key_file;
-            }
-            app.settings.tls_proxy_enabled = tls_proxy_enabled;
-            app.settings.mouse_enabled = mouse_enabled;
-            app.settings.zwj_enabled = zwj_enabled;
-            app.settings.new_line_indicator = new_line_indicator;
-            app.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
-            app.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
-            if app.settings.dictionary_path != dictionary_path {
-                app.settings.dictionary_path = dictionary_path;
-                app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-            }
-
-            let scrollback_changed = app.settings.scrollback_enabled != scrollback_enabled;
-            app.settings.scrollback_enabled = scrollback_enabled;
-            if scrollback_changed {
-                app.init_scrollback();
-            }
-
-            // Save settings. Tag the (debug-mode-only) audit log with which kind of
-            // client pushed this, so a future settings-loss report can be traced back
-            // to its source (web/gui/console/android).
-            let save_source = app.ws_get_client_type(client_id).map(|t| t.label()).unwrap_or("web");
-            let _ = persistence::save_settings_with_source(app, save_source);
-
-            // Broadcast updated settings (use build_global_settings_msg to avoid leaking sensitive data)
-            let settings = app.build_global_settings_msg();
-            app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
+            app.update_global_settings(
+                client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
+                world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
+                gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines,
+                input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet,
+                web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing,
+                web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
+                ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
+                mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
+            );
         }
         WsMessage::ToggleWorldGmcp { world_index } => {
             if world_index < app.worlds.len() {
@@ -1869,16 +1806,7 @@ pub async fn handle_daemon_ws_message(
         // Result comes back via AppEvent::ImportResult, handled by both callers of this
         // function's event loops (run_app_headless in main.rs, run_daemon_server in this module).
         WsMessage::ImportSettings { addr, password, auth_key, allow_insecure } => {
-            let event_tx = event_tx.clone();
-            tokio::spawn(async move {
-                let result = remote_client::run_import_client(
-                    &addr,
-                    password.as_deref(),
-                    auth_key.as_deref(),
-                    allow_insecure,
-                ).await;
-                let _ = event_tx.send(AppEvent::ImportResult(client_id, addr, result)).await;
-            });
+            spawn_import_settings(event_tx.clone(), client_id, addr, password, auth_key, allow_insecure);
         }
         // Full state resync — mirrors the handler in main.rs's App::handle_ws_message
         // (WsMessage::RequestState). Needed here too since --local-server (Android

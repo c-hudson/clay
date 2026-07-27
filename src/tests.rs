@@ -5111,3 +5111,50 @@ if you're more curious.\"";
             "a real plaintext password must still update normally");
     }
 
+    // --- App::update_global_settings ---
+    // Pins the clamping/validation and ws_password handling that daemon's inline copy used to
+    // skip entirely (T37).
+
+    fn call_update_global_settings(app: &mut App, gui_transparency: f32, color_offset_percent: u8, input_height: u16, font_size: f32, ws_password: &str) {
+        app.update_global_settings(
+            0, true, true, true,
+            "unseen".to_string(), false, false, true,
+            "dark".to_string(), "dark".to_string(),
+            gui_transparency, color_offset_percent, 0, 500,
+            input_height, "monospace".to_string(), font_size,
+            14.0, 14.0, 14.0, 400, 1.2, 0.0, 0.0,
+            String::new(), false, false, 9000, String::new(),
+            String::new(), String::new(), ws_password.to_string(),
+            false, String::new(), true, true, false,
+            "off".to_string(), "off".to_string(), false,
+        );
+    }
+
+    #[test]
+    fn test_update_global_settings_clamps_high_out_of_range_values() {
+        let mut app = App::new();
+        call_update_global_settings(&mut app, 5.0, 200, 999, 1000.0, "");
+        assert_eq!(app.settings.gui_transparency, 1.0, "gui_transparency must clamp to <= 1.0");
+        assert_eq!(app.settings.color_offset_percent, 100, "color_offset_percent must clamp to <= 100");
+        assert_eq!(app.input_height, 15, "input_height must clamp to <= 15");
+        assert_eq!(app.input.visible_height, 15, "input.visible_height must stay in sync with input_height");
+        assert_eq!(app.settings.font_size, 48.0, "font_size must clamp to <= 48.0");
+    }
+
+    #[test]
+    fn test_update_global_settings_clamps_low_out_of_range_values() {
+        let mut app = App::new();
+        call_update_global_settings(&mut app, 0.0, 0, 0, 0.0, "");
+        assert_eq!(app.settings.gui_transparency, 0.3, "gui_transparency must clamp to >= 0.3");
+        assert_eq!(app.input_height, 1, "input_height must clamp to >= 1");
+        assert_eq!(app.settings.font_size, 8.0, "font_size must clamp to >= 8.0");
+    }
+
+    #[test]
+    fn test_update_global_settings_applies_ws_password() {
+        let mut app = App::new();
+        call_update_global_settings(&mut app, 1.0, 0, 5, 14.0, "newpassword");
+        assert_eq!(app.settings.websocket_password, "newpassword",
+            "ws_password must actually be applied - daemon's copy used to ignore this field entirely");
+    }
+
