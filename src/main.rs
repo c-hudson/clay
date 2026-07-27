@@ -5550,6 +5550,34 @@ impl App {
         }
     }
 
+    /// Handles the `Notify`/`Say` cases of a `TfCommandResult::ClayCommand` produced by an
+    /// action trigger firing with no attached client (daemon-mode action triggers, headless
+    /// `ServerData` processing). These have real server-side effects (TTS playback, a
+    /// broadcast notification) that must fire exactly once, so they're executed directly here
+    /// rather than bounced through any client — bouncing to every connected client would have
+    /// each one independently re-send it as `SendCommand` (the fallback path
+    /// `executeLocalCommand()` in app.js takes for anything it doesn't special-case locally),
+    /// causing an N-way duplicate. Returns `true` if `cmd` was one of the handled variants.
+    /// `Send` is deliberately NOT handled here — its target-world resolution and delivery
+    /// (async `.send().await` vs sync `try_send`) differs between callers, so each site keeps
+    /// that part inline; see T30's notes on why that divergence is real, not drift.
+    pub(crate) fn handle_triggered_notify_or_say(&mut self, cmd: Command, world_idx: usize) -> bool {
+        match cmd {
+            Command::Notify { message } => {
+                let title = self.worlds.get(world_idx).map(|w| w.name.clone()).unwrap_or_else(|| "Clay".to_string());
+                self.ws_broadcast(WsMessage::Notification { title, message });
+                true
+            }
+            Command::Say { text } => {
+                tts::speak(&self.tts_backend, &text, self.settings.tts_mode);
+                let clean_text = strip_ansi_codes(&text);
+                self.ws_broadcast(WsMessage::ServerSpeak { text: clean_text, world_index: world_idx });
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Write comprehensive debug state to `~/.clay/dump.log` for `/dump`.
     /// `mode` is just a label identifying which dispatch path triggered this
     /// (console/master-ws/daemon) — the content is otherwise identical
@@ -13589,37 +13617,17 @@ pub async fn run_app_headless(
                                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                             // Handle Clay-specific commands in daemon mode
                                             let parsed = parse_command(&clay_cmd);
-                                            match parsed {
-                                                Command::Send { text, target_world, .. } => {
-                                                    let target_idx = if let Some(ref w) = target_world {
-                                                        app.find_world_index(w)
-                                                    } else { Some(world_idx) };
-                                                    if let Some(idx) = target_idx {
-                                                        if let Some(tx) = &app.worlds[idx].command_tx {
-                                                            let _ = tx.send(WriteCommand::Text(text)).await;
-                                                        }
+                                            if let Command::Send { text, target_world, .. } = &parsed {
+                                                let target_idx = if let Some(w) = target_world {
+                                                    app.find_world_index(w)
+                                                } else { Some(world_idx) };
+                                                if let Some(idx) = target_idx {
+                                                    if let Some(tx) = &app.worlds[idx].command_tx {
+                                                        let _ = tx.send(WriteCommand::Text(text.clone())).await;
                                                     }
                                                 }
-                                                Command::Notify { message } => {
-                                                    let title = if world_idx < app.worlds.len() {
-                                                        app.worlds[world_idx].name.clone()
-                                                    } else {
-                                                        "Clay".to_string()
-                                                    };
-                                                    app.ws_broadcast(WsMessage::Notification {
-                                                        title,
-                                                        message: message.clone(),
-                                                    });
-                                                }
-                                                Command::Say { text } => {
-                                                    tts::speak(&app.tts_backend, &text, app.settings.tts_mode);
-                                                    let clean_text = strip_ansi_codes(&text);
-                                                    app.ws_broadcast(WsMessage::ServerSpeak {
-                                                        text: clean_text,
-                                                        world_index: world_idx,
-                                                    });
-                                                }
-                                                _ => {}
+                                            } else {
+                                                app.handle_triggered_notify_or_say(parsed, world_idx);
                                             }
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
