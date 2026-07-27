@@ -2790,10 +2790,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         app.emit_tf_error(world_idx, &err, false);
                     }
                     tf::TfCommandResult::SendToMud(text) => {
-                        if let Some(tx) = &app.current_world().command_tx {
-                            let _ = tx.try_send(WriteCommand::Text(text));
-                            app.current_world_mut().last_send_time = Some(std::time::Instant::now());
-                        }
+                        let world_idx = app.current_world_index;
+                        app.send_to_world_and_mark_sent(world_idx, text);
                     }
                     tf::TfCommandResult::ClayCommand(_) => {
                         // Avoid recursion - just show unknown

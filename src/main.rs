@@ -5522,6 +5522,34 @@ impl App {
         self.tf_engine.processes.push(process);
     }
 
+    /// `TfCommandResult::SendToMud(text)` handling for sites that don't need any bookkeeping
+    /// beyond the send itself (fire-and-forget, e.g. GMCP/MSDP hook results, or action-trigger
+    /// execution where a caller-side loop already owns any batching). Bounds-checked via
+    /// `Vec::get` rather than direct indexing — several of the sites this replaces indexed
+    /// `self.worlds[world_idx]` directly, relying on the index always being valid by
+    /// construction; using `get` here instead makes that assumption fail safe (silently does
+    /// nothing) rather than panicking the whole process if it's ever wrong. Returns whether the
+    /// send was attempted (world existed and had a live `command_tx`), for
+    /// `send_to_world_and_mark_sent` below to build on.
+    pub(crate) fn send_to_world(&mut self, world_idx: usize, text: String) -> bool {
+        if let Some(tx) = self.worlds.get(world_idx).and_then(|w| w.command_tx.as_ref()) {
+            let _ = tx.try_send(WriteCommand::Text(text));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `TfCommandResult::SendToMud(text)` handling for the single-command (non-loop) sites that
+    /// also record `last_send_time` immediately after sending — as opposed to the
+    /// action-command loop sites, which batch multiple sends and only set it once at the end
+    /// (those aren't covered here; see T28/T30's scope notes).
+    pub(crate) fn send_to_world_and_mark_sent(&mut self, world_idx: usize, text: String) {
+        if self.send_to_world(world_idx, text) {
+            self.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
+        }
+    }
+
     /// Write comprehensive debug state to `~/.clay/dump.log` for `/dump`.
     /// `mode` is just a label identifying which dispatch path triggered this
     /// (console/master-ws/daemon) — the content is otherwise identical
@@ -6931,11 +6959,7 @@ impl App {
             let results = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Gmcp);
             for r in results {
                 if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                    if let Some(world) = self.worlds.get(world_idx) {
-                        if let Some(ref tx) = world.command_tx {
-                            let _ = tx.try_send(WriteCommand::Text(text));
-                        }
-                    }
+                    self.send_to_world(world_idx, text);
                 }
             }
         }
@@ -6950,11 +6974,7 @@ impl App {
         let results = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Msdp);
         for r in results {
             if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                if let Some(world) = self.worlds.get(world_idx) {
-                    if let Some(ref tx) = world.command_tx {
-                        let _ = tx.try_send(WriteCommand::Text(text));
-                    }
-                }
+                self.send_to_world(world_idx, text);
             }
         }
         // Broadcast to WebSocket clients
@@ -7325,12 +7345,7 @@ impl App {
                             self.emit_tf_error(world_index, &err, false);
                         }
                         tf::TfCommandResult::SendToMud(text) => {
-                            if world_index < self.worlds.len() {
-                                if let Some(tx) = &self.worlds[world_index].command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(text));
-                                    self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                }
-                            }
+                            self.send_to_world_and_mark_sent(world_index, text);
                         }
                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                             self.dispatch_ws_clay_command(client_id, clay_cmd, event_tx);
@@ -8148,12 +8163,7 @@ impl App {
                         let result = self.tf_engine.execute(&line);
                         match result {
                             tf::TfCommandResult::SendToMud(text) => {
-                                if target_idx < self.worlds.len() {
-                                    if let Some(tx) = &self.worlds[target_idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(text));
-                                        self.worlds[target_idx].last_send_time = Some(std::time::Instant::now());
-                                    }
-                                }
+                                self.send_to_world_and_mark_sent(target_idx, text);
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
                                 self.emit_client_text(world_index, &msg, false);
@@ -13574,9 +13584,7 @@ pub async fn run_app_headless(
                                     app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
-                                            if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                            }
+                                            app.send_to_world(world_idx, text);
                                         }
                                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                             // Handle Clay-specific commands in daemon mode
@@ -14105,9 +14113,7 @@ pub async fn run_app_headless(
                         match result {
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(idx) = target_idx {
-                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(text));
-                                    }
+                                    app.send_to_world(idx, text);
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
@@ -15868,9 +15874,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
-                                            if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                            }
+                                            app.send_to_world(world_idx, text);
                                         }
                                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                             handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
@@ -16120,9 +16124,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
-                                            if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                            }
+                                            app.send_to_world(world_idx, text);
                                         }
                                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                             handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
@@ -16612,9 +16614,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         match result {
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(idx) = target_idx {
-                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(text));
-                                    }
+                                    app.send_to_world(idx, text);
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
@@ -16803,9 +16803,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::SendToMud(text) => {
-                                        if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                            let _ = tx.try_send(WriteCommand::Text(text));
-                                        }
+                                        app.send_to_world(world_idx, text);
                                     }
                                     tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                         handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
@@ -17009,9 +17007,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::SendToMud(text) => {
-                                        if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                            let _ = tx.try_send(WriteCommand::Text(text));
-                                        }
+                                        app.send_to_world(world_idx, text);
                                     }
                                     tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                         handle_command(&clay_cmd, &mut app, event_tx.clone()).await;

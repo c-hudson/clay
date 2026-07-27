@@ -202,9 +202,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         match result {
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(idx) = target_idx {
-                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(text));
-                                    }
+                                    app.send_to_world(idx, text);
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
@@ -268,9 +266,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                     app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
-                                            if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                            }
+                                            app.send_to_world(world_idx, text);
                                         }
                                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                             // Handle Clay-specific commands in daemon mode
@@ -511,12 +507,7 @@ pub async fn handle_daemon_ws_message(
                                 app.emit_tf_error(world_index, &err, true);
                             }
                             tf::TfCommandResult::SendToMud(text) => {
-                                if world_index < app.worlds.len() {
-                                    if let Some(tx) = &app.worlds[world_index].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(text));
-                                        app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                    }
-                                }
+                                app.send_to_world_and_mark_sent(world_index, text);
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                 app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
@@ -2259,9 +2250,7 @@ keep_alive_type=Generic
                         match result {
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(idx) = target_idx {
-                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(text));
-                                    }
+                                    app.send_to_world(idx, text);
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
