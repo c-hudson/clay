@@ -7618,24 +7618,15 @@ impl App {
                     self.worlds[world_index].lines_since_pause = 0;
                     self.worlds[world_index].paused = false;
                     self.ws_broadcast(WsMessage::WorldFlushed { world_index });
-                    self.ws_broadcast(WsMessage::ServerData {
-                        world_index,
-                        data: format!("Flushed {} lines from output buffer.", line_count),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                        marked_new: false,
-                        flush: false, gagged: false,
-                    });
+                    self.emit_client_text(world_index, &format!("Flushed {} lines from output buffer.", line_count), false);
                 }
             }
             Command::Remote => {
                 spawn_remote_ping_check(self, event_tx.clone(), client_id, world_index);
             }
             Command::RemoteKill { client_id: kill_id } => {
-                if let Some(ref ws_server) = self.ws_server {
-                    let msg = if let Ok(clients) = ws_server.clients.try_read() {
+                let msg = if let Some(ref ws_server) = self.ws_server {
+                    if let Ok(clients) = ws_server.clients.try_read() {
                         if let Some(client) = clients.get(&kill_id) {
                             let ip = client.ip_address.clone();
                             drop(clients);
@@ -7650,13 +7641,11 @@ impl App {
                         }
                     } else {
                         "Could not read client list (busy).".to_string()
-                    };
-                    self.ws_broadcast(WsMessage::ServerData {
-                        world_index, data: msg, is_viewed: false,
-                        ts: current_timestamp_secs(), from_server: false,
-                        seq: 0, marked_new: false, flush: false, gagged: false,
-                    });
-                }
+                    }
+                } else {
+                    "WebSocket server is not running.".to_string()
+                };
+                self.emit_client_text(world_index, &msg, false);
             }
             Command::RemotePause { client_id: pause_id } => {
                 let msg = match self.ws_toggle_client_paused(pause_id) {
@@ -7671,11 +7660,7 @@ impl App {
                     }
                     None => format!("No client with ID {}.", pause_id),
                 };
-                self.ws_broadcast(WsMessage::ServerData {
-                    world_index, data: msg, is_viewed: false,
-                    ts: current_timestamp_secs(), from_server: false,
-                    seq: 0, marked_new: false, flush: false, gagged: false,
-                });
+                self.emit_client_text(world_index, &msg, false);
             }
             Command::BanList => {
                 // Send current ban list
@@ -7777,35 +7762,17 @@ impl App {
                     title,
                     message: message.clone(),
                 });
-                self.ws_broadcast(WsMessage::ServerData {
-                    world_index,
-                    data: format!("Notification sent: {}", message),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
+                self.emit_client_text(world_index, &format!("Notification sent: {}", message), false);
             }
             Command::Say { text } => {
                 // Speak text via TTS (console subprocess + broadcast to web clients)
                 tts::speak(&self.tts_backend, &text, self.settings.tts_mode);
                 let clean_text = strip_ansi_codes(&text);
                 self.ws_broadcast(WsMessage::ServerSpeak {
-                    text: clean_text.clone(),
+                    text: clean_text,
                     world_index,
                 });
-                self.ws_broadcast(WsMessage::ServerData {
-                    world_index,
-                    data: format!("TTS: {}", text),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
+                self.emit_client_text(world_index, &format!("TTS: {}", text), false);
             }
             Command::Dump => {
                 // Don't broadcast on success — /dump must be passive and not
@@ -7867,6 +7834,20 @@ impl App {
                 let world_idx = if let Some(idx) = existing_idx {
                     idx
                 } else {
+                    // Validate name - matches console's checks (commands.rs), missing here
+                    // before meant a web/GUI/Android client could create a broken world entry.
+                    if name.is_empty() {
+                        self.emit_client_text(world_index, "Error: World name cannot be empty", false);
+                        return WsAsyncAction::Done;
+                    }
+                    if name.contains(' ') {
+                        self.emit_client_text(world_index, "Error: World name cannot contain spaces", false);
+                        return WsAsyncAction::Done;
+                    }
+                    if name.starts_with('(') {
+                        self.emit_client_text(world_index, "Error: World name cannot start with '('", false);
+                        return WsAsyncAction::Done;
+                    }
                     let new_world = World::new(&name);
                     self.worlds.push(new_world);
                     self.worlds.len() - 1
@@ -7897,16 +7878,7 @@ impl App {
                 } else {
                     " (connectionless)".to_string()
                 };
-                self.ws_broadcast(WsMessage::ServerData {
-                    world_index,
-                    data: format!("{} world '{}'{}.", action, name, host_info),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
+                self.emit_client_text(world_index, &format!("{} world '{}'{}.", action, name, host_info), false);
             }
             // Connect command - needs async follow-up
             Command::Connect { .. } => {
