@@ -603,16 +603,7 @@ pub async fn handle_daemon_ws_message(
                     app.emit_client_text(world_index, &help_text, true);
                 }
                 Command::Unknown { cmd } => {
-                    app.ws_broadcast(WsMessage::ServerData {
-                        world_index,
-                        data: format!("Unknown command: {}", cmd),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                    });
+                    app.emit_client_text(world_index, &format!("Unknown command: {}", cmd), true);
                 }
                 Command::Send { text, all_worlds, target_world, no_newline } => {
                     let make_write_cmd = |t: &str| -> WriteCommand {
@@ -1150,6 +1141,8 @@ pub async fn handle_daemon_ws_message(
                                 app.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name: world_name });
                             }
                         }
+                    } else {
+                        app.emit_client_text(world_index, &format!("World '{}' not found.", name), true);
                     }
                 }
                 Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
@@ -1169,16 +1162,7 @@ pub async fn handle_daemon_ws_message(
                             let world_name = app.worlds[idx].name.clone();
 
                             let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                            app.ws_broadcast(WsMessage::ServerData {
-                                world_index: idx,
-                                data: format!("Connecting to {}:{}{}...\n", settings.hostname, settings.port, ssl_msg),
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0,
-                            marked_new: false,
-                            flush: false, gagged: false,
-                            });
+                            app.emit_client_text(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg), true);
 
                             app.worlds[idx].connection_id += 1;
                             let skip_login = app.worlds[idx].skip_auto_login;
@@ -1205,29 +1189,11 @@ pub async fn handle_daemon_ws_message(
                                 app.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name: world_name });
                             } else {
                                 app.worlds[idx].skip_auto_login = false;
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: idx,
-                                    data: "Connection failed.\n".to_string(),
-                                    is_viewed: false,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0,
-                                marked_new: false,
-                                flush: false, gagged: false,
-                                });
+                                app.emit_client_text(idx, "Connection failed.", true);
                             }
                         }
                     } else {
-                        app.ws_broadcast(WsMessage::ServerData {
-                            world_index,
-                            data: format!("World '{}' not found.", name),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0,
-                        marked_new: false,
-                        flush: false, gagged: false,
-                        });
+                        app.emit_client_text(world_index, &format!("World '{}' not found.", name), true);
                     }
                 }
             }

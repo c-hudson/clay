@@ -7447,16 +7447,7 @@ impl App {
                 self.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: self.show_tags });
             }
             Command::Unknown { cmd } => {
-                self.ws_broadcast(WsMessage::ServerData {
-                    world_index,
-                    data: format!("Unknown command: {}", cmd),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
+                self.emit_client_text(world_index, &format!("Unknown command: {}", cmd), false);
             }
             Command::Send { text, all_worlds, target_world, no_newline } => {
                 // Handle /send command
@@ -7909,16 +7900,7 @@ impl App {
                         return WsAsyncAction::Connect { world_index: idx, prev_index, broadcast: false };
                     }
                 } else {
-                    self.ws_send_to_client(client_id, WsMessage::ServerData {
-                        world_index,
-                        data: format!("World '{}' not found.", name),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                        marked_new: false,
-                        flush: false, gagged: false,
-                    });
+                    self.emit_client_text(world_index, &format!("World '{}' not found.", name), false);
                 }
             }
             // WorldSwitch and WorldConnectNoLogin need proper handling
@@ -7948,16 +7930,7 @@ impl App {
                         return WsAsyncAction::Connect { world_index: idx, prev_index, broadcast: false };
                     }
                 } else {
-                    self.ws_send_to_client(client_id, WsMessage::ServerData {
-                        world_index,
-                        data: format!("World '{}' not found.", name),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                        marked_new: false,
-                        flush: false, gagged: false,
-                    });
+                    self.emit_client_text(world_index, &format!("World '{}' not found.", name), false);
                 }
             }
             Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } | Command::TinyUrl { .. } => {
