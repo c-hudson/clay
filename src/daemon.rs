@@ -417,6 +417,10 @@ pub async fn handle_daemon_ws_message(
     if let WsMessage::SendCommand { ref command, .. } = msg {
         crate::debug_log(is_debug_enabled(), &format!("DAEMON_CMD: client_id={} command={:?}", client_id, command));
     }
+    // Auto-resume a paused session when the user interacts (mirrors "exit more mode by
+    // acting") - was previously master-WS-only despite daemon sharing the same per-client
+    // pause tracking (T38).
+    app.auto_resume_if_user_action(client_id, &msg);
     match msg {
         WsMessage::SendCommand { world_index, command } => {
             // Determine the current world name for action world-scoping.
@@ -1376,137 +1380,10 @@ pub async fn handle_daemon_ws_message(
             }
         }
         WsMessage::ReleasePending { world_index, count } => {
-            // Release pending lines for the specified world
-            if world_index < app.worlds.len() {
-                let pending_count = app.worlds[world_index].pending_lines.len();
-                if pending_count > 0 {
-                    // Get client's output width for visual line calculation
-                    let client_width = app.ws_client_worlds.get(&client_id)
-                        .map(|s| s.visible_columns)
-                        .filter(|&w| w > 0)
-                        .unwrap_or(app.output_width as usize);
-
-                    // count == 0 means release all; otherwise treat count as visual budget
-                    let visual_budget = if count == 0 { usize::MAX } else { count };
-
-                    // Pre-calculate logical lines to release (mirrors release_pending logic)
-                    let width = client_width.max(1);
-                    let mut visual_total = 0;
-                    let mut logical_count = 0;
-                    for line in &app.worlds[world_index].pending_lines {
-                        let vl = visual_line_count(&line.text, width, app.settings.wrapspace as usize);
-                        if visual_total > 0 && visual_total + vl > visual_budget {
-                            break;
-                        }
-                        visual_total += vl;
-                        logical_count += 1;
-                        if visual_total >= visual_budget {
-                            break;
-                        }
-                    }
-                    if logical_count == 0 && pending_count > 0 {
-                        logical_count = 1;
-                    }
-                    let to_release = logical_count.min(pending_count);
-
-                    // Get text, marked_new, and from_server of lines that will be released.
-                    // from_server must travel with each line (not be assumed true) - pending
-                    // can hold a mix of real server output and client-generated content
-                    // (e.g. a /recall that overflowed a screenful while paused), and clients
-                    // key the "✨ " marker off this exact flag.
-                    let lines_with_flags: Vec<(String, bool, bool)> = app.worlds[world_index]
-                        .pending_lines
-                        .iter()
-                        .take(to_release)
-                        .map(|line| (line.text.replace('\r', ""), line.marked_new, line.from_server))
-                        .collect();
-
-                    // Release the lines
-                    app.worlds[world_index].release_pending(visual_budget, client_width, app.settings.new_line_indicator, app.settings.wrapspace as usize);
-
-                    // Broadcast the released lines to clients viewing this world, but skip
-                    // clients that already have these lines from InitialState. Group
-                    // consecutive lines by (marked_new, from_server) so each batch gets the
-                    // correct indicator and the correct client-line marker.
-                    if !lines_with_flags.is_empty() {
-                        let ts = current_timestamp_secs();
-                        let mut batch: Vec<&str> = Vec::new();
-                        let mut batch_marked_new = lines_with_flags[0].1;
-                        let mut batch_from_server = lines_with_flags[0].2;
-                        for (text, marked_new, from_server) in &lines_with_flags {
-                            if (*marked_new != batch_marked_new || *from_server != batch_from_server) && !batch.is_empty() {
-                                let ws_data = batch.join("\n") + "\n";
-                                app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                                    world_index,
-                                    data: ws_data,
-                                    is_viewed: true,
-                                    ts,
-                                    from_server: batch_from_server,
-                                    // Use seq 0 to bypass client-side dedup check. Released pending
-                                    // lines have old seqs that may be lower than _max_seq if new data
-                                    // arrived after reconnect, causing false duplicate detection.
-                                    seq: 0,
-                                    marked_new: batch_marked_new,
-                                    flush: false, gagged: false,
-                                });
-                                batch.clear();
-                                batch_marked_new = *marked_new;
-                                batch_from_server = *from_server;
-                            }
-                            batch.push(text);
-                        }
-                        if !batch.is_empty() {
-                            let ws_data = batch.join("\n") + "\n";
-                            app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                                world_index,
-                                data: ws_data,
-                                is_viewed: true,
-                                ts,
-                                from_server: batch_from_server,
-                                seq: 0,
-                                marked_new: batch_marked_new,
-                                flush: false, gagged: false,
-                            });
-                        }
-                    }
-
-                    // Broadcast release event and updated pending count
-                    app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
-                    let new_pending_count = app.worlds[world_index].pending_lines.len();
-                    app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_pending_count });
-
-                    app.broadcast_activity();
-                }
-            }
+            app.release_pending_lines(client_id, world_index, count);
         }
         WsMessage::SelectiveFlush { world_index } => {
-            if world_index < app.worlds.len() && app.worlds[world_index].paused {
-                let pending = std::mem::take(&mut app.worlds[world_index].pending_lines);
-                let mut kept = Vec::new();
-                for line in pending {
-                    if line.highlight_color.is_some() {
-                        kept.push(line);
-                    }
-                }
-                for line in &kept {
-                    let ws_data = line.text.replace('\r', "") + "\n";
-                    app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                        world_index,
-                        data: ws_data,
-                        is_viewed: true,
-                        ts: current_timestamp_secs(),
-                        from_server: line.from_server,
-                        seq: line.seq,
-                        marked_new: false,
-                        flush: false, gagged: false,
-                    });
-                }
-                app.worlds[world_index].output_lines.extend(kept);
-                app.worlds[world_index].paused = false;
-                app.worlds[world_index].lines_since_pause = 0;
-                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
-                app.broadcast_activity();
-            }
+            app.selective_flush(world_index);
         }
         WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
             if is_debug_enabled() {

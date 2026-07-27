@@ -5158,3 +5158,82 @@ if you're more curious.\"";
             "ws_password must actually be applied - daemon's copy used to ignore this field entirely");
     }
 
+    // --- App::release_pending_lines / App::selective_flush ---
+    // Pins the state transitions of the shared pending/flush handling (T38). SelectiveFlush
+    // was entirely unhandled in master-WS before this task - these tests exercise the same
+    // shared methods both master-WS and daemon now call.
+
+    fn make_pending_line(text: &str, highlighted: bool) -> OutputLine {
+        OutputLine {
+            text: text.to_string(),
+            timestamp: std::time::SystemTime::now(),
+            from_server: true,
+            gagged: false,
+            seq: 0,
+            highlight_color: if highlighted { Some("red".to_string()) } else { None },
+            marked_new: false,
+            from_archive: false,
+        }
+    }
+
+    #[test]
+    fn test_release_pending_lines_zero_pending_is_a_noop() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.release_pending_lines(1, 0, 0);
+        assert!(app.worlds[0].pending_lines.is_empty());
+        assert!(app.worlds[0].output_lines.is_empty());
+    }
+
+    #[test]
+    fn test_release_pending_lines_moves_lines_from_pending_to_output() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        for i in 0..5 {
+            app.worlds[0].pending_lines.push(make_pending_line(&format!("line {i}"), false));
+        }
+        app.worlds[0].paused = true;
+
+        // count=0 means release all
+        app.release_pending_lines(1, 0, 0);
+
+        assert!(app.worlds[0].pending_lines.is_empty(), "all pending lines should be released");
+        assert_eq!(app.worlds[0].output_lines.len(), 5, "released lines should move to output_lines");
+    }
+
+    #[test]
+    fn test_selective_flush_keeps_only_highlighted_lines_when_paused() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].paused = true;
+        app.worlds[0].pending_lines.push(make_pending_line("plain", false));
+        app.worlds[0].pending_lines.push(make_pending_line("highlighted", true));
+        app.worlds[0].lines_since_pause = 7;
+
+        app.selective_flush(0);
+
+        assert!(app.worlds[0].pending_lines.is_empty(), "selective flush must clear all pending lines");
+        assert_eq!(app.worlds[0].output_lines.len(), 1, "only the highlighted line should be kept");
+        assert_eq!(app.worlds[0].output_lines[0].text, "highlighted");
+        assert!(!app.worlds[0].paused, "selective flush must unpause the world");
+        assert_eq!(app.worlds[0].lines_since_pause, 0);
+    }
+
+    #[test]
+    fn test_selective_flush_noop_when_not_paused() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].paused = false;
+        app.worlds[0].pending_lines.push(make_pending_line("plain", false));
+
+        app.selective_flush(0);
+
+        assert_eq!(app.worlds[0].pending_lines.len(), 1,
+            "selective flush must do nothing when the world isn't paused");
+        assert!(app.worlds[0].output_lines.is_empty());
+    }
+

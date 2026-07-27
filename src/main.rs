@@ -5832,6 +5832,200 @@ impl App {
         });
     }
 
+    /// Auto-resume a paused client session when it takes a real user action — mirrors "exit
+    /// more mode by acting" (T38). Was master-WS-only (`handle_ws_client_msg`) despite daemon
+    /// (`handle_daemon_ws_message`) sharing the exact same per-client `ws_client_worlds`/
+    /// `paused` tracking; without this, a paused daemon-mode client (e.g. a browser hitting
+    /// more-mode pause on a busy world) never auto-resumed on its own next action — it had to
+    /// explicitly release pending output instead of that happening for free, the way
+    /// master-WS clients already got.
+    pub(crate) fn auto_resume_if_user_action(&mut self, client_id: u64, msg: &WsMessage) {
+        let is_user_action = matches!(msg,
+            WsMessage::SendCommand { .. } | WsMessage::SwitchWorld { .. } |
+            WsMessage::ReleasePending { .. } | WsMessage::SelectiveFlush { .. } |
+            WsMessage::MarkWorldSeen { .. } | WsMessage::ConnectWorld { .. } |
+            WsMessage::DisconnectWorld { .. }
+        );
+        if !is_user_action {
+            return;
+        }
+        let was_paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
+        if was_paused {
+            if let Some(ref server) = self.ws_server {
+                server.set_client_paused(client_id, false);
+            }
+            if let Some(state) = self.ws_client_worlds.get_mut(&client_id) {
+                state.paused = false;
+            }
+            self.ws_send_to_client(client_id, WsMessage::PausedState { paused: false });
+            self.broadcast_activity();
+        }
+    }
+
+    /// `WsMessage::ReleasePending` handling — shared by master-WS and daemon (T38).
+    ///
+    /// Reconciles two real divergences found between the previous per-transport copies, not
+    /// just structural duplication: the visual-row budget calculation now always accounts for
+    /// the new-line-indicator setting (daemon's copy used the plain 3-arg `visual_line_count`
+    /// instead of `nli_visual_rows`, so its "how many lines is one screenful" budget could be
+    /// wrong whenever NLI was enabled); and the broadcast of released lines now preserves each
+    /// line's own `marked_new`/`from_server` flags instead of collapsing them to one
+    /// batch-wide guess (main.rs's copy hardcoded `from_server: true` for the *entire*
+    /// released batch, so a client-generated pending line released alongside real server
+    /// output would get mismarked as server output and silently lose its "✨" client-line
+    /// indicator on the receiving end).
+    pub(crate) fn release_pending_lines(&mut self, client_id: u64, world_index: usize, count: usize) {
+        if world_index >= self.worlds.len() {
+            return;
+        }
+        let pending_count = self.worlds[world_index].pending_lines.len();
+        if pending_count == 0 {
+            // Client has stale pending_count - sync them with the actual state
+            self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
+            self.broadcast_activity();
+            return;
+        }
+
+        let client_width = self.ws_client_worlds.get(&client_id)
+            .map(|s| s.visible_columns)
+            .filter(|&w| w > 0)
+            .unwrap_or(self.output_width as usize);
+
+        // count == 0 means release all; otherwise treat count as visual budget
+        let visual_budget = if count == 0 { usize::MAX } else { count };
+
+        // Pre-calculate logical lines to release (mirrors release_pending logic)
+        let width = client_width.max(1);
+        let nli = self.settings.new_line_indicator;
+        let mut visual_total = 0;
+        let mut logical_count = 0;
+        for line in &self.worlds[world_index].pending_lines {
+            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli, self.settings.wrapspace as usize);
+            if visual_total > 0 && visual_total + vl > visual_budget {
+                break;
+            }
+            visual_total += vl;
+            logical_count += 1;
+            if visual_total >= visual_budget {
+                break;
+            }
+        }
+        if logical_count == 0 && pending_count > 0 {
+            logical_count = 1;
+        }
+        let to_release = logical_count.min(pending_count);
+
+        // Get text, marked_new, and from_server of lines that will be released. from_server
+        // must travel with each line (not be assumed true) - pending can hold a mix of real
+        // server output and client-generated content (e.g. a /recall that overflowed a
+        // screenful while paused), and clients key the "✨ " marker off this exact flag.
+        let lines_with_flags: Vec<(String, bool, bool)> = self.worlds[world_index]
+            .pending_lines
+            .iter()
+            .take(to_release)
+            .map(|line| (line.text.replace('\r', ""), line.marked_new, line.from_server))
+            .collect();
+
+        self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator, self.settings.wrapspace as usize);
+
+        // Broadcast the released lines to clients viewing this world. Group consecutive
+        // lines by (marked_new, from_server) so each batch gets the correct indicator and
+        // the correct client-line marker.
+        if !lines_with_flags.is_empty() {
+            let ts = current_timestamp_secs();
+            let mut batch: Vec<&str> = Vec::new();
+            let mut batch_marked_new = lines_with_flags[0].1;
+            let mut batch_from_server = lines_with_flags[0].2;
+            for (text, marked_new, from_server) in &lines_with_flags {
+                if (*marked_new != batch_marked_new || *from_server != batch_from_server) && !batch.is_empty() {
+                    let ws_data = batch.join("\n") + "\n";
+                    self.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                        world_index,
+                        data: ws_data,
+                        is_viewed: true,
+                        ts,
+                        from_server: batch_from_server,
+                        // Use seq 0 to bypass client-side dedup check. Released pending
+                        // lines have old seqs that may be lower than _max_seq if new data
+                        // arrived after reconnect, causing false duplicate detection.
+                        seq: 0,
+                        marked_new: batch_marked_new,
+                        flush: false, gagged: false,
+                    });
+                    batch.clear();
+                    batch_marked_new = *marked_new;
+                    batch_from_server = *from_server;
+                }
+                batch.push(text);
+            }
+            if !batch.is_empty() {
+                let ws_data = batch.join("\n") + "\n";
+                self.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                    world_index,
+                    data: ws_data,
+                    is_viewed: true,
+                    ts,
+                    from_server: batch_from_server,
+                    seq: 0,
+                    marked_new: batch_marked_new,
+                    flush: false, gagged: false,
+                });
+            }
+        }
+
+        // Broadcast release event and updated pending count
+        self.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
+        let new_pending_count = self.worlds[world_index].pending_lines.len();
+        self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_pending_count });
+        self.broadcast_activity();
+
+        // Update console display (harmless no-op in headless/daemon mode - nothing reads this
+        // flag there)
+        if world_index == self.current_world_index {
+            self.needs_output_redraw = true;
+        }
+    }
+
+    /// `WsMessage::SelectiveFlush` handling — shared by master-WS and daemon (T38).
+    ///
+    /// Was completely unhandled in master-WS's dispatch (`handle_ws_client_msg` had no arm
+    /// for this message at all — it silently fell through to the catch-all), even though it's
+    /// reachable from the real, user-bindable "Selective Flush" keyboard action in the
+    /// web/GUI/Android client (`selective_flush` in `keybindings.rs`'s action list,
+    /// `app.js`'s `selectiveFlush()`). The action silently did nothing for any single-user
+    /// master-WS client, while working correctly for daemon-attached clients — the opposite
+    /// direction of T36/T37's findings, where daemon was the one missing behavior.
+    pub(crate) fn selective_flush(&mut self, world_index: usize) {
+        if world_index >= self.worlds.len() || !self.worlds[world_index].paused {
+            return;
+        }
+        let pending = std::mem::take(&mut self.worlds[world_index].pending_lines);
+        let mut kept = Vec::new();
+        for line in pending {
+            if line.highlight_color.is_some() {
+                kept.push(line);
+            }
+        }
+        for line in &kept {
+            let ws_data = line.text.replace('\r', "") + "\n";
+            self.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                world_index,
+                data: ws_data,
+                is_viewed: true,
+                ts: current_timestamp_secs(),
+                from_server: line.from_server,
+                seq: line.seq,
+                marked_new: false,
+                flush: false, gagged: false,
+            });
+        }
+        self.worlds[world_index].output_lines.extend(kept);
+        self.worlds[world_index].paused = false;
+        self.worlds[world_index].lines_since_pause = 0;
+        self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
+        self.broadcast_activity();
+    }
+
     /// `TfCommandResult::SendToMud(text)` handling for sites that don't need any bookkeeping
     /// beyond the send itself (fire-and-forget, e.g. GMCP/MSDP hook results, or action-trigger
     /// execution where a caller-side loop already owns any batching). Bounds-checked via
@@ -8466,25 +8660,7 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn handle_ws_client_msg(&mut self, client_id: u64, msg: WsMessage, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
         // Auto-resume a paused session when the user interacts (mirrors "exit more mode by acting")
-        let is_user_action = matches!(msg,
-            WsMessage::SendCommand { .. } | WsMessage::SwitchWorld { .. } |
-            WsMessage::ReleasePending { .. } | WsMessage::SelectiveFlush { .. } |
-            WsMessage::MarkWorldSeen { .. } | WsMessage::ConnectWorld { .. } |
-            WsMessage::DisconnectWorld { .. }
-        );
-        if is_user_action {
-            let was_paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
-            if was_paused {
-                if let Some(ref server) = self.ws_server {
-                    server.set_client_paused(client_id, false);
-                }
-                if let Some(state) = self.ws_client_worlds.get_mut(&client_id) {
-                    state.paused = false;
-                }
-                self.ws_send_to_client(client_id, WsMessage::PausedState { paused: false });
-                self.broadcast_activity();
-            }
-        }
+        self.auto_resume_if_user_action(client_id, &msg);
 
         let auth_current_world = if let WsMessage::AuthRequest { ref current_world, .. } = msg {
             *current_world
@@ -8644,90 +8820,10 @@ impl App {
                 }
             }
             WsMessage::ReleasePending { world_index, count } => {
-                // A remote client is releasing pending lines - sync across all interfaces
-                if world_index < self.worlds.len() {
-                    let pending_count = self.worlds[world_index].pending_lines.len();
-                    if pending_count > 0 {
-                        // Get client's output width for visual line calculation
-                        let client_width = self.ws_client_worlds.get(&client_id)
-                            .map(|s| s.visible_columns)
-                            .filter(|&w| w > 0)
-                            .unwrap_or(self.output_width as usize);
-
-                        // count == 0 means release all; otherwise treat count as visual budget
-                        let visual_budget = if count == 0 { usize::MAX } else { count };
-
-                        // Pre-calculate logical lines to release (same logic as release_pending)
-                        let width = client_width.max(1);
-                        let nli = self.settings.new_line_indicator;
-                        let mut visual_total = 0;
-                        let mut logical_count = 0;
-                        for line in &self.worlds[world_index].pending_lines {
-                            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli, self.settings.wrapspace as usize);
-                            if visual_total > 0 && visual_total + vl > visual_budget {
-                                break;
-                            }
-                            visual_total += vl;
-                            logical_count += 1;
-                            if visual_total >= visual_budget {
-                                break;
-                            }
-                        }
-                        if logical_count == 0 && pending_count > 0 {
-                            logical_count = 1;
-                        }
-                        // For release-all, cap at pending_count
-                        let to_release = logical_count.min(pending_count);
-
-                        // Get text and marked_new flag of lines that will be released
-                        let has_marked_new = self.worlds[world_index].pending_lines.iter()
-                            .take(to_release).any(|l| l.marked_new);
-                        let lines_to_broadcast: Vec<String> = self.worlds[world_index]
-                            .pending_lines
-                            .iter()
-                            .take(to_release)
-                            .map(|line| line.text.replace('\r', ""))
-                            .collect();
-
-                        // Release the lines on the server
-                        self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator, self.settings.wrapspace as usize);
-
-                        // Broadcast the released lines to clients viewing this world
-                        if !lines_to_broadcast.is_empty() {
-                            let ws_data = lines_to_broadcast.join("\n") + "\n";
-                            self.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                                world_index,
-                                data: ws_data,
-                                is_viewed: true,
-                                ts: current_timestamp_secs(),
-                                from_server: true,
-                                // Use seq 0 to bypass client-side dedup check. Released pending
-                                // lines have old seqs that may be lower than _max_seq if new data
-                                // arrived after reconnect, causing false duplicate detection.
-                                seq: 0,
-                                marked_new: has_marked_new,
-                                flush: false, gagged: false,
-                            });
-                        }
-
-                        // Broadcast to all clients so they know how many were released
-                        self.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
-                        let new_count = self.worlds[world_index].pending_lines.len();
-                        self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_count });
-
-                        // Broadcast activity count since pending lines changed
-                        self.broadcast_activity();
-
-                        // Update console display
-                        if world_index == self.current_world_index {
-                            self.needs_output_redraw = true;
-                        }
-                    } else {
-                        // Client has stale pending_count - sync them with the actual state
-                        self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
-                        self.broadcast_activity();
-                    }
-                }
+                self.release_pending_lines(client_id, world_index, count);
+            }
+            WsMessage::SelectiveFlush { world_index } => {
+                self.selective_flush(world_index);
             }
             WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs } => {
                 self.update_world_settings(
