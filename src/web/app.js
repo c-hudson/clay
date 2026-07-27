@@ -4868,9 +4868,12 @@
         for (const action of actions) {
             // Skip disabled actions
             if (action.enabled === false) continue;
-            // Check world match (empty = all worlds)
-            if (action.world && action.world.trim() !== '' &&
-                action.world.toLowerCase() !== worldName.toLowerCase()) continue;
+            // Check world match: mirrors actions.rs::action_matches_world — an
+            // action.world that's empty (or all-comma/whitespace) is global and
+            // matches every world; otherwise it's a comma-separated list, each
+            // segment trimmed and compared case-insensitively.
+            if (action.world && !action.world.split(',').every(w => w.trim() === '') &&
+                !action.world.split(',').some(w => w.trim().toLowerCase() === worldName.toLowerCase())) continue;
             // Action-level match type (legacy per-pattern type ignored)
             const matchType = action.match_type || 'Regexp';
             // Build effective pattern list (new multi-pattern or legacy single)
