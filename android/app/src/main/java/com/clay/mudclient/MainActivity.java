@@ -1229,6 +1229,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startKeepalive() {
+        // Idempotent: cancel any already-running chain first. Without this, calling
+        // startBackgroundService() again while already connected (e.g. forceReconnect()'s
+        // callback-suppression path, which skips stopBackgroundService()) would leave the
+        // old runnable's self-rescheduling loop running forever alongside the new one -
+        // each call stacking another uncancelled keepalive chain.
+        stopKeepalive();
         if (keepaliveHandler == null) {
             keepaliveHandler = new Handler(Looper.getMainLooper());
         }
@@ -1259,6 +1265,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startHeartbeat() {
+        // Idempotent for the same reason as startKeepalive() above.
+        stopHeartbeat();
         if (heartbeatHandler == null) {
             heartbeatHandler = new Handler(Looper.getMainLooper());
         }
