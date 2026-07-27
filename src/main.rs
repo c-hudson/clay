@@ -15321,10 +15321,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.sync_tf_world_info();
                     match app.tf_engine.execute(single_cmd) {
                         tf::TfCommandResult::Success(Some(msg)) => {
-                            app.add_output(&msg);
+                            let world_idx = app.current_world_index;
+                            app.emit_client_text(world_idx, &msg, false);
                         }
                         tf::TfCommandResult::Error(err) => {
-                            app.add_output(&format!("Error: {}", err));
+                            let world_idx = app.current_world_index;
+                            app.emit_tf_error(world_idx, &err, false);
                         }
                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                             handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
