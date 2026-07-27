@@ -4,7 +4,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 #[cfg(any(unix, windows))]
 use std::sync::Arc;
 
@@ -248,11 +248,24 @@ pub(crate) const RELOAD_FDS_ENV: &str = "CLAY_RELOAD_FDS";
 pub(crate) const CRASH_COUNT_ENV: &str = "CLAY_CRASH_COUNT";
 #[cfg(not(target_os = "android"))]
 pub(crate) const MAX_CRASH_RESTARTS: u32 = 2;
+// Sentinel env var for the desktop-Linux GUI hardware->software rendering fallback
+// (see gui_software_fallback_restart()): set right before the one-shot relaunch, it
+// both tells the relaunched process to force software rendering (webview_gui.rs)
+// and tells sigabrt_handler the fallback was already tried, so a second abort falls
+// through to the normal crash report instead of looping.
+#[cfg(target_os = "linux")]
+pub(crate) const GUI_SOFTWARE_FALLBACK_ENV: &str = "CLAY_GUI_SOFTWARE_FALLBACK";
 
 // Static pointer to App for crash recovery - set when app is running
 pub(crate) static APP_PTR: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
 // Track current crash count to avoid re-reading env var
 pub(crate) static CRASH_COUNT: AtomicU32 = AtomicU32::new(0);
+// Whether a GUI (not console/TUI) was requested this run. Signal handlers are plain
+// extern "C" fn(c_int) with no captured state, so this is how sigabrt_handler learns
+// whether a software-render relaunch applies at all (it never does for a TUI abort).
+// Only meaningful on desktop Linux (see maybe_gui_software_fallback/webview_gui.rs).
+#[cfg(target_os = "linux")]
+pub(crate) static IS_GUI_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Get the current crash count from environment variable
 pub(crate) fn get_crash_count() -> u32 {
@@ -339,6 +352,47 @@ pub(crate) fn crash_restart() {
 
         // This replaces the current process if successful
         let _ = std::process::Command::new(&exe).args(&args).exec();
+    }
+}
+
+/// One-shot relaunch used when the desktop-Linux GUI's hardware-accelerated
+/// rendering aborts (see `main.rs`'s `sigabrt_handler` and `webview_gui.rs`'s
+/// `set_software_render_env_vars`). Deliberately separate from `crash_restart()`
+/// and its `CRASH_COUNT_ENV`/`MAX_CRASH_RESTARTS` budget — that budget is for
+/// genuine Rust-panic crash loops, a different concern from "hardware rendering
+/// isn't available, try software instead." No app-state saving: an abort this
+/// early happens before any `World`/socket state worth preserving exists.
+#[cfg(target_os = "linux")]
+pub(crate) fn gui_software_fallback_restart() {
+    std::env::set_var(GUI_SOFTWARE_FALLBACK_ENV, "1");
+    if let Ok((exe, _)) = get_executable_path() {
+        use std::os::unix::process::CommandExt;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        // This replaces the current process if successful.
+        let _ = std::process::Command::new(&exe).args(&args).exec();
+    }
+}
+
+/// Called from `sigabrt_handler` before it falls through to the normal crash
+/// report. If a GUI was requested (`IS_GUI_MODE`) and hardware rendering hasn't
+/// already been tried and found broken (`GUI_SOFTWARE_FALLBACK_ENV` unset),
+/// prints a short fallback notice and relaunches with software rendering
+/// forced via `gui_software_fallback_restart()` — an expected, handled
+/// condition, not a crash report. No-op for TUI aborts, for the
+/// software-rendering relaunch itself (second abort), and on any platform
+/// other than desktop Linux (Android already forces software rendering
+/// unconditionally and never reaches this path; other platforms don't use
+/// WebKit2GTK/GBM/EGL at all). Matches the cfg of the signal-handler block in
+/// `main.rs` that's the only caller, so it's never compiled somewhere it'd be
+/// dead code.
+#[cfg(all(unix, not(target_os = "android")))]
+pub(crate) fn maybe_gui_software_fallback() {
+    #[cfg(target_os = "linux")]
+    {
+        if IS_GUI_MODE.load(Ordering::SeqCst) && std::env::var(GUI_SOFTWARE_FALLBACK_ENV).is_err() {
+            eprintln!("clay: hardware-accelerated GUI rendering failed, retrying with software rendering...");
+            gui_software_fallback_restart();
+        }
     }
 }
 

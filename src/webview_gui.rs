@@ -144,6 +144,18 @@ fn show_error_dialog(title: &str, message: &str) {
     }
 }
 
+/// Force WebKit2GTK and Mesa onto pure software rendering, bypassing GPU/EGL/GBM
+/// entirely. Called unconditionally on Android (Termux:X11 has no working
+/// DRI3/EGL acceleration at all) and conditionally on desktop Linux, only after
+/// a first hardware attempt has already aborted — see
+/// `platform::gui_software_fallback_restart`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn set_software_render_env_vars() {
+    std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+}
+
 /// Master mode: run App headlessly with a local WebSocket, open WebView window
 pub fn run_master_webgui() -> io::Result<()> {
 
@@ -159,14 +171,27 @@ pub fn run_master_webgui() -> io::Result<()> {
         }
     }
 
-    // Termux:X11 has no DRI3/EGL hardware acceleration; force software rendering
-    // so WebKit2GTK doesn't show a blank window. Disable the WebKit sandbox so
-    // the web process can reach ws://127.0.0.1 from the clay:// custom scheme.
+    // Termux:X11 has no DRI3/EGL hardware acceleration at all; force software
+    // rendering unconditionally so WebKit2GTK doesn't show a blank window (or
+    // abort). Disable the WebKit sandbox so the web process can reach
+    // ws://127.0.0.1 from the clay:// custom scheme — a distinct, Termux-specific
+    // security tradeoff, not a rendering concern, so it stays Android-only.
     #[cfg(target_os = "android")]
     {
-        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
-        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        set_software_render_env_vars();
         std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+    }
+
+    // Desktop Linux: try hardware rendering first (unlike Termux, a real GPU/EGL
+    // stack is normally available and worth using). Only force software rendering
+    // if this is the one-shot relaunch after a hardware attempt already aborted —
+    // see sigabrt_handler in main.rs and platform::gui_software_fallback_restart.
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::IS_GUI_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+        if std::env::var(crate::platform::GUI_SOFTWARE_FALLBACK_ENV).is_ok() {
+            set_software_render_env_vars();
+        }
     }
 
     // Read the configured HTTP port from settings (default 9000)
@@ -304,14 +329,26 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
         }
     }
 
-    // Termux:X11 has no DRI3/EGL hardware acceleration; force software rendering
-    // so WebKit2GTK doesn't show a blank window. Disable the WebKit sandbox so
-    // the web process can reach the remote WebSocket from the clay:// custom scheme.
+    // Termux:X11 has no DRI3/EGL hardware acceleration at all; force software
+    // rendering unconditionally so WebKit2GTK doesn't show a blank window (or
+    // abort). Disable the WebKit sandbox so the web process can reach the remote
+    // WebSocket from the clay:// custom scheme — a distinct, Termux-specific
+    // security tradeoff, not a rendering concern, so it stays Android-only.
     #[cfg(target_os = "android")]
     {
-        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
-        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        set_software_render_env_vars();
         std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+    }
+
+    // Desktop Linux: try hardware rendering first. Only force software rendering
+    // if this is the one-shot relaunch after a hardware attempt already aborted —
+    // see sigabrt_handler in main.rs and platform::gui_software_fallback_restart.
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::IS_GUI_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+        if std::env::var(crate::platform::GUI_SOFTWARE_FALLBACK_ENV).is_ok() {
+            set_software_render_env_vars();
+        }
     }
 
     // --ssh: the remote clay_port is only reachable through the SSH tunnel, never
@@ -1417,4 +1454,27 @@ fn install_update(temp_path: &std::path::Path, version: &str) -> String {
     }
 
     format!("Updated to Clay v{} — reloading...", version)
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_software_render_env_vars_sets_all_three() {
+        // Guards the desktop-Linux GL/EGL abort fallback (see
+        // platform::maybe_gui_software_fallback / gui_software_fallback_restart):
+        // these are the exact vars that stop WebKit2GTK from calling abort() when
+        // it can't init a GBM EGL display, and stop it/Mesa from touching the GPU
+        // driver at all afterward.
+        std::env::remove_var("WEBKIT_DISABLE_COMPOSITING_MODE");
+        std::env::remove_var("WEBKIT_DISABLE_DMABUF_RENDERER");
+        std::env::remove_var("LIBGL_ALWAYS_SOFTWARE");
+
+        set_software_render_env_vars();
+
+        assert_eq!(std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("LIBGL_ALWAYS_SOFTWARE").as_deref(), Ok("1"));
+    }
 }

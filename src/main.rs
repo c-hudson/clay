@@ -12948,41 +12948,18 @@ async fn main() -> io::Result<()> {
         unsafe { FreeConsole(); }
     }
 
-    // Dispatch based on (interface, connection_mode)
-    match (use_gui, remote_addr) {
-        // Remote GUI: connect to a running Clay instance via WebSocket
-        (true, Some(ref addr)) => {
-            #[cfg(feature = "webview-gui")]
-            {
-                return webview_gui::run_remote_webgui(addr, ssh_target);
-            }
-            #[cfg(not(feature = "webview-gui"))]
-            {
-                let _ = addr;
-                let _ = ssh_target;
-                unreachable!("use_gui should be false when webview-gui feature is not available");
-            }
-        }
-        // Master GUI: run App in-process with webview GUI
-        (true, None) => {
-            #[cfg(feature = "webview-gui")]
-            {
-                return webview_gui::run_master_webgui();
-            }
-            #[cfg(not(feature = "webview-gui"))]
-            {
-                unreachable!("use_gui should be false when webview-gui feature is not available");
-            }
-        }
-        // Remote console: connect to a running Clay instance via WebSocket
-        (false, Some(ref addr)) => {
-            return remote_client::run_console_client(addr, ssh_target).await;
-        }
-        // Master console: default TUI mode (falls through to existing code below)
-        (false, None) => {}
-    }
+    // Record whether a GUI was requested before signal handlers are registered, so
+    // sigabrt_handler below (registered before the GUI dispatch, not after — a crash
+    // during GUI startup must be caught same as a TUI crash) can tell a GUI abort
+    // apart from a TUI one. See platform::maybe_gui_software_fallback.
+    #[cfg(target_os = "linux")]
+    platform::IS_GUI_MODE.store(use_gui, std::sync::atomic::Ordering::SeqCst);
 
-    // Set up signal handlers for crash debugging (not available on Android or Windows)
+    // Set up signal handlers for crash debugging (not available on Android or
+    // Windows). Registered here, before the GUI dispatch below, rather than only
+    // in the TUI fall-through path — a GUI-mode crash (e.g. WebKit's own abort()
+    // when GBM/EGL init fails) needs exactly the same handling, and previously
+    // never reached it since the GUI arms below `return` before this point.
     #[cfg(all(unix, not(target_os = "android")))]
     unsafe {
         extern "C" fn sigfpe_handler(_: libc::c_int) {
@@ -13032,6 +13009,15 @@ async fn main() -> io::Result<()> {
         libc::signal(libc::SIGBUS, sigbus_handler as *const () as libc::sighandler_t);
 
         extern "C" fn sigabrt_handler(_: libc::c_int) {
+            // GUI-mode-only, no-op everywhere else: if hardware-accelerated GUI
+            // rendering just aborted (e.g. WebKit2GTK's GBM/EGL init failure) and
+            // software rendering hasn't been tried yet, relaunch once with it
+            // forced instead of falling through to a scary crash report — this is
+            // an expected, handled condition on a machine without working
+            // GPU/EGL, not a bug. Only returns (continuing below) if that doesn't
+            // apply or the relaunch itself couldn't be started.
+            platform::maybe_gui_software_fallback();
+
             let _ = disable_raw_mode();
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
             debug_log(is_debug_enabled(), "CRASH: SIGABRT (Abort)");
@@ -13048,6 +13034,40 @@ async fn main() -> io::Result<()> {
     // Set up crash handler for automatic recovery (not available on Android)
     #[cfg(not(target_os = "android"))]
     setup_crash_handler();
+
+    // Dispatch based on (interface, connection_mode)
+    match (use_gui, remote_addr) {
+        // Remote GUI: connect to a running Clay instance via WebSocket
+        (true, Some(ref addr)) => {
+            #[cfg(feature = "webview-gui")]
+            {
+                return webview_gui::run_remote_webgui(addr, ssh_target);
+            }
+            #[cfg(not(feature = "webview-gui"))]
+            {
+                let _ = addr;
+                let _ = ssh_target;
+                unreachable!("use_gui should be false when webview-gui feature is not available");
+            }
+        }
+        // Master GUI: run App in-process with webview GUI
+        (true, None) => {
+            #[cfg(feature = "webview-gui")]
+            {
+                return webview_gui::run_master_webgui();
+            }
+            #[cfg(not(feature = "webview-gui"))]
+            {
+                unreachable!("use_gui should be false when webview-gui feature is not available");
+            }
+        }
+        // Remote console: connect to a running Clay instance via WebSocket
+        (false, Some(ref addr)) => {
+            return remote_client::run_console_client(addr, ssh_target).await;
+        }
+        // Master console: default TUI mode (falls through to existing code below)
+        (false, None) => {}
+    }
 
     enable_raw_mode()?;
     let mut stdout = stdout();
