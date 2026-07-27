@@ -2885,14 +2885,20 @@
                 break;
 
             case 'OpenWindow':
-                var worldParam = msg.world ? '?world=' + encodeURIComponent(msg.world) : '';
-                // Use WS_HOST/WS_PORT if available (WebView uses custom protocol, not real host)
-                var wsProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
-                var wsHost = window.WS_HOST || window.location.hostname;
-                var wsPort = (window.WS_PORT && window.WS_PORT !== 0)
-                    ? window.WS_PORT : window.location.port;
-                var openUrl = wsProto + '://' + wsHost + ':' + wsPort + basePath() + '/' + worldParam;
-                window.open(openUrl, '_blank');
+                // In WebView mode, use IPC to spawn a new native WebView window
+                // (window.open doesn't produce a usable new window there).
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('new-window:' + (msg.world || ''));
+                } else {
+                    var worldParam = msg.world ? '?world=' + encodeURIComponent(msg.world) : '';
+                    // Use WS_HOST/WS_PORT if available (WebView uses custom protocol, not real host)
+                    var wsProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
+                    var wsHost = window.WS_HOST || window.location.hostname;
+                    var wsPort = (window.WS_PORT && window.WS_PORT !== 0)
+                        ? window.WS_PORT : window.location.port;
+                    var openUrl = wsProto + '://' + wsHost + ':' + wsPort + basePath() + '/' + worldParam;
+                    window.open(openUrl, '_blank');
+                }
                 break;
 
             case 'AnsiMusic':
@@ -3875,15 +3881,21 @@
 
         const cmdTrimmed = cmd.trim();
 
-        // Intercept /window locally — open new browser/tab directly from client
+        // Intercept /window --grep locally only — this opens a client-side filtered
+        // view that the server has no concept of (parse_command's Command::Window
+        // only knows a plain world-name argument, so a --grep string would be
+        // mistaken for one server-side). Plain "/window"/"/window <world>" is NOT
+        // intercepted below: it's sent to the server so Command::Window's
+        // auto-connect-if-disconnected behavior (main.rs) applies, same as the TUI;
+        // the server replies with OpenWindow, which the handler above then opens.
         if (cmdTrimmed === '/window' || cmdTrimmed.startsWith('/window ')) {
-            elements.input.value = '';
             var winArgs = cmdTrimmed.length > 8 ? cmdTrimmed.substring(8).trim() : '';
 
             // Check for --grep flag: /window --grep pattern [-w world] [--regexp]
             // Supports quoted patterns: --grep "*some pattern*" or --grep pattern
             var grepMatch = winArgs.match(/--grep\s+"([^"]+)"/) || winArgs.match(/--grep\s+'([^']+)'/) || winArgs.match(/--grep\s+(\S+)/);
             if (grepMatch) {
+                elements.input.value = '';
                 var grepPattern = grepMatch[1];
                 var grepWorldMatch = winArgs.match(/-w\s+(\S+)/);
                 var grepWorld = grepWorldMatch ? grepWorldMatch[1] : null;
@@ -3909,27 +3921,7 @@
                 }
                 return;
             }
-
-            var winWorld = winArgs;
-            var winParam = winWorld ? '?world=' + encodeURIComponent(winWorld) : '';
-            // Build URL using real server address (SERVER_URL set by WebView, else use WS_HOST)
-            var winUrl;
-            if (window.SERVER_URL) {
-                winUrl = window.SERVER_URL + basePath() + '/' + winParam;
-            } else {
-                var winProto = window.WS_PROTOCOL === 'wss' ? 'https' : 'http';
-                var winHost = window.WS_HOST || window.location.hostname;
-                var winPort = (window.WS_PORT && window.WS_PORT !== 0)
-                    ? window.WS_PORT : window.location.port;
-                winUrl = winProto + '://' + winHost + ':' + winPort + basePath() + '/' + winParam;
-            }
-            // In WebView mode, use IPC to spawn a new WebView window (not system browser)
-            if (window.WEBVIEW_MODE) {
-                sendIpc('new-window:' + (winWorld || ''));
-            } else {
-                window.open(winUrl, '_blank');
-            }
-            return;
+            // Not --grep: fall through to the default server-send path below.
         }
 
         // Intercept /reload in remote WebView mode — restart the local GUI binary
