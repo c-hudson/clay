@@ -2215,10 +2215,10 @@
                     }
                     settingsSynced = true;
                 }
-                // Calculate activity count from world data (don't wait for ActivityUpdate message)
-                serverActivityCount = worlds.filter((w, i) =>
-                    i !== currentWorldIndex && (w.unseen_lines > 0 || (w.pending_count || 0) > 0)
-                ).length;
+                // Calculate activity count from world data (don't wait for ActivityUpdate message) -
+                // needed immediately here since some InitialState-sending paths (ImportSettings,
+                // hot-reload) never follow up with a broadcast_activity() call.
+                serverActivityCount = worlds.filter((w, i) => i !== currentWorldIndex && worldHasActivity(w)).length;
                 renderOutput();
                 updateStatusBar();
                 // Send initial view state for synchronized more-mode
@@ -6122,6 +6122,12 @@
         return n.toString().padStart(4, ' ');
     }
 
+    // Mirrors main.rs's World::has_activity(): a world counts as having activity
+    // if it has unseen lines or held-back (paused/more-mode) pending lines.
+    function worldHasActivity(w) {
+        return (w.unseen_lines || 0) > 0 || (w.pending_count || 0) > 0;
+    }
+
     // Update status bar
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
@@ -6170,7 +6176,7 @@
             elements.activityIndicator.style.display = '';
             // Build tooltip listing worlds with activity
             const activeWorlds = worlds
-                .filter((w, i) => i !== currentWorldIndex && ((w.unseen_lines || 0) > 0 || (w.pending_count || 0) > 0))
+                .filter((w, i) => i !== currentWorldIndex && worldHasActivity(w))
                 .map(w => w.name);
             elements.activityIndicator.title = activeWorlds.length > 0
                 ? 'Unseen: ' + activeWorlds.join(', ')
