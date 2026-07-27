@@ -19,7 +19,6 @@ use crate::{
 use crate::actions::{split_action_commands, substitute_action_args,
     find_invocable_action, rewrite_slashless_action};
 use crate::commands::{connect_slack, connect_discord};
-use crate::util::local_time_from_epoch;
 use crate::websocket::{TimestampedLine, RemoteClientType};
 
 /// Run headlessly as a local, loopback-only Clay instance for an embedding client — currently
@@ -952,48 +951,21 @@ pub async fn handle_daemon_ws_message(
                     });
                 }
                 Command::Dump => {
-                    use std::io::Write;
-                    let ts = current_timestamp_secs();
-                    let dump_path = crate::clay_config_path("dump.log");
-
-                    match std::fs::File::create(&dump_path) {
-                        Ok(mut file) => {
-                            let mut total_lines = 0;
-                            for world in app.worlds.iter() {
-                                for line in &world.output_lines {
-                                    let line_ts = line.timestamp
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs())
-                                        .unwrap_or(0) as i64;
-                                    let lt = local_time_from_epoch(line_ts);
-                                    let datetime = format!(
-                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                        lt.year, lt.month, lt.day,
-                                        lt.hour, lt.minute, lt.second
-                                    );
-                                    let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                                    total_lines += 1;
-                                }
-                                for line in &world.pending_lines {
-                                    let line_ts = line.timestamp
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs())
-                                        .unwrap_or(0) as i64;
-                                    let lt = local_time_from_epoch(line_ts);
-                                    let datetime = format!(
-                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                        lt.year, lt.month, lt.day,
-                                        lt.hour, lt.minute, lt.second
-                                    );
-                                    let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                                    total_lines += 1;
-                                }
-                            }
+                    // Same debug-dump content console/master-WS write (previously this
+                    // was a bare 3-column CSV missing all the actual debug state -
+                    // paused/pending/encoding/effective-dimensions - that's the whole
+                    // point of the command). daemon.rs is the one dispatch path that
+                    // already gave user-facing feedback on success/failure, so keep that.
+                    let total_lines: usize = app.worlds.iter()
+                        .map(|w| w.output_lines.len() + w.pending_lines.len())
+                        .sum();
+                    match app.write_debug_dump("daemon") {
+                        Ok(dump_path) => {
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index,
                                 data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path.display()),
                                 is_viewed: false,
-                                ts,
+                                ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,
@@ -1005,7 +977,7 @@ pub async fn handle_daemon_ws_message(
                                 world_index,
                                 data: format!("Failed to create dump file: {}", e),
                                 is_viewed: false,
-                                ts,
+                                ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0,
                             marked_new: false,

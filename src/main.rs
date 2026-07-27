@@ -5512,6 +5512,127 @@ impl App {
         self.emit_client_text(world_idx, &format!("Error: {}", err), is_daemon_mode);
     }
 
+    /// Write comprehensive debug state to `~/.clay/dump.log` for `/dump`.
+    /// `mode` is just a label identifying which dispatch path triggered this
+    /// (console/master-ws/daemon) — the content is otherwise identical
+    /// regardless of caller, which used to not be true: console, master-WS,
+    /// and daemon each had their own hand-copied version of this dump, and
+    /// daemon's had drifted into a bare 3-column CSV missing all the actual
+    /// debug state (paused/pending/encoding/effective-dimensions) that's the
+    /// whole point of the command. One shared implementation now.
+    ///
+    /// Deliberately passive: never touches `add_output`/`ws_broadcast` itself
+    /// (that would disturb more-mode state / scroll position) — callers
+    /// decide what, if anything, to tell the user about the result.
+    pub(crate) fn write_debug_dump(&self, mode: &str) -> std::io::Result<std::path::PathBuf> {
+        use std::io::Write;
+
+        let dump_path = clay_config_path("dump.log");
+        let mut file = std::fs::File::create(&dump_path)?;
+
+        writeln!(file, "=== CLAY DEBUG DUMP ===")?;
+        writeln!(file, "Version: {} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH)?;
+        let now_ts = current_timestamp_secs();
+        let lt = local_time_from_epoch(now_ts as i64);
+        writeln!(file, "Timestamp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second)?;
+        writeln!(file, "Mode: {}", mode)?;
+        writeln!(file)?;
+
+        // Global state
+        writeln!(file, "=== GLOBAL STATE ===")?;
+        writeln!(file, "output_height: {}", self.output_height)?;
+        writeln!(file, "output_width: {}", self.output_width)?;
+        writeln!(file, "input_height: {}", self.input_height)?;
+        writeln!(file, "current_world_index: {}", self.current_world_index)?;
+        writeln!(file, "worlds_count: {}", self.worlds.len())?;
+        writeln!(file, "more_mode_enabled: {}", self.settings.more_mode_enabled)?;
+        writeln!(file, "show_tags: {}", self.show_tags)?;
+        writeln!(file, "new_line_indicator: {}", self.settings.new_line_indicator)?;
+        writeln!(file, "max_lines (output_height-2): {}", (self.output_height as usize).saturating_sub(2))?;
+        writeln!(file)?;
+
+        // WS client info
+        writeln!(file, "=== WS CLIENTS ===")?;
+        writeln!(file, "ws_client_worlds count: {}", self.ws_client_worlds.len())?;
+        for (cid, cv) in &self.ws_client_worlds {
+            writeln!(file, "  client {}: world_index={}, visible_lines={}, visible_columns={}, dimensions={:?}",
+                cid, cv.world_index, cv.visible_lines, cv.visible_columns, cv.dimensions)?;
+        }
+        writeln!(file)?;
+
+        // Per-world state
+        for (wi, world) in self.worlds.iter().enumerate() {
+            let is_current = wi == self.current_world_index;
+            writeln!(file, "=== WORLD {} [{}] {} ===",
+                wi, world.name, if is_current { "(CURRENT)" } else { "" })?;
+            writeln!(file, "connected: {}", world.connected)?;
+            writeln!(file, "paused: {}", world.paused)?;
+            writeln!(file, "lines_since_pause: {}", world.lines_since_pause)?;
+            writeln!(file, "visual_line_offset: {}", world.visual_line_offset)?;
+            writeln!(file, "scroll_offset: {}", world.scroll_offset)?;
+            writeln!(file, "output_lines.len: {}", world.output_lines.len())?;
+            writeln!(file, "pending_lines.len: {}", world.pending_lines.len())?;
+            writeln!(file, "unseen_lines: {}", world.unseen_lines)?;
+            writeln!(file, "showing_splash: {}", world.showing_splash)?;
+            writeln!(file, "partial_line: {:?}", if world.partial_line.is_empty() { "".to_string() } else { format!("({} chars) {:?}", world.partial_line.len(), &world.partial_line[..world.partial_line.len().min(100)]) })?;
+            writeln!(file, "partial_in_pending: {}", world.partial_in_pending)?;
+            if let Some(ps) = world.pending_since {
+                writeln!(file, "pending_since: {:?} ago", ps.elapsed())?;
+            }
+            writeln!(file, "encoding: {:?}", world.settings.encoding)?;
+
+            // Min viewer dimensions
+            let ws_min_lines = self.min_viewer_lines(wi);
+            let ws_min_width = self.min_viewer_width(wi);
+            writeln!(file, "min_viewer_lines: {:?}", ws_min_lines)?;
+            writeln!(file, "min_viewer_width: {:?}", ws_min_width)?;
+
+            // Effective output dimensions for more-mode
+            let console_viewing = wi == self.current_world_index;
+            let eff_height = match (console_viewing, ws_min_lines) {
+                (true, Some(ws)) => (self.output_height).min(ws as u16),
+                (true, None) => self.output_height,
+                (false, Some(ws)) => ws as u16,
+                (false, None) => self.output_height,
+            };
+            let eff_width = match (console_viewing, ws_min_width) {
+                (true, Some(ws_w)) => (self.output_width).min(ws_w as u16),
+                (true, None) => self.output_width,
+                (false, Some(ws_w)) => ws_w as u16,
+                (false, None) => self.output_width,
+            };
+            writeln!(file, "effective_output_height: {}", eff_height)?;
+            writeln!(file, "effective_output_width: {}", eff_width)?;
+            writeln!(file, "effective_max_lines: {}", (eff_height as usize).saturating_sub(2))?;
+            writeln!(file)?;
+
+            // Full scrollback dump (all output + pending lines)
+            writeln!(file, "--- OUTPUT LINES ({}) ---", world.output_lines.len())?;
+            for line in &world.output_lines {
+                let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+                let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
+                writeln!(file, "{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
+                    prefix, lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second,
+                    line.text)?;
+            }
+
+            if !world.pending_lines.is_empty() {
+                writeln!(file, "--- PENDING LINES ({}) ---", world.pending_lines.len())?;
+                for line in &world.pending_lines {
+                    let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+                    let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
+                    writeln!(file, "P,{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
+                        prefix, lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second,
+                        line.text)?;
+                }
+            }
+            writeln!(file)?;
+        }
+
+        Ok(dump_path)
+    }
+
     /// Run a /recall against `world_idx`'s history (or the -w/-g/-D source in
     /// `opts`) and return (matches, header). Shared by `emit_recall` and the
     /// `/quote` backtick-recall paths (which need matches but must not
@@ -7633,113 +7754,9 @@ impl App {
                 });
             }
             Command::Dump => {
-                // Dump comprehensive debug state to ~/.clay/dump.log
-                use std::io::Write;
-                let ts = current_timestamp_secs();
-
-                let dump_path = clay_config_path("dump.log");
-
-                match std::fs::File::create(&dump_path) {
-                    Ok(mut file) => {
-                        let _ = writeln!(file, "=== CLAY DEBUG DUMP ===");
-                        let _ = writeln!(file, "Version: {} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH);
-                        let lt = local_time_from_epoch(ts as i64);
-                        let _ = writeln!(file, "Timestamp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                            lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second);
-                        let _ = writeln!(file, "Mode: daemon/ws");
-                        let _ = writeln!(file);
-
-                        // Global state
-                        let _ = writeln!(file, "=== GLOBAL STATE ===");
-                        let _ = writeln!(file, "output_height: {}", self.output_height);
-                        let _ = writeln!(file, "output_width: {}", self.output_width);
-                        let _ = writeln!(file, "current_world_index: {}", self.current_world_index);
-                        let _ = writeln!(file, "worlds_count: {}", self.worlds.len());
-                        let _ = writeln!(file, "more_mode_enabled: {}", self.settings.more_mode_enabled);
-                        let _ = writeln!(file, "show_tags: {}", self.show_tags);
-                        let _ = writeln!(file, "new_line_indicator: {}", self.settings.new_line_indicator);
-                        let _ = writeln!(file);
-
-                        // WS client info
-                        let _ = writeln!(file, "=== WS CLIENTS ===");
-                        let _ = writeln!(file, "ws_client_worlds count: {}", self.ws_client_worlds.len());
-                        for (cid, cv) in &self.ws_client_worlds {
-                            let _ = writeln!(file, "  client {}: world_index={}, visible_lines={}, visible_columns={}, dimensions={:?}",
-                                cid, cv.world_index, cv.visible_lines, cv.visible_columns, cv.dimensions);
-                        }
-                        let _ = writeln!(file);
-
-                        // Per-world state
-                        for (wi, world) in self.worlds.iter().enumerate() {
-                            let is_current = wi == self.current_world_index;
-                            let _ = writeln!(file, "=== WORLD {} [{}] {} ===",
-                                wi, world.name, if is_current { "(CURRENT)" } else { "" });
-                            let _ = writeln!(file, "connected: {}", world.connected);
-                            let _ = writeln!(file, "paused: {}", world.paused);
-                            let _ = writeln!(file, "lines_since_pause: {}", world.lines_since_pause);
-                            let _ = writeln!(file, "visual_line_offset: {}", world.visual_line_offset);
-                            let _ = writeln!(file, "scroll_offset: {}", world.scroll_offset);
-                            let _ = writeln!(file, "output_lines.len: {}", world.output_lines.len());
-                            let _ = writeln!(file, "pending_lines.len: {}", world.pending_lines.len());
-                            let _ = writeln!(file, "unseen_lines: {}", world.unseen_lines);
-                            let _ = writeln!(file, "showing_splash: {}", world.showing_splash);
-                            let _ = writeln!(file, "partial_line: {:?}", if world.partial_line.is_empty() { "".to_string() } else { format!("({} chars) {:?}", world.partial_line.len(), &world.partial_line[..world.partial_line.len().min(100)]) });
-                            let _ = writeln!(file, "partial_in_pending: {}", world.partial_in_pending);
-                            if let Some(ps) = world.pending_since {
-                                let _ = writeln!(file, "pending_since: {:?} ago", ps.elapsed());
-                            }
-                            let _ = writeln!(file, "encoding: {:?}", world.settings.encoding);
-
-                            let ws_min_lines = self.min_viewer_lines(wi);
-                            let ws_min_width = self.min_viewer_width(wi);
-                            let _ = writeln!(file, "min_viewer_lines: {:?}", ws_min_lines);
-                            let _ = writeln!(file, "min_viewer_width: {:?}", ws_min_width);
-
-                            let console_viewing = wi == self.current_world_index;
-                            let eff_height = match (console_viewing, ws_min_lines) {
-                                (true, Some(ws)) => (self.output_height).min(ws as u16),
-                                (true, None) => self.output_height,
-                                (false, Some(ws)) => ws as u16,
-                                (false, None) => self.output_height,
-                            };
-                            let eff_width = match (console_viewing, ws_min_width) {
-                                (true, Some(ws_w)) => (self.output_width).min(ws_w as u16),
-                                (true, None) => self.output_width,
-                                (false, Some(ws_w)) => ws_w as u16,
-                                (false, None) => self.output_width,
-                            };
-                            let _ = writeln!(file, "effective_output_height: {}", eff_height);
-                            let _ = writeln!(file, "effective_output_width: {}", eff_width);
-                            let _ = writeln!(file, "effective_max_lines: {}", (eff_height as usize).saturating_sub(2));
-                            let _ = writeln!(file);
-
-                            // Full scrollback dump (all output + pending lines)
-                            let _ = writeln!(file, "--- OUTPUT LINES ({}) ---", world.output_lines.len());
-                            for line in &world.output_lines {
-                                let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
-                                let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
-                                let _ = writeln!(file, "{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
-                                    prefix, lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second,
-                                    line.text);
-                            }
-
-                            if !world.pending_lines.is_empty() {
-                                let _ = writeln!(file, "--- PENDING LINES ({}) ---", world.pending_lines.len());
-                                for line in &world.pending_lines {
-                                    let lt = local_time_from_epoch(line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
-                                    let prefix = if line.gagged { "G" } else if !line.from_server { "C" } else { "" };
-                                    let _ = writeln!(file, "P,{},{:04}-{:02}-{:02} {:02}:{:02}:{:02},{}",
-                                        prefix, lt.year, lt.month, lt.day, lt.hour, lt.minute, lt.second,
-                                        line.text);
-                                }
-                            }
-                            let _ = writeln!(file);
-                        }
-
-                        // Don't broadcast — /dump must be passive and not disturb more-mode state
-                    }
-                    Err(_e) => {}
-                }
+                // Don't broadcast on success — /dump must be passive and not
+                // disturb more-mode state.
+                let _ = self.write_debug_dump("master-ws");
             }
             Command::Window { ref world } => {
                 // Auto-connect if the world exists but isn't connected
