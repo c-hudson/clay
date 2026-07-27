@@ -7296,13 +7296,19 @@ impl App {
 
                 if all_worlds {
                     // Send to all connected worlds
+                    let mut sent_count = 0;
                     for world in self.worlds.iter_mut() {
                         if world.connected {
                             if let Some(tx) = &world.command_tx {
-                                let _ = tx.try_send(make_write_cmd(&text));
-                                world.last_send_time = Some(std::time::Instant::now());
+                                if tx.try_send(make_write_cmd(&text)).is_ok() {
+                                    world.last_send_time = Some(std::time::Instant::now());
+                                    sent_count += 1;
+                                }
                             }
                         }
+                    }
+                    if sent_count == 0 {
+                        self.emit_client_text(world_index, "No connected worlds to send to.", false);
                     }
                 } else if let Some(ref target) = target_world {
                     // Send to specific world by name
@@ -7325,9 +7331,10 @@ impl App {
                             });
                         }
                     } else {
+                        // Wording matches the console copy (commands.rs) exactly.
                         self.ws_broadcast(WsMessage::ServerData {
                             world_index,
-                            data: format!("Unknown world: {}", target),
+                            data: format!("World '{}' not found.", target),
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
@@ -7339,9 +7346,14 @@ impl App {
                 } else {
                     // Send to current world (the one this command came from)
                     if world_index < self.worlds.len() {
-                        if let Some(tx) = &self.worlds[world_index].command_tx {
-                            let _ = tx.try_send(make_write_cmd(&text));
-                            self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                        if !self.worlds[world_index].connected {
+                            self.emit_client_text(world_index, "Not connected. Use /worlds to connect.", false);
+                        } else if let Some(tx) = &self.worlds[world_index].command_tx {
+                            if tx.try_send(make_write_cmd(&text)).is_ok() {
+                                self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                            } else {
+                                self.emit_client_text(world_index, "Failed to send command.", false);
+                            }
                         }
                     }
                 }

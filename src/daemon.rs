@@ -655,13 +655,19 @@ pub async fn handle_daemon_ws_message(
                     };
 
                     if all_worlds {
+                        let mut sent_count = 0;
                         for world in app.worlds.iter_mut() {
                             if world.connected {
                                 if let Some(tx) = &world.command_tx {
-                                    let _ = tx.try_send(make_write_cmd(&text));
-                                    world.last_send_time = Some(std::time::Instant::now());
+                                    if tx.try_send(make_write_cmd(&text)).is_ok() {
+                                        world.last_send_time = Some(std::time::Instant::now());
+                                        sent_count += 1;
+                                    }
                                 }
                             }
+                        }
+                        if sent_count == 0 {
+                            app.emit_client_text(world_index, "No connected worlds to send to.", true);
                         }
                     } else if let Some(ref target) = target_world {
                         if let Some(world) = app.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
@@ -683,9 +689,10 @@ pub async fn handle_daemon_ws_message(
                                 });
                             }
                         } else {
+                            // Wording matches the console copy (commands.rs) exactly.
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index,
-                                data: format!("Unknown world: {}", target),
+                                data: format!("World '{}' not found.", target),
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
@@ -695,9 +702,14 @@ pub async fn handle_daemon_ws_message(
                             });
                         }
                     } else if world_index < app.worlds.len() {
-                        if let Some(tx) = &app.worlds[world_index].command_tx {
-                            let _ = tx.try_send(make_write_cmd(&text));
-                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                        if !app.worlds[world_index].connected {
+                            app.emit_client_text(world_index, "Not connected. Use /worlds to connect.", true);
+                        } else if let Some(tx) = &app.worlds[world_index].command_tx {
+                            if tx.try_send(make_write_cmd(&text)).is_ok() {
+                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                            } else {
+                                app.emit_client_text(world_index, "Failed to send command.", true);
+                            }
                         }
                     }
                 }
