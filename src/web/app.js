@@ -8348,8 +8348,10 @@
 
             // Clay Extensions
             case 'toggle_tags':
-                showTags = !showTags;
-                renderOutput();
+                // show_tags is server-owned state (broadcast to all clients on
+                // change) - send /tag rather than flipping it locally, so the
+                // ShowTagsChanged broadcast is the single source of truth.
+                send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/tag' });
                 return true;
             case 'filter_popup':
                 if (filterPopupOpen) closeFilterPopup(); else openFilterPopup();
@@ -8430,8 +8432,9 @@
                 openEditorPage('keybind-editor');
                 break;
             case 'toggle-tags':
-                showTags = !showTags;
-                renderOutput();
+                // show_tags is server-owned state - route through /tag like the
+                // toggle_tags keybinding does, instead of mutating locally.
+                send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/tag' });
                 focusInputWithKeyboard();
                 break;
             case 'filter':
