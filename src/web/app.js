@@ -406,6 +406,12 @@
     // Server's activity count (number of worlds with unseen/pending output)
     let serverActivityCount = 0;
 
+    // Remote-WebView /connect confirm state - mirrors App::request_remote_attach's
+    // pending_remote_connect (main.rs): a second "/connect <same addr>" within 15s
+    // confirms the relaunch. Only used by the WEBVIEW_MODE && !AUTO_PASSWORD intercept.
+    let pendingRemoteConnect = null; // { addr, requestedAt } or null
+    const REMOTE_CONNECT_CONFIRM_WINDOW_MS = 15000;
+
     // Settings
     let worldSwitchMode = 'Unseen First';  // 'Unseen First' or 'Alphabetical'
     let keybindings = {};  // key name -> action ID, received from server
@@ -3943,12 +3949,28 @@
             if (connectArgs.length === 0) {
                 appendClientLine('Usage: /connect host:port  (or)  /connect host port  (or)  /connect --close');
             } else if (connectArgs[0] === '--close') {
+                pendingRemoteConnect = null;
                 sendIpc('connect-close');
             } else if (connectArgs[0] === '--cancel') {
-                appendClientLine('No pending /connect to cancel.');
+                if (pendingRemoteConnect) {
+                    pendingRemoteConnect = null;
+                    appendClientLine('Cancelled.');
+                } else {
+                    appendClientLine('No pending /connect to cancel.');
+                }
             } else {
                 var connectAddr = connectArgs.length > 1 ? (connectArgs[0] + ':' + connectArgs[1]) : connectArgs[0];
-                sendIpc('connect:' + connectAddr);
+                var now = Date.now();
+                if (pendingRemoteConnect && pendingRemoteConnect.addr === connectAddr &&
+                    (now - pendingRemoteConnect.requestedAt) < REMOTE_CONNECT_CONFIRM_WINDOW_MS) {
+                    pendingRemoteConnect = null;
+                    sendIpc('connect:' + connectAddr);
+                } else {
+                    pendingRemoteConnect = { addr: connectAddr, requestedAt: now };
+                    appendClientLine('This will disconnect from the current server and attach to ' +
+                        connectAddr + ' instead. Run /connect ' + connectAddr +
+                        ' again within 15s to confirm, or /connect --cancel.');
+                }
             }
             return;
         }
