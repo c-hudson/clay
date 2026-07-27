@@ -2454,25 +2454,27 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output(&msg);
         }
         Command::BanList => {
-            // Show current banned hosts
+            // Show current banned hosts. Format matches the WS/daemon copies
+            // (main.rs, daemon.rs) exactly, including the Type column this
+            // console version used to omit.
             let bans = app.ban_list.get_ban_info();
             if bans.is_empty() {
                 app.add_output("No hosts are currently banned.");
             } else {
                 app.add_output("");
                 app.add_output("Banned Hosts:");
-                app.add_output("─".repeat(55).as_str());
-                app.add_output(&format!("{:<20} {}", "Host", "Last URL/Reason"));
-                app.add_output("─".repeat(55).as_str());
-                for (ip, _, reason) in bans {
-                    let reason_display = if reason.is_empty() { "(unknown)" } else { &reason };
-                    app.add_output(&format!("{:<20} {}", ip, reason_display));
+                app.add_output("─".repeat(70).as_str());
+                app.add_output(&format!("{:<20} {:<12} {}", "Host", "Type", "Last URL/Reason"));
+                app.add_output("─".repeat(70).as_str());
+                for (ip, ban_type, reason) in &bans {
+                    let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
+                    app.add_output(&format!("{:<20} {:<12} {}", ip, ban_type, reason_display));
                 }
                 app.add_output("─".repeat(70).as_str());
                 app.add_output("Use /unban <host> to remove a ban.");
             }
             // Broadcast to remote clients
-            app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+            app.ws_broadcast(WsMessage::BanListResponse { bans });
         }
         Command::Unban { host } => {
             if app.ban_list.remove_ban(&host) {
