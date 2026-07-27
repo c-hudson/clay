@@ -8005,20 +8005,27 @@ impl App {
         WsAsyncAction::Done
     }
 
-    /// Send TF help output to a WebSocket client
+    /// Send TF help output to a single requesting WebSocket client (not the whole
+    /// world - deliberately not routed through emit_client_text/emit_client_lines,
+    /// which broadcast to every client viewing the world; help output must stay
+    /// private to whoever asked).
     fn handle_ws_help_via_tf(&mut self, client_id: u64, world_index: usize, cmd: &str) {
         self.sync_tf_world_info();
         let help_text = match self.tf_engine.execute(cmd) {
             tf::TfCommandResult::Success(Some(msg)) => msg,
             _ => "No help available. Try /help commands".to_string(),
         };
-        for line in help_text.lines() {
-            self.ws_send_to_client(client_id, WsMessage::ServerData {
-                world_index, data: line.to_string(), is_viewed: false,
-                ts: current_timestamp_secs(), from_server: false, seq: 0,
-                marked_new: false, flush: false, gagged: false,
-            });
-        }
+        // One message for the whole block instead of one ws_send_to_client per
+        // line - matches the "single broadcast per block" pattern used elsewhere
+        // (emit_client_lines) without changing the single-client targeting.
+        // Trailing newline required - without it the client's line-parser would
+        // treat this as an incomplete/partial line rather than a complete block.
+        let data = if help_text.ends_with('\n') { help_text } else { format!("{}\n", help_text) };
+        self.ws_send_to_client(client_id, WsMessage::ServerData {
+            world_index, data, is_viewed: false,
+            ts: current_timestamp_secs(), from_server: false, seq: 0,
+            marked_new: false, flush: false, gagged: false,
+        });
     }
 
     /// Handle TfCommandResult::Quote from a WebSocket client command.
