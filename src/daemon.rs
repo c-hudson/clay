@@ -711,16 +711,14 @@ pub async fn handle_daemon_ws_message(
                         if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
                             crate::platform::kill_proxy_process(proxy_pid);
                         }
-                        if let Some(ref socket_path) = app.worlds[world_index].proxy_socket_path {
-                            let _ = std::fs::remove_file(socket_path);
-                        }
-                        app.worlds[world_index].proxy_pid = None;
-                        app.worlds[world_index].proxy_socket_path = None;
-                        app.worlds[world_index].command_tx = None;
-                        app.worlds[world_index].connected = false;
-                        app.worlds[world_index].socket_fd = None;
-                        app.worlds[world_index].close_log_file();
-                        app.worlds[world_index].prompt.clear();
+                        // Use the same World::clear_connection_state the console/master-WS
+                        // paths use, instead of an inline field-by-field copy - the inline
+                        // version here was missing several fields (skip_auto_login,
+                        // negotiated_encoding, telnet_mode, naws_enabled/naws_sent_size,
+                        // fansi_detect_until/fansi_login_pending, active_media, timing
+                        // fields), leaking stale state into the next connection attempt on
+                        // this world in daemon mode.
+                        app.worlds[world_index].clear_connection_state(true, true);
                         app.ws_broadcast(WsMessage::ServerData {
                             world_index,
                             data: "Disconnected.".to_string(),

@@ -2230,6 +2230,57 @@
     }
 
     #[test]
+    fn test_clear_connection_state_resets_all_negotiation_and_session_fields() {
+        // Regression guard for the daemon.rs /disconnect fix (T3 of the command-
+        // duplication audit): daemon.rs used to hand-roll 7 field resets inline
+        // instead of calling World::clear_connection_state, silently leaking
+        // stale telnet/session state into the next connection attempt on that
+        // world. Pin every field clear_connection_state is responsible for.
+        let mut world = World::new("test");
+        world.proxy_pid = Some(1234);
+        world.proxy_socket_path = Some(std::path::PathBuf::from("/tmp/fake.sock"));
+        world.proxy_socket_fd = Some(5);
+        world.connected = true;
+        world.socket_fd = Some(6);
+        world.telnet_mode = true;
+        world.negotiated_encoding = Some(Encoding::Utf8);
+        world.naws_enabled = true;
+        world.naws_sent_size = Some((80, 24));
+        world.reader_name = Some("test-reader".to_string());
+        world.skip_auto_login = true;
+        world.fansi_detect_until = Some(std::time::Instant::now());
+        world.fansi_login_pending = Some("login".to_string());
+        world.last_send_time = Some(std::time::Instant::now());
+        world.last_receive_time = Some(std::time::Instant::now());
+        world.last_nop_time = Some(std::time::Instant::now());
+        world.last_user_command_time = Some(std::time::Instant::now());
+        world.active_media.insert("key".to_string(), "{}".to_string());
+        world.prompt = "prompt> ".to_string();
+
+        world.clear_connection_state(true, true);
+
+        assert_eq!(world.proxy_pid, None);
+        assert_eq!(world.proxy_socket_path, None);
+        assert_eq!(world.proxy_socket_fd, None);
+        assert!(!world.connected);
+        assert_eq!(world.socket_fd, None);
+        assert!(!world.telnet_mode);
+        assert_eq!(world.negotiated_encoding, None);
+        assert!(!world.naws_enabled);
+        assert_eq!(world.naws_sent_size, None);
+        assert_eq!(world.reader_name, None);
+        assert!(!world.skip_auto_login, "skip_auto_login must reset so the next connect auto-logs in");
+        assert_eq!(world.fansi_detect_until, None);
+        assert_eq!(world.fansi_login_pending, None);
+        assert_eq!(world.last_send_time, None);
+        assert_eq!(world.last_receive_time, None);
+        assert_eq!(world.last_nop_time, None);
+        assert_eq!(world.last_user_command_time, None);
+        assert!(world.active_media.is_empty());
+        assert!(world.prompt.is_empty());
+    }
+
+    #[test]
     fn test_more_mode_visual_line_offset_survives_gagged_lines() {
         // Regression test: gagged lines appended after add_output must not
         // clear visual_line_offset (the bug was scroll_to_bottom in the gagged
