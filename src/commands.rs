@@ -2543,14 +2543,20 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
         }
         Command::DictUsage => {
-            app.add_output("Usage: /dict <word>");
-            app.add_output("  Looks up <word> in the dictionary and places the definition in the input buffer.");
-            app.add_output("  Example: /dict hello");
+            let world_idx = app.current_world_index;
+            app.emit_usage(world_idx, &[
+                "Usage: /dict <word>",
+                "  Looks up <word> in the dictionary and places the definition in the input buffer.",
+                "  Example: /dict hello",
+            ], false);
         }
         Command::UrbanUsage => {
-            app.add_output("Usage: /urban <word>");
-            app.add_output("  Looks up <word> in Urban Dictionary and places the definition in the input buffer.");
-            app.add_output("  Example: /urban yeet");
+            let world_idx = app.current_world_index;
+            app.emit_usage(world_idx, &[
+                "Usage: /urban <word>",
+                "  Looks up <word> in Urban Dictionary and places the definition in the input buffer.",
+                "  Example: /urban yeet",
+            ], false);
         }
         Command::Translate { lang, text } => {
             match lookup_translation(&text, &lang).await {
@@ -2566,11 +2572,14 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
         }
         Command::TranslateUsage => {
-            app.add_output("Usage: /translate <lang> <text>");
-            app.add_output("  Translates <text> to <lang> and places the result in the input buffer.");
-            app.add_output("  <lang> can be a code (es, fr, de) or name (spanish, french, german).");
-            app.add_output("  Example: /translate spanish Hello, how are you?");
-            app.add_output("  Example: /tr es Hello");
+            let world_idx = app.current_world_index;
+            app.emit_usage(world_idx, &[
+                "Usage: /translate <lang> <text>",
+                "  Translates <text> to <lang> and places the result in the input buffer.",
+                "  <lang> can be a code (es, fr, de) or name (spanish, french, german).",
+                "  Example: /translate spanish Hello, how are you?",
+                "  Example: /tr es Hello",
+            ], false);
         }
         Command::TinyUrl { url } => {
             match shorten_url_fallback(&url).await {
@@ -2584,9 +2593,12 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
         }
         Command::TinyUrlUsage => {
-            app.add_output("Usage: /url <url>");
-            app.add_output("  Shortens <url> and places the result in the input buffer.");
-            app.add_output("  Example: /url https://github.com/c-hudson/clay");
+            let world_idx = app.current_world_index;
+            app.emit_usage(world_idx, &[
+                "Usage: /url <url>",
+                "  Shortens <url> and places the result in the input buffer.",
+                "  Example: /url https://github.com/c-hudson/clay",
+            ], false);
         }
         Command::Dump => {
             // Don't use add_output on success — it resets lines_since_pause and

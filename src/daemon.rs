@@ -561,52 +561,34 @@ pub async fn handle_daemon_ws_message(
                     spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
                 }
                 Command::DictUsage => {
-                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                        world_index,
-                        data: "Usage: /dict <word>".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                    });
+                    app.emit_usage(world_index, &[
+                        "Usage: /dict <word>",
+                        "  Looks up <word> in the dictionary and places the definition in the input buffer.",
+                        "  Example: /dict hello",
+                    ], true);
                 }
                 Command::UrbanUsage => {
-                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                        world_index,
-                        data: "Usage: /urban <word>".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                    });
+                    app.emit_usage(world_index, &[
+                        "Usage: /urban <word>",
+                        "  Looks up <word> in Urban Dictionary and places the definition in the input buffer.",
+                        "  Example: /urban yeet",
+                    ], true);
                 }
                 Command::TranslateUsage => {
-                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                        world_index,
-                        data: "Usage: /translate <lang> <text>".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                    });
+                    app.emit_usage(world_index, &[
+                        "Usage: /translate <lang> <text>",
+                        "  Translates <text> to <lang> and places the result in the input buffer.",
+                        "  <lang> can be a code (es, fr, de) or name (spanish, french, german).",
+                        "  Example: /translate spanish Hello, how are you?",
+                        "  Example: /tr es Hello",
+                    ], true);
                 }
                 Command::TinyUrlUsage => {
-                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                        world_index,
-                        data: "Usage: /url <url>".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                    });
+                    app.emit_usage(world_index, &[
+                        "Usage: /url <url>",
+                        "  Shortens <url> and places the result in the input buffer.",
+                        "  Example: /url https://github.com/c-hudson/clay",
+                    ], true);
                 }
                 Command::HelpTopic { ref topic } => {
                     use crate::popup::definitions::help::get_topic_help;

@@ -5513,6 +5513,14 @@ impl App {
         self.emit_client_text(world_idx, &format!("Error: {}", err), is_daemon_mode);
     }
 
+    /// `Command::*Usage` rendering (e.g. `/dict` with no args). One shared copy so the text
+    /// stays consistent — the WS/daemon copies used to carry only the bare "Usage: /dict
+    /// <word>" line, missing the explanation/example lines console's version had.
+    pub(crate) fn emit_usage(&mut self, world_idx: usize, lines: &[&str], is_daemon_mode: bool) {
+        let owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        self.emit_client_lines(world_idx, &owned, is_daemon_mode);
+    }
+
     /// `TfCommandResult::RepeatProcess(process)` handling: register the process so the
     /// engine's repeat-tick loop picks it up. One shared copy instead of ~16 identical
     /// `self.tf_engine.processes.push(process)` one-liners scattered across every TF-result
@@ -7984,52 +7992,34 @@ impl App {
                 spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
             }
             Command::DictUsage => {
-                self.ws_send_to_client(client_id, WsMessage::ServerData {
-                    world_index,
-                    data: "Usage: /dict <word>".to_string(),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
+                self.emit_usage(world_index, &[
+                    "Usage: /dict <word>",
+                    "  Looks up <word> in the dictionary and places the definition in the input buffer.",
+                    "  Example: /dict hello",
+                ], false);
             }
             Command::UrbanUsage => {
-                self.ws_send_to_client(client_id, WsMessage::ServerData {
-                    world_index,
-                    data: "Usage: /urban <word>".to_string(),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
+                self.emit_usage(world_index, &[
+                    "Usage: /urban <word>",
+                    "  Looks up <word> in Urban Dictionary and places the definition in the input buffer.",
+                    "  Example: /urban yeet",
+                ], false);
             }
             Command::TranslateUsage => {
-                self.ws_send_to_client(client_id, WsMessage::ServerData {
-                    world_index,
-                    data: "Usage: /translate <lang> <text>".to_string(),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
+                self.emit_usage(world_index, &[
+                    "Usage: /translate <lang> <text>",
+                    "  Translates <text> to <lang> and places the result in the input buffer.",
+                    "  <lang> can be a code (es, fr, de) or name (spanish, french, german).",
+                    "  Example: /translate spanish Hello, how are you?",
+                    "  Example: /tr es Hello",
+                ], false);
             }
             Command::TinyUrlUsage => {
-                self.ws_send_to_client(client_id, WsMessage::ServerData {
-                    world_index,
-                    data: "Usage: /url <url>".to_string(),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                    seq: 0,
-                    marked_new: false,
-                    flush: false, gagged: false,
-                });
+                self.emit_usage(world_index, &[
+                    "Usage: /url <url>",
+                    "  Shortens <url> and places the result in the input buffer.",
+                    "  Example: /url https://github.com/c-hudson/clay",
+                ], false);
             }
             Command::HelpTopic { ref topic } => {
                 // Try Clay help first, then TF help via engine
