@@ -2804,7 +2804,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                         app.emit_recall(&opts, world_idx, false);
                     }
                     tf::TfCommandResult::RepeatProcess(process) => {
-                        app.tf_engine.processes.push(process);
+                        app.register_repeat_process(process);
                     }
                     tf::TfCommandResult::Quote { lines, disposition, .. } => {
                         match disposition {

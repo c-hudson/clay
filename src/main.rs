@@ -5513,6 +5513,15 @@ impl App {
         self.emit_client_text(world_idx, &format!("Error: {}", err), is_daemon_mode);
     }
 
+    /// `TfCommandResult::RepeatProcess(process)` handling: register the process so the
+    /// engine's repeat-tick loop picks it up. One shared copy instead of ~16 identical
+    /// `self.tf_engine.processes.push(process)` one-liners scattered across every TF-result
+    /// dispatch site — trivial today, but keeps any future change (dedup, a process-count
+    /// cap, logging) from needing to land in sync across all of them.
+    pub(crate) fn register_repeat_process(&mut self, process: tf::TfProcess) {
+        self.tf_engine.processes.push(process);
+    }
+
     /// Write comprehensive debug state to `~/.clay/dump.log` for `/dump`.
     /// `mode` is just a label identifying which dispatch path triggered this
     /// (console/master-ws/daemon) — the content is otherwise identical
@@ -7283,7 +7292,7 @@ impl App {
                                         self.emit_recall(&opts, world_index, false);
                                     }
                                     tf::TfCommandResult::RepeatProcess(process) => {
-                                        self.tf_engine.processes.push(process);
+                                        self.register_repeat_process(process);
                                     }
                                     tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
                                         self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts, strip_ansi);
@@ -7330,7 +7339,7 @@ impl App {
                             self.emit_recall(&opts, world_index, false);
                         }
                         tf::TfCommandResult::RepeatProcess(process) => {
-                            self.tf_engine.processes.push(process);
+                            self.register_repeat_process(process);
                         }
                         tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
                             self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts, strip_ansi);
@@ -13606,7 +13615,7 @@ pub async fn run_app_headless(
                                             }
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.tf_engine.processes.push(process);
+                                            app.register_repeat_process(process);
                                         }
                                         _ => {}
                                     }
@@ -14108,7 +14117,7 @@ pub async fn run_app_headless(
                                 app.emit_tf_error(world_idx, &err, true);
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
-                                app.tf_engine.processes.push(process);
+                                app.register_repeat_process(process);
                             }
                             tf::TfCommandResult::NotTfCommand => {
                                 // Plain text command - send to MUD
@@ -15333,7 +15342,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
                         }
                         tf::TfCommandResult::RepeatProcess(process) => {
-                            app.tf_engine.processes.push(process);
+                            app.register_repeat_process(process);
                         }
                         _ => {}
                     }
@@ -15646,7 +15655,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         let interval = format_duration_short(process.interval);
                                         let count_str = process.count.map_or("infinite".to_string(), |c| c.to_string());
                                         let cmd = process.command.clone();
-                                        app.tf_engine.processes.push(process);
+                                        app.register_repeat_process(process);
                                         app.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
                                     }
                                     tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
@@ -15867,7 +15876,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.tf_engine.processes.push(process);
+                                            app.register_repeat_process(process);
                                         }
                                         _ => {}
                                     }
@@ -16119,7 +16128,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.tf_engine.processes.push(process);
+                                            app.register_repeat_process(process);
                                         }
                                         tf::TfCommandResult::Quote { lines, disposition, .. } => {
                                             match disposition {
@@ -16620,7 +16629,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
-                                app.tf_engine.processes.push(process);
+                                app.register_repeat_process(process);
                             }
                             tf::TfCommandResult::NotTfCommand => {
                                 // Plain text command - send to MUD
@@ -16802,7 +16811,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
                                     }
                                     tf::TfCommandResult::RepeatProcess(process) => {
-                                        app.tf_engine.processes.push(process);
+                                        app.register_repeat_process(process);
                                     }
                                     _ => {}
                                 }
@@ -17008,7 +17017,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
                                     }
                                     tf::TfCommandResult::RepeatProcess(process) => {
-                                        app.tf_engine.processes.push(process);
+                                        app.register_repeat_process(process);
                                     }
                                     _ => {}
                                 }

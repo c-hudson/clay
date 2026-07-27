@@ -214,7 +214,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 app.emit_tf_error(world_idx, &err, true);
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
-                                app.tf_engine.processes.push(process);
+                                app.register_repeat_process(process);
                             }
                             tf::TfCommandResult::NotTfCommand => {
                                 // Plain text command - send to MUD
@@ -289,7 +289,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                             }
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.tf_engine.processes.push(process);
+                                            app.register_repeat_process(process);
                                         }
                                         _ => {}
                                     }
@@ -483,7 +483,7 @@ pub async fn handle_daemon_ws_message(
                                             app.emit_recall(&opts, world_index, true);
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
-                                            app.tf_engine.processes.push(process);
+                                            app.register_repeat_process(process);
                                         }
                                         _ => {}
                                     }
@@ -525,7 +525,7 @@ pub async fn handle_daemon_ws_message(
                                 app.emit_recall(&opts, world_index, true);
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
-                                app.tf_engine.processes.push(process);
+                                app.register_repeat_process(process);
                             }
                             _ => {
                                 app.ws_broadcast(WsMessage::ServerData {
@@ -2280,7 +2280,7 @@ keep_alive_type=Generic
                                 app.emit_tf_error(world_idx, &err, true);
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
-                                app.tf_engine.processes.push(process);
+                                app.register_repeat_process(process);
                             }
                             tf::TfCommandResult::NotTfCommand => {
                                 // Plain text command - send to MUD
