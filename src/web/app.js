@@ -697,13 +697,14 @@
     // ============================================================================
 
     // Internal commands for tab completion (must match Rust parse_command match arms)
-    // This list is verified by test_command_parity_js_vs_rust in main.rs
+    // This list is verified against parse_command()'s own source by
+    // test_command_parity_js_vs_rust in tests.rs
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'import',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'note', 'tag', 'tags',
-        'dict', 'urban', 'translate', 'tr', 'font', 'window',
+        'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say',
     ];
 
     function isInternalCommand(name) {

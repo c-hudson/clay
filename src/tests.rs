@@ -4179,18 +4179,44 @@
         js_commands.sort();
         js_commands.dedup();
 
-        // --- Build expected command list from Rust parse_command() ---
-        // These are the command strings (without /) that parse_command() matches on.
-        // When adding a new command to parse_command(), add it here too.
-        let mut rust_commands: Vec<String> = vec![
-            "help", "version", "quit", "reload", "update", "setup", "web", "actions",
-            "connections", "l", "worlds", "world", "disconnect", "dc", "connect", "import",
-            "flush", "menu", "send", "remote", "ban", "unban",
-            "testmusic", "dump", "notify", "addworld", "note", "tag", "tags",
-            "dict", "urban", "translate", "tr", "font", "window",
-        ].into_iter().map(|s| s.to_string()).collect();
+        // --- Extract the real command list from parse_command()'s own source ---
+        // A hand-maintained copy here is exactly what drifted out of sync before
+        // (missing /say and /url from JS, with nothing able to catch it since this
+        // test's own Rust-side list had silently drifted to match the same gaps).
+        // Scanning the source directly means there's only one list left to update
+        // when a command is added: INTERNAL_COMMANDS in app.js.
+        let main_rs = std::fs::read_to_string("src/main.rs")
+            .expect("Failed to read src/main.rs");
+        let fn_start_marker = "pub fn parse_command(input: &str) -> Command {";
+        let fn_start = main_rs.find(fn_start_marker)
+            .expect("Could not find parse_command() in main.rs");
+        let fn_end_marker = "fn parse_world_command";
+        let fn_end_rel = main_rs[fn_start..].find(fn_end_marker)
+            .expect("Could not find end of parse_command() in main.rs");
+        let fn_body = &main_rs[fn_start..fn_start + fn_end_rel];
+
+        // Match top-level `"/cmd"` or `"/cmd1" | "/cmd2"` match-arm patterns (only
+        // lines that actually dispatch on the token, not incidental quoted strings
+        // like the "/common" example in a comment elsewhere in this function).
+        let arm_re = regex::Regex::new(r#"(?m)^\s*((?:"/[a-zA-Z_]+"\s*\|\s*)*"/[a-zA-Z_]+")\s*=>"#).unwrap();
+        let token_re = regex::Regex::new(r#""/([a-zA-Z_]+)""#).unwrap();
+        let mut rust_commands: Vec<String> = Vec::new();
+        for arm_caps in arm_re.captures_iter(fn_body) {
+            for tok_caps in token_re.captures_iter(&arm_caps[1]) {
+                let name = tok_caps[1].to_lowercase();
+                // /__connect is explicitly internal-use-only (Connect buttons), not a
+                // user-typed command - out of scope for JS's INTERNAL_COMMANDS.
+                if name != "__connect" {
+                    rust_commands.push(name);
+                }
+            }
+        }
         rust_commands.sort();
         rust_commands.dedup();
+        assert!(rust_commands.len() > 30,
+            "Sanity check failed: only found {} commands in parse_command() - the \
+             extraction regex likely broke against a source change. Commands found: {:?}",
+            rust_commands.len(), rust_commands);
 
         // --- Compare ---
         let js_set: std::collections::HashSet<&str> = js_commands.iter().map(|s| s.as_str()).collect();
@@ -4204,7 +4230,8 @@
              Missing from JS (present in Rust): {:?}\n\
              Extra in JS (not in Rust): {:?}\n\
              \n\
-             To fix: update INTERNAL_COMMANDS in src/web/app.js and rust_commands in this test.",
+             To fix: update INTERNAL_COMMANDS in src/web/app.js (parse_command() is scanned \
+             directly now, so there's no second Rust-side list to keep in sync here).",
             missing_from_js, extra_in_js);
     }
 
