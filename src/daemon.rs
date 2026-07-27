@@ -19,7 +19,11 @@ use crate::{
 use crate::actions::{action_commands_to_run,
     find_invocable_action, rewrite_slashless_action};
 use crate::commands::{connect_slack, connect_discord};
-use crate::websocket::{TimestampedLine, RemoteClientType};
+use crate::websocket::TimestampedLine;
+// Only used by the #[cfg(test)] helpers below (RemoteConsole's own non-test use moved into
+// the now-shared App::handle_cycle_world in main.rs - T39).
+#[cfg(test)]
+use crate::websocket::RemoteClientType;
 
 /// Run headlessly as a local, loopback-only Clay instance for an embedding client — currently
 /// the Android app's bundled server, spawned as a child process. No TUI, no native WebView; the
@@ -1408,101 +1412,7 @@ pub async fn handle_daemon_ws_message(
             }
         }
         WsMessage::CycleWorld { direction } => {
-            // Client requests to cycle to next/previous world
-            // Apply server's world switching rules and send result
-            let current = app.ws_client_worlds.get(&client_id)
-                .map(|s| s.world_index)
-                .unwrap_or(app.current_world_index);
-
-            let new_index = if direction == "up" {
-                app.calculate_prev_world_from(current)
-            } else {
-                app.calculate_next_world_from(current)
-            };
-
-            if let Some(idx) = new_index {
-                // Update client's view state (sync state)
-                let prev = app.ws_client_worlds.get(&client_id);
-                let visible_lines = prev.map(|s| s.visible_lines).unwrap_or(24);
-                let visible_columns = prev.map(|s| s.visible_columns).unwrap_or(0);
-                let dimensions = prev.and_then(|s| s.dimensions);
-                let paused = prev.map(|s| s.paused).unwrap_or(false);
-                app.ws_client_worlds.insert(client_id, ClientViewState {
-                    world_index: idx,
-                    visible_lines,
-                    visible_columns,
-                    dimensions,
-                    paused,
-                });
-                // Update client's world in WebSocket server (async state)
-                app.ws_set_client_world(client_id, Some(idx));
-
-                // Send world switch result with state
-                if idx < app.worlds.len() {
-                    let pending_count = app.worlds[idx].pending_lines.len();
-                    let paused = app.worlds[idx].paused;
-                    let world_name = app.worlds[idx].name.clone();
-
-                    app.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
-                        world_index: idx,
-                        world_name,
-                        pending_count,
-                        paused,
-                    });
-
-                    // Send initial output lines based on client type
-                    let client_type = app.ws_get_client_type(client_id);
-                    let world = &app.worlds[idx];
-                    let total_lines = world.output_lines.len();
-
-                    let lines_to_send = match client_type {
-                        Some(RemoteClientType::RemoteConsole) => {
-                            // Console: last screenful (viewport - 2)
-                            visible_lines.saturating_sub(2).min(total_lines)
-                        }
-                        _ => {
-                            // Web/GUI: full history
-                            total_lines
-                        }
-                    };
-
-                    if lines_to_send > 0 {
-                        let start = total_lines.saturating_sub(lines_to_send);
-                        let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
-                            .map(|line| {
-                                let ts = line.timestamp
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                TimestampedLine {
-                                    text: line.text.clone(),
-                                    ts,
-                                    gagged: line.gagged,
-                                    from_server: line.from_server,
-                                    seq: line.seq,
-                                    highlight_color: line.highlight_color.clone(),
-                                    marked_new: line.marked_new,
-                                    from_archive: line.from_archive,
-                                }
-                            })
-                            .collect();
-
-                        app.ws_send_to_client(client_id, WsMessage::OutputLines {
-                            world_index: idx,
-                            lines,
-                            is_initial: true,
-                        });
-                    }
-
-                    // Also mark world as seen if it had unseen output
-                    if app.worlds[idx].unseen_lines > 0 {
-                        app.worlds[idx].unseen_lines = 0;
-                        app.worlds[idx].first_unseen_at = None;
-                        app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
-                        app.broadcast_activity();
-                    }
-                }
-            }
+            app.handle_cycle_world(client_id, &direction);
         }
         WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
             // Console client requests scrollback from master
@@ -1611,64 +1521,16 @@ pub async fn handle_daemon_ws_message(
             );
         }
         WsMessage::CalculateNextWorld { current_index } => {
-            let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
-                .map(|w| crate::util::WorldSwitchInfo {
-                    name: w.name.clone(),
-                    connected: w.connected,
-                    unseen_lines: w.unseen_lines,
-                    pending_lines: w.pending_lines.len(),
-                    first_unseen_at: w.first_unseen_at,
-                })
-                .collect();
-            let next_idx = crate::util::calculate_next_world(
-                &world_info, current_index, app.settings.world_switch_mode,
-            );
-            if let Some(ref ws) = app.ws_server {
-                ws.send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
-            }
+            let next_idx = app.calculate_next_world_from(current_index);
+            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
         }
         WsMessage::CalculatePrevWorld { current_index } => {
-            let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
-                .map(|w| crate::util::WorldSwitchInfo {
-                    name: w.name.clone(),
-                    connected: w.connected,
-                    unseen_lines: w.unseen_lines,
-                    pending_lines: w.pending_lines.len(),
-                    first_unseen_at: w.first_unseen_at,
-                })
-                .collect();
-            let prev_idx = crate::util::calculate_prev_world(
-                &world_info, current_index, app.settings.world_switch_mode,
-            );
-            if let Some(ref ws) = app.ws_server {
-                ws.send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
-            }
+            let prev_idx = app.calculate_prev_world_from(current_index);
+            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
         }
         WsMessage::CalculateOldestPending { current_index } => {
-            let mut oldest_idx: Option<usize> = None;
-            let mut oldest_time: Option<std::time::Instant> = None;
-            for (idx, world) in app.worlds.iter().enumerate() {
-                if idx != current_index && !world.pending_lines.is_empty() {
-                    if let Some(since) = world.pending_since {
-                        if oldest_time.is_none() || since < oldest_time.unwrap() {
-                            oldest_time = Some(since);
-                            oldest_idx = Some(idx);
-                        }
-                    }
-                }
-            }
-            // Fall back to any world with unseen lines
-            if oldest_idx.is_none() {
-                for (idx, world) in app.worlds.iter().enumerate() {
-                    if idx != current_index && world.unseen_lines > 0 {
-                        oldest_idx = Some(idx);
-                        break;
-                    }
-                }
-            }
-            if let Some(ref ws) = app.ws_server {
-                ws.send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
-            }
+            let oldest_idx = app.calculate_oldest_pending_world_from(current_index);
+            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
         }
         // /import export side: mirrors the handler in main.rs's App::handle_ws_message —
         // needed here too since --local-server (Android on-device mode) and -D (run_daemon_server)

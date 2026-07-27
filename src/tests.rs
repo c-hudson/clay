@@ -5237,3 +5237,47 @@ if you're more curious.\"";
         assert!(app.worlds[0].output_lines.is_empty());
     }
 
+    // --- App::calculate_oldest_pending_world_from ---
+    // Pins the third fallback tier (T39): daemon's inline copy was missing it entirely, so
+    // "switch to the world needing attention" (Escape+w) had a strictly weaker fallback for
+    // daemon-attached clients.
+
+    #[test]
+    fn test_calculate_oldest_pending_falls_back_to_previous_world() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds.push(World::new("beta"));
+        app.worlds.push(World::new("gamma"));
+        // No world has pending or unseen output - only the "previous world" tier can fire.
+        app.previous_world_index = Some(2);
+
+        let result = app.calculate_oldest_pending_world_from(0);
+        assert_eq!(result, Some(2), "with no pending/unseen output anywhere, should fall back to previous_world_index");
+    }
+
+    #[test]
+    fn test_calculate_oldest_pending_prefers_pending_over_previous_world() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds.push(World::new("beta"));
+        app.worlds[1].pending_lines.push(make_pending_line("line", false));
+        app.worlds[1].pending_since = Some(std::time::Instant::now());
+        app.previous_world_index = Some(0);
+
+        let result = app.calculate_oldest_pending_world_from(0);
+        assert_eq!(result, Some(1), "a world with actual pending output should win over the previous-world fallback");
+    }
+
+    #[test]
+    fn test_calculate_oldest_pending_none_when_nothing_qualifies() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.previous_world_index = None;
+
+        let result = app.calculate_oldest_pending_world_from(0);
+        assert_eq!(result, None);
+    }
+

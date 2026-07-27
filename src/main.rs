@@ -5165,6 +5165,152 @@ impl App {
         crate::util::calculate_prev_world(&world_info, from_index, self.settings.world_switch_mode)
     }
 
+    /// `WsMessage::CalculateOldestPending` handling — shared by master-WS and daemon (T39).
+    /// Priority: 1) oldest pending output, 2) any unseen output, 3) the previously-viewed
+    /// world. Daemon's inline copy was missing tier 3 entirely (no `previous_world_index`
+    /// fallback), so "switch to the world needing attention" (Escape+w) had a strictly weaker
+    /// fallback for daemon-attached clients — if no world had pending or unseen output, it
+    /// returned nothing instead of falling back to wherever the client was previously.
+    fn calculate_oldest_pending_world_from(&self, current_index: usize) -> Option<usize> {
+        let mut oldest_idx: Option<usize> = None;
+        let mut oldest_time: Option<std::time::Instant> = None;
+
+        // Check for worlds with pending output
+        for (idx, world) in self.worlds.iter().enumerate() {
+            if idx == current_index || world.pending_lines.is_empty() {
+                continue;
+            }
+            if let Some(pending_time) = world.pending_since {
+                if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
+                    oldest_time = Some(pending_time);
+                    oldest_idx = Some(idx);
+                }
+            }
+        }
+
+        // If no pending, check for unseen output
+        if oldest_idx.is_none() {
+            for (idx, world) in self.worlds.iter().enumerate() {
+                if idx != current_index && world.unseen_lines > 0 {
+                    oldest_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        // If still none, use previous world
+        if oldest_idx.is_none() {
+            if let Some(prev_idx) = self.previous_world_index {
+                if prev_idx != current_index && prev_idx < self.worlds.len() {
+                    oldest_idx = Some(prev_idx);
+                }
+            }
+        }
+
+        oldest_idx
+    }
+
+    /// `WsMessage::CycleWorld` handling — shared by master-WS and daemon (T39). Confirmed
+    /// byte-identical between the two previous copies (unlike most of this audit's other
+    /// findings) — pure duplication, no divergence to reconcile.
+    pub(crate) fn handle_cycle_world(&mut self, client_id: u64, direction: &str) {
+        let current = self.ws_client_worlds.get(&client_id)
+            .map(|s| s.world_index)
+            .unwrap_or(self.current_world_index);
+
+        let new_index = if direction == "up" {
+            self.calculate_prev_world_from(current)
+        } else {
+            self.calculate_next_world_from(current)
+        };
+
+        let Some(idx) = new_index else { return; };
+
+        // Update client's view state (sync state)
+        let prev = self.ws_client_worlds.get(&client_id);
+        let visible_lines = prev.map(|s| s.visible_lines).unwrap_or(24);
+        let visible_columns = prev.map(|s| s.visible_columns).unwrap_or(0);
+        let dimensions = prev.and_then(|s| s.dimensions);
+        let paused = prev.map(|s| s.paused).unwrap_or(false);
+        self.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: idx,
+            visible_lines,
+            visible_columns,
+            dimensions,
+            paused,
+        });
+        // Update client's world in WebSocket server (async state)
+        self.ws_set_client_world(client_id, Some(idx));
+
+        if idx >= self.worlds.len() {
+            return;
+        }
+
+        // Send world switch result with state
+        let pending_count = self.worlds[idx].pending_lines.len();
+        let paused = self.worlds[idx].paused;
+        let world_name = self.worlds[idx].name.clone();
+
+        self.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
+            world_index: idx,
+            world_name,
+            pending_count,
+            paused,
+        });
+
+        // Send initial output lines based on client type
+        let client_type = self.ws_get_client_type(client_id);
+        let world = &self.worlds[idx];
+        let total_lines = world.output_lines.len();
+
+        let lines_to_send = match client_type {
+            Some(websocket::RemoteClientType::RemoteConsole) => {
+                // Console: last screenful (viewport - 2)
+                visible_lines.saturating_sub(2).min(total_lines)
+            }
+            _ => {
+                // Web/GUI: full history
+                total_lines
+            }
+        };
+
+        if lines_to_send > 0 {
+            let start = total_lines.saturating_sub(lines_to_send);
+            let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
+                .map(|line| {
+                    let ts = line.timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    TimestampedLine {
+                        text: line.text.clone(),
+                        ts,
+                        gagged: line.gagged,
+                        from_server: line.from_server,
+                        seq: line.seq,
+                        highlight_color: line.highlight_color.clone(),
+                        marked_new: line.marked_new,
+                        from_archive: line.from_archive,
+                    }
+                })
+                .collect();
+
+            self.ws_send_to_client(client_id, WsMessage::OutputLines {
+                world_index: idx,
+                lines,
+                is_initial: true,
+            });
+        }
+
+        // Also mark world as seen if it had unseen output
+        if self.worlds[idx].unseen_lines > 0 {
+            self.worlds[idx].unseen_lines = 0;
+            self.worlds[idx].first_unseen_at = None;
+            self.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
+            self.broadcast_activity();
+        }
+    }
+
     /// Activity count excluding a specific world (for per-client counts)
     fn activity_count_excluding(&self, exclude_world: Option<usize>) -> usize {
         self.worlds
@@ -8858,79 +9004,15 @@ impl App {
                 });
             }
             WsMessage::CalculateNextWorld { current_index } => {
-                // Calculate next world using shared logic
-                let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
-                    .map(|w| crate::util::WorldSwitchInfo {
-                        name: w.name.clone(),
-                        connected: w.connected,
-                        unseen_lines: w.unseen_lines,
-                        pending_lines: w.pending_lines.len(),
-                        first_unseen_at: w.first_unseen_at,
-                    })
-                    .collect();
-                let next_idx = crate::util::calculate_next_world(
-                    &world_info,
-                    current_index,
-                    self.settings.world_switch_mode,
-                );
+                let next_idx = self.calculate_next_world_from(current_index);
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
             }
             WsMessage::CalculatePrevWorld { current_index } => {
-                // Calculate prev world using shared logic
-                let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
-                    .map(|w| crate::util::WorldSwitchInfo {
-                        name: w.name.clone(),
-                        connected: w.connected,
-                        unseen_lines: w.unseen_lines,
-                        pending_lines: w.pending_lines.len(),
-                        first_unseen_at: w.first_unseen_at,
-                    })
-                    .collect();
-                let prev_idx = crate::util::calculate_prev_world(
-                    &world_info,
-                    current_index,
-                    self.settings.world_switch_mode,
-                );
+                let prev_idx = self.calculate_prev_world_from(current_index);
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
             }
             WsMessage::CalculateOldestPending { current_index } => {
-                // Find world with oldest pending output (for Escape+w)
-                // Priority: 1) oldest pending, 2) any unseen, 3) previous world
-                let mut oldest_idx: Option<usize> = None;
-                let mut oldest_time: Option<std::time::Instant> = None;
-
-                // Check for worlds with pending output
-                for (idx, world) in self.worlds.iter().enumerate() {
-                    if idx == current_index || world.pending_lines.is_empty() {
-                        continue;
-                    }
-                    if let Some(pending_time) = world.pending_since {
-                        if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
-                            oldest_time = Some(pending_time);
-                            oldest_idx = Some(idx);
-                        }
-                    }
-                }
-
-                // If no pending, check for unseen output
-                if oldest_idx.is_none() {
-                    for (idx, world) in self.worlds.iter().enumerate() {
-                        if idx != current_index && world.unseen_lines > 0 {
-                            oldest_idx = Some(idx);
-                            break;
-                        }
-                    }
-                }
-
-                // If still none, use previous world
-                if oldest_idx.is_none() {
-                    if let Some(prev_idx) = self.previous_world_index {
-                        if prev_idx != current_index && prev_idx < self.worlds.len() {
-                            oldest_idx = Some(prev_idx);
-                        }
-                    }
-                }
-
+                let oldest_idx = self.calculate_oldest_pending_world_from(current_index);
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
             }
             WsMessage::RequestState => {
@@ -9192,100 +9274,7 @@ impl App {
                 self.ws_set_client_type(client_id, client_type);
             }
             WsMessage::CycleWorld { direction } => {
-                // Client requests to cycle to next/previous world
-                let current = self.ws_client_worlds.get(&client_id)
-                    .map(|s| s.world_index)
-                    .unwrap_or(self.current_world_index);
-
-                let new_index = if direction == "up" {
-                    self.calculate_prev_world_from(current)
-                } else {
-                    self.calculate_next_world_from(current)
-                };
-
-                if let Some(idx) = new_index {
-                    // Update client's view state (sync state)
-                    let prev = self.ws_client_worlds.get(&client_id);
-                    let visible_lines = prev.map(|s| s.visible_lines).unwrap_or(24);
-                    let visible_columns = prev.map(|s| s.visible_columns).unwrap_or(0);
-                    let dimensions = prev.and_then(|s| s.dimensions);
-                    let paused = prev.map(|s| s.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState {
-                        world_index: idx,
-                        visible_lines,
-                        visible_columns,
-                        dimensions,
-                        paused,
-                    });
-                    // Update client's world in WebSocket server (async state)
-                    self.ws_set_client_world(client_id, Some(idx));
-
-                    // Send world switch result with state
-                    if idx < self.worlds.len() {
-                        let pending_count = self.worlds[idx].pending_lines.len();
-                        let paused = self.worlds[idx].paused;
-                        let world_name = self.worlds[idx].name.clone();
-
-                        self.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
-                            world_index: idx,
-                            world_name,
-                            pending_count,
-                            paused,
-                        });
-
-                        // Send initial output lines based on client type
-                        let client_type = self.ws_get_client_type(client_id);
-                        let world = &self.worlds[idx];
-                        let total_lines = world.output_lines.len();
-
-                        let lines_to_send = match client_type {
-                            Some(websocket::RemoteClientType::RemoteConsole) => {
-                                // Console: last screenful (viewport - 2)
-                                visible_lines.saturating_sub(2).min(total_lines)
-                            }
-                            _ => {
-                                // Web/GUI: full history
-                                total_lines
-                            }
-                        };
-
-                        if lines_to_send > 0 {
-                            let start = total_lines.saturating_sub(lines_to_send);
-                            let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
-                                .map(|line| {
-                                    let ts = line.timestamp
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs())
-                                        .unwrap_or(0);
-                                    TimestampedLine {
-                                        text: line.text.clone(),
-                                        ts,
-                                        gagged: line.gagged,
-                                        from_server: line.from_server,
-                                        seq: line.seq,
-                                        highlight_color: line.highlight_color.clone(),
-                                        marked_new: line.marked_new,
-                                        from_archive: line.from_archive,
-                                    }
-                                })
-                                .collect();
-
-                            self.ws_send_to_client(client_id, WsMessage::OutputLines {
-                                world_index: idx,
-                                lines,
-                                is_initial: true,
-                            });
-                        }
-
-                        // Also mark world as seen if it had unseen output
-                        if self.worlds[idx].unseen_lines > 0 {
-                            self.worlds[idx].unseen_lines = 0;
-                            self.worlds[idx].first_unseen_at = None;
-                            self.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
-                            self.broadcast_activity();
-                        }
-                    }
-                }
+                self.handle_cycle_world(client_id, &direction);
             }
             WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
                 // Console client requests scrollback from master
