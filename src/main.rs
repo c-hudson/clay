@@ -5311,6 +5311,179 @@ impl App {
         }
     }
 
+    /// `WsMessage::RequestScrollback` handling — shared by master-WS and daemon (T40).
+    /// Confirmed byte-identical between the two previous copies — pure duplication.
+    pub(crate) fn handle_request_scrollback(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>) {
+        if world_index >= self.worlds.len() {
+            return;
+        }
+        let world = &self.worlds[world_index];
+
+        // Find lines to send based on before_seq/after_seq
+        let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
+            // Send lines with seq < before_seq (older than what client has)
+            let eligible: Vec<_> = world.output_lines.iter()
+                .filter(|l| l.seq < seq)
+                .collect();
+            let start = eligible.len().saturating_sub(count);
+            eligible[start..].iter()
+                .map(|line| {
+                    let ts = line.timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    TimestampedLine {
+                        text: line.text.clone(),
+                        ts,
+                        gagged: line.gagged,
+                        from_server: line.from_server,
+                        seq: line.seq,
+                        highlight_color: line.highlight_color.clone(),
+                        marked_new: line.marked_new,
+                        from_archive: line.from_archive,
+                    }
+                })
+                .collect()
+        } else if let Some(seq) = after_seq {
+            // Reconnect gap-fill: the client kept its buffer across the reconnect and only
+            // wants lines newer than the highest seq it already has. Oldest-first (unlike
+            // before_seq's newest-first slice) so the client can append+dedup in order.
+            let eligible: Vec<_> = world.output_lines.iter()
+                .filter(|l| l.seq > seq)
+                .collect();
+            let take = count.min(eligible.len());
+            eligible[..take].iter()
+                .map(|line| {
+                    let ts = line.timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    TimestampedLine {
+                        text: line.text.clone(),
+                        ts,
+                        gagged: line.gagged,
+                        from_server: line.from_server,
+                        seq: line.seq,
+                        highlight_color: line.highlight_color.clone(),
+                        marked_new: line.marked_new,
+                        from_archive: line.from_archive,
+                    }
+                })
+                .collect()
+        } else {
+            // No before_seq/after_seq - send last N lines (backwards compatible)
+            let total_lines = world.output_lines.len();
+            let start = total_lines.saturating_sub(count);
+            world.output_lines[start..].iter()
+                .map(|line| {
+                    let ts = line.timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    TimestampedLine {
+                        text: line.text.clone(),
+                        ts,
+                        gagged: line.gagged,
+                        from_server: line.from_server,
+                        seq: line.seq,
+                        highlight_color: line.highlight_color.clone(),
+                        marked_new: line.marked_new,
+                        from_archive: line.from_archive,
+                    }
+                })
+                .collect()
+        };
+
+        // Works for both directions: before_seq slices the newest `count` eligible lines
+        // (so `lines.len() < count` means we ran out of older history); after_seq takes
+        // `count.min(eligible.len())` (so `lines.len() < count` means we returned every
+        // newer line available, i.e. the gap is fully closed).
+        let backfill_complete = lines.len() < count;
+        self.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
+            world_index,
+            lines,
+            backfill_complete,
+        });
+    }
+
+    /// `WsMessage::RequestState` handling — shared by master-WS and daemon (T40). Confirmed
+    /// byte-identical between the two previous copies. Full state resync: web/Android ping
+    /// the server on visibility change and send this when the connection looks stale.
+    pub(crate) fn handle_request_state(&mut self, client_id: u64) {
+        let initial_state = self.build_initial_state();
+        self.ws_send_initial_state_and_mark(client_id, initial_state);
+        // Set client's initial world so broadcast_to_world_viewers works immediately
+        self.ws_set_client_world(client_id, Some(self.current_world_index));
+        // Also send current activity count and pause state
+        self.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+            count: self.activity_count(),
+        });
+        let is_paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
+        if is_paused {
+            self.ws_send_to_client(client_id, WsMessage::PausedState { paused: true });
+        }
+    }
+
+    /// `WsMessage::RequestWorldState` handling — shared by master-WS and daemon (T40). Was
+    /// entirely absent from daemon's dispatch (silently fell into the catch-all - no reply,
+    /// no error), so a daemon-attached client asking for a specific world's current state
+    /// (e.g. on switching to it) got nothing back.
+    pub(crate) fn handle_request_world_state(&mut self, client_id: u64, world_index: usize) {
+        if world_index >= self.worlds.len() {
+            return;
+        }
+        let world = &self.worlds[world_index];
+        // Build recent lines from output_lines (last 100 lines for context)
+        let recent_lines: Vec<TimestampedLine> = world.output_lines
+            .iter()
+            .rev()
+            .take(100)
+            .map(|line| TimestampedLine {
+                text: line.text.clone(),
+                ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                gagged: line.gagged,
+                from_server: line.from_server,
+                seq: line.seq,
+                highlight_color: line.highlight_color.clone(),
+                marked_new: line.marked_new,
+                from_archive: line.from_archive,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let pending_count = world.pending_lines.len();
+
+        self.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
+            world_index,
+            pending_count,
+            prompt: world.prompt.clone(),
+            scroll_offset: world.scroll_offset,
+            recent_lines,
+        });
+    }
+
+    /// `WsMessage::UpdateActions` handling — shared by master-WS and daemon (T40).
+    ///
+    /// **Was entirely absent from daemon.rs** (not in the regular handler, not in the
+    /// multiuser handler) — this is the message the web/GUI/Android Action Editor's Save
+    /// button sends. Saving action changes was silently broken for every daemon-mode
+    /// deployment (standalone `-D` daemon, Android local-server mode, multiuser): the message
+    /// fell into the catch-all with no reply, no save, no broadcast.
+    pub(crate) fn handle_update_actions(&mut self, actions: Vec<Action>) {
+        // Update actions from remote client; normalize migrates any legacy single-pattern fields
+        self.settings.actions = actions.clone();
+        for action in &mut self.settings.actions {
+            action.normalize();
+        }
+        compile_all_action_regexes(&mut self.settings.actions);
+        // Save settings to persist changes
+        let _ = persistence::save_settings(self);
+        // Broadcast update to all clients
+        self.ws_broadcast(WsMessage::ActionsUpdated { actions });
+    }
+
     /// Activity count excluding a specific world (for per-client counts)
     fn activity_count_excluding(&self, exclude_world: Option<usize>) -> usize {
         self.worlds
@@ -8990,18 +9163,7 @@ impl App {
                 );
             }
             WsMessage::UpdateActions { actions } => {
-                // Update actions from remote client; normalize migrates any legacy single-pattern fields
-                self.settings.actions = actions.clone();
-                for action in &mut self.settings.actions {
-                    action.normalize();
-                }
-                compile_all_action_regexes(&mut self.settings.actions);
-                // Save settings to persist changes
-                let _ = persistence::save_settings(self);
-                // Broadcast update to all clients
-                self.ws_broadcast(WsMessage::ActionsUpdated {
-                    actions,
-                });
+                self.handle_update_actions(actions);
             }
             WsMessage::CalculateNextWorld { current_index } => {
                 let next_idx = self.calculate_next_world_from(current_index);
@@ -9016,54 +9178,10 @@ impl App {
                 self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
             }
             WsMessage::RequestState => {
-                // Client requested full state resync - send initial state
-                let initial_state = self.build_initial_state();
-                self.ws_send_initial_state_and_mark(client_id, initial_state);
-                // Set client's initial world so broadcast_to_world_viewers works immediately
-                self.ws_set_client_world(client_id, Some(self.current_world_index));
-                // Also send current activity count and pause state
-                self.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
-                    count: self.activity_count(),
-                });
-                let is_paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
-                if is_paused {
-                    self.ws_send_to_client(client_id, WsMessage::PausedState { paused: true });
-                }
+                self.handle_request_state(client_id);
             }
             WsMessage::RequestWorldState { world_index } => {
-                // Client switched to a world and needs current state
-                if world_index < self.worlds.len() {
-                    let world = &self.worlds[world_index];
-                    // Build recent lines from output_lines (last 100 lines for context)
-                    let recent_lines: Vec<TimestampedLine> = world.output_lines
-                        .iter()
-                        .rev()
-                        .take(100)
-                        .map(|line| TimestampedLine {
-                            text: line.text.clone(),
-                            ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                            gagged: line.gagged,
-                            from_server: line.from_server,
-                            seq: line.seq,
-                            highlight_color: line.highlight_color.clone(),
-                            marked_new: line.marked_new,
-                            from_archive: line.from_archive,
-                        })
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-
-                    let pending_count = world.pending_lines.len();
-
-                    self.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
-                        world_index,
-                        pending_count,
-                        prompt: world.prompt.clone(),
-                        scroll_offset: world.scroll_offset,
-                        recent_lines,
-                    });
-                }
+                self.handle_request_world_state(client_id, world_index);
             }
             WsMessage::BanListRequest => {
                 // Send current ban list to client
@@ -9277,98 +9395,7 @@ impl App {
                 self.handle_cycle_world(client_id, &direction);
             }
             WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
-                // Console client requests scrollback from master
-                if world_index < self.worlds.len() {
-                    let world = &self.worlds[world_index];
-
-                    // Find lines to send based on before_seq/after_seq
-                    let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
-                        // Send lines with seq < before_seq (older than what client has)
-                        let eligible: Vec<_> = world.output_lines.iter()
-                            .filter(|l| l.seq < seq)
-                            .collect();
-                        let start = eligible.len().saturating_sub(count);
-                        eligible[start..].iter()
-                            .map(|line| {
-                                let ts = line.timestamp
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                TimestampedLine {
-                                    text: line.text.clone(),
-                                    ts,
-                                    gagged: line.gagged,
-                                    from_server: line.from_server,
-                                    seq: line.seq,
-                                    highlight_color: line.highlight_color.clone(),
-                                    marked_new: line.marked_new,
-                                    from_archive: line.from_archive,
-                                }
-                            })
-                            .collect()
-                    } else if let Some(seq) = after_seq {
-                        // Reconnect gap-fill: the client kept its buffer across the
-                        // reconnect and only wants lines newer than the highest seq it
-                        // already has. Oldest-first (unlike before_seq's newest-first
-                        // slice) so the client can append+dedup in order.
-                        let eligible: Vec<_> = world.output_lines.iter()
-                            .filter(|l| l.seq > seq)
-                            .collect();
-                        let take = count.min(eligible.len());
-                        eligible[..take].iter()
-                            .map(|line| {
-                                let ts = line.timestamp
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                TimestampedLine {
-                                    text: line.text.clone(),
-                                    ts,
-                                    gagged: line.gagged,
-                                    from_server: line.from_server,
-                                    seq: line.seq,
-                                    highlight_color: line.highlight_color.clone(),
-                                    marked_new: line.marked_new,
-                                    from_archive: line.from_archive,
-                                }
-                            })
-                            .collect()
-                    } else {
-                        // No before_seq/after_seq - send last N lines (backwards compatible)
-                        let total_lines = world.output_lines.len();
-                        let start = total_lines.saturating_sub(count);
-                        world.output_lines[start..].iter()
-                            .map(|line| {
-                                let ts = line.timestamp
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                TimestampedLine {
-                                    text: line.text.clone(),
-                                    ts,
-                                    gagged: line.gagged,
-                                    from_server: line.from_server,
-                                    seq: line.seq,
-                                    highlight_color: line.highlight_color.clone(),
-                                    marked_new: line.marked_new,
-                                    from_archive: line.from_archive,
-                                }
-                            })
-                            .collect()
-                    };
-
-                    // Works for both directions: before_seq slices the newest `count`
-                    // eligible lines (so `lines.len() < count` means we ran out of
-                    // older history); after_seq takes `count.min(eligible.len())` (so
-                    // `lines.len() < count` means we returned every newer line
-                    // available, i.e. the gap is fully closed).
-                    let backfill_complete = lines.len() < count;
-                    self.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
-                        world_index,
-                        lines,
-                        backfill_complete,
-                    });
-                }
+                self.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq);
             }
             WsMessage::ToggleWorldGmcp { world_index } => {
                 if world_index < self.worlds.len() {

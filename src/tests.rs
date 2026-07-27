@@ -5281,3 +5281,35 @@ if you're more curious.\"";
         assert_eq!(result, None);
     }
 
+    // --- App::handle_update_actions ---
+    // Pins the most severe finding of the whole audit (T40): this message was entirely absent
+    // from daemon.rs, in both the regular and multiuser handlers - saving action-editor
+    // changes was silently broken for every daemon-mode deployment.
+
+    #[test]
+    fn test_handle_update_actions_saves_and_normalizes() {
+        let mut app = App::new();
+        app.settings.actions.clear();
+        let action = Action { name: "greet".to_string(), command: "say hi".to_string(), ..Action::default() };
+
+        app.handle_update_actions(vec![action]);
+
+        assert_eq!(app.settings.actions.len(), 1);
+        assert_eq!(app.settings.actions[0].name, "greet");
+        assert_eq!(app.settings.actions[0].command, "say hi");
+    }
+
+    #[test]
+    fn test_handle_update_actions_replaces_existing_list() {
+        let mut app = App::new();
+        app.settings.actions = vec![
+            Action { name: "old1".to_string(), ..Action::default() },
+            Action { name: "old2".to_string(), ..Action::default() },
+        ];
+
+        app.handle_update_actions(vec![Action { name: "new".to_string(), ..Action::default() }]);
+
+        assert_eq!(app.settings.actions.len(), 1);
+        assert_eq!(app.settings.actions[0].name, "new");
+    }
+

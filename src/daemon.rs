@@ -1287,6 +1287,58 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
             }
         }
+        // Was entirely absent from this handler (T40) - a daemon-mode client that hit a TLS
+        // pin mismatch had no way to trust the new certificate and reconnect; the "Trust new
+        // certificate" button in the cert-mismatch dialog silently did nothing. Re-pin, then
+        // reconnect using the same inline pattern ConnectWorld above uses (daemon.rs doesn't
+        // have a shared "connect this world" helper to call here - see Phase C's ConnectWorld
+        // consolidation note for that separate, larger duplication).
+        WsMessage::TrustCertificate { world_index, host, new_fingerprint } => {
+            if world_index < app.worlds.len() {
+                persistence::replace_pin(&host, &new_fingerprint);
+                app.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: format!("Trusting new certificate for {}, reconnecting...\n", host),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                    seq: 0,
+                    marked_new: false,
+                    flush: false, gagged: false,
+                });
+                if !app.worlds[world_index].connected {
+                    let settings = app.worlds[world_index].settings.clone();
+                    let world_name = app.worlds[world_index].name.clone();
+                    app.worlds[world_index].connection_id += 1;
+                    let skip_login = app.worlds[world_index].skip_auto_login;
+                    if let Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) = connect_daemon_world(
+                        world_index,
+                        world_name.clone(),
+                        &settings,
+                        event_tx.clone(),
+                        app.worlds[world_index].connection_id,
+                        skip_login,
+                        app.settings.tls_proxy_enabled,
+                    ).await {
+                        app.worlds[world_index].connected = true;
+                        app.worlds[world_index].command_tx = Some(cmd_tx);
+                        app.worlds[world_index].was_connected = true;
+                        app.worlds[world_index].skip_auto_login = false;
+                        app.worlds[world_index].socket_fd = socket_fd;
+                        app.worlds[world_index].is_tls = is_tls;
+                        app.worlds[world_index].proxy_pid = proxy_pid;
+                        app.worlds[world_index].proxy_socket_path = proxy_socket_path;
+                        let now = std::time::Instant::now();
+                        app.worlds[world_index].last_send_time = Some(now);
+                        app.worlds[world_index].last_receive_time = Some(now);
+                        app.ws_broadcast(WsMessage::WorldConnected { world_index, name: world_name });
+                    } else {
+                        app.worlds[world_index].skip_auto_login = false;
+                        app.emit_client_text(world_index, "Connection failed.", true);
+                    }
+                }
+            }
+        }
         WsMessage::SwitchWorld { world_index } => {
             if world_index < app.worlds.len() {
                 app.current_world_index = world_index;
@@ -1334,6 +1386,128 @@ pub async fn handle_daemon_ws_message(
                 }
             }
         }
+        // Theme editor, keybind editor, and action editor state messages were entirely absent
+        // from this handler (T40) - opening any of these editors from a daemon-attached
+        // client showed no data, and Save/Add/Delete actions silently did nothing.
+        WsMessage::RequestThemeEditorState => {
+            let themes_json = app.theme_file.to_json_all();
+            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+            let active_theme = app.settings.gui_theme.name().to_string();
+            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                themes_json,
+                theme_names,
+                active_theme,
+            });
+        }
+        WsMessage::UpdateThemeColors { theme_name, colors_json } => {
+            let base = if theme_name == "light" {
+                theme::ThemeColors::light_default()
+            } else {
+                theme::ThemeColors::dark_default()
+            };
+            let colors = theme::ThemeColors::from_json(&colors_json, &base);
+            app.theme_file.set_theme(&theme_name, colors);
+            // If updated theme is the active GUI theme, broadcast CSS vars update
+            if theme_name == app.settings.gui_theme.name() {
+                let css_vars = app.gui_theme_colors().to_css_vars();
+                let colors_json = app.gui_theme_colors().to_json();
+                app.ws_broadcast(WsMessage::ThemeCssVarsUpdated {
+                    css_vars,
+                    colors_json: colors_json.clone(),
+                });
+                // Also broadcast GlobalSettingsUpdated for GUI clients
+                let settings_msg = app.build_global_settings_msg();
+                app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                    settings: settings_msg,
+                    input_height: app.input_height,
+                });
+            }
+        }
+        WsMessage::AddTheme { name, copy_from } => {
+            let base_colors = app.theme_file.get(&copy_from).clone();
+            app.theme_file.set_theme(&name, base_colors);
+            let themes_json = app.theme_file.to_json_all();
+            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+            let active_theme = app.settings.gui_theme.name().to_string();
+            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                themes_json,
+                theme_names,
+                active_theme,
+            });
+        }
+        WsMessage::DeleteTheme { name } => {
+            app.theme_file.remove_theme(&name);
+            let themes_json = app.theme_file.to_json_all();
+            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+            let active_theme = app.settings.gui_theme.name().to_string();
+            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                themes_json,
+                theme_names,
+                active_theme,
+            });
+        }
+        WsMessage::SaveThemeFile => {
+            let content = app.theme_file.generate_file_content();
+            let path = clay_config_path("theme.dat");
+            match std::fs::write(&path, &content) {
+                Ok(_) => {
+                    app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: true, error: None });
+                }
+                Err(e) => {
+                    app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: false, error: Some(e.to_string()) });
+                }
+            }
+        }
+        WsMessage::RequestActionEditorState => {
+            let actions_json = serde_json::to_string(&app.settings.actions).unwrap_or_default();
+            let world_names: Vec<&str> = app.worlds.iter().map(|w| w.name.as_str()).collect();
+            let world_names_json = serde_json::to_string(&world_names).unwrap_or_default();
+            app.ws_send_to_client(client_id, WsMessage::ActionEditorState {
+                actions_json,
+                world_names_json,
+            });
+        }
+        WsMessage::RequestKeybindEditorState => {
+            let bindings_json = app.keybindings.to_json();
+            let defaults_json = keybindings::KeyBindings::tf_defaults().to_json();
+            let actions_json = keybindings::KeyBindings::actions_json();
+            app.ws_send_to_client(client_id, WsMessage::KeybindEditorState {
+                bindings_json,
+                defaults_json,
+                actions_json,
+            });
+        }
+        WsMessage::UpdateKeybindEditorBindings { bindings_json } => {
+            app.keybindings = keybindings::KeyBindings::from_json(&bindings_json);
+            app.ws_broadcast(WsMessage::KeybindingsUpdated {
+                bindings_json: app.keybindings.to_json(),
+            });
+        }
+        WsMessage::SaveKeybindFile => {
+            let path = clay_config_path("keybindings.dat");
+            match app.keybindings.save(&path) {
+                Ok(_) => {
+                    app.ws_send_to_client(client_id, WsMessage::KeybindFileSaved { success: true, error: None });
+                }
+                Err(e) => {
+                    app.ws_send_to_client(client_id, WsMessage::KeybindFileSaved { success: false, error: Some(e.to_string()) });
+                }
+            }
+        }
+        WsMessage::ResetKeybindDefaults => {
+            app.keybindings = keybindings::KeyBindings::tf_defaults();
+            let bindings_json = app.keybindings.to_json();
+            let defaults_json = keybindings::KeyBindings::tf_defaults().to_json();
+            let actions_json = keybindings::KeyBindings::actions_json();
+            app.ws_send_to_client(client_id, WsMessage::KeybindEditorState {
+                bindings_json,
+                defaults_json,
+                actions_json,
+            });
+            app.ws_broadcast(WsMessage::KeybindingsUpdated {
+                bindings_json: app.keybindings.to_json(),
+            });
+        }
         WsMessage::RequestConnectionsList => {
             let current_idx = app.current_world_index;
             const KEEPALIVE_SECS: u64 = 5 * 60;
@@ -1362,6 +1536,34 @@ pub async fn handle_daemon_ws_message(
             let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
             app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
         }
+        // Were entirely absent from this handler (T40) - a daemon-attached client could
+        // never view or manage the ban list (the request just silently fell into the
+        // catch-all, no reply).
+        WsMessage::BanListRequest => {
+            let bans = app.ban_list.get_ban_info();
+            app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+        }
+        WsMessage::UnbanRequest { host } => {
+            if app.ban_list.remove_ban(&host) {
+                let _ = persistence::save_settings(app);
+                app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+                app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+            } else {
+                app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+            }
+        }
+        // Was entirely absent from this handler (T40) - a /remote liveness check
+        // (spawn_remote_ping_check) against a daemon-attached client would always time out,
+        // since the client's PongCheck reply had nowhere to land.
+        WsMessage::PongCheck { nonce } => {
+            if nonce == app.remote_ping_nonce {
+                if let Some(ref responses) = app.remote_ping_responses {
+                    if let Ok(mut set) = responses.lock() {
+                        set.insert(client_id);
+                    }
+                }
+            }
+        }
         WsMessage::Ping => {
             app.ws_send_to_client(client_id, WsMessage::Pong);
         }
@@ -1372,6 +1574,18 @@ pub async fn handle_daemon_ws_message(
                 let vc = visible_columns.unwrap_or_else(|| app.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
                 let paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
                 app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused });
+            }
+        }
+        // Was entirely absent from this handler (T40) - a daemon-attached client reporting its
+        // output dimensions (for NAWS) got no response, so NAWS updates never propagated to
+        // the MUD server for daemon-attached clients.
+        WsMessage::UpdateDimensions { width, height } => {
+            if let Some(state) = app.ws_client_worlds.get_mut(&client_id) {
+                let old_dims = state.dimensions;
+                state.dimensions = Some((width, height));
+                if old_dims != Some((width, height)) {
+                    app.send_naws_to_all_worlds();
+                }
             }
         }
         WsMessage::MarkWorldSeen { world_index } => {
@@ -1415,98 +1629,13 @@ pub async fn handle_daemon_ws_message(
             app.handle_cycle_world(client_id, &direction);
         }
         WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
-            // Console client requests scrollback from master
-            if world_index < app.worlds.len() {
-                let world = &app.worlds[world_index];
-
-                // Find lines to send based on before_seq/after_seq
-                let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
-                    // Send lines with seq < before_seq (older than what client has)
-                    let eligible: Vec<_> = world.output_lines.iter()
-                        .filter(|l| l.seq < seq)
-                        .collect();
-                    let start = eligible.len().saturating_sub(count);
-                    eligible[start..].iter()
-                        .map(|line| {
-                            let ts = line.timestamp
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            TimestampedLine {
-                                text: line.text.clone(),
-                                ts,
-                                gagged: line.gagged,
-                                from_server: line.from_server,
-                                seq: line.seq,
-                                highlight_color: line.highlight_color.clone(),
-                                marked_new: line.marked_new,
-                                from_archive: line.from_archive,
-                            }
-                        })
-                        .collect()
-                } else if let Some(seq) = after_seq {
-                    // Reconnect gap-fill: the client kept its buffer across the
-                    // reconnect and only wants lines newer than the highest seq it
-                    // already has. Oldest-first (unlike before_seq's newest-first
-                    // slice) so the client can append+dedup in order.
-                    let eligible: Vec<_> = world.output_lines.iter()
-                        .filter(|l| l.seq > seq)
-                        .collect();
-                    let take = count.min(eligible.len());
-                    eligible[..take].iter()
-                        .map(|line| {
-                            let ts = line.timestamp
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            TimestampedLine {
-                                text: line.text.clone(),
-                                ts,
-                                gagged: line.gagged,
-                                from_server: line.from_server,
-                                seq: line.seq,
-                                highlight_color: line.highlight_color.clone(),
-                                marked_new: line.marked_new,
-                                from_archive: line.from_archive,
-                            }
-                        })
-                        .collect()
-                } else {
-                    // No before_seq/after_seq - send last N lines (backwards compatible)
-                    let total_lines = world.output_lines.len();
-                    let start = total_lines.saturating_sub(count);
-                    world.output_lines[start..].iter()
-                        .map(|line| {
-                            let ts = line.timestamp
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            TimestampedLine {
-                                text: line.text.clone(),
-                                ts,
-                                gagged: line.gagged,
-                                from_server: line.from_server,
-                                seq: line.seq,
-                                highlight_color: line.highlight_color.clone(),
-                                marked_new: line.marked_new,
-                                from_archive: line.from_archive,
-                            }
-                        })
-                        .collect()
-                };
-
-                // Works for both directions: before_seq slices the newest `count`
-                // eligible lines (so `lines.len() < count` means we ran out of older
-                // history); after_seq takes `count.min(eligible.len())` (so
-                // `lines.len() < count` means we returned every newer line available,
-                // i.e. the gap is fully closed).
-                let backfill_complete = lines.len() < count;
-                app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
-                    world_index,
-                    lines,
-                    backfill_complete,
-                });
-            }
+            app.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq);
+        }
+        WsMessage::RequestWorldState { world_index } => {
+            app.handle_request_world_state(client_id, world_index);
+        }
+        WsMessage::UpdateActions { actions } => {
+            app.handle_update_actions(actions);
         }
         WsMessage::CreateWorld { name } => {
             app.create_world(client_id, &name);
@@ -1547,27 +1676,13 @@ pub async fn handle_daemon_ws_message(
         WsMessage::ImportSettings { addr, password, auth_key, allow_insecure } => {
             spawn_import_settings(event_tx.clone(), client_id, addr, password, auth_key, allow_insecure);
         }
-        // Full state resync — mirrors the handler in main.rs's App::handle_ws_message
-        // (WsMessage::RequestState). Needed here too since --local-server (Android
-        // on-device mode) and -D (run_daemon_server) both dispatch through this function
-        // instead of main.rs's. Without this arm the message silently fell into the
-        // catch-all below: no reply, no error — the exact same class of bug as the
-        // /import handlers above, this time affecting reconnect/wake-from-background
-        // resync (web/Android ping the server on visibility change and call RequestState
-        // when the connection looks stale).
+        // Full state resync. Needed here too since --local-server (Android on-device mode)
+        // and -D (run_daemon_server) both dispatch through this function instead of
+        // main.rs's - without an arm here the message silently falls into the catch-all
+        // below: no reply, no error (web/Android ping the server on visibility change and
+        // call RequestState when the connection looks stale).
         WsMessage::RequestState => {
-            let initial_state = app.build_initial_state();
-            app.ws_send_initial_state_and_mark(client_id, initial_state);
-            // Set client's initial world so broadcast_to_world_viewers works immediately
-            app.ws_set_client_world(client_id, Some(app.current_world_index));
-            // Also send current activity count and pause state
-            app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
-                count: app.activity_count(),
-            });
-            let is_paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
-            if is_paused {
-                app.ws_send_to_client(client_id, WsMessage::PausedState { paused: true });
-            }
+            app.handle_request_state(client_id);
         }
         _ => {}
     }
