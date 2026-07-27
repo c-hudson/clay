@@ -1224,8 +1224,11 @@
         const path = window.location.pathname || '/';
         const segments = path.split('/').filter(Boolean);
         if (segments.length === 0) return '';
+        // Mirrors http.rs's KNOWN_ASSET_PATHS (source of truth for the legacy/stealth
+        // path split) - keep in sync or a client using this to derive its own asset
+        // base path can mis-derive the stealth prefix for a path it doesn't recognize.
         const knownLegacyRoots = ['index.html', 'style.css', 'app.js', 'theme-editor',
-            'keybind-editor', 'action-editor', 'favicon.ico', 'fonts'];
+            'keybind-editor', 'action-editor', 'favicon.ico', 'clay2.png', 'fonts'];
         return knownLegacyRoots.indexOf(segments[0]) === -1 ? '/' + segments[0] : '';
     }
 
