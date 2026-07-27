@@ -1785,104 +1785,16 @@ pub async fn handle_daemon_ws_message(
             }
         }
         WsMessage::CreateWorld { name } => {
-            let new_world = World::new(&name);
-            app.worlds.push(new_world);
-            let idx = app.worlds.len() - 1;
-            let world = &app.worlds[idx];
-            let world_state = WorldStateMsg {
-                index: idx,
-                name: world.name.clone(),
-                connected: false,
-                output_lines: Vec::new(),
-                pending_lines: Vec::new(),
-                output_lines_ts: Vec::new(),
-                pending_lines_ts: Vec::new(),
-                prompt: String::new(),
-                scroll_offset: 0,
-                paused: false,
-                unseen_lines: 0,
-                settings: WorldSettingsMsg {
-                    hostname: world.settings.hostname.clone(),
-                    port: world.settings.port.clone(),
-                    user: world.settings.user.clone(),
-                    password: String::new(),
-                    has_password: !world.settings.password.is_empty(),
-                    use_ssl: world.settings.use_ssl,
-                    log_enabled: world.settings.log_enabled,
-                    encoding: world.settings.encoding.name().to_string(),
-                    auto_connect_type: world.settings.auto_connect_type.name().to_string(),
-                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                    keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
-                    gmcp_packages: world.settings.gmcp_packages.clone(),
-                    auto_reconnect_secs: world.settings.auto_reconnect_display(),
-                },
-                last_send_secs: None,
-                last_recv_secs: None,
-                last_nop_secs: None,
-                keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                showing_splash: world.showing_splash,
-                was_connected: false,
-                is_proxy: false,
-                gmcp_user_enabled: world.gmcp_user_enabled,
-                total_output_lines: 0,
-                pending_count: 0,
-            };
-            app.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
-            let _ = persistence::save_settings(app);
-            app.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
+            app.create_world(client_id, &name);
         }
         WsMessage::DeleteWorld { world_index } => {
-            if app.worlds.len() > 1 && world_index < app.worlds.len() {
-                app.worlds.remove(world_index);
-                if app.current_world_index >= app.worlds.len() {
-                    app.current_world_index = app.worlds.len().saturating_sub(1);
-                } else if app.current_world_index > world_index {
-                    app.current_world_index -= 1;
-                }
-                if let Some(prev) = app.previous_world_index {
-                    if prev >= app.worlds.len() {
-                        app.previous_world_index = Some(app.worlds.len().saturating_sub(1));
-                    } else if prev > world_index {
-                        app.previous_world_index = Some(prev - 1);
-                    }
-                }
-                app.ws_broadcast(WsMessage::WorldRemoved { world_index });
-                let _ = persistence::save_settings(app);
-            }
+            app.delete_world(world_index);
         }
         WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs } => {
-            if world_index < app.worlds.len() {
-                app.worlds[world_index].name = name.clone();
-                app.worlds[world_index].settings.hostname = hostname.clone();
-                app.worlds[world_index].settings.port = port.clone();
-                app.worlds[world_index].settings.user = user.clone();
-                app.worlds[world_index].settings.password = password.clone();
-                app.worlds[world_index].settings.use_ssl = use_ssl;
-                app.worlds[world_index].settings.log_enabled = log_enabled;
-                app.worlds[world_index].settings.encoding = match encoding.as_str() {
-                    "latin1" => Encoding::Latin1,
-                    "fansi" => Encoding::Fansi,
-                    _ => Encoding::Utf8,
-                };
-                app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
-                app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
-                app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
-                app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
-                let (ar_secs, ar_on_web) = crate::WorldSettings::parse_auto_reconnect(&auto_reconnect_secs);
-                app.worlds[world_index].settings.auto_reconnect_secs = ar_secs;
-                app.worlds[world_index].settings.auto_reconnect_on_web = ar_on_web;
-                let _ = persistence::save_settings(app);
-                let settings_msg = WorldSettingsMsg {
-                    hostname, port, user,
-                    has_password: !password.is_empty(),
-                    password: String::new(),
-                    use_ssl, log_enabled, encoding,
-                    auto_connect_type: auto_login,
-                    keep_alive_type, keep_alive_cmd, gmcp_packages,
-                    auto_reconnect_secs,
-                };
-                app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
-            }
+            app.update_world_settings(
+                world_index, name, hostname, port, user, password, use_ssl, log_enabled,
+                encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
+            );
         }
         WsMessage::CalculateNextWorld { current_index } => {
             let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()

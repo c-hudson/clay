@@ -5052,3 +5052,62 @@ if you're more curious.\"";
         assert!(app.tf_engine.processes.is_empty());
     }
 
+    // --- App::update_world_settings ---
+    // Pins the password-guard fix (T36): daemon's inline copy used to unconditionally
+    // overwrite the stored password with whatever the client sent, silently wiping it on any
+    // settings save where the incoming password was empty or an "ENC:" placeholder.
+
+    #[test]
+    fn test_update_world_settings_empty_password_does_not_wipe_stored_password() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].settings.password = "hunter2".to_string();
+
+        app.update_world_settings(
+            0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
+            "myuser".to_string(), String::new(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(),
+        );
+
+        assert_eq!(app.worlds[0].settings.password, "hunter2",
+            "an empty incoming password must be treated as 'field not touched', not 'clear it'");
+    }
+
+    #[test]
+    fn test_update_world_settings_enc_placeholder_does_not_wipe_stored_password() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].settings.password = "hunter2".to_string();
+
+        app.update_world_settings(
+            0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
+            "myuser".to_string(), "ENC:whatever".to_string(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(),
+        );
+
+        assert_eq!(app.worlds[0].settings.password, "hunter2",
+            "an 'ENC:' placeholder must be treated as 'field not touched', not a new password");
+    }
+
+    #[test]
+    fn test_update_world_settings_nonempty_plaintext_password_does_update() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].settings.password = "hunter2".to_string();
+
+        app.update_world_settings(
+            0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
+            "myuser".to_string(), "newpassword".to_string(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(),
+        );
+
+        assert_eq!(app.worlds[0].settings.password, "newpassword",
+            "a real plaintext password must still update normally");
+    }
+

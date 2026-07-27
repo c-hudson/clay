@@ -5530,6 +5530,159 @@ impl App {
         self.tf_engine.processes.push(process);
     }
 
+    /// `WsMessage::CreateWorld` handling — shared by master-WS and daemon (T36). Creates a new
+    /// world, broadcasts `WorldAdded` to all clients, and tells the requesting client its new
+    /// index via `WorldCreated`.
+    pub(crate) fn create_world(&mut self, client_id: u64, name: &str) {
+        let new_world = World::new(name);
+        self.worlds.push(new_world);
+        let idx = self.worlds.len() - 1;
+        let world = &self.worlds[idx];
+        let world_state = WorldStateMsg {
+            index: idx,
+            name: world.name.clone(),
+            connected: false,
+            output_lines: Vec::new(),
+            pending_lines: Vec::new(),
+            output_lines_ts: Vec::new(),
+            pending_lines_ts: Vec::new(),
+            prompt: String::new(),
+            scroll_offset: 0,
+            paused: false,
+            unseen_lines: 0,
+            settings: WorldSettingsMsg {
+                hostname: world.settings.hostname.clone(),
+                port: world.settings.port.clone(),
+                user: world.settings.user.clone(),
+                password: {
+                    let p = persistence::decrypt_password(&world.settings.password);
+                    if p.starts_with("ENC:") { String::new() } else { p }
+                },
+                has_password: !world.settings.password.is_empty(),
+                use_ssl: world.settings.use_ssl,
+                log_enabled: world.settings.log_enabled,
+                encoding: world.settings.encoding.name().to_string(),
+                auto_connect_type: world.settings.auto_connect_type.name().to_string(),
+                keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                gmcp_packages: world.settings.gmcp_packages.clone(),
+                auto_reconnect_secs: world.settings.auto_reconnect_display(),
+            },
+            last_send_secs: None,
+            last_recv_secs: None,
+            last_nop_secs: None,
+            keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+            showing_splash: world.showing_splash,
+            was_connected: false,
+            is_proxy: false,
+            gmcp_user_enabled: world.gmcp_user_enabled,
+            total_output_lines: 0,
+            pending_count: 0,
+        };
+        self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
+        let _ = persistence::save_settings(self);
+        self.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
+    }
+
+    /// `WsMessage::DeleteWorld` handling — shared by master-WS and daemon (T36). Never deletes
+    /// the last remaining world. No text feedback is sent: `WorldRemoved` is a structural
+    /// broadcast every client already reacts to on its own. A prior master-WS-only
+    /// `add_output()` call here was actually a bug, not a missing feature elsewhere — it
+    /// targeted `current_world_index` (the local console's own view), unrelated to whichever
+    /// world was actually deleted, so it could misattribute the message to the wrong world or
+    /// even the wrong client's session.
+    pub(crate) fn delete_world(&mut self, world_index: usize) {
+        if self.worlds.len() <= 1 || world_index >= self.worlds.len() {
+            return;
+        }
+        self.worlds.remove(world_index);
+        if self.current_world_index >= self.worlds.len() {
+            self.current_world_index = self.worlds.len().saturating_sub(1);
+        } else if self.current_world_index > world_index {
+            self.current_world_index -= 1;
+        }
+        if let Some(prev) = self.previous_world_index {
+            if prev >= self.worlds.len() {
+                self.previous_world_index = Some(self.worlds.len().saturating_sub(1));
+            } else if prev > world_index {
+                self.previous_world_index = Some(prev - 1);
+            }
+        }
+        self.ws_broadcast(WsMessage::WorldRemoved { world_index });
+        let _ = persistence::save_settings(self);
+    }
+
+    /// `WsMessage::UpdateWorldSettings` handling — shared by master-WS and daemon (T36).
+    ///
+    /// The password guard below is load-bearing, not defensive boilerplate: daemon's inline
+    /// copy used to unconditionally overwrite the stored password with whatever the client
+    /// sent, including an empty string or the "ENC:" placeholder clients echo back when the
+    /// password field was never touched in the editor — silently wiping a saved password on
+    /// any settings save that didn't include a fresh plaintext one. `has_password` in the
+    /// broadcast reply is likewise computed from the world's actual post-update stored
+    /// password, not the (possibly empty/placeholder) incoming field, per CLAUDE.md's
+    /// "has_password mirrors whether the password is non-empty" contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_world_settings(
+        &mut self,
+        world_index: usize,
+        name: String,
+        hostname: String,
+        port: String,
+        user: String,
+        password: String,
+        use_ssl: bool,
+        log_enabled: bool,
+        encoding: String,
+        auto_login: String,
+        keep_alive_type: String,
+        keep_alive_cmd: String,
+        gmcp_packages: String,
+        auto_reconnect_secs: String,
+    ) {
+        if world_index >= self.worlds.len() {
+            return;
+        }
+        self.worlds[world_index].name = name.clone();
+        self.worlds[world_index].settings.hostname = hostname.clone();
+        self.worlds[world_index].settings.port = port.clone();
+        self.worlds[world_index].settings.user = user.clone();
+        // Only update the password if the client sent a non-empty plaintext value - an empty
+        // string or an "ENC:" placeholder means the password field wasn't touched.
+        if !password.is_empty() && !password.starts_with("ENC:") {
+            self.worlds[world_index].settings.password = password;
+        }
+        self.worlds[world_index].settings.use_ssl = use_ssl;
+        self.worlds[world_index].settings.log_enabled = log_enabled;
+        self.worlds[world_index].settings.encoding = match encoding.as_str() {
+            "latin1" => Encoding::Latin1,
+            "fansi" => Encoding::Fansi,
+            _ => Encoding::Utf8,
+        };
+        self.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
+        self.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
+        self.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
+        self.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
+        let (ar_secs, ar_on_web) = WorldSettings::parse_auto_reconnect(&auto_reconnect_secs);
+        self.worlds[world_index].settings.auto_reconnect_secs = ar_secs;
+        self.worlds[world_index].settings.auto_reconnect_on_web = ar_on_web;
+        if ar_secs == 0 {
+            self.worlds[world_index].reconnect_at = None;
+        }
+        let _ = persistence::save_settings(self);
+        let has_password = !self.worlds[world_index].settings.password.is_empty();
+        let settings_msg = WorldSettingsMsg {
+            hostname, port, user,
+            has_password,
+            password: String::new(),
+            use_ssl, log_enabled, encoding,
+            auto_connect_type: auto_login,
+            keep_alive_type, keep_alive_cmd, gmcp_packages,
+            auto_reconnect_secs,
+        };
+        self.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
+    }
+
     /// `TfCommandResult::SendToMud(text)` handling for sites that don't need any bookkeeping
     /// beyond the send itself (fire-and-forget, e.g. GMCP/MSDP hook results, or action-trigger
     /// execution where a caller-side loop already owns any batching). Bounds-checked via
@@ -8275,81 +8428,10 @@ impl App {
                 }
             }
             WsMessage::CreateWorld { name } => {
-                // Create new world and broadcast to all clients
-                let new_world = World::new(&name);
-                self.worlds.push(new_world);
-                let idx = self.worlds.len() - 1;
-                let world = &self.worlds[idx];
-                let world_state = WorldStateMsg {
-                    index: idx,
-                    name: world.name.clone(),
-                    connected: false,
-                    output_lines: Vec::new(),
-                    pending_lines: Vec::new(),
-                    output_lines_ts: Vec::new(),
-                    pending_lines_ts: Vec::new(),
-                    prompt: String::new(),
-                    scroll_offset: 0,
-                    paused: false,
-                    unseen_lines: 0,
-                    settings: WorldSettingsMsg {
-                        hostname: world.settings.hostname.clone(),
-                        port: world.settings.port.clone(),
-                        user: world.settings.user.clone(),
-                        password: {
-                            let p = persistence::decrypt_password(&world.settings.password);
-                            if p.starts_with("ENC:") { String::new() } else { p }
-                        },
-                        has_password: !world.settings.password.is_empty(),
-                        use_ssl: world.settings.use_ssl,
-                        log_enabled: world.settings.log_enabled,
-                        encoding: world.settings.encoding.name().to_string(),
-                        auto_connect_type: world.settings.auto_connect_type.name().to_string(),
-                        keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                        keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
-                        gmcp_packages: world.settings.gmcp_packages.clone(),
-                        auto_reconnect_secs: world.settings.auto_reconnect_display(),
-                    },
-                    last_send_secs: None,
-                    last_recv_secs: None,
-                    last_nop_secs: None,
-                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                    showing_splash: world.showing_splash,
-                    was_connected: false,
-                    is_proxy: false,
-                    gmcp_user_enabled: world.gmcp_user_enabled,
-                    total_output_lines: 0,
-                    pending_count: 0,
-                };
-                self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
-                let _ = persistence::save_settings(self);
-                // Send the new world's index back to the requesting client
-                self.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
+                self.create_world(client_id, &name);
             }
             WsMessage::DeleteWorld { world_index } => {
-                // Delete specified world (if not the last one)
-                if self.worlds.len() > 1 && world_index < self.worlds.len() {
-                    let deleted_name = self.worlds[world_index].name.clone();
-                    self.worlds.remove(world_index);
-                    // Adjust current_world_index if needed
-                    if self.current_world_index >= self.worlds.len() {
-                        self.current_world_index = self.worlds.len().saturating_sub(1);
-                    } else if self.current_world_index > world_index {
-                        self.current_world_index -= 1;
-                    }
-                    // Adjust previous_world_index if needed
-                    if let Some(prev) = self.previous_world_index {
-                        if prev >= self.worlds.len() {
-                            self.previous_world_index = Some(self.worlds.len().saturating_sub(1));
-                        } else if prev > world_index {
-                            self.previous_world_index = Some(prev - 1);
-                        }
-                    }
-                    self.add_output(&format!("World '{}' deleted.\n", deleted_name));
-                    // Broadcast WorldRemoved to all clients
-                    self.ws_broadcast(WsMessage::WorldRemoved { world_index });
-                    let _ = persistence::save_settings(self);
-                }
+                self.delete_world(world_index);
             }
             WsMessage::MarkWorldSeen { world_index } => {
                 // A remote client has viewed this world - update their current_world
@@ -8499,58 +8581,10 @@ impl App {
                 }
             }
             WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs } => {
-                // Update world settings from remote client
-                if world_index < self.worlds.len() {
-                    self.worlds[world_index].name = name.clone();
-                    self.worlds[world_index].settings.hostname = hostname.clone();
-                    self.worlds[world_index].settings.port = port.clone();
-                    self.worlds[world_index].settings.user = user.clone();
-                    // Only update password if client sent a non-empty plaintext value
-                    if !password.is_empty() && !password.starts_with("ENC:") {
-                        self.worlds[world_index].settings.password = password.clone();
-                    }
-                    self.worlds[world_index].settings.use_ssl = use_ssl;
-                    self.worlds[world_index].settings.log_enabled = log_enabled;
-                    self.worlds[world_index].settings.encoding = match encoding.as_str() {
-                        "latin1" => Encoding::Latin1,
-                        "fansi" => Encoding::Fansi,
-                        _ => Encoding::Utf8,
-                    };
-                    self.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
-                    self.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
-                    self.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
-                    self.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
-                    let (ar_secs, ar_on_web) = WorldSettings::parse_auto_reconnect(&auto_reconnect_secs);
-                    self.worlds[world_index].settings.auto_reconnect_secs = ar_secs;
-                    self.worlds[world_index].settings.auto_reconnect_on_web = ar_on_web;
-                    if ar_secs == 0 {
-                        self.worlds[world_index].reconnect_at = None;
-                    }
-                    // Save settings to persist changes
-                    let _ = persistence::save_settings(self);
-                    // Build settings message for broadcast (don't leak password)
-                    let settings_msg = WorldSettingsMsg {
-                        hostname,
-                        port,
-                        user,
-                        has_password: !password.is_empty(),
-                        password: String::new(),
-                        use_ssl,
-                        log_enabled,
-                        encoding,
-                        auto_connect_type: auto_login,
-                        keep_alive_type,
-                        keep_alive_cmd,
-                        gmcp_packages,
-                        auto_reconnect_secs,
-                    };
-                    // Broadcast update to all clients
-                    self.ws_broadcast(WsMessage::WorldSettingsUpdated {
-                        world_index,
-                        settings: settings_msg,
-                        name,
-                    });
-                }
+                self.update_world_settings(
+                    world_index, name, hostname, port, user, password, use_ssl, log_enabled,
+                    encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
+                );
             }
             WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled } => {
                 // Update global settings from remote client
