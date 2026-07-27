@@ -1324,11 +1324,17 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startBackgroundShutdownTimer() {
-        // Only start timer if connected - no point otherwise
-        if (!isConnected) {
-            return;
-        }
-
+        // Always arm the timer on backgrounding, even if not connected right now.
+        // isConnected only flips true once JS reports a fully authenticated session
+        // (see app.js's InitialState handler) and flips false on any disconnect or
+        // failed connection attempt - including the brief gap between retries in an
+        // in-progress reconnect loop (handleAttemptFailure()'s setTimeout(connect, 2000)
+        // still calls stopBackgroundService() first). Bailing out here when that gap
+        // happened to line up with onStop() previously left backgrounding completely
+        // untimed for the rest of the background period, even once a reconnect
+        // succeeded - the runnable below re-checks isConnected when it actually fires
+        // and reschedules itself if there's nothing to time out yet, rather than this
+        // one-shot check silently deciding "never" up front.
         if (backgroundShutdownHandler == null) {
             backgroundShutdownHandler = new Handler(Looper.getMainLooper());
         }
@@ -1368,6 +1374,11 @@ public class MainActivity extends AppCompatActivity {
                             null
                         );
                     }
+                } else if (backgroundShutdownHandler != null) {
+                    // Not connected right now (e.g. mid-retry, or gave up entirely) - nothing
+                    // to time out yet, but keep checking in case a reconnect succeeds later
+                    // in the background period instead of leaving this check permanently dead.
+                    backgroundShutdownHandler.postDelayed(this, BACKGROUND_SHUTDOWN_MS);
                 }
             }
         };
