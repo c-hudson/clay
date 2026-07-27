@@ -514,6 +514,43 @@ public class MainActivity extends AppCompatActivity {
                                 "if (typeof onNativeWebSocketError === 'function') onNativeWebSocketError(" + id + ", \"" + escaped + "\");", null);
                         });
                     }
+
+                    @Override
+                    public void onCertMismatch(String hostPort, String oldFingerprint, String newFingerprint) {
+                        // Distinct from onError(): offers the same "trust new certificate"
+                        // remedy every other Clay client gives for a TOFU pin mismatch
+                        // (showCertMismatchDialog() in app.js) instead of a generic failure
+                        // message with no way to proceed short of "Clear ALL Pinned
+                        // Certificates". This mismatch is on the app's own connection to the
+                        // Clay server itself (CertPinning, local OkHttp trust store) - not the
+                        // server-to-MUD-world mismatch that dialog handles, so there's no live
+                        // WebSocket to relay a TrustCertificate message over; re-pinning has to
+                        // happen entirely locally, then retry.
+                        runOnUiThread(() -> {
+                            new AlertDialog.Builder(MainActivity.this)
+                                .setTitle("TLS Certificate Changed")
+                                .setMessage("The certificate for " + hostPort + " no longer matches the one "
+                                    + "pinned on first connect. This could mean the server was reinstalled, "
+                                    + "or that someone is intercepting your connection.\n\n"
+                                    + "Old: " + oldFingerprint + "\nNew: " + newFingerprint)
+                                .setCancelable(true)
+                                .setNegativeButton("Cancel", (dialog, which) -> {
+                                    webView.evaluateJavascript(
+                                        "if (typeof onNativeWebSocketError === 'function') onNativeWebSocketError(" + id + ", \"Certificate verification failed\");",
+                                        null);
+                                })
+                                .setPositiveButton("Trust New Certificate", (dialog, which) -> {
+                                    CertPinning.trustNewFingerprint(MainActivity.this, hostPort, newFingerprint);
+                                    NativeWebSocket retryWs = nativeWebSockets.get(id);
+                                    if (retryWs != null) {
+                                        String retryAuthKey = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                                            .getString(KEY_AUTH_KEY, "");
+                                        retryWs.connect(url, retryAuthKey);
+                                    }
+                                })
+                                .show();
+                        });
+                    }
                 });
 
                 nativeWebSockets.put(id, ws);

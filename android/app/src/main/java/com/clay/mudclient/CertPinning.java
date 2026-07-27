@@ -48,17 +48,34 @@ final class CertPinning {
     /** Thrown when a pinned host presents a certificate that doesn't match its stored pin. */
     static final class PinMismatchException extends CertificateException {
         final String hostPort;
-        PinMismatchException(String hostPort) {
+        final String oldFingerprint;
+        final String newFingerprint;
+        PinMismatchException(String hostPort, String oldFingerprint, String newFingerprint) {
             super("Certificate for " + hostPort + " does not match the previously pinned "
                 + "certificate. If you rotated this server's certificate intentionally, clear "
                 + "pinned certificates in Settings and reconnect.");
             this.hostPort = hostPort;
+            this.oldFingerprint = oldFingerprint;
+            this.newFingerprint = newFingerprint;
         }
     }
 
     /** Wipes every stored pin (used by the clay-server tab's "Clear Pinned Certificates"). */
     static void clearAllPins(Context context) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply();
+    }
+
+    /**
+     * Overwrites the stored pin for one host:port with a new fingerprint, used only after the
+     * user explicitly confirms a changed certificate via the cert-mismatch dialog (mirrors the
+     * Rust side's per-host {@code replace_pin} on "Trust new certificate" — see
+     * {@code persistence::replace_pin}). Unlike {@link #clearAllPins}, this doesn't touch any
+     * other host's pin.
+     */
+    static void trustNewFingerprint(Context context, String hostPort, String newFingerprint) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString(hostPort, newFingerprint).apply();
+        Log.i(TAG, "Re-pinned " + hostPort + " after user confirmed certificate change");
     }
 
     /** True if at least one certificate is currently pinned. */
@@ -125,7 +142,7 @@ final class CertPinning {
                     Log.i(TAG, "Pinned new certificate for " + hostPort);
                 } else if (!pinned.equals(fingerprint)) {
                     Log.w(TAG, "Certificate mismatch for " + hostPort);
-                    throw new PinMismatchException(hostPort);
+                    throw new PinMismatchException(hostPort, pinned, fingerprint);
                 }
             }
 

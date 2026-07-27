@@ -63,11 +63,29 @@ public class NativeWebSocket {
         void onMessage(String message);
         void onClose(int code, String reason);
         void onError(String error);
+        /** A pinned certificate changed - see CertPinning.PinMismatchException. Distinct from
+         *  onError() so callers can offer a real "trust new certificate" action instead of just
+         *  showing a generic connection-failure message. */
+        void onCertMismatch(String hostPort, String oldFingerprint, String newFingerprint);
     }
 
     public NativeWebSocket(Context context, WebSocketCallback callback) {
         this.appContext = context.getApplicationContext();
         this.callback = callback;
+    }
+
+    /** Walks the cause chain looking for a wrapped CertPinning.PinMismatchException - OkHttp's
+     *  TLS layer wraps whatever the trust manager throws (typically in an
+     *  SSLHandshakeException), so it's never the top-level throwable itself. */
+    private static CertPinning.PinMismatchException findPinMismatch(Throwable t) {
+        int depth = 0;
+        while (t != null && depth++ < 10) {
+            if (t instanceof CertPinning.PinMismatchException) {
+                return (CertPinning.PinMismatchException) t;
+            }
+            t = t.getCause();
+        }
+        return null;
     }
 
     /** Backward-compatible overload: no auth key means no knock attempt. */
@@ -174,6 +192,21 @@ public class NativeWebSocket {
                         knockUnsupported = true;
                         isConnected = false;
                         connectInternal(url, authKey, false);
+                        return;
+                    }
+
+                    // A pin mismatch surfaces here wrapped in an SSLHandshakeException (OkHttp
+                    // wraps whatever the trust manager throws) - walk the cause chain rather
+                    // than assuming it's the top-level throwable.
+                    CertPinning.PinMismatchException pinMismatch = findPinMismatch(t);
+                    if (pinMismatch != null) {
+                        Log.w(TAG, "Certificate pin mismatch for " + pinMismatch.hostPort);
+                        isConnected = false;
+                        mainHandler.post(() -> {
+                            if (callback != null) {
+                                callback.onCertMismatch(pinMismatch.hostPort, pinMismatch.oldFingerprint, pinMismatch.newFingerprint);
+                            }
+                        });
                         return;
                     }
 
