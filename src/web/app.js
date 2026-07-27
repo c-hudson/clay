@@ -608,7 +608,10 @@
     let scrollbackEnabled = false;  // Long-term archive output
     let dictionaryPath = '';  // Custom dictionary path
     let spellCheckEnabled = true;  // Spell checking
-    let prevInputLen = 0;  // Track previous input length for temp conversion
+    // Track whether the last edit was a deletion - mirrors Rust's
+    // App.last_input_was_delete (main.rs), which check_temp_conversion() uses
+    // to skip re-converting right after the user undoes a conversion.
+    let lastInputWasDelete = false;
     let skipTempConversion = null;  // Temperature to skip re-converting (after user undid conversion)
 
     // ============================================================================
@@ -779,17 +782,10 @@
         if (!tempConvertEnabled) return;
 
         const input = elements.input.value;
-        if (!input || input.length === 0) {
-            prevInputLen = 0;
-            return;
-        }
+        if (!input || input.length === 0) return;
 
-        // Don't convert when user is deleting - allows undoing conversion
-        if (input.length <= prevInputLen) {
-            prevInputLen = input.length;
-            return;
-        }
-        prevInputLen = input.length;
+        // Don't convert when the last edit was a deletion - allows undoing a conversion
+        if (lastInputWasDelete) return;
 
         // Only check when cursor is at the end
         if (elements.input.selectionStart !== input.length) return;
@@ -802,9 +798,14 @@
             return;
         }
 
-        // Pattern: optional minus, digits, optional decimal+digits, optional °, F or C
-        // Look for temp pattern just before the separator
-        const match = input.slice(0, -1).match(/(-?\d+\.?\d*)(°?[FfCc])$/);
+        // Pattern: optional minus, then digits with at most one decimal point placed
+        // either after some digits ("32", "32.5", "32.") or before a required digit
+        // (".5"), optional °, F or C. Mirrors main.rs::check_temp_conversion's
+        // backward character scan (requires at least one digit somewhere, but
+        // allows a bare leading decimal point) - a plain `\d+\.?\d*` regex would
+        // silently drop a leading "." with no digit before it, misreading ".5F" as
+        // "5F" (a 10x magnitude error) instead of skipping straight to the "5".
+        const match = input.slice(0, -1).match(/(-?(?:\d+\.?\d*|\.\d+))(°?[FfCc])$/);
         if (!match) return;
 
         // Make sure it's not part of a word (check char before the number)
@@ -850,8 +851,6 @@
         const beforeSep = input.slice(0, -1);
         const sep = lastChar;
         elements.input.value = beforeSep + convertedStr + sep;
-        // Update prevInputLen to reflect new length after conversion
-        prevInputLen = elements.input.value.length;
         // Move cursor to end
         elements.input.selectionStart = elements.input.selectionEnd = elements.input.value.length;
     }
@@ -9488,8 +9487,12 @@
 
         // Reset command completion state when input changes (typing, not Tab)
         // Also check for temperature conversion
-        elements.input.addEventListener('input', function() {
+        elements.input.addEventListener('input', function(e) {
             resetCompletion();
+            // Mirrors Rust's last_input_was_delete: any deleteContent*/deleteBy*
+            // inputType counts as a deletion (allows undoing a conversion);
+            // anything else (typed character, paste, IME composition) does not.
+            lastInputWasDelete = !!(e.inputType && e.inputType.indexOf('delete') === 0);
             checkTempConversion();
         });
 
