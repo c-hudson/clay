@@ -4850,6 +4850,45 @@
         }
     }
 
+    // Wildcard-to-regex for action triggers — mirrors actions.rs::wildcard_to_regex.
+    // Unlike filterWildcardToRegex (unanchored "contains" semantics for /filter),
+    // action patterns must match the entire line, so this anchors with ^...$.
+    function actionWildcardToRegex(pattern) {
+        let regex = '^';
+        let i = 0;
+        while (i < pattern.length) {
+            const c = pattern[i];
+            if (c === '\\') {
+                const next = i + 1 < pattern.length ? pattern[i + 1] : undefined;
+                if (next === '*' || next === '?' || next === '\\') {
+                    regex += '\\' + next;
+                    i += 2;
+                } else {
+                    // Lone backslash (incl. trailing) - escape it for regex
+                    regex += '\\\\';
+                    i += 1;
+                }
+                continue;
+            }
+            if (c === '*') {
+                regex += '(.*)';
+            } else if (c === '?') {
+                regex += '(.)';
+            } else if (c === '"' || c === '“' || c === '”') {
+                regex += '["“”]';
+            } else if (c === '\'' || c === '‘' || c === '’') {
+                regex += '[\'‘’]';
+            } else if ('.+^$|()[]{}'.includes(c)) {
+                regex += '\\' + c;
+            } else {
+                regex += c;
+            }
+            i++;
+        }
+        regex += '$';
+        return regex;
+    }
+
     // Check if text matches filter pattern (supports wildcards * and ?)
     function matchesFilter(text, pattern) {
         const hasWildcards = pattern.includes('*') || pattern.includes('?');
@@ -4886,7 +4925,7 @@
                 try {
                     let pat = patText;
                     if (matchType === 'Wildcard') {
-                        pat = filterWildcardToRegex(patText);
+                        pat = actionWildcardToRegex(patText);
                     }
                     const regex = new RegExp(pat, 'i');
                     if (regex.test(plainLine)) return true;
