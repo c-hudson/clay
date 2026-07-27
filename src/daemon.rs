@@ -18,6 +18,7 @@ use crate::{
 };
 use crate::actions::{split_action_commands, substitute_action_args,
     find_invocable_action, rewrite_slashless_action};
+use crate::commands::{connect_slack, connect_discord};
 use crate::util::local_time_from_epoch;
 use crate::websocket::{TimestampedLine, RemoteClientType};
 
@@ -1123,6 +1124,30 @@ pub async fn handle_daemon_ws_message(
                 // Connect command - use daemon connection logic
                 Command::Connect { .. } => {
                     if world_index < app.worlds.len() && !app.worlds[world_index].connected {
+                        // Slack/Discord worlds don't go through connect_daemon_world (that's
+                        // MUD-only, telnet/proxy-socket specific) - route them through the
+                        // same connect_slack/connect_discord commands.rs already uses for
+                        // console/master-WS. Those operate on app.current_world_index, so
+                        // temporarily point it at this request's target world and restore
+                        // it after, mirroring the WsAsyncAction::Connect delegation pattern
+                        // in main.rs (which ultimately calls into the same two functions).
+                        let world_type = app.worlds[world_index].settings.world_type.clone();
+                        if !matches!(world_type, WorldType::Mud) {
+                            let prev_index = app.current_world_index;
+                            app.current_world_index = world_index;
+                            let connected = match world_type {
+                                WorldType::Slack => connect_slack(app, event_tx.clone()).await,
+                                WorldType::Discord => connect_discord(app, event_tx.clone()).await,
+                                WorldType::Mud => unreachable!(),
+                            };
+                            app.current_world_index = prev_index;
+                            if connected {
+                                app.worlds[world_index].was_connected = true;
+                                let name = app.worlds[world_index].name.clone();
+                                app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
+                            }
+                            return;
+                        }
                         if app.worlds[world_index].settings.has_connection_settings() {
                             let settings = app.worlds[world_index].settings.clone();
                             let world_name = app.worlds[world_index].name.clone();
