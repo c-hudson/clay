@@ -4969,3 +4969,86 @@ if you're more curious.\"";
         }
     }
 
+    // --- App::resolve_quote_lines ---
+    // Pins the shared /quote helper's behavior, including the world-targeting/delay-scheduling
+    // support console's two call sites used to silently drop entirely (T32).
+
+    #[test]
+    fn test_resolve_quote_lines_no_options_returns_lines_unchanged() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.current_world_index = 0;
+
+        let result = app.resolve_quote_lines(
+            vec!["one".to_string(), "two".to_string()],
+            &None, 0.0, None, false, 0, tf::QuoteDisposition::Send, false,
+        );
+        assert_eq!(result, Some((0, vec!["one".to_string(), "two".to_string()])));
+    }
+
+    #[test]
+    fn test_resolve_quote_lines_targets_named_world() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds.push(World::new("beta"));
+        app.current_world_index = 0;
+
+        let result = app.resolve_quote_lines(
+            vec!["hi".to_string()],
+            &Some("beta".to_string()), 0.0, None, false, 0, tf::QuoteDisposition::Send, false,
+        );
+        assert_eq!(result, Some((1, vec!["hi".to_string()])), "should target beta (index 1), not the current world");
+    }
+
+    #[test]
+    fn test_resolve_quote_lines_unknown_world_falls_back_to_current() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.current_world_index = 0;
+
+        let result = app.resolve_quote_lines(
+            vec!["hi".to_string()],
+            &Some("nonexistent".to_string()), 0.0, None, false, 0, tf::QuoteDisposition::Send, false,
+        );
+        assert_eq!(result, Some((0, vec!["hi".to_string()])), "unknown world name should fall back to world_index");
+    }
+
+    #[test]
+    fn test_resolve_quote_lines_delay_schedules_processes_and_returns_none() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.current_world_index = 0;
+        assert!(app.tf_engine.processes.is_empty());
+
+        let result = app.resolve_quote_lines(
+            vec!["one".to_string(), "two".to_string(), "three".to_string()],
+            &None, 5.0, None, false, 0, tf::QuoteDisposition::Send, false,
+        );
+        assert_eq!(result, None, "delayed multi-line quote has nothing left to send immediately");
+        assert_eq!(app.tf_engine.processes.len(), 3, "each line should be scheduled as its own delayed process");
+        assert_eq!(app.tf_engine.processes[0].command, "one");
+        assert_eq!(app.tf_engine.processes[1].command, "two");
+        assert_eq!(app.tf_engine.processes[2].command, "three");
+    }
+
+    #[test]
+    fn test_resolve_quote_lines_single_line_ignores_delay() {
+        // Delay-scheduling only kicks in for lines.len() > 1 - a single line always sends
+        // immediately regardless of delay_secs.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.current_world_index = 0;
+
+        let result = app.resolve_quote_lines(
+            vec!["only".to_string()],
+            &None, 5.0, None, false, 0, tf::QuoteDisposition::Send, false,
+        );
+        assert_eq!(result, Some((0, vec!["only".to_string()])));
+        assert!(app.tf_engine.processes.is_empty());
+    }
+

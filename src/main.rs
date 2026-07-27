@@ -8074,8 +8074,95 @@ impl App {
         });
     }
 
-    /// Handle TfCommandResult::Quote from a WebSocket client command.
-    /// Mirrors the console Quote handling but uses synchronous ws_broadcast/try_send.
+    /// Resolves a `TfCommandResult::Quote`'s `recall_opts`/`world`/`delay_secs` into what
+    /// should actually be sent: executes a backtick `/recall` substitution if present,
+    /// resolves the target world by name (falling back to `world_index`), and if `delay_secs`
+    /// calls for scheduling multiple lines as delayed processes, does that directly and
+    /// returns `None` — there's nothing left for the caller to send immediately. Otherwise
+    /// returns `Some((target_idx, lines))` for the caller to dispatch per-disposition
+    /// (Send/Echo/Exec) itself — that final dispatch differs enough by transport (sync
+    /// `try_send` vs async `.send().await`, full `handle_command` recursion vs a narrower
+    /// inline TF-engine call for `Exec`) that it's kept separate rather than folded in here.
+    /// This is also what brings console's `/quote` up to feature parity with web/GUI's — it
+    /// used to silently ignore `world`/`delay_secs`/`recall_opts`/`strip_ansi` entirely.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_quote_lines(
+        &mut self,
+        mut lines: Vec<String>,
+        world: &Option<String>,
+        delay_secs: f64,
+        recall_opts: Option<(tf::RecallOptions, String)>,
+        strip_ansi: bool,
+        world_index: usize,
+        disposition: tf::QuoteDisposition,
+        is_daemon_mode: bool,
+    ) -> Option<(usize, Vec<String>)> {
+        // If this is a /quote with backtick /recall, execute the recall now
+        if let Some((opts, recall_prefix)) = recall_opts {
+            if world_index < self.worlds.len() {
+                match self.recall_matches(&opts, world_index) {
+                    Ok((matches, _header)) => {
+                        lines = matches.iter()
+                            .map(|line| {
+                                let raw = format!("{}{}", recall_prefix, line);
+                                if strip_ansi { strip_ansi_codes(&raw) } else { raw }
+                            })
+                            .collect();
+                        if lines.is_empty() {
+                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                            self.emit_client_text(world_index, &format!("(no recall matches for '{}')", pattern_str), is_daemon_mode);
+                        }
+                    }
+                    Err(e) => {
+                        self.emit_tf_error(world_index, &e, is_daemon_mode);
+                    }
+                }
+            }
+        }
+
+        // Determine target world index
+        let target_idx = if let Some(world_name) = world {
+            self.worlds.iter().position(|w| w.name == *world_name).unwrap_or(world_index)
+        } else {
+            world_index
+        };
+        let target_world_name = self.worlds.get(target_idx).map(|w| w.name.clone());
+
+        if delay_secs > 0.0 && lines.len() > 1 {
+            // Schedule as processes with delays
+            let delay = std::time::Duration::from_secs_f64(delay_secs);
+            let now = std::time::Instant::now();
+            for (i, line) in lines.into_iter().enumerate() {
+                let cmd = match disposition {
+                    tf::QuoteDisposition::Send => line,
+                    tf::QuoteDisposition::Echo => format!("/echo {}", line),
+                    tf::QuoteDisposition::Exec => line,
+                };
+                let id = self.tf_engine.next_process_id;
+                self.tf_engine.next_process_id += 1;
+                self.register_repeat_process(tf::TfProcess {
+                    id,
+                    command: cmd,
+                    interval: delay,
+                    count: Some(1),
+                    remaining: Some(1),
+                    next_run: now + delay * i as u32,
+                    world: target_world_name.clone(),
+                    synchronous: false,
+                    on_prompt: false,
+                    priority: 0,
+                });
+            }
+            None
+        } else {
+            Some((target_idx, lines))
+        }
+    }
+
+    /// Handle TfCommandResult::Quote from a WebSocket client command. Uses
+    /// `resolve_quote_lines` for the transport-agnostic part; the immediate-send loop below is
+    /// master-WS-specific (sync `try_send`, and a narrower inline TF-engine call for `Exec`
+    /// rather than full `handle_command` recursion — see `resolve_quote_lines`'s doc comment).
     #[allow(clippy::too_many_arguments)]
     fn handle_ws_quote_result(
         &mut self,
@@ -8087,126 +8174,53 @@ impl App {
         recall_opts: Option<(tf::RecallOptions, String)>,
         strip_ansi: bool,
     ) {
-        // If this is a /quote with backtick /recall, execute the recall now
-        if let Some((opts, recall_prefix)) = recall_opts {
-            if world_index < self.worlds.len() {
-                match self.recall_matches(&opts, world_index) {
-                    Ok((matches, _header)) => {
-                        *lines = matches.iter()
-                            .map(|line| {
-                                let raw = format!("{}{}", recall_prefix, line);
-                                if strip_ansi { strip_ansi_codes(&raw) } else { raw }
-                            })
-                            .collect();
-                        if lines.is_empty() {
-                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                            self.ws_broadcast(WsMessage::ServerData {
-                                world_index, data: format!("(no recall matches for '{}')", pattern_str),
-                                is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
-                                flush: false, gagged: false,
-                            });
+        let Some((target_idx, resolved_lines)) = self.resolve_quote_lines(
+            std::mem::take(lines), world, delay_secs, recall_opts, strip_ansi, world_index, disposition, false,
+        ) else {
+            return;
+        };
+
+        // Echo lines are buffered and flushed as a single emit_client_lines
+        // call after the loop, rather than one broadcast per line - one
+        // block, one budget computation, one broadcast (same reasoning as
+        // emit_recall). Send/Exec still act per-line since each can have
+        // its own side effect (a MUD write, a nested TF command).
+        let mut echo_batch: Vec<String> = Vec::new();
+        for line in resolved_lines {
+            match disposition {
+                tf::QuoteDisposition::Send => {
+                    if target_idx < self.worlds.len() {
+                        if self.worlds[target_idx].connected {
+                            self.send_to_world_and_mark_sent(target_idx, line);
+                        } else {
+                            self.emit_client_text(world_index, "Not connected", false);
+                            break;
                         }
                     }
-                    Err(e) => {
-                        self.ws_broadcast(WsMessage::ServerData {
-                            world_index, data: e,
-                            is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
-                            flush: false, gagged: false,
-                        });
+                }
+                tf::QuoteDisposition::Echo => {
+                    echo_batch.push(line);
+                }
+                tf::QuoteDisposition::Exec => {
+                    // Execute each line as a TF command
+                    let result = self.tf_engine.execute(&line);
+                    match result {
+                        tf::TfCommandResult::SendToMud(text) => {
+                            self.send_to_world_and_mark_sent(target_idx, text);
+                        }
+                        tf::TfCommandResult::Success(Some(msg)) => {
+                            self.emit_client_text(world_index, &msg, false);
+                        }
+                        tf::TfCommandResult::Error(err) => {
+                            self.emit_tf_error(world_index, &err, false);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
-
-        // Determine target world index
-        let target_idx = if let Some(ref world_name) = world {
-            self.worlds.iter().position(|w| w.name == *world_name).unwrap_or(world_index)
-        } else {
-            world_index
-        };
-        let target_world_name = if target_idx < self.worlds.len() {
-            Some(self.worlds[target_idx].name.clone())
-        } else {
-            None
-        };
-
-        if delay_secs > 0.0 && lines.len() > 1 {
-            // Schedule as processes with delays
-            let delay = std::time::Duration::from_secs_f64(delay_secs);
-            let now = std::time::Instant::now();
-            for (i, line) in lines.drain(..).enumerate() {
-                let cmd = match disposition {
-                    tf::QuoteDisposition::Send => line,
-                    tf::QuoteDisposition::Echo => format!("/echo {}", line),
-                    tf::QuoteDisposition::Exec => line,
-                };
-                let id = self.tf_engine.next_process_id;
-                self.tf_engine.next_process_id += 1;
-                let process = tf::TfProcess {
-                    id,
-                    command: cmd,
-                    interval: delay,
-                    count: Some(1),
-                    remaining: Some(1),
-                    next_run: now + delay * i as u32,
-                    world: target_world_name.clone(),
-                    synchronous: false,
-                    on_prompt: false,
-                    priority: 0,
-                };
-                self.tf_engine.processes.push(process);
-            }
-        } else {
-            // Send immediately (no delay or single line)
-            // Echo lines are buffered and flushed as a single emit_client_lines
-            // call after the loop, rather than one broadcast per line - one
-            // block, one budget computation, one broadcast (same reasoning as
-            // emit_recall). Send/Exec still act per-line since each can have
-            // its own side effect (a MUD write, a nested TF command).
-            let mut echo_batch: Vec<String> = Vec::new();
-            for line in lines.drain(..) {
-                match disposition {
-                    tf::QuoteDisposition::Send => {
-                        if target_idx < self.worlds.len() {
-                            if self.worlds[target_idx].connected {
-                                if let Some(tx) = &self.worlds[target_idx].command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(line));
-                                    self.worlds[target_idx].last_send_time = Some(std::time::Instant::now());
-                                }
-                            } else {
-                                self.ws_broadcast(WsMessage::ServerData {
-                                    world_index, data: "Not connected".to_string(),
-                                    is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
- flush: false, gagged: false,
-                                });
-                                break;
-                            }
-                        }
-                    }
-                    tf::QuoteDisposition::Echo => {
-                        echo_batch.push(line);
-                    }
-                    tf::QuoteDisposition::Exec => {
-                        // Execute each line as a TF command
-                        let result = self.tf_engine.execute(&line);
-                        match result {
-                            tf::TfCommandResult::SendToMud(text) => {
-                                self.send_to_world_and_mark_sent(target_idx, text);
-                            }
-                            tf::TfCommandResult::Success(Some(msg)) => {
-                                self.emit_client_text(world_index, &msg, false);
-                            }
-                            tf::TfCommandResult::Error(err) => {
-                                self.emit_tf_error(world_index, &err, false);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            if !echo_batch.is_empty() {
-                self.emit_client_lines(world_index, &echo_batch, false);
-            }
+        if !echo_batch.is_empty() {
+            self.emit_client_lines(world_index, &echo_batch, false);
         }
     }
 
@@ -15672,81 +15686,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.register_repeat_process(process);
                                         app.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
                                     }
-                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
-                                        // If this is a /quote with backtick /recall, execute the recall now
-                                        if let Some((opts, recall_prefix)) = recall_opts {
-                                            let fallback = app.current_world_index;
-                                            match app.recall_matches(&opts, fallback) {
-                                                Ok((matches, _header)) => {
-                                                    lines = matches.iter()
-                                                        .map(|line| {
-                                                            let raw = format!("{}{}", recall_prefix, line);
-                                                            if strip_ansi { strip_ansi_codes(&raw) } else { raw }
-                                                        })
-                                                        .collect();
-                                                    if lines.is_empty() {
-                                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                        app.add_tf_output(&format!("(no recall matches for '{}')", pattern_str));
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    app.add_tf_output(&format!("Error: {}", e));
-                                                }
-                                            }
-                                        }
-
-                                        // Determine target world
-                                        let target_world = if let Some(ref world_name) = world {
-                                            Some(world_name.clone())
-                                        } else {
-                                            Some(app.current_world().name.clone())
-                                        };
-                                        let target_idx = if let Some(ref world_name) = world {
-                                            app.worlds.iter().position(|w| w.name == *world_name)
-                                        } else {
-                                            Some(app.current_world_index)
-                                        };
-
-                                        if delay_secs > 0.0 && lines.len() > 1 {
-                                            // Schedule as processes with delays
-                                            let delay = std::time::Duration::from_secs_f64(delay_secs);
-                                            let now = std::time::Instant::now();
-                                            for (i, line) in lines.into_iter().enumerate() {
-                                                let cmd = match disposition {
-                                                    tf::QuoteDisposition::Send => line,
-                                                    tf::QuoteDisposition::Echo => format!("/echo {}", line),
-                                                    tf::QuoteDisposition::Exec => line,
-                                                };
-                                                let id = app.tf_engine.next_process_id;
-                                                app.tf_engine.next_process_id += 1;
-                                                let process = tf::TfProcess {
-                                                    id,
-                                                    command: cmd,
-                                                    interval: delay,
-                                                    count: Some(1),
-                                                    remaining: Some(1),
-                                                    next_run: now + delay * i as u32,
-                                                    world: target_world.clone(),
-                                                    synchronous: false,
-                                                    on_prompt: false,
-                                                    priority: 0,
-                                                };
-                                                app.tf_engine.processes.push(process);
-                                            }
-                                        } else {
-                                            // Send immediately (no delay or single line)
-                                            for line in lines {
+                                    tf::TfCommandResult::Quote { lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
+                                        let world_idx = app.current_world_index;
+                                        if let Some((target_idx, resolved_lines)) = app.resolve_quote_lines(
+                                            lines, &world, delay_secs, recall_opts, strip_ansi, world_idx, disposition, false,
+                                        ) {
+                                            // Send immediately (no delay or single line). Async .send().await
+                                            // (not sync try_send) since this context can afford to await
+                                            // backpressure - see resolve_quote_lines's doc comment.
+                                            for line in resolved_lines {
                                                 match disposition {
                                                     tf::QuoteDisposition::Send => {
-                                                        if let Some(idx) = target_idx {
-                                                            if app.worlds[idx].connected {
-                                                                if let Some(tx) = &app.worlds[idx].command_tx {
-                                                                    let _ = tx.send(WriteCommand::Text(line)).await;
-                                                                }
-                                                            } else {
-                                                                app.add_output("Not connected");
-                                                                break;
+                                                        if app.worlds[target_idx].connected {
+                                                            if let Some(tx) = &app.worlds[target_idx].command_tx {
+                                                                let _ = tx.send(WriteCommand::Text(line)).await;
                                                             }
+                                                        } else {
+                                                            app.add_output("Not connected");
+                                                            break;
                                                         }
                                                     }
                                                     tf::QuoteDisposition::Echo => {
@@ -15757,10 +15714,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         let result = app.tf_engine.execute(&line);
                                                         match result {
                                                             tf::TfCommandResult::SendToMud(text) => {
-                                                                if let Some(idx) = target_idx {
-                                                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                                                        let _ = tx.send(WriteCommand::Text(text)).await;
-                                                                    }
+                                                                if let Some(tx) = &app.worlds[target_idx].command_tx {
+                                                                    let _ = tx.send(WriteCommand::Text(text)).await;
                                                                 }
                                                             }
                                                             tf::TfCommandResult::Success(Some(msg)) => {
@@ -16140,23 +16095,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         tf::TfCommandResult::RepeatProcess(process) => {
                                             app.register_repeat_process(process);
                                         }
-                                        tf::TfCommandResult::Quote { lines, disposition, .. } => {
-                                            match disposition {
-                                                tf::QuoteDisposition::Send => {
-                                                    if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                                        for line in lines {
-                                                            let _ = tx.try_send(WriteCommand::Text(line));
+                                        tf::TfCommandResult::Quote { lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
+                                            if let Some((target_idx, resolved_lines)) = app.resolve_quote_lines(
+                                                lines, &world, delay_secs, recall_opts, strip_ansi, world_idx, disposition, false,
+                                            ) {
+                                                match disposition {
+                                                    tf::QuoteDisposition::Send => {
+                                                        for line in resolved_lines {
+                                                            app.send_to_world(target_idx, line);
                                                         }
                                                     }
-                                                }
-                                                tf::QuoteDisposition::Echo => {
-                                                    for line in lines {
-                                                        app.add_output(&line);
+                                                    tf::QuoteDisposition::Echo => {
+                                                        for line in resolved_lines {
+                                                            app.add_output(&line);
+                                                        }
                                                     }
-                                                }
-                                                tf::QuoteDisposition::Exec => {
-                                                    for line in lines {
-                                                        handle_command(&line, &mut app, event_tx.clone()).await;
+                                                    tf::QuoteDisposition::Exec => {
+                                                        for line in resolved_lines {
+                                                            handle_command(&line, &mut app, event_tx.clone()).await;
+                                                        }
                                                     }
                                                 }
                                             }

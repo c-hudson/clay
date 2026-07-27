@@ -2736,26 +2736,33 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 let world_idx = app.current_world_index;
                                 app.emit_recall(&opts, world_idx, false);
                             }
-                            tf::TfCommandResult::Quote { lines, disposition, .. } => {
-                                match disposition {
-                                    tf::QuoteDisposition::Send => {
-                                        if let Some(tx) = &app.current_world().command_tx {
-                                            for line in lines {
-                                                let _ = tx.try_send(WriteCommand::Text(line));
+                            tf::TfCommandResult::Quote { lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
+                                let world_idx = app.current_world_index;
+                                if let Some((target_idx, resolved_lines)) = app.resolve_quote_lines(
+                                    lines, &world, delay_secs, recall_opts, strip_ansi, world_idx, disposition, false,
+                                ) {
+                                    match disposition {
+                                        tf::QuoteDisposition::Send => {
+                                            if target_idx < app.worlds.len() && app.worlds[target_idx].command_tx.is_some() {
+                                                for line in resolved_lines {
+                                                    if let Some(tx) = &app.worlds[target_idx].command_tx {
+                                                        let _ = tx.try_send(WriteCommand::Text(line));
+                                                    }
+                                                }
+                                                sent_to_server = true;
+                                            } else {
+                                                app.add_output("Not connected.");
                                             }
-                                            sent_to_server = true;
-                                        } else {
-                                            app.add_output("Not connected.");
                                         }
-                                    }
-                                    tf::QuoteDisposition::Echo => {
-                                        for line in lines {
-                                            app.add_output(&line);
+                                        tf::QuoteDisposition::Echo => {
+                                            for line in resolved_lines {
+                                                app.add_output(&line);
+                                            }
                                         }
-                                    }
-                                    tf::QuoteDisposition::Exec => {
-                                        for line in lines {
-                                            Box::pin(handle_command(&line, app, event_tx.clone())).await;
+                                        tf::QuoteDisposition::Exec => {
+                                            for line in resolved_lines {
+                                                Box::pin(handle_command(&line, app, event_tx.clone())).await;
+                                            }
                                         }
                                     }
                                 }
@@ -2804,28 +2811,32 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                     tf::TfCommandResult::RepeatProcess(process) => {
                         app.register_repeat_process(process);
                     }
-                    tf::TfCommandResult::Quote { lines, disposition, .. } => {
+                    tf::TfCommandResult::Quote { lines, disposition, world, delay_secs, recall_opts, strip_ansi } => {
+                        let world_idx = app.current_world_index;
+                        if let Some((target_idx, resolved_lines)) = app.resolve_quote_lines(
+                            lines, &world, delay_secs, recall_opts, strip_ansi, world_idx, disposition, false,
+                        ) {
                         match disposition {
                             tf::QuoteDisposition::Send => {
-                                if let Some(tx) = &app.current_world().command_tx {
-                                    for line in lines {
-                                        let _ = tx.try_send(WriteCommand::Text(line));
+                                if target_idx < app.worlds.len() && app.worlds[target_idx].command_tx.is_some() {
+                                    for line in resolved_lines {
+                                        app.send_to_world_and_mark_sent(target_idx, line);
                                     }
-                                    app.current_world_mut().last_send_time = Some(std::time::Instant::now());
                                 } else {
                                     app.add_output("Not connected.");
                                 }
                             }
                             tf::QuoteDisposition::Echo => {
-                                for line in lines {
+                                for line in resolved_lines {
                                     app.add_output(&line);
                                 }
                             }
                             tf::QuoteDisposition::Exec => {
-                                for line in lines {
+                                for line in resolved_lines {
                                     Box::pin(handle_command(&line, app, event_tx.clone())).await;
                                 }
                             }
+                        }
                         }
                     }
                     _ => {
