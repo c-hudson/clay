@@ -3870,13 +3870,7 @@
             renderOutput();
         }
 
-        // Intercept /update locally — should run on the client, not the server
         const cmdTrimmed = cmd.trim();
-        if (cmdTrimmed === '/update' || cmdTrimmed.startsWith('/update ')) {
-            elements.input.value = '';
-            executeLocalCommand(cmdTrimmed);
-            return;
-        }
 
         // Intercept /window locally — open new browser/tab directly from client
         if (cmdTrimmed === '/window' || cmdTrimmed.startsWith('/window ')) {
