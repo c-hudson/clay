@@ -6782,9 +6782,9 @@
         if (duplicateIndex >= 0) {
             return 'An action with this name already exists';
         }
-        // Check for internal command conflicts
-        const internalCommands = ['help', 'disconnect', 'dc', 'setup', 'world', 'worlds', 'l', 'reload', 'quit', 'actions', 'gag'];
-        if (internalCommands.includes(name.toLowerCase())) {
+        // Check for internal command conflicts - reuse the single source-of-truth
+        // list (INTERNAL_COMMANDS) instead of a separately hand-maintained guess.
+        if (isInternalCommand(name)) {
             return 'Cannot use internal command name';
         }
         return null;
