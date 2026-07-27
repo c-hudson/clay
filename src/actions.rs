@@ -420,9 +420,8 @@ pub fn wildcard_to_regex(pattern: &str) -> String {
     regex
 }
 
-/// Execute recall command with options
-/// Returns (matches, header_message) - matches is the list of matching lines
-pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], show_tags: bool) -> (Vec<String>, Option<String>) {
+/// Execute recall command with options, returning the list of matching lines
+pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], show_tags: bool) -> Vec<String> {
     use tf::{RecallMatchStyle, RecallRange};
 
     // Build regex from pattern based on match style
@@ -576,16 +575,7 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], sho
 
     // TODO: Handle context lines (-A, -B, -C) if needed
 
-    let result: Vec<String> = matches.into_iter().map(|(_, s)| s).collect();
-
-    // Generate header if not quiet
-    let header = if opts.quiet {
-        None
-    } else {
-        Some("================ Recall start ================".to_string())
-    };
-
-    (result, header)
+    matches.into_iter().map(|(_, s)| s).collect()
 }
 
 /// Check if a line matches any action triggers.

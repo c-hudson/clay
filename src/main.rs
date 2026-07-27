@@ -2387,10 +2387,6 @@ const MAX_LINE_LENGTH: usize = 10_000;
 /// one world fully, so a world with deep history doesn't block others from filling.
 const BACKFILL_PHASE2_CHUNK_SIZE: usize = 200;
 
-/// Footer line printed after non-quiet /recall output, shared by every emitter
-/// via `App::emit_recall`.
-const RECALL_END_BANNER: &str = "================= Recall end =================";
-
 impl OutputLine {
     /// Truncate text if it exceeds MAX_LINE_LENGTH to prevent performance issues
     fn truncate_if_needed(text: String) -> String {
@@ -6523,14 +6519,14 @@ impl App {
     }
 
     /// Run a /recall against `world_idx`'s history (or the -w/-g/-D source in
-    /// `opts`) and return (matches, header). Shared by `emit_recall` and the
+    /// `opts`) and return the matches. Shared by `emit_recall` and the
     /// `/quote` backtick-recall paths (which need matches but must not
     /// display them — they feed a command list instead).
     pub(crate) fn recall_matches(
         &self,
         opts: &tf::RecallOptions,
         world_idx: usize,
-    ) -> Result<(Vec<String>, Option<String>), String> {
+    ) -> Result<Vec<String>, String> {
         let lines = self.recall_source_lines(opts, world_idx)?;
         Ok(execute_recall(opts, &lines, self.show_tags))
     }
@@ -6542,23 +6538,13 @@ impl App {
     /// -w/-g/-D inside `opts`) and the destination for the rendered output.
     pub(crate) fn emit_recall(&mut self, opts: &tf::RecallOptions, world_idx: usize, is_daemon_mode: bool) {
         let block: Vec<String> = match self.recall_matches(opts, world_idx) {
-            Ok((matches, header)) => {
-                let mut block = Vec::with_capacity(matches.len() + 2);
-                if !opts.quiet {
-                    if let Some(h) = header {
-                        block.push(h);
-                    }
-                }
+            Ok(matches) => {
                 if matches.is_empty() {
                     let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                    block.push(format!("No matches for '{}'", pattern_str));
+                    vec![format!("No matches for '{}'", pattern_str)]
                 } else {
-                    block.extend(matches);
+                    matches
                 }
-                if !opts.quiet {
-                    block.push(RECALL_END_BANNER.to_string());
-                }
-                block
             }
             Err(e) => vec![e],
         };
@@ -8851,7 +8837,7 @@ impl App {
         if let Some((opts, recall_prefix)) = recall_opts {
             if world_index < self.worlds.len() {
                 match self.recall_matches(&opts, world_index) {
-                    Ok((matches, _header)) => {
+                    Ok(matches) => {
                         lines = matches.iter()
                             .map(|line| {
                                 let raw = format!("{}{}", recall_prefix, line);

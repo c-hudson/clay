@@ -1842,13 +1842,13 @@
         let opts = recall_opts_for_alpha();
         app.emit_recall(&opts, 0, false);
 
-        // Block = 1 header + 100 matches + 1 footer = 102 rows of 1 visual
-        // line each, max_lines = 10: rows 1-10 fill the budget, row 11 trips
-        // triggers_pause (still shown), rows 12-102 divert to pending.
+        // Block = 100 matches, 1 visual line each, max_lines = 10: rows 1-10
+        // fill the budget, row 11 trips triggers_pause (still shown), rows
+        // 12-100 divert to pending.
         assert!(app.worlds[0].paused, "should be paused once /recall output exceeds a screenful");
         assert_eq!(app.worlds[0].lines_since_pause, 11);
         assert_eq!(app.worlds[0].output_lines.len(), 100 + 11);
-        assert_eq!(app.worlds[0].pending_lines.len(), 91);
+        assert_eq!(app.worlds[0].pending_lines.len(), 89);
 
         // The bug this guards against: pre-fix, the WS/daemon arms broadcast
         // one ServerData per matched line and never sent PendingLinesUpdate,
@@ -1857,7 +1857,7 @@
         let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
         assert_eq!(server_data_count, 1, "the visible portion of a /recall block must be a single broadcast");
         assert!(
-            log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { world_index: 0, count: 91 })),
+            log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { world_index: 0, count: 89 })),
             "must broadcast PendingLinesUpdate so remote/web/GUI clients know to pause"
         );
     }
@@ -1880,7 +1880,7 @@
 
         assert!(!app.worlds[0].paused);
         assert!(app.worlds[0].pending_lines.is_empty());
-        assert_eq!(app.worlds[0].output_lines.len(), 100 + 102);
+        assert_eq!(app.worlds[0].output_lines.len(), 100 + 100);
 
         let log = app.ws_broadcast_log.lock().unwrap();
         let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
@@ -1913,14 +1913,14 @@
         let opts = recall_opts_for_alpha();
         app.emit_recall(&opts, 0, false);
 
-        assert_eq!(app.worlds[0].pending_lines.len(), 102, "entire block should divert to pending");
+        assert_eq!(app.worlds[0].pending_lines.len(), 100, "entire block should divert to pending");
         assert_eq!(app.worlds[0].output_lines.len(), 100, "no /recall lines should reach output_lines");
 
         let log = app.ws_broadcast_log.lock().unwrap();
         let server_data_count = log.iter().filter(|m| matches!(m, WsMessage::ServerData { .. })).count();
         assert_eq!(server_data_count, 0, "nothing landed in output_lines, so nothing should broadcast");
         assert!(
-            log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { world_index: 0, count: 102 })),
+            log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { world_index: 0, count: 100 })),
             "pending count changed and must still be announced"
         );
     }
