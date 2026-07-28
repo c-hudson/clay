@@ -91,6 +91,19 @@ webkit2gtk = { version = "2.0", optional = true }
 gdk = { version = "0.18", optional = true }
 gtk = { version = "0.18", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Used only to probe whether the AT-SPI accessibility bus is reachable before
+# GTK's atk-bridge loads (see webview_gui.rs::disable_a11y_bridge_if_broken) -
+# both already resolved transitively via gtk, this just lets us call them
+# directly.
+gio = { version = "0.18", optional = true }
+glib = { version = "0.18", optional = true }
+# dbind (the library GTK's atk-bridge actually uses to find the AT-SPI bus)
+# resolves the address primarily from an X11 root-window property, not from
+# asking the session D-Bus - see webview_gui.rs::a11y_bus_address_x11. Pure
+# Rust XCB client, no libX11 linkage needed.
+x11rb = { version = "0.14", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Audio playback (uses CoreAudio on macOS automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav", "mp3", "vorbis", "flac"] }
@@ -113,7 +126,7 @@ default = ["rustls-backend", "native-audio", "ssh-transport"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
 native-audio = ["rodio"]
-webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk"]
+webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk", "gio", "glib", "x11rb"]
 ssh-transport = ["russh"]
 
 [[bin]]

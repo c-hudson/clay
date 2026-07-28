@@ -156,6 +156,134 @@ fn set_software_render_env_vars() {
     std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
 }
 
+/// Read the AT-SPI bus address from the X11 root-window `AT_SPI_BUS`
+/// property. This - not the `org.a11y.Bus` session-D-Bus service - is what
+/// `dbind` (the library GTK's atk-bridge actually uses) checks first: it
+/// needs to find the bus before the session D-Bus is necessarily even up.
+/// On a shared X server this property is a single global slot, so whichever
+/// `at-spi-bus-launcher` set it last wins for *every* client on that
+/// display, regardless of which user's own bus is actually reachable - e.g.
+/// a stray root-owned launcher (leftover from a `sudo`'d GUI app sharing the
+/// display) can leave every other user pointed at a socket only root can
+/// open. Returns `None` for a Wayland-only session, no X connection, or no
+/// property (nothing has ever claimed it on that display).
+#[cfg(target_os = "linux")]
+fn a11y_bus_address_x11() -> Option<String> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+
+    if std::env::var("DISPLAY").map(|v| v.is_empty()).unwrap_or(true) {
+        return None;
+    }
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen_num)?.root;
+    // only_if_exists=true: if no client has ever interned this atom name,
+    // the property was certainly never set either.
+    let atom = conn.intern_atom(true, b"AT_SPI_BUS").ok()?.reply().ok()?.atom;
+    if atom == x11rb::NONE {
+        return None;
+    }
+    let reply = conn
+        .get_property(false, root, atom, AtomEnum::ANY, 0, u32::MAX)
+        .ok()?
+        .reply()
+        .ok()?;
+    let addr = String::from_utf8(reply.value).ok()?;
+    if addr.is_empty() {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
+/// Resolve the AT-SPI accessibility bus address the same way at-spi2-atk
+/// itself does, in the same priority order: an explicit `AT_SPI_BUS_ADDRESS`
+/// override, then the X11 root-window property (`a11y_bus_address_x11`),
+/// then the session bus's `org.a11y.Bus` service (the Wayland-only /
+/// no-property fallback). Returns `None` if all three are unavailable -
+/// meaning the bridge couldn't have connected either.
+#[cfg(target_os = "linux")]
+fn a11y_bus_address() -> Option<String> {
+    if let Ok(addr) = std::env::var("AT_SPI_BUS_ADDRESS") {
+        if !addr.is_empty() {
+            return Some(addr);
+        }
+    }
+    if let Some(addr) = a11y_bus_address_x11() {
+        return Some(addr);
+    }
+    let session = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
+    let reply = session
+        .call_sync(
+            Some("org.a11y.Bus"),
+            "/org/a11y/bus",
+            "org.a11y.Bus",
+            "GetAddress",
+            None,
+            Some(glib::VariantTy::new("(s)").ok()?),
+            gio::DBusCallFlags::NONE,
+            1000, // ms - an unresponsive session bus must not hang startup
+            gio::Cancellable::NONE,
+        )
+        .ok()?;
+    let (addr,): (String,) = reply.get()?;
+    if addr.is_empty() {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
+/// True if the resolved a11y bus address can actually be connected to.
+#[cfg(target_os = "linux")]
+fn a11y_bus_reachable() -> bool {
+    let Some(addr) = a11y_bus_address() else {
+        return false;
+    };
+    gio::DBusConnection::for_address_sync(
+        &addr,
+        gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
+            | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+        None,
+        gio::Cancellable::NONE,
+    )
+    .is_ok()
+}
+
+/// Pure decision for `disable_a11y_bridge_if_broken()`, split out so it's
+/// unit-testable without a session bus.
+#[cfg(target_os = "linux")]
+fn should_disable_a11y_bridge(user_configured: bool, bus_reachable: bool) -> bool {
+    !user_configured && !bus_reachable
+}
+
+/// Works around a NULL-deref crash (SIGSEGV in `spi_register_object_to_path`)
+/// in at-spi2-atk's GTK accessibility bridge, which some systems hit when the
+/// a11y bus it resolves is unreachable (e.g. owned by a different user - the
+/// bridge logs a `dbind-WARNING` for the failed connect but then dereferences
+/// the NULL bus anyway instead of just disabling itself). That's an upstream
+/// bug we can't fix, so we detect the broken case ourselves and pre-empt it
+/// with the same escape hatch GTK already documents: `NO_AT_BRIDGE=1` (GTK3,
+/// what actually silences the bridge here) and `GTK_A11Y=none` (GTK4-forward,
+/// set for the same reason). Must run before GTK initializes - i.e. before
+/// `EventLoopBuilder::build()` - or the bridge has already loaded.
+///
+/// Never overrides a value the user already set for either variable: if
+/// they've deliberately forced the bridge on or off, that wins regardless of
+/// what the probe finds. Otherwise every failure mode of the probe (no
+/// session bus, no `org.a11y.Bus` service, unreachable socket) is a case
+/// where the bridge could not have worked anyway, so disabling it is always
+/// safe on a healthy system it still leaves accessibility untouched.
+#[cfg(target_os = "linux")]
+fn disable_a11y_bridge_if_broken() {
+    let user_configured =
+        std::env::var("NO_AT_BRIDGE").is_ok() || std::env::var("GTK_A11Y").is_ok();
+    if should_disable_a11y_bridge(user_configured, a11y_bus_reachable()) {
+        std::env::set_var("NO_AT_BRIDGE", "1");
+        std::env::set_var("GTK_A11Y", "none");
+    }
+}
+
 /// Master mode: run App headlessly with a local WebSocket, open WebView window
 pub fn run_master_webgui() -> io::Result<()> {
 
@@ -192,6 +320,7 @@ pub fn run_master_webgui() -> io::Result<()> {
         if std::env::var(crate::platform::GUI_SOFTWARE_FALLBACK_ENV).is_ok() {
             set_software_render_env_vars();
         }
+        disable_a11y_bridge_if_broken();
     }
 
     // Read the configured HTTP port from settings (default 9000)
@@ -349,6 +478,7 @@ pub fn run_remote_webgui(addr: &str, ssh: Option<crate::ssh::SshTarget>) -> io::
         if std::env::var(crate::platform::GUI_SOFTWARE_FALLBACK_ENV).is_ok() {
             set_software_render_env_vars();
         }
+        disable_a11y_bridge_if_broken();
     }
 
     // --ssh: the remote clay_port is only reachable through the SSH tunnel, never
@@ -1476,5 +1606,44 @@ mod tests {
         assert_eq!(std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").as_deref(), Ok("1"));
         assert_eq!(std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").as_deref(), Ok("1"));
         assert_eq!(std::env::var("LIBGL_ALWAYS_SOFTWARE").as_deref(), Ok("1"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_should_disable_a11y_bridge_truth_table() {
+        // Guards the at-spi2-atk NULL-deref workaround (see
+        // disable_a11y_bridge_if_broken): only disable the bridge when the user
+        // hasn't configured it themselves AND the bus genuinely can't be reached.
+        assert!(should_disable_a11y_bridge(false, false)); // broken, no user override -> disable
+        assert!(!should_disable_a11y_bridge(false, true)); // healthy -> leave it alone
+        assert!(!should_disable_a11y_bridge(true, false)); // user override wins even if broken
+        assert!(!should_disable_a11y_bridge(true, true)); // user override wins when healthy too
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_disable_a11y_bridge_if_broken_respects_user_override() {
+        // A user who already set either variable must never be overridden,
+        // regardless of what the live bus probe would otherwise find.
+        let saved_no_at_bridge = std::env::var("NO_AT_BRIDGE").ok();
+        let saved_gtk_a11y = std::env::var("GTK_A11Y").ok();
+
+        std::env::set_var("NO_AT_BRIDGE", "user-set-sentinel");
+        std::env::remove_var("GTK_A11Y");
+
+        disable_a11y_bridge_if_broken();
+
+        assert_eq!(std::env::var("NO_AT_BRIDGE").as_deref(), Ok("user-set-sentinel"));
+        assert!(std::env::var("GTK_A11Y").is_err());
+
+        // Restore whatever was there before this test ran.
+        match saved_no_at_bridge {
+            Some(v) => std::env::set_var("NO_AT_BRIDGE", v),
+            None => std::env::remove_var("NO_AT_BRIDGE"),
+        }
+        match saved_gtk_a11y {
+            Some(v) => std::env::set_var("GTK_A11Y", v),
+            None => std::env::remove_var("GTK_A11Y"),
+        }
     }
 }
