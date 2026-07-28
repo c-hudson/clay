@@ -12489,8 +12489,8 @@ async fn main() -> io::Result<()> {
         unsafe { WSAStartup(0x0202, &mut wsa_data); }
     }
 
-    // Remove any leftover .old exe from a previous self-update on Windows.
-    #[cfg(target_os = "windows")]
+    // Remove any leftover .old exe from a previous self-update.
+    #[cfg(not(target_os = "android"))]
     platform::cleanup_old_exe();
 
     // =========================================================================
@@ -14027,86 +14027,19 @@ pub async fn run_app_headless(
                     AppEvent::UpdateResult(result) => {
                         match result {
                             Ok(success) => {
-                                #[cfg(all(unix, not(target_os = "android")))]
-                                {
-                                    match get_executable_path() {
-                                        Ok((exe_path, _)) => {
-                                            use std::os::unix::fs::PermissionsExt;
-                                            if let Err(e) = std::fs::set_permissions(
-                                                &success.temp_path,
-                                                std::fs::Permissions::from_mode(0o755),
-                                            ) {
-                                                app.add_output(&format!("Failed to set permissions: {}", e));
-                                                let _ = std::fs::remove_file(&success.temp_path);
-                                            } else if let Err(e) = std::fs::rename(&success.temp_path, &exe_path) {
-                                                // rename may fail cross-device; fallback to copy
-                                                match std::fs::copy(&success.temp_path, &exe_path) {
-                                                    Ok(_) => {
-                                                        let _ = std::fs::remove_file(&success.temp_path);
-                                                        app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
-                                                        app.ws_broadcast(WsMessage::ServerReloading);
-                                                        exec_reload(&mut app)?;
-                                                        return Ok(());
-                                                    }
-                                                    Err(e2) => {
-                                                        app.add_output(&format!("Failed to install update: {} (rename: {})", e2, e));
-                                                        let _ = std::fs::remove_file(&success.temp_path);
-                                                    }
-                                                }
-                                            } else {
-                                                app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
-                                                app.ws_broadcast(WsMessage::ServerReloading);
-                                                exec_reload(&mut app)?;
-                                                return Ok(());
-                                            }
-                                        }
-                                        Err(e) => {
-                                            app.add_output(&format!("Cannot find current binary: {}", e));
-                                            let _ = std::fs::remove_file(&success.temp_path);
-                                        }
+                                #[cfg(not(target_os = "android"))]
+                                match platform::install_update(&success.temp_path) {
+                                    Ok(()) => {
+                                        app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
+                                        app.ws_broadcast(WsMessage::ServerReloading);
+                                        exec_reload(&mut app)?;
+                                        return Ok(());
+                                    }
+                                    Err(e) => {
+                                        app.add_output(&e);
                                     }
                                 }
-                                #[cfg(target_os = "windows")]
-                                {
-                                    match get_executable_path() {
-                                        Ok((exe_path, _)) => {
-                                            let old_path = exe_path.with_extension("exe.old");
-                                            // Rename the running exe out of the way (Windows won't let
-                                            // us overwrite an open file, but we can rename it).
-                                            match std::fs::rename(&exe_path, &old_path) {
-                                                Err(e) => {
-                                                    app.add_output(&format!("Failed to prepare update (rename to .old): {}", e));
-                                                    let _ = std::fs::remove_file(&success.temp_path);
-                                                }
-                                                Ok(()) => {
-                                                    // Put the new binary at the original path.
-                                                    let install_result = std::fs::rename(&success.temp_path, &exe_path)
-                                                        .or_else(|_| std::fs::copy(&success.temp_path, &exe_path).map(|_| ()));
-                                                    match install_result {
-                                                        Ok(()) => {
-                                                            let _ = std::fs::remove_file(&success.temp_path);
-                                                            app.add_output(&format!("Updated to Clay v{} \u{2014} reloading...", success.version));
-                                                            app.ws_broadcast(WsMessage::ServerReloading);
-                                                            exec_reload(&mut app)?;
-                                                            return Ok(());
-                                                        }
-                                                        Err(e) => {
-                                                            // Roll back: restore the original exe
-                                                            let _ = std::fs::rename(&old_path, &exe_path);
-                                                            app.add_output(&format!("Failed to install update: {}", e));
-                                                            let _ = std::fs::remove_file(&success.temp_path);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            app.add_output(&format!("Cannot find current binary: {}", e));
-                                            let _ = std::fs::remove_file(&success.temp_path);
-                                        }
-                                    }
-                                }
-                                #[cfg(not(any(all(unix, not(target_os = "android")), target_os = "windows")))]
+                                #[cfg(target_os = "android")]
                                 {
                                     app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
                                 }
@@ -16433,91 +16366,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::UpdateResult(result) => {
                         match result {
                             Ok(success) => {
-                                #[cfg(all(unix, not(target_os = "android")))]
-                                {
-                                    match get_executable_path() {
-                                        Ok((exe_path, _)) => {
-                                            use std::os::unix::fs::PermissionsExt;
-                                            if let Err(e) = std::fs::set_permissions(
-                                                &success.temp_path,
-                                                std::fs::Permissions::from_mode(0o755),
-                                            ) {
-                                                app.add_output(&format!("Failed to set permissions: {}", e));
-                                                let _ = std::fs::remove_file(&success.temp_path);
-                                            } else if let Err(e) = std::fs::rename(&success.temp_path, &exe_path) {
-                                                match std::fs::copy(&success.temp_path, &exe_path) {
-                                                    Ok(_) => {
-                                                        let _ = std::fs::remove_file(&success.temp_path);
-                                                        app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
-                                                        app.ws_broadcast(WsMessage::ServerReloading);
-                                                        let _ = crossterm::terminal::disable_raw_mode();
-                                                        let _ = crossterm::execute!(
-                                                            std::io::stdout(),
-                                                            crossterm::terminal::LeaveAlternateScreen
-                                                        );
-                                                        exec_reload(&mut app)?;
-                                                        return Ok(());
-                                                    }
-                                                    Err(e2) => {
-                                                        app.add_output(&format!("Failed to install update: {} (rename: {})", e2, e));
-                                                        let _ = std::fs::remove_file(&success.temp_path);
-                                                    }
-                                                }
-                                            } else {
-                                                app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
-                                                app.ws_broadcast(WsMessage::ServerReloading);
-                                                let _ = crossterm::terminal::disable_raw_mode();
-                                                let _ = crossterm::execute!(
-                                                    std::io::stdout(),
-                                                    crossterm::terminal::LeaveAlternateScreen
-                                                );
-                                                exec_reload(&mut app)?;
-                                                return Ok(());
-                                            }
-                                        }
-                                        Err(e) => {
-                                            app.add_output(&format!("Cannot find current binary: {}", e));
-                                            let _ = std::fs::remove_file(&success.temp_path);
-                                        }
+                                #[cfg(not(target_os = "android"))]
+                                match platform::install_update(&success.temp_path) {
+                                    Ok(()) => {
+                                        app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
+                                        app.ws_broadcast(WsMessage::ServerReloading);
+                                        let _ = crossterm::terminal::disable_raw_mode();
+                                        let _ = crossterm::execute!(
+                                            std::io::stdout(),
+                                            crossterm::terminal::LeaveAlternateScreen
+                                        );
+                                        exec_reload(&mut app)?;
+                                        return Ok(());
+                                    }
+                                    Err(e) => {
+                                        app.add_output(&e);
                                     }
                                 }
-                                #[cfg(target_os = "windows")]
-                                {
-                                    match get_executable_path() {
-                                        Ok((exe_path, _)) => {
-                                            let old_path = exe_path.with_extension("exe.old");
-                                            match std::fs::rename(&exe_path, &old_path) {
-                                                Err(e) => {
-                                                    app.add_output(&format!("Failed to prepare update (rename to .old): {}", e));
-                                                    let _ = std::fs::remove_file(&success.temp_path);
-                                                }
-                                                Ok(()) => {
-                                                    let install_result = std::fs::rename(&success.temp_path, &exe_path)
-                                                        .or_else(|_| std::fs::copy(&success.temp_path, &exe_path).map(|_| ()));
-                                                    match install_result {
-                                                        Ok(()) => {
-                                                            let _ = std::fs::remove_file(&success.temp_path);
-                                                            app.add_output(&format!("Updated to Clay v{} \u{2014} reloading...", success.version));
-                                                            app.ws_broadcast(WsMessage::ServerReloading);
-                                                            exec_reload(&mut app)?;
-                                                            return Ok(());
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = std::fs::rename(&old_path, &exe_path);
-                                                            app.add_output(&format!("Failed to install update: {}", e));
-                                                            let _ = std::fs::remove_file(&success.temp_path);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            app.add_output(&format!("Cannot find current binary: {}", e));
-                                            let _ = std::fs::remove_file(&success.temp_path);
-                                        }
-                                    }
-                                }
-                                #[cfg(not(any(all(unix, not(target_os = "android")), target_os = "windows")))]
+                                #[cfg(target_os = "android")]
                                 {
                                     app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
                                 }
@@ -17021,9 +16887,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::Sigusr1Received => {}
                 AppEvent::UpdateResult(result) => {
                     match result {
-                        Ok(_success) => {
-                            app.add_output("Update downloaded but reload is not supported in daemon mode.");
-                            let _ = std::fs::remove_file(&_success.temp_path);
+                        Ok(success) => {
+                            // Live reload isn't wired up on this path (multiuser/headless
+                            // event loop) — install the binary so it's in place, but
+                            // report that a manual restart is needed rather than
+                            // exec_reload-ing out from under any connected clients.
+                            #[cfg(not(target_os = "android"))]
+                            match platform::install_update(&success.temp_path) {
+                                Ok(()) => app.add_output(&format!(
+                                    "Updated to Clay v{} — restart to apply.",
+                                    success.version
+                                )),
+                                Err(e) => app.add_output(&e),
+                            }
+                            #[cfg(target_os = "android")]
+                            {
+                                app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
+                            }
                         }
                         Err(e) => { app.add_output(&e); }
                     }

@@ -1300,39 +1300,12 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                 if let Some(result) = result {
                     match result {
                         Ok(success) => {
-                            #[cfg(all(unix, not(target_os = "android")))]
-                            {
-                                match get_executable_path() {
-                                    Ok((exe_path, _)) => {
-                                        use std::os::unix::fs::PermissionsExt;
-                                        if let Err(e) = std::fs::set_permissions(
-                                            &success.temp_path,
-                                            std::fs::Permissions::from_mode(0o755),
-                                        ) {
-                                            app.add_output(&format!("Failed to set permissions: {}", e));
-                                            let _ = std::fs::remove_file(&success.temp_path);
-                                        } else if let Err(e) = std::fs::rename(&success.temp_path, &exe_path) {
-                                            match std::fs::copy(&success.temp_path, &exe_path) {
-                                                Ok(_) => {
-                                                    let _ = std::fs::remove_file(&success.temp_path);
-                                                    app.add_output(&format!("Updated to Clay v{} — please restart.", success.version));
-                                                }
-                                                Err(e2) => {
-                                                    app.add_output(&format!("Failed to install update: {} (rename: {})", e2, e));
-                                                    let _ = std::fs::remove_file(&success.temp_path);
-                                                }
-                                            }
-                                        } else {
-                                            app.add_output(&format!("Updated to Clay v{} — please restart.", success.version));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        app.add_output(&format!("Cannot find current binary: {}", e));
-                                        let _ = std::fs::remove_file(&success.temp_path);
-                                    }
-                                }
+                            #[cfg(not(target_os = "android"))]
+                            match install_update(&success.temp_path) {
+                                Ok(()) => app.add_output(&format!("Updated to Clay v{} — please restart.", success.version)),
+                                Err(e) => app.add_output(&e),
                             }
-                            #[cfg(not(all(unix, not(target_os = "android"))))]
+                            #[cfg(target_os = "android")]
                             {
                                 app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
                             }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
-#[cfg(any(all(unix, not(target_os = "android")), windows))]
+#[cfg(not(target_os = "android"))]
 use std::path::Path;
 
 use tokio::net::TcpStream;
@@ -1239,6 +1239,15 @@ pub fn get_executable_path() -> io::Result<(PathBuf, String)> {
     Ok((exe, debug_info))
 }
 
+/// Fallback for any target that is neither Unix (non-Android) nor Windows.
+/// Keeps `install_update`/`cleanup_old_exe`/`update_staging_path` compiling
+/// (and erroring cleanly at runtime) instead of requiring every caller to
+/// special-case an exotic platform.
+#[cfg(not(any(all(unix, not(target_os = "android")), windows, target_os = "android")))]
+pub fn get_executable_path() -> io::Result<(PathBuf, String)> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "self-update is not supported on this platform"))
+}
+
 /// Get the correct GitHub release asset name for this platform.
 /// These names must match exactly what the /release skill uploads to GitHub.
 #[cfg(not(target_os = "android"))]
@@ -1277,14 +1286,43 @@ fn is_platform_asset_candidate(name: &str) -> bool {
     { let _ = name; false }
 }
 
-/// Clean up any leftover `.old` file from a previous Windows self-replace.
-/// Called once at startup on Windows; silently ignored if the file doesn't exist.
-#[cfg(target_os = "windows")]
+/// Path used to stash the previous executable during an install, one directory
+/// entry away from a live rename-aside. Built by appending ".old" to the full
+/// path (not `with_extension`, which would clobber a version-like final
+/// component such as "clay.1.4.3" down to "clay.1.4.old").
+#[cfg(not(target_os = "android"))]
+fn old_exe_path(exe_path: &Path) -> PathBuf {
+    let mut name = exe_path.as_os_str().to_os_string();
+    name.push(".old");
+    PathBuf::from(name)
+}
+
+/// Clean up any leftover `.old` file from a previous self-replace.
+/// Called once at startup; silently ignored if the file doesn't exist. Matters
+/// most on Windows (where the old binary can't be removed while still running,
+/// so it's left for next startup), but a Unix install that died between the
+/// rename-aside and the final rename can leave one too.
+#[cfg(not(target_os = "android"))]
 pub fn cleanup_old_exe() {
     if let Ok((exe_path, _)) = get_executable_path() {
-        let old_path = exe_path.with_extension("exe.old");
+        let old_path = old_exe_path(&exe_path);
         let _ = std::fs::remove_file(&old_path);
     }
+}
+
+/// Directory + filename to stage an update download in: always the same
+/// directory as the running binary, so the final install step is a
+/// same-filesystem rename rather than a cross-device copy. Dot-prefixed
+/// (hidden) and pid-suffixed so concurrent or retried runs never collide on a
+/// predictable name.
+#[cfg(not(target_os = "android"))]
+fn update_staging_path(version: &str) -> Result<PathBuf, String> {
+    let (exe_path, _debug_info) = get_executable_path()
+        .map_err(|e| format!("Cannot find current binary: {}", e))?;
+    let dir = exe_path.parent().ok_or_else(|| {
+        format!("Executable path '{}' has no parent directory", exe_path.display())
+    })?;
+    Ok(dir.join(format!(".clay-update-{}-{}", version, std::process::id())))
 }
 
 /// Compare two semver-style version strings, returns true if remote is newer than current.
@@ -1401,8 +1439,27 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
         .ok_or("No download URL for asset")?;
     let expected_size = asset["size"].as_u64().unwrap_or(0);
 
-    // Download to temp file
-    let temp_path = std::env::temp_dir().join(format!("clay-update-{}", remote_version));
+    // Stage the download in the same directory as the running executable (not
+    // std::env::temp_dir(), which is very often a different filesystem — e.g.
+    // tmpfs `/tmp` vs an ext4 root — making the final install rename fail with
+    // EXDEV). Probe writability now, before spending time on the download: a
+    // create_new() here (O_EXCL, so it can't follow a symlink or reuse an
+    // existing file) proves the directory is writable without leaving anything
+    // behind, since we remove it immediately.
+    let temp_path = update_staging_path(remote_version)?;
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        Err(e) => {
+            let dir = temp_path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+            return Err(format!(
+                "Cannot write to install directory {} — reinstall manually or re-run with elevated privileges ({})",
+                dir, e
+            ));
+        }
+    }
+
     let response = client
         .get(download_url)
         .send()
@@ -1453,14 +1510,132 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
         return Err("Downloaded file is not a valid Windows executable".to_string());
     }
 
-    // Write to temp file
-    std::fs::write(&temp_path, &bytes)
+    // Write to the staged path. create_new() again (rather than plain
+    // fs::write, which would follow a symlink or truncate a pre-existing file)
+    // since the pid+version name should be exclusively ours at this point.
+    {
+        use std::io::Write as _;
+        let mut file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o755)
+                    .open(&temp_path)
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp_path)
+            }
+        }
         .map_err(|e| format!("Failed to write update: {}", e))?;
+
+        if let Err(e) = file.write_all(&bytes) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("Failed to write update: {}", e));
+        }
+    }
 
     Ok(UpdateSuccess {
         version: remote_version.to_string(),
         temp_path,
     })
+}
+
+/// Atomically replace the running executable with an already-downloaded,
+/// already-validated binary staged in the same directory (see
+/// `update_staging_path` / `check_and_download_update`). Shared by every
+/// interface (console TUI, WebView GUI, remote console, daemon) so there is
+/// exactly one install sequence to get right. Callers already hold the
+/// version string (from `UpdateSuccess`) for their own success message, so it
+/// isn't threaded through here.
+///
+/// On any error, the staged file is removed and the original executable is
+/// left in place (rolled back if the rename-aside already happened).
+#[cfg(not(target_os = "android"))]
+pub fn install_update(temp_path: &Path) -> Result<(), String> {
+    let (exe_path, _debug_info) = get_executable_path()
+        .map_err(|e| format!("Cannot find current binary: {}", e))?;
+    let result = install_update_at(temp_path, &exe_path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp_path);
+    }
+    result
+}
+
+/// Core replace logic, taking an explicit target path so tests can exercise
+/// it against a scratch file instead of the live binary.
+///
+/// Deliberately **not** unified across Unix and Windows — an earlier version
+/// of this used the same rename-aside-then-replace sequence on both and it
+/// broke reload on Linux: `get_executable_path()` resolves `/proc/self/exe`
+/// and strips a trailing " (deleted)", which only recovers the right path
+/// when the *new* binary lands at the exe's original name. Renaming the
+/// running exe to `exe.old` first moves the running process's own dentry to
+/// `exe.old`, so `/proc/self/exe` then reports `exe.old (deleted)` once that
+/// file is unlinked — `exec_reload` then goes looking for a binary that no
+/// longer exists. See the caught-by-live-testing note in the fix's plan.
+///
+/// - **Unix**: a single direct `rename(temp, exe)`. Same directory as `exe`
+///   (see `update_staging_path`), so no EXDEV; renaming onto a running
+///   executable is explicitly supported on Linux/macOS (it unlinks the old
+///   dirent while the running process keeps its open inode) and keeps
+///   `/proc/self/exe` resolving to the *new* binary at the original name —
+///   no copy-based fallback needed or wanted (copying would truncate a
+///   running executable in place: ETXTBSY on Linux, and not atomic even
+///   where it would succeed).
+/// - **Windows**: rename the running exe aside to `exe.old` first (Windows
+///   won't let a rename land on the currently-open exe path directly), then
+///   place the new binary at the original name, rolling back on failure.
+///   `get_executable_path()` on Windows is `std::env::current_exe()`, which
+///   reflects how the process was launched rather than a live dentry lookup,
+///   so it isn't affected by the intermediate rename the way `/proc/self/exe`
+///   is.
+#[cfg(all(unix, not(target_os = "android")))]
+fn install_update_at(temp_path: &Path, exe_path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(temp_path, std::fs::Permissions::from_mode(0o755)) {
+        return Err(format!("Failed to set permissions: {}", e));
+    }
+    std::fs::rename(temp_path, exe_path)
+        .map_err(|e| format!("Failed to install update: {}", e))
+}
+
+#[cfg(windows)]
+fn install_update_at(temp_path: &Path, exe_path: &Path) -> Result<(), String> {
+    let old_path = old_exe_path(exe_path);
+    // Clean up any stale .old from a previous failed/partial install before we
+    // reuse the name.
+    let _ = std::fs::remove_file(&old_path);
+
+    std::fs::rename(exe_path, &old_path)
+        .map_err(|e| format!("Failed to prepare update (rename to .old): {}", e))?;
+
+    if let Err(e) = std::fs::rename(temp_path, exe_path) {
+        // Roll back: restore the original exe so the running process (and the
+        // next start) still finds a working binary.
+        let _ = std::fs::rename(&old_path, exe_path);
+        return Err(format!("Failed to install update: {}", e));
+    }
+
+    // Best-effort: fails harmlessly while the old binary is still mapped in;
+    // cleanup_old_exe() sweeps it up at next startup.
+    let _ = std::fs::remove_file(&old_path);
+
+    Ok(())
+}
+
+/// Fallback for any target that is neither Unix (non-Android) nor Windows —
+/// mirrors `get_executable_path`'s fallback so `install_update` still
+/// compiles there instead of requiring every caller to special-case it.
+#[cfg(not(any(all(unix, not(target_os = "android")), windows, target_os = "android")))]
+fn install_update_at(_temp_path: &Path, _exe_path: &Path) -> Result<(), String> {
+    Err("self-update is not supported on this platform".to_string())
 }
 
 #[cfg(all(unix, not(target_os = "android")))]
@@ -1864,6 +2039,121 @@ mod tests {
         let found = find_asset(&assets, "clay-windows-x86_64.exe");
         assert_eq!(found.and_then(|a| a["name"].as_str()), Some("clay.exe"),
             "Fallback should pick up old clay.exe even when exact name changed");
+    }
+
+    // -----------------------------------------------------------------
+    // Self-update install (install_update_at / update_staging_path)
+    //
+    // Regression coverage for the "Text file busy" / "Invalid cross-device
+    // link" bug: staging used to go to std::env::temp_dir() (often a
+    // different filesystem than the install dir, e.g. tmpfs /tmp vs an ext4
+    // root), so the final rename hit EXDEV, and the fs::copy fallback then
+    // hit ETXTBSY trying to truncate a running executable in place.
+    // -----------------------------------------------------------------
+
+    /// Scratch directory for these tests, isolated per-test-run by pid so
+    /// concurrent `cargo test` runs never collide.
+    fn install_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("clay-test-install-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_update_staging_path_same_dir_as_exe() {
+        // The regression guard: staging must share a filesystem with the
+        // target executable, which in practice means "same directory".
+        let (exe_path, _) = get_executable_path().expect("current test binary must resolve");
+        let staged = update_staging_path("9.9.9").expect("staging path should resolve");
+        assert_eq!(staged.parent(), exe_path.parent(),
+            "staged file must be in the same directory as the running executable, \
+             not a separate temp filesystem (this is the EXDEV regression)");
+        assert!(staged.file_name().unwrap().to_string_lossy().starts_with('.'),
+            "staging name should be dot-hidden");
+    }
+
+    #[test]
+    fn test_install_update_at_replaces_target() {
+        let dir = install_test_dir("replace");
+        let exe = dir.join("clay");
+        let staged = dir.join(".clay-update-staged");
+        std::fs::write(&exe, b"old binary contents").unwrap();
+        std::fs::write(&staged, b"new binary contents").unwrap();
+
+        install_update_at(&staged, &exe).expect("install should succeed");
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new binary contents");
+        assert!(!staged.exists(), "staged file must be gone after a successful install");
+        assert!(!old_exe_path(&exe).exists(), "no .old file should remain after success");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "installed binary should be executable");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_update_at_rolls_back_on_failure() {
+        // Force the second rename (temp -> exe) to fail by making the
+        // directory read-only after the rename-aside step would normally
+        // succeed. Simplest reliable way: make exe's parent dir read-only,
+        // which blocks the rename(2) that would remove/replace the `exe`
+        // directory entry (rename requires write permission on both parent
+        // directories involved).
+        let dir = install_test_dir("rollback");
+        let exe = dir.join("clay");
+        let staged = dir.join(".clay-update-staged");
+        std::fs::write(&exe, b"original contents").unwrap();
+        std::fs::write(&staged, b"new contents").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = install_update_at(&staged, &exe);
+
+        // Restore write access so the test harness can clean up regardless of
+        // outcome, before asserting (an assert failure must not leave a
+        // read-only dir behind for the next run).
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_err(), "install should fail when the directory is read-only");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"original contents",
+            "original executable must be restored intact on failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_old_exe_path_appends_not_replaces_extension() {
+        // Regression guard for the with_extension() footgun: with_extension
+        // would turn "clay.1.4.3" into "clay.1.4.old", silently losing part
+        // of the name. Appending ".old" to the whole path avoids that.
+        let versioned = PathBuf::from("/opt/clay/clay.1.4.3");
+        assert_eq!(old_exe_path(&versioned), PathBuf::from("/opt/clay/clay.1.4.3.old"));
+
+        let windows_style = PathBuf::from(r"C:\Users\adrick\clay\clay.exe");
+        assert_eq!(old_exe_path(&windows_style), PathBuf::from(r"C:\Users\adrick\clay\clay.exe.old"));
+    }
+
+    #[test]
+    fn test_staging_create_new_refuses_existing_path() {
+        // Guards the O_EXCL behavior the writability pre-check and final
+        // write both rely on: create_new() must refuse a path that already
+        // exists rather than silently truncating/following it.
+        let dir = install_test_dir("excl");
+        let path = dir.join("already-here");
+        std::fs::write(&path, b"pre-existing").unwrap();
+
+        let result = std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
+        assert!(result.is_err(), "create_new must refuse a pre-existing file");
+        assert_eq!(std::fs::read(&path).unwrap(), b"pre-existing",
+            "the pre-existing file must be untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------

@@ -1063,7 +1063,10 @@ fn dispatch_ipc_message(
                 let result = rt.block_on(crate::platform::check_and_download_update(force));
                 match result {
                     Ok(success) => {
-                        let msg = install_update(&success.temp_path, &success.version);
+                        let msg = match crate::platform::install_update(&success.temp_path) {
+                            Ok(()) => format!("Updated to Clay v{} — reloading...", success.version),
+                            Err(e) => e,
+                        };
                         let is_success = msg.starts_with("Updated to");
                         let _ = proxy_clone.send_event(WvEvent::UpdateStatus(msg));
                         if is_success {
@@ -1532,58 +1535,6 @@ fn create_webview_window(
             _ => {}
         }
     });
-}
-
-/// Install a downloaded update binary, returning a status message
-#[cfg(not(target_os = "android"))]
-fn install_update(temp_path: &std::path::Path, version: &str) -> String {
-    // Get current executable path
-    let exe_path = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = std::fs::remove_file(temp_path);
-            return format!("Cannot find current binary: {}", e);
-        }
-    };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(temp_path, std::fs::Permissions::from_mode(0o755)) {
-            let _ = std::fs::remove_file(temp_path);
-            return format!("Failed to set permissions: {}", e);
-        }
-    }
-
-    // Try rename first, fall back to copy (may fail cross-device)
-    if let Err(e) = std::fs::rename(temp_path, &exe_path) {
-        match std::fs::copy(temp_path, &exe_path) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(temp_path);
-            }
-            Err(e2) => {
-                // On Windows, can't overwrite running exe — try rename-and-replace
-                #[cfg(windows)]
-                {
-                    let old_path = exe_path.with_extension("exe.old");
-                    let _ = std::fs::remove_file(&old_path); // clean up previous .old
-                    if std::fs::rename(&exe_path, &old_path).is_ok() {
-                        if let Err(e3) = std::fs::rename(temp_path, &exe_path) {
-                            // Restore the old binary
-                            let _ = std::fs::rename(&old_path, &exe_path);
-                            let _ = std::fs::remove_file(temp_path);
-                            return format!("Failed to install update: {}", e3);
-                        }
-                        return format!("Updated to Clay v{} — reloading...", version);
-                    }
-                }
-                let _ = std::fs::remove_file(temp_path);
-                return format!("Failed to install update: {} (rename: {})", e2, e);
-            }
-        }
-    }
-
-    format!("Updated to Clay v{} — reloading...", version)
 }
 
 #[cfg(all(test, unix, not(target_os = "macos")))]
