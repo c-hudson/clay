@@ -1376,6 +1376,96 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     KeyAction::None
 }
 
+/// Sanitize pasted text for a target field: normalize CRLF/CR to LF, drop other
+/// control characters, and either keep line breaks (multi-line targets) or
+/// collapse each into a single space (single-line targets, so the whole paste
+/// stays visible and editable on one line instead of silently losing everything
+/// after the first line break).
+fn sanitize_paste(text: &str, keep_newlines: bool) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .map(|c| if c == '\n' && !keep_newlines { ' ' } else { c })
+        .collect()
+}
+
+/// Route a bracketed-paste event to whichever widget currently has focus,
+/// mirroring the priority ladder `handle_key_event` uses for typed characters:
+/// confirm dialog -> split-screen editor -> unified popup -> filter popup ->
+/// search popup -> input area. Text is spliced in directly rather than replayed
+/// as synthetic keystrokes (as the old `Event::Paste` arm did for popups), so a
+/// paste can't be misinterpreted as button hotkeys and doesn't lose embedded
+/// newlines.
+pub(crate) fn handle_paste(app: &mut App, text: &str) {
+    app.last_input_was_delete = false;
+
+    // Confirm dialog first (highest priority, same as handle_key_event) - it has
+    // no text field, so a paste while it's up simply has nothing to do.
+    if app.confirm_dialog.visible {
+        return;
+    }
+
+    // Split-screen editor (before popups, after confirm dialog) - e.g. /note.
+    // If the input side is focused instead, fall through to normal handling
+    // below (including the popup/filter/search checks), same as handle_key_event.
+    if app.editor.visible && app.editor.focus == EditorFocus::Editor {
+        app.editor.insert_str(&sanitize_paste(text, true));
+        let visible_lines = app.output_height.saturating_sub(2) as usize;
+        let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+        app.editor.ensure_cursor_visible(visible_lines, editor_width);
+        return;
+    }
+
+    // Unified popup system (world editor, action editor, etc.).
+    if app.has_new_popup() {
+        if let Some(state) = app.popup_manager.current_mut() {
+            if state.is_editing_text() {
+                let is_multiline = state.selected_field()
+                    .map(|f| matches!(&f.kind, popup::FieldKind::MultilineText { .. }))
+                    .unwrap_or(false);
+                state.insert_str(&sanitize_paste(text, is_multiline));
+                if is_multiline {
+                    state.ensure_multiline_cursor_visible();
+                }
+            }
+            // Not editing a text field: ignore. Replaying the paste as
+            // per-character keys here would fire button hotkeys instead.
+        }
+        return;
+    }
+
+    // Filter popup (F4).
+    if app.filter_popup.visible {
+        let clean = sanitize_paste(text, false);
+        app.filter_popup.filter_text.insert_str(app.filter_popup.cursor, &clean);
+        app.filter_popup.cursor += clean.len();
+        let output_lines = app.current_world().output_lines.clone();
+        app.filter_popup.update_filter(&output_lines);
+        app.needs_output_redraw = true;
+        return;
+    }
+
+    // Search popup (F5).
+    if app.search_popup.visible {
+        let clean = sanitize_paste(text, false);
+        app.search_popup.search_text.insert_str(app.search_popup.cursor, &clean);
+        app.search_popup.cursor += clean.len();
+        let output_lines = app.current_world().output_lines.clone();
+        let show_tags = app.show_tags;
+        app.search_popup.update_search(&output_lines, show_tags);
+        if let Some(line_idx) = app.search_popup.current_match_line() {
+            app.current_world_mut().scroll_offset = line_idx;
+        }
+        app.needs_output_redraw = true;
+        return;
+    }
+
+    // Nothing above claimed it: the command line. It's multi-line capable, so
+    // keep literal newlines, same as today's behavior.
+    app.input.insert_str(&sanitize_paste(text, true));
+}
+
 /// Convert our canonical key names to TF's parse_key_name format for /bind lookup.
 pub(crate) fn canonical_to_tf_key_name(name: &str) -> String {
     // Our format -> TF format:

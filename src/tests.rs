@@ -5313,3 +5313,139 @@ if you're more curious.\"";
         assert_eq!(app.settings.actions[0].name, "new");
     }
 
+    // --- handle_paste: paste routed to whichever widget has focus ---
+    // Regression coverage for: pasting into an open /note editor landed in the
+    // command input instead of the note buffer.
+
+    const PASTE_TEST_FIELD_TEXT: popup::FieldId = popup::FieldId(1);
+    const PASTE_TEST_FIELD_MULTI: popup::FieldId = popup::FieldId(2);
+    const PASTE_TEST_BTN_SAVE: popup::ButtonId = popup::ButtonId(1);
+
+    fn paste_test_popup() -> popup::PopupDefinition {
+        popup::PopupDefinition::new(popup::PopupId("paste_test"), "Paste Test")
+            .with_field(popup::Field::new(PASTE_TEST_FIELD_TEXT, "Text", popup::FieldKind::text("")))
+            .with_field(popup::Field::new(PASTE_TEST_FIELD_MULTI, "Multi", popup::FieldKind::multiline("", 3)))
+            .with_button(popup::Button::new(PASTE_TEST_BTN_SAVE, "Save").primary().with_shortcut('s'))
+    }
+
+    #[test]
+    fn test_paste_into_note_editor_when_focused() {
+        let mut app = App::new();
+        app.editor.open_notes(0, "");
+        assert!(matches!(app.editor.focus, EditorFocus::Editor));
+
+        handle_paste(&mut app, "pasted note text");
+
+        assert_eq!(app.editor.buffer, "pasted note text");
+        assert!(app.editor.dirty);
+        assert_eq!(app.input.buffer, "", "paste must not leak into the command line");
+    }
+
+    #[test]
+    fn test_paste_into_editor_input_side_when_focused() {
+        let mut app = App::new();
+        app.editor.open_notes(0, "");
+        app.editor.toggle_focus();
+        assert!(matches!(app.editor.focus, EditorFocus::Input));
+
+        handle_paste(&mut app, "command text");
+
+        assert_eq!(app.editor.buffer, "");
+        assert_eq!(app.input.buffer, "command text");
+    }
+
+    #[test]
+    fn test_paste_multiline_into_note_editor_keeps_newlines() {
+        let mut app = App::new();
+        app.editor.open_notes(0, "");
+
+        handle_paste(&mut app, "line one\nline two");
+
+        assert_eq!(app.editor.buffer, "line one\nline two");
+        assert!(app.editor.cursor_line > 0);
+    }
+
+    #[test]
+    fn test_paste_into_popup_not_editing_is_ignored() {
+        let mut app = App::new();
+        app.popup_manager.open(paste_test_popup());
+        // Selected field, but not in edit mode - matches how a popup sits
+        // between keystrokes.
+        assert!(!app.popup_manager.current().unwrap().editing);
+
+        // Contains the Save button's shortcut ('s'); if this were still replayed
+        // as synthetic keystrokes it would fire Save and close the popup.
+        handle_paste(&mut app, "s");
+
+        let state = app.popup_manager.current().unwrap();
+        assert!(state.visible, "paste while not editing must not trigger button hotkeys");
+        assert_eq!(state.get_text(PASTE_TEST_FIELD_TEXT), Some(""));
+        assert_eq!(app.input.buffer, "", "paste must not fall through to the input area either");
+    }
+
+    #[test]
+    fn test_paste_into_popup_single_line_field_collapses_newlines() {
+        let mut app = App::new();
+        app.popup_manager.open(paste_test_popup());
+        {
+            let state = app.popup_manager.current_mut().unwrap();
+            state.select_field(PASTE_TEST_FIELD_TEXT);
+            state.start_edit();
+        }
+
+        handle_paste(&mut app, "a\nb");
+
+        let state = app.popup_manager.current().unwrap();
+        assert_eq!(state.edit_buffer, "a b");
+    }
+
+    #[test]
+    fn test_paste_into_popup_multiline_field_keeps_newlines() {
+        let mut app = App::new();
+        app.popup_manager.open(paste_test_popup());
+        {
+            let state = app.popup_manager.current_mut().unwrap();
+            state.select_field(PASTE_TEST_FIELD_MULTI);
+            state.start_edit();
+        }
+
+        handle_paste(&mut app, "a\nb");
+
+        let state = app.popup_manager.current().unwrap();
+        assert_eq!(state.edit_buffer, "a\nb");
+    }
+
+    #[test]
+    fn test_paste_into_input_area_when_nothing_focused() {
+        let mut app = App::new();
+
+        handle_paste(&mut app, "line one\nline two");
+
+        assert_eq!(app.input.buffer, "line one\nline two");
+    }
+
+    #[test]
+    fn test_editor_state_insert_str_multibyte() {
+        let mut editor = EditorState::new();
+        editor.open_notes(0, "ab");
+        editor.cursor_position = 1; // between 'a' and 'b'
+
+        editor.insert_str("😀x");
+
+        assert_eq!(editor.buffer, "a😀xb");
+        assert_eq!(editor.cursor_position, 3); // 1 + "😀x".chars().count()
+    }
+
+    #[test]
+    fn test_popup_state_insert_str_multibyte() {
+        let def = paste_test_popup();
+        let mut state = popup::PopupState::new(def);
+        state.select_field(PASTE_TEST_FIELD_TEXT);
+        state.start_edit();
+
+        state.insert_str("😀x");
+
+        assert_eq!(state.edit_buffer, "😀x");
+        assert_eq!(state.edit_cursor, 2); // char count, not byte count
+    }
+

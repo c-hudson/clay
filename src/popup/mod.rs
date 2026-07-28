@@ -1483,6 +1483,21 @@ impl PopupState {
         }
     }
 
+    /// Insert a whole string at the cursor (e.g. a paste) in one pass, rather than
+    /// looping `insert_char` per character. `edit_cursor` is a character index here,
+    /// same convention as `insert_char`.
+    pub fn insert_str(&mut self, s: &str) {
+        if self.editing && !s.is_empty() {
+            let byte_pos = self.edit_buffer
+                .char_indices()
+                .nth(self.edit_cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(self.edit_buffer.len());
+            self.edit_buffer.insert_str(byte_pos, s);
+            self.edit_cursor += s.chars().count();
+        }
+    }
+
     /// Delete character before cursor (backspace)
     pub fn backspace(&mut self) {
         if self.editing && self.edit_cursor > 0 {

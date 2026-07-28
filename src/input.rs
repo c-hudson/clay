@@ -146,6 +146,18 @@ impl InputArea {
         self.history_index = None;
     }
 
+    /// Insert a whole string at the cursor (e.g. a paste) in one pass, rather
+    /// than looping `insert_char` per character.
+    pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.buffer.insert_str(self.cursor_position, s);
+        self.cursor_position += s.len();
+        self.adjust_viewport();
+        self.history_index = None;
+    }
+
     pub fn delete_char(&mut self) {
         if self.cursor_position > 0 {
             // Find the previous character boundary

@@ -783,6 +783,23 @@ impl EditorState {
         self.update_cursor_position();
     }
 
+    /// Insert a whole string at the cursor position in one pass (e.g. a paste) -
+    /// splicing once here is O(n) instead of looping `insert_char` per character,
+    /// which would rebuild the whole buffer each time.
+    pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let pos = self.cursor_position.min(chars.len());
+        let before: String = chars[..pos].iter().collect();
+        let after: String = chars[pos..].iter().collect();
+        self.buffer = format!("{}{}{}", before, s, after);
+        self.cursor_position = pos + s.chars().count();
+        self.dirty = self.buffer != self.original_content;
+        self.update_cursor_position();
+    }
+
     /// Delete character before cursor (backspace)
     pub fn delete_backward(&mut self) {
         if self.cursor_position == 0 {
@@ -15631,25 +15648,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 if let Event::Paste(ref text) = event {
                     // Bracketed paste: entire pasted text arrives as one event.
-                    if app.has_new_popup() {
-                        // Route paste into the active popup field via synthetic key events.
-                        for c in text.chars() {
-                            if !c.is_control() {
-                                let synthetic = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-                                handle_new_popup_key(&mut app, synthetic);
-                            }
-                        }
-                    } else {
-                        for c in text.chars() {
-                            if c == '\n' || c == '\r' {
-                                // Pastes may contain newlines — insert literal newline
-                                app.input.insert_char('\n');
-                            } else if !c.is_control() {
-                                app.input.insert_char(c);
-                            }
-                        }
-                    }
-                    app.last_input_was_delete = false;
+                    // Route it to whichever widget has focus (editor, popup, filter,
+                    // search, or the input area) - same ladder handle_key_event uses.
+                    handle_paste(&mut app, text);
                     // Fall through to the draw at the end of the loop
                 } else if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press { continue; }
