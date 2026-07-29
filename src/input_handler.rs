@@ -37,9 +37,14 @@ pub(crate) fn save_editor_content(app: &mut App) -> KeyAction {
         // Save to world notes
         if world_idx < app.worlds.len() {
             app.worlds[world_idx].settings.notes = app.editor.buffer.clone();
+            let has_notes = !app.worlds[world_idx].settings.notes.is_empty();
             // Save settings to persist notes
             let _ = persistence::save_settings(app);
             app.add_output("Notes saved.");
+            // Tell any web/GUI client viewing this world to update its note
+            // indicator icon — this is the console's own note-save path, so
+            // it's the one place that previously told no one.
+            app.ws_broadcast(WsMessage::NotesChanged { world_index: world_idx, has_notes });
         }
     }
     app.editor.close();

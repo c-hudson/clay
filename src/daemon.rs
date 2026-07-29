@@ -1524,7 +1524,9 @@ pub async fn handle_daemon_ws_message(
         WsMessage::UpdateNote { world_index, notes } => {
             if let Some(world) = app.worlds.get_mut(world_index) {
                 world.settings.notes = notes;
+                let has_notes = !world.settings.notes.is_empty();
                 let _ = persistence::save_settings(app);
+                app.ws_broadcast(WsMessage::NotesChanged { world_index, has_notes });
             }
         }
         WsMessage::RequestConnectionsList => {
@@ -2963,6 +2965,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     keep_alive_cmd: if is_owner { world.settings.keep_alive_cmd.clone() } else { String::new() },
                     gmcp_packages: if is_owner { world.settings.gmcp_packages.clone() } else { String::new() },
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
+                    has_notes: is_owner && !world.settings.notes.is_empty(),
                 },
                 last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),
@@ -3211,7 +3214,12 @@ pub async fn handle_multiuser_ws_message(
             if let Some(world) = app.worlds.get_mut(world_index) {
                 if world.owner.as_ref() == username.as_ref() {
                     world.settings.notes = notes;
+                    let has_notes = !world.settings.notes.is_empty();
+                    let owner = world.owner.clone();
                     let _ = persistence::save_settings(app);
+                    if let Some(ws) = &app.ws_server {
+                        ws.broadcast_to_owner(WsMessage::NotesChanged { world_index, has_notes }, owner.as_deref());
+                    }
                 }
             }
         }

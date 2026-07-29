@@ -59,6 +59,7 @@
         moreCount: document.getElementById('more-count'),
         activityIndicator: document.getElementById('activity-indicator'),
         activityCount: document.getElementById('activity-count'),
+        statusNoteBtn: document.getElementById('status-note-btn'),
         statusScrollback: document.getElementById('status-scrollback'),
         statusScrollbackPct: document.getElementById('status-scrollback-pct'),
         statusTime: document.getElementById('status-time'),
@@ -75,6 +76,7 @@
         noteEditorTitle: document.getElementById('note-editor-title'),
         noteEditorStatus: document.getElementById('note-editor-status'),
         noteEditorSaveBtn: document.getElementById('note-editor-save-btn'),
+        noteEditorCancelBtn: document.getElementById('note-editor-cancel-btn'),
         noteEditorTextarea: document.getElementById('note-editor-textarea'),
         inputContainer: document.getElementById('input-container'),
         prompt: document.getElementById('prompt'),
@@ -2133,6 +2135,16 @@
                     // This avoids duplicate lines when pending is released.
                     // Use server's centralized unseen tracking - don't reset to 0
                     // world.unseen_lines comes from server, keep it as-is
+                    // Same correction switchWorldLocal/user-input/ServerData-flush already
+                    // apply: showing_splash means "no real output yet", so a stale true
+                    // alongside non-empty output_lines (e.g. the server flag never got
+                    // cleared before this client's first connection) must not hide already-
+                    // existing output behind the splash screen (WebView/Android only render
+                    // the splash image, see renderOutput()) until the user happens to switch
+                    // worlds and back.
+                    if (world.showing_splash && world.output_lines && world.output_lines.length > 0) {
+                        world.showing_splash = false;
+                    }
                 });
                 if (msg.settings) {
                     if (msg.settings.input_height) {
@@ -2933,6 +2945,15 @@
                 // Another client (console, web, or GUI) has viewed this world
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].unseen_lines = 0;
+                    updateStatusBar();
+                }
+                break;
+
+            case 'NotesChanged':
+                // Notes for a world were saved (from this client, another
+                // client, or the console) - update the note icon's visibility.
+                if (msg.world_index !== undefined && worlds[msg.world_index] && worlds[msg.world_index].settings) {
+                    worlds[msg.world_index].settings.has_notes = !!msg.has_notes;
                     updateStatusBar();
                 }
                 break;
@@ -4429,24 +4450,11 @@
                 break;
 
             case '/note':
-                // GUI/web /note: opens the current world's notes in a genuine
-                // separate window (native OS window in webview-GUI, a new
-                // browser tab otherwise) — not an in-page modal, not a
-                // shell-out. Only the no-args "current world" form is
-                // supported here; `/note -l` and `/note <file>` remain
-                // console-only (see plan doc for why).
                 if (args.length > 0) {
                     appendClientLine("This form of /note is console-only. Plain /note opens the current world's notes.", currentWorldIndex, 'system');
                     break;
                 }
-                if (!worlds[currentWorldIndex]) break;
-                var notePayload = { world_index: currentWorldIndex, world_name: worlds[currentWorldIndex].name };
-                if (window.WEBVIEW_MODE) {
-                    sendIpc('note-window:' + JSON.stringify(notePayload));
-                } else {
-                    var noteUrl = window.location.origin + basePath() + '/?note=' + currentWorldIndex;
-                    window.open(noteUrl, '_blank');
-                }
+                openNoteEditor();
                 break;
 
             case '/quit':
@@ -4732,6 +4740,23 @@
             return proto + '//' + host + ':' + port;
         }
         return proto + '//' + host;
+    }
+
+    // Opens the current world's notes in a genuine separate window (native OS
+    // window in webview-GUI, a new browser tab otherwise) — not an in-page
+    // modal, not a shell-out. Shared by the /note command and the status-bar
+    // note icon (both should behave identically). Only the no-args "current
+    // world" form is supported here; `/note -l` and `/note <file>` remain
+    // console-only (see plan doc for why).
+    function openNoteEditor() {
+        if (!worlds[currentWorldIndex]) return;
+        var notePayload = { world_index: currentWorldIndex, world_name: worlds[currentWorldIndex].name };
+        if (window.WEBVIEW_MODE) {
+            sendIpc('note-window:' + JSON.stringify(notePayload));
+        } else {
+            var noteUrl = window.location.origin + basePath() + '/?note=' + currentWorldIndex;
+            window.open(noteUrl, '_blank');
+        }
     }
 
     function openHelpPopup() {
@@ -6332,6 +6357,9 @@
             elements.activityIndicator.style.display = 'none';
             elements.activityIndicator.title = '';
         }
+
+        // Note icon: only shown when the current world actually has notes.
+        elements.statusNoteBtn.style.display = (world && world.settings && world.settings.has_notes) ? '' : 'none';
 
         updateScrollbackProgress();
         renderTabsRibbon();
@@ -9150,6 +9178,12 @@
             requestNextWorld();
         });
 
+        // Click on the note icon to open the current world's notes (same
+        // editor as typing /note).
+        elements.statusNoteBtn.addEventListener('click', function() {
+            openNoteEditor();
+        });
+
         // Click on the world name to open the world-switch dropdown
         if (elements.statusItem) {
             elements.statusItem.addEventListener('click', function(e) {
@@ -10054,9 +10088,8 @@
         elements.settingsCancelBtn.onclick = closeSettingsPopup;
 
         // Note editor (NOTE_MODE only): save current world's notes and show a
-        // brief confirmation. No auto-close — the user closes this spawned
-        // window/tab with its own native controls, same as every other
-        // spawned window in this codebase.
+        // brief confirmation. Save itself never closes the window — Cancel
+        // (below) is the deliberate way to back out, whether or not you saved.
         if (elements.noteEditorSaveBtn) {
             elements.noteEditorSaveBtn.onclick = function() {
                 if (!noteMode) return;
@@ -10071,6 +10104,18 @@
                     setTimeout(function() {
                         elements.noteEditorStatus.classList.remove('visible');
                     }, 1500);
+                }
+            };
+        }
+
+        // Cancel: close this spawned window/tab without saving, discarding
+        // any unsaved edits (same IPC-vs-window.close() split as /quit).
+        if (elements.noteEditorCancelBtn) {
+            elements.noteEditorCancelBtn.onclick = function() {
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('close-window');
+                } else {
+                    window.close();
                 }
             };
         }

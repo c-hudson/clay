@@ -5942,6 +5942,7 @@ impl App {
                 keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                 gmcp_packages: world.settings.gmcp_packages.clone(),
                 auto_reconnect_secs: world.settings.auto_reconnect_display(),
+                has_notes: !world.settings.notes.is_empty(),
             },
             last_send_secs: None,
             last_recv_secs: None,
@@ -6046,6 +6047,7 @@ impl App {
         }
         let _ = persistence::save_settings(self);
         let has_password = !self.worlds[world_index].settings.password.is_empty();
+        let has_notes = !self.worlds[world_index].settings.notes.is_empty();
         let settings_msg = WorldSettingsMsg {
             hostname, port, user,
             has_password,
@@ -6054,6 +6056,7 @@ impl App {
             auto_connect_type: auto_login,
             keep_alive_type, keep_alive_cmd, gmcp_packages,
             auto_reconnect_secs,
+            has_notes,
         };
         self.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
     }
@@ -9409,7 +9412,9 @@ impl App {
             WsMessage::UpdateNote { world_index, notes } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     world.settings.notes = notes;
+                    let has_notes = !world.settings.notes.is_empty();
                     let _ = persistence::save_settings(self);
+                    self.ws_broadcast(WsMessage::NotesChanged { world_index, has_notes });
                 }
             }
             WsMessage::RequestConnectionsList => {
@@ -9710,6 +9715,7 @@ impl App {
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                     gmcp_packages: world.settings.gmcp_packages.clone(),
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
+                    has_notes: !world.settings.notes.is_empty(),
                 },
                 last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),

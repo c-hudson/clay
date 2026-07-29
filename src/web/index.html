@@ -23,6 +23,7 @@
                 <span id="note-editor-title" class="note-editor-title">Notes</span>
                 <span id="note-editor-status" class="note-editor-status"></span>
                 <button id="note-editor-save-btn" class="note-editor-save-btn">Save</button>
+                <button id="note-editor-cancel-btn" class="note-editor-cancel-btn">Cancel</button>
             </div>
             <textarea id="note-editor-textarea" class="note-editor-textarea" spellcheck="true"></textarea>
         </div>
@@ -58,6 +59,9 @@
                 <span class="session-paused-label">PAUSED</span>
             </div>
             <div class="status-spacer"></div>
+            <div class="status-btn status-note-btn" id="status-note-btn" title="Notes" style="display:none">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 1.5h7l3 3v10a0.5 0.5 0 0 1-0.5 0.5h-9.5a0.5 0.5 0 0 1-0.5-0.5v-12.5a0.5 0.5 0 0 1 0.5-0.5z" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M10 1.5v3h3" stroke="currentColor" stroke-width="1.2" fill="none"/><rect x="4.5" y="7" width="6" height="1" rx="0.5" fill="currentColor"/><rect x="4.5" y="9.5" width="6" height="1" rx="0.5" fill="currentColor"/><rect x="4.5" y="12" width="4" height="1" rx="0.5" fill="currentColor"/></svg>
+            </div>
             <div class="font-slider-group status-font-slider">
                 <span class="font-slider-label" id="font-slider-label" title="Decrease font size">A</span>
                 <input type="range" class="font-slider" id="font-slider" min="9" max="20" value="14" title="Font size">

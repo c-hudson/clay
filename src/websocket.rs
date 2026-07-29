@@ -434,6 +434,15 @@ pub enum WsMessage {
     // Note editor (server -> client)
     NoteEditorState { world_index: usize, world_name: String, notes: String },
 
+    // Broadcast whenever a world's notes go from empty to non-empty or back
+    // (console /note edits, or a GUI/web note-editor Save) — lets any client
+    // viewing that world update its has_notes indicator live. Deliberately a
+    // narrow, single-field message rather than reusing WorldSettingsUpdated:
+    // WorldSettingsUpdated has no client handler today and always carries an
+    // empty password, so writing its first handler risks clobbering the
+    // world editor's locally-cached plaintext password.
+    NotesChanged { world_index: usize, has_notes: bool },
+
     // Keepalive
     Ping,
     Pong,
@@ -527,6 +536,11 @@ pub struct WorldSettingsMsg {
     pub has_password: bool,  // True if a password is configured (password field is empty)
     #[serde(default)]
     pub auto_reconnect_secs: String,
+    /// Mirrors whether world.settings.notes is non-empty, same idea as
+    /// has_password — the note text itself is never sent here (see
+    /// NoteEditorState, fetched on demand when the note editor opens).
+    #[serde(default)]
+    pub has_notes: bool,
 }
 
 /// Global settings for WebSocket protocol

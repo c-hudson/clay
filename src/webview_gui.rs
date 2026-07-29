@@ -67,6 +67,10 @@ enum WvEvent {
     /// Open a note-editor window for a world's notes (own OS window, not a
     /// shell-out or in-page modal — see NOTE_MODE in web/app.js)
     NoteWindow { world_index: usize, world_name: String },
+    /// Close one specific spawned window (e.g. the note editor's Cancel
+    /// button) without exiting the whole app — unlike Quit. Reuses the same
+    /// removal logic as a native close (WindowEvent::CloseRequested).
+    CloseWindow(tao::window::WindowId),
 }
 
 use crate::theme::ThemeFile;
@@ -1029,6 +1033,7 @@ fn dispatch_ipc_message(
     is_master: bool,
     proxy: &EventLoopProxy<WvEvent>,
     reload_tx: &Option<tokio::sync::mpsc::UnboundedSender<crate::WsMessage>>,
+    window_id: tao::window::WindowId,
 ) {
     if let Some(url) = body.strip_prefix("open-url:") {
         open_url_in_browser(url);
@@ -1054,6 +1059,10 @@ fn dispatch_ipc_message(
         }
     } else if body == "quit" {
         let _ = proxy.send_event(WvEvent::Quit);
+    } else if body == "close-window" {
+        // Close only the window that sent this — unlike "quit" (whole app),
+        // this is what a spawned window's own Cancel/close button should use.
+        let _ = proxy.send_event(WvEvent::CloseWindow(window_id));
     } else if body == "update" || body == "update-force" {
         #[cfg(not(target_os = "android"))]
         {
@@ -1165,6 +1174,7 @@ fn build_webview(
     let js_content = WEB_APP_JS.to_string();
 
     let is_master = params.auto_password.is_some();
+    let win_id = window.id();
 
     // Clone proxy/reload_tx for the protocol IPC fallback (used when
     // window.webkit.messageHandlers is unavailable, e.g. on Termux WebKit2GTK)
@@ -1179,7 +1189,7 @@ fn build_webview(
             // window.webkit.messageHandlers is unavailable (e.g. Termux WebKit2GTK).
             if path == "/ipc" {
                 let msg = String::from_utf8_lossy(request.body()).to_string();
-                dispatch_ipc_message(&msg, is_master, &proxy_for_protocol, &reload_tx_for_protocol);
+                dispatch_ipc_message(&msg, is_master, &proxy_for_protocol, &reload_tx_for_protocol, win_id);
                 return wry::http::Response::builder()
                     .header("Content-Type", "text/plain")
                     .header("Access-Control-Allow-Origin", "*")
@@ -1207,7 +1217,7 @@ fn build_webview(
             let proxy = proxy.clone();
             let reload_tx = reload_tx.clone();
             move |req| {
-                dispatch_ipc_message(req.body(), is_master, &proxy, &reload_tx);
+                dispatch_ipc_message(req.body(), is_master, &proxy, &reload_tx, win_id);
             }
         })
         // Open external links in the system browser instead of navigating the WebView.
@@ -1563,6 +1573,16 @@ fn create_webview_window(
                     let id = new_window.id();
                     windows.insert(id, new_window);
                     webviews.insert(id, wv);
+                }
+            }
+            Event::UserEvent(WvEvent::CloseWindow(id)) => {
+                // Close just this one window (e.g. the note editor's Cancel
+                // button) — same removal logic as a native CloseRequested,
+                // but triggered from JS via IPC rather than the OS chrome.
+                windows.remove(&id);
+                webviews.remove(&id);
+                if windows.is_empty() {
+                    *control_flow = ControlFlow::Exit;
                 }
             }
             _ => {}

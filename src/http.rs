@@ -1212,6 +1212,11 @@ pub async fn start_https_server(
     let conn_counter = ConnectionCounter::new();
     let ws_counter = ConnectionCounter::new();
     tokio::spawn(async move {
+        // Signal ready INSIDE the spawned task — ensures the accept loop is actually
+        // running. Mirrors start_http_server's signal (this is the only server-start
+        // path the GUI uses since D8's "always HTTPS-capable" change; webview_gui.rs's
+        // startup wait loop watches this exact flag).
+        crate::GUI_HTTP_READY.store(true, std::sync::atomic::Ordering::SeqCst);
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -1409,6 +1414,11 @@ pub async fn start_https_server(
     let conn_counter = ConnectionCounter::new();
     let ws_counter = ConnectionCounter::new();
     tokio::spawn(async move {
+        // Signal ready INSIDE the spawned task — ensures the accept loop is actually
+        // running. Mirrors start_http_server's signal (this is the only server-start
+        // path the GUI uses since D8's "always HTTPS-capable" change; webview_gui.rs's
+        // startup wait loop watches this exact flag).
+        crate::GUI_HTTP_READY.store(true, std::sync::atomic::Ordering::SeqCst);
         loop {
             tokio::select! {
                 result = listener.accept() => {
