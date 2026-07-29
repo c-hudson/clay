@@ -14,6 +14,19 @@
             <div id="output"></div>
         </div>
 
+        <!-- Note editor (NOTE_MODE only — a genuine separate window/tab, not an
+             in-page modal; see WvEvent::NoteWindow in webview_gui.rs). Hidden
+             unless window.NOTE_MODE (or ?note=<world_index> in plain-browser
+             mode) is set, in which case it replaces the whole app view. -->
+        <div id="note-editor-view" class="note-editor-view">
+            <div class="note-editor-header">
+                <span id="note-editor-title" class="note-editor-title">Notes</span>
+                <span id="note-editor-status" class="note-editor-status"></span>
+                <button id="note-editor-save-btn" class="note-editor-save-btn">Save</button>
+            </div>
+            <textarea id="note-editor-textarea" class="note-editor-textarea" spellcheck="true"></textarea>
+        </div>
+
         <!-- World-tabs ribbon (Tabs setting: none/top/bottom). Hidden by default;
              lives here in the DOM as its natural "bottom ribbon" position (directly
              above the status/separator bar) — moved before #output-container by JS

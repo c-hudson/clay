@@ -9393,6 +9393,25 @@ impl App {
                     bindings_json: self.keybindings.to_json(),
                 });
             }
+            // Note editor (opens as its own native window / browser tab, see
+            // WvEvent::NoteWindow in webview_gui.rs and NOTE_MODE in web/app.js).
+            // Single-user master: no ownership check needed (see the multiuser
+            // daemon.rs handler for the world.owner == username check).
+            WsMessage::RequestNoteEditorState { world_index } => {
+                if let Some(world) = self.worlds.get(world_index) {
+                    self.ws_send_to_client(client_id, WsMessage::NoteEditorState {
+                        world_index,
+                        world_name: world.name.clone(),
+                        notes: world.settings.notes.clone(),
+                    });
+                }
+            }
+            WsMessage::UpdateNote { world_index, notes } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.settings.notes = notes;
+                    let _ = persistence::save_settings(self);
+                }
+            }
             WsMessage::RequestConnectionsList => {
                 // Generate connections list using same format as master console
                 let current_idx = self.current_world_index;

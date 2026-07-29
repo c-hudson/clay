@@ -422,6 +422,18 @@ pub enum WsMessage {
     // Keybindings update (server -> all clients)
     KeybindingsUpdated { bindings_json: String },
 
+    // Note editor — opens as its own native OS window (webview-GUI) or a
+    // separate browser tab (web), not a shell-out or an in-page modal. See
+    // NOTE_MODE handling in web/app.js and WvEvent::NoteWindow in
+    // webview_gui.rs. Backed by the same world.settings.notes the console
+    // TUI's split-screen /note editor already uses.
+    // (client -> server)
+    RequestNoteEditorState { world_index: usize },
+    UpdateNote { world_index: usize, notes: String },
+
+    // Note editor (server -> client)
+    NoteEditorState { world_index: usize, world_name: String, notes: String },
+
     // Keepalive
     Ping,
     Pong,

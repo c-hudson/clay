@@ -64,6 +64,9 @@ enum WvEvent {
     NewWindow(Option<String>),
     /// Open a grep results window (half height, no status/input, filtered output)
     GrepWindow { pattern: String, world: Option<String>, use_regex: bool },
+    /// Open a note-editor window for a world's notes (own OS window, not a
+    /// shell-out or in-page modal — see NOTE_MODE in web/app.js)
+    NoteWindow { world_index: usize, world_name: String },
 }
 
 use crate::theme::ThemeFile;
@@ -1042,6 +1045,13 @@ fn dispatch_ipc_message(
                 let _ = proxy.send_event(WvEvent::GrepWindow { pattern, world, use_regex });
             }
         }
+    } else if let Some(json_str) = body.strip_prefix("note-window:") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if let Some(world_index) = v["world_index"].as_u64() {
+                let world_name = v["world_name"].as_str().unwrap_or("").to_string();
+                let _ = proxy.send_event(WvEvent::NoteWindow { world_index: world_index as usize, world_name });
+            }
+        }
     } else if body == "quit" {
         let _ = proxy.send_event(WvEvent::Quit);
     } else if body == "update" || body == "update-force" {
@@ -1527,6 +1537,29 @@ fn create_webview_window(
                 );
                 let world_lock = world.as_deref();
                 if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, world_lock, Some(&grep_js)) {
+                    let id = new_window.id();
+                    windows.insert(id, new_window);
+                    webviews.insert(id, wv);
+                }
+            }
+            Event::UserEvent(WvEvent::NoteWindow { world_index, ref world_name }) => {
+                // Create a note-editor window, sized for text editing rather
+                // than a full chat client (this is a small self-contained form,
+                // not world-locked — NOTE_MODE alone tells the client which
+                // world's notes to fetch/save).
+                let win_title = format!("Clay - Notes: {}", world_name);
+                let new_window = match WindowBuilder::new()
+                    .with_title(&win_title)
+                    .with_theme(window_theme)
+                    .with_inner_size(tao::dpi::LogicalSize::new(700.0, 500.0))
+                    .build(event_loop_target)
+                {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+
+                let note_js = format!("window.NOTE_MODE = {{ world_index: {} }};", world_index);
+                if let Ok(wv) = build_webview(&new_window, &params, &proxy, &reload_tx, None, Some(&note_js)) {
                     let id = new_window.id();
                     windows.insert(id, new_window);
                     webviews.insert(id, wv);

@@ -70,6 +70,12 @@
         tabsRibbonLeft: document.getElementById('tabs-ribbon-left'),
         tabsRibbonRight: document.getElementById('tabs-ribbon-right'),
         worldMenuDropdown: document.getElementById('world-menu-dropdown'),
+        // Note editor (NOTE_MODE only — own window/tab, see webview_gui.rs's WvEvent::NoteWindow)
+        noteEditorView: document.getElementById('note-editor-view'),
+        noteEditorTitle: document.getElementById('note-editor-title'),
+        noteEditorStatus: document.getElementById('note-editor-status'),
+        noteEditorSaveBtn: document.getElementById('note-editor-save-btn'),
+        noteEditorTextarea: document.getElementById('note-editor-textarea'),
         inputContainer: document.getElementById('input-container'),
         prompt: document.getElementById('prompt'),
         input: document.getElementById('input'),
@@ -350,6 +356,18 @@
         } catch (e) {
             // Invalid pattern — match everything
             grepRegex = null;
+        }
+    }
+
+    // Note editor mode: own window/tab showing just a note-editing form for
+    // one world (set by /note or URL ?note=<world_index>, mirrors grep mode).
+    var noteMode = null;
+    if (window.NOTE_MODE) {
+        noteMode = window.NOTE_MODE;
+    } else if (urlParams.get('note') !== null) {
+        var noteWorldIndex = parseInt(urlParams.get('note'), 10);
+        if (!isNaN(noteWorldIndex)) {
+            noteMode = { world_index: noteWorldIndex };
         }
     }
     let pendingReconnectCommand = null;  // Command to resend after reconnect
@@ -2305,6 +2323,18 @@
                     renderOutput();
                 }
 
+                // Note editor mode: replace the whole app view with the note
+                // editor and request the target world's current notes.
+                if (noteMode) {
+                    if (elements.statusBar) elements.statusBar.style.display = 'none';
+                    if (elements.inputContainer) elements.inputContainer.style.display = 'none';
+                    if (elements.navBar) elements.navBar.style.display = 'none';
+                    if (elements.outputContainer) elements.outputContainer.style.display = 'none';
+                    if (elements.tabsRibbon) elements.tabsRibbon.style.display = 'none';
+                    if (elements.noteEditorView) elements.noteEditorView.style.display = 'flex';
+                    send({ type: 'RequestNoteEditorState', world_index: noteMode.world_index });
+                }
+
                 // Handle pending reconnect command (resend after reconnection)
                 if (pendingReconnectCommand !== null) {
                     // Switch to the world that was active when the command failed
@@ -2885,6 +2915,18 @@
                 if (msg.index !== null && msg.index !== undefined && msg.index !== currentWorldIndex) {
                     switchWorldLocal(msg.index);
                 }
+                break;
+
+            case 'NoteEditorState':
+                // Reply to RequestNoteEditorState (see noteMode handling above) —
+                // populate the note-editor window/tab with this world's current notes.
+                if (elements.noteEditorTextarea) {
+                    elements.noteEditorTextarea.value = msg.notes || '';
+                }
+                if (elements.noteEditorTitle) {
+                    elements.noteEditorTitle.textContent = 'Notes: ' + msg.world_name;
+                }
+                document.title = 'Clay - Notes: ' + msg.world_name;
                 break;
 
             case 'UnseenCleared':
@@ -4387,8 +4429,24 @@
                 break;
 
             case '/note':
-                // Open split-screen editor locally
-                // (handled by specific client-side logic if implemented)
+                // GUI/web /note: opens the current world's notes in a genuine
+                // separate window (native OS window in webview-GUI, a new
+                // browser tab otherwise) — not an in-page modal, not a
+                // shell-out. Only the no-args "current world" form is
+                // supported here; `/note -l` and `/note <file>` remain
+                // console-only (see plan doc for why).
+                if (args.length > 0) {
+                    appendClientLine("This form of /note is console-only. Plain /note opens the current world's notes.", currentWorldIndex, 'system');
+                    break;
+                }
+                if (!worlds[currentWorldIndex]) break;
+                var notePayload = { world_index: currentWorldIndex, world_name: worlds[currentWorldIndex].name };
+                if (window.WEBVIEW_MODE) {
+                    sendIpc('note-window:' + JSON.stringify(notePayload));
+                } else {
+                    var noteUrl = window.location.origin + basePath() + '/?note=' + currentWorldIndex;
+                    window.open(noteUrl, '_blank');
+                }
                 break;
 
             case '/quit':
@@ -9994,6 +10052,28 @@
         }
         elements.settingsSaveBtn.onclick = saveSettingsAll;
         elements.settingsCancelBtn.onclick = closeSettingsPopup;
+
+        // Note editor (NOTE_MODE only): save current world's notes and show a
+        // brief confirmation. No auto-close — the user closes this spawned
+        // window/tab with its own native controls, same as every other
+        // spawned window in this codebase.
+        if (elements.noteEditorSaveBtn) {
+            elements.noteEditorSaveBtn.onclick = function() {
+                if (!noteMode) return;
+                send({
+                    type: 'UpdateNote',
+                    world_index: noteMode.world_index,
+                    notes: elements.noteEditorTextarea.value
+                });
+                if (elements.noteEditorStatus) {
+                    elements.noteEditorStatus.textContent = 'Saved';
+                    elements.noteEditorStatus.classList.add('visible');
+                    setTimeout(function() {
+                        elements.noteEditorStatus.classList.remove('visible');
+                    }, 1500);
+                }
+            };
+        }
 
         // Clay Server tab (Android only): toggle remote fields live when Run Mode changes,
         // without needing to save+reopen first.

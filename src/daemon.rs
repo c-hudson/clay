@@ -1509,6 +1509,24 @@ pub async fn handle_daemon_ws_message(
                 bindings_json: app.keybindings.to_json(),
             });
         }
+        // Note editor (single-user daemon/--local-server: no ownership check
+        // needed, same as the theme/keybind editors above; see
+        // handle_multiuser_ws_message for the multiuser-owner-checked version).
+        WsMessage::RequestNoteEditorState { world_index } => {
+            if let Some(world) = app.worlds.get(world_index) {
+                app.ws_send_to_client(client_id, WsMessage::NoteEditorState {
+                    world_index,
+                    world_name: world.name.clone(),
+                    notes: world.settings.notes.clone(),
+                });
+            }
+        }
+        WsMessage::UpdateNote { world_index, notes } => {
+            if let Some(world) = app.worlds.get_mut(world_index) {
+                world.settings.notes = notes;
+                let _ = persistence::save_settings(app);
+            }
+        }
         WsMessage::RequestConnectionsList => {
             let current_idx = app.current_world_index;
             const KEEPALIVE_SECS: u64 = 5 * 60;
@@ -3171,6 +3189,29 @@ pub async fn handle_multiuser_ws_message(
                     if let Some(ws) = &app.ws_server {
                         ws.send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                     }
+                }
+            }
+        }
+        // Note editor: verify ownership before reading or writing another user's
+        // world notes (mirrors SwitchWorld above).
+        WsMessage::RequestNoteEditorState { world_index } => {
+            if let Some(world) = app.worlds.get(world_index) {
+                if world.owner.as_ref() == username.as_ref() {
+                    if let Some(ws) = &app.ws_server {
+                        ws.send_to_client(client_id, WsMessage::NoteEditorState {
+                            world_index,
+                            world_name: world.name.clone(),
+                            notes: world.settings.notes.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        WsMessage::UpdateNote { world_index, notes } => {
+            if let Some(world) = app.worlds.get_mut(world_index) {
+                if world.owner.as_ref() == username.as_ref() {
+                    world.settings.notes = notes;
+                    let _ = persistence::save_settings(app);
                 }
             }
         }
