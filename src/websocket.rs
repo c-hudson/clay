@@ -280,6 +280,8 @@ pub enum WsMessage {
         scrollback_enabled: bool,
         #[serde(default = "default_keyboard_always_visible")]
         keyboard_always_visible: bool,
+        #[serde(default)]
+        tabs: String,
     },
 
     // Settings update confirmations (server -> client)
@@ -590,6 +592,10 @@ pub struct GlobalSettingsMsg {
     /// app included); ignored when a hardware keyboard is attached.
     #[serde(default = "default_keyboard_always_visible")]
     pub keyboard_always_visible: bool,
+    /// World-tabs ribbon display mode: "none" (default) / "top" / "bottom".
+    /// web/GUI/Android only — see TabsMode.
+    #[serde(default)]
+    pub tabs: String,
     /// Theme colors from ~/.clay/theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,

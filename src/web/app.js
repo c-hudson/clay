@@ -63,6 +63,13 @@
         statusScrollbackPct: document.getElementById('status-scrollback-pct'),
         statusTime: document.getElementById('status-time'),
         statusBar: document.getElementById('status-bar'),
+        statusItem: document.querySelector('#status-bar .status-item'),
+        // World-tabs ribbon
+        tabsRibbon: document.getElementById('tabs-ribbon'),
+        tabsRibbonTabs: document.getElementById('tabs-ribbon-tabs'),
+        tabsRibbonLeft: document.getElementById('tabs-ribbon-left'),
+        tabsRibbonRight: document.getElementById('tabs-ribbon-right'),
+        worldMenuDropdown: document.getElementById('world-menu-dropdown'),
         inputContainer: document.getElementById('input-container'),
         prompt: document.getElementById('prompt'),
         input: document.getElementById('input'),
@@ -215,6 +222,7 @@
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
         setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
+        setupTabsSelect: document.getElementById('setup-tabs-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupKeyboardVisibleToggle: document.getElementById('setup-keyboard-visible-toggle'),
@@ -495,6 +503,7 @@
     let setupAnsiMusic = true;
     let setupZwj = false;
     let setupTtsMode = 'Off';
+    let setupTabsMode = 'none';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
     let setupKeyboardAlwaysVisible = true;
@@ -570,6 +579,11 @@
 
     // Menu state
     let menuOpen = false;
+
+    // World-tabs ribbon mode, synced from server settings ('none', 'top', 'bottom')
+    let tabsMode = 'none';
+    // World-switch dropdown (opened by clicking the world name on the status bar)
+    let worldMenuOpen = false;
 
     // Font size state: pixel value (9-20 range)
     let currentFontSize = 14;  // Default to 14px
@@ -2120,6 +2134,7 @@
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
+                    if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
                     }
@@ -2670,6 +2685,7 @@
                     }
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
+                    if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
                     if (msg.settings.new_line_indicator !== undefined) {
                         const oldNli = newLineIndicator;
                         newLineIndicator = msg.settings.new_line_indicator;
@@ -6260,6 +6276,7 @@
         }
 
         updateScrollbackProgress();
+        renderTabsRibbon();
     }
 
     // Update time (12-hour format H:MM, no AM/PM)
@@ -6975,6 +6992,7 @@
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'edge' ? 'Edge' : 'Off';
+        setupTabsMode = tabsMode;
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupKeyboardAlwaysVisible = keyboardAlwaysVisible;
@@ -7044,6 +7062,10 @@
         if (elements.setupTtsSpeakModeSelect) {
             elements.setupTtsSpeakModeSelect.value = ttsSpeakMode;
             updateCustomDropdown(elements.setupTtsSpeakModeSelect);
+        }
+        if (elements.setupTabsSelect) {
+            elements.setupTabsSelect.value = setupTabsMode;
+            updateCustomDropdown(elements.setupTabsSelect);
         }
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
@@ -7133,6 +7155,7 @@
             zwj_enabled: zwjEnabled,
             tts_mode: ttsMode,
             tts_speak_mode: ttsSpeakMode,
+            tabs: tabsMode,
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
@@ -7241,6 +7264,7 @@
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
         ttsMode = setupTtsMode.toLowerCase();
+        applyTabsMode(setupTabsMode);
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         keyboardAlwaysVisible = setupKeyboardAlwaysVisible;
@@ -8466,6 +8490,109 @@
         }
     }
 
+    // Connected worlds, each tagged with its index into the `worlds` array —
+    // the single source of truth shared by the tabs ribbon and the world-switch
+    // dropdown (both only ever show worlds that are currently connected).
+    function getConnectedWorlds() {
+        return worlds
+            .map((w, i) => ({ world: w, index: i }))
+            .filter(w => w.world.connected);
+    }
+
+    // Rebuild the tabs-ribbon strip from the current connected-worlds list and
+    // highlight whichever tab matches currentWorldIndex. Called from
+    // updateStatusBar() so it always stays in sync with the rest of the UI
+    // without needing its own scattered call sites.
+    function renderTabsRibbon() {
+        if (!elements.tabsRibbon) return;
+        const connected = getConnectedWorlds();
+        if (tabsMode === 'none' || connected.length === 0) {
+            elements.tabsRibbon.style.display = 'none';
+            return;
+        }
+        elements.tabsRibbon.style.display = 'flex';
+
+        elements.tabsRibbonTabs.innerHTML = '';
+        connected.forEach(({ world, index }) => {
+            // No connection dot — this list is already filtered to connected
+            // worlds only (getConnectedWorlds()), so it would always render
+            // the same "on" state; pure noise on what should read as a tab.
+            const tab = document.createElement('div');
+            tab.className = 'tabs-ribbon-tab' + (index === currentWorldIndex ? ' active' : '');
+            tab.textContent = world.name;
+            tab.onclick = function(e) {
+                e.stopPropagation();
+                switchWorldLocal(index);
+            };
+            elements.tabsRibbonTabs.appendChild(tab);
+        });
+
+        // Only show the scroll arrows when the strip actually overflows.
+        const overflowing = elements.tabsRibbonTabs.scrollWidth > elements.tabsRibbonTabs.clientWidth;
+        elements.tabsRibbonLeft.classList.toggle('hidden', !overflowing);
+        elements.tabsRibbonRight.classList.toggle('hidden', !overflowing);
+    }
+
+    // Apply a Tabs setting change: move the ribbon to the right place in the
+    // DOM (top: before the output area; bottom: its natural position directly
+    // above the status bar) and show/hide/re-render it. DOM position is moved
+    // rather than juggled via flex `order` on every sibling — simpler and it
+    // can't accidentally affect unrelated layout.
+    function applyTabsMode(mode) {
+        tabsMode = mode;
+        if (!elements.tabsRibbon) return;
+        const app = document.getElementById('app');
+        if (mode === 'top') {
+            app.insertBefore(elements.tabsRibbon, elements.outputContainer);
+        } else {
+            // 'bottom' (or 'none', where position doesn't matter since hidden)
+            app.insertBefore(elements.tabsRibbon, elements.statusBar);
+        }
+        renderTabsRibbon();
+    }
+
+    // World-switch dropdown: opened by clicking the world name on the status
+    // bar. Populated fresh from the connected-worlds list on every open (the
+    // list can change while the app is running), unlike the static hamburger
+    // dropdown. Reuses .menu-dropdown/.menu-item styling and the same
+    // anchor-above-the-button positioning as toggleMenu().
+    function toggleWorldMenu() {
+        worldMenuOpen = !worldMenuOpen;
+        if (worldMenuOpen) {
+            renderWorldMenu();
+            const rect = elements.statusItem.getBoundingClientRect();
+            elements.worldMenuDropdown.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+            elements.worldMenuDropdown.style.left = rect.left + 'px';
+        }
+        elements.worldMenuDropdown.classList.toggle('visible', worldMenuOpen);
+    }
+
+    function closeWorldMenu() {
+        worldMenuOpen = false;
+        elements.worldMenuDropdown.classList.remove('visible');
+    }
+
+    function renderWorldMenu() {
+        const connected = getConnectedWorlds();
+        elements.worldMenuDropdown.innerHTML = '';
+        connected.forEach(({ world, index }) => {
+            const item = document.createElement('div');
+            item.className = 'menu-item' + (index === currentWorldIndex ? ' selected' : '');
+            item.textContent = world.name;
+            item.dataset.index = index;
+            elements.worldMenuDropdown.appendChild(item);
+        });
+    }
+
+    elements.worldMenuDropdown && (elements.worldMenuDropdown.onclick = function(e) {
+        e.stopPropagation();
+        const item = e.target.closest('.menu-item');
+        if (item) {
+            switchWorldLocal(parseInt(item.dataset.index, 10));
+            closeWorldMenu();
+        }
+    });
+
     // Toggle menu dropdown (unified - opens upward from button)
     function toggleMenu(anchorBtn) {
         menuOpen = !menuOpen;
@@ -8965,6 +9092,28 @@
             requestNextWorld();
         });
 
+        // Click on the world name to open the world-switch dropdown
+        if (elements.statusItem) {
+            elements.statusItem.addEventListener('click', function(e) {
+                e.stopPropagation();
+                toggleWorldMenu();
+            });
+        }
+
+        // Tabs ribbon scroll arrows
+        if (elements.tabsRibbonLeft) {
+            elements.tabsRibbonLeft.addEventListener('click', function(e) {
+                e.stopPropagation();
+                elements.tabsRibbonTabs.scrollBy({ left: -120, behavior: 'smooth' });
+            });
+        }
+        if (elements.tabsRibbonRight) {
+            elements.tabsRibbonRight.addEventListener('click', function(e) {
+                e.stopPropagation();
+                elements.tabsRibbonTabs.scrollBy({ left: 120, behavior: 'smooth' });
+            });
+        }
+
         // Track whether we're at the bottom (for resize handling)
         let wasAtBottomBeforeResize = true;
 
@@ -9010,6 +9159,9 @@
             // Close menu if open
             if (menuOpen) {
                 closeMenu();
+            }
+            if (worldMenuOpen && !e.target.closest('.status-item')) {
+                closeWorldMenu();
             }
 
             // Don't steal focus if user has selected text (for copy)
@@ -9763,6 +9915,11 @@
         if (elements.setupTtsSpeakModeSelect) {
             elements.setupTtsSpeakModeSelect.onchange = function() {
                 ttsSpeakMode = this.value;
+            };
+        }
+        if (elements.setupTabsSelect) {
+            elements.setupTabsSelect.onchange = function() {
+                setupTabsMode = this.value;
             };
         }
         elements.setupTlsProxyToggle.onclick = function() {

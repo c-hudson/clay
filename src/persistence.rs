@@ -380,6 +380,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
+    writeln!(file, "tabs={}", app.settings.tabs.name())?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -1010,6 +1011,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     }
                     "scrollback_enabled" => {
                         app.settings.scrollback_enabled = value == "true";
+                    }
+                    "tabs" => {
+                        app.settings.tabs = crate::TabsMode::from_name(value);
                     }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
@@ -1701,6 +1705,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
+    writeln!(file, "tabs={}", app.settings.tabs.name())?;
 
     // Save watchdog state
     writeln!(file, "watchdog_enabled={}", app.tf_engine.watchdog_enabled)?;
@@ -2402,6 +2407,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "scrollback_enabled" => {
                         app.settings.scrollback_enabled = value == "true";
                     }
+                    "tabs" => {
+                        app.settings.tabs = crate::TabsMode::from_name(value);
+                    }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
@@ -2731,6 +2739,7 @@ mod tests {
             web_font_word_spacing: 2.0,        // default: 0.0
             scrollback_enabled: true,          // default: false
             keyboard_always_visible: false,    // default: true
+            tabs: TabsMode::Top,               // default: None
         }
     }
 
@@ -2820,6 +2829,7 @@ mod tests {
         assert_eq!(a.tts_mode, b.tts_mode, "{context}: tts_mode");
         assert_eq!(a.scrollback_enabled, b.scrollback_enabled, "{context}: scrollback_enabled");
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
+        assert_eq!(a.tabs, b.tabs, "{context}: tabs");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -3153,6 +3163,7 @@ pattern=foo
         assert_ne!(non_default.tts_mode, default.tts_mode, "tts_mode should differ");
         assert_ne!(non_default.scrollback_enabled, default.scrollback_enabled, "scrollback_enabled should differ");
         assert_ne!(non_default.keyboard_always_visible, default.keyboard_always_visible, "keyboard_always_visible should differ");
+        assert_ne!(non_default.tabs, default.tabs, "tabs should differ");
     }
 
     #[test]

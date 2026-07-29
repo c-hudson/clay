@@ -14,6 +14,16 @@
             <div id="output"></div>
         </div>
 
+        <!-- World-tabs ribbon (Tabs setting: none/top/bottom). Hidden by default;
+             lives here in the DOM as its natural "bottom ribbon" position (directly
+             above the status/separator bar) — moved before #output-container by JS
+             for "top ribbon" mode. -->
+        <div id="tabs-ribbon" class="tabs-ribbon">
+            <span id="tabs-ribbon-left" class="tabs-ribbon-arrow" title="Scroll left">&#9664;</span>
+            <div id="tabs-ribbon-tabs" class="tabs-ribbon-tabs"></div>
+            <span id="tabs-ribbon-right" class="tabs-ribbon-arrow" title="Scroll right">&#9654;</span>
+        </div>
+
         <!-- Status bar -->
         <div id="status-bar">
             <div class="status-btn status-menu-btn" id="menu-btn" title="Menu">
@@ -90,6 +100,12 @@
             <div class="menu-sep menu-logout-divider" style="display: none;"></div>
             <div class="menu-item menu-logout" data-action="logout" style="display: none;">Logout</div>
         </div>
+
+        <!-- World-switch dropdown: opened by clicking the world name on the status
+             bar (or a ribbon tab's own click already switches directly). Populated
+             dynamically from the connected-worlds list on each open — see
+             toggleWorldMenu() in app.js. Reuses .menu-dropdown/.menu-item styling. -->
+        <div id="world-menu-dropdown" class="menu-dropdown"></div>
 
         <!-- Authentication modal -->
         <div id="auth-modal" class="modal">
@@ -653,6 +669,16 @@
                                                 <select id="setup-tts-speak-mode-select" class="form-select">
                                                     <option value="all">All</option>
                                                     <option value="limit">Limit</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row" title="Shows a ribbon of connected-world tabs for quick switching. No effect on the console.">
+                                            <span class="setting-label">Tabs</span>
+                                            <div class="setting-value">
+                                                <select id="setup-tabs-select" class="form-select">
+                                                    <option value="none">None</option>
+                                                    <option value="top">Show Top Ribbon</option>
+                                                    <option value="bottom">Show Bottom Ribbon</option>
                                                 </select>
                                             </div>
                                         </div>

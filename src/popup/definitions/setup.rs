@@ -29,6 +29,7 @@ pub const SETUP_FIELD_SCROLLBACK: FieldId = FieldId(20);
 // Note: FieldId(21) was url_shortener, removed - /url now falls back across services automatically
 pub const SETUP_FIELD_WRAPSPACE: FieldId = FieldId(22);
 pub const SETUP_FIELD_KEYBOARD_VISIBLE: FieldId = FieldId(23);
+pub const SETUP_FIELD_TABS: FieldId = FieldId(24);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -75,6 +76,15 @@ pub fn tts_speak_mode_options() -> Vec<SelectOption> {
     ]
 }
 
+/// World-tabs ribbon display options (web/GUI/Android only)
+pub fn tabs_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption::new("none", "None"),
+        SelectOption::new("top", "Show Top Ribbon"),
+        SelectOption::new("bottom", "Show Bottom Ribbon"),
+    ]
+}
+
 /// Create the setup popup definition with current values
 #[allow(clippy::too_many_arguments)]
 pub fn create_setup_popup(
@@ -97,6 +107,7 @@ pub fn create_setup_popup(
     scrollback: bool,
     wrapspace: i64,
     keyboard_always_visible: bool,
+    tabs: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -107,6 +118,7 @@ pub fn create_setup_popup(
         _ => 0,  // "off"
     };
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
+    let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
 
     PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -204,6 +216,11 @@ pub fn create_setup_popup(
             "Wrap Space",
             FieldKind::number_range(wrapspace, 0, 20),
         ))
+        .with_field(Field::new(
+            SETUP_FIELD_TABS,
+            "Tabs",
+            FieldKind::select(tabs_options(), tabs_idx),
+        ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
@@ -292,6 +309,12 @@ fn setup_help_text() -> Vec<String> {
         "Wrap Space: Number of spaces to hang-indent wrapped",
         "  continuation lines of long MUD output (0 = off).",
         "  Like TinyFugue's wrapspace, but defaults to 0.",
+        "",
+        "Tabs: Show a ribbon of connected-world tabs in the",
+        "  web/GUI/Android UI (no effect on the console). 'Show",
+        "  Top Ribbon' places it above the output area; 'Show",
+        "  Bottom Ribbon' places it directly above the separator",
+        "  bar. 'None' (default) keeps the current look.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -305,13 +328,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", false, 0, true,
+            false, "off", "words", false, 0, true, "none",
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 19);
+        assert_eq!(state.definition.fields.len(), 20);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -320,7 +343,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, "edge", "sentences", true, 4, false,
+            false, "edge", "sentences", true, 4, false, "top",
         );
         let state = PopupState::new(def);
 
@@ -336,5 +359,6 @@ mod tests {
         assert_eq!(state.get_bool(SETUP_FIELD_ZWJ), Some(true));
         assert_eq!(state.get_number(SETUP_FIELD_WRAPSPACE), Some(4));
         assert_eq!(state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE), Some(false));
+        assert_eq!(state.get_selected(SETUP_FIELD_TABS), Some("top"));
     }
 }

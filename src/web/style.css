@@ -208,6 +208,7 @@ body {
     align-items: center;
     gap: 6px;
     min-width: 12ch;
+    cursor: pointer;
 }
 
 .status-dot {
@@ -230,6 +231,93 @@ body {
     color: var(--text-color);
     letter-spacing: 0.2px;
     white-space: nowrap;
+}
+
+/* ─── World-Tabs Ribbon (Tabs setting: none/top/bottom) ─── */
+.tabs-ribbon {
+    display: none;   /* shown via JS (applyTabsMode) only when mode != 'none' */
+    align-items: center;
+    height: var(--status-height);
+    padding: 0 4px;
+    background: var(--theme-status-bar-bg, var(--theme-bg-surface, #1c1722));
+    border-top: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--theme-border-subtle, #221c2b);
+    flex-shrink: 0;
+    gap: 4px;
+    user-select: none;
+    position: relative;
+    z-index: 2;
+}
+
+.tabs-ribbon-arrow {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 100%;
+    color: var(--theme-fg-secondary, #a89fb4);
+    font-size: 10px;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+}
+
+.tabs-ribbon-arrow:hover {
+    background: var(--theme-bg-hover, #2c2535);
+    color: var(--text-color);
+}
+
+.tabs-ribbon-arrow.hidden {
+    visibility: hidden;
+}
+
+.tabs-ribbon-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-behavior: smooth;
+    scrollbar-width: none;
+}
+
+.tabs-ribbon-tabs::-webkit-scrollbar {
+    display: none;
+}
+
+.tabs-ribbon-tab {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    padding: 4px 12px;
+    /* Rounded top corners only, flat bottom — the classic "attached" tab
+       silhouette, kept the same regardless of whether the ribbon itself sits
+       at the top or bottom of the window (one consistent, recognizable
+       shape rather than flipping per position). */
+    border-radius: 6px 6px 0 0;
+    font-family: var(--sans);
+    font-size: 11.5px;
+    color: var(--theme-fg-secondary, #a89fb4);
+    white-space: nowrap;
+    cursor: pointer;
+    position: relative;
+    border-top: 2px solid transparent;
+}
+
+.tabs-ribbon-tab:hover {
+    background: var(--theme-bg-hover, #2c2535);
+    color: var(--text-color);
+}
+
+.tabs-ribbon-tab.active {
+    /* Elevated surface + accent top bar, matching the settings sidebar's own
+       active-tab language (.settings-tab-btn.active) rather than a solid
+       filled badge/pill. */
+    background: var(--theme-bg-elevated, #231d2a);
+    border-top-color: var(--accent-color);
+    color: var(--text-color);
+    font-weight: 700;
 }
 
 .status-more {
@@ -574,6 +662,13 @@ body {
 .menu-dropdown .menu-item:hover {
     background: var(--theme-bg-hover, #2c2535);
     color: var(--text-color);
+}
+
+/* Highlights the currently-focused world in the world-switch dropdown
+   (#world-menu-dropdown, populated dynamically — see renderWorldMenu()). */
+.menu-dropdown .menu-item.selected {
+    color: var(--accent-color);
+    font-weight: 700;
 }
 
 .menu-dropdown .menu-item .shortcut {

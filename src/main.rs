@@ -436,6 +436,34 @@ impl EditorSide {
     }
 }
 
+/// World-tabs ribbon display mode (web/GUI/Android only — no effect on the
+/// console TUI, which has no equivalent horizontal-strip UI).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum TabsMode {
+    #[default]
+    None,
+    Top,
+    Bottom,
+}
+
+impl TabsMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TabsMode::None => "none",
+            TabsMode::Top => "top",
+            TabsMode::Bottom => "bottom",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "top" => TabsMode::Top,
+            "bottom" => TabsMode::Bottom,
+            _ => TabsMode::None,
+        }
+    }
+}
+
 /// Which element has focus when editor is open
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum EditorFocus {
@@ -1597,6 +1625,8 @@ pub struct Settings {
     pub new_line_indicator: bool,
     /// Text-to-speech mode: Off, Local (espeak/say), or Edge (MS neural TTS)
     pub tts_mode: tts::TtsMode,
+    /// World-tabs ribbon display mode (web/GUI/Android only, see TabsMode)
+    pub tabs: TabsMode,
     pub tts_speak_mode: tts::TtsSpeakMode,
     pub tts_muted: bool,  // Runtime-only, toggled by F9
     pub scrollback_enabled: bool,
@@ -1655,6 +1685,7 @@ impl Default for Settings {
             zwj_enabled: false,
             new_line_indicator: false,
             tts_mode: tts::TtsMode::Off,
+            tabs: TabsMode::None,
             tts_speak_mode: tts::TtsSpeakMode::All,
             tts_muted: false,
             scrollback_enabled: false,
@@ -3617,6 +3648,7 @@ impl App {
             tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
             scrollback_enabled: self.settings.scrollback_enabled,
             keyboard_always_visible: self.settings.keyboard_always_visible,
+            tabs: self.settings.tabs.name().to_string(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
@@ -3681,6 +3713,7 @@ impl App {
         self.settings.mouse_enabled = settings.mouse_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
         self.settings.new_line_indicator = settings.new_line_indicator;
+        self.settings.tabs = TabsMode::from_name(&settings.tabs);
         let old_tts_mode = self.settings.tts_mode;
         self.settings.tts_mode = tts::TtsMode::from_name(&settings.tts_mode);
         self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
@@ -4057,6 +4090,7 @@ impl App {
             self.settings.scrollback_enabled,
             self.settings.wrapspace as i64,
             self.settings.keyboard_always_visible,
+            self.settings.tabs.name(),
         );
         self.popup_manager.open(def);
 
@@ -6081,6 +6115,7 @@ impl App {
         tts_speak_mode: String,
         scrollback_enabled: bool,
         keyboard_always_visible: bool,
+        tabs: String,
     ) {
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
@@ -6149,6 +6184,7 @@ impl App {
         self.settings.mouse_enabled = mouse_enabled;
         self.settings.zwj_enabled = zwj_enabled;
         self.settings.new_line_indicator = new_line_indicator;
+        self.settings.tabs = TabsMode::from_name(&tabs);
         self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
         self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
         if self.settings.dictionary_path != dictionary_path {
@@ -9164,7 +9200,7 @@ impl App {
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, keyboard_always_visible } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, keyboard_always_visible, tabs } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -9174,7 +9210,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                     mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
-                    keyboard_always_visible,
+                    keyboard_always_visible, tabs,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -10657,6 +10693,7 @@ pub(crate) struct SetupSettings {
     pub(crate) scrollback: bool,
     pub(crate) wrapspace: i64,
     pub(crate) keyboard_always_visible: bool,
+    pub(crate) tabs: String,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -10809,6 +10846,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
         SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
+        SETUP_FIELD_TABS,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -11059,6 +11097,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
                     wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
                     keyboard_always_visible: state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE).unwrap_or(true),
+                    tabs: state.get_selected(SETUP_FIELD_TABS).unwrap_or("none").to_string(),
                 }
             };
 
