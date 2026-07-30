@@ -6363,6 +6363,11 @@
 
         updateScrollbackProgress();
         renderTabsRibbon();
+        // Keep an open world-switch dropdown live - e.g. a disconnected
+        // world's unseen count can reach zero (viewed from another client)
+        // while the menu is still open, and it should drop out immediately
+        // rather than waiting for the next open.
+        if (worldMenuOpen) renderWorldMenu();
     }
 
     // Update time (12-hour format H:MM, no AM/PM)
@@ -6466,6 +6471,7 @@
             if (elements.outputContainer) elements.outputContainer.style.display = 'none';
             // Close any open menus
             closeMenu();
+            closeWorldMenu();
             elements.authPassword.value = '';
             elements.authError.textContent = '';
             if (elements.authUsername) {
@@ -8577,12 +8583,25 @@
     }
 
     // Connected worlds, each tagged with its index into the `worlds` array —
-    // the single source of truth shared by the tabs ribbon and the world-switch
-    // dropdown (both only ever show worlds that are currently connected).
+    // the single source of truth for the tabs ribbon (only ever shows worlds
+    // that are currently connected). The world-switch dropdown uses its own,
+    // wider helper below (getWorldSwitcherWorlds()) — don't repurpose this one
+    // for it, or the ribbon's deliberately-connected-only behavior breaks too.
     function getConnectedWorlds() {
         return worlds
             .map((w, i) => ({ world: w, index: i }))
             .filter(w => w.world.connected);
+    }
+
+    // Worlds shown in the world-switch dropdown: connected worlds, plus any
+    // disconnected world that still has unseen output pending. A disconnected
+    // world drops out again once its unseen count reaches zero (e.g. viewed
+    // from another client) - see the worldMenuOpen refresh hook in
+    // updateStatusBar() for how that happens live while the menu is open.
+    function getWorldSwitcherWorlds() {
+        return worlds
+            .map((w, i) => ({ world: w, index: i }))
+            .filter(w => w.world.connected || (w.world.unseen_lines || 0) > 0);
     }
 
     // Rebuild the tabs-ribbon strip from the current connected-worlds list and
@@ -8638,13 +8657,18 @@
     }
 
     // World-switch dropdown: opened by clicking the world name on the status
-    // bar. Populated fresh from the connected-worlds list on every open (the
+    // bar. Populated fresh from getWorldSwitcherWorlds() on every open (the
     // list can change while the app is running), unlike the static hamburger
     // dropdown. Reuses .menu-dropdown/.menu-item styling and the same
     // anchor-above-the-button positioning as toggleMenu().
     function toggleWorldMenu() {
         worldMenuOpen = !worldMenuOpen;
         if (worldMenuOpen) {
+            // Opening this menu - dismiss the hamburger menu if it's up.
+            // Both trigger buttons stopPropagation() on click, so neither
+            // ever reaches the document.body.onclick handler that would
+            // otherwise close the other one - has to be done explicitly here.
+            if (menuOpen) closeMenu();
             renderWorldMenu();
             const rect = elements.statusItem.getBoundingClientRect();
             elements.worldMenuDropdown.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
@@ -8659,13 +8683,36 @@
     }
 
     function renderWorldMenu() {
-        const connected = getConnectedWorlds();
+        const list = getWorldSwitcherWorlds();
+        // Only hide the current world once the list is large enough that
+        // trimming it actually helps - with 5 or fewer entries, show
+        // everything including the world you're already looking at.
+        const hideCurrent = list.length > 5;
         elements.worldMenuDropdown.innerHTML = '';
-        connected.forEach(({ world, index }) => {
+        list.forEach(({ world, index }) => {
+            if (hideCurrent && index === currentWorldIndex) return;
+
             const item = document.createElement('div');
             item.className = 'menu-item' + (index === currentWorldIndex ? ' selected' : '');
-            item.textContent = world.name;
             item.dataset.index = index;
+
+            // Status bubble: same green/red connected convention as the
+            // status bar's own dot (updateStatusBar()) - meaningful here
+            // since this list can include disconnected-with-unseen worlds.
+            const dot = document.createElement('span');
+            dot.className = 'status-dot' + (world.connected ? '' : ' off');
+            item.appendChild(dot);
+
+            item.appendChild(document.createTextNode(world.name));
+
+            const unseen = world.unseen_lines || 0;
+            if (unseen > 0) {
+                const badge = document.createElement('span');
+                badge.className = 'shortcut';
+                badge.textContent = '[' + unseen + ' unseen]';
+                item.appendChild(badge);
+            }
+
             elements.worldMenuDropdown.appendChild(item);
         });
     }
@@ -8682,11 +8729,16 @@
     // Toggle menu dropdown (unified - opens upward from button)
     function toggleMenu(anchorBtn) {
         menuOpen = !menuOpen;
-        if (menuOpen && anchorBtn) {
-            // Position dropdown above the anchor button
-            const rect = anchorBtn.getBoundingClientRect();
-            elements.menuDropdown.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
-            elements.menuDropdown.style.left = rect.left + 'px';
+        if (menuOpen) {
+            // Opening this menu - dismiss the world-switch dropdown if it's
+            // up, for the same stopPropagation reason as toggleWorldMenu().
+            if (worldMenuOpen) closeWorldMenu();
+            if (anchorBtn) {
+                // Position dropdown above the anchor button
+                const rect = anchorBtn.getBoundingClientRect();
+                elements.menuDropdown.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+                elements.menuDropdown.style.left = rect.left + 'px';
+            }
         }
         elements.menuDropdown.classList.toggle('visible', menuOpen);
     }
@@ -9304,7 +9356,8 @@
                     activeCustomDropdown !== null ||
                     importDialogOpen ||
                     importInsecureDialogOpen ||
-                    menuOpen;
+                    menuOpen ||
+                    worldMenuOpen;
             }
 
             // Track mouse interaction on output area to prevent focus-stealing during text selection

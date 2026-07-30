@@ -150,6 +150,12 @@ $BT/apksigner verify android/clay-android.apk
 - **Lifecycle:** VM is kept powered off when not in use. `/release` starts it before building and powers it off after (see SKILL.md Step 6b).
 - Start: `VBoxManage startvm clay-win11 --type headless`
 - Stop: `VBoxManage controlvm clay-win11 poweroff`
+- **Disk:** C: is ~70GB (resized from 50GB on 2026-07-29; disk UUID `7effa39a-7122-44d7-a15b-286616b4cd34`, the current differencing/snapshot medium attached at SATA-0-0 — resize `VBoxManage modifymedium disk <uuid> --resize <MB>` targets that medium, not the base `clay-win11.vdi`).
+
+**Resizing this disk again — known gotchas (hit 2026-07-29):**
+1. The trailing WinRE recovery partition sits at the very end of the disk, so newly-added virtual space isn't adjacent to C: until that partition is deleted (`diskpart`: `select partition N` / `delete partition override`) and C: is extended into the reclaimed + new space.
+2. After `modifymedium --resize` (done while the VM is off), the guest **will not see the new size** even after `diskpart rescan` while running — a full poweroff + startvm cycle is required before Windows reports the new disk size (confirmed via `Get-Disk`).
+3. `diskpart extend` on C: after that resize hit a real VirtualBox bug: an I/O write right at the very last block of the newly-extended medium failed (`VBox.log`: `I/O cache: Error while writing entry at offset <capacity-16896> ... rc=VERR_INVALID_PARAMETER`), which **paused** the VM (`BLKCACHE_IOERR`) rather than crashing it. Fix: `VBoxManage controlvm clay-win11 resume` — the log's own message ("Operation can be resumed afterwards") was accurate; the retry succeeded and `diskpart` completed normally. Do **not** hard-poweroff a VM in this paused state — resume first. Ran `chkdsk C: /scan` afterward as a precaution; came back clean.
 
 ### Windows x86_64 binary (MSVC, GUI + audio)
 
