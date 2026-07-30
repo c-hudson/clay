@@ -2135,14 +2135,19 @@
                     // This avoids duplicate lines when pending is released.
                     // Use server's centralized unseen tracking - don't reset to 0
                     // world.unseen_lines comes from server, keep it as-is
-                    // Same correction switchWorldLocal/user-input/ServerData-flush already
-                    // apply: showing_splash means "no real output yet", so a stale true
-                    // alongside non-empty output_lines (e.g. the server flag never got
-                    // cleared before this client's first connection) must not hide already-
-                    // existing output behind the splash screen (WebView/Android only render
-                    // the splash image, see renderOutput()) until the user happens to switch
-                    // worlds and back.
-                    if (world.showing_splash && world.output_lines && world.output_lines.length > 0) {
+                    // A world that has genuinely connected before (was_connected) can end
+                    // up with a stale showing_splash: true alongside its real accumulated
+                    // output_lines (e.g. the server flag never got cleared before this
+                    // client's first connection) - that must not hide already-existing
+                    // output behind the splash screen (WebView/Android only render the
+                    // splash image, see renderOutput()) until the user happens to switch
+                    // worlds and back. The was_connected check is required: a fresh,
+                    // never-connected world ALSO has showing_splash: true with non-empty
+                    // output_lines (the server puts the 12-line ASCII splash art directly
+                    // into output_lines, see World::new_with_splash in main.rs) - without
+                    // this check, every startup splash gets wrongly cleared and the
+                    // WebView's centered PNG logo falls through to plain left-aligned text.
+                    if (world.showing_splash && world.was_connected && world.output_lines && world.output_lines.length > 0) {
                         world.showing_splash = false;
                     }
                 });
@@ -4513,9 +4518,12 @@
                 oldWorld.output_lines.forEach(l => { l.marked_new = false; });
             }
             currentWorldIndex = index;
-            // Clear splash on world switch — if the world has output, show it
+            // Clear splash on world switch, but only for a world that has actually
+            // connected before - a fresh/never-connected world's output_lines is
+            // just the splash art itself (see the InitialState handler's identical
+            // was_connected check above for why this guard is required).
             const newWorld = worlds[index];
-            if (newWorld && newWorld.showing_splash && newWorld.output_lines && newWorld.output_lines.length > 0) {
+            if (newWorld && newWorld.showing_splash && newWorld.was_connected && newWorld.output_lines && newWorld.output_lines.length > 0) {
                 newWorld.showing_splash = false;
             }
             // Reset more-mode state for new world
