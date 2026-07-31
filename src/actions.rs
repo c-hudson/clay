@@ -76,6 +76,8 @@ pub struct Action {
     pub enabled: bool,          // If false, action will not fire
     #[serde(default)]
     pub startup: bool,          // If true, run commands on Clay startup
+    #[serde(default)]
+    pub gui_shortcut: bool,     // If true, show as a shortcut tile in the web/GUI icon bar
 }
 
 impl Default for Action {
@@ -90,6 +92,7 @@ impl Default for Action {
             owner: None,
             enabled: true,
             startup: false,
+            gui_shortcut: false,
         }
     }
 }

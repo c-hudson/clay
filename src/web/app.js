@@ -48,6 +48,67 @@
         return text;
     }
 
+    // --- Out-of-order ServerData recovery (D-Termux-lines) ---------------------------
+    // The server used to be able to deliver two ServerData batches for the same world
+    // out of order under lock contention (fixed server-side too, see
+    // WsServer::broadcast_to_world_viewers), and the WebView->Java->JS bridge on Android
+    // (evaluateJavascript, fire-and-forget) can still reorder frames on its own. The old
+    // dedup check here treated ANY batch whose seq was <= world._max_seq as a full
+    // duplicate and silently dropped it — which is correct for a genuine resync replay,
+    // but wrong for a batch that arrived late: that batch's lines were never actually
+    // appended, yet _max_seq had already been bumped past them by the batch that
+    // leapfrogged it, so they looked like "old" data and were discarded for good (and a
+    // resync couldn't recover them either, since _max_seq no longer pointed at the hole).
+    //
+    // world._seqGaps tracks seq ranges we know are MISSING below world._max_seq (recorded
+    // when a batch skips ahead of the expected next seq). A later low-seq batch is only
+    // treated as a genuine duplicate if it does NOT overlap a recorded gap; otherwise it's
+    // accepted and spliced into output_lines in seq order instead of being dropped.
+    const MAX_TRACKED_SEQ_GAPS = 50;
+
+    function recordSeqGapIfAny(world, oldMax, newBatchStartSeq) {
+        if (oldMax > 0 && newBatchStartSeq > oldMax + 1) {
+            if (!world._seqGaps) world._seqGaps = [];
+            world._seqGaps.push({ start: oldMax + 1, end: newBatchStartSeq - 1 });
+            if (world._seqGaps.length > MAX_TRACKED_SEQ_GAPS) {
+                world._seqGaps.shift();
+            }
+        }
+    }
+
+    // Returns the index into world._seqGaps of a gap overlapping [seqStart, seqEnd], or -1.
+    function findOverlappingSeqGap(world, seqStart, seqEnd) {
+        if (!world._seqGaps) return -1;
+        return world._seqGaps.findIndex(g => seqStart <= g.end && seqEnd >= g.start);
+    }
+
+    // Shrinks/removes the gap at `idx` after [filledStart, filledEnd] has been recovered.
+    function shrinkSeqGap(world, idx, filledStart, filledEnd) {
+        if (!world._seqGaps || idx < 0 || idx >= world._seqGaps.length) return;
+        const gap = world._seqGaps[idx];
+        const remaining = [];
+        if (gap.start < filledStart) remaining.push({ start: gap.start, end: filledStart - 1 });
+        if (gap.end > filledEnd) remaining.push({ start: filledEnd + 1, end: gap.end });
+        world._seqGaps.splice(idx, 1, ...remaining);
+    }
+
+    // Splice line objects (already carrying real .seq values) into world.output_lines at
+    // the position seq order dictates, rather than assuming they belong at the tail —
+    // used only for recovered gap-fill batches, which are older than what's already there.
+    function insertLinesBySeq(world, newLineObjs) {
+        if (newLineObjs.length === 0) return;
+        const firstSeq = newLineObjs[0].seq;
+        let insertAt = 0;
+        for (let i = world.output_lines.length - 1; i >= 0; i--) {
+            const existing = world.output_lines[i];
+            if (existing._has_real_seq && existing.seq < firstSeq) {
+                insertAt = i + 1;
+                break;
+            }
+        }
+        world.output_lines.splice(insertAt, 0, ...newLineObjs);
+    }
+
     // DOM elements
     const elements = {
         output: document.getElementById('output'),
@@ -70,6 +131,13 @@
         tabsRibbonTabs: document.getElementById('tabs-ribbon-tabs'),
         tabsRibbonLeft: document.getElementById('tabs-ribbon-left'),
         tabsRibbonRight: document.getElementById('tabs-ribbon-right'),
+        // Icon bar
+        iconBar: document.getElementById('icon-bar'),
+        iconBarDivider: document.getElementById('icon-bar-divider'),
+        iconBarLeft: document.getElementById('icon-bar-left'),
+        iconBarRight: document.getElementById('icon-bar-right'),
+        iconBarShortcuts: document.getElementById('icon-bar-shortcuts'),
+        iconBarTagsTile: document.getElementById('icon-bar-tags-tile'),
         worldMenuDropdown: document.getElementById('world-menu-dropdown'),
         // Note editor (NOTE_MODE only — own window/tab, see webview_gui.rs's WvEvent::NoteWindow)
         noteEditorView: document.getElementById('note-editor-view'),
@@ -149,6 +217,7 @@
         actionCommand: document.getElementById('action-command'),
         actionEnabled: document.getElementById('action-enabled'),
         actionStartup: document.getElementById('action-startup'),
+        actionGuiShortcut: document.getElementById('action-gui-shortcut'),
         actionError: document.getElementById('action-error'),
         actionSaveBtn: document.getElementById('action-save-btn'),
         actionEditorDeleteBtn: document.getElementById('action-editor-delete-btn'),
@@ -231,6 +300,7 @@
         setupTtsSelect: document.getElementById('setup-tts-select'),
         setupTtsSpeakModeSelect: document.getElementById('setup-tts-speak-mode-select'),
         setupTabsSelect: document.getElementById('setup-tabs-select'),
+        setupIconBarSelect: document.getElementById('setup-iconbar-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupKeyboardVisibleToggle: document.getElementById('setup-keyboard-visible-toggle'),
@@ -524,6 +594,7 @@
     let setupZwj = false;
     let setupTtsMode = 'Off';
     let setupTabsMode = 'none';
+    let setupIconBarMode = 'app_tablet';
     let setupTlsProxy = false;
     let setupNewLineIndicator = false;
     let setupKeyboardAlwaysVisible = true;
@@ -602,6 +673,8 @@
 
     // World-tabs ribbon mode, synced from server settings ('none', 'top', 'bottom')
     let tabsMode = 'none';
+    // Icon bar visibility mode, synced from server settings ('none', 'app_tablet', 'all')
+    let iconBarMode = 'app_tablet';
     // World-switch dropdown (opened by clicking the world name on the status bar)
     let worldMenuOpen = false;
 
@@ -1126,6 +1199,10 @@
             document.body.classList.add('is-mobile');
         }
         applyKeyboardForceState();
+        // Device mode affects iconBarVisible() ('app_tablet' mode) - re-render
+        // on every device-mode change (auto-detect at startup, or the manual
+        // long-press override) so the icon bar's visibility stays correct.
+        renderIconBar();
     }
 
     // Initialize
@@ -1253,6 +1330,7 @@
     // Prevent two concurrent connect() calls (visibilitychange + checkConnectionOnResume race)
     let connectInProgress = false;
     let lastForceReconnectAt = 0; // debounce guard against double-trigger on resume
+    let forceReconnectRetryTimer = null; // scheduled retry when a call lands inside the debounce window (see forceReconnect)
 
     // Debug logging - console only (no Toast)
     function debugLog(msg) {
@@ -1706,9 +1784,22 @@
     function forceReconnect() {
         var now = Date.now();
         if (now - lastForceReconnectAt < 1000) {
-            debugLog('forceReconnect: debounced (' + (now - lastForceReconnectAt) + 'ms since last)');
+            var remaining = 1000 - (now - lastForceReconnectAt);
+            debugLog('forceReconnect: debounced (' + (now - lastForceReconnectAt) + 'ms since last), retry in ' + remaining + 'ms');
+            // A debounced call must not simply be dropped: if nothing else re-triggers a
+            // reconnect (e.g. onResume() and a visibilitychange firing within the same
+            // second — exactly this shape), the socket is left dead with no retry
+            // scheduled at all. Coalesce instead of discarding: schedule one follow-up
+            // call for when the debounce window clears, unless one's already pending.
+            if (!forceReconnectRetryTimer) {
+                forceReconnectRetryTimer = setTimeout(function() {
+                    forceReconnectRetryTimer = null;
+                    forceReconnect();
+                }, remaining);
+            }
             return;
         }
+        if (forceReconnectRetryTimer) { clearTimeout(forceReconnectRetryTimer); forceReconnectRetryTimer = null; }
         lastForceReconnectAt = now;
         if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
         if (connectionTimeout) { clearTimeout(connectionTimeout); connectionTimeout = null; }
@@ -2054,7 +2145,20 @@
                 if (resolvedWorldIndex < 0) {
                     resolvedWorldIndex = msg.current_world_index !== undefined ? msg.current_world_index : 0;
                 }
-                currentWorldIndex = Math.max(0, Math.min(resolvedWorldIndex, worlds.length - 1));
+                // Clamp defensively: an out-of-range index must never silently land on
+                // an arbitrary REAL world via Math.min(x, worlds.length - 1) - that
+                // previously mapped multiuser's current_world_index: 9999 sentinel
+                // ("this user has no world connection yet", see
+                // build_multiuser_initial_state in daemon.rs) straight onto whatever
+                // happens to be the LAST world in the list, showing that world's
+                // (unrelated) connection state instead of a well-defined starting
+                // point. Fall back to the first world instead; worlds.length === 0 is
+                // still handled by the `!world` guards in renderOutput()/
+                // updateStatusBar() downstream.
+                if (resolvedWorldIndex < 0 || resolvedWorldIndex >= worlds.length) {
+                    resolvedWorldIndex = 0;
+                }
+                currentWorldIndex = resolvedWorldIndex;
 
                 actions = msg.actions || [];
                 splashLines = msg.splash_lines || [];
@@ -2067,6 +2171,13 @@
                 worldOutputCache = worlds.map(() => []);
                 // Ensure output_lines arrays exist, prefer timestamped versions
                 const currentTs = Math.floor(Date.now() / 1000);
+                // Wrapped in try/catch: a single malformed/unexpected world entry (e.g. a
+                // version mismatch between this client and an older/newer remote server)
+                // must not throw out of the whole InitialState handler and skip the
+                // renderOutput()/updateStatusBar() calls below - that would freeze the
+                // page on its pre-connection state (blank world name, splash screen)
+                // with no way to recover short of a manual reload.
+                try {
                 worlds.forEach((world) => {
                     const priorWorld = world.name ? priorWorldsByName[world.name] : null;
                     const cachedWorld = (!priorWorld && world.name) ? worldCacheLoaded[world.name] : null;
@@ -2151,6 +2262,13 @@
                         world.showing_splash = false;
                     }
                 });
+                } catch (e) {
+                    console.error('Clay: error normalizing InitialState worlds - continuing with partial state', e);
+                }
+                // Wrapped in try/catch for the same reason as the worlds.forEach above -
+                // one unexpected/missing settings field must not prevent the world name
+                // and output from ever rendering.
+                try {
                 if (msg.settings) {
                     if (msg.settings.input_height) {
                         setInputHeight(msg.settings.input_height);
@@ -2160,6 +2278,7 @@
                     }
                     if (msg.settings.show_tags !== undefined) {
                         showTags = msg.settings.show_tags;
+                        updateTagsTileState();
                     }
                     if (msg.settings.ansi_music_enabled !== undefined) {
                         ansiMusicEnabled = msg.settings.ansi_music_enabled;
@@ -2170,6 +2289,7 @@
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
+                    if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.new_line_indicator !== undefined) {
                         newLineIndicator = msg.settings.new_line_indicator;
                     }
@@ -2310,6 +2430,9 @@
                     }
                     settingsSynced = true;
                 }
+                } catch (e) {
+                    console.error('Clay: error applying InitialState settings - continuing with partial state', e);
+                }
                 // Calculate activity count from world data (don't wait for ActivityUpdate message) -
                 // needed immediately here since some InitialState-sending paths (ImportSettings,
                 // hot-reload) never follow up with a broadcast_activity() call.
@@ -2400,6 +2523,7 @@
                         worldOutputCache[msg.world_index] = [];
                         partialLines[msg.world_index] = '';
                         world._max_seq = 0; // Reset dedup tracking after flush
+                        world._seqGaps = [];
                         if (msg.world_index === currentWorldIndex) {
                             elements.output.innerHTML = '';
                             linesSincePause = 0;
@@ -2408,28 +2532,39 @@
                         }
                     }
                     if (msg.data) {
-                        // Dedup: skip ServerData that has already been received (e.g., after resync)
+                        // Dedup, gap-aware: a batch whose seq is <= our high-water mark is only
+                        // a genuine duplicate (e.g. a resync re-sending already-seen lines) if it
+                        // does NOT overlap a recorded gap. If it does, it arrived late relative to
+                        // a later batch that leapfrogged it — recover it below instead of dropping
+                        // it (see insertLinesBySeq / findOverlappingSeqGap above).
+                        let fillsGapIdx = -1;
                         if (msg.seq && msg.seq > 0 && world._max_seq && msg.seq <= world._max_seq) {
-                            const dupInfo = {
-                                world_index: msg.world_index,
-                                msg_seq: msg.seq,
-                                max_seq: world._max_seq,
-                                line_count: msg.data.split('\n').length,
-                                first_line: msg.data.substring(0, 200),
-                                timestamp: new Date().toISOString()
-                            };
-                            console.warn('DUPLICATE ServerData detected:', dupInfo);
-                            // Report to server for persistent logging
-                            send({
-                                type: 'ReportDuplicate',
-                                world_index: msg.world_index,
-                                line_seq: msg.seq,
-                                max_seq: world._max_seq,
-                                line_text: msg.data.substring(0, 200),
-                                source: window.Android ? 'android' : 'web'
-                            });
-                            break;
+                            const approxLineCount = msg.data.split(/\r\n|\n|\r/).length;
+                            const batchEndApprox = msg.seq + Math.max(approxLineCount - 1, 0);
+                            fillsGapIdx = findOverlappingSeqGap(world, msg.seq, batchEndApprox);
+                            if (fillsGapIdx === -1) {
+                                const dupInfo = {
+                                    world_index: msg.world_index,
+                                    msg_seq: msg.seq,
+                                    max_seq: world._max_seq,
+                                    line_count: msg.data.split('\n').length,
+                                    first_line: msg.data.substring(0, 200),
+                                    timestamp: new Date().toISOString()
+                                };
+                                console.warn('DUPLICATE ServerData detected:', dupInfo);
+                                // Report to server for persistent logging
+                                send({
+                                    type: 'ReportDuplicate',
+                                    world_index: msg.world_index,
+                                    line_seq: msg.seq,
+                                    max_seq: world._max_seq,
+                                    line_text: msg.data.substring(0, 200),
+                                    source: window.Android ? 'android' : 'web'
+                                });
+                                break;
+                            }
                         }
+                        const isGapFill = fillsGapIdx !== -1;
 
                         // Get timestamp from message or use current time
                         const lineTs = msg.ts || Math.floor(Date.now() / 1000);
@@ -2464,6 +2599,7 @@
                         }
 
                         let appendedLineCount = 0;
+                        const gapFillLineObjs = []; // only populated when isGapFill
                         rawLines.forEach(line => {
                             // Skip lines that are ONLY ANSI codes with no visible content
                             // (e.g., trailing reset codes after newlines), but keep blank lines
@@ -2482,10 +2618,21 @@
                                     return;
                                 }
                             }
-                            const lineIndex = world.output_lines.length;
                             const hasRealSeq = msg.seq !== undefined && msg.seq > 0;
-                            const lineSeq = hasRealSeq ? msg.seq + appendedLineCount : lineIndex;
-                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, marked_new: msg.marked_new || false, gagged: msg.gagged || false });
+                            const lineSeq = hasRealSeq ? msg.seq + appendedLineCount : (isGapFill ? -1 : world.output_lines.length);
+                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, marked_new: msg.marked_new || false, gagged: msg.gagged || false };
+
+                            if (isGapFill) {
+                                // This batch fills a historical hole, not the tail — collect it
+                                // and splice it into output_lines in seq order below instead of
+                                // rendering it incrementally as if it were new tail output.
+                                gapFillLineObjs.push(lineObj);
+                                appendedLineCount++;
+                                return;
+                            }
+
+                            const lineIndex = world.output_lines.length;
+                            world.output_lines.push(lineObj);
                             appendedLineCount++;
                             // Verify sequence order (only for messages with real server-assigned seq)
                             if (lineIndex > 0 && msg.seq !== undefined && msg.seq > 0) {
@@ -2520,8 +2667,30 @@
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and sends UnseenUpdate messages to keep all clients in sync
                         });
-                        // Update _max_seq after appending lines
-                        if (msg.seq && msg.seq > 0 && appendedLineCount > 0) {
+                        if (isGapFill) {
+                            if (gapFillLineObjs.length > 0) {
+                                insertLinesBySeq(world, gapFillLineObjs);
+                                shrinkSeqGap(world, fillsGapIdx, msg.seq, msg.seq + appendedLineCount - 1);
+                                console.warn('RECOVERED out-of-order ServerData (filled a gap):', { world_index: msg.world_index, seq: msg.seq, count: appendedLineCount });
+                                send({
+                                    type: 'ReportOutOfOrder',
+                                    world_index: msg.world_index,
+                                    line_seq: msg.seq,
+                                    recovered_count: appendedLineCount,
+                                    source: window.Android ? 'android' : 'web'
+                                });
+                                // These lines were inserted earlier than the tail — an incremental
+                                // append can't place them correctly, so re-render fully.
+                                if (msg.world_index === currentWorldIndex) {
+                                    renderOutput();
+                                }
+                            }
+                        } else if (msg.seq && msg.seq > 0 && appendedLineCount > 0) {
+                            // Update _max_seq after appending lines, recording a gap first if this
+                            // batch skipped ahead of the expected next seq — so a later
+                            // out-of-order batch can still recover it instead of being treated as
+                            // a duplicate.
+                            recordSeqGapIfAny(world, world._max_seq || 0, msg.seq);
                             world._max_seq = Math.max(world._max_seq || 0, msg.seq + appendedLineCount - 1);
                         }
                         if (msg.world_index !== currentWorldIndex) {
@@ -2720,6 +2889,7 @@
                     if (msg.settings.show_tags !== undefined) {
                         const oldShowTags = showTags;
                         showTags = msg.settings.show_tags;
+                        updateTagsTileState();
                         if (oldShowTags !== showTags) {
                             renderOutput(); // Re-render with new tag visibility
                         }
@@ -2733,6 +2903,7 @@
                     if (msg.settings.tts_mode !== undefined) ttsMode = msg.settings.tts_mode;
                     if (msg.settings.tts_speak_mode !== undefined) ttsSpeakMode = msg.settings.tts_speak_mode;
                     if (msg.settings.tabs !== undefined) applyTabsMode(msg.settings.tabs);
+                    if (msg.settings.icon_bar !== undefined) applyIconBarMode(msg.settings.icon_bar);
                     if (msg.settings.new_line_indicator !== undefined) {
                         const oldNli = newLineIndicator;
                         newLineIndicator = msg.settings.new_line_indicator;
@@ -2925,6 +3096,7 @@
                 if (actionsListPopupOpen) {
                     renderActionsList();
                 }
+                renderIconBar();
                 break;
 
             case 'CalculatedWorld':
@@ -2986,6 +3158,7 @@
             case 'ShowTagsChanged':
                 // Server toggled show_tags (F2 or /tag command)
                 showTags = msg.show_tags;
+                updateTagsTileState();
                 renderOutput();
                 break;
 
@@ -3183,9 +3356,22 @@
                     let appended = false;
 
                     (msg.lines || []).forEach((line) => {
-                        if (line.seq === undefined || !world._max_seq || line.seq > world._max_seq) {
+                        const isNew = line.seq === undefined || !world._max_seq || line.seq > world._max_seq;
+                        const gapIdx = !isNew && line.seq !== undefined ? findOverlappingSeqGap(world, line.seq, line.seq) : -1;
+                        if (isNew) {
                             world.output_lines.push(line);
                             if (line.seq !== undefined) world._max_seq = Math.max(world._max_seq || 0, line.seq);
+                            appended = true;
+                        } else if (gapIdx !== -1) {
+                            // Recovers a line this client thought it had already passed (see
+                            // the ServerData handler's gap-tracking above) — a genuine dup
+                            // (already-received line) still correctly falls through and is
+                            // skipped here. Insertion position is best-effort (this handler
+                            // doesn't consistently tag entries with _has_real_seq the way
+                            // ServerData does) but never worse than the silent drop this
+                            // replaces.
+                            insertLinesBySeq(world, [line]);
+                            shrinkSeqGap(world, gapIdx, line.seq, line.seq);
                             appended = true;
                         }
                     });
@@ -4895,7 +5081,9 @@
             '  /gag hides the matched line.',
             '  /notify sends a push notification.', '',
             'Enabled: Whether this action is active.', '',
-            'Startup: Run command when Clay starts/hot-reloads.'
+            'Startup: Run command when Clay starts/hot-reloads.', '',
+            'GUI Menu Shortcut: Show this action as a one-click',
+            '  shortcut tile in the web/GUI icon bar.'
         ],
         connections: [
             'Connected Worlds - Active Connections', '',
@@ -6371,6 +6559,7 @@
 
         updateScrollbackProgress();
         renderTabsRibbon();
+        renderIconBar();
         // Keep an open world-switch dropdown live - e.g. a disconnected
         // world's unseen count can reach zero (viewed from another client)
         // while the menu is still open, and it should drop out immediately
@@ -6882,6 +7071,7 @@
             elements.actionCommand.value = action.command || '';
             elements.actionEnabled.value = (action.enabled !== false) ? 'yes' : 'no';
             elements.actionStartup.value = action.startup ? 'yes' : 'no';
+            elements.actionGuiShortcut.value = action.gui_shortcut ? 'yes' : 'no';
         } else {
             // New action
             elements.actionEditorTitle.textContent = 'New Action';
@@ -6892,6 +7082,7 @@
             elements.actionCommand.value = '';
             elements.actionEnabled.value = 'yes';
             elements.actionStartup.value = 'no';
+            elements.actionGuiShortcut.value = 'no';
         }
 
         renderActionPatternRows(editPatterns);
@@ -7001,7 +7192,8 @@
             patterns: filteredPatterns,
             command: elements.actionCommand.value,
             enabled: elements.actionEnabled.value === 'yes',
-            startup: elements.actionStartup.value === 'yes'
+            startup: elements.actionStartup.value === 'yes',
+            gui_shortcut: elements.actionGuiShortcut.value === 'yes'
         };
 
         if (editingActionIndex < 0) {
@@ -7093,6 +7285,7 @@
         setupZwj = zwjEnabled;
         setupTtsMode = ttsMode === 'off' ? 'Off' : ttsMode === 'local' ? 'Local' : ttsMode === 'edge' ? 'Edge' : 'Off';
         setupTabsMode = tabsMode;
+        setupIconBarMode = iconBarMode;
         setupTlsProxy = tlsProxyEnabled;
         setupNewLineIndicator = newLineIndicator;
         setupKeyboardAlwaysVisible = keyboardAlwaysVisible;
@@ -7166,6 +7359,10 @@
         if (elements.setupTabsSelect) {
             elements.setupTabsSelect.value = setupTabsMode;
             updateCustomDropdown(elements.setupTabsSelect);
+        }
+        if (elements.setupIconBarSelect) {
+            elements.setupIconBarSelect.value = setupIconBarMode;
+            updateCustomDropdown(elements.setupIconBarSelect);
         }
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
@@ -7256,6 +7453,7 @@
             tts_mode: ttsMode,
             tts_speak_mode: ttsSpeakMode,
             tabs: tabsMode,
+            icon_bar: iconBarMode,
             new_line_indicator: newLineIndicator,
             mouse_enabled: mouseEnabled,
             debug_enabled: debugEnabled,
@@ -7365,6 +7563,7 @@
         zwjEnabled = setupZwj;
         ttsMode = setupTtsMode.toLowerCase();
         applyTabsMode(setupTabsMode);
+        applyIconBarMode(setupIconBarMode);
         tlsProxyEnabled = setupTlsProxy;
         newLineIndicator = setupNewLineIndicator;
         keyboardAlwaysVisible = setupKeyboardAlwaysVisible;
@@ -8664,6 +8863,107 @@
         renderTabsRibbon();
     }
 
+    // Whether the icon bar (Worlds/Actions/Settings/Find tiles + shortcuts,
+    // see renderIconBar()) should be visible right now: the user setting,
+    // combined with the current effective device type. Mirrors
+    // keyboardForceEnabled()'s "setting && device check" shape.
+    function iconBarVisible() {
+        if (iconBarMode === 'none') return false;
+        if (iconBarMode === 'all') return true;
+        // 'app_tablet': the desktop WebView GUI app, or a tablet-width
+        // layout - NOT a plain desktop browser tab, NOT phone.
+        return deviceMode === 'tablet' || (deviceMode === 'desktop' && window.WEBVIEW_MODE);
+    }
+
+    // Apply an Icon Bar setting change and re-render.
+    function applyIconBarMode(mode) {
+        iconBarMode = mode;
+        renderIconBar();
+    }
+
+    // Actions the user has flagged to show as a one-click shortcut tile in
+    // the icon bar. Disabled actions are excluded - a disabled action can't
+    // fire anyway, so showing it as a clickable shortcut would be misleading.
+    function getShortcutActions() {
+        return actions.filter(a => a.enabled && a.gui_shortcut);
+    }
+
+    // Rebuild the icon bar: show/hide it per iconBarVisible(), and - only
+    // if there's at least one shortcut-enabled action - build the shortcut
+    // tiles and show the ‹/› cycle arrows when they overflow. The 4
+    // built-in tiles (Worlds/Actions/Settings/Find) are static markup in
+    // index.html and never move; everything right of them (divider, cycle
+    // arrows, shortcuts) is hidden entirely with zero shortcuts configured.
+    function renderIconBar() {
+        if (!elements.iconBar) return;
+        const visible = iconBarVisible();
+        elements.iconBar.style.display = visible ? 'flex' : 'none';
+        if (!visible) return;
+
+        const shortcuts = getShortcutActions();
+        const hasShortcuts = shortcuts.length > 0;
+
+        elements.iconBarDivider.style.display = hasShortcuts ? '' : 'none';
+        elements.iconBarShortcuts.style.display = hasShortcuts ? '' : 'none';
+        if (!hasShortcuts) {
+            elements.iconBarLeft.style.display = 'none';
+            elements.iconBarRight.style.display = 'none';
+            elements.iconBarShortcuts.innerHTML = '';
+            return;
+        }
+
+        elements.iconBarLeft.style.display = '';
+        elements.iconBarRight.style.display = '';
+        elements.iconBarShortcuts.innerHTML = '';
+        shortcuts.forEach((action) => {
+            const tile = document.createElement('div');
+            tile.className = 'icon-tile shortcut';
+            tile.title = action.name;
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.setAttribute('viewBox', '0 0 32 32');
+            svg.setAttribute('fill', 'currentColor');
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', 'M16 3 19.06 11.8 28.35 11.98 20.94 17.6 23.65 26.53 16 21.2 8.35 26.53 11.06 17.6 3.65 11.98 12.94 11.8Z');
+            svg.appendChild(path);
+            tile.appendChild(svg);
+            const label = document.createElement('span');
+            label.className = 'icon-tile-label';
+            label.textContent = action.name;
+            tile.appendChild(label);
+            tile.onclick = function(e) {
+                e.stopPropagation();
+                invokeShortcutAction(action);
+            };
+            elements.iconBarShortcuts.appendChild(tile);
+        });
+
+        // Only show the cycle arrows when the shortcuts strip actually overflows -
+        // same overflow check renderTabsRibbon() uses for its own arrows.
+        const overflowing = elements.iconBarShortcuts.scrollWidth > elements.iconBarShortcuts.clientWidth;
+        elements.iconBarLeft.classList.toggle('hidden', !overflowing);
+        elements.iconBarRight.classList.toggle('hidden', !overflowing);
+    }
+
+    // Invoke a shortcut Action the same way manual invocation already works
+    // elsewhere in the client (an action with no pattern is invoked as
+    // /name, see actions.rs) - route through the exact same input pipeline
+    // as typing it and pressing Enter, so history/more-mode/etc. all behave
+    // identically to a real typed command.
+    function invokeShortcutAction(action) {
+        elements.input.value = '/' + action.name;
+        sendCommand();
+    }
+
+    // Reflect the current showTags state on the icon bar's Toggle Tags
+    // tile, so it reads as a real toggle (on/off), not a one-shot action
+    // like the other built-in tiles. Called from every showTags-assignment
+    // site (InitialState, GlobalSettingsUpdated, ShowTagsChanged).
+    function updateTagsTileState() {
+        if (elements.iconBarTagsTile) {
+            elements.iconBarTagsTile.classList.toggle('active', showTags);
+        }
+    }
+
     // World-switch dropdown: opened by clicking the world name on the status
     // bar. Populated fresh from getWorldSwitcherWorlds() on every open (the
     // list can change while the app is running), unlike the static hamburger
@@ -8757,9 +9057,46 @@
         elements.menuDropdown.classList.remove('visible');
     }
 
+    // Close every content/navigation popup that could be left open from a
+    // previous menu-item click - e.g. clicking Worlds then Actions back to
+    // back (icon bar or hamburger menu, both funnel through
+    // handleMenuItem()) used to leave both open, since each open*Popup()
+    // shows its own modal with no awareness of any other one. Each call is
+    // guarded by that popup's own *Open flag so closing an already-closed
+    // popup is a no-op rather than doing needless work (some close
+    // functions also clear text/re-render). Deliberately excludes the auth
+    // and password-change modals - those are security-relevant gates with
+    // their own lifecycle, not menu-item navigation.
+    //
+    // `except` names the action about to be dispatched (e.g. 'filter' or
+    // 'search') whose OWN popup should be left untouched here - Find/Search
+    // toggle themselves closed when clicked while already open
+    // (`if (xOpen) close(); else open();` in the switch below), and closing
+    // it here first would make that check always see it as closed, silently
+    // turning "click to close" into "close then instantly reopen".
+    //
+    // Note: isAnyModalOpen() (further down this file) is a similar but
+    // block-scoped, read-only list used elsewhere for a different purpose
+    // (it's also missing help/search) - not reachable from here, and not
+    // worth unifying with this one for what is a narrowly-scoped fix.
+    function closeAllPopups(except) {
+        if (filterPopupOpen && except !== 'filter') closeFilterPopup();
+        if (searchPopupOpen && except !== 'search') closeSearchPopup();
+        if (helpPopupOpen) closeHelpPopup();
+        if (actionsListPopupOpen) closeActionsListPopup();
+        if (actionsEditorPopupOpen) closeActionsEditorPopup();
+        if (actionsConfirmPopupOpen) closeActionsConfirmPopup();
+        if (settingsPopupOpen) closeSettingsPopup();
+        if (worldsPopupOpen) closeWorldsPopup();
+        if (worldSelectorPopupOpen) closeWorldSelectorPopup();
+        if (worldEditorPopupOpen) closeWorldEditorPopup();
+        if (worldConfirmPopupOpen) closeWorldConfirmPopup();
+    }
+
     // Handle menu item click
     function handleMenuItem(action) {
         closeMenu();
+        closeAllPopups(action);
         switch (action) {
             case 'help':
                 openHelpPopup();
@@ -9263,6 +9600,30 @@
             elements.tabsRibbonRight.addEventListener('click', function(e) {
                 e.stopPropagation();
                 elements.tabsRibbonTabs.scrollBy({ left: 120, behavior: 'smooth' });
+            });
+        }
+
+        // Icon bar: the 4 built-in tiles reuse the hamburger menu's own
+        // dispatch (same data-action strings handleMenuItem() already
+        // switches on) instead of duplicating popup-opening logic.
+        if (elements.iconBar) {
+            elements.iconBar.querySelectorAll('.icon-tile[data-action]').forEach((tile) => {
+                tile.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    handleMenuItem(tile.dataset.action);
+                });
+            });
+        }
+        if (elements.iconBarLeft) {
+            elements.iconBarLeft.addEventListener('click', function(e) {
+                e.stopPropagation();
+                elements.iconBarShortcuts.scrollBy({ left: -120, behavior: 'smooth' });
+            });
+        }
+        if (elements.iconBarRight) {
+            elements.iconBarRight.addEventListener('click', function(e) {
+                e.stopPropagation();
+                elements.iconBarShortcuts.scrollBy({ left: 120, behavior: 'smooth' });
             });
         }
 
@@ -10073,6 +10434,11 @@
         if (elements.setupTabsSelect) {
             elements.setupTabsSelect.onchange = function() {
                 setupTabsMode = this.value;
+            };
+        }
+        if (elements.setupIconBarSelect) {
+            elements.setupIconBarSelect.onchange = function() {
+                setupIconBarMode = this.value;
             };
         }
         elements.setupTlsProxyToggle.onclick = function() {

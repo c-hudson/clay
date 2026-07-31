@@ -1171,7 +1171,8 @@ pub(crate) fn spawn_remote_ping_check(
     // Gather client snapshot and send PingCheck to each
     let mut snapshots = Vec::new();
     if let Some(ref ws_server) = app.ws_server {
-        if let Ok(clients) = ws_server.clients.try_read() {
+        {
+            let clients = ws_server.clients.read().unwrap();
             let mut sorted: Vec<_> = clients.iter()
                 .filter(|(_, c)| c.authenticated)
                 .collect();
@@ -2440,21 +2441,16 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         }
         Command::RemoteKill { client_id } => {
             let msg = if let Some(ref ws_server) = app.ws_server {
-                if let Ok(clients) = ws_server.clients.try_read() {
-                    if let Some(client) = clients.get(&client_id) {
-                        let ip = client.ip_address.clone();
-                        drop(clients);
-                        if let Ok(mut clients_mut) = ws_server.clients.try_write() {
-                            clients_mut.remove(&client_id);
-                            format!("Disconnected remote client {} ({})", client_id, ip)
-                        } else {
-                            "Could not acquire write lock (busy).".to_string()
-                        }
-                    } else {
-                        format!("No client with ID {}.", client_id)
-                    }
+                let ip = {
+                    let clients = ws_server.clients.read().unwrap();
+                    clients.get(&client_id).map(|c| c.ip_address.clone())
+                };
+                if let Some(ip) = ip {
+                    let mut clients_mut = ws_server.clients.write().unwrap();
+                    clients_mut.remove(&client_id);
+                    format!("Disconnected remote client {} ({})", client_id, ip)
                 } else {
-                    "Could not read client list (busy).".to_string()
+                    format!("No client with ID {}.", client_id)
                 }
             } else {
                 "WebSocket server is not running.".to_string()

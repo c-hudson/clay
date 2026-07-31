@@ -30,6 +30,7 @@ pub const SETUP_FIELD_SCROLLBACK: FieldId = FieldId(20);
 pub const SETUP_FIELD_WRAPSPACE: FieldId = FieldId(22);
 pub const SETUP_FIELD_KEYBOARD_VISIBLE: FieldId = FieldId(23);
 pub const SETUP_FIELD_TABS: FieldId = FieldId(24);
+pub const SETUP_FIELD_ICON_BAR: FieldId = FieldId(25);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -85,6 +86,15 @@ pub fn tabs_options() -> Vec<SelectOption> {
     ]
 }
 
+/// Icon bar visibility options (web/GUI/Android only)
+pub fn icon_bar_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption::new("none", "None"),
+        SelectOption::new("app_tablet", "App/Tablet"),
+        SelectOption::new("all", "All"),
+    ]
+}
+
 /// Create the setup popup definition with current values
 #[allow(clippy::too_many_arguments)]
 pub fn create_setup_popup(
@@ -108,6 +118,7 @@ pub fn create_setup_popup(
     wrapspace: i64,
     keyboard_always_visible: bool,
     tabs: &str,
+    icon_bar: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -119,6 +130,7 @@ pub fn create_setup_popup(
     };
     let tts_speak_mode_idx = if tts_speak_mode == "limit" { 1 } else { 0 };
     let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
+    let icon_bar_idx = icon_bar_options().iter().position(|o| o.value == icon_bar).unwrap_or(1);
 
     PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
@@ -221,6 +233,11 @@ pub fn create_setup_popup(
             "Tabs",
             FieldKind::select(tabs_options(), tabs_idx),
         ))
+        .with_field(Field::new(
+            SETUP_FIELD_ICON_BAR,
+            "Icon Bar",
+            FieldKind::select(icon_bar_options(), icon_bar_idx),
+        ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
@@ -315,6 +332,13 @@ fn setup_help_text() -> Vec<String> {
         "  Top Ribbon' places it above the output area; 'Show",
         "  Bottom Ribbon' places it directly above the separator",
         "  bar. 'None' (default) keeps the current look.",
+        "",
+        "Icon Bar: Show a row of large Worlds/Actions/Settings/Find",
+        "  icons (plus any Action marked GUI Menu Shortcut) above",
+        "  the output area in the web/GUI/Android UI (no effect on",
+        "  the console). 'None' hides it; 'App/Tablet' (default)",
+        "  shows it in the desktop GUI app and on tablet-width web",
+        "  clients; 'All' also shows it on phone.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -328,13 +352,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", false, 0, true, "none",
+            false, "off", "words", false, 0, true, "none", "app_tablet",
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 20);
+        assert_eq!(state.definition.fields.len(), 21);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -343,7 +367,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, "edge", "sentences", true, 4, false, "top",
+            false, "edge", "sentences", true, 4, false, "top", "all",
         );
         let state = PopupState::new(def);
 
@@ -360,5 +384,6 @@ mod tests {
         assert_eq!(state.get_number(SETUP_FIELD_WRAPSPACE), Some(4));
         assert_eq!(state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE), Some(false));
         assert_eq!(state.get_selected(SETUP_FIELD_TABS), Some("top"));
+        assert_eq!(state.get_selected(SETUP_FIELD_ICON_BAR), Some("all"));
     }
 }

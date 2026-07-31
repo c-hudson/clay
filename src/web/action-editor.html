@@ -659,11 +659,12 @@ function renderDetail() {
   worldHint.textContent = 'Comma-separated world names';
   addField(panel, 'World', buildInput('text', a.world, v => { a.world = v; markDirty(); }), worldHint);
 
-  // Enabled / Startup
+  // Enabled / Startup / GUI Menu Shortcut
   const checkRow = document.createElement('div');
   checkRow.className = 'checkbox-row';
   checkRow.appendChild(buildCheckbox('Enabled', a.enabled, v => { a.enabled = v; renderList(); markDirty(); }));
   checkRow.appendChild(buildCheckbox('Run at startup', a.startup, v => { a.startup = v; markDirty(); }));
+  checkRow.appendChild(buildCheckbox('GUI Menu Shortcut', a.gui_shortcut, v => { a.gui_shortcut = v; markDirty(); }));
   const checkWrap = document.createElement('div');
   checkWrap.className = 'field-row';
   checkWrap.appendChild(checkRow);
@@ -853,6 +854,7 @@ function addNewAction() {
       owner: null,
       enabled: true,
       startup: false,
+      gui_shortcut: false,
     };
     actions.push(a);
     selActionName = name;

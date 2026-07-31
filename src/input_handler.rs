@@ -14,7 +14,7 @@ use crate::{
     Theme, WorldSwitchMode,
     Encoding, AutoConnectType, KeepAliveType, WorldType,
     current_timestamp_secs,
-    App, World, EditorFocus, EditorSide, TabsMode, DEBUG_ENABLED,
+    App, World, EditorFocus, EditorSide, TabsMode, IconBarMode, DEBUG_ENABLED,
     handle_new_popup_key, NewPopupAction,
     WorldSelectorAction, ActionsListAction, NotesListAction, RecentWorldsAction,
     web_settings_from_custom_data, apply_web_settings,
@@ -625,6 +625,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.new_line_indicator = settings.new_line_indicator;
                 app.settings.keyboard_always_visible = settings.keyboard_always_visible;
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
+                app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
                 let old_tts_mode = app.settings.tts_mode;
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.settings.tts_speak_mode = crate::tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);

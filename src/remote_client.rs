@@ -29,7 +29,7 @@ use crate::{
     UpdateSuccess,
     NewPopupAction, WebSettings,
     ActionsListAction, RecentWorldsAction,
-    EditorSide, TabsMode, AutoConnectType, KeepAliveType,
+    EditorSide, TabsMode, IconBarMode, AutoConnectType, KeepAliveType,
     web_settings_from_custom_data, handle_new_popup_key,
     websocket, popup, keybindings, tf, platform, persistence,
 };
@@ -1483,6 +1483,7 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.new_line_indicator = settings.new_line_indicator;
                 app.settings.keyboard_always_visible = settings.keyboard_always_visible;
                 app.settings.tabs = TabsMode::from_name(&settings.tabs);
+                app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.settings.scrollback_enabled = settings.scrollback;
                 // No local needs_output_redraw here — this is a remote console client; the
@@ -1539,6 +1540,7 @@ pub(crate) fn handle_remote_client_key(
                     scrollback_enabled: app.settings.scrollback_enabled,
                     keyboard_always_visible: app.settings.keyboard_always_visible,
                     tabs: app.settings.tabs.name().to_string(),
+                    icon_bar: app.settings.icon_bar.name().to_string(),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -2336,6 +2338,7 @@ pub(crate) fn apply_remote_web_settings(
         scrollback_enabled: app.settings.scrollback_enabled,
         keyboard_always_visible: app.settings.keyboard_always_visible,
         tabs: app.settings.tabs.name().to_string(),  // unchanged — this function only touches web settings
+        icon_bar: app.settings.icon_bar.name().to_string(),  // unchanged — this function only touches web settings
     });
 }
 pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {

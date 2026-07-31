@@ -282,6 +282,8 @@ pub enum WsMessage {
         keyboard_always_visible: bool,
         #[serde(default)]
         tabs: String,
+        #[serde(default)]
+        icon_bar: String,
     },
 
     // Settings update confirmations (server -> client)
@@ -332,6 +334,16 @@ pub enum WsMessage {
         line_seq: u64,
         max_seq: u64,
         line_text: String,
+        source: String,  // "web", "gui", "android", "console"
+    },
+
+    /// Report that a client recovered an out-of-order ServerData batch that overlapped a
+    /// gap it had recorded, instead of treating it as a duplicate (client -> server). See
+    /// app.js's insertLinesBySeq/findOverlappingSeqGap (D-Termux-lines investigation).
+    ReportOutOfOrder {
+        world_index: usize,
+        line_seq: u64,
+        recovered_count: usize,
         source: String,  // "web", "gui", "android", "console"
     },
 
@@ -622,6 +634,10 @@ pub struct GlobalSettingsMsg {
     /// web/GUI/Android only — see TabsMode.
     #[serde(default)]
     pub tabs: String,
+    /// Icon bar visibility mode: "none" / "app_tablet" (default) / "all".
+    /// web/GUI/Android only — see IconBarMode.
+    #[serde(default)]
+    pub icon_bar: String,
     /// Theme colors from ~/.clay/theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
@@ -736,7 +752,14 @@ pub struct UserCredential {
 
 /// WebSocket server state
 pub struct WebSocketServer {
-    pub clients: Arc<RwLock<HashMap<u64, WsClientInfo>>>,
+    /// Guarded by `std::sync::RwLock`, not `tokio::sync::RwLock`: every critical section here
+    /// is a short map lookup/mutation plus an unbounded-channel `send()`, never held across an
+    /// `.await`. A blocking `.read()`/`.write()` (as opposed to `try_read()`/`try_write()` with a
+    /// spawn-fallback) guarantees broadcasts to a client are never reordered relative to one
+    /// another and are never silently dropped under lock contention (see D-Termux-lines
+    /// investigation: reordering + a couple of missed `try_write()`s combined to make output
+    /// batches vanish permanently on the Android client).
+    pub clients: Arc<std::sync::RwLock<HashMap<u64, WsClientInfo>>>,
     pub next_client_id: Arc<std::sync::Mutex<u64>>,
     pub password_hash: Arc<std::sync::RwLock<String>>,
     /// True when a non-empty password is configured; false for auth-key-only mode.
@@ -778,7 +801,7 @@ impl WebSocketServer {
         // Parse allow list: comma-separated, trimmed entries
         let allow_list_vec: Vec<String> = parse_allow_list_csv(allow_list);
         Self {
-            clients: Arc::new(RwLock::new(HashMap::new())),
+            clients: Arc::new(std::sync::RwLock::new(HashMap::new())),
             next_client_id: Arc::new(std::sync::Mutex::new(1)),
             password_hash: Arc::new(std::sync::RwLock::new(password_hash)),
             password_enabled: Arc::new(std::sync::RwLock::new(!password.is_empty())),
@@ -836,61 +859,49 @@ impl WebSocketServer {
 
     /// Set the username for a connected client
     pub fn set_client_username(&self, client_id: u64, username: Option<String>) {
-        if let Ok(mut clients) = self.clients.try_write() {
-            if let Some(client) = clients.get_mut(&client_id) {
-                client.username = username;
-            }
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.username = username;
         }
     }
 
     /// Get the username of a connected client (multiuser mode)
     pub fn get_client_username(&self, client_id: u64) -> Option<String> {
-        // Use try_read to avoid blocking in async context
-        if let Ok(clients) = self.clients.try_read() {
-            clients.get(&client_id).and_then(|c| c.username.clone())
-        } else {
-            None
-        }
+        let clients = self.clients.read().unwrap();
+        clients.get(&client_id).and_then(|c| c.username.clone())
     }
 
     /// Get the IP address of a connected client
     pub fn get_client_ip(&self, client_id: u64) -> Option<String> {
-        // Use try_read to avoid blocking in async context
-        if let Ok(clients) = self.clients.try_read() {
-            clients.get(&client_id).map(|c| c.ip_address.clone())
-        } else {
-            None
-        }
+        let clients = self.clients.read().unwrap();
+        clients.get(&client_id).map(|c| c.ip_address.clone())
     }
 
     /// Clear a client's authentication state (for logout)
     pub fn clear_client_auth(&self, client_id: u64) {
-        if let Ok(mut clients) = self.clients.try_write() {
-            if let Some(client) = clients.get_mut(&client_id) {
-                client.authenticated = false;
-                client.username = None;
-            }
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.authenticated = false;
+            client.username = None;
         }
     }
 
     /// Broadcast a message to all clients owned by a specific user
     pub fn broadcast_to_owner(&self, msg: WsMessage, owner: Option<&str>) {
-        // Use try_read to avoid blocking in async context
-        if let Ok(clients) = self.clients.try_read() {
-            for client in clients.values() {
-                // Only broadcast to clients that are authenticated AND have received InitialState
-                // This prevents ServerData from reaching clients before InitialState,
-                // which causes SEQ MISMATCH errors and duplicate/flickering messages
-                if client.authenticated && client.received_initial_state {
-                    // In multiuser mode, only send to clients with matching username
-                    if self.multiuser_mode {
-                        if client.username.as_deref() == owner {
-                            let _ = client.tx.send(msg.clone());
-                        }
-                    } else {
-                        // In single-user mode, broadcast to all authenticated clients
+        let clients = self.clients.read().unwrap();
+        for client in clients.values() {
+            // Only broadcast to clients that are authenticated AND have received InitialState
+            // This prevents ServerData from reaching clients before InitialState,
+            // which causes SEQ MISMATCH errors and duplicate/flickering messages
+            if client.authenticated && client.received_initial_state {
+                // In multiuser mode, only send to clients with matching username
+                if self.multiuser_mode {
+                    if client.username.as_deref() == owner {
                         let _ = client.tx.send(msg.clone());
                     }
+                } else {
+                    // In single-user mode, broadcast to all authenticated clients
+                    let _ = client.tx.send(msg.clone());
                 }
             }
         }
@@ -899,14 +910,12 @@ impl WebSocketServer {
     /// Broadcast a message to all authenticated clients (regardless of owner)
     /// Only sends to clients that have received their InitialState to prevent duplicates
     pub fn broadcast_to_all(&self, msg: WsMessage) {
-        // Use try_read to avoid blocking in async context
-        if let Ok(clients) = self.clients.try_read() {
-            for client in clients.values() {
-                // Only broadcast to clients that are authenticated AND have received InitialState
-                // This prevents duplicate messages when a client connects while data is streaming
-                if client.authenticated && client.received_initial_state {
-                    let _ = client.tx.send(msg.clone());
-                }
+        let clients = self.clients.read().unwrap();
+        for client in clients.values() {
+            // Only broadcast to clients that are authenticated AND have received InitialState
+            // This prevents duplicate messages when a client connects while data is streaming
+            if client.authenticated && client.received_initial_state {
+                let _ = client.tx.send(msg.clone());
             }
         }
     }
@@ -914,154 +923,117 @@ impl WebSocketServer {
     /// Mark a client as having received its InitialState
     /// After this, the client will receive broadcasts
     pub fn mark_initial_state_sent(&self, client_id: u64) {
-        if let Ok(mut clients) = self.clients.try_write() {
-            if let Some(client) = clients.get_mut(&client_id) {
-                client.received_initial_state = true;
-            }
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.received_initial_state = true;
         }
     }
 
     /// Send a message to a specific client
     pub fn send_to_client(&self, client_id: u64, msg: WsMessage) {
-        // Use try_read to avoid blocking in async context
-        if let Ok(clients) = self.clients.try_read() {
-            if let Some(client) = clients.get(&client_id) {
-                let _ = client.tx.send(msg);
-            }
+        let clients = self.clients.read().unwrap();
+        if let Some(client) = clients.get(&client_id) {
+            let _ = client.tx.send(msg);
         }
     }
 
-    /// Send InitialState to a client AND mark received_initial_state = true.
-    /// Tries synchronous write first to avoid race where broadcasts are dropped
-    /// before the flag is set. Falls back to spawned task if lock is contended.
+    /// Send InitialState to a client AND mark received_initial_state = true, in one
+    /// lock acquisition — avoids the race where a broadcast lands between sending the
+    /// message and setting the flag.
     pub fn send_initial_state_and_mark(&self, client_id: u64, msg: WsMessage) {
-        if let Ok(mut guard) = self.clients.try_write() {
-            if let Some(client) = guard.get_mut(&client_id) {
-                let _ = client.tx.send(msg);
-                client.received_initial_state = true;
-            }
-        } else {
-            let clients = self.clients.clone();
-            tokio::spawn(async move {
-                let mut guard = clients.write().await;
-                if let Some(client) = guard.get_mut(&client_id) {
-                    let _ = client.tx.send(msg);
-                    client.received_initial_state = true;
-                }
-            });
+        let mut guard = self.clients.write().unwrap();
+        if let Some(client) = guard.get_mut(&client_id) {
+            let _ = client.tx.send(msg);
+            client.received_initial_state = true;
         }
     }
 
     /// Set the client type for a connected client
     pub fn set_client_type(&self, client_id: u64, client_type: RemoteClientType) {
-        if let Ok(mut clients) = self.clients.try_write() {
-            if let Some(client) = clients.get_mut(&client_id) {
-                client.client_type = client_type;
-            }
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.client_type = client_type;
         }
     }
 
     /// Set the viewport height for a connected client
     pub fn set_client_viewport(&self, client_id: u64, height: usize) {
-        if let Ok(mut clients) = self.clients.try_write() {
-            if let Some(client) = clients.get_mut(&client_id) {
-                client.viewport_height = height;
-            }
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.viewport_height = height;
         }
     }
 
     /// Set the current world being viewed by a connected client
     pub fn set_client_world(&self, client_id: u64, world_index: Option<usize>) {
-        if let Ok(mut clients) = self.clients.try_write() {
-            if let Some(client) = clients.get_mut(&client_id) {
-                client.current_world = world_index;
-            }
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.current_world = world_index;
         }
     }
 
     /// Set the paused state for a connected client. Returns (was_paused, ip_address, current_world).
     pub fn set_client_paused(&self, client_id: u64, paused: bool) -> Option<(bool, String, Option<usize>)> {
-        if let Ok(mut clients) = self.clients.try_write() {
-            if let Some(client) = clients.get_mut(&client_id) {
-                let was_paused = client.paused;
-                client.paused = paused;
-                return Some((was_paused, client.ip_address.clone(), client.current_world));
-            }
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            let was_paused = client.paused;
+            client.paused = paused;
+            return Some((was_paused, client.ip_address.clone(), client.current_world));
         }
         None
     }
 
     /// Set the authenticated status for a connected client
     pub fn set_client_authenticated(&self, client_id: u64, authenticated: bool) {
-        if let Ok(mut clients) = self.clients.try_write() {
-            if let Some(client) = clients.get_mut(&client_id) {
-                client.authenticated = authenticated;
-            }
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.authenticated = authenticated;
         }
     }
 
     /// Get the client type for a connected client
     pub fn get_client_type(&self, client_id: u64) -> Option<RemoteClientType> {
-        if let Ok(clients) = self.clients.try_read() {
-            clients.get(&client_id).map(|c| c.client_type)
-        } else {
-            None
-        }
+        let clients = self.clients.read().unwrap();
+        clients.get(&client_id).map(|c| c.client_type)
     }
 
     /// Get the minimum viewport height across all clients viewing a specific world
     /// Returns None if no clients are viewing the world
     pub fn min_viewport_for_world(&self, world_index: usize) -> Option<usize> {
-        if let Ok(clients) = self.clients.try_read() {
-            let heights: Vec<usize> = clients.values()
-                .filter(|c| c.authenticated && c.received_initial_state)
-                .filter(|c| c.current_world == Some(world_index))
-                .map(|c| c.viewport_height)
-                .filter(|&h| h > 0)
-                .collect();
-            if heights.is_empty() {
-                None
-            } else {
-                Some(*heights.iter().min().unwrap())
-            }
-        } else {
+        let clients = self.clients.read().unwrap();
+        let heights: Vec<usize> = clients.values()
+            .filter(|c| c.authenticated && c.received_initial_state)
+            .filter(|c| c.current_world == Some(world_index))
+            .map(|c| c.viewport_height)
+            .filter(|&h| h > 0)
+            .collect();
+        if heights.is_empty() {
             None
+        } else {
+            Some(*heights.iter().min().unwrap())
         }
     }
 
     /// Get list of client IDs viewing a specific world
     pub fn clients_viewing_world(&self, world_index: usize) -> Vec<u64> {
-        if let Ok(clients) = self.clients.try_read() {
-            clients.iter()
-                .filter(|(_, c)| c.authenticated && c.received_initial_state)
-                .filter(|(_, c)| c.current_world == Some(world_index))
-                .map(|(&id, _)| id)
-                .collect()
-        } else {
-            Vec::new()
-        }
+        let clients = self.clients.read().unwrap();
+        clients.iter()
+            .filter(|(_, c)| c.authenticated && c.received_initial_state)
+            .filter(|(_, c)| c.current_world == Some(world_index))
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// Broadcast a message to all authenticated clients (they filter by world_index client-side)
-    /// This avoids race conditions where client switches world but server hasn't processed the update yet
+    /// This avoids race conditions where client switches world but server hasn't processed the update yet.
+    /// Uses a single blocking lock acquisition (not try_read+spawn-fallback) so broadcasts to the
+    /// same world are never reordered relative to one another (see D-Termux-lines investigation).
     pub fn broadcast_to_world_viewers(&self, _world_index: usize, msg: WsMessage) {
-        if let Ok(clients) = self.clients.try_read() {
-            for client in clients.values() {
-                if client.authenticated && client.received_initial_state {
-                    let _ = client.tx.send(msg.clone());
-                }
+        let clients = self.clients.read().unwrap();
+        for client in clients.values() {
+            if client.authenticated && client.received_initial_state {
+                let _ = client.tx.send(msg.clone());
             }
-        } else {
-            // Lock contention - fall back to async broadcast to avoid silently dropping messages
-            let clients = self.clients.clone();
-            tokio::spawn(async move {
-                let clients_guard = clients.read().await;
-                for client in clients_guard.values() {
-                    if client.authenticated && client.received_initial_state {
-                        let _ = client.tx.send(msg.clone());
-                    }
-                }
-            });
         }
     }
 
@@ -1501,7 +1473,7 @@ pub async fn start_websocket_server(
 pub async fn handle_ws_client<S>(
     stream: S,
     client_id: u64,
-    clients: Arc<RwLock<HashMap<u64, WsClientInfo>>>,
+    clients: Arc<std::sync::RwLock<HashMap<u64, WsClientInfo>>>,
     password_hash: String,
     password_enabled: bool,
     allow_list: Arc<std::sync::RwLock<Vec<String>>>,
@@ -1603,7 +1575,7 @@ where
 
     // Add client to clients map (auto-authenticated if whitelisted)
     {
-        let mut clients_guard = clients.write().await;
+        let mut clients_guard = clients.write().unwrap();
         clients_guard.insert(client_id, WsClientInfo {
             authenticated: is_whitelisted,
             tx: tx.clone(),
@@ -1643,12 +1615,22 @@ where
     // Auth deadline: absolute — unauthenticated clients have WS_AUTH_TIMEOUT_SECS to authenticate.
     // Keepalive: idle authenticated clients receive a protocol-level Ping every
     // WS_KEEPALIVE_INTERVAL_SECS; no Pong within WS_PONG_TIMEOUT_SECS = dead peer, disconnect.
+    //
+    // Both `keepalive_deadline` and `pong_deadline` are absolute instants, advanced only on
+    // a real state transition (Ping just sent / Pong received) — never recomputed as a flat
+    // "N seconds from now" on every loop iteration. That used to be the bug here: `sleep_dur`
+    // was a fresh `Duration::from_secs(...)` each time, and `tokio::select!` re-enters this
+    // loop (recomputing sleep_dur from scratch) whenever ANY arm fires — most commonly
+    // `rx.recv()` delivering MUD output. On a world producing output more than once a minute,
+    // the keepalive Ping was therefore never sent and a dead-but-locally-still-writable
+    // connection was never detected (D-Termux-lines investigation).
     let auth_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WS_AUTH_TIMEOUT_SECS);
-    let mut awaiting_pong = false;
+    let mut keepalive_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS);
+    let mut pong_deadline: Option<tokio::time::Instant> = None;
 
     loop {
         let authed = {
-            let clients_guard = clients.read().await;
+            let clients_guard = clients.read().unwrap();
             clients_guard.get(&client_id).map(|c| c.authenticated).unwrap_or(false)
         };
 
@@ -1659,10 +1641,10 @@ where
                 break;
             }
             remaining
-        } else if awaiting_pong {
-            std::time::Duration::from_secs(WS_PONG_TIMEOUT_SECS)
+        } else if let Some(pd) = pong_deadline {
+            pd.saturating_duration_since(tokio::time::Instant::now())
         } else {
-            std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS)
+            keepalive_deadline.saturating_duration_since(tokio::time::Instant::now())
         };
 
         tokio::select! {
@@ -1794,7 +1776,7 @@ where
                                 ban_list.clear_violations(&client_ip);
 
                                 // Mark as authenticated and set username
-                                let mut clients_guard = clients.write().await;
+                                let mut clients_guard = clients.write().unwrap();
                                 if let Some(client) = clients_guard.get_mut(&client_id) {
                                     client.authenticated = true;
                                     client.username = auth_username.clone();
@@ -1848,13 +1830,13 @@ where
                         _ => {
                             // Check if authenticated before processing other messages
                             let is_authed = {
-                                let clients_guard = clients.read().await;
+                                let clients_guard = clients.read().unwrap();
                                 clients_guard.get(&client_id).map(|c| c.authenticated).unwrap_or(false)
                             };
                             if is_authed {
                                 // Update last activity time
                                 {
-                                    let mut clients_guard = clients.write().await;
+                                    let mut clients_guard = clients.write().unwrap();
                                     if let Some(client) = clients_guard.get_mut(&client_id) {
                                         client.last_activity = std::time::Instant::now();
                                     }
@@ -1879,8 +1861,10 @@ where
                 }
             }
             Some(Ok(WsRawMessage::Pong(_))) => {
-                // Response to our keepalive ping — peer is alive
-                awaiting_pong = false;
+                // Response to our keepalive ping — peer is alive. Reset the keepalive
+                // deadline from now, not from whenever this loop iteration happens to run.
+                pong_deadline = None;
+                keepalive_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS);
             }
             Some(Ok(WsRawMessage::Close(_))) => break,
             Some(Ok(WsRawMessage::Ping(_))) => {
@@ -1895,7 +1879,7 @@ where
                 if !authed {
                     crate::http::log_remote_event("WS-AUTH-TIMEOUT", &client_ip, "unauthenticated grace period expired");
                     break;
-                } else if awaiting_pong {
+                } else if pong_deadline.is_some() {
                     crate::http::log_remote_event("WS-DEAD", &client_ip, "no pong response to keepalive");
                     break;
                 } else {
@@ -1903,7 +1887,7 @@ where
                         crate::http::log_remote_event("WS-SEND-FAIL", &client_ip, &format!("keepalive ping: {}", e));
                         break;
                     }
-                    awaiting_pong = true;
+                    pong_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(WS_PONG_TIMEOUT_SECS));
                 }
             }
         }
@@ -1911,7 +1895,7 @@ where
 
     // Clean up
     {
-        let mut clients_guard = clients.write().await;
+        let mut clients_guard = clients.write().unwrap();
         clients_guard.remove(&client_id);
     }
     let _ = event_tx.send(AppEvent::WsClientDisconnected(client_id)).await;

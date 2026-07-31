@@ -82,9 +82,37 @@ pub fn get_custom_config_path() -> Option<&'static PathBuf> {
     CUSTOM_CONFIG_PATH.get()
 }
 
-/// Get the full version string including build hash
+/// Short platform tag for /version and bug reports. Follows the same
+/// `#[cfg(target_os = ...)]`-per-block style as `platform::get_platform_asset_name()`.
+/// Termux and the packaged Android app both compile as `target_os = "android"` and are
+/// not otherwise distinguishable at runtime, so disambiguate via the `PREFIX` env var
+/// Termux always sets (e.g. `/data/data/com.termux/files/usr`) — added so a user's
+/// `/version` output tells us at a glance whether a report came from a Termux-hosted
+/// instance (relevant to connection-health bugs like D-Termux-lines) vs. the app.
+fn platform_tag() -> String {
+    #[cfg(target_os = "android")]
+    {
+        let is_termux = std::env::var("PREFIX")
+            .map(|p| p.contains("com.termux"))
+            .unwrap_or(false);
+        (if is_termux { "termux" } else { "android" }).to_string()
+    }
+    #[cfg(target_os = "linux")]
+    { "linux".to_string() }
+    #[cfg(target_os = "macos")]
+    { "macos".to_string() }
+    #[cfg(target_os = "windows")]
+    { "windows".to_string() }
+    #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "windows")))]
+    { std::env::consts::OS.to_string() }
+}
+
+/// Get the full version string including build hash and platform/architecture tag,
+/// e.g. `Clay v1.4.8 (build 2026-07-30-abc1234) [termux/aarch64]` — the tag helps
+/// triage bug reports (e.g. distinguishing a Termux-hosted instance from the packaged
+/// Android app) without the user needing to know or say which platform they're on.
 pub fn get_version_string() -> String {
-    format!("Clay v{} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH)
+    format!("Clay v{} (build {}-{}) [{}/{}]", VERSION, BUILD_DATE, BUILD_HASH, platform_tag(), std::env::consts::ARCH)
 }
 
 // Re-export commonly used types from modules
@@ -460,6 +488,37 @@ impl TabsMode {
             "top" => TabsMode::Top,
             "bottom" => TabsMode::Bottom,
             _ => TabsMode::None,
+        }
+    }
+}
+
+/// Icon bar visibility mode (web/GUI/Android only — no visual effect on the
+/// console TUI, though the setting itself is still editable there). The
+/// icon bar is the row of large Worlds/Actions/Settings/Find tiles plus
+/// user-defined Action shortcuts (see Action::gui_shortcut) shown above the
+/// output area.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum IconBarMode {
+    None,
+    #[default]
+    AppTablet,
+    All,
+}
+
+impl IconBarMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            IconBarMode::None => "none",
+            IconBarMode::AppTablet => "app_tablet",
+            IconBarMode::All => "all",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "none" => IconBarMode::None,
+            "all" => IconBarMode::All,
+            _ => IconBarMode::AppTablet,
         }
     }
 }
@@ -1627,6 +1686,8 @@ pub struct Settings {
     pub tts_mode: tts::TtsMode,
     /// World-tabs ribbon display mode (web/GUI/Android only, see TabsMode)
     pub tabs: TabsMode,
+    /// Icon bar visibility mode (web/GUI/Android only, see IconBarMode)
+    pub icon_bar: IconBarMode,
     pub tts_speak_mode: tts::TtsSpeakMode,
     pub tts_muted: bool,  // Runtime-only, toggled by F9
     pub scrollback_enabled: bool,
@@ -1686,6 +1747,7 @@ impl Default for Settings {
             new_line_indicator: false,
             tts_mode: tts::TtsMode::Off,
             tabs: TabsMode::None,
+            icon_bar: IconBarMode::AppTablet,
             tts_speak_mode: tts::TtsSpeakMode::All,
             tts_muted: false,
             scrollback_enabled: false,
@@ -3649,6 +3711,7 @@ impl App {
             scrollback_enabled: self.settings.scrollback_enabled,
             keyboard_always_visible: self.settings.keyboard_always_visible,
             tabs: self.settings.tabs.name().to_string(),
+            icon_bar: self.settings.icon_bar.name().to_string(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
@@ -3714,6 +3777,7 @@ impl App {
         self.settings.zwj_enabled = settings.zwj_enabled;
         self.settings.new_line_indicator = settings.new_line_indicator;
         self.settings.tabs = TabsMode::from_name(&settings.tabs);
+        self.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
         let old_tts_mode = self.settings.tts_mode;
         self.settings.tts_mode = tts::TtsMode::from_name(&settings.tts_mode);
         self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&settings.tts_speak_mode);
@@ -4091,6 +4155,7 @@ impl App {
             self.settings.wrapspace as i64,
             self.settings.keyboard_always_visible,
             self.settings.tabs.name(),
+            self.settings.icon_bar.name(),
         );
         self.popup_manager.open(def);
 
@@ -4312,6 +4377,7 @@ impl App {
                     command: action.command.clone(),
                     enabled: action.enabled,
                     startup: action.startup,
+                    gui_shortcut: action.gui_shortcut,
                 }
             } else {
                 ActionSettings::default()
@@ -5566,14 +5632,13 @@ impl App {
             }
         }
         if let Some(ref server) = self.ws_server {
-            if let Ok(clients_guard) = server.clients.try_read() {
-                for client in clients_guard.values() {
-                    if client.authenticated {
-                        // Paused clients get full activity count (their world is no longer excluded)
-                        let exclude = if client.paused { None } else { client.current_world };
-                        let count = self.activity_count_excluding(exclude);
-                        let _ = client.tx.send(WsMessage::ActivityUpdate { count });
-                    }
+            let clients_guard = server.clients.read().unwrap();
+            for client in clients_guard.values() {
+                if client.authenticated {
+                    // Paused clients get full activity count (their world is no longer excluded)
+                    let exclude = if client.paused { None } else { client.current_world };
+                    let count = self.activity_count_excluding(exclude);
+                    let _ = client.tx.send(WsMessage::ActivityUpdate { count });
                 }
             }
         }
@@ -6119,6 +6184,7 @@ impl App {
         scrollback_enabled: bool,
         keyboard_always_visible: bool,
         tabs: String,
+        icon_bar: String,
     ) {
         self.settings.more_mode_enabled = more_mode_enabled;
         self.settings.spell_check_enabled = spell_check_enabled;
@@ -6188,6 +6254,7 @@ impl App {
         self.settings.zwj_enabled = zwj_enabled;
         self.settings.new_line_indicator = new_line_indicator;
         self.settings.tabs = TabsMode::from_name(&tabs);
+        self.settings.icon_bar = IconBarMode::from_name(&icon_bar);
         self.settings.tts_mode = tts::TtsMode::from_name(&tts_mode);
         self.settings.tts_speak_mode = tts::TtsSpeakMode::from_name(&tts_speak_mode);
         if self.settings.dictionary_path != dictionary_path {
@@ -6483,7 +6550,7 @@ impl App {
         let mut file = std::fs::File::create(&dump_path)?;
 
         writeln!(file, "=== CLAY DEBUG DUMP ===")?;
-        writeln!(file, "Version: {} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH)?;
+        writeln!(file, "Version: {} (build {}-{}) [{}/{}]", VERSION, BUILD_DATE, BUILD_HASH, platform_tag(), std::env::consts::ARCH)?;
         let now_ts = current_timestamp_secs();
         let lt = local_time_from_epoch(now_ts as i64);
         writeln!(file, "Timestamp: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -6816,32 +6883,22 @@ impl App {
                 repaint();
             }
         }
-        // Broadcast to WebSocket server
+        // Broadcast to WebSocket server. A single blocking lock acquisition (not
+        // try_read()+spawn-fallback) — the spawned fallback used to run out of order
+        // relative to calls that took the fast path, which could deliver a later
+        // broadcast before an earlier one (see D-Termux-lines investigation).
         if let Some(ref server) = self.ws_server {
-            // Use synchronous try_read to avoid spawning a task
-            if let Ok(clients_guard) = server.clients.try_read() {
-                let mut sent_count = 0;
-                for client in clients_guard.values() {
-                    if client.authenticated {
-                        let _ = client.tx.send(msg.clone());
-                        sent_count += 1;
-                    }
+            let clients_guard = server.clients.read().unwrap();
+            let mut sent_count = 0;
+            for client in clients_guard.values() {
+                if client.authenticated {
+                    let _ = client.tx.send(msg.clone());
+                    sent_count += 1;
                 }
-                // Log if we didn't send to anyone (for debugging)
-                if is_debug_enabled() && sent_count == 0 && !clients_guard.is_empty() {
-                    output_debug_log(&format!("ws_broadcast: {} clients connected, 0 authenticated", clients_guard.len()));
-                }
-            } else {
-                // Lock contention - fall back to async broadcast
-                let clients = server.clients.clone();
-                tokio::spawn(async move {
-                    let clients_guard = clients.read().await;
-                    for client in clients_guard.values() {
-                        if client.authenticated {
-                            let _ = client.tx.send(msg.clone());
-                        }
-                    }
-                });
+            }
+            // Log if we didn't send to anyone (for debugging)
+            if is_debug_enabled() && sent_count == 0 && !clients_guard.is_empty() {
+                output_debug_log(&format!("ws_broadcast: {} clients connected, 0 authenticated", clients_guard.len()));
             }
         }
     }
@@ -6859,13 +6916,10 @@ impl App {
             return;
         }
         if let Some(ref server) = self.ws_server {
-            let clients = server.clients.clone();
-            tokio::spawn(async move {
-                let clients_guard = clients.read().await;
-                if let Some(client) = clients_guard.get(&client_id) {
-                    let _ = client.tx.send(msg);
-                }
-            });
+            let clients_guard = server.clients.read().unwrap();
+            if let Some(client) = clients_guard.get(&client_id) {
+                let _ = client.tx.send(msg);
+            }
         }
     }
 
@@ -6885,10 +6939,9 @@ impl App {
         }
     }
 
-    /// Send InitialState to a client AND mark it as having received InitialState.
-    /// Uses try_write first for immediate marking (avoids race where broadcasts
-    /// are dropped before the spawned task runs). Falls back to spawned task
-    /// if the lock is contended.
+    /// Send InitialState to a client AND mark it as having received InitialState, in one
+    /// lock acquisition — avoids the race where a broadcast lands between sending the
+    /// message and setting the flag.
     fn ws_send_initial_state_and_mark(&self, client_id: u64, msg: WsMessage) {
         // client_id 0 is the embedded GUI - send directly, no tracking needed
         if client_id == 0 {
@@ -6901,23 +6954,10 @@ impl App {
             return;
         }
         if let Some(ref server) = self.ws_server {
-            // Try synchronous write first — this avoids the race where broadcasts
-            // are skipped because received_initial_state hasn't been set yet
-            if let Ok(mut clients_guard) = server.clients.try_write() {
-                if let Some(client) = clients_guard.get_mut(&client_id) {
-                    let _ = client.tx.send(msg);
-                    client.received_initial_state = true;
-                }
-            } else {
-                // Lock contended — fall back to spawned task
-                let clients = server.clients.clone();
-                tokio::spawn(async move {
-                    let mut clients_guard = clients.write().await;
-                    if let Some(client) = clients_guard.get_mut(&client_id) {
-                        let _ = client.tx.send(msg);
-                        client.received_initial_state = true;
-                    }
-                });
+            let mut clients_guard = server.clients.write().unwrap();
+            if let Some(client) = clients_guard.get_mut(&client_id) {
+                let _ = client.tx.send(msg);
+                client.received_initial_state = true;
             }
         }
     }
@@ -6947,8 +6987,8 @@ impl App {
     /// Returns (new_paused, ip_address) if the client was found.
     fn ws_toggle_client_paused(&mut self, client_id: u64) -> Option<(bool, String)> {
         let (was_paused, ip, current_world) = if let Some(ref server) = self.ws_server {
-            server.clients.try_read().ok()
-                .and_then(|g| g.get(&client_id).map(|c| (c.paused, c.ip_address.clone(), c.current_world)))?
+            let g = server.clients.read().unwrap();
+            g.get(&client_id).map(|c| (c.paused, c.ip_address.clone(), c.current_world))?
         } else {
             return None;
         };
@@ -8485,21 +8525,16 @@ impl App {
             }
             Command::RemoteKill { client_id: kill_id } => {
                 let msg = if let Some(ref ws_server) = self.ws_server {
-                    if let Ok(clients) = ws_server.clients.try_read() {
-                        if let Some(client) = clients.get(&kill_id) {
-                            let ip = client.ip_address.clone();
-                            drop(clients);
-                            if let Ok(mut clients_mut) = ws_server.clients.try_write() {
-                                clients_mut.remove(&kill_id);
-                                format!("Disconnected remote client {} ({})", kill_id, ip)
-                            } else {
-                                "Could not acquire write lock (busy).".to_string()
-                            }
-                        } else {
-                            format!("No client with ID {}.", kill_id)
-                        }
+                    let ip = {
+                        let clients = ws_server.clients.read().unwrap();
+                        clients.get(&kill_id).map(|c| c.ip_address.clone())
+                    };
+                    if let Some(ip) = ip {
+                        let mut clients_mut = ws_server.clients.write().unwrap();
+                        clients_mut.remove(&kill_id);
+                        format!("Disconnected remote client {} ({})", kill_id, ip)
                     } else {
-                        "Could not read client list (busy).".to_string()
+                        format!("No client with ID {}.", kill_id)
                     }
                 } else {
                     "WebSocket server is not running.".to_string()
@@ -9203,7 +9238,7 @@ impl App {
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, keyboard_always_visible, tabs } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, keyboard_always_visible, tabs, icon_bar } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -9213,7 +9248,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                     mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
-                    keyboard_always_visible, tabs,
+                    keyboard_always_visible, tabs, icon_bar,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -9447,20 +9482,28 @@ impl App {
                 self.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
             }
             WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-                if is_debug_enabled() {
-                    let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                    output_debug_log(&format!("SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                        source, world_name, expected_seq_gt, actual_seq,
-                        line_text.chars().take(80).collect::<String>()));
-                }
+                // Always-on (not gated behind is_debug_enabled()): this only fires on a real
+                // connection-level fault, so there's no log-spam risk, and it was invisible in
+                // the field until now — exactly the class of bug the D-Termux-lines
+                // investigation was diagnosing blind for lack of this data.
+                let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+                let ip = self.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+                crate::http::log_remote_event("SEQ-MISMATCH", &ip, &format!("[{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                    source, world_name, expected_seq_gt, actual_seq,
+                    line_text.chars().take(80).collect::<String>()));
             }
             WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
-                if is_debug_enabled() {
-                    let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                    output_debug_log(&format!("DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                        source, world_name, line_seq, max_seq,
-                        line_text.chars().take(200).collect::<String>()));
-                }
+                let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+                let ip = self.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+                crate::http::log_remote_event("DUPLICATE", &ip, &format!("[{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                    source, world_name, line_seq, max_seq,
+                    line_text.chars().take(200).collect::<String>()));
+            }
+            WsMessage::ReportOutOfOrder { world_index, line_seq, recovered_count, source } => {
+                let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+                let ip = self.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+                crate::http::log_remote_event("OUT-OF-ORDER", &ip, &format!("[{}] in '{}': recovered {} line(s) starting at seq={} that had arrived out of order",
+                    source, world_name, recovered_count, line_seq));
             }
             WsMessage::ClientTypeDeclaration { client_type } => {
                 // Update client type in WebSocket server
@@ -10719,6 +10762,7 @@ pub(crate) struct SetupSettings {
     pub(crate) wrapspace: i64,
     pub(crate) keyboard_always_visible: bool,
     pub(crate) tabs: String,
+    pub(crate) icon_bar: String,
 }
 
 /// Settings from the web popup. The auth key is NOT included here — it's
@@ -10871,7 +10915,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
         SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
-        SETUP_FIELD_TABS,
+        SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -10892,6 +10936,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         ACTIONS_BTN_ADD, ACTIONS_BTN_EDIT, ACTIONS_BTN_DELETE, ACTIONS_BTN_CANCEL,
         EDITOR_FIELD_NAME, EDITOR_FIELD_WORLD, EDITOR_FIELD_MATCH_TYPE,
         EDITOR_FIELD_PATTERNS, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED, EDITOR_FIELD_STARTUP,
+        EDITOR_FIELD_GUI_SHORTCUT,
         EDITOR_BTN_SAVE, EDITOR_BTN_CANCEL, EDITOR_BTN_DELETE,
     };
     use popup::definitions::world_editor::{
@@ -11123,6 +11168,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
                     keyboard_always_visible: state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE).unwrap_or(true),
                     tabs: state.get_selected(SETUP_FIELD_TABS).unwrap_or("none").to_string(),
+                    icon_bar: state.get_selected(SETUP_FIELD_ICON_BAR).unwrap_or("app_tablet").to_string(),
                 }
             };
 
@@ -11981,6 +12027,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             let command = state.get_text(EDITOR_FIELD_COMMAND).unwrap_or("").to_string();
                             let enabled = state.get_bool(EDITOR_FIELD_ENABLED).unwrap_or(true);
                             let startup = state.get_bool(EDITOR_FIELD_STARTUP).unwrap_or(false);
+                            let gui_shortcut = state.get_bool(EDITOR_FIELD_GUI_SHORTCUT).unwrap_or(false);
                             let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
 
                             // Read the action-level match type
@@ -12007,6 +12054,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 owner: None,
                                 enabled,
                                 startup,
+                                gui_shortcut,
                                 ..Action::default()
                             };
 
@@ -12161,6 +12209,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             let command = state.get_text(EDITOR_FIELD_COMMAND).unwrap_or("").to_string();
                             let enabled = state.get_bool(EDITOR_FIELD_ENABLED).unwrap_or(true);
                             let startup = state.get_bool(EDITOR_FIELD_STARTUP).unwrap_or(false);
+                            let gui_shortcut = state.get_bool(EDITOR_FIELD_GUI_SHORTCUT).unwrap_or(false);
                             let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
 
                             let match_type_str = state.get_selected(EDITOR_FIELD_MATCH_TYPE).unwrap_or("regexp");
@@ -12185,6 +12234,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 owner: None,
                                 enabled,
                                 startup,
+                                gui_shortcut,
                                 ..Action::default()
                             };
 
@@ -12718,7 +12768,7 @@ async fn main() -> io::Result<()> {
         } else {
             features.join(", ")
         };
-        println!("Clay v{} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH);
+        println!("Clay v{} (build {}-{}) [{}/{}]", VERSION, BUILD_DATE, BUILD_HASH, platform_tag(), std::env::consts::ARCH);
         println!("Features: {}", features_str);
         return Ok(());
     }

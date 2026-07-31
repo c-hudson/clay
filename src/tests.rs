@@ -970,7 +970,7 @@
         use futures::{SinkExt, StreamExt};
         use crate::websocket::{WsMessage, WsClientInfo};
         use std::sync::Arc;
-        use tokio::sync::RwLock;
+        use std::sync::RwLock;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1050,7 +1050,7 @@
         use futures::{SinkExt, StreamExt};
         use crate::websocket::{WsMessage, WsClientInfo};
         use std::sync::Arc;
-        use tokio::sync::RwLock;
+        use std::sync::RwLock;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1114,7 +1114,7 @@
         use futures::{SinkExt, StreamExt};
         use crate::websocket::{WsMessage, WsClientInfo};
         use std::sync::Arc;
-        use tokio::sync::RwLock;
+        use std::sync::RwLock;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1189,7 +1189,7 @@
         use futures::{SinkExt, StreamExt};
         use crate::websocket::{WsMessage, WsClientInfo, UserCredential};
         use std::sync::Arc;
-        use tokio::sync::RwLock;
+        use std::sync::RwLock;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1433,7 +1433,7 @@
         use futures::{SinkExt, StreamExt};
         use crate::websocket::{WsMessage, WsClientInfo};
         use std::sync::Arc;
-        use tokio::sync::RwLock;
+        use std::sync::RwLock;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1570,7 +1570,7 @@
         use futures::StreamExt;
         use crate::websocket::{WsMessage, WsClientInfo};
         use std::sync::Arc;
-        use tokio::sync::RwLock;
+        use std::sync::RwLock;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -5127,7 +5127,7 @@ if you're more curious.\"";
             String::new(), String::new(), ws_password.to_string(),
             false, String::new(), true, true, false,
             "off".to_string(), "off".to_string(), false, true,
-            "none".to_string(),
+            "none".to_string(), "app_tablet".to_string(),
         );
     }
 
@@ -5448,5 +5448,19 @@ if you're more curious.\"";
 
         assert_eq!(state.edit_buffer, "😀x");
         assert_eq!(state.edit_cursor, 2); // char count, not byte count
+    }
+
+    /// `/version` now includes a `[platform/arch]` tag (D-Termux-lines investigation)
+    /// so a user's bug report carries that context automatically — e.g. distinguishing
+    /// a Termux-hosted instance from the packaged Android app.
+    #[test]
+    fn test_version_string_includes_platform_tag() {
+        let s = get_version_string();
+        assert!(s.starts_with("Clay v"), "unexpected prefix: {:?}", s);
+        assert!(s.contains(std::env::consts::ARCH), "missing arch tag: {:?}", s);
+        // Bracketed tag is always present and non-empty on every supported target.
+        let open = s.find('[').expect("missing '[' platform tag");
+        let close = s.find(']').expect("missing ']' platform tag");
+        assert!(close > open + 1, "empty platform/arch tag: {:?}", s);
     }
 

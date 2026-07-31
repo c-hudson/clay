@@ -320,6 +320,145 @@ body {
     font-weight: 700;
 }
 
+/* ─── Icon Bar (Icon Bar setting: none/app_tablet/all) ───
+   Large icon+label tiles for the most-used menu items, plus any Action
+   marked "GUI Menu Shortcut" appended at the end of the same row. Visible
+   only when the window/device qualifies (see iconBarVisible() in app.js). */
+.icon-bar {
+    display: none;   /* shown via JS (applyIconBarMode/renderIconBar) */
+    align-items: center;
+    padding: 5px 7px;
+    gap: 2px;
+    background: var(--theme-status-bar-bg, var(--theme-bg-surface, #1c1722));
+    border-top: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--theme-border-subtle, #221c2b);
+    flex-shrink: 0;
+    user-select: none;
+    position: relative;
+    z-index: 2;
+
+    /* "Slate Lift" (dark) / "Paper Lift" (light) tile treatment: tiles get a
+       real background at rest - a lighter tint of the bar itself, computed
+       from the live theme's own bar color so it still looks right under a
+       custom (non-default) theme - instead of sitting flush against the bar
+       with no visual weight of their own. Hover swaps to a genuinely
+       different color (not just a lighter/darker version of the rest tint)
+       so "hovered" reads as a distinct state, not just "brighter". The
+       body.theme-light override below (see applyTheme() in app.js) supplies
+       the light-theme variant of both. */
+    --icon-tile-rest-bg: color-mix(in srgb, var(--theme-status-bar-bg, #284b63) 100%, white 15%);
+    --icon-tile-hover-bg: var(--theme-highlight, #e8c46a);
+    --icon-tile-hover-fg: var(--theme-bg-surface, #1c1722);
+}
+
+body.theme-light .icon-bar {
+    /* Paper Lift: a lighter grey plate than the bar (greys need a bigger mix
+       percentage than a saturated hue to read as visibly lifted), and the
+       existing accent (terracotta) for hover - matches the accent used
+       everywhere else in the light theme instead of introducing a new hue. */
+    --icon-tile-rest-bg: color-mix(in srgb, var(--theme-status-bar-bg, #9b9b9b) 100%, white 35%);
+    --icon-tile-hover-bg: var(--accent-color);
+    --icon-tile-hover-fg: var(--theme-bg, #e8e8e8);
+}
+
+.icon-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    width: 53px;
+    padding: 6px 3px 5px;
+    border-radius: var(--radius-md);
+    background: var(--icon-tile-rest-bg);
+    color: var(--text-color);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: color var(--transition), background var(--transition);
+}
+
+.icon-tile svg {
+    width: 24px;
+    height: 24px;
+    display: block;
+}
+
+.icon-tile-label {
+    font-family: var(--sans);
+    font-size: 8.5px;
+    font-weight: 700;
+    line-height: 1.1;
+    text-align: center;
+    color: var(--text-color);
+}
+
+.icon-tile:hover,
+.icon-tile.active {
+    /* .active: persistent "currently on" state for a real toggle tile (e.g.
+       Toggle Tags) - same treatment as :hover, just not dependent on the
+       pointer being over it. */
+    color: var(--icon-tile-hover-fg);
+    background: var(--icon-tile-hover-bg);
+}
+
+.icon-tile:hover .icon-tile-label,
+.icon-tile.active .icon-tile-label {
+    color: var(--icon-tile-hover-fg);
+}
+
+.icon-bar-sep {
+    flex: 1;
+}
+
+.icon-bar-divider {
+    width: 1px;
+    align-self: stretch;
+    margin: 7px 3px;
+    background: var(--border-color);
+    flex-shrink: 0;
+}
+
+.icon-bar-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    color: var(--theme-fg-muted, #6e6479);
+    cursor: pointer;
+    transition: color var(--transition), background var(--transition);
+}
+
+.icon-bar-arrow svg {
+    width: 10px;
+    height: 10px;
+}
+
+.icon-bar-arrow:hover {
+    color: var(--icon-tile-hover-fg);
+    background: var(--icon-tile-hover-bg);
+}
+
+.icon-bar-arrow.hidden {
+    visibility: hidden;
+}
+
+.icon-bar-shortcuts {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    overflow-x: auto;
+    scroll-behavior: smooth;
+    scrollbar-width: none;
+    min-width: 0;
+    max-width: 221px;
+}
+
+.icon-bar-shortcuts::-webkit-scrollbar {
+    display: none;
+}
+
 /* ─── Note Editor (own window/tab, NOTE_MODE — see webview_gui.rs's
    WvEvent::NoteWindow) ─── */
 .note-editor-view {

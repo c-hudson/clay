@@ -1031,7 +1031,7 @@ async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 /// Shared WebSocket connection state passed from WebSocketServer to the unified HTTP+WS server.
 pub struct WsConnectionState {
-    pub clients: Arc<RwLock<HashMap<u64, crate::websocket::WsClientInfo>>>,
+    pub clients: Arc<std::sync::RwLock<HashMap<u64, crate::websocket::WsClientInfo>>>,
     pub next_client_id: Arc<std::sync::Mutex<u64>>,
     pub password_hash: Arc<std::sync::RwLock<String>>,
     pub password_enabled: Arc<std::sync::RwLock<bool>>,
@@ -1234,6 +1234,7 @@ pub async fn start_https_server(
                                 }
                             };
                             let _ = stream.set_nodelay(true);
+                            crate::platform::enable_tcp_keepalive(&stream);
                             let tls_acceptor = tls_acceptor.clone();
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
@@ -1436,6 +1437,7 @@ pub async fn start_https_server(
                                 }
                             };
                             let _ = stream.set_nodelay(true);
+                            crate::platform::enable_tcp_keepalive(&stream);
                             let tls_acceptor = tls_acceptor.clone();
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
@@ -1792,6 +1794,7 @@ pub async fn start_http_server(
                                 }
                             };
                             let _ = stream.set_nodelay(true);
+                            crate::platform::enable_tcp_keepalive(&stream);
                             let theme_css_vars = theme_css_vars.clone();
                             let ws_state = ws_state.clone();
                             let ws_counter = ws_counter.clone();

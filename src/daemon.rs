@@ -175,6 +175,18 @@ pub async fn run_daemon_server() -> io::Result<()> {
     let process_tick_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(process_tick_sleep);
 
+    // MUD keepalive (send an idle-connection NOP/Custom/Generic ping per world's
+    // KeepAliveType, same as run_app/run_app_headless) and auto-reconnect (services
+    // World.reconnect_at, scheduled by handle_disconnected). `-D` mode used to have
+    // neither: an idle MUD connection on a mobile network can go silently dead (no RST,
+    // so read() never errors) and Clay never noticed because it never sent anything to
+    // provoke the failure, nor did it ever retry a connection that did fail (D-Termux-lines
+    // investigation).
+    const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+    let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(reconnect_sleep);
+
     // Main event loop - handles MUD connections and WebSocket messages
     loop {
         #[cfg(all(unix, not(target_os = "android")))]
@@ -309,11 +321,16 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             if conn_id != app.worlds[world_idx].connection_id {
                                 continue;
                             }
-                            app.worlds[world_idx].connected = false;
-                            app.worlds[world_idx].command_tx = None;
-
-                            // Broadcast disconnect to clients
-                            app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+                            // Shared with run_app/run_app_headless — also fires the TF
+                            // DISCONNECT hook, pushes a "Disconnected." line, tracks
+                            // unseen_lines, and (the part `-D` mode was missing entirely)
+                            // schedules world.reconnect_at from auto_reconnect_secs. The
+                            // reconnect_sleep re-arm below is what actually services it.
+                            app.handle_disconnected(world_idx);
+                            if let Some(next) = app.next_reconnect_instant() {
+                                let dur = next.saturating_duration_since(std::time::Instant::now());
+                                reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                            }
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
@@ -382,9 +399,11 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
                         // Mirrors the console/GUI dispatch in main.rs: validate the auth key,
                         // send AuthResponse, and (on success) mark the client authenticated and
-                        // send InitialState. Single-user daemon mode has no world-reconnect
-                        // timer (unlike console/GUI), so app.web_reconnect_needed is left unread
-                        // here — it's harmless, just unused in this mode.
+                        // send InitialState. `-D` mode now has its own reconnect_sleep timer
+                        // (see run_daemon_server) driven by World.reconnect_at directly, so
+                        // unlike console/GUI it doesn't need the separate
+                        // app.web_reconnect_needed/trigger_web_reconnects() nudge — left unread
+                        // here deliberately, it's harmless, just unused in this mode.
                         app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
                     }
                     AppEvent::WsKeyRequest(client_id) => {
@@ -397,6 +416,133 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         app.handle_import_result(client_id, addr, result);
                     }
                     _ => {}
+                }
+            }
+
+            // MUD keepalive timer (mirrors run_app_headless in main.rs): pokes any world
+            // idle >= KEEPALIVE_INTERVAL with a NOP/Custom/Generic keepalive per its
+            // KeepAliveType, so a connection gone silently dead (no RST — read() never
+            // errors) gets a chance to be noticed rather than just looking connected
+            // forever with no more lines ever arriving.
+            _ = keepalive_interval.tick() => {
+                for world in &mut app.worlds {
+                    if world.connected {
+                        // Only check last_send_time: server kicks us when WE go idle.
+                        let should_send = match world.last_send_time {
+                            Some(t) => t.elapsed() >= KEEPALIVE_INTERVAL,
+                            None => true,
+                        };
+                        if should_send {
+                            if let Some(tx) = &world.command_tx {
+                                let now = std::time::Instant::now();
+                                match world.settings.keep_alive_type {
+                                    KeepAliveType::None => {}
+                                    KeepAliveType::Nop => {
+                                        let nop = vec![TELNET_IAC, TELNET_NOP];
+                                        let _ = tx.try_send(WriteCommand::Raw(nop));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent NOP to world '{}'", world.name));
+                                        world.last_send_time = Some(now);
+                                        world.last_nop_time = Some(now);
+                                    }
+                                    KeepAliveType::Custom => {
+                                        let rand_num = (std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_nanos() % 1000 + 1) as u32;
+                                        let idler_tag = format!("###_idler_message_{}_###", rand_num);
+                                        let cmd = world.settings.keep_alive_cmd
+                                            .replace("##rand##", &idler_tag);
+                                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Custom keepalive to world '{}'", world.name));
+                                        world.last_send_time = Some(now);
+                                        world.last_nop_time = Some(now);
+                                    }
+                                    KeepAliveType::Generic => {
+                                        let rand_num = (std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_nanos() % 1000 + 1) as u32;
+                                        let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
+                                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Generic keepalive to world '{}'", world.name));
+                                        world.last_send_time = Some(now);
+                                        world.last_nop_time = Some(now);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check proxy health
+                #[cfg(all(unix, not(target_os = "android")))]
+                for world in &mut app.worlds {
+                    if world.connected {
+                        if let Some(proxy_pid) = world.proxy_pid {
+                            if !crate::platform::is_process_alive(proxy_pid) {
+                                world.clear_connection_state(false, false);
+                                let seq = world.next_seq;
+                                world.next_seq += 1;
+                                world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string(), seq));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Auto-reconnect timer (mirrors run_app_headless): services World.reconnect_at,
+            // scheduled by handle_disconnected above.
+            _ = &mut reconnect_sleep => {
+                let now = std::time::Instant::now();
+                let to_reconnect: Vec<String> = app.worlds.iter()
+                    .filter(|w| w.reconnect_at.map(|t| t <= now).unwrap_or(false))
+                    .map(|w| w.name.clone())
+                    .collect();
+                for world_name in to_reconnect {
+                    if let Some(idx) = app.find_world_index(&world_name) {
+                        app.worlds[idx].reconnect_at = None;
+                        if !app.worlds[idx].connected && app.worlds[idx].settings.has_connection_settings() {
+                            let settings = app.worlds[idx].settings.clone();
+                            app.worlds[idx].connection_id += 1;
+                            let connection_id = app.worlds[idx].connection_id;
+                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+                            app.emit_client_text(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg), true);
+                            // skip_auto_login=true: handle_connection_success sends auto-login itself.
+                            match connect_daemon_world(
+                                idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
+                                app.settings.tls_proxy_enabled,
+                            ).await {
+                                Some((cmd_tx, socket_fd, is_tls, proxy_pid, proxy_socket_path)) => {
+                                    app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
+                                    if let Some(new_idx) = app.find_world_index(&world_name) {
+                                        app.worlds[new_idx].proxy_pid = proxy_pid;
+                                        app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
+                                        app.emit_client_text(new_idx, "Connected!", true);
+                                    }
+                                }
+                                None => {
+                                    if let Some(current_idx) = app.find_world_index(&world_name) {
+                                        let secs = app.worlds[current_idx].settings.auto_reconnect_secs;
+                                        if secs > 0 {
+                                            app.worlds[current_idx].reconnect_at = Some(
+                                                std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
+                                            );
+                                            app.emit_client_text(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs), true);
+                                        } else {
+                                            app.emit_client_text(current_idx, "Connection failed.", true);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Re-arm timer for next scheduled reconnect
+                if let Some(next) = app.next_reconnect_instant() {
+                    let dur = next.saturating_duration_since(std::time::Instant::now());
+                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+                } else {
+                    reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
                 }
             }
         }
@@ -741,21 +887,16 @@ pub async fn handle_daemon_ws_message(
                 }
                 Command::RemoteKill { client_id } => {
                     let msg = if let Some(ref ws_server) = app.ws_server {
-                        if let Ok(clients) = ws_server.clients.try_read() {
-                            if let Some(client) = clients.get(&client_id) {
-                                let ip = client.ip_address.clone();
-                                drop(clients);
-                                if let Ok(mut clients_mut) = ws_server.clients.try_write() {
-                                    clients_mut.remove(&client_id);
-                                    format!("Disconnected remote client {} ({})", client_id, ip)
-                                } else {
-                                    "Could not acquire write lock (busy).".to_string()
-                                }
-                            } else {
-                                format!("No client with ID {}.", client_id)
-                            }
+                        let ip = {
+                            let clients = ws_server.clients.read().unwrap();
+                            clients.get(&client_id).map(|c| c.ip_address.clone())
+                        };
+                        if let Some(ip) = ip {
+                            let mut clients_mut = ws_server.clients.write().unwrap();
+                            clients_mut.remove(&client_id);
+                            format!("Disconnected remote client {} ({})", client_id, ip)
                         } else {
-                            "Could not read client list (busy).".to_string()
+                            format!("No client with ID {}.", client_id)
                         }
                     } else {
                         "WebSocket server is not running.".to_string()
@@ -1345,7 +1486,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, keyboard_always_visible, tabs } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, keyboard_always_visible, tabs, icon_bar } => {
             app.update_global_settings(
                 client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                 world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -1355,7 +1496,7 @@ pub async fn handle_daemon_ws_message(
                 web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                 ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                 mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
-                keyboard_always_visible, tabs,
+                keyboard_always_visible, tabs, icon_bar,
             );
         }
         WsMessage::ToggleWorldGmcp { world_index } => {
@@ -1625,20 +1766,27 @@ pub async fn handle_daemon_ws_message(
             app.selective_flush(world_index);
         }
         WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-            if is_debug_enabled() {
-                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                output_debug_log(&format!("SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                    source, world_name, expected_seq_gt, actual_seq,
-                    line_text.chars().take(80).collect::<String>()));
-            }
+            // Always-on (not gated behind is_debug_enabled()): only fires on a real
+            // connection-level fault, so no log-spam risk, and it was invisible in the field
+            // until now (D-Termux-lines investigation).
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("SEQ-MISMATCH", &ip, &format!("[{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                source, world_name, expected_seq_gt, actual_seq,
+                line_text.chars().take(80).collect::<String>()));
         }
         WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
-            if is_debug_enabled() {
-                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                output_debug_log(&format!("DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                    source, world_name, line_seq, max_seq,
-                    line_text.chars().take(200).collect::<String>()));
-            }
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("DUPLICATE", &ip, &format!("[{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                source, world_name, line_seq, max_seq,
+                line_text.chars().take(200).collect::<String>()));
+        }
+        WsMessage::ReportOutOfOrder { world_index, line_seq, recovered_count, source } => {
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("OUT-OF-ORDER", &ip, &format!("[{}] in '{}': recovered {} line(s) starting at seq={} that had arrived out of order",
+                source, world_name, recovered_count, line_seq));
         }
         WsMessage::ClientTypeDeclaration { client_type } => {
             // Update client type in WebSocket server
@@ -3312,20 +3460,26 @@ pub async fn handle_multiuser_ws_message(
             // Silently reject - users can't edit worlds in multiuser mode
         }
         WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-            if is_debug_enabled() {
-                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                output_debug_log(&format!("SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                    source, world_name, expected_seq_gt, actual_seq,
-                    line_text.chars().take(80).collect::<String>()));
-            }
+            // Always-on (not gated behind is_debug_enabled()) — see the single-user daemon
+            // handler above for why (D-Termux-lines investigation).
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("SEQ-MISMATCH", &ip, &format!("[{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                source, world_name, expected_seq_gt, actual_seq,
+                line_text.chars().take(80).collect::<String>()));
         }
         WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
-            if is_debug_enabled() {
-                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                output_debug_log(&format!("DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
-                    source, world_name, line_seq, max_seq,
-                    line_text.chars().take(200).collect::<String>()));
-            }
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("DUPLICATE", &ip, &format!("[{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                source, world_name, line_seq, max_seq,
+                line_text.chars().take(200).collect::<String>()));
+        }
+        WsMessage::ReportOutOfOrder { world_index, line_seq, recovered_count, source } => {
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("OUT-OF-ORDER", &ip, &format!("[{}] in '{}': recovered {} line(s) starting at seq={} that had arrived out of order",
+                source, world_name, recovered_count, line_seq));
         }
         WsMessage::ToggleWorldGmcp { world_index } => {
             if world_index < app.worlds.len() {
@@ -3368,8 +3522,8 @@ mod change_password_tests {
     /// Returns the client id and a receiver for whatever the handler sends back.
     fn register_client(server: &WebSocketServer, client_id: u64, username: &str) -> mpsc::UnboundedReceiver<WsMessage> {
         let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
-        // try_write (not blocking_write) per CLAUDE.md: never block a tokio RwLock from
-        // inside the runtime. No contention here — this runs before any concurrent access.
+        // `clients` is a std::sync::RwLock (see WebSocketServer::clients) — try_write here
+        // is just for the "uncontended in test setup" assertion, not async-safety.
         let mut clients = server.clients.try_write().expect("clients lock should be uncontended in test setup");
         clients.insert(client_id, WsClientInfo {
             authenticated: true,

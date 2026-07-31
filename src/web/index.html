@@ -9,6 +9,67 @@
 </head>
 <body>
     <div id="app">
+        <!-- Icon bar (Icon Bar setting: none/app_tablet/all). Hidden by
+             default via CSS; shown via JS (applyIconBarMode/renderIconBar)
+             per iconBarVisible(). The 4 built-in tiles reuse the exact
+             actions the hamburger menu's data-action dispatch already
+             handles; user-defined shortcuts (Actions with GUI Menu
+             Shortcut enabled) are appended after the divider and cycle
+             with the ‹/› arrows - the built-in tiles never move. -->
+        <div id="icon-bar" class="icon-bar">
+            <div class="icon-tile" data-action="world-selector" title="World Selector">
+                <svg viewBox="0 0 32 32" fill="none">
+                    <circle cx="16" cy="16" r="13" stroke="currentColor" stroke-width="1.6"/>
+                    <path d="M16 6 18.6 16 13.4 16Z" fill="currentColor"/>
+                    <path d="M16 26 18.6 16 13.4 16Z" stroke="currentColor" stroke-width="1" fill="none"/>
+                    <circle cx="16" cy="16" r="1.7" fill="currentColor"/>
+                </svg>
+                <span class="icon-tile-label">Worlds</span>
+            </div>
+            <div class="icon-tile" data-action="actions" title="Actions">
+                <svg viewBox="0 0 32 32" fill="currentColor"><path d="M19 2 8 17h7l-3 13 14-16h-8z"/></svg>
+                <span class="icon-tile-label">Actions</span>
+            </div>
+            <div class="icon-tile" data-action="setup" title="Settings">
+                <svg viewBox="0 0 32 32" fill="none">
+                    <circle cx="16" cy="16" r="9" stroke="currentColor" stroke-width="1.8"/>
+                    <circle cx="16" cy="16" r="3.2" stroke="currentColor" stroke-width="1.6"/>
+                    <rect x="14.5" y="2.1" width="3" height="4.6" rx="0.8" fill="currentColor"/>
+                    <rect x="14.5" y="2.1" width="3" height="4.6" rx="0.8" fill="currentColor" transform="rotate(45 16 16)"/>
+                    <rect x="14.5" y="2.1" width="3" height="4.6" rx="0.8" fill="currentColor" transform="rotate(90 16 16)"/>
+                    <rect x="14.5" y="2.1" width="3" height="4.6" rx="0.8" fill="currentColor" transform="rotate(135 16 16)"/>
+                    <rect x="14.5" y="2.1" width="3" height="4.6" rx="0.8" fill="currentColor" transform="rotate(180 16 16)"/>
+                    <rect x="14.5" y="2.1" width="3" height="4.6" rx="0.8" fill="currentColor" transform="rotate(225 16 16)"/>
+                    <rect x="14.5" y="2.1" width="3" height="4.6" rx="0.8" fill="currentColor" transform="rotate(270 16 16)"/>
+                    <rect x="14.5" y="2.1" width="3" height="4.6" rx="0.8" fill="currentColor" transform="rotate(315 16 16)"/>
+                </svg>
+                <span class="icon-tile-label">Settings</span>
+            </div>
+            <div class="icon-tile" data-action="filter" title="Find">
+                <svg viewBox="0 0 32 32" fill="none">
+                    <circle cx="13" cy="13" r="8.5" stroke="currentColor" stroke-width="2.2"/>
+                    <line x1="19" y1="19" x2="28" y2="28" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+                </svg>
+                <span class="icon-tile-label">Find</span>
+            </div>
+            <div class="icon-tile" id="icon-bar-tags-tile" data-action="toggle-tags" title="Toggle Tags">
+                <svg viewBox="0 0 32 32" fill="none">
+                    <path d="M4 9h17l7 7-7 7H4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                    <circle cx="10.5" cy="16" r="2.1" fill="currentColor"/>
+                </svg>
+                <span class="icon-tile-label">Tags</span>
+            </div>
+            <div class="icon-bar-sep"></div>
+            <div class="icon-bar-divider" id="icon-bar-divider"></div>
+            <div class="icon-bar-arrow" id="icon-bar-left" title="Previous shortcuts">
+                <svg viewBox="0 0 16 16" fill="none"><path d="M10 3 5 8l5 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </div>
+            <div class="icon-bar-shortcuts" id="icon-bar-shortcuts"></div>
+            <div class="icon-bar-arrow" id="icon-bar-right" title="More shortcuts">
+                <svg viewBox="0 0 16 16" fill="none"><path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </div>
+        </div>
+
         <!-- Main output area -->
         <div id="output-container">
             <div id="output"></div>
@@ -283,6 +344,13 @@
                 <div class="action-field">
                     <label for="action-startup">Startup:</label>
                     <select id="action-startup" class="form-select">
+                        <option value="no">No</option>
+                        <option value="yes">Yes</option>
+                    </select>
+                </div>
+                <div class="action-field" title="Show this action as a one-click shortcut tile in the web/GUI icon bar">
+                    <label for="action-gui-shortcut">GUI Menu Shortcut:</label>
+                    <select id="action-gui-shortcut" class="form-select">
                         <option value="no">No</option>
                         <option value="yes">Yes</option>
                     </select>
@@ -696,6 +764,16 @@
                                                     <option value="none">None</option>
                                                     <option value="top">Show Top Ribbon</option>
                                                     <option value="bottom">Show Bottom Ribbon</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="setting-row" title="Shows a row of large Worlds/Actions/Settings/Find icons (plus any Action marked GUI Menu Shortcut) above the output area. No effect on the console.">
+                                            <span class="setting-label">Icon Bar</span>
+                                            <div class="setting-value">
+                                                <select id="setup-iconbar-select" class="form-select">
+                                                    <option value="none">None</option>
+                                                    <option value="app_tablet">App/Tablet</option>
+                                                    <option value="all">All</option>
                                                 </select>
                                             </div>
                                         </div>

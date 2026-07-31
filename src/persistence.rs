@@ -381,6 +381,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
+    writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -481,6 +482,10 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         // Only save startup if enabled (default is false)
         if action.startup {
             writeln!(file, "startup=true")?;
+        }
+        // Only save gui_shortcut if enabled (default is false)
+        if action.gui_shortcut {
+            writeln!(file, "gui_shortcut=true")?;
         }
     }
 
@@ -740,6 +745,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "command" => action.command = unescape_action_value(value),
                         "enabled" => action.enabled = value != "false",
                         "startup" => action.startup = value == "true",
+                        "gui_shortcut" => action.gui_shortcut = value == "true",
                         _ if key.starts_with("pattern.") => {
                             let parts: Vec<&str> = key.splitn(3, '.').collect();
                             if parts.len() == 3 {
@@ -1014,6 +1020,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     }
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
+                    }
+                    "icon_bar" => {
+                        app.settings.icon_bar = crate::IconBarMode::from_name(value);
                     }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
@@ -1361,6 +1370,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "command" => action.command = unescape_action_value(value),
                         "enabled" => action.enabled = value != "false",
                         "startup" => action.startup = value == "true",
+                        "gui_shortcut" => action.gui_shortcut = value == "true",
                         _ if key.starts_with("pattern.") => {
                             // Multi-pattern keys: "pattern.N.text" (and legacy "pattern.N.type")
                             let parts: Vec<&str> = key.splitn(3, '.').collect();
@@ -1624,6 +1634,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             if action.startup {
                 writeln!(file, "startup=true")?;
             }
+            if action.gui_shortcut {
+                writeln!(file, "gui_shortcut=true")?;
+            }
         }
     }
 
@@ -1706,6 +1719,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
+    writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
 
     // Save watchdog state
     writeln!(file, "watchdog_enabled={}", app.tf_engine.watchdog_enabled)?;
@@ -1913,6 +1927,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         }
         if action.startup {
             writeln!(file, "startup=true")?;
+        }
+        if action.gui_shortcut {
+            writeln!(file, "gui_shortcut=true")?;
         }
     }
 
@@ -2410,6 +2427,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
                     }
+                    "icon_bar" => {
+                        app.settings.icon_bar = crate::IconBarMode::from_name(value);
+                    }
                     "arrow_up_down_mode" | "shift_arrow_up_down_mode" => {
                         // Legacy: silently ignore (now handled by keybindings system)
                     }
@@ -2548,6 +2568,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "command" => action.command = unescape_action_value(value),
                             "enabled" => action.enabled = value != "false",
                             "startup" => action.startup = value == "true",
+                            "gui_shortcut" => action.gui_shortcut = value == "true",
                             _ if key.starts_with("pattern.") => {
                                 // Multi-pattern keys: "pattern.N.text" (and legacy "pattern.N.type")
                                 let parts: Vec<&str> = key.splitn(3, '.').collect();
@@ -2722,6 +2743,7 @@ mod tests {
                     a.world = "testworld".to_string();
                     a.enabled = false;
                     a.startup = true;
+                    a.gui_shortcut = true;
                     a
                 },
             ],
@@ -2740,6 +2762,7 @@ mod tests {
             scrollback_enabled: true,          // default: false
             keyboard_always_visible: false,    // default: true
             tabs: TabsMode::Top,               // default: None
+            icon_bar: IconBarMode::All,        // default: AppTablet
         }
     }
 
@@ -2819,6 +2842,7 @@ mod tests {
             assert_eq!(aa.world, bb.world, "{context}: action[{i}].world");
             assert_eq!(aa.enabled, bb.enabled, "{context}: action[{i}].enabled");
             assert_eq!(aa.startup, bb.startup, "{context}: action[{i}].startup");
+            assert_eq!(aa.gui_shortcut, bb.gui_shortcut, "{context}: action[{i}].gui_shortcut");
         }
         assert_eq!(a.tls_proxy_enabled, b.tls_proxy_enabled, "{context}: tls_proxy_enabled");
         assert_eq!(a.dictionary_path, b.dictionary_path, "{context}: dictionary_path");
@@ -2830,6 +2854,7 @@ mod tests {
         assert_eq!(a.scrollback_enabled, b.scrollback_enabled, "{context}: scrollback_enabled");
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
         assert_eq!(a.tabs, b.tabs, "{context}: tabs");
+        assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -3164,6 +3189,7 @@ pattern=foo
         assert_ne!(non_default.scrollback_enabled, default.scrollback_enabled, "scrollback_enabled should differ");
         assert_ne!(non_default.keyboard_always_visible, default.keyboard_always_visible, "keyboard_always_visible should differ");
         assert_ne!(non_default.tabs, default.tabs, "tabs should differ");
+        assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");
     }
 
     #[test]
