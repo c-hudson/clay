@@ -3856,8 +3856,16 @@ impl App {
 
         // Build world info cache
         let now = std::time::Instant::now();
+        // Same constant as Command::WorldsList (commands.rs) - kept in sync manually since
+        // that's the App-side implementation of the same /l output for non-TF-nested callers.
+        const KEEPALIVE_SECS: u64 = 5 * 60;
         self.tf_engine.world_info_cache.clear();
         for world in &self.worlds {
+            let next_nop_secs = if world.connected {
+                world.last_send_time.map(|t| KEEPALIVE_SECS.saturating_sub(t.elapsed().as_secs()))
+            } else {
+                None
+            };
             self.tf_engine.world_info_cache.push(tf::WorldInfoCache {
                 name: world.name.clone(),
                 host: world.settings.hostname.clone(),
@@ -3866,9 +3874,14 @@ impl App {
                 password: world.settings.password.clone(),
                 is_connected: world.connected,
                 use_ssl: world.settings.use_ssl,
+                is_proxy: world.proxy_pid.is_some(),
                 unseen_lines: world.unseen_lines,
                 last_receive_secs_ago: world.last_receive_time.map(|t| now.duration_since(t).as_secs() as i64),
                 last_send_secs_ago: world.last_send_time.map(|t| now.duration_since(t).as_secs() as i64),
+                last_nop_secs_ago: world.last_nop_time.map(|t| now.duration_since(t).as_secs() as i64),
+                next_nop_secs,
+                buffer_size: world.output_lines.len() + world.pending_lines.len(),
+                last_user_command_secs_ago: world.last_user_command_time.map(|t| now.duration_since(t).as_secs() as i64),
             });
         }
 
@@ -3877,6 +3890,11 @@ impl App {
             buffer: self.input.buffer.clone(),
             cursor_position: self.input.cursor_position,
         };
+
+        // Sync ban list snapshot for TF's own /ban (cmd_banlist) - see ban_info_cache's
+        // doc comment. get_ban_info() is a few RwLock reads over what's normally an empty
+        // or tiny list, cheap enough to refresh unconditionally like world_info_cache above.
+        self.tf_engine.ban_info_cache = self.ban_list.get_ban_info();
     }
 
     /// Process pending keyboard operations from TF functions

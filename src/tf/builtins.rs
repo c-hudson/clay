@@ -2652,6 +2652,112 @@ mod tests {
         }
     }
 
+    /// Regression test: `/quote :> `/l` used to silently produce "(no output)"
+    /// because /l (and its full names /connections, /listsockets) were routed
+    /// to TfCommandResult::ClayCommand, which cmd_quote's backtick-source
+    /// handling explicitly cannot capture (see the D-quote-l-capture
+    /// investigation). /l is now a genuine TF-native command
+    /// (cmd_connections) that returns real text, same as /version already did.
+    #[test]
+    fn test_cmd_quote_l_captures_connections_output() {
+        let mut engine = TfEngine::new();
+        engine.current_world = Some("MyMud".to_string());
+        engine.world_info_cache.push(super::super::WorldInfoCache {
+            name: "MyMud".to_string(),
+            is_connected: true,
+            unseen_lines: 3,
+            ..Default::default()
+        });
+
+        // Unquoted backtick source, exactly as the user typed it.
+        let result = cmd_quote(&mut engine, ":> `/l");
+        match result {
+            TfCommandResult::Quote { lines, disposition, .. } => {
+                assert!(!lines.is_empty(), "expected /l's world-list output to be captured, got no lines");
+                assert!(lines.iter().any(|l| l.contains("MyMud")),
+                    "expected the connected world's name in the captured output: {:?}", lines);
+                assert!(lines.iter().all(|l| l.starts_with(":> ")),
+                    "every captured line must carry the prefix: {:?}", lines);
+                // ":> " doesn't start with '/', so this must stay a Send (not
+                // auto-promoted to Exec).
+                assert_eq!(disposition, QuoteDisposition::Send);
+            }
+            other => panic!("Expected Quote result, got {:?}", other),
+        }
+
+        // /connections and /listsockets are full-name aliases for the same command.
+        for alias in ["`/connections", "`/listsockets"] {
+            let result = cmd_quote(&mut engine, alias);
+            match result {
+                TfCommandResult::Quote { lines, .. } => {
+                    assert!(lines.iter().any(|l| l.contains("MyMud")), "alias {alias} did not capture output");
+                }
+                other => panic!("alias {alias}: expected Quote result, got {:?}", other),
+            }
+        }
+    }
+
+    /// Same bug, same fix, different command: /fg with no arguments is documented as
+    /// "equivalent to /connections" but still routed through ClayCommand until now.
+    #[test]
+    fn test_cmd_quote_fg_no_args_captures_connections_output() {
+        let mut engine = TfEngine::new();
+        engine.current_world = Some("MyMud".to_string());
+        engine.world_info_cache.push(super::super::WorldInfoCache {
+            name: "MyMud".to_string(),
+            is_connected: true,
+            ..Default::default()
+        });
+
+        let result = cmd_quote(&mut engine, "`/fg");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert!(lines.iter().any(|l| l.contains("MyMud")),
+                    "expected /fg (no args) to capture the same output as /connections: {:?}", lines);
+            }
+            other => panic!("Expected Quote result, got {:?}", other),
+        }
+
+        // /fg <world> is a real switch action, not informational - must stay uncapturable
+        // (still routes to ClayCommand), unlike the no-args form above.
+        let result = cmd_quote(&mut engine, "`/fg MyMud");
+        match result {
+            TfCommandResult::Success(Some(msg)) => {
+                assert!(msg.starts_with("(no output)"), "expected /fg <world> to stay uncapturable: {:?}", msg);
+            }
+            other => panic!("Expected an uncaptured '(no output)' result for /fg <world>, got {:?}", other),
+        }
+    }
+
+    /// Same bug, same fix: /ban (list banned hosts) was never in TF's own command
+    /// table at all, so it always fell through to the generic ClayCommand fallback -
+    /// same silent-drop symptom as /l before that fix.
+    #[test]
+    fn test_cmd_quote_ban_captures_banlist_output() {
+        let mut engine = TfEngine::new();
+
+        // Empty ban list: still real captured text, just the "no bans" message.
+        let result = cmd_quote(&mut engine, "`/ban");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert!(lines.iter().any(|l| l.contains("No hosts are currently banned")),
+                    "expected the empty-ban-list message to be captured: {:?}", lines);
+            }
+            other => panic!("Expected Quote result, got {:?}", other),
+        }
+
+        // Populated ban list: the banned host must appear in the captured text.
+        engine.ban_info_cache.push(("1.2.3.4".to_string(), "temporary".to_string(), "too many failed logins".to_string()));
+        let result = cmd_quote(&mut engine, "`/ban");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert!(lines.iter().any(|l| l.contains("1.2.3.4")),
+                    "expected the banned host to appear in captured output: {:?}", lines);
+            }
+            other => panic!("Expected Quote result, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_cmd_gag_ungag() {
         let mut engine = TfEngine::new();

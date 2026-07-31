@@ -368,6 +368,11 @@ pub struct TfEngine {
     pub current_world: Option<String>,
     /// Connected worlds list (name, host, port, user, is_connected)
     pub world_info_cache: Vec<WorldInfoCache>,
+    /// Snapshot of app.ban_list.get_ban_info() (ip, ban_type, reason), synced
+    /// alongside world_info_cache - lets TF's own /ban (cmd_banlist) reproduce
+    /// Command::BanList's output for /quote backtick capture, same reasoning
+    /// as world_info_cache/cmd_connections.
+    pub ban_info_cache: Vec<(String, String, String)>,
     /// Current keyboard buffer state (synced from InputArea)
     pub keyboard_state: KeyboardBufferState,
     /// Pending keyboard operations to be processed by main app
@@ -400,7 +405,10 @@ pub struct PendingWorldOp {
     pub use_ssl: bool,
 }
 
-/// Cached world info for TF functions (fg_world, world_info, nactive)
+/// Cached world info for TF functions (fg_world, world_info, nactive) and for
+/// TF's own /connections /listsockets /l (see cmd_connections in parser.rs,
+/// which needs the extra fields below to reproduce Command::WorldsList's
+/// output — see commands.rs — for /quote backtick capture).
 #[derive(Debug, Clone, Default)]
 pub struct WorldInfoCache {
     pub name: String,
@@ -410,9 +418,18 @@ pub struct WorldInfoCache {
     pub password: String,
     pub is_connected: bool,
     pub use_ssl: bool,
+    pub is_proxy: bool,
     pub unseen_lines: usize,
     pub last_receive_secs_ago: Option<i64>,
     pub last_send_secs_ago: Option<i64>,
+    pub last_nop_secs_ago: Option<i64>,
+    pub next_nop_secs: Option<u64>,
+    pub buffer_size: usize,
+    /// Distinct from last_send_secs_ago (which tracks ANY outbound send,
+    /// including keepalives, for idle()/sidle()): this is specifically the
+    /// last time the *user* sent something, matching Command::WorldsList's
+    /// "Last" column (commands.rs uses world.last_user_command_time there).
+    pub last_user_command_secs_ago: Option<i64>,
 }
 
 /// Cached keyboard buffer state for TF functions (kbhead, kbtail, etc.)

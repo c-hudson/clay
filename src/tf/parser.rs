@@ -78,7 +78,7 @@ pub fn is_tf_command_name(cmd: &str) -> bool {
         // These are also TF commands (mapped to Clay equivalents)
         "say" |
         "quit" | "dc" | "disconnect" | "world" | "listworlds" |
-        "listsockets" | "connections" | "addworld" | "version" |
+        "listsockets" | "connections" | "l" | "ban" | "addworld" | "version" |
         // Note: "send" maps to Clay's /send command, but TF's /send has different options
         // so we route it through TF to handle -w flag properly
         "send" |
@@ -282,7 +282,8 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "dc" | "disconnect" => TfCommandResult::ClayCommand("/disconnect".to_string()),
         "world" => cmd_world(args),
         "listworlds" => cmd_listworlds(engine, args),
-        "listsockets" | "connections" => TfCommandResult::ClayCommand("/connections".to_string()),
+        "listsockets" | "connections" | "l" => cmd_connections(engine, args),
+        "ban" => cmd_banlist(engine, args),
         "addworld" => cmd_addworld(args),
 
         // Info commands
@@ -337,7 +338,7 @@ fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_su
         "kill" => builtins::cmd_kill(engine, args),
 
         // World switching
-        "fg" => cmd_fg(args),
+        "fg" => cmd_fg(engine, args),
 
         // Portal/bamf
         "bamf" => cmd_bamf(engine, args),
@@ -1047,6 +1048,68 @@ fn cmd_listworlds(engine: &TfEngine, args: &str) -> TfCommandResult {
             name_w=name_w, host_w=host_w, port_w=port_w));
     }
 
+    TfCommandResult::Success(Some(lines.join("\n")))
+}
+
+/// /connections, /listsockets, /l - List connected worlds with stats (unseen count,
+/// last recv/send, last/next keepalive, buffer size). This is the TF-native
+/// implementation of the same output Command::WorldsList (commands.rs) produces for
+/// non-TF-nested callers (e.g. a plain typed /l on a WS/GUI/web client, which never
+/// reaches the TF engine at all - see handle_ws_send_command's own Command::WorldsList
+/// arm). Returning real Success(Some(text)) here (instead of the ClayCommand bounce
+/// those other paths use) is what makes `/quote `` `/l` `` capturable - cmd_quote's
+/// backtick-source handling discards ClayCommand results as "not capturable output",
+/// which is exactly what made this command silently produce "(no output)" before.
+fn cmd_connections(engine: &TfEngine, _args: &str) -> TfCommandResult {
+    let worlds_info: Vec<crate::util::WorldListInfo> = engine.world_info_cache.iter().map(|w| {
+        crate::util::WorldListInfo {
+            name: w.name.clone(),
+            connected: w.is_connected,
+            is_current: engine.current_world.as_deref() == Some(w.name.as_str()),
+            is_ssl: w.use_ssl,
+            is_proxy: w.is_proxy,
+            unseen_lines: w.unseen_lines,
+            last_send_secs: w.last_user_command_secs_ago.map(|s| s.max(0) as u64),
+            last_recv_secs: w.last_receive_secs_ago.map(|s| s.max(0) as u64),
+            last_nop_secs: w.last_nop_secs_ago.map(|s| s.max(0) as u64),
+            next_nop_secs: w.next_nop_secs,
+            buffer_size: w.buffer_size,
+        }
+    }).collect();
+    TfCommandResult::Success(Some(crate::util::format_worlds_list(&worlds_info)))
+}
+
+/// /ban - List currently banned hosts. TF-native counterpart to Command::BanList
+/// (commands.rs), same reasoning as cmd_connections above: returning real text here
+/// (instead of the ClayCommand bounce Command::BanList's own call site used) is what
+/// makes `/quote `` `/ban` `` capturable.
+///
+/// Known, accepted gap: Command::BanList also broadcasts WsMessage::BanListResponse
+/// so an open ban-management popup on another client stays fresh even when a
+/// *different* interface is the one that ran /ban. This TF-native path has no App
+/// access and can't send that broadcast — a console-typed plain `/ban` (which now
+/// resolves here instead of round-tripping through Command::BanList) will show the
+/// list correctly but won't proactively refresh someone else's already-open popup.
+/// Not worth threading a side-channel through the TF engine for; the popup still
+/// refreshes correctly the next time anyone actually changes the ban list.
+fn cmd_banlist(engine: &TfEngine, _args: &str) -> TfCommandResult {
+    let bans = &engine.ban_info_cache;
+    if bans.is_empty() {
+        return TfCommandResult::Success(Some("No hosts are currently banned.".to_string()));
+    }
+    let mut lines = vec![
+        String::new(),
+        "Banned Hosts:".to_string(),
+        "─".repeat(70),
+        format!("{:<20} {:<12} {}", "Host", "Type", "Last URL/Reason"),
+        "─".repeat(70),
+    ];
+    for (ip, ban_type, reason) in bans {
+        let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
+        lines.push(format!("{:<20} {:<12} {}", ip, ban_type, reason_display));
+    }
+    lines.push("─".repeat(70));
+    lines.push("Use /unban <host> to remove a ban.".to_string());
     TfCommandResult::Success(Some(lines.join("\n")))
 }
 
@@ -2224,11 +2287,13 @@ fn cmd_unbind(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 }
 
 /// Switch to a world (foreground)
-fn cmd_fg(args: &str) -> TfCommandResult {
+fn cmd_fg(engine: &TfEngine, args: &str) -> TfCommandResult {
     let world = args.trim();
     if world.is_empty() {
-        // No argument - show current world or list
-        TfCommandResult::ClayCommand("/connections".to_string())
+        // No argument - show current world or list. Call cmd_connections directly
+        // (same as /connections/l) instead of bouncing through ClayCommand, so
+        // `/quote `` `/fg` `` can capture it — see cmd_connections's own doc comment.
+        cmd_connections(engine, "")
     } else {
         // Switch to specified world
         TfCommandResult::ClayCommand(format!("/worlds {}", world))

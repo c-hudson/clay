@@ -2463,16 +2463,12 @@
                     renderOutput();
                 }
 
-                // Note editor mode: replace the whole app view with the note
-                // editor and request the target world's current notes.
+                // Note editor mode: this is a dedicated note window/tab (desktop
+                // GUI's own OS window, or the ?note= browser tab) - replace the
+                // whole page view with the note editor. See enterNoteMode() for
+                // the Android in-place equivalent (entered at runtime, not here).
                 if (noteMode) {
-                    if (elements.statusBar) elements.statusBar.style.display = 'none';
-                    if (elements.inputContainer) elements.inputContainer.style.display = 'none';
-                    if (elements.navBar) elements.navBar.style.display = 'none';
-                    if (elements.outputContainer) elements.outputContainer.style.display = 'none';
-                    if (elements.tabsRibbon) elements.tabsRibbon.style.display = 'none';
-                    if (elements.noteEditorView) elements.noteEditorView.style.display = 'flex';
-                    send({ type: 'RequestNoteEditorState', world_index: noteMode.world_index });
+                    enterNoteMode(noteMode.world_index);
                 }
 
                 // Handle pending reconnect command (resend after reconnection)
@@ -4936,16 +4932,59 @@
         return proto + '//' + host;
     }
 
-    // Opens the current world's notes in a genuine separate window (native OS
-    // window in webview-GUI, a new browser tab otherwise) — not an in-page
-    // modal, not a shell-out. Shared by the /note command and the status-bar
-    // note icon (both should behave identically). Only the no-args "current
-    // world" form is supported here; `/note -l` and `/note <file>` remain
-    // console-only (see plan doc for why).
+    // Switch the CURRENT page/WebView into note-editing mode in place: hides the
+    // normal chat chrome and shows the note editor view, same DOM swap the
+    // page-load-time noteMode branch in the InitialState handler does for a
+    // dedicated note window/tab. This is the only option on Android — its
+    // single WebView has no multi-window support (no onCreateWindow /
+    // setSupportMultipleWindows wired up in MainActivity.java), so window.open()
+    // there either crashes (file:// URI exposure in local/standalone mode) or
+    // silently hijacks the one WebView with no way back (remote mode); see
+    // exitNoteMode() for the reverse. Desktop/plain-web keep the real
+    // separate-window/tab behavior below since they actually support it.
+    function enterNoteMode(worldIndex) {
+        noteMode = { world_index: worldIndex };
+        if (elements.statusBar) elements.statusBar.style.display = 'none';
+        if (elements.inputContainer) elements.inputContainer.style.display = 'none';
+        if (elements.navBar) elements.navBar.style.display = 'none';
+        if (elements.outputContainer) elements.outputContainer.style.display = 'none';
+        if (elements.tabsRibbon) elements.tabsRibbon.style.display = 'none';
+        if (elements.iconBar) elements.iconBar.style.display = 'none';
+        if (elements.noteEditorView) elements.noteEditorView.style.display = 'flex';
+        send({ type: 'RequestNoteEditorState', world_index: worldIndex });
+    }
+
+    // Reverses enterNoteMode(): restore the normal chat view. Mirrors the
+    // hide/restore pattern showAuthModal(false) already uses for the same set
+    // of containers.
+    function exitNoteMode() {
+        noteMode = null;
+        if (elements.noteEditorView) elements.noteEditorView.style.display = 'none';
+        if (elements.statusBar) elements.statusBar.style.display = '';
+        if (elements.inputContainer) elements.inputContainer.style.display = '';
+        if (elements.navBar) elements.navBar.style.display = '';
+        if (elements.outputContainer) elements.outputContainer.style.display = '';
+        document.title = 'Clay MUD Client';
+        setupToolbars(deviceMode);
+        renderOutput();
+        updateStatusBar();
+        elements.input.focus();
+    }
+
+    // Opens the current world's notes. Desktop GUI/plain-web get a genuine
+    // separate window (native OS window via webview-GUI's IPC, a new browser
+    // tab otherwise) — not an in-page modal, not a shell-out. Android instead
+    // switches the current page into note mode in place (see enterNoteMode()
+    // for why: its WebView has no multi-window support). Shared by the /note
+    // command and the status-bar note icon (both should behave identically).
+    // Only the no-args "current world" form is supported here; `/note -l` and
+    // `/note <file>` remain console-only (see plan doc for why).
     function openNoteEditor() {
         if (!worlds[currentWorldIndex]) return;
-        var notePayload = { world_index: currentWorldIndex, world_name: worlds[currentWorldIndex].name };
-        if (window.WEBVIEW_MODE) {
+        if (window.Android) {
+            enterNoteMode(currentWorldIndex);
+        } else if (window.WEBVIEW_MODE) {
+            var notePayload = { world_index: currentWorldIndex, world_name: worlds[currentWorldIndex].name };
             sendIpc('note-window:' + JSON.stringify(notePayload));
         } else {
             var noteUrl = window.location.origin + basePath() + '/?note=' + currentWorldIndex;
@@ -10535,11 +10574,16 @@
             };
         }
 
-        // Cancel: close this spawned window/tab without saving, discarding
-        // any unsaved edits (same IPC-vs-window.close() split as /quit).
+        // Cancel: discard any unsaved edits and leave note mode. Android
+        // never actually opened a separate window (see enterNoteMode()), so
+        // it just switches the current page back to the normal chat view;
+        // desktop/plain-web really did spawn one, so they close it (same
+        // IPC-vs-window.close() split as /quit).
         if (elements.noteEditorCancelBtn) {
             elements.noteEditorCancelBtn.onclick = function() {
-                if (window.WEBVIEW_MODE) {
+                if (window.Android) {
+                    exitNoteMode();
+                } else if (window.WEBVIEW_MODE) {
                     sendIpc('close-window');
                 } else {
                     window.close();
