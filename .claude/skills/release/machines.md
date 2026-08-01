@@ -130,16 +130,26 @@ present in the unsigned APK before signing — if that check fails, the NDK/rust
 probably missing on this machine.
 
 **APK Signing** (run from the repo root, not from `android/`). Use the **full path** to
-`zipalign` — the Android build-tools dir is not on PATH in a non-interactive shell:
+`zipalign` — the Android build-tools dir is not on PATH in a non-interactive shell.
+
+`zipalign` refuses to overwrite an existing output file and exits non-zero (`Output file
+'...' exists`) rather than failing loudly enough to notice in a scrollback — a prior
+release run left `android/clay-android-aligned.apk` on disk, this step silently declined
+to regenerate it, and `apksigner` went on to sign that stale, previous-version intermediate
+(caught only afterward, by the Step 7 asset-freshness check). Always pass `-f` to force
+the overwrite so this can't happen again:
 ```bash
 BT=~/Android/Sdk/build-tools/35.0.0
-# Align
-$BT/zipalign -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk android/clay-android-aligned.apk
+# Align (-f: force-overwrite any stale aligned APK left from a prior run, see above)
+$BT/zipalign -f -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk android/clay-android-aligned.apk
 # Sign
 $BT/apksigner sign --ks android/clay-release.keystore --ks-pass file:$HOME/.clay-keystore-pass --out android/clay-android.apk android/clay-android-aligned.apk
 # Verify (expect "Verifies")
 $BT/apksigner verify android/clay-android.apk
 ```
+Do not treat the Step 7 freshness check as a substitute for this — it catches a stale APK
+*after* the fact (and only because it happens to grep for a string added in the current
+release); `-f` prevents the staleness from being introduced in the first place.
 
 ## Windows VM (192.168.2.14) — VirtualBox guest on Linux host
 
