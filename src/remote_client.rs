@@ -969,6 +969,12 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     app.ws_client_tx = Some(ws_tx.clone());
     app.is_master = false;
 
+    // Warn at most once per session (not on every reconnect) if this console's own
+    // version drifts from the server's. Declared here, outside the "wait for
+    // InitialState" loop below, so it survives any future in-process reconnect within
+    // this same --console invocation rather than resetting per attempt.
+    let mut version_mismatch_shown = false;
+
     // Now set up the terminal for the main UI
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -998,13 +1004,33 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             }
                             // Auth success - continue waiting for InitialState
                         }
-                        WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, .. } => {
+                        WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, actions, server_version, .. } => {
                             // Save world totals for backfill before consuming worlds vec
                             let world_totals: Vec<(usize, usize)> = worlds.iter()
                                 .map(|w| (w.index, w.total_output_lines))
                                 .collect();
                             // Initialize app state from server
                             app.init_from_initial_state(worlds, current_world_index, settings, splash_lines, actions);
+                            // Warn once per session if our version differs from the server's.
+                            // An empty server_version means an old server that predates this
+                            // field (#[serde(default)]) - stay silent, not a mismatch.
+                            if !version_mismatch_shown && !server_version.is_empty() && server_version != crate::VERSION {
+                                app.add_output(&format!(
+                                    "Version mismatch: {} (local) ≠ {} (remote).",
+                                    crate::VERSION, server_version
+                                ));
+                                // This is the only InitialState this loop currently ever
+                                // receives (a dropped connection ends the process rather
+                                // than looping back here - see the comment on
+                                // `version_mismatch_shown`'s declaration above), so this
+                                // write is never read again today. Kept (and the lint
+                                // silenced) so the guard is already correct if an
+                                // in-process reconnect loop is ever added here.
+                                #[allow(unused_assignments)]
+                                {
+                                    version_mismatch_shown = true;
+                                }
+                            }
                             // Initialize backfill queue. Phase 1 target is a guaranteed
                             // screenful (max(75, visible rows)) so switching to any world
                             // shows content immediately; phase 2 then tops each world up

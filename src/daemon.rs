@@ -3177,6 +3177,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         current_world_index,
         actions,
         splash_lines,
+        server_version: crate::VERSION.to_string(),
     }
 }
 

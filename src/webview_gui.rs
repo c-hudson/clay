@@ -796,7 +796,8 @@ fn build_html(params: &WebViewParams) -> String {
         .replace("{{WS_REMOTE_HOST}}", "")
         .replace("{{CONNECTION_MODE}}", "auto")
         .replace("{{SHOW_CONNECTION_WINDOW}}", if params.server_host.is_some() { "true" } else { "false" })
-        .replace("{{THEME_CSS_VARS}}", &params.theme_css);
+        .replace("{{THEME_CSS_VARS}}", &params.theme_css)
+        .replace("{{CLIENT_VERSION}}", crate::VERSION);
 
     // Inject world lock from env var (set by parent when spawning /window <world>)
     if let Ok(world_name) = std::env::var("CLAY_WINDOW_WORLD") {

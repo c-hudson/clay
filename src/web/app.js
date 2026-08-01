@@ -440,6 +440,7 @@
     let serverChallenge = '';  // Challenge from ServerHello for challenge-response auth
     let worlds = [];
     let currentWorldIndex = 0;
+    let versionMismatchShown = false;  // Warn on client/server version drift once per session, not every reconnect
 
     // Check for world lock parameter in URL or injected by WebView
     var urlParams = new URLSearchParams(window.location.search);
@@ -2534,6 +2535,28 @@
                 updateStatusBar();
                 // Send initial view state for synchronized more-mode
                 sendViewStateIfChanged();
+                // Warn once per session if this client's bundled version differs from the
+                // server's (only GUI-remote/Android can genuinely drift - see plan doc).
+                // Defense-in-depth: also treat a value still containing "{{" (an
+                // unreplaced template placeholder, e.g. from a future regression like the
+                // one already found/fixed for {{CLIENT_VERSION}}) as absent, not a real
+                // mismatch. Wrapped in its own try/catch so a malformed/missing field
+                // can never break InitialState processing.
+                try {
+                    var localVersion = window.CLIENT_VERSION;
+                    var remoteVersion = msg.server_version;
+                    if (!versionMismatchShown && localVersion && remoteVersion &&
+                        localVersion.indexOf('{{') === -1 && remoteVersion.indexOf('{{') === -1 &&
+                        localVersion !== remoteVersion) {
+                        appendClientLine(
+                            `Version mismatch: ${localVersion} (local) ≠ ${remoteVersion} (remote).`,
+                            currentWorldIndex, 'system'
+                        );
+                        versionMismatchShown = true;
+                    }
+                } catch (e) {
+                    console.error('Clay: error checking client/server version mismatch', e);
+                }
                 // Schedule lazy backfill of remaining scrollback history
                 startBackfill();
                 // Lock to specific world if URL parameter specified

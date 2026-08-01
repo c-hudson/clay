@@ -1756,6 +1756,13 @@ public class MainActivity extends AppCompatActivity {
 
     /** Build a JS snippet that sets window.WS_* vars and applies the saved theme. */
     private String buildVarInjectionScript() {
+        String appVersion;
+        try {
+            appVersion = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (PackageManager.NameNotFoundException e) {
+            appVersion = "";
+        }
+        if (appVersion == null) appVersion = "";
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         boolean isLocalMode = RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))
             && localServerManager != null && localServerManager.isRunning();
@@ -1814,6 +1821,7 @@ public class MainActivity extends AppCompatActivity {
                "window.WS_REMOTE_HOST=" + remoteHost + ";" +
                "window.WS_PORT=" + port + ";" +
                "window.WS_PROTOCOL='wss';" +
+               "window.CLIENT_VERSION=" + jsStr(appVersion) + ";" +
                "window.CONNECTION_MODE=" + mode + ";" +
                // Tells app.js's connect() to gate each dial on Android.ensureSshTunnelReady()
                // before opening a socket to the tunneled loopback port — explicit boolean

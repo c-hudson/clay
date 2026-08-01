@@ -286,6 +286,8 @@ pub enum WsMessage {
         actions: Vec<Action>,
         #[serde(default)]
         splash_lines: Vec<String>,
+        #[serde(default)]
+        server_version: String,
     },
 
     // Real-time updates (server -> client)

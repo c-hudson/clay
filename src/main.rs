@@ -30,7 +30,7 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-const VERSION: &str = "1.5.2";
+pub(crate) const VERSION: &str = "1.5.2";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
@@ -10074,6 +10074,7 @@ impl App {
             current_world_index: self.current_world_index,
             actions: self.settings.actions.clone(),
             splash_lines: generate_splash_strings(),
+            server_version: crate::VERSION.to_string(),
         }
     }
 

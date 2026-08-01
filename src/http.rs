@@ -542,7 +542,15 @@ fn handle_http_routes(
                 .replace("{{WS_REMOTE_HOST}}", "")
                 .replace("{{CONNECTION_MODE}}", "auto")
                 .replace("{{SHOW_CONNECTION_WINDOW}}", "false")
-                .replace("{{THEME_CSS_VARS}}", theme_css_vars);
+                .replace("{{THEME_CSS_VARS}}", theme_css_vars)
+                // A browser fetches this page directly from the server it's about to
+                // connect to over WS, so "local" and "remote" are the same binary here
+                // by construction - always equal, never a real mismatch. Still must be
+                // replaced with a real value (not left as literal "{{CLIENT_VERSION}}"
+                // template text), or the version-mismatch check in app.js would see a
+                // non-empty string that differs from the server's real version and fire
+                // a false positive for every ordinary browser user.
+                .replace("{{CLIENT_VERSION}}", crate::VERSION);
             RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
         }
         "/style.css" => {
