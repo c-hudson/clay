@@ -392,7 +392,7 @@
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new() };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
@@ -1161,6 +1161,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
+            resume: Vec::new(),
         };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
@@ -1267,6 +1268,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
+            resume: Vec::new(),
         };
         sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap())).await.unwrap();
         let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
@@ -1287,6 +1289,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
+            resume: Vec::new(),
         };
         sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap())).await.unwrap();
         let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
@@ -1414,6 +1417,7 @@
             auth_key: Some("test_key".to_string()),
             request_key: false,
             challenge_response: false,
+            resume: Vec::new(),
         };
         let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string(), "test_challenge".to_string());
 
@@ -1479,6 +1483,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
+            resume: Vec::new(),
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
 
@@ -4969,6 +4974,397 @@ if you're more curious.\"";
         }
     }
 
+    // --- PROTOCOL-ROADMAP.md Step 2: resume-driven replay on (re)connect ---
+
+    /// A client that disconnects after acking up through seq N and reconnects with
+    /// `AuthRequest { resume: vec![(world_index, N)], .. }` must receive exactly the
+    /// lines with seq > N - no gap, no duplicate - proactively from the server via
+    /// the same gap-fill path `RequestScrollback{after_seq}` already uses
+    /// (`App::handle_request_scrollback`), driven straight out of the AuthRequest
+    /// handler (`App::handle_ws_auth_initial_state`) rather than waiting on the client
+    /// to notice and ask for it. Also covers requirement #3: the resume payload must
+    /// seed `WsClientInfo::acked_seq` so an immediate second reconnect isn't treated
+    /// as behind.
+    #[test]
+    fn test_resume_replay_on_reconnect_sends_exact_gap_no_duplicate() {
+        use crate::websocket::{WsMessage, WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        // Simulate ServerData the client already saw (seq 1..=10) before it disconnected.
+        for seq in 1..=10u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        // Register a fake WS client directly in the clients map, the same way
+        // daemon.rs's `register_client` test helper does - bypasses the real TCP
+        // handshake, which isn't the thing under test here, while still exercising the
+        // real send path (`ws_send_to_client`/`ws_send_initial_state_and_mark` read
+        // from this same map).
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        // Bounded (PROTOCOL-ROADMAP.md Step 3) — matches the real per-client channel.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true,
+                tx,
+                current_world: None,
+                username: None,
+                received_initial_state: false,
+                client_type: RemoteClientType::Web,
+                viewport_height: 24,
+                ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                paused: false,
+                acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        // Reconnect: the client already has seq 1..=7 (last_contiguous_seq = 7), so
+        // resume replay should send back exactly seq 8, 9, 10, oldest-first.
+        app.handle_ws_auth_initial_state(client_id, Some(0), vec![(0, 7)]);
+
+        let mut scrollback_lines = None;
+        // ScrollbackLines is a single-recipient send, so Outbound::Message
+        // (PROTOCOL-ROADMAP.md Step 8).
+        while let Ok(item) = rx.try_recv() {
+            if let Outbound::Message(msg) = item {
+                if let WsMessage::ScrollbackLines { world_index, lines, backfill_complete } = *msg {
+                    assert_eq!(world_index, 0);
+                    assert!(backfill_complete,
+                        "the whole gap fits in one reply, so backfill should be reported complete");
+                    assert!(scrollback_lines.is_none(), "resume replay must send exactly one ScrollbackLines reply per world, not several");
+                    scrollback_lines = Some(lines);
+                }
+            }
+        }
+
+        let lines = scrollback_lines.expect("expected a ScrollbackLines reply from the resume replay path");
+        let seqs: Vec<u64> = lines.iter().map(|l| l.seq).collect();
+        assert_eq!(seqs, vec![8, 9, 10],
+            "resume replay must send exactly the lines with seq > last_contiguous_seq, in \
+             order, with no gap and no duplicate - got {seqs:?}");
+
+        // Requirement #3: acked_seq should be seeded from the resume payload itself, so
+        // an immediate second reconnect (before any new PongCheck ack) isn't treated as
+        // behind.
+        let clients = app.ws_server.as_ref().unwrap().clients.read().unwrap();
+        let client = clients.get(&client_id).expect("client should still be registered");
+        assert_eq!(client.acked_seq.get(&0), Some(&7),
+            "acked_seq must be seeded from AuthRequest.resume on (re)connect");
+    }
+
+    /// Empty `resume` (old clients, or a fresh client with no prior state) must behave
+    /// exactly as before this step: InitialState only, no unsolicited ScrollbackLines.
+    #[test]
+    fn test_empty_resume_sends_no_scrollback_replay() {
+        use crate::websocket::{WsMessage, WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=10u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        // Bounded (PROTOCOL-ROADMAP.md Step 3) — matches the real per-client channel.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true,
+                tx,
+                current_world: None,
+                username: None,
+                received_initial_state: false,
+                client_type: RemoteClientType::Web,
+                viewport_height: 24,
+                ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                paused: false,
+                acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        app.handle_ws_auth_initial_state(client_id, Some(0), Vec::new());
+
+        let mut saw_scrollback = false;
+        let mut saw_initial_state = false;
+        // Both are single-recipient sends, so Outbound::Message (PROTOCOL-ROADMAP.md Step 8).
+        while let Ok(item) = rx.try_recv() {
+            if let Outbound::Message(msg) = item {
+                match *msg {
+                    WsMessage::ScrollbackLines { .. } => saw_scrollback = true,
+                    WsMessage::InitialState { .. } => saw_initial_state = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_initial_state, "InitialState must still be sent as before this step");
+        assert!(!saw_scrollback, "an empty resume list must not trigger any replay - first-time connections must be unaffected");
+    }
+
+    // --- PROTOCOL-ROADMAP.md Step 3: bounded channel + ResyncRequired on overflow ---
+
+    /// A client whose outbound channel overflows must not have the overflow silently
+    /// dropped: the affected world gets flagged `needs_resync`, and once the channel has
+    /// room again (draining, in this test simulating a slow client catching up) exactly
+    /// one `ResyncRequired` for that world is delivered - and the connection is never torn
+    /// down (the client stays registered throughout, matching a stalled-but-alive client
+    /// rather than a dead one).
+    #[test]
+    fn test_channel_full_sends_resync_required_once() {
+        use crate::websocket::{WsMessage, WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        // A small test-only capacity so a handful of sends overflows it - exercising the
+        // real WS_CLIENT_CHANNEL_CAPACITY (256) would need hundreds of iterations to hit
+        // the same code path.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(4);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true,
+                tx,
+                current_world: Some(0),
+                username: None,
+                received_initial_state: true,
+                client_type: RemoteClientType::Web,
+                viewport_height: 24,
+                ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                paused: false,
+                acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+
+        let make_line = |seq: u64| WsMessage::ServerData {
+            world_index: 0,
+            data: format!("line {seq}"),
+            is_viewed: true,
+            ts: 0,
+            from_server: true,
+            seq,
+            marked_new: false,
+            flush: false,
+            gagged: false,
+        };
+
+        // Fill the channel past its capacity of 4 - the 5th broadcast must overflow it.
+        for seq in 1..=5u64 {
+            server.broadcast_to_all(make_line(seq));
+        }
+
+        // The connection must survive the overflow (still registered), and world 0 must
+        // be flagged as needing a resync - no ResyncRequired could be delivered yet since
+        // the channel is still completely full.
+        {
+            let clients = server.clients.read().unwrap();
+            let client = clients.get(&client_id)
+                .expect("client must still be registered - a channel overflow must not tear down the connection");
+            assert!(client.needs_resync.contains(&0),
+                "world 0 should be flagged needing resync after its channel overflowed");
+        }
+
+        // Simulate the client catching up: drain most (not all) of the backlog, freeing
+        // room in the channel.
+        let mut drained = 0;
+        while drained < 3 && rx.try_recv().is_ok() {
+            drained += 1;
+        }
+
+        // The next successful broadcast should piggyback delivery of the flagged resync
+        // now that there's room (see `reconcile_resync`'s flush_candidates handling).
+        server.broadcast_to_all(make_line(6));
+
+        {
+            let clients = server.clients.read().unwrap();
+            let client = clients.get(&client_id).unwrap();
+            assert!(!client.needs_resync.contains(&0),
+                "needs_resync must be cleared once ResyncRequired is actually delivered");
+        }
+
+        // Drain everything left and count ResyncRequired occurrences - must be exactly one.
+        // ResyncRequired's from_seq is per-client, so it's always Outbound::Message
+        // (PROTOCOL-ROADMAP.md Step 8) - the ServerData broadcasts also sitting in this
+        // channel are Outbound::Shared and simply don't match the Message pattern below.
+        let mut resync_count = 0;
+        while let Ok(item) = rx.try_recv() {
+            if let Outbound::Message(msg) = item {
+                if let WsMessage::ResyncRequired { world_index, .. } = *msg {
+                    assert_eq!(world_index, 0);
+                    resync_count += 1;
+                }
+            }
+        }
+        assert_eq!(resync_count, 1,
+            "exactly one ResyncRequired should be observed for the affected world, not zero or several");
+    }
+
+    // --- PROTOCOL-ROADMAP.md Step 6: Rust remote console client (receiving side) ---
+    // Exercises `App::handle_remote_ws_message`, the client-side handler for messages
+    // received *from* a remote Clay server over `--console`. Unlike Step 2's tests above
+    // (which drive the server's resume-replay path), these drive the client's reaction to
+    // a live mid-stream gap: a forward seq jump in `ServerData`, followed by the
+    // `ResyncRequired`/`ScrollbackLines` round trip that recovers it.
+
+    fn console_server_data(world_index: usize, seq: u64, lines: &[&str]) -> WsMessage {
+        WsMessage::ServerData {
+            world_index,
+            data: lines.join("\n"),
+            is_viewed: true,
+            ts: 0,
+            from_server: true,
+            seq,
+            marked_new: false,
+            flush: false,
+            gagged: false,
+        }
+    }
+
+    /// A `ServerData` batch that jumps ahead of `max_received_seq` (the server's outbound
+    /// channel dropped something in between, PROTOCOL-ROADMAP.md Step 3) must not be
+    /// treated as a duplicate or silently lose the gap: the client should record exactly
+    /// where the gap starts (`World::pending_gap`), and once the server's `ResyncRequired`
+    /// /`ScrollbackLines` round trip supplies the missing lines, splice them back into that
+    /// exact position so the world's buffer ends up complete and in order - not tacked onto
+    /// the front (the old blind-prepend behavior) or the back.
+    #[test]
+    fn test_console_client_resync_gap_fill_restores_order_no_loss() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("world0"));
+        app.current_world_index = 0;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        app.ws_client_tx = Some(tx);
+
+        // Normal contiguous delivery: seq 1..=5.
+        app.handle_remote_ws_message(console_server_data(0, 1,
+            &["line1", "line2", "line3", "line4", "line5"]));
+        assert_eq!(app.worlds[0].max_received_seq, 5);
+        assert_eq!(app.worlds[0].output_lines.len(), 5);
+        assert!(app.worlds[0].pending_gap.is_none(), "no gap yet - nothing to track");
+
+        // A batch arrives at seq 11 - seq 6..=10 never made it (server-side channel
+        // overflow). The client must not treat this as a duplicate (11 > max_received_seq),
+        // must still accept and display it (trusting in-order delivery per Step 6), and
+        // must remember exactly where the hole starts: right after the 5 lines it already
+        // has.
+        app.handle_remote_ws_message(console_server_data(0, 11,
+            &["line11", "line12", "line13", "line14", "line15"]));
+        assert_eq!(app.worlds[0].max_received_seq, 15);
+        assert_eq!(app.worlds[0].output_lines.len(), 10,
+            "the seq-11 batch must still be appended, not dropped, despite the gap behind it");
+        assert_eq!(app.worlds[0].pending_gap, Some((5, 5)),
+            "gap must be recorded at local index 5 (right after the first batch), with 5 as \
+             the last contiguous seq");
+
+        // The server notices (via its own overflow bookkeeping) and sends ResyncRequired.
+        // The client must ask for exactly the missing range via the same RequestScrollback
+        // mechanism reconnect-time gap-fill already uses.
+        app.handle_remote_ws_message(WsMessage::ResyncRequired { world_index: 0, from_seq: 5 });
+        let sent = rx.try_recv().expect("ResyncRequired must trigger a RequestScrollback");
+        match sent {
+            WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
+                assert_eq!(world_index, 0);
+                assert_eq!(before_seq, None);
+                assert_eq!(after_seq, Some(5));
+                assert!(count >= 5, "count must be large enough to cover the whole gap");
+            }
+            other => panic!("expected RequestScrollback, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one RequestScrollback, not several");
+
+        // The server replies with the missing lines (seq 6..=10), exactly as
+        // `handle_request_scrollback`'s after_seq branch would produce.
+        let gap_lines: Vec<TimestampedLine> = (6..=10u64).map(|seq| TimestampedLine {
+            text: format!("line{seq}"),
+            ts: 0,
+            gagged: false,
+            from_server: true,
+            seq,
+            highlight_color: None,
+            marked_new: false,
+            from_archive: false,
+        }).collect();
+        app.handle_remote_ws_message(WsMessage::ScrollbackLines {
+            world_index: 0,
+            lines: gap_lines,
+            backfill_complete: true,
+        });
+
+        // Complete: all 15 lines present, no permanent loss.
+        assert_eq!(app.worlds[0].output_lines.len(), 15);
+        assert!(app.worlds[0].pending_gap.is_none(), "pending_gap must be cleared once filled");
+        // In order: reading the buffer front-to-back must reproduce line1..line15 in
+        // sequence - not gap-fill-at-the-front (old prepend behavior) or gap-fill-at-the-
+        // back (naive append), either of which would scramble the chronological order.
+        let texts: Vec<&str> = app.worlds[0].output_lines.iter().map(|l| l.text.as_str()).collect();
+        let expected: Vec<String> = (1..=15u64).map(|n| format!("line{n}")).collect();
+        assert_eq!(texts, expected, "gap-filled lines must be spliced back into their exact \
+            chronological position, producing a complete, in-order buffer");
+    }
+
+    /// `PongCheck.acked` must report the last *contiguous* seq, not the highest seq seen -
+    /// while a gap is outstanding, acking the post-gap `max_received_seq` would tell the
+    /// server we have lines we don't, hiding the hole from any future resume.
+    #[test]
+    fn test_console_client_pong_check_acks_pre_gap_boundary() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("world0"));
+        app.current_world_index = 0;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        app.ws_client_tx = Some(tx);
+
+        app.handle_remote_ws_message(console_server_data(0, 1, &["line1", "line2"]));
+        // No gap yet: acked should reflect max_received_seq (2).
+        app.handle_remote_ws_message(WsMessage::PingCheck { nonce: 1 });
+        match rx.try_recv().unwrap() {
+            WsMessage::PongCheck { nonce, acked } => {
+                assert_eq!(nonce, 1);
+                assert_eq!(acked, vec![(0, 2)]);
+            }
+            other => panic!("expected PongCheck, got {other:?}"),
+        }
+
+        // Open a gap: seq jumps from 2 to 5 (missing 3, 4).
+        app.handle_remote_ws_message(console_server_data(0, 5, &["line5"]));
+        assert_eq!(app.worlds[0].max_received_seq, 5);
+        assert_eq!(app.worlds[0].pending_gap, Some((2, 2)));
+
+        app.handle_remote_ws_message(WsMessage::PingCheck { nonce: 2 });
+        match rx.try_recv().unwrap() {
+            WsMessage::PongCheck { nonce, acked } => {
+                assert_eq!(nonce, 2);
+                assert_eq!(acked, vec![(0, 2)],
+                    "must ack the pre-gap boundary (2), not max_received_seq (5) - acking 5 \
+                     would hide the still-missing 3..4 from the server");
+            }
+            other => panic!("expected PongCheck, got {other:?}"),
+        }
+    }
+
     // --- App::resolve_quote_lines ---
     // Pins the shared /quote helper's behavior, including the world-targeting/delay-scheduling
     // support console's two call sites used to silently drop entirely (T32).
@@ -5462,5 +5858,77 @@ if you're more curious.\"";
         let open = s.find('[').expect("missing '[' platform tag");
         let close = s.find(']').expect("missing ']' platform tag");
         assert!(close > open + 1, "empty platform/arch tag: {:?}", s);
+    }
+
+    /// Step 10 (PROTOCOL-ROADMAP.md): `ServerData.from_server`/`marked_new` now skip
+    /// serialization when they equal their defaults (true/false respectively), mirroring
+    /// `flush`/`gagged`. Confirms the omission round-trips correctly: the common-case
+    /// values are dropped from the JSON, and deserializing that trimmed JSON reconstructs
+    /// the exact same struct via the `#[serde(default = "default_true")]`/`#[serde(default)]`
+    /// fallbacks already present for wire compatibility with old clients/servers.
+    #[test]
+    fn test_server_data_common_case_omits_from_server_and_marked_new() {
+        let msg = WsMessage::ServerData {
+            world_index: 0,
+            data: "hello\n".to_string(),
+            is_viewed: true,
+            ts: 12345,
+            from_server: true,
+            seq: 7,
+            marked_new: false,
+            flush: false,
+            gagged: false,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("from_server"), "from_server should be omitted when true: {}", json);
+        assert!(!json.contains("marked_new"), "marked_new should be omitted when false: {}", json);
+        assert!(!json.contains("flush"), "flush should still be omitted when false: {}", json);
+        assert!(!json.contains("gagged"), "gagged should still be omitted when false: {}", json);
+
+        let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, marked_new, flush, gagged } => {
+                assert_eq!(world_index, 0);
+                assert_eq!(data, "hello\n");
+                assert!(is_viewed);
+                assert_eq!(ts, 12345);
+                assert!(from_server, "from_server must default back to true");
+                assert_eq!(seq, 7);
+                assert!(!marked_new, "marked_new must default back to false");
+                assert!(!flush);
+                assert!(!gagged);
+            }
+            other => panic!("expected ServerData, got {:?}", other),
+        }
+    }
+
+    /// Companion to the above: confirms the non-default values (from_server: false,
+    /// marked_new: true) are still explicitly present on the wire, so the new
+    /// `skip_serializing_if` is conditional on the default, not a blanket omission.
+    #[test]
+    fn test_server_data_non_default_from_server_and_marked_new_are_serialized() {
+        let msg = WsMessage::ServerData {
+            world_index: 1,
+            data: "system message".to_string(),
+            is_viewed: false,
+            ts: 0,
+            from_server: false,
+            seq: 0,
+            marked_new: true,
+            flush: false,
+            gagged: false,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"from_server\":false"), "from_server:false must be present on the wire: {}", json);
+        assert!(json.contains("\"marked_new\":true"), "marked_new:true must be present on the wire: {}", json);
+
+        let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            WsMessage::ServerData { from_server, marked_new, .. } => {
+                assert!(!from_server);
+                assert!(marked_new);
+            }
+            other => panic!("expected ServerData, got {:?}", other),
+        }
     }
 

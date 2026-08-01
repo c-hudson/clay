@@ -75,8 +75,7 @@ Key behaviors:
 - `InitialState` includes `output_lines` only (not `pending_lines`)
 - `pending_count` field shows pending lines; release via PgDn/Tab
 - `ServerData` `flush` flag: client clears output buffer before appending (splash screen replacement)
-- Server tracks each client's viewed world via `WsClient::current_world`
-- `broadcast_to_world_viewers()` routes output only to clients viewing that world
+- Server tracks each client's viewed world via `WsClient::current_world`, but `broadcast_to_world_viewers()` deliberately does **not** filter by it — every client buffers every world's output locally regardless of which tab is focused (instant tab-switching, live unseen badges for background worlds), so this function always broadcasts to all authenticated clients. See the comment on `broadcast_to_world_viewers()` in `src/websocket.rs` (PROTOCOL-ROADMAP.md Step 9).
 
 ### Allow List / Whitelisting
 - `WS allow list` - CSV of IPs that can be whitelisted

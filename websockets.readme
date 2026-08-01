@@ -1,338 +1,369 @@
 # Clay WebSocket Protocol
 
-This document describes the WebSocket protocol used by Clay MUD client for communication between the server (console client) and remote clients (web interface, GUI client).
+This document describes the WebSocket protocol used by Clay MUD client for
+communication between a Clay server (single-user master instance, `-D`
+headless daemon, or `--multiuser` server) and its clients (the web UI, the
+webview GUI, the Rust `--console`/`--grep` remote clients, and Android).
 
-## Connection
+It reflects the protocol as of PROTOCOL-ROADMAP.md Steps 1-10 (2026-07-31).
+For field-level ground truth, always prefer `src/websocket.rs`'s `WsMessage`
+enum over this document — this file is prose describing that enum, not a
+replacement for it, and it has gone stale before.
 
-Connect to the WebSocket server on the configured port. The server supports both `ws://` (non-secure) and `wss://` (TLS) connections depending on configuration.
+## Transport & framing
 
-## Message Format
+One TCP port serves everything: plain WebSocket for localhost clients, and a
+first-byte peek that multiplexes CLAY-KNOCK, TLS, and plain HTTP/WebSocket
+upgrades on the same port for remote clients. The full security design
+(stealth path, accept-time IP gate, CLAY-KNOCK v1, TOFU pinning, ban
+exemptions) is documented in `CLAUDE.md`'s "Connection Security" section and
+`SECURITY-ROADMAP.md` — this file only covers what a client needs to know to
+speak the WebSocket protocol itself:
 
-All messages are JSON objects with a `type` field that identifies the message type. Messages use serde's tagged enum format:
+- The first byte received determines how the connection is handled:
+  `0xC7` starts a CLAY-KNOCK v1 preamble (`src/http.rs`, `KNOCK_MAGIC =
+  [0xC7, 0x4C, 0x41, 0x59]`, i.e. `0xC7` + ASCII `"LAY"`); `0x16` is a TLS
+  ClientHello; anything else is treated as plain HTTP/ASCII. This is why
+  `0xC7` was chosen — it collides with neither.
+- Once a connection reaches the WebSocket layer, everything is JSON text
+  frames — `serde_json`-serialized `WsMessage` values sent as
+  `Message::Text`, framed by `tokio-tungstenite`. There is no binary framing
+  and no compression; a `Message::Binary` frame is treated as a protocol
+  violation and the connection is dropped (see PROTOCOL-ROADMAP.md Step 12,
+  optional/not implemented, for a possible future negotiated-deflate path).
+- Size caps, set on `WebSocketConfig` when the connection is accepted
+  (`src/websocket.rs`, `accept_async_with_config`):
+  `max_message_size: 2 MiB`, `max_frame_size: 256 KiB`. These are symmetric —
+  they bound the server's own outbound sends too (e.g. `InitialState`), not
+  just inbound client messages, which is why `InitialState`/scrollback
+  replies are built against an internal line-count budget that keeps them
+  well under 2 MiB regardless of world count.
+- Every message is a JSON object with a `"type"` field naming the variant
+  (serde's internally-tagged enum representation):
+  ```json
+  { "type": "SendCommand", "world_index": 0, "command": "look" }
+  ```
 
-```json
-{ "type": "MessageType", "field1": "value1", "field2": "value2" }
-```
+## Connecting and authenticating
 
-## Authentication
+1. **`ServerHello`** (server -> client, sent immediately on connect, before
+   auth): `{ "type": "ServerHello", "multiuser_mode": bool, "challenge":
+   "<hex>" }`. `challenge` is a fresh, cryptographically random 16-byte value
+   (hex-encoded) generated per connection; if secure random generation fails
+   the server refuses the connection outright rather than falling back to a
+   weak/default challenge.
 
-### Client -> Server
+2. **`AuthRequest`** (client -> server):
+   ```json
+   {
+     "type": "AuthRequest",
+     "username": null,
+     "password_hash": "<hex>",
+     "current_world": null,
+     "auth_key": null,
+     "request_key": false,
+     "challenge_response": true,
+     "resume": [[0, 42], [2, 130]]
+   }
+   ```
+   - `username` is required in multiuser mode, omitted/null in single-user
+     mode.
+   - Two mutually-exclusive credential paths: `password_hash` (challenge-
+     response, see below), or `auth_key` (a previously-issued device key,
+     validated by the app layer rather than the WebSocket accept loop
+     itself). If `auth_key` is set and non-empty it's tried first.
+   - **Password hashing is challenge-response, not a bare hash.** The stored
+     credential is `password_hash = SHA256(password)` (`hash_password()`,
+     `src/websocket.rs`). To authenticate, the client sets
+     `challenge_response: true` and sends `password_hash =
+     SHA256(SHA256(password) + challenge)` — i.e. `SHA256(stored_hash +
+     challenge)` — using the `challenge` value it received in `ServerHello`.
+     The server verifies by computing `hash_with_challenge(stored_hash,
+     challenge)` itself (`src/websocket.rs`) and comparing.
+     `challenge_response: false` (a bare, non-salted hash) is still accepted
+     for backward compatibility but is compared with a constant-time
+     equality check rather than challenge-verified; new clients should
+     always use the challenge-response path. The stored hash and the
+     in-flight challenge value are never sent to the client — only the
+     challenge itself (in `ServerHello`) and the client's own computed
+     response travel the wire.
+   - `request_key: true` asks the server to also mint and return a device
+     auth key on successful password auth (delivered via a separate
+     `KeyGenerated` message), so future connections can skip password entry.
+   - `resume`: `Vec<(usize, u64)>` — see "Ordering & reliability contract"
+     below. Empty on a first-ever connection; populated on reconnect.
 
-**AuthRequest** - Authenticate with the server
-```json
-{ "type": "AuthRequest", "password_hash": "<sha256_hex>" }
-```
-The password must be hashed with SHA-256 and sent as a lowercase hex string.
+3. **`AuthResponse`** (server -> client): `{ "type": "AuthResponse",
+   "success": bool, "error": Option<String>, "username": Option<String>,
+   "multiuser_mode": bool }`.
 
-### Server -> Client
+4. On success, the server sends **`InitialState`** (full application-state
+   bootstrap: worlds, settings, current world index, actions, splash lines —
+   see `WsMessage::InitialState` in `src/websocket.rs` for the exact shape).
 
-**AuthResponse** - Authentication result
-```json
-{ "type": "AuthResponse", "success": true, "error": null }
-{ "type": "AuthResponse", "success": false, "error": "Invalid password" }
-```
+5. **If `AuthRequest.resume` was non-empty**, the server follows
+   `InitialState` with one **`ScrollbackLines`** reply per named world,
+   replaying exactly the lines the client is missing (see next section) —
+   the client does not need to ask for this separately.
 
-On successful authentication, the server immediately sends an `InitialState` message.
+Localhost connections used by Clay's own GUI/web-standalone can also be
+auto-authenticated via an IP whitelist mechanism (see `is_whitelisted` in
+`src/websocket.rs` and the Connection Security docs) — in that case
+`ServerHello`/`AuthRequest`/`AuthResponse` still happen (the server
+synthesizes an empty `AuthRequest` on the client's behalf to trigger
+`InitialState`), just without a real password round trip.
 
-## Initial State
+## The ordering & reliability contract
 
-**InitialState** - Complete application state sent after authentication or on `RequestState`
-```json
-{
-  "type": "InitialState",
-  "worlds": [...],
-  "settings": {...},
-  "current_world_index": 0,
-  "actions": [...]
-}
-```
+This is the core of what PROTOCOL-ROADMAP.md Steps 1-9 built, and the reason
+this file needed a rewrite. TCP+WebSocket already guarantees in-order,
+lossless delivery on the wire — the problem this contract solves is
+everything *above* that layer: a server-side per-client queue that can
+overflow, and a client that reconnects and needs to know exactly what it
+missed, without guessing.
 
-### WorldStateMsg Structure
-```json
-{
-  "index": 0,
-  "name": "WorldName",
-  "connected": true,
-  "output_lines": ["line1", "line2"],
-  "pending_lines": [],
-  "scroll_offset": 0,
-  "paused": false,
-  "prompt": "> ",
-  "unseen_lines": 0,
-  "settings": {...},
-  "last_send_secs": 120,
-  "last_recv_secs": 5,
-  "last_nop_secs": null,
-  "keep_alive_type": "nop",
-  "output_lines_ts": [{"text": "line1", "ts": 1704067200}],
-  "pending_lines_ts": []
-}
-```
+**`seq` is the delivery contract, not telemetry.** Every `ServerData` carries
+a monotonically increasing `seq: u64` (per world). A client tracks, per
+world, its *last contiguous seq* — the highest seq N such that it has
+received every seq from 1..=N with no hole. This is deliberately not the
+same as "the highest seq seen": if a later batch arrives out of order or
+after a gap, the highest-seen seq can be past a hole that hasn't been filled
+yet, and treating it as caught-up would hide that hole from the server.
 
-### WorldSettingsMsg Structure
-```json
-{
-  "hostname": "mud.example.com",
-  "port": "4000",
-  "user": "username",
-  "use_ssl": false,
-  "log_file": "/path/to/log.txt",
-  "encoding": "utf8",
-  "auto_connect_type": "connect",
-  "keep_alive_type": "nop",
-  "keep_alive_cmd": ""
-}
-```
+**On reconnect**, the client sends its per-world last-contiguous-seq list as
+`AuthRequest.resume: Vec<(world_index, last_contiguous_seq)>`. The server
+(`App::handle_ws_auth_initial_state`, `src/main.rs`) seeds its own bookkeeping
+of what that client has (`WsClientInfo.acked_seq`), then — after sending
+`InitialState` — replays each named world's exact missing range via the same
+scrollback mechanism `RequestScrollback` uses
+(`handle_request_scrollback(.., after_seq: Some(last_seq))`), returned as a
+`ScrollbackLines` message. This is exact and unbounded (limited only by how
+much scrollback the server's in-memory ring actually holds for that world),
+not a capped, best-effort guess.
 
-### GlobalSettingsMsg Structure
-```json
-{
-  "more_mode_enabled": true,
-  "spell_check_enabled": true,
-  "world_switch_mode": "unseen_first",
-  "debug_enabled": false,
-  "show_tags": false,
-  "console_theme": "dark",
-  "gui_theme": "dark",
-  "input_height": 3,
-  "font_name": "",
-  "font_size": 14.0,
-  "ws_allow_list": "192.168.1.0/24",
-  "web_secure": true,
-  "http_enabled": true,
-  "http_port": 9000,
-  "ws_enabled": true,
-  "ws_port": 9002,
-  "ws_cert_file": "/path/to/cert.pem",
-  "ws_key_file": "/path/to/key.pem"
-}
-```
+**While connected**, the client periodically acks its per-world
+last-contiguous-seq the same way, piggybacked on the existing keepalive
+reply rather than a new message type: `PongCheck { nonce, acked:
+Vec<(world_index, last_contiguous_seq)> }`. The server updates
+`WsClientInfo.acked_seq` from this on every `PongCheck` it receives.
 
-## Commands (Client -> Server)
+**Server-side, each client's outbound queue is bounded**, not unbounded:
+`WS_CLIENT_CHANNEL_CAPACITY = 256` (`src/websocket.rs`) — sized to absorb a
+realistic multi-world output burst while still surfacing a genuinely-stuck
+client (a suspended mobile WebView, a congested tunnel) rather than letting
+server memory grow without bound for it. If a client's queue is full when the
+server tries to send it a message, the message is dropped (never silently —
+logged as `WS-CHANNEL-FULL` via `log_remote_event`), and if the dropped
+message belonged to a specific world, that world is flagged
+`needs_resync` on the client. As soon as there's evidence the channel has
+room again (either a later send to that client succeeds, or the client's own
+receive loop drains a message), the server makes a best-effort delivery of
+**`ResyncRequired { world_index, from_seq }`** for each flagged world, where
+`from_seq` is that client's last-known-acked seq for it.
 
-**SendCommand** - Send a command to a world
-```json
-{ "type": "SendCommand", "world_index": 0, "command": "look" }
-```
+**On receiving `ResyncRequired`** (live, without disconnecting), the client
+requests an exact gap-fill: `RequestScrollback { world_index, count,
+before_seq: None, after_seq: Some(from_seq) }`, reusing the same message
+reconnect-resume uses under the hood. The server answers with
+`ScrollbackLines { world_index, lines, backfill_complete }`, oldest-first, to
+be spliced/appended rather than prepended.
 
-**SwitchWorld** - Switch the server's current world view
-```json
-{ "type": "SwitchWorld", "world_index": 1 }
-```
+**This replaced an earlier, lossier design**: before this contract existed,
+clients (particularly `src/web/app.js`) tried to *guess* what they'd missed
+purely from local evidence — a capped table of observed seq gaps
+(`MAX_TRACKED_SEQ_GAPS`), heuristic overlap/duplicate detection, and a
+reconnect-time backfill request anchored only on "everything after my
+highest-seen seq," which could silently miss an older hole a later batch had
+leapfrogged. That client-side heuristic machinery (`_seqGaps`,
+`recordSeqGapIfAny`/`findOverlappingSeqGap`/`shrinkSeqGap`/
+`insertLinesBySeq` in `app.js`) is still present as a defense-in-depth safety
+net for mid-stream reordering on transports that can still reorder locally
+(notably the Android WebView bridge before PROTOCOL-ROADMAP.md Step 7), but
+it is no longer what reconnect gap recovery depends on — `resume`/`acked`/
+`ResyncRequired` is now the authoritative contract, and the exact server-side
+replay it drives is unbounded and precise rather than capped and
+best-effort.
 
-**ConnectWorld** - Connect a world to its MUD server
-```json
-{ "type": "ConnectWorld", "world_index": 0 }
-```
+## `ServerData`: the live-output message
 
-**DisconnectWorld** - Disconnect a world from its MUD server
-```json
-{ "type": "DisconnectWorld", "world_index": 0 }
-```
-
-**CreateWorld** - Create a new world
-```json
-{ "type": "CreateWorld", "name": "NewWorld" }
-```
-
-**ReleasePending** - Release pending lines (when paused in more-mode)
-```json
-{ "type": "ReleasePending", "world_index": 0 }
-```
-
-**MarkWorldSeen** - Mark a world as seen (clears unseen line count)
-```json
-{ "type": "MarkWorldSeen", "world_index": 0 }
-```
-
-**RequestState** - Request full state resync
-```json
-{ "type": "RequestState" }
-```
-Server responds with `InitialState`.
-
-## World Switching Calculation
-
-**CalculateNextWorld** - Request next world index based on server's switching logic
-```json
-{ "type": "CalculateNextWorld", "current_index": 0 }
-```
-
-**CalculatePrevWorld** - Request previous world index
-```json
-{ "type": "CalculatePrevWorld", "current_index": 0 }
-```
-
-**CalculatedWorld** - Server response with calculated index
-```json
-{ "type": "CalculatedWorld", "index": 1 }
-{ "type": "CalculatedWorld", "index": null }
-```
-Returns `null` if no valid world to switch to.
-
-## Settings Updates (Client -> Server)
-
-**UpdateWorldSettings** - Update a world's settings
-```json
-{
-  "type": "UpdateWorldSettings",
-  "world_index": 0,
-  "name": "WorldName",
-  "hostname": "mud.example.com",
-  "port": "4000",
-  "user": "username",
-  "password": "secret",
-  "use_ssl": false,
-  "log_file": "",
-  "encoding": "utf8",
-  "auto_login": "connect",
-  "keep_alive_type": "nop",
-  "keep_alive_cmd": ""
-}
-```
-
-**UpdateGlobalSettings** - Update global settings
-```json
-{
-  "type": "UpdateGlobalSettings",
-  "console_theme": "dark",
-  "gui_theme": "dark",
-  "input_height": 3,
-  "font_name": "",
-  "font_size": 14.0,
-  "ws_allow_list": "",
-  "web_secure": true,
-  "http_enabled": true,
-  "http_port": 9000,
-  "ws_enabled": true,
-  "ws_port": 9002,
-  "ws_cert_file": "",
-  "ws_key_file": ""
-}
-```
-
-**UpdateActions** - Update action triggers
-```json
-{
-  "type": "UpdateActions",
-  "actions": [
-    { "name": "greet", "pattern": "", "command": "say Hello!" }
-  ]
-}
-```
-
-## Real-time Updates (Server -> Client)
-
-**ServerData** - MUD output data
 ```json
 {
   "type": "ServerData",
   "world_index": 0,
   "data": "You are in a dark room.\n",
   "is_viewed": true,
+  "seq": 1042,
   "ts": 1704067200
 }
 ```
-- `is_viewed`: true if any interface is currently viewing this world
-- `ts`: Unix timestamp when the line was received
 
-**WorldConnected** - World connected to MUD
-```json
-{ "type": "WorldConnected", "world_index": 0, "name": "WorldName" }
-```
+Full field list (`src/websocket.rs`, the `ServerData` variant):
+`world_index: usize`, `data: String`, `is_viewed: bool`, `ts: u64`
+(`#[serde(default)]`), `from_server: bool` (`#[serde(default =
+"default_true", skip_serializing_if = "is_true")]`), `seq: u64`
+(`#[serde(default)]`), `marked_new: bool` (`#[serde(default,
+skip_serializing_if = "is_false")]`), `flush: bool` (`#[serde(default,
+skip_serializing_if = "is_false")]`), `gagged: bool` (`#[serde(default,
+skip_serializing_if = "is_false")]`).
 
-**WorldDisconnected** - World disconnected from MUD
-```json
-{ "type": "WorldDisconnected", "world_index": 0 }
-```
+Four of these fields are omitted from the wire entirely when they hold their
+common-case value (bandwidth — `ServerData` is by far the highest-volume
+message type, so trimming a few bytes per line adds up): `from_server`
+(omitted when `true`, the overwhelming common case by message volume — real
+MUD output), `marked_new` (omitted when `false`), `flush` (omitted when
+`false`), and `gagged` (omitted when `false`). A client must treat an absent
+field as its documented default, not as "unknown" — `serde`'s `#[default]`
+attributes reconstruct the true value on decode, and this is round-trip
+tested (`src/tests.rs`,
+`test_server_data_common_case_omits_from_server_and_marked_new` /
+`test_server_data_non_default_from_server_and_marked_new_are_serialized`).
+`world_index`, `data`, `is_viewed`, `seq`, and `ts` are always present —
+`seq` in particular must never be silently omitted-as-zero, since 0 is a
+legitimate value (a client-generated/pending-release marker) and needs to
+stay distinguishable from "field absent."
 
-**WorldAdded** - New world created
-```json
-{ "type": "WorldAdded", "world": {...} }
-```
+Field meanings:
+- `is_viewed`: true if any connected interface is currently viewing this
+  world. Note this does **not** mean the server only sends `ServerData` to
+  clients focused on that world — every authenticated client receives every
+  world's `ServerData` regardless of which world it's currently displaying
+  (see `broadcast_to_world_viewers`'s doc comment in `src/websocket.rs`).
+  This is deliberate: every client (every browser tab, GUI, Android) locally
+  buffers all worlds' output so tab-switching is instant and unseen-line
+  badges stay live for backgrounded worlds. Filtering server-side by focused
+  world was considered (PROTOCOL-ROADMAP.md Step 9) and rejected as a
+  regression, not implemented.
+- `flush`: signals the client should treat this as a flush boundary (e.g.
+  discard/replace buffered partial-line state) rather than an incremental
+  append.
+- `gagged`: this line was gagged (matched a gag pattern) — still delivered
+  for completeness/logging purposes but should be hidden by default in the
+  UI.
+- `from_server`: true if this line originated from the MUD server; false for
+  client-generated lines (system/status messages, command echo, etc.).
+- `marked_new`: true only for a previously-pending line released while the
+  client was scrolled back — a rare case, used to distinguish "genuinely new
+  arrival" from an ordinary append for UI purposes (e.g. animation/highlight
+  cues).
 
-**WorldRemoved** - World deleted
-```json
-{ "type": "WorldRemoved", "world_index": 0 }
-```
+## Message catalog
 
-**WorldSwitched** - Server switched current world
-```json
-{ "type": "WorldSwitched", "new_index": 1 }
-```
+`WsMessage` (`src/websocket.rs`) has well over 100 variants; this section
+groups the major categories with representative examples rather than
+reproducing every variant (that approach is exactly how this file went
+stale before — the enum itself, not this document, is the field-level
+source of truth).
 
-**PromptUpdate** - World prompt changed
-```json
-{ "type": "PromptUpdate", "world_index": 0, "prompt": "> " }
-```
+**Handshake / auth**: `ServerHello`, `AuthRequest`, `AuthResponse`,
+`KeyGenerated`, `RevokeKey`/`KeyRevoked`, `RegenerateAuthKey`,
+`ChangePassword`/`PasswordChanged`, `Logout`/`LoggedOut`.
 
-**PendingLinesUpdate** - Pending line count changed (more-mode)
-```json
-{ "type": "PendingLinesUpdate", "world_index": 0, "count": 42 }
-```
+**State bootstrap**: `InitialState`, `RequestState` (client -> server,
+"send me a fresh `InitialState`" — used by `app.js` on browser
+visibility-change wake to resync a connection that might have gone stale
+without a full reconnect), `RequestWorldState` / `WorldStateResponse`
+(narrower per-world resync, used e.g. when switching worlds, distinct from a
+full `InitialState`). Note `RequestState` re-sends the *whole* `InitialState`
+snapshot — it does not by itself replay any live-output gap; a client that
+actually lost `ServerData` lines should rely on the `resume`/`acked`/
+`ResyncRequired` contract below, not `RequestState`, to recover them.
 
-**UnseenCleared** - World's unseen count was cleared (any client viewed the world)
-```json
-{ "type": "UnseenCleared", "world_index": 0 }
-```
+**Live output**: `ServerData` (above), `WorldConnected`/`WorldDisconnected`,
+`PromptUpdate`, `PendingLinesUpdate`/`PendingReleased`, `UnseenCleared`/
+`UnseenUpdate`, `ActivityUpdate`, `WorldFlushed`, `ServerSpeak`, `AnsiMusic`,
+`GmcpData`/`MsdpData`/`McmpMedia`, `Notification`.
 
-**UnseenUpdate** - World's unseen count changed (new lines arrived while no client viewing)
-```json
-{ "type": "UnseenUpdate", "world_index": 0, "count": 5 }
-```
+**Client commands**: `SendCommand`, `SwitchWorld`, `ConnectWorld`/
+`DisconnectWorld`, `CreateWorld`/`DeleteWorld`, `ReleasePending`,
+`MarkWorldSeen`, `SendGmcp`/`SendMsdp`, `CycleWorld`,
+`CalculateNextWorld`/`CalculatePrevWorld`/`CalculatedWorld`.
 
-**WorldSettingsUpdated** - World settings changed
-```json
-{
-  "type": "WorldSettingsUpdated",
-  "world_index": 0,
-  "settings": {...},
-  "name": "WorldName"
-}
-```
+**Settings**: `UpdateWorldSettings`/`WorldSettingsUpdated`,
+`UpdateGlobalSettings`/`GlobalSettingsUpdated`, `UpdateActions`/
+`ActionsUpdated`, theme editor (`RequestThemeEditorState`,
+`UpdateThemeColors`, `ThemeEditorState`, `ThemeCssVarsUpdated`, ...),
+keybind editor (`RequestKeybindEditorState`, `UpdateKeybindEditorBindings`,
+`KeybindEditorState`, ...), note editor (`RequestNoteEditorState`,
+`UpdateNote`, `NoteEditorState`, `NotesChanged`).
 
-**GlobalSettingsUpdated** - Global settings changed
-```json
-{
-  "type": "GlobalSettingsUpdated",
-  "settings": {...},
-  "input_height": 3
-}
-```
+**Scrollback / resume**: `RequestScrollback { world_index, count,
+before_seq, after_seq }`, `ScrollbackLines { world_index, lines,
+backfill_complete }`, `ResyncRequired { world_index, from_seq }`. See the
+ordering contract section above.
 
-**ActionsUpdated** - Actions changed
-```json
-{ "type": "ActionsUpdated", "actions": [...] }
-```
+**Diagnostics** (client -> server, telemetry only — not part of the delivery
+contract itself): `ReportSeqMismatch`, `ReportDuplicate`,
+`ReportOutOfOrder` — let a client tell the server it observed an anomaly,
+for logging/debugging; the server does not act on these to drive recovery
+(that's what `resume`/`acked`/`ResyncRequired` are for).
 
-## Keepalive
+**Keepalive**: `Ping`/`Pong` (simple liveness), `PingCheck`/`PongCheck`
+(liveness + piggybacked `acked` seq list, see above).
 
-**Ping** - Client keepalive (send every 30 seconds)
-```json
-{ "type": "Ping" }
-```
+**Connection/cert management**: `CertMismatch`/`TrustCertificate` (TLS
+pinning mismatch flow, see `CLAUDE.md` D7), `BanListRequest`/
+`BanListResponse`, `UnbanRequest`/`UnbanResult`, `RequestConnectionsList`/
+`ConnectionsListResponse`.
 
-**Pong** - Server keepalive response
-```json
-{ "type": "Pong" }
-```
+**Settings import/export**: `ImportSettings`, `ImportNeedsInsecureConfirm`,
+`ImportResult`, `RequestSettingsExport`/`SettingsExport`.
 
-## Typical Client Flow
+For any message's exact field names and types, read the corresponding arm of
+`WsMessage` in `src/websocket.rs` directly.
 
-1. Connect to WebSocket server
-2. Send `AuthRequest` with hashed password
-3. Receive `AuthResponse` (success/failure)
-4. Receive `InitialState` with full application state
-5. Render worlds and output
-6. Send `Ping` every 30 seconds
-7. Handle real-time updates as they arrive
-8. Send commands via `SendCommand`
-9. On visibility change (browser wake), send `RequestState` to resync
+## Multiuser note
 
-## Encoding Values
+`--multiuser` mode is distinct from single-user mode (master instance, `-D`
+daemon, or GUI/web against your own worlds): multiple usernames connect to
+one server, each owning a disjoint set of worlds (`world.owner ==
+username`). Every path that can read or replay world data is owner-scoped —
+including resume and scrollback (PROTOCOL-ROADMAP.md Step 6a):
+`AuthRequest.resume` and `PongCheck.acked` entries naming a `world_index` the
+connecting user doesn't own are silently filtered out before either seeding
+`acked_seq` or triggering replay (`owner_filtered_pairs`, `src/daemon.rs`),
+and `RequestScrollback` is served through an owner-checked wrapper
+(`App::handle_request_scrollback_owned`, `src/main.rs`) that no-ops (no
+reply at all, to avoid leaking whether a `world_index` exists) rather than
+silently serving another user's data. In single-user mode there is no such
+scoping because there is only one session — every connected client (console,
+web tabs, GUI, Android, remote consoles) shares the same worlds.
+
+## Keepalive & reconnect summary
+
+- Server-side: an authenticated connection that's been idle receives a
+  protocol-level `Ping` after `WS_KEEPALIVE_INTERVAL_SECS = 60` seconds of
+  inactivity; if no `Pong` arrives within `WS_PONG_TIMEOUT_SECS = 20`
+  seconds, the connection is treated as dead and dropped
+  (`src/websocket.rs`). An unauthenticated connection has
+  `WS_AUTH_TIMEOUT_SECS = 30` seconds to complete `AuthRequest` before being
+  dropped.
+- Client-side: `src/web/app.js` sends `{ "type": "Ping" }` (and, on the same
+  30-second interval, `{ "type": "PongCheck", "nonce": 0, "acked":
+  <resume-ack list> }`) so the server's `acked_seq` bookkeeping stays current
+  even without an outstanding `/remote`-triggered `PingCheck`. The Rust
+  remote console/`--grep` clients ack the same way in reply to the server's
+  own `PingCheck`.
+- **On disconnect**, a client that intends to reconnect should reopen the
+  socket and send `AuthRequest` with `resume` populated from its own
+  per-world last-contiguous-seq state (see the ordering contract above) —
+  this is what lets the server replay exactly what was missed via
+  `ScrollbackLines`, instead of the client having to re-derive it from a
+  full `InitialState` plus guesswork. Clients that never buffer/track
+  per-world seq state (e.g. the Rust `--grep` client's one-shot history-
+  search mode, which fetches everything and exits) legitimately send an
+  empty `resume` — there's nothing to resume from.
+- On a live (still-connected) desync — the server-side channel-overflow case
+  above — the client does not need to reconnect at all: it answers the
+  unprompted `ResyncRequired` with a targeted `RequestScrollback`.
+
+## Encoding / enum value reference
 
 - `encoding`: `"utf8"`, `"latin1"`, `"fansi"`
 - `auto_login` / `auto_connect_type`: `"connect"`, `"prompt"`, `"moo_prompt"`
 - `keep_alive_type`: `"none"`, `"nop"`, `"custom"`, `"generic"`
 - `world_switch_mode`: `"unseen_first"`, `"alphabetical"`
 - `console_theme` / `gui_theme`: `"dark"`, `"light"`
+
+These string-valued settings fields didn't change across Steps 1-10; verify
+against `GlobalSettingsMsg`/`WorldSettingsMsg` in `src/websocket.rs` if in
+doubt, since this document does not reproduce those structs field-by-field.

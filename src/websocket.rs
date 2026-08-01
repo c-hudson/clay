@@ -19,6 +19,188 @@ const WS_KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Seconds to wait for a Pong response before treating the connection as dead and dropping it.
 const WS_PONG_TIMEOUT_SECS: u64 = 20;
 
+/// Bounded capacity of each client's outbound `WsMessage` channel (PROTOCOL-ROADMAP.md
+/// Step 3). Previously `mpsc::unbounded_channel`, which let a stalled/slow client (a
+/// suspended mobile WebView, a congested SSH tunnel) accumulate server-side memory without
+/// bound and with no way to detect it was falling behind.
+///
+/// Sized against realistic legitimate bursts without becoming a giant hidden buffer that
+/// just moves the "client can't keep up" problem further out instead of surfacing it:
+///   - `ServerData`: up to one message per socket read per busy world, fanned out to every
+///     connected client (`broadcast_to_all`/`broadcast_to_owner`). A fast-scrolling combat
+///     or a `look` in a big room can emit several reads in a single tick; a handful of
+///     simultaneously-busy worlds could plausibly emit a few dozen `ServerData` messages in
+///     under a second.
+///   - `PendingCountUpdate`: one per world roughly every 2 seconds — negligible.
+///   - `InitialState`/`ScrollbackLines`: large but singular, sent once per connect/resume,
+///     not part of a steady-state burst.
+///
+/// 256 gives several seconds of headroom at typical MUD output rates before a client is
+/// considered stuck, while capping worst-case per-client memory to a few hundred queued
+/// `WsMessage` clones (each typically well under 1 KiB for `ServerData`) — far short of the
+/// 2 MiB `max_message_size` that already bounds a single outbound frame (see `ws_config`
+/// below). A client that can't drain 256 messages' worth of backlog is meaningfully behind,
+/// not just briefly bursty, and is exactly the case Step 3 wants to detect via
+/// `ResyncRequired` rather than let grow forever.
+pub(crate) const WS_CLIENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Extract the `world_index` a `WsMessage` pertains to, if any (PROTOCOL-ROADMAP.md Step
+/// 3). Used to target a dropped-on-overflow message's `ResyncRequired` at the right world;
+/// messages with no single world (control/global messages) return `None` and are simply
+/// logged as dropped with no resync target — losing e.g. an `ActivityUpdate` doesn't
+/// corrupt any world's `seq` stream the way losing a `ServerData` would.
+pub(crate) fn message_world_index(msg: &WsMessage) -> Option<usize> {
+    match msg {
+        WsMessage::ServerData { world_index, .. }
+        | WsMessage::WorldConnected { world_index, .. }
+        | WsMessage::WorldDisconnected { world_index, .. }
+        | WsMessage::WorldCreated { world_index, .. }
+        | WsMessage::WorldRemoved { world_index, .. }
+        | WsMessage::PromptUpdate { world_index, .. }
+        | WsMessage::PendingLinesUpdate { world_index, .. }
+        | WsMessage::PendingReleased { world_index, .. }
+        | WsMessage::UnseenCleared { world_index, .. }
+        | WsMessage::UnseenUpdate { world_index, .. }
+        | WsMessage::WorldFlushed { world_index, .. }
+        | WsMessage::ServerSpeak { world_index, .. }
+        | WsMessage::AnsiMusic { world_index, .. }
+        | WsMessage::GmcpData { world_index, .. }
+        | WsMessage::MsdpData { world_index, .. }
+        | WsMessage::McmpMedia { world_index, .. }
+        | WsMessage::GmcpUserToggled { world_index, .. }
+        | WsMessage::CertMismatch { world_index, .. }
+        | WsMessage::WorldSettingsUpdated { world_index, .. }
+        | WsMessage::PendingCountUpdate { world_index, .. }
+        | WsMessage::ScrollbackLines { world_index, .. }
+        | WsMessage::WorldSwitchResult { world_index, .. }
+        | WsMessage::OutputLines { world_index, .. }
+        | WsMessage::NoteEditorState { world_index, .. }
+        | WsMessage::NotesChanged { world_index, .. }
+        | WsMessage::ResyncRequired { world_index, .. } => Some(*world_index),
+        _ => None,
+    }
+}
+
+/// Item type for a client's outbound channel (PROTOCOL-ROADMAP.md Step 8). Before this
+/// step, every broadcast fan-out (`broadcast_to_owner`/`broadcast_to_all`/
+/// `broadcast_to_world_viewers`) sent a `WsMessage` clone into every recipient's channel,
+/// and each client's own `handle_ws_client` receive loop independently ran
+/// `serde_json::to_string` on its clone — so one broadcast to N clients did N identical
+/// JSON serializations of the same data. `Outbound` lets a broadcast call site serialize
+/// once and hand every recipient a cheap `Arc<str>` clone of the result instead.
+///
+/// - `Shared`: pre-serialized JSON for a message whose content is identical for every
+///   recipient (the broadcast case). The receive loop sends it straight through with no
+///   further serialization.
+/// - `Message`: a `WsMessage` serialized individually by the receiving client's own task,
+///   unchanged from before this step. Used for anything genuinely per-client — content
+///   that differs per recipient (e.g. `ActivityUpdate`'s per-client-excluded count,
+///   `ResyncRequired`'s per-client `from_seq`) or that only ever has one recipient
+///   (`InitialState`, auth replies, `ScrollbackLines` replay, `ServerHello`).
+///
+/// Both variants flow through the same bounded `mpsc::Sender`/`Receiver<Outbound>`, so
+/// FIFO ordering between a `Shared` broadcast and a `Message` per-client send to the same
+/// client is preserved exactly as it was when the channel only ever carried `WsMessage`.
+#[derive(Clone, Debug)]
+pub(crate) enum Outbound {
+    /// Pre-serialized JSON, shared via `Arc<str>` across every recipient of one broadcast.
+    Shared(std::sync::Arc<str>),
+    /// A message to be serialized individually in the receiving client's own task.
+    Message(Box<WsMessage>),
+}
+
+/// Serialize a `WsMessage` once for a broadcast (PROTOCOL-ROADMAP.md Step 8), returning the
+/// shared JSON as an `Outbound::Shared`. On a serialization failure, logs
+/// `WS-SERIALIZE-FAIL` exactly once (not once per recipient — before this step, every
+/// client's receive loop ran the same failing `serde_json::to_string` independently and
+/// logged its own copy; broadcasting now serializes once up front, so a failure here means
+/// nobody gets the message, which is the same net effect with one log line instead of N)
+/// and returns `None` so the caller sends to nobody, matching the old per-client "drop
+/// silently past the log" behavior.
+pub(crate) fn serialize_for_broadcast(msg: &WsMessage) -> Option<std::sync::Arc<str>> {
+    match serde_json::to_string(msg) {
+        Ok(json) => Some(std::sync::Arc::from(json.as_str())),
+        Err(e) => {
+            let debug_str = format!("{:?}", msg);
+            let variant = debug_str.split(['{', '(']).next().unwrap_or(&debug_str).trim();
+            crate::http::log_remote_event("WS-SERIALIZE-FAIL", "broadcast",
+                &format!("variant={}: {}", variant, e));
+            debug_log(true, &format!("WS-SERIALIZE-FAIL: broadcast variant={}: {}", variant, e));
+            None
+        }
+    }
+}
+
+/// Shared PROTOCOL-ROADMAP.md Step 3 bookkeeping for every send site (the `WebSocketServer`
+/// fan-out methods below, and `handle_ws_client`'s own local sends and drain-triggered
+/// retry). `full` are client ids whose channel just rejected a `world_index`-bearing message
+/// with `TrySendError::Full`; `flush_candidates` are client ids that just had a *successful*
+/// send go through while still flagged `needs_resync` for this world, i.e. evidence the
+/// channel now has room to retry the `ResyncRequired` that couldn't be delivered earlier.
+/// For each id, attempts exactly one `try_send(ResyncRequired)`: on success clears the flag,
+/// on failure (re)sets it so a later call (the next overflow, or the next successful send to
+/// that client) gets another chance. No-op when `world_index` is `None` — a message with no
+/// single world can't be tied to a resync target. `pub(crate)` — also called directly from
+/// `main.rs`'s single-user-path App methods (`ws_broadcast`/`ws_send_to_client`/
+/// `ws_send_initial_state_and_mark`/`broadcast_activity`), which touch `WsClientInfo.tx`
+/// directly rather than going through the `WebSocketServer` fan-out methods below.
+pub(crate) fn reconcile_resync(
+    clients: &std::sync::RwLock<HashMap<u64, WsClientInfo>>,
+    world_index: Option<usize>,
+    full: &[u64],
+    flush_candidates: &[u64],
+) {
+    let Some(wi) = world_index else { return };
+    if full.is_empty() && flush_candidates.is_empty() {
+        return;
+    }
+    let mut guard = clients.write().unwrap();
+    for &id in full.iter().chain(flush_candidates.iter()) {
+        if let Some(client) = guard.get_mut(&id) {
+            let from_seq = client.acked_seq.get(&wi).copied().unwrap_or(0);
+            // ResyncRequired's `from_seq` is per-client (keyed off that client's own
+            // acked_seq), so it's always a `Message`, never `Shared` (PROTOCOL-ROADMAP.md
+            // Step 8) - there is nothing to share across recipients here.
+            match client.tx.try_send(Outbound::Message(Box::new(WsMessage::ResyncRequired { world_index: wi, from_seq }))) {
+                Ok(()) => {
+                    client.needs_resync.remove(&wi);
+                }
+                Err(_) => {
+                    client.needs_resync.insert(wi);
+                }
+            }
+        }
+    }
+}
+
+/// Non-blocking send for `handle_ws_client`'s own local response sends (ServerHello,
+/// AuthResponse, Pong) — mirrors the `WebSocketServer` fan-out methods' Step 3 handling: a
+/// full channel is logged via `WS-CHANNEL-FULL` and, in the unlikely case the message does
+/// carry a `world_index`, reconciled through `reconcile_resync` the same way. These
+/// particular messages never carry one today, but the helper stays generic rather than
+/// silently dropping a future world-scoped message added here without this handling.
+fn try_send_local(
+    clients: &std::sync::RwLock<HashMap<u64, WsClientInfo>>,
+    client_id: u64,
+    tx: &mpsc::Sender<Outbound>,
+    ip: &str,
+    msg: WsMessage,
+) {
+    let world_index = message_world_index(&msg);
+    // These are all genuinely per-client (or one-shot pre-auth) sends - Message, not
+    // Shared (PROTOCOL-ROADMAP.md Step 8).
+    match tx.try_send(Outbound::Message(Box::new(msg))) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+                &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
+                    client_id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
+            reconcile_resync(clients, world_index, &[client_id], &[]);
+        }
+    }
+}
+
 // ============================================================================
 // WebSocket Protocol Types
 // ============================================================================
@@ -26,6 +208,7 @@ const WS_PONG_TIMEOUT_SECS: u64 = 20;
 /// Default function for serde to return true (for from_server field backwards compatibility)
 fn default_true() -> bool { true }
 fn is_false(v: &bool) -> bool { !v }
+fn is_true(v: &bool) -> bool { *v }
 
 /// WebSocket protocol messages for client-server communication
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -51,6 +234,11 @@ pub enum WsMessage {
         request_key: bool,  // If true, request a new auth key after successful password auth
         #[serde(default)]
         challenge_response: bool,  // If true, password_hash is SHA256(SHA256(password) + challenge)
+        #[serde(default)]
+        resume: Vec<(usize, u64)>,  // Per-world (world_index, last_contiguous_seq) the client already
+                                     // has, so the server can replay exactly the gap on reconnect.
+                                     // See PROTOCOL-ROADMAP.md Step 2 (single-user) and Step 6a
+                                     // (multiuser, owner-scoped).
     },
     AuthResponse {
         success: bool,
@@ -104,7 +292,7 @@ pub enum WsMessage {
     /// is_viewed: true if any interface (console/web/GUI) is viewing this world
     /// ts: timestamp in seconds since Unix epoch (when the line was received)
     /// from_server: true if data came from MUD server, false if client-generated
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default)] marked_new: bool, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool },
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true", skip_serializing_if = "is_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default, skip_serializing_if = "is_false")] marked_new: bool, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
@@ -461,7 +649,20 @@ pub enum WsMessage {
 
     // Liveness check for /remote command (server -> client -> server)
     PingCheck { nonce: u64 },
-    PongCheck { nonce: u64 },
+    /// PongCheck also piggybacks the client's per-world delivery ack: `acked` is
+    /// (world_index, last_contiguous_seq) for each world the client has received
+    /// `ServerData` for, i.e. the highest seq such that every seq up to and including
+    /// it has been seen with no gap. Lets the server replay exactly the missing range
+    /// on reconnect instead of the client guessing. See PROTOCOL-ROADMAP.md (not yet
+    /// wired up — Step 1 is schema only).
+    PongCheck { nonce: u64, #[serde(default)] acked: Vec<(usize, u64)> },
+
+    /// Server -> client: this world's stream has a gap the server can't (or won't)
+    /// silently patch — e.g. the client's outbound queue overflowed and messages were
+    /// dropped (see PROTOCOL-ROADMAP.md Step 3). `from_seq` is the seq the client
+    /// should request via `RequestScrollback { after_seq: Some(from_seq), .. }` to
+    /// resync. Not yet sent by anything — Step 1 is schema only.
+    ResyncRequired { world_index: usize, from_seq: u64 },
 }
 
 /// A line of output with timestamp
@@ -721,7 +922,15 @@ impl RemoteClientType {
 /// Information about a connected WebSocket client
 pub struct WsClientInfo {
     pub authenticated: bool,
-    pub tx: mpsc::UnboundedSender<WsMessage>,
+    /// Bounded (PROTOCOL-ROADMAP.md Step 3, capacity `WS_CLIENT_CHANNEL_CAPACITY`) —
+    /// was `mpsc::UnboundedSender`. All send sites use `try_send` (non-blocking) rather
+    /// than `.send().await`, both because the fan-out functions below are sync and
+    /// because awaiting a send from inside `handle_ws_client`'s own select loop — the
+    /// same task that drains this channel — would deadlock if the channel were ever full.
+    /// Item type is `Outbound`, not `WsMessage` (PROTOCOL-ROADMAP.md Step 8) — broadcasts
+    /// serialize once and share the JSON (`Outbound::Shared`) across every recipient
+    /// instead of each recipient's receive loop re-serializing its own clone.
+    pub(crate) tx: mpsc::Sender<Outbound>,
     /// Which world this client is currently viewing (for activity indicator)
     pub current_world: Option<usize>,
     /// Username of the authenticated user (multiuser mode only)
@@ -742,6 +951,16 @@ pub struct WsClientInfo {
     /// True when this session has been paused via /remote --pause.
     /// Paused sessions don't suppress activity notices for their world.
     pub paused: bool,
+    /// Per-world last-contiguous-acked seq (PROTOCOL-ROADMAP.md Step 2): world_index ->
+    /// highest seq such that every seq up to and including it has been delivered with no
+    /// gap. Updated from `PongCheck.acked` and seeded from `AuthRequest.resume` on
+    /// (re)connect, via `WebSocketServer::record_acked_seq`.
+    pub acked_seq: std::collections::HashMap<usize, u64>,
+    /// Worlds whose outbound stream to this client dropped a message because the bounded
+    /// channel was full (PROTOCOL-ROADMAP.md Step 3). Each entry means a `ResyncRequired`
+    /// for that world is still owed to the client — set on a failed best-effort
+    /// `try_send(ResyncRequired)` in `reconcile_resync`, cleared once one is delivered.
+    pub needs_resync: std::collections::HashSet<usize>,
 }
 
 /// User credential for multiuser authentication
@@ -888,36 +1107,90 @@ impl WebSocketServer {
 
     /// Broadcast a message to all clients owned by a specific user
     pub fn broadcast_to_owner(&self, msg: WsMessage, owner: Option<&str>) {
-        let clients = self.clients.read().unwrap();
-        for client in clients.values() {
-            // Only broadcast to clients that are authenticated AND have received InitialState
-            // This prevents ServerData from reaching clients before InitialState,
-            // which causes SEQ MISMATCH errors and duplicate/flickering messages
-            if client.authenticated && client.received_initial_state {
-                // In multiuser mode, only send to clients with matching username
-                if self.multiuser_mode {
-                    if client.username.as_deref() == owner {
-                        let _ = client.tx.send(msg.clone());
+        let world_index = message_world_index(&msg);
+        // PROTOCOL-ROADMAP.md Step 8: serialize once for the whole broadcast, share the
+        // JSON via Arc<str> with every recipient instead of each recipient's own receive
+        // loop re-serializing an identical WsMessage clone. A failure here is logged once
+        // (inside serialize_for_broadcast) and nobody gets the message - same net effect
+        // as the old per-client failure, minus the duplicate log lines.
+        let Some(shared_json) = serialize_for_broadcast(&msg) else { return };
+        let mut full: Vec<(u64, String)> = Vec::new();
+        let mut flush_candidates: Vec<u64> = Vec::new();
+        {
+            let clients = self.clients.read().unwrap();
+            for (&id, client) in clients.iter() {
+                // Only broadcast to clients that are authenticated AND have received InitialState
+                // This prevents ServerData from reaching clients before InitialState,
+                // which causes SEQ MISMATCH errors and duplicate/flickering messages
+                if client.authenticated && client.received_initial_state {
+                    // In multiuser mode, only send to clients with matching username
+                    let eligible = !self.multiuser_mode || client.username.as_deref() == owner;
+                    if !eligible {
+                        continue;
                     }
-                } else {
-                    // In single-user mode, broadcast to all authenticated clients
-                    let _ = client.tx.send(msg.clone());
+                    // Bounded channel (PROTOCOL-ROADMAP.md Step 3) — try_send instead of
+                    // the old infallible unbounded send. See `reconcile_resync` for how a
+                    // `TrySendError::Full` here is turned into a `ResyncRequired`. The
+                    // Arc<str> clone below is cheap (refcount bump, no JSON re-copy).
+                    match client.tx.try_send(Outbound::Shared(shared_json.clone())) {
+                        Ok(()) => {
+                            if let Some(wi) = world_index {
+                                if client.needs_resync.contains(&wi) {
+                                    flush_candidates.push(id);
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => full.push((id, client.ip_address.clone())),
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
                 }
             }
         }
+        for (id, ip) in &full {
+            crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+                &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
+                    id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
+        }
+        let full_ids: Vec<u64> = full.into_iter().map(|(id, _)| id).collect();
+        reconcile_resync(&self.clients, world_index, &full_ids, &flush_candidates);
     }
 
     /// Broadcast a message to all authenticated clients (regardless of owner)
     /// Only sends to clients that have received their InitialState to prevent duplicates
     pub fn broadcast_to_all(&self, msg: WsMessage) {
-        let clients = self.clients.read().unwrap();
-        for client in clients.values() {
-            // Only broadcast to clients that are authenticated AND have received InitialState
-            // This prevents duplicate messages when a client connects while data is streaming
-            if client.authenticated && client.received_initial_state {
-                let _ = client.tx.send(msg.clone());
+        let world_index = message_world_index(&msg);
+        // PROTOCOL-ROADMAP.md Step 8 — see broadcast_to_owner.
+        let Some(shared_json) = serialize_for_broadcast(&msg) else { return };
+        let mut full: Vec<(u64, String)> = Vec::new();
+        let mut flush_candidates: Vec<u64> = Vec::new();
+        {
+            let clients = self.clients.read().unwrap();
+            for (&id, client) in clients.iter() {
+                // Only broadcast to clients that are authenticated AND have received InitialState
+                // This prevents duplicate messages when a client connects while data is streaming
+                if client.authenticated && client.received_initial_state {
+                    // Bounded channel (PROTOCOL-ROADMAP.md Step 3) — see broadcast_to_owner.
+                    match client.tx.try_send(Outbound::Shared(shared_json.clone())) {
+                        Ok(()) => {
+                            if let Some(wi) = world_index {
+                                if client.needs_resync.contains(&wi) {
+                                    flush_candidates.push(id);
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => full.push((id, client.ip_address.clone())),
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                }
             }
         }
+        for (id, ip) in &full {
+            crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+                &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
+                    id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
+        }
+        let full_ids: Vec<u64> = full.into_iter().map(|(id, _)| id).collect();
+        reconcile_resync(&self.clients, world_index, &full_ids, &flush_candidates);
     }
 
     /// Mark a client as having received its InitialState
@@ -929,11 +1202,32 @@ impl WebSocketServer {
         }
     }
 
-    /// Send a message to a specific client
+    /// Send a message to a specific client. Single-recipient by construction, so this
+    /// always carries `Outbound::Message` (PROTOCOL-ROADMAP.md Step 8) — there is no
+    /// second recipient to share a pre-serialized `Shared` payload with.
     pub fn send_to_client(&self, client_id: u64, msg: WsMessage) {
-        let clients = self.clients.read().unwrap();
-        if let Some(client) = clients.get(&client_id) {
-            let _ = client.tx.send(msg);
+        let world_index = message_world_index(&msg);
+        let outcome = {
+            let clients = self.clients.read().unwrap();
+            clients.get(&client_id).map(|client| {
+                let was_flagged = world_index.map(|wi| client.needs_resync.contains(&wi)).unwrap_or(false);
+                (client.tx.try_send(Outbound::Message(Box::new(msg))), client.ip_address.clone(), was_flagged)
+            })
+        };
+        let Some((result, ip, was_flagged)) = outcome else { return };
+        match result {
+            Ok(()) => {
+                if was_flagged {
+                    reconcile_resync(&self.clients, world_index, &[], &[client_id]);
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                crate::http::log_remote_event("WS-CHANNEL-FULL", &ip,
+                    &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
+                        client_id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
+                reconcile_resync(&self.clients, world_index, &[client_id], &[]);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
@@ -943,8 +1237,35 @@ impl WebSocketServer {
     pub fn send_initial_state_and_mark(&self, client_id: u64, msg: WsMessage) {
         let mut guard = self.clients.write().unwrap();
         if let Some(client) = guard.get_mut(&client_id) {
-            let _ = client.tx.send(msg);
+            // InitialState carries no single world_index to target a resync at (it's the
+            // whole-session bootstrap, not a per-world stream), so a `Full` here just gets
+            // logged — nothing better to do than let the client hit its auth/keepalive
+            // timeout and reconnect, at which point it gets a fresh InitialState anyway.
+            // Single-recipient send, so Outbound::Message (PROTOCOL-ROADMAP.md Step 8).
+            if let Err(mpsc::error::TrySendError::Full(_)) = client.tx.try_send(Outbound::Message(Box::new(msg))) {
+                crate::http::log_remote_event("WS-CHANNEL-FULL", &client.ip_address,
+                    &format!("client={} InitialState dropped - outbound channel full (capacity {})",
+                        client_id, WS_CLIENT_CHANNEL_CAPACITY));
+            }
             client.received_initial_state = true;
+        }
+    }
+
+    /// Record (or seed) a client's per-world delivery ack (PROTOCOL-ROADMAP.md Step 2).
+    /// Called from the `PongCheck.acked` handler on every liveness reply, and once from
+    /// the `AuthRequest.resume` handler on (re)connect so a client that resumes and then
+    /// reconnects again immediately isn't re-sent lines it already proved it has. Keeps
+    /// the max seen per world so a stale/out-of-order ack can never move the tracked
+    /// position backwards.
+    pub fn record_acked_seq(&self, client_id: u64, acked: &[(usize, u64)]) {
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            for &(world_index, seq) in acked {
+                let entry = client.acked_seq.entry(world_index).or_insert(0);
+                if seq > *entry {
+                    *entry = seq;
+                }
+            }
         }
     }
 
@@ -1024,17 +1345,52 @@ impl WebSocketServer {
             .collect()
     }
 
-    /// Broadcast a message to all authenticated clients (they filter by world_index client-side)
-    /// This avoids race conditions where client switches world but server hasn't processed the update yet.
+    /// Broadcast a message to all authenticated clients (they filter by world_index client-side).
+    ///
+    /// This is deliberate, not merely unimplemented (PROTOCOL-ROADMAP.md Step 9 investigated
+    /// filtering this to `client.current_world == world_index` and rejected it): every connected
+    /// client — every browser tab, the GUI, Android — maintains a full local buffer for *every*
+    /// world simultaneously, not just the one currently focused (see `app.js`'s `ServerData`
+    /// handler, which indexes `worlds[msg.world_index]` unconditionally). That's what makes
+    /// switching tabs instant and keeps unseen-line badges live for background worlds. Filtering
+    /// server-side by "currently viewed" would silently starve every world a client isn't actively
+    /// looking at, which is a regression, not a bandwidth optimization. It also avoids race
+    /// conditions where a client switches world locally before the server has processed the
+    /// corresponding `SwitchWorld`/`UpdateViewState`.
     /// Uses a single blocking lock acquisition (not try_read+spawn-fallback) so broadcasts to the
     /// same world are never reordered relative to one another (see D-Termux-lines investigation).
     pub fn broadcast_to_world_viewers(&self, _world_index: usize, msg: WsMessage) {
-        let clients = self.clients.read().unwrap();
-        for client in clients.values() {
-            if client.authenticated && client.received_initial_state {
-                let _ = client.tx.send(msg.clone());
+        let world_index = message_world_index(&msg);
+        // PROTOCOL-ROADMAP.md Step 8 — see broadcast_to_owner.
+        let Some(shared_json) = serialize_for_broadcast(&msg) else { return };
+        let mut full: Vec<(u64, String)> = Vec::new();
+        let mut flush_candidates: Vec<u64> = Vec::new();
+        {
+            let clients = self.clients.read().unwrap();
+            for (&id, client) in clients.iter() {
+                if client.authenticated && client.received_initial_state {
+                    // Bounded channel (PROTOCOL-ROADMAP.md Step 3) — see broadcast_to_owner.
+                    match client.tx.try_send(Outbound::Shared(shared_json.clone())) {
+                        Ok(()) => {
+                            if let Some(wi) = world_index {
+                                if client.needs_resync.contains(&wi) {
+                                    flush_candidates.push(id);
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => full.push((id, client.ip_address.clone())),
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                }
             }
         }
+        for (id, ip) in &full {
+            crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+                &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
+                    id, world_index, WS_CLIENT_CHANNEL_CAPACITY));
+        }
+        let full_ids: Vec<u64> = full.into_iter().map(|(id, _)| id).collect();
+        reconcile_resync(&self.clients, world_index, &full_ids, &flush_candidates);
     }
 
     /// Configure TLS for WSS support
@@ -1554,8 +1910,9 @@ where
     };
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
-    // Create channel for sending messages to this client
-    let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+    // Create channel for sending messages to this client. Bounded (PROTOCOL-ROADMAP.md
+    // Step 3) — see WS_CLIENT_CHANNEL_CAPACITY for sizing rationale.
+    let (tx, mut rx) = mpsc::channel::<Outbound>(WS_CLIENT_CHANNEL_CAPACITY);
 
     // Generate random challenge for challenge-response auth. Fail closed: an all-zero
     // (or otherwise predictable) challenge would let an attacker who knows a user's
@@ -1571,7 +1928,7 @@ where
     };
 
     // Send ServerHello immediately to tell client about multiuser mode
-    let _ = tx.send(WsMessage::ServerHello { multiuser_mode, challenge: challenge.clone() });
+    try_send_local(&clients, client_id, &tx, &client_ip, WsMessage::ServerHello { multiuser_mode, challenge: challenge.clone() });
 
     // Add client to clients map (auto-authenticated if whitelisted)
     {
@@ -1588,6 +1945,8 @@ where
             connected_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),
             paused: false,
+            acked_seq: std::collections::HashMap::new(),
+            needs_resync: std::collections::HashSet::new(),
         });
     }
 
@@ -1606,9 +1965,9 @@ where
             username: None,
             multiuser_mode,
         };
-        let _ = tx.send(response);
+        try_send_local(&clients, client_id, &tx, &client_ip, response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new() }))).await;
     }
 
     // Combined receive/send/keepalive loop.
@@ -1648,9 +2007,47 @@ where
         };
 
         tokio::select! {
-            Some(msg) = rx.recv() => {
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let msg_len = json.len();
+            Some(outbound) = rx.recv() => {
+                // PROTOCOL-ROADMAP.md Step 8: `Outbound::Shared` carries JSON that was
+                // already successfully serialized once, up front, by whichever broadcast
+                // call site produced it (see `serialize_for_broadcast`) - so there is no
+                // serialization step (and no WS-SERIALIZE-FAIL path) here for it, unlike
+                // the `Message` arm below which still serializes individually exactly as
+                // every send did before this step.
+                let send_outcome: Result<(String, usize), ()> = match outbound {
+                    Outbound::Shared(json) => {
+                        let msg_len = json.len();
+                        Ok((json.to_string(), msg_len))
+                    }
+                    Outbound::Message(msg) => {
+                        match serde_json::to_string(&msg) {
+                            Ok(json) => {
+                                let msg_len = json.len();
+                                Ok((json, msg_len))
+                            }
+                            Err(e) => {
+                                // PROTOCOL-ROADMAP.md Step 4: was previously silent - a serialization
+                                // failure here (e.g. a NaN/Infinity float slipping into a settings
+                                // message) vanished with zero trace, right after successfully being
+                                // dequeued, as if the message had been delivered. Log which message
+                                // *variant* failed (never the full Debug dump - some variants, e.g.
+                                // UpdateWorldSettings/AuthRequest, carry a plaintext password field
+                                // per CLAUDE.md's password-handling rule, so only the part of the
+                                // Debug output before the first field list is kept). The message is
+                                // dropped (not retried - a value that can't serialize now won't
+                                // serialize later) but the connection stays up.
+                                let debug_str = format!("{:?}", msg);
+                                let variant = debug_str.split(['{', '(']).next().unwrap_or(&debug_str).trim();
+                                crate::http::log_remote_event("WS-SERIALIZE-FAIL", &client_ip,
+                                    &format!("variant={}: {}", variant, e));
+                                debug_log(true, &format!(
+                                    "WS-SERIALIZE-FAIL: client={} variant={}: {}", client_ip, variant, e));
+                                Err(())
+                            }
+                        }
+                    }
+                };
+                if let Ok((json, msg_len)) = send_outcome {
                     if let Err(e) = ws_sink.send(WsRawMessage::Text(json)).await {
                         // Was previously silent - a send failure here (e.g. exceeding
                         // ws_config's max_message_size above) killed the connection right
@@ -1660,6 +2057,20 @@ where
                         debug_log(is_debug_enabled(), &format!(
                             "WS-SEND-FAIL: client={} {} bytes: {}", client_ip, msg_len, e));
                         break;
+                    }
+                    // PROTOCOL-ROADMAP.md Step 3: draining `outbound` out of `rx` just freed
+                    // a slot in this client's channel. If an earlier broadcast overflowed it
+                    // and left a `ResyncRequired` undelivered (`needs_resync`), this is
+                    // exactly the moment - right after a successful send, from the same
+                    // task that owns and drains this channel - to retry it, without any
+                    // risk of the lock-nesting/deadlock that ruled out doing this from
+                    // inside the sync fan-out functions themselves.
+                    let pending_worlds: Vec<usize> = {
+                        let guard = clients.read().unwrap();
+                        guard.get(&client_id).map(|c| c.needs_resync.iter().copied().collect()).unwrap_or_default()
+                    };
+                    for wi in pending_worlds {
+                        reconcile_resync(&clients, Some(wi), &[], &[client_id]);
                     }
                 }
             }
@@ -1688,7 +2099,7 @@ where
                             if !password_enabled {
                                 crate::http::log_remote_event("WS-REJECT", &client_ip,
                                     "no password configured, auth key required");
-                                let _ = tx.send(WsMessage::AuthResponse {
+                                try_send_local(&clients, client_id, &tx, &client_ip, WsMessage::AuthResponse {
                                     success: false,
                                     error: Some("Password auth not available. Use an auth key.".to_string()),
                                     username: None,
@@ -1715,7 +2126,7 @@ where
                                 if !knocked {
                                     ban_list.record_violation(&client_ip, "WebSocket: not in allow list");
                                 }
-                                let _ = tx.send(WsMessage::AuthResponse {
+                                try_send_local(&clients, client_id, &tx, &client_ip, WsMessage::AuthResponse {
                                     success: false,
                                     error: Some("Not authorized from this address".to_string()),
                                     username: None,
@@ -1809,7 +2220,7 @@ where
                                 username: auth_username,
                                 multiuser_mode,
                             };
-                            let _ = tx.send(response);
+                            try_send_local(&clients, client_id, &tx, &client_ip, response);
 
                             if auth_success {
                                 // Extract request_key before moving ws_msg
@@ -1825,7 +2236,7 @@ where
                             }
                         }
                         WsMessage::Ping => {
-                            let _ = tx.send(WsMessage::Pong);
+                            try_send_local(&clients, client_id, &tx, &client_ip, WsMessage::Pong);
                         }
                         _ => {
                             // Check if authenticated before processing other messages

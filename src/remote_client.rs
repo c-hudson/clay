@@ -176,6 +176,9 @@ pub(crate) async fn run_grep_client(
     // Authenticate with challenge-response
     let password_hash = hash_password(&password);
     let challenge_hash = hash_with_challenge(&password_hash, &server_challenge);
+    // `resume` is intentionally empty: this process holds no prior per-world seq state at
+    // this point (it's a one-shot invocation, not a reconnect - there is no persisted
+    // client-side state to resume from). See PROTOCOL-ROADMAP.md Step 6.
     let _ = ws_tx.send(WsMessage::AuthRequest {
         password_hash: challenge_hash,
         username: None,
@@ -183,6 +186,7 @@ pub(crate) async fn run_grep_client(
         auth_key: None,
         request_key: false,
         challenge_response: true,
+        resume: Vec::new(),
     });
 
     // Wait for auth response
@@ -303,7 +307,12 @@ pub(crate) async fn run_grep_client(
                                     let _ = ws_tx.send(WsMessage::Pong);
                                 }
                                 Ok(WsMessage::PingCheck { nonce }) => {
-                                    let _ = ws_tx.send(WsMessage::PongCheck { nonce });
+                                    // `acked` stays empty: --grep --follow never buffers or
+                                    // tracks per-world seq state (it prints matches as an
+                                    // ephemeral stream and keeps nothing to resume), so there is
+                                    // no contiguous-seq boundary to report. See PROTOCOL-ROADMAP.md
+                                    // Step 6.
+                                    let _ = ws_tx.send(WsMessage::PongCheck { nonce, acked: Vec::new() });
                                 }
                                 _ => {}
                             }
@@ -331,25 +340,37 @@ pub(crate) async fn run_grep_client(
             .map(|w| (w.index, w.name.clone()))
             .collect();
 
-        // Request scrollback for each world
-        for &(world_index, _) in &search_worlds {
-            let _ = ws_tx.send(WsMessage::RequestScrollback {
-                world_index,
-                count: 10000,
-                before_seq: None,
-                after_seq: None,
-            });
-        }
-
         // Collect all lines per world: scrollback + initial state lines
         let mut world_lines: std::collections::HashMap<usize, Vec<TimestampedLine>> = std::collections::HashMap::new();
         let mut pending_worlds: std::collections::HashSet<usize> = search_worlds.iter().map(|&(idx, _)| idx).collect();
 
-        // Pre-populate with initial state lines
+        // Pre-populate with initial state lines (InitialState already gave us the most
+        // recent `remote_initial_lines` lines per world, so scrollback below only needs
+        // to fetch older history than that).
         for w in &worlds {
             if matches_world(w.index) {
                 world_lines.insert(w.index, w.output_lines_ts.clone());
             }
+        }
+
+        // Request scrollback for each world, anchored just before whatever InitialState
+        // already gave us. Anchoring here (rather than `before_seq: None`, which would ask
+        // the server for its own most-recent lines - the same range InitialState already
+        // covered) means this and every follow-up request below only ever fetch strictly
+        // older, non-overlapping ranges. Combined with the guaranteed in-order, unreordered
+        // delivery of a direct tokio_tungstenite connection (PROTOCOL-ROADMAP.md Step 6),
+        // that removes the need to sort+dedup by seq afterward: nothing overlapping or
+        // out-of-order is ever received in the first place.
+        for &(world_index, _) in &search_worlds {
+            let before_seq = world_lines.get(&world_index)
+                .and_then(|lines| lines.iter().map(|l| l.seq).min())
+                .filter(|&s| s > 0);
+            let _ = ws_tx.send(WsMessage::RequestScrollback {
+                world_index,
+                count: 10000,
+                before_seq,
+                after_seq: None,
+            });
         }
 
         // Receive scrollback responses
@@ -383,7 +404,13 @@ pub(crate) async fn run_grep_client(
                             let _ = ws_tx.send(WsMessage::Pong);
                         }
                         Ok(WsMessage::PingCheck { nonce }) => {
-                            let _ = ws_tx.send(WsMessage::PongCheck { nonce });
+                            // `acked` stays empty: this is the one-shot history-search fetch
+                            // loop (connect, backfill everything, print, exit) - by the time
+                            // any PingCheck could arrive we're either still actively backfilling
+                            // (no stable "caught up to N" boundary worth reporting) or about to
+                            // disconnect, and there's no reconnect path here to benefit from a
+                            // resume anchor. See PROTOCOL-ROADMAP.md Step 6.
+                            let _ = ws_tx.send(WsMessage::PongCheck { nonce, acked: Vec::new() });
                         }
                         _ => {}
                     }
@@ -395,11 +422,11 @@ pub(crate) async fn run_grep_client(
             }
         }
 
-        // Deduplicate by seq within each world and sort
-        for lines in world_lines.values_mut() {
-            lines.sort_by_key(|l| l.seq);
-            lines.dedup_by_key(|l| l.seq);
-        }
+        // No per-world sort+dedup needed here (PROTOCOL-ROADMAP.md Step 6): each world's
+        // `lines` is the InitialState seed followed by zero or more strictly-older,
+        // non-overlapping before_seq batches (see the request loop above), each already
+        // seq-ascending as sent by the server and prepended in oldest-first request order -
+        // so the accumulated Vec is already fully sorted with no duplicates.
 
         // Collect all lines across worlds, sort by timestamp then seq
         let mut all_lines: Vec<(usize, &TimestampedLine)> = Vec::new();
@@ -552,6 +579,9 @@ pub(crate) async fn run_import_client(
     // server's own routing in websocket.rs (checks `auth_key.is_some()` first). The stored
     // auth-key is never sent in the clear — only its challenge-response hash — mirroring
     // `handle_ws_auth_key_validation`'s `hash_with_challenge(&ak.key, challenge) == key` check.
+    // `resume` is empty in both branches below: this client never touches world/scrollback
+    // state at all (it only fetches settings/theme/keybindings for /import), so there is
+    // nothing to resume.
     let auth_request = if let Some(key) = auth_key {
         WsMessage::AuthRequest {
             password_hash: String::new(),
@@ -560,6 +590,7 @@ pub(crate) async fn run_import_client(
             auth_key: Some(hash_with_challenge(key, &server_challenge)),
             request_key: false,
             challenge_response: true,
+            resume: Vec::new(),
         }
     } else {
         let password_hash = hash_password(password.unwrap_or_default());
@@ -570,6 +601,7 @@ pub(crate) async fn run_import_client(
             auth_key: None,
             request_key: false,
             challenge_response: true,
+            resume: Vec::new(),
         }
     };
     let _ = ws_tx.send(auth_request);
@@ -869,7 +901,16 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             // Send authentication with challenge-response
                             let password_hash = hash_password(&password);
                             let challenge_hash = hash_with_challenge(&password_hash, &server_challenge);
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username, current_world: None, auth_key: None, request_key: false, challenge_response: true });
+                            // `resume` is empty here: `App` (and every `World`'s max_received_seq)
+                            // isn't created until after auth succeeds (see `App::new()` below), and
+                            // this whole function is a single connection attempt with no in-process
+                            // reconnect loop - a dropped connection ends the process rather than
+                            // looping back to resend AuthRequest, so there is never prior per-world
+                            // state available to resume from at this call site. Live gap recovery
+                            // for a connection that stays up is handled separately via
+                            // `ResyncRequired` in `App::handle_remote_ws_message` (PROTOCOL-ROADMAP.md
+                            // Step 6).
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username, current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new() });
                             break;
                         }
                         KeyCode::Char(c) => {

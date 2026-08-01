@@ -1192,10 +1192,18 @@ pub(crate) fn spawn_remote_ping_check(
                     paused: client.paused,
                 });
             }
-            // Send PingCheck to each authenticated client
+            // Send PingCheck to each authenticated client. Bounded channel (PROTOCOL-
+            // ROADMAP.md Step 3) — try_send; a full channel just gets logged (PingCheck
+            // carries no world_index, so there's no resync target to flag). Sent as
+            // `Outbound::Message` (PROTOCOL-ROADMAP.md Step 8) rather than a pre-shared
+            // JSON blob: this is a rare, admin-triggered `/l` fan-out (not a hot broadcast
+            // path), so it keeps the simpler per-client form used before this step.
             for (&id, client) in &sorted {
-                let _ = client.tx.send(WsMessage::PingCheck { nonce });
-                let _ = id;
+                if let Err(mpsc::error::TrySendError::Full(_)) = client.tx.try_send(crate::websocket::Outbound::Message(Box::new(WsMessage::PingCheck { nonce }))) {
+                    crate::http::log_remote_event("WS-CHANNEL-FULL", &client.ip_address,
+                        &format!("client={} PingCheck dropped - outbound channel full (capacity {})",
+                            id, crate::websocket::WS_CLIENT_CHANNEL_CAPACITY));
+                }
             }
         }
     }

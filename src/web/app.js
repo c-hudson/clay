@@ -52,7 +52,9 @@
     // The server used to be able to deliver two ServerData batches for the same world
     // out of order under lock contention (fixed server-side too, see
     // WsServer::broadcast_to_world_viewers), and the WebView->Java->JS bridge on Android
-    // (evaluateJavascript, fire-and-forget) can still reorder frames on its own. The old
+    // (evaluateJavascript, fire-and-forget) can still reorder frames on its own — that
+    // bridge fix is tracked separately as PROTOCOL-ROADMAP.md Step 7 and has NOT shipped
+    // yet, so this live mid-stream compensation must stay in place until it does. The old
     // dedup check here treated ANY batch whose seq was <= world._max_seq as a full
     // duplicate and silently dropped it — which is correct for a genuine resync replay,
     // but wrong for a batch that arrived late: that batch's lines were never actually
@@ -64,7 +66,17 @@
     // when a batch skips ahead of the expected next seq). A later low-seq batch is only
     // treated as a genuine duplicate if it does NOT overlap a recorded gap; otherwise it's
     // accepted and spliced into output_lines in seq order instead of being dropped.
-    const MAX_TRACKED_SEQ_GAPS = 50;
+    //
+    // PROTOCOL-ROADMAP.md Step 5: _seqGaps is now also the source of truth for
+    // lastContiguousSeq() below, which feeds AuthRequest.resume and PongCheck.acked. The
+    // old *reconnect*-time recovery (guessing what was lost across a disconnect from a
+    // capped/lossy record) is gone — resume+the server's exact scrollback replay replaced
+    // it. What remains here is purely the live mid-stream safety net for the still-open
+    // Android bridge risk; do not remove it before Step 7 lands. Because lastContiguousSeq
+    // now also feeds the reconnect contract, a gap that ages out of this bounded array
+    // (see MAX_TRACKED_SEQ_GAPS) would in theory also be invisible to resume/acked — kept
+    // generous below so that's a pathological-only corner case, not a practical one.
+    const MAX_TRACKED_SEQ_GAPS = 2000;
 
     function recordSeqGapIfAny(world, oldMax, newBatchStartSeq) {
         if (oldMax > 0 && newBatchStartSeq > oldMax + 1) {
@@ -90,6 +102,40 @@
         if (gap.start < filledStart) remaining.push({ start: gap.start, end: filledStart - 1 });
         if (gap.end > filledEnd) remaining.push({ start: filledEnd + 1, end: gap.end });
         world._seqGaps.splice(idx, 1, ...remaining);
+    }
+
+    // --- Resume/ack contract (PROTOCOL-ROADMAP.md Step 5) ----------------------------
+    // The reconnect and keepalive-ack contract needs the highest seq such that EVERY
+    // seq up to and including it has actually been received - not just the highest seq
+    // seen (world._max_seq), which can be past an unrecovered hole left by the live
+    // mid-stream reordering compensation above (see world._seqGaps). Sending _max_seq
+    // as-is would tell the server "I have everything up to here", permanently hiding
+    // that hole from the exact resume replay this step exists to provide. If there are
+    // open gaps, the true contiguous boundary is one below the earliest of them.
+    function lastContiguousSeq(world) {
+        if (!world) return 0;
+        if (world._seqGaps && world._seqGaps.length > 0) {
+            let minGapStart = Infinity;
+            for (const g of world._seqGaps) {
+                if (g.start < minGapStart) minGapStart = g.start;
+            }
+            return Math.max(0, minGapStart - 1);
+        }
+        return world._max_seq || 0;
+    }
+
+    // Builds the (world_index, last_contiguous_seq) list shared by AuthRequest.resume
+    // (sent on connect/reconnect) and PongCheck.acked (sent periodically on the
+    // keepalive cycle) - same shape, same semantics, see websocket.rs. Only worlds with
+    // real received history are included; a world with nothing yet has nothing to
+    // resume/ack.
+    function buildResumeAckList() {
+        const list = [];
+        worlds.forEach((world, idx) => {
+            const seq = lastContiguousSeq(world);
+            if (seq > 0) list.push([idx, seq]);
+        });
+        return list;
     }
 
     // Splice line objects (already carrying real .seq values) into world.output_lines at
@@ -1432,7 +1478,7 @@
         setTimeout(hideConnectionLog, 800);
 
         if (window.AUTO_PASSWORD) {
-            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false }));
+            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckList() }));
             return;
         }
 
@@ -1664,6 +1710,39 @@
                 handleMessage(msg);
             } catch (e) {
                 console.error('Failed to parse Base64 message:', e);
+            }
+        };
+
+        // PROTOCOL-ROADMAP.md Step 7: pull side of the ordered-queue Android bridge. Android's
+        // MainActivity.java no longer pushes each WebSocket frame through evaluateJavascript()
+        // (that was fire-and-forget and could execute out of order under load, even though the
+        // underlying OkHttp WebSocket delivers frames in order) - it now just calls this as a
+        // content-free "go pull" signal once per enqueued message, and we synchronously drain
+        // window.Android.drainWsQueue(), a direct @JavascriptInterface method call (no
+        // WebView-internal async dispatch, so no reordering risk) that atomically returns every
+        // message queued since the last drain as a JSON array of [id, message] pairs, oldest
+        // first. Processed through the exact same handleMessage() path as every other transport,
+        // in order, synchronously - ordering is now structurally guaranteed rather than
+        // compensated for after the fact. No base64 involved: drainWsQueue() returns raw JSON
+        // text directly, since evaluateJavascript is no longer used to carry the payload.
+        window.onNativeWsQueueReady = function() {
+            if (!window.Android || typeof window.Android.drainWsQueue !== 'function') return;
+            let batch;
+            try {
+                batch = JSON.parse(window.Android.drainWsQueue());
+            } catch (e) {
+                console.error('Failed to parse native WS queue batch:', e);
+                return;
+            }
+            for (const pair of batch) {
+                const id = pair[0];
+                const data = pair[1];
+                if (id !== winnerAttemptId) continue;
+                try {
+                    handleMessage(JSON.parse(data));
+                } catch (e) {
+                    console.error('Failed to parse native WS queue message:', e);
+                }
             }
         };
 
@@ -2186,6 +2265,20 @@
                     // freshly-sent slice - startBackfill() uses this to gap-fill
                     // instead of doing a full backfill for this world.
                     world._hydratedFromLocal = !!(priorWorld || (cachedWorld && cachedWorld.lines && cachedWorld.lines.length > 0));
+                    // PROTOCOL-ROADMAP.md Step 5: was this world covered by the
+                    // AuthRequest.resume we just sent (see buildResumeAckList(), built
+                    // from the pre-reconnect `worlds` array priorWorldsByName also
+                    // captured, using the same stable indices)? Only the in-memory
+                    // reconnect case (priorWorld) qualifies - a cachedWorld hit (the
+                    // cross-session IndexedDB cache) has no server-assigned index until
+                    // this very InitialState arrives, so it structurally cannot have
+                    // been part of resume and still needs the client-driven
+                    // requestGapFill() fallback below. When true, the server is already
+                    // about to push exactly the missing lines unprompted as
+                    // ScrollbackLines - startBackfill() must not also request them
+                    // itself (redundant round trip), but does need _gapFillPending set
+                    // so that unprompted reply is handled as an append, not a prepend.
+                    world._resumedFromServer = !!(priorWorld && lastContiguousSeq(priorWorld) > 0);
                     if (priorWorld) {
                         // Reconnect: keep what we already had in memory - it's at
                         // least as complete as the fresh InitialState's front-loaded
@@ -2224,7 +2317,7 @@
                     // (server returned fewer lines than requested) - stops phase 2
                     // from re-queuing a world that has nothing left to give.
                     world._backfill_exhausted = false;
-                    world._gapFillPending = false;
+                    world._gapFillPending = world._resumedFromServer;
                     if (world.output_lines.length > 0) {
                         let minSeq = Infinity;
                         for (const line of world.output_lines) {
@@ -3083,8 +3176,11 @@
                 break;
 
             case 'PingCheck':
-                // Server liveness check for /remote command - respond immediately
-                send({ type: 'PongCheck', nonce: msg.nonce || 0 });
+                // Server liveness check for /remote command - respond immediately, and
+                // piggyback our current per-world ack (PROTOCOL-ROADMAP.md Step 5) so this
+                // reply also counts as a fresh ack even if the periodic keepalive ack
+                // (see the setInterval below) hasn't fired recently.
+                send({ type: 'PongCheck', nonce: msg.nonce || 0, acked: buildResumeAckList() });
                 break;
 
             case 'ActionsUpdated':
@@ -3334,6 +3430,20 @@
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].pending_count = msg.count || 0;
                     updateStatusBar();
+                }
+                break;
+
+            case 'ResyncRequired':
+                // Live-connection resync (PROTOCOL-ROADMAP.md Step 3/5): our outbound
+                // channel on the server overflowed and a ServerData batch for this world
+                // may have been dropped before ever reaching us - distinct from the
+                // reconnect path (AuthRequest.resume) above, this fires on an otherwise
+                // healthy, still-open connection. Pull exactly what was missed via the
+                // same gap-fill machinery reconnect uses (RequestScrollback/
+                // ScrollbackLines, see requestGapFill()/ScrollbackLines handler below)
+                // rather than duplicating that logic here.
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    requestGapFill(msg.world_index, msg.from_seq);
                 }
                 break;
 
@@ -3592,8 +3702,15 @@
         // it with real lines - those are the newest lines, not a local buffer to
         // extend, so requesting an "everything since" gap-fill for it would be a
         // wasted round trip (the server has nothing newer to send).
+        //
+        // PROTOCOL-ROADMAP.md Step 5: skip the explicit requestGapFill() call for a
+        // world the server is already resuming unprompted (_resumedFromServer, set in
+        // the InitialState handler from the AuthRequest.resume we sent on connect) -
+        // asking again here would just be a redundant round trip for the exact same
+        // range. Only the cache-hydrated case (no resume coverage possible - see
+        // _resumedFromServer's comment above) still needs this client-driven request.
         worlds.forEach((world, idx) => {
-            if (world._hydratedFromLocal && world._max_seq) {
+            if (world._hydratedFromLocal && world._max_seq && !world._resumedFromServer) {
                 requestGapFill(idx);
             }
         });
@@ -3903,14 +4020,20 @@
         }, WORLD_CACHE_SAVE_DEBOUNCE_MS);
     }
 
-    // Issue a gap-fill request for a world that already has a buffer (from
-    // memory or the persistent cache), asking only for lines newer than its
-    // highest known seq. Falls back to a normal backfill if the world has
-    // nothing to gap-fill from.
-    function requestGapFill(worldIndex) {
+    // Issue a gap-fill request for a world that already has a buffer (from memory or
+    // the persistent cache), asking only for lines newer than `fromSeq` (defaults to
+    // its highest known seq - the reconnect/continuation case). Falls back to a normal
+    // backfill if no anchor is available at all. `fromSeq` is passed explicitly by the
+    // ResyncRequired handler (PROTOCOL-ROADMAP.md Step 5), which has a server-supplied
+    // seq to resync from that may differ from our own (possibly stale) world._max_seq -
+    // 0 is a legitimate explicit value there (client hasn't acked anything yet for that
+    // world), so it's distinguished from "no argument" rather than treated as falsy.
+    function requestGapFill(worldIndex, fromSeq) {
         const world = worlds[worldIndex];
         if (!world) return;
-        if (!world._max_seq) {
+        const hasExplicitFromSeq = (fromSeq !== undefined && fromSeq !== null);
+        const seq = hasExplicitFromSeq ? fromSeq : world._max_seq;
+        if (!hasExplicitFromSeq && !seq) {
             queueNormalBackfill(worldIndex);
             return;
         }
@@ -3919,7 +4042,7 @@
             type: 'RequestScrollback',
             world_index: worldIndex,
             count: BACKFILL_PHASE2_CHUNK_SIZE,
-            after_seq: world._max_seq
+            after_seq: seq
         });
     }
 
@@ -3960,7 +4083,8 @@
             password_hash: '',  // Empty - using key instead
             auth_key: keyValue,
             challenge_response: usesChallenge,
-            request_key: false
+            request_key: false,
+            resume: buildResumeAckList()
         };
         if (currentWorldIndex !== undefined) {
             msg.current_world = currentWorldIndex;
@@ -4029,7 +4153,7 @@
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
             const challengeHash = serverChallenge ? await hashPassword(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckList() };
             if (username) {
                 msg.username = username;
             }
@@ -4042,7 +4166,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             const challengeHash = serverChallenge ? sha256Fallback(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckList() };
             if (username) {
                 msg.username = username;
             }
@@ -6038,6 +6162,27 @@
                     }
                 }
                 continue;
+            }
+
+            // Skip Discord custom emoji tags entirely (<:name:id> or <a:name:id>) - without
+            // this, a run of text isn't allowed to reset at the tag's own '<'/'>' (neither is
+            // a break char or whitespace), so two adjacent tags with no space between them
+            // (or even one long-named tag on its own) get counted as one long "word". Once
+            // that word crosses MIN_WORD_LEN, the next '_' encountered - which is very likely
+            // to be inside the emoji name itself, since underscores are common there - gets a
+            // ZWSP inserted right after it. That silently corrupts the tag's name and makes
+            // convertDiscordEmojis's `[A-Za-z0-9_]+` regex fail to match it, leaving a broken
+            // custom emoji rendered as literal (and now ZWSP-corrupted) text instead of the
+            // image. Treating the whole tag as atomic - like the ANSI skip above - fixes this
+            // regardless of tag length or adjacency to other tags.
+            if (c === '<') {
+                const tagMatch = /^<a?:[A-Za-z0-9_]+:\d+>/.exec(text.slice(i - 1));
+                if (tagMatch) {
+                    const rest = tagMatch[0].slice(1); // '<' already appended above
+                    result += rest;
+                    i += rest.length;
+                    continue;
+                }
             }
 
             if (/\s/.test(c)) {
@@ -10826,10 +10971,18 @@
             };
         }
 
-        // Keepalive ping every 30 seconds
+        // Keepalive ping every 30 seconds. Also piggybacks a PongCheck carrying our
+        // current per-world ack (PROTOCOL-ROADMAP.md Step 5) so the server's acked_seq
+        // (used to target ResyncRequired.from_seq on a channel-overflow resync, see
+        // websocket.rs reconcile_resync) stays current between reconnects rather than
+        // only being refreshed on an explicit /remote PingCheck. PongCheck is handled by
+        // the server unconditionally (it doesn't require a matching PingCheck nonce to
+        // land - see WsMessage::PongCheck handling in main.rs/daemon.rs), so sending it
+        // proactively here is safe.
         setInterval(function() {
             if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
                 send({ type: 'Ping' });
+                send({ type: 'PongCheck', nonce: 0, acked: buildResumeAckList() });
             }
         }, 30000);
 

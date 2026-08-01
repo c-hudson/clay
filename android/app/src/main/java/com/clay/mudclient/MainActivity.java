@@ -156,6 +156,33 @@ public class MainActivity extends AppCompatActivity {
     private Runnable backgroundShutdownRunnable;
     private final java.util.concurrent.ConcurrentHashMap<Integer, NativeWebSocket> nativeWebSockets =
         new java.util.concurrent.ConcurrentHashMap<>();
+    // PROTOCOL-ROADMAP.md Step 7: ordered-queue pull model replacing the old
+    // base64-through-evaluateJavascript push-per-message relay. Each received text frame is
+    // appended here (FIFO, thread-safe) instead of being carried as data inside an
+    // evaluateJavascript() call — evaluateJavascript is documented as NOT guaranteeing that
+    // back-to-back calls execute, in the WebView's JS engine, in the order they were issued,
+    // which could reorder MUD output under load even though the OkHttp WebSocket itself
+    // (NativeWebSocket.java) delivers frames in order. Now evaluateJavascript is used only to
+    // send a content-free "go pull" signal (onNativeWsQueueReady); the JS side retrieves the
+    // actual data via the synchronous drainWsQueue() @JavascriptInterface call below, which is
+    // a direct Java method invocation from JS (not a fire-and-forget WebView-internal post) and
+    // therefore has no reordering race. This also drops the ~33% base64 size inflation on this
+    // hot path, since drainWsQueue() returns raw JSON text.
+    private final java.util.concurrent.ConcurrentLinkedQueue<WsQueueItem> wsMessageQueue =
+        new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+    /** One queued native WebSocket text frame awaiting pickup by drainWsQueue(). Carries the
+     *  connection id alongside the message (mirroring the old per-message callback's (id, data)
+     *  pair) so JS can keep discarding messages from a non-winning racing connection attempt,
+     *  exactly as it already does for onNativeWebSocketMessageBase64. */
+    private static final class WsQueueItem {
+        final int id;
+        final String message;
+        WsQueueItem(int id, String message) {
+            this.id = id;
+            this.message = message;
+        }
+    }
     private Handler heartbeatHandler;
     private Runnable heartbeatRunnable;
     private int missedHeartbeats = 0;
@@ -514,16 +541,20 @@ public class MainActivity extends AppCompatActivity {
 
                     @Override
                     public void onMessage(String message) {
-                        runOnUiThread(() -> {
-                            String base64 = android.util.Base64.encodeToString(
-                                message.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                                android.util.Base64.NO_WRAP
-                            );
-                            webView.evaluateJavascript(
-                                "if (typeof onNativeWebSocketMessageBase64 === 'function') onNativeWebSocketMessageBase64(" + id + ", \"" + base64 + "\");",
-                                null
-                            );
-                        });
+                        // PROTOCOL-ROADMAP.md Step 7: enqueue, then send a content-free
+                        // "go pull" signal instead of pushing the message itself through
+                        // evaluateJavascript(). See the wsMessageQueue field doc comment for
+                        // why: back-to-back evaluateJavascript calls carrying data can execute
+                        // out of order inside the WebView, which used to be able to reorder MUD
+                        // output under load. The signal call below never carries data, so even
+                        // if two signal calls themselves got coalesced/reordered, the next
+                        // drainWsQueue() still drains the FIFO queue in the exact order frames
+                        // were received.
+                        wsMessageQueue.add(new WsQueueItem(id, message));
+                        webView.post(() -> webView.evaluateJavascript(
+                            "if (typeof onNativeWsQueueReady === 'function') onNativeWsQueueReady();",
+                            null
+                        ));
                     }
 
                     @Override
@@ -620,6 +651,30 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public boolean hasNativeWebSocket() {
             return true;
+        }
+
+        // PROTOCOL-ROADMAP.md Step 7: pull side of the ordered-queue relay. Called by JS in
+        // response to the onNativeWsQueueReady() "go pull" signal (see wsMessageQueue's doc
+        // comment above and the onMessage() override in connectWebSocket()). Atomically drains
+        // every message queued since the last drain and returns them as a JSON array of
+        // [id, message] pairs, oldest first — a burst of N queued frames costs one JS<->Java
+        // round trip instead of N evaluateJavascript calls, and ordering is now structurally
+        // guaranteed by draining a single FIFO queue via a synchronous method call rather than
+        // relying on evaluateJavascript's execution order. `message` is the raw JSON text
+        // received from the WebSocket verbatim - no base64 needed on this path, since
+        // evaluateJavascript is no longer used to carry the payload (org.json.JSONArray/
+        // JSONObject handles all string escaping for safe embedding in the returned JSON text).
+        @JavascriptInterface
+        public String drainWsQueue() {
+            org.json.JSONArray batch = new org.json.JSONArray();
+            WsQueueItem item;
+            while ((item = wsMessageQueue.poll()) != null) {
+                org.json.JSONArray pair = new org.json.JSONArray();
+                pair.put(item.id);
+                pair.put(item.message);
+                batch.put(pair);
+            }
+            return batch.toString();
         }
 
         // Called by app.js's connect() before every SSH-mode WS dial (see window.SSH_MODE,

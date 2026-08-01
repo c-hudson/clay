@@ -335,10 +335,26 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         // Check if this is an AuthRequest (client just authenticated)
-                        if matches!(*msg, WsMessage::AuthRequest { .. }) {
+                        if let WsMessage::AuthRequest { ref resume, .. } = *msg {
                             // Send initial state after successful authentication
                             let initial_state = app.build_initial_state();
                             app.ws_send_initial_state_and_mark(client_id, initial_state);
+                            // Resume-driven replay (PROTOCOL-ROADMAP.md Step 2): reuse the
+                            // exact same gap-fill logic RequestScrollback{after_seq} already
+                            // uses, once per named world, instead of waiting for the client
+                            // to notice and ask for it. Mirrors main.rs's
+                            // handle_ws_auth_initial_state for the master-WS path.
+                            if !resume.is_empty() {
+                                if let Some(ref server) = app.ws_server {
+                                    server.record_acked_seq(client_id, resume);
+                                }
+                                // Mirrors the in-memory scrollback ring's cap (MAX_LINES,
+                                // main.rs) so a single replay always covers the entire ring.
+                                const RESUME_REPLAY_MAX: usize = 10_000;
+                                for &(world_index, last_seq) in resume {
+                                    app.handle_request_scrollback(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq));
+                                }
+                            }
                         } else {
                             handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
@@ -1717,12 +1733,19 @@ pub async fn handle_daemon_ws_message(
         // Was entirely absent from this handler (T40) - a /remote liveness check
         // (spawn_remote_ping_check) against a daemon-attached client would always time out,
         // since the client's PongCheck reply had nowhere to land.
-        WsMessage::PongCheck { nonce } => {
+        WsMessage::PongCheck { nonce, acked } => {
             if nonce == app.remote_ping_nonce {
                 if let Some(ref responses) = app.remote_ping_responses {
                     if let Ok(mut set) = responses.lock() {
                         set.insert(client_id);
                     }
+                }
+            }
+            // Record the client's per-world delivery ack (PROTOCOL-ROADMAP.md Step 2) so a
+            // future resume/backpressure path knows how caught-up it already is.
+            if !acked.is_empty() {
+                if let Some(ref server) = app.ws_server {
+                    server.record_acked_seq(client_id, &acked);
                 }
             }
         }
@@ -3176,6 +3199,18 @@ pub fn generate_splash_strings() -> Vec<String> {
 }
 
 /// Handle WebSocket message in multiuser mode
+/// Filters a `(world_index, seq)` list down to entries whose world is owned by
+/// `uname` (PROTOCOL-ROADMAP.md Step 6a). Shared by the `AuthRequest.resume` and
+/// `PongCheck.acked` arms of `handle_multiuser_ws_message` below so neither can
+/// seed/record state for — or, via `handle_request_scrollback_owned`, replay from —
+/// a `world_index` belonging to another user.
+fn owner_filtered_pairs(app: &App, uname: &str, pairs: &[(usize, u64)]) -> Vec<(usize, u64)> {
+    pairs.iter()
+        .filter(|(wi, _)| app.worlds.get(*wi).map(|w| w.owner.as_deref() == Some(uname)).unwrap_or(false))
+        .cloned()
+        .collect()
+}
+
 pub async fn handle_multiuser_ws_message(
     app: &mut App,
     client_id: u64,
@@ -3190,12 +3225,59 @@ pub async fn handle_multiuser_ws_message(
     };
 
     match msg {
-        WsMessage::AuthRequest { .. } => {
+        WsMessage::AuthRequest { ref resume, .. } => {
             // Client just authenticated - send them their InitialState filtered by username
             if let Some(ref uname) = username {
                 let initial_state = build_multiuser_initial_state(app, uname);
                 if let Some(ws) = &app.ws_server {
                     ws.send_initial_state_and_mark(client_id, initial_state);
+                }
+                // Resume-driven replay (PROTOCOL-ROADMAP.md Step 6a): owner-filtered
+                // first, so a user's `resume` list can only ever seed acked_seq for, and
+                // replay scrollback from, worlds they own — closes the gap left open by
+                // Step 2 (see that step's Status note and handle_request_scrollback_owned).
+                if !resume.is_empty() {
+                    let owned = owner_filtered_pairs(app, uname, resume);
+                    if !owned.is_empty() {
+                        if let Some(ref server) = app.ws_server {
+                            server.record_acked_seq(client_id, &owned);
+                        }
+                        // Mirrors the in-memory scrollback ring's cap (MAX_LINES, main.rs)
+                        // so a single replay always covers the entire ring if needed.
+                        const RESUME_REPLAY_MAX: usize = 10_000;
+                        for (world_index, last_seq) in owned {
+                            app.handle_request_scrollback_owned(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq), uname);
+                        }
+                    }
+                }
+            }
+        }
+        WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
+            // Owner-scoped (PROTOCOL-ROADMAP.md Step 6a) — multiuser previously had no
+            // handler for this at all, so a client couldn't scroll back further than its
+            // initial state. Reuses the same owner check as the AuthRequest.resume path.
+            if let Some(ref uname) = username {
+                app.handle_request_scrollback_owned(client_id, world_index, count, before_seq, after_seq, uname);
+            }
+        }
+        WsMessage::PongCheck { acked, .. } => {
+            // Record the client's per-world delivery ack (PROTOCOL-ROADMAP.md Step 6a),
+            // mirroring the single-user master-WS/`-D` daemon PongCheck handlers
+            // (multiuser previously had no handler for this at all). No owner check is
+            // strictly required to ack your own claimed progress — acked_seq/needs_resync
+            // bookkeeping is per-client (WsClientInfo) and ResyncRequired delivery only
+            // ever targets worlds actually broadcast to this client via
+            // broadcast_to_owner, i.e. this client's own worlds — but entries are still
+            // owner-filtered as defense-in-depth so a bogus world_index in `acked` can't
+            // write into this client's per-world state for a world it doesn't own.
+            if !acked.is_empty() {
+                if let Some(ref uname) = username {
+                    let owned = owner_filtered_pairs(app, uname, &acked);
+                    if !owned.is_empty() {
+                        if let Some(ref server) = app.ws_server {
+                            server.record_acked_seq(client_id, &owned);
+                        }
+                    }
                 }
             }
         }
@@ -3520,8 +3602,12 @@ mod change_password_tests {
 
     /// Register a fake authenticated WS client so `get_client_username` resolves.
     /// Returns the client id and a receiver for whatever the handler sends back.
-    fn register_client(server: &WebSocketServer, client_id: u64, username: &str) -> mpsc::UnboundedReceiver<WsMessage> {
-        let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
+    /// Item type is `Outbound`, not `WsMessage` (PROTOCOL-ROADMAP.md Step 8) - matches
+    /// the real per-client channel's item type since `WsClientInfo.tx` changed.
+    fn register_client(server: &WebSocketServer, client_id: u64, username: &str) -> mpsc::Receiver<crate::websocket::Outbound> {
+        // Bounded (PROTOCOL-ROADMAP.md Step 3) — matches the real per-client channel created
+        // in `handle_ws_client`.
+        let (tx, rx) = mpsc::channel::<crate::websocket::Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
         // `clients` is a std::sync::RwLock (see WebSocketServer::clients) — try_write here
         // is just for the "uncontended in test setup" assertion, not async-safety.
         let mut clients = server.clients.try_write().expect("clients lock should be uncontended in test setup");
@@ -3537,6 +3623,8 @@ mod change_password_tests {
             connected_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),
             paused: false,
+            acked_seq: std::collections::HashMap::new(),
+            needs_resync: std::collections::HashSet::new(),
         });
         rx
     }
@@ -3575,11 +3663,15 @@ mod change_password_tests {
         };
         handle_multiuser_ws_message(&mut app, client_id, msg, &event_tx).await;
 
-        // Handler must report success.
+        // Handler must report success. PasswordChanged is a single-recipient send, so it
+        // always arrives as Outbound::Message (PROTOCOL-ROADMAP.md Step 8).
         match rx.try_recv() {
-            Ok(WsMessage::PasswordChanged { success, error }) => {
-                assert!(success, "ChangePassword should succeed, got error: {:?}", error);
-            }
+            Ok(crate::websocket::Outbound::Message(msg)) => match *msg {
+                WsMessage::PasswordChanged { success, error } => {
+                    assert!(success, "ChangePassword should succeed, got error: {:?}", error);
+                }
+                other => panic!("expected PasswordChanged, got {:?}", other),
+            },
             other => panic!("expected PasswordChanged, got {:?}", other),
         }
 
@@ -3658,5 +3750,184 @@ mod change_password_tests {
         assert_eq!(app.users[0].password, hash_password("third-password"));
         let users = ws.users.read().unwrap();
         assert_eq!(users.get("bob").unwrap().password_hash, hash_password("third-password"));
+    }
+}
+
+#[cfg(test)]
+mod resume_owner_scoping_tests {
+    // PROTOCOL-ROADMAP.md Step 6a: multiuser's AuthRequest.resume / RequestScrollback /
+    // PongCheck handlers in `handle_multiuser_ws_message` must never let one user pull
+    // scrollback from a world they don't own.
+    use super::*;
+
+    /// Registers a fake authenticated WS client the same way
+    /// `change_password_tests::register_client` does (bounded per-client channel matching
+    /// the real `handle_ws_client` setup), returning the receiver so a test can inspect
+    /// exactly what the handler sent back.
+    fn register_client(server: &WebSocketServer, client_id: u64, username: &str) -> mpsc::Receiver<crate::websocket::Outbound> {
+        // Item type is `Outbound`, not `WsMessage` (PROTOCOL-ROADMAP.md Step 8).
+        let (tx, rx) = mpsc::channel::<crate::websocket::Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let mut clients = server.clients.try_write().expect("clients lock should be uncontended in test setup");
+        clients.insert(client_id, WsClientInfo {
+            authenticated: true,
+            tx,
+            current_world: None,
+            username: Some(username.to_string()),
+            received_initial_state: false,
+            client_type: RemoteClientType::Web,
+            viewport_height: 24,
+            ip_address: "127.0.0.1".to_string(),
+            connected_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            paused: false,
+            acked_seq: std::collections::HashMap::new(),
+            needs_resync: std::collections::HashSet::new(),
+        });
+        rx
+    }
+
+    /// Builds a two-user, two-world multiuser `App`: world 0 owned by "alice", world 1
+    /// owned by "bob", each pre-populated with output_lines seq 1..=10 so a resume/
+    /// scrollback replay has real data to (not) leak.
+    fn two_owner_app() -> App {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+
+        let mut alice_world = World::new("alice-world");
+        alice_world.owner = Some("alice".to_string());
+        for seq in 1..=10u64 {
+            alice_world.output_lines.push(OutputLine::new(format!("alice secret line {seq}"), seq));
+        }
+        app.worlds.push(alice_world);
+
+        let mut bob_world = World::new("bob-world");
+        bob_world.owner = Some("bob".to_string());
+        for seq in 1..=10u64 {
+            bob_world.output_lines.push(OutputLine::new(format!("bob secret line {seq}"), seq));
+        }
+        app.worlds.push(bob_world);
+
+        app.current_world_index = 0;
+        app
+    }
+
+    /// Drains `rx` and returns every `ScrollbackLines` payload received, as
+    /// `(world_index, seqs)` pairs, in receipt order. `ScrollbackLines` is always sent
+    /// per-client (`Outbound::Message`, PROTOCOL-ROADMAP.md Step 8) - any `Outbound::Shared`
+    /// item drained here (there shouldn't be any in these tests) is simply not a
+    /// `ScrollbackLines` and is skipped.
+    fn drain_scrollback_replies(rx: &mut mpsc::Receiver<crate::websocket::Outbound>) -> Vec<(usize, Vec<u64>)> {
+        let mut out = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            if let crate::websocket::Outbound::Message(msg) = item {
+                if let WsMessage::ScrollbackLines { world_index, lines, .. } = *msg {
+                    out.push((world_index, lines.iter().map(|l| l.seq).collect()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The security property this step exists to establish: alice's `resume` list (sent
+    /// on her own `AuthRequest`) names bob's `world_index` (1). She must receive nothing
+    /// for it — no `ScrollbackLines` for world 1 at all, i.e. bob's MUD output never
+    /// reaches her socket. Also drives the same attack via `RequestScrollback` directly,
+    /// since Step 6a wires both through the same owner-scoped path.
+    ///
+    /// This test is NOT vacuous against the pre-fix code: before this step,
+    /// `handle_multiuser_ws_message`'s `AuthRequest` arm didn't touch `resume` at all (so
+    /// this exact leak was merely latent/unwired, not yet reachable) and had no
+    /// `RequestScrollback` arm whatsoever (it fell into the `_ => {}` catch-all). Naively
+    /// wiring `resume`/`RequestScrollback` straight into
+    /// `App::handle_request_scrollback` without the new owner check — the literal bug
+    /// this step fixes — would make this test fail: it would deliver bob's lines to
+    /// alice's channel. Confirmed by temporarily reverting the owner-check call sites to
+    /// call `handle_request_scrollback` directly during development; restored before
+    /// landing.
+    #[tokio::test]
+    async fn resume_and_request_scrollback_cannot_read_another_users_world() {
+        let mut app = two_owner_app();
+
+        let server = WebSocketServer::new("", 9000, "", None, true, BanList::new());
+        let alice_id = 1u64;
+        let mut alice_rx = register_client(&server, alice_id, "alice");
+        app.ws_server = Some(server);
+        let (event_tx, _event_rx) = mpsc::channel::<AppEvent>(8);
+
+        // Attack 1: AuthRequest.resume names bob's world_index (1).
+        handle_multiuser_ws_message(&mut app, alice_id, WsMessage::AuthRequest {
+            username: Some("alice".to_string()),
+            password_hash: String::new(),
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+            challenge_response: false,
+            resume: vec![(1, 0)],
+        }, &event_tx).await;
+
+        let replies = drain_scrollback_replies(&mut alice_rx);
+        assert!(replies.iter().all(|(wi, _)| *wi != 1),
+            "alice must never receive ScrollbackLines for bob's world_index via AuthRequest.resume, got {replies:?}");
+
+        // Bob's world_index must not have been seeded into alice's acked_seq either -
+        // that would be state about a world she doesn't own leaking into her session.
+        {
+            let clients = app.ws_server.as_ref().unwrap().clients.read().unwrap();
+            let alice_client = clients.get(&alice_id).unwrap();
+            assert!(!alice_client.acked_seq.contains_key(&1),
+                "acked_seq must not be seeded for a world_index alice doesn't own");
+        }
+
+        // Attack 2: same thing, but via a direct RequestScrollback (the pre-existing gap
+        // this step also closes) instead of resume.
+        handle_multiuser_ws_message(&mut app, alice_id, WsMessage::RequestScrollback {
+            world_index: 1,
+            count: 10_000,
+            before_seq: None,
+            after_seq: Some(0),
+        }, &event_tx).await;
+
+        let replies = drain_scrollback_replies(&mut alice_rx);
+        assert!(replies.is_empty(),
+            "alice must never receive ScrollbackLines for bob's world via a direct RequestScrollback naming his world_index, got {replies:?}");
+    }
+
+    /// Positive companion to the leak test above (mirrors Step 2's single-user resume
+    /// test, but driven through the multiuser path): a user resuming with their OWN
+    /// world_index must still get the exact gap replayed, no gap, no duplicate.
+    #[tokio::test]
+    async fn resume_replays_own_world_scrollback_correctly() {
+        let mut app = two_owner_app();
+
+        let server = WebSocketServer::new("", 9000, "", None, true, BanList::new());
+        let alice_id = 1u64;
+        let mut alice_rx = register_client(&server, alice_id, "alice");
+        app.ws_server = Some(server);
+        let (event_tx, _event_rx) = mpsc::channel::<AppEvent>(8);
+
+        // Alice already has seq 1..=7 of her OWN world (index 0); resume should replay
+        // exactly 8, 9, 10.
+        handle_multiuser_ws_message(&mut app, alice_id, WsMessage::AuthRequest {
+            username: Some("alice".to_string()),
+            password_hash: String::new(),
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+            challenge_response: false,
+            resume: vec![(0, 7)],
+        }, &event_tx).await;
+
+        let replies = drain_scrollback_replies(&mut alice_rx);
+        assert_eq!(replies.len(), 1, "expected exactly one ScrollbackLines reply, got {replies:?}");
+        let (world_index, seqs) = &replies[0];
+        assert_eq!(*world_index, 0);
+        assert_eq!(seqs, &vec![8, 9, 10],
+            "resume replay of alice's own world must send exactly seq 8,9,10 - no gap, no duplicate");
+
+        // acked_seq must be seeded from the resume payload for her own world.
+        let clients = app.ws_server.as_ref().unwrap().clients.read().unwrap();
+        let alice_client = clients.get(&alice_id).unwrap();
+        assert_eq!(alice_client.acked_seq.get(&0), Some(&7));
     }
 }

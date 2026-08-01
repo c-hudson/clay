@@ -2662,6 +2662,19 @@ pub struct World {
     pub tts_speaker_whitelist: std::collections::HashSet<String>, // Per-world TTS speaker whitelist
     pub connection_id: u64,          // Incremented on each connection, used to ignore stale disconnect events
     pub max_received_seq: u64,       // Highest seq received from server (remote console dedup)
+    /// PROTOCOL-ROADMAP.md Step 6: set when incoming `ServerData` (or a server
+    /// `ResyncRequired`) reveals a mid-stream seq gap - `(local output_lines index the
+    /// gap starts at, last contiguous seq before the gap)`. Lets the eventual
+    /// `ScrollbackLines` gap-fill reply (from `RequestScrollback{after_seq}`) splice
+    /// back into its correct chronological position instead of landing at the wrong
+    /// end of the buffer, and lets `build_resume_ack_list()` ack the pre-gap boundary
+    /// instead of a `max_received_seq` that would hide the hole from the server.
+    /// `None` when no gap is currently outstanding. Only one gap is tracked at a time
+    /// (a second gap opening before the first resolves keeps the first's position) -
+    /// deliberately narrow scope, matching this client's "trust in-order delivery,
+    /// no reordering compensation layer" design (unlike `app.js`'s `_seqGaps`, which
+    /// exists for a different, still-open problem - see PROTOCOL-ROADMAP.md Step 7).
+    pub pending_gap: Option<(usize, u64)>,
     pub first_marked_new_index: Option<usize>, // Index of first marked_new line in output_lines (for fast clear)
     pub visual_line_offset: usize, // When > 0, show only first N visual lines of scroll_offset line (partial display for more-mode)
     pub watchdog_history: std::collections::VecDeque<String>,  // Rolling window of recent lines (stripped) for /watchdog
@@ -2743,6 +2756,7 @@ impl World {
             tts_speaker_whitelist: std::collections::HashSet::new(),
             connection_id: 0,
             max_received_seq: 0,
+            pending_gap: None,
             first_marked_new_index: None,
             visual_line_offset: 0,
             watchdog_history: std::collections::VecDeque::new(),
@@ -4443,7 +4457,13 @@ impl App {
                         world.scroll_offset = 0;
                         self.needs_output_redraw = true;
                     }
-                    // Dedup: skip ServerData that has already been received (e.g., after resync)
+                    // Dedup: msg_seq <= max_received_seq means the server sent us something
+                    // we've already fully processed (e.g. a resume/gap-fill reply overlapping
+                    // live traffic, or the server retrying after a send it couldn't confirm).
+                    // Under this client's resume contract (PROTOCOL-ROADMAP.md Step 6) this is
+                    // a normal, recoverable overlap, not the unrecoverable loss the old
+                    // permanent-drop framing implied — a genuine gap (msg_seq skipping ahead)
+                    // is handled below via `pending_gap` + `ResyncRequired`, not by this check.
                     if msg_seq > 0 && msg_seq <= world.max_received_seq {
                         // Log duplicate to debug file
                         if is_debug_enabled() {
@@ -4462,6 +4482,22 @@ impl App {
                             });
                         }
                     } else {
+                        // A forward jump (msg_seq skips past max_received_seq+1) means the
+                        // server's outbound channel to us dropped something in between (see
+                        // Step 3's WS-CHANNEL-FULL/ResyncRequired). We don't chase this
+                        // ourselves - trust in-order delivery and let the server's
+                        // `ResyncRequired` (handled below) tell us when and where. We do
+                        // remember exactly where in the buffer the jump happened, so that once
+                        // the gap-fill comes back via `ScrollbackLines` it can be spliced back
+                        // into the right chronological position instead of tacked onto
+                        // whichever end a blind prepend/append would pick.
+                        if msg_seq > 0 && world.max_received_seq > 0
+                            && msg_seq > world.max_received_seq + 1
+                            && world.pending_gap.is_none()
+                        {
+                            world.pending_gap = Some((world.output_lines.len(), world.max_received_seq));
+                        }
+
                         // Check if user was at bottom before adding lines
                         let was_at_bottom = world.is_at_bottom();
 
@@ -4553,7 +4589,10 @@ impl App {
                     world.prompt = prompt;
                     world.pending_count = pending_count;
                     world.paused = pending_count > 0;
-                    // Append recent lines, skipping any already received (dedup)
+                    // Append recent lines, skipping any already received. This is a genuine
+                    // duplicate check (this world's resync/reconnect state already covers it
+                    // exactly, PROTOCOL-ROADMAP.md Step 6), not a best-effort guess — safe to
+                    // drop without risking permanent loss.
                     for tl in recent_lines {
                         if tl.seq > 0 && tl.seq <= world.max_received_seq {
                             continue; // Skip duplicate line
@@ -4744,6 +4783,49 @@ impl App {
                 }
             }
             WsMessage::ScrollbackLines { world_index, lines, backfill_complete } => {
+                // A gap-fill reply (our RequestScrollback{after_seq} sent from the
+                // ResyncRequired handler below) must be spliced back into the exact
+                // position the gap was first noticed (`World::pending_gap`), not prepended
+                // to the front like a normal older-history backfill reply — see that
+                // field's doc comment and PROTOCOL-ROADMAP.md Step 6. Handled first and
+                // returns early: it's unrelated to the historical-backfill state machine
+                // (backfill_queue/backfill_exhausted/backfill_advance_to_next) below, which
+                // only concerns before_seq requests for older scrollback history.
+                if let Some((insert_at, last_contiguous_seq)) = self.worlds.get(world_index).and_then(|w| w.pending_gap) {
+                    if let Some(world) = self.worlds.get_mut(world_index) {
+                        world.pending_gap = None;
+                        // Defensive filter: the request may have used an older boundary
+                        // than our own tracked one (the server's from_seq can lag behind
+                        // ours if we haven't acked recently), so the reply can legitimately
+                        // include lines we already have — drop those instead of duplicating.
+                        let new_lines: Vec<OutputLine> = lines.into_iter()
+                            .filter(|l| l.seq > last_contiguous_seq)
+                            .map(|line| OutputLine {
+                                text: line.text,
+                                timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
+                                from_server: line.from_server,
+                                gagged: line.gagged,
+                                seq: line.seq,
+                                highlight_color: line.highlight_color,
+                                marked_new: line.marked_new,
+                                from_archive: line.from_archive,
+                            }).collect();
+                        let insert_at = insert_at.min(world.output_lines.len());
+                        let inserted = new_lines.len();
+                        for (i, line) in new_lines.into_iter().enumerate() {
+                            world.output_lines.insert(insert_at + i, line);
+                        }
+                        // Only the view needs shifting if the splice landed at or before
+                        // it — content spliced in after the current scroll position
+                        // doesn't move what's already on screen.
+                        if insert_at <= world.scroll_offset {
+                            world.scroll_offset += inserted;
+                        }
+                        self.needs_output_redraw = true;
+                    }
+                    return;
+                }
+
                 // Response to RequestScrollback - prepend lines to output
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Insert at the beginning of output_lines
@@ -4797,13 +4879,67 @@ impl App {
                 compile_all_action_regexes(&mut self.settings.actions);
             }
             WsMessage::PingCheck { nonce } => {
-                // Server liveness check for /remote command - respond immediately
+                // Server liveness check for /remote command - respond immediately, piggybacking
+                // our per-world resume/ack contract (PROTOCOL-ROADMAP.md Step 6) the same way
+                // app.js's PongCheck replies do.
                 if let Some(ref tx) = self.ws_client_tx {
-                    let _ = tx.send(WsMessage::PongCheck { nonce });
+                    let _ = tx.send(WsMessage::PongCheck { nonce, acked: self.build_resume_ack_list() });
+                }
+            }
+            WsMessage::ResyncRequired { world_index, from_seq } => {
+                // The server's outbound channel to us overflowed and a ServerData for this
+                // world may have been silently lost (Step 3's WS-CHANNEL-FULL path). Request
+                // an exact replay of what we're missing, reusing the same
+                // RequestScrollback{after_seq} mechanism the resume-on-connect path
+                // (handle_ws_auth_initial_state, server-side) and normal reconnect gap-fill
+                // already use — no separate request type needed.
+                let after_seq = if let Some(world) = self.worlds.get_mut(world_index) {
+                    // Prefer our own tracked gap boundary over the server's from_seq: ours is
+                    // exact (recorded the instant the jump was seen), while from_seq reflects
+                    // whatever we last acked, which can lag behind if we haven't acked
+                    // recently. If we hadn't already noticed a gap ourselves (e.g. it starts
+                    // exactly at our current tail), fall back to from_seq and remember where
+                    // to splice the reply so ScrollbackLines below can find it.
+                    if world.pending_gap.is_none() && from_seq < world.max_received_seq {
+                        world.pending_gap = Some((world.output_lines.len(), from_seq));
+                    }
+                    world.pending_gap.map(|(_, seq)| seq).unwrap_or(from_seq)
+                } else {
+                    from_seq
+                };
+                if let Some(ref tx) = self.ws_client_tx {
+                    let _ = tx.send(WsMessage::RequestScrollback {
+                        world_index,
+                        count: 10_000, // Matches the server's RESUME_REPLAY_MAX (main.rs) — the
+                                       // scrollback ring can never hold more than that per world.
+                        before_seq: None,
+                        after_seq: Some(after_seq),
+                    });
                 }
             }
             _ => {}
         }
+    }
+
+    /// Build the `(world_index, last_contiguous_seq)` list for `PongCheck.acked` — every
+    /// world we've received at least one server-seq'd line for, paired with the highest seq
+    /// we can vouch for as *contiguous* (not just highest received: if `pending_gap` is set,
+    /// `max_received_seq` has already jumped past an unfilled hole, so acking it would tell
+    /// the server we have lines we don't and hide the hole from any future resume). Mirrors
+    /// `app.js`'s `buildResumeAckList()`/`lastContiguousSeq()` for the same wire shape, but
+    /// doesn't need their `_seqGaps` machinery: this client tracks at most one outstanding
+    /// gap per world (see `World::pending_gap`) rather than an arbitrary set, since it never
+    /// has to compensate for out-of-order delivery — only for a server-acknowledged drop.
+    fn build_resume_ack_list(&self) -> Vec<(usize, u64)> {
+        self.worlds.iter().enumerate()
+            .filter_map(|(i, w)| {
+                let seq = match w.pending_gap {
+                    Some((_, last_contiguous_seq)) => last_contiguous_seq,
+                    None => w.max_received_seq,
+                };
+                if seq > 0 { Some((i, seq)) } else { None }
+            })
+            .collect()
     }
 
     /// Initialize App state from InitialState message (remote client mode)
@@ -5546,6 +5682,30 @@ impl App {
         });
     }
 
+    /// Owner-scoped wrapper around `handle_request_scrollback` for multiuser mode
+    /// (PROTOCOL-ROADMAP.md Step 6a). `handle_request_scrollback` itself has no
+    /// per-world owner check — its existing callers (master-WS, `-D` daemon) are all
+    /// single-user contexts where every `world_index` already belongs to the sole
+    /// local operator, so adding a check there would be pure overhead and risks
+    /// nothing being missed. Multiuser is different: a client-supplied `world_index`
+    /// (from `AuthRequest.resume` or `RequestScrollback`) could name another user's
+    /// world, and blindly delegating would leak that user's MUD output — the same
+    /// class of bug CLAUDE.md's D7 invariants call out for `ConnectWorld`/
+    /// `SwitchWorld` (`world.owner == username`). On a mismatch or a missing world
+    /// this silently no-ops (no reply at all) rather than sending an error — an error
+    /// reply would itself leak whether `world_index` exists, which a bare 404-style
+    /// silence avoids.
+    pub(crate) fn handle_request_scrollback_owned(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>, owner: &str) {
+        match self.worlds.get(world_index) {
+            Some(world) if world.owner.as_deref() == Some(owner) => {
+                self.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq);
+            }
+            _ => {
+                // Deliberate silent no-op — see doc comment above.
+            }
+        }
+    }
+
     /// `WsMessage::RequestState` handling — shared by master-WS and daemon (T40). Confirmed
     /// byte-identical between the two previous copies. Full state resync: web/Android ping
     /// the server on visibility change and send this when the connection looks stale.
@@ -5650,14 +5810,30 @@ impl App {
             }
         }
         if let Some(ref server) = self.ws_server {
-            let clients_guard = server.clients.read().unwrap();
-            for client in clients_guard.values() {
-                if client.authenticated {
-                    // Paused clients get full activity count (their world is no longer excluded)
-                    let exclude = if client.paused { None } else { client.current_world };
-                    let count = self.activity_count_excluding(exclude);
-                    let _ = client.tx.send(WsMessage::ActivityUpdate { count });
+            // ActivityUpdate carries no world_index (PROTOCOL-ROADMAP.md Step 3's
+            // `message_world_index` returns None for it), so an overflowed channel here
+            // just gets logged - there's no per-world resync target to flag.
+            let mut full: Vec<(u64, String)> = Vec::new();
+            {
+                let clients_guard = server.clients.read().unwrap();
+                for (&id, client) in clients_guard.iter() {
+                    if client.authenticated {
+                        // Paused clients get full activity count (their world is no longer excluded)
+                        let exclude = if client.paused { None } else { client.current_world };
+                        let count = self.activity_count_excluding(exclude);
+                        // Genuinely per-client content (count excludes a different world
+                        // per client), so Outbound::Message not Shared (PROTOCOL-ROADMAP.md
+                        // Step 8) - there's nothing to share across recipients here.
+                        if let Err(mpsc::error::TrySendError::Full(_)) = client.tx.try_send(websocket::Outbound::Message(Box::new(WsMessage::ActivityUpdate { count }))) {
+                            full.push((id, client.ip_address.clone()));
+                        }
+                    }
                 }
+            }
+            for (id, ip) in full {
+                crate::http::log_remote_event("WS-CHANNEL-FULL", &ip,
+                    &format!("client={} ActivityUpdate dropped - outbound channel full (capacity {})",
+                        id, websocket::WS_CLIENT_CHANNEL_CAPACITY));
             }
         }
     }
@@ -6906,18 +7082,50 @@ impl App {
         // relative to calls that took the fast path, which could deliver a later
         // broadcast before an earlier one (see D-Termux-lines investigation).
         if let Some(ref server) = self.ws_server {
-            let clients_guard = server.clients.read().unwrap();
+            let world_index = websocket::message_world_index(&msg);
+            // PROTOCOL-ROADMAP.md Step 8: serialize once for the whole broadcast (same
+            // content to every recipient) instead of each client's own receive loop
+            // re-serializing an identical clone. On a serialization failure,
+            // `serialize_for_broadcast` already logs WS-SERIALIZE-FAIL once and nobody
+            // gets the message - same net effect as before, minus the duplicate logs.
+            let Some(shared_json) = websocket::serialize_for_broadcast(&msg) else { return };
             let mut sent_count = 0;
-            for client in clients_guard.values() {
-                if client.authenticated {
-                    let _ = client.tx.send(msg.clone());
-                    sent_count += 1;
+            let mut full: Vec<(u64, String)> = Vec::new();
+            let mut flush_candidates: Vec<u64> = Vec::new();
+            {
+                let clients_guard = server.clients.read().unwrap();
+                for (&id, client) in clients_guard.iter() {
+                    if client.authenticated {
+                        // Bounded channel (PROTOCOL-ROADMAP.md Step 3) — try_send instead
+                        // of the old infallible unbounded send. A `Full` here is turned
+                        // into a `ResyncRequired` via `reconcile_resync` below. The
+                        // Arc<str> clone is cheap (refcount bump, no JSON re-copy).
+                        match client.tx.try_send(websocket::Outbound::Shared(shared_json.clone())) {
+                            Ok(()) => {
+                                sent_count += 1;
+                                if let Some(wi) = world_index {
+                                    if client.needs_resync.contains(&wi) {
+                                        flush_candidates.push(id);
+                                    }
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => full.push((id, client.ip_address.clone())),
+                            Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        }
+                    }
+                }
+                // Log if we didn't send to anyone (for debugging)
+                if is_debug_enabled() && sent_count == 0 && !clients_guard.is_empty() {
+                    output_debug_log(&format!("ws_broadcast: {} clients connected, 0 authenticated", clients_guard.len()));
                 }
             }
-            // Log if we didn't send to anyone (for debugging)
-            if is_debug_enabled() && sent_count == 0 && !clients_guard.is_empty() {
-                output_debug_log(&format!("ws_broadcast: {} clients connected, 0 authenticated", clients_guard.len()));
+            for (id, ip) in &full {
+                crate::http::log_remote_event("WS-CHANNEL-FULL", ip,
+                    &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
+                        id, world_index, websocket::WS_CLIENT_CHANNEL_CAPACITY));
             }
+            let full_ids: Vec<u64> = full.into_iter().map(|(id, _)| id).collect();
+            websocket::reconcile_resync(&server.clients, world_index, &full_ids, &flush_candidates);
         }
     }
 
@@ -6934,9 +7142,30 @@ impl App {
             return;
         }
         if let Some(ref server) = self.ws_server {
-            let clients_guard = server.clients.read().unwrap();
-            if let Some(client) = clients_guard.get(&client_id) {
-                let _ = client.tx.send(msg);
+            let world_index = websocket::message_world_index(&msg);
+            let outcome = {
+                let clients_guard = server.clients.read().unwrap();
+                clients_guard.get(&client_id).map(|client| {
+                    let was_flagged = world_index.map(|wi| client.needs_resync.contains(&wi)).unwrap_or(false);
+                    // Single-recipient send, so Outbound::Message (PROTOCOL-ROADMAP.md Step 8).
+                    (client.tx.try_send(websocket::Outbound::Message(Box::new(msg))), client.ip_address.clone(), was_flagged)
+                })
+            };
+            if let Some((result, ip, was_flagged)) = outcome {
+                match result {
+                    Ok(()) => {
+                        if was_flagged {
+                            websocket::reconcile_resync(&server.clients, world_index, &[], &[client_id]);
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        crate::http::log_remote_event("WS-CHANNEL-FULL", &ip,
+                            &format!("client={} world={:?} outbound channel full (capacity {}) - message dropped",
+                                client_id, world_index, websocket::WS_CLIENT_CHANNEL_CAPACITY));
+                        websocket::reconcile_resync(&server.clients, world_index, &[client_id], &[]);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
             }
         }
     }
@@ -6974,7 +7203,14 @@ impl App {
         if let Some(ref server) = self.ws_server {
             let mut clients_guard = server.clients.write().unwrap();
             if let Some(client) = clients_guard.get_mut(&client_id) {
-                let _ = client.tx.send(msg);
+                // InitialState carries no single world_index - see the identical note in
+                // WebSocketServer::send_initial_state_and_mark. Single-recipient send, so
+                // Outbound::Message (PROTOCOL-ROADMAP.md Step 8).
+                if let Err(mpsc::error::TrySendError::Full(_)) = client.tx.try_send(websocket::Outbound::Message(Box::new(msg))) {
+                    crate::http::log_remote_event("WS-CHANNEL-FULL", &client.ip_address,
+                        &format!("client={} InitialState dropped - outbound channel full (capacity {})",
+                            client_id, websocket::WS_CLIENT_CHANNEL_CAPACITY));
+                }
                 client.received_initial_state = true;
             }
         }
@@ -8084,7 +8320,15 @@ impl App {
     }
 
     /// Handle initial WsClientMessage (AuthRequest) after authentication.
-    fn handle_ws_auth_initial_state(&mut self, client_id: u64, current_world: Option<usize>) {
+    ///
+    /// `resume` (PROTOCOL-ROADMAP.md Step 2) is the client's per-world
+    /// `(world_index, last_contiguous_seq)` list from `AuthRequest.resume`: lines it
+    /// already has, so instead of relying on the client to notice a gap after
+    /// `InitialState`, the server proactively replays exactly the missing range for
+    /// each named world via the same path `RequestScrollback{ after_seq }` uses
+    /// (`handle_request_scrollback`). Empty `resume` (old clients, or a client with no
+    /// prior state) leaves behavior exactly as before this step.
+    fn handle_ws_auth_initial_state(&mut self, client_id: u64, current_world: Option<usize>, resume: Vec<(usize, u64)>) {
         // Debug: log current world state for reload message diagnosis
         let cw = self.current_world_index;
         if cw < self.worlds.len() {
@@ -8119,6 +8363,25 @@ impl App {
         self.broadcast_activity();
         // Signal event loop to trigger web reconnects
         self.web_reconnect_needed = true;
+
+        // Resume-driven replay (PROTOCOL-ROADMAP.md Step 2): reuse the exact same
+        // gap-fill logic RequestScrollback{after_seq} already uses, once per named
+        // world, instead of waiting for the client to notice and ask for it. Seed
+        // acked_seq from the resume payload first so it reflects "caught up to N" even
+        // before any new PongCheck ack arrives - otherwise a client that resumes and
+        // then reconnects again immediately (before ever acking) would look uncaught-up.
+        if !resume.is_empty() {
+            if let Some(ref server) = self.ws_server {
+                server.record_acked_seq(client_id, &resume);
+            }
+            // Mirrors the in-memory scrollback ring's cap (MAX_LINES, main.rs) so a
+            // single replay always covers the entire ring if needed - the ring can never
+            // hold more than that many lines per world regardless of how big the gap is.
+            const RESUME_REPLAY_MAX: usize = 10_000;
+            for (world_index, last_seq) in resume {
+                self.handle_request_scrollback(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq));
+            }
+        }
     }
 
     /// Handle ConnectionSuccess event (used in headless and console modes).
@@ -9092,9 +9355,14 @@ impl App {
         } else {
             None
         };
+        let auth_resume = if let WsMessage::AuthRequest { ref resume, .. } = msg {
+            resume.clone()
+        } else {
+            Vec::new()
+        };
         match msg {
             WsMessage::AuthRequest { .. } => {
-                self.handle_ws_auth_initial_state(client_id, auth_current_world);
+                self.handle_ws_auth_initial_state(client_id, auth_current_world, auth_resume);
             }
             WsMessage::SendCommand { world_index, command } => {
                 // Reset more-mode counter when ANY client sends a command
@@ -9565,13 +9833,20 @@ impl App {
                     }
                 }
             }
-            WsMessage::PongCheck { nonce } => {
+            WsMessage::PongCheck { nonce, acked } => {
                 // Client responded to a /remote liveness check
                 if nonce == self.remote_ping_nonce {
                     if let Some(ref responses) = self.remote_ping_responses {
                         if let Ok(mut set) = responses.lock() {
                             set.insert(client_id);
                         }
+                    }
+                }
+                // Record the client's per-world delivery ack (PROTOCOL-ROADMAP.md Step 2)
+                // so a future resume/backpressure path knows how caught-up it already is.
+                if !acked.is_empty() {
+                    if let Some(ref server) = self.ws_server {
+                        server.record_acked_seq(client_id, &acked);
                     }
                 }
             }
@@ -13976,8 +14251,8 @@ pub async fn run_app_headless(
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
-                        if let WsMessage::AuthRequest { current_world, .. } = &*msg {
-                            app.handle_ws_auth_initial_state(client_id, *current_world);
+                        if let WsMessage::AuthRequest { current_world, resume, .. } = &*msg {
+                            app.handle_ws_auth_initial_state(client_id, *current_world, resume.clone());
                             if app.web_reconnect_needed {
                                 app.web_reconnect_needed = false;
                                 if app.trigger_web_reconnects() {
