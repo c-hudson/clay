@@ -124,6 +124,7 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 - **Web content**: HTML/CSS/JS embedded via `include_str!()` in http.rs. Changes require rebuild + `/reload`.
 - **TF control flow in macros**: Body split by `%;`, control flow blocks grouped by `split_body_preserving_control_flow()`. Plain text in loop bodies becomes `SendToMud`, queued in `engine.pending_commands`.
 - **Async lock access**: Use `try_read()`/`try_write()` on tokio RwLock from sync code, never `blocking_read()`/`blocking_write()` inside async runtime.
+- **`World::output_lines` is always sorted by `seq`**: every release-path broadcast (`App::broadcast_released_lines`) and the seq-drift fix's `ServerData.end_seq` field depend on this. The invariant is maintained by routing a gagged line into `pending_lines` instead of `output_lines` (`process_server_data`'s `hold_gagged_in_pending`) whenever more-mode is on, the world is paused, and pending lines are already queued — otherwise a gagged line could get a newer seq and land in `output_lines` ahead of older, still-pending lines. See PROTOCOL-ROADMAP.md's seq-drift-fix Phase B, Step 4.
 
 ### Connection Security
 

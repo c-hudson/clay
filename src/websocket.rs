@@ -294,7 +294,16 @@ pub enum WsMessage {
     /// is_viewed: true if any interface (console/web/GUI) is viewing this world
     /// ts: timestamp in seconds since Unix epoch (when the line was received)
     /// from_server: true if data came from MUD server, false if client-generated
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true", skip_serializing_if = "is_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default, skip_serializing_if = "is_false")] marked_new: bool, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool },
+    /// end_seq: the seq of the LAST line in this batch, when the sender actually knows it
+    /// (i.e. `data` was built from a contiguous slice of `output_lines`/`pending_lines` that
+    /// really did consume seqs `seq..=end_seq`). `Option`, not a trimmed `u64`: seq 0 is a
+    /// real value (a world's first line), so "field absent" must stay distinguishable from
+    /// "value 0", the same reason `seq`/`ts` are never `skip_serializing_if`-trimmed. Lets a
+    /// client derive a batch's true line count/span without re-deriving it by counting
+    /// filtered lines locally (see PROTOCOL-ROADMAP.md's seq-drift fix) - the sender always
+    /// knows the true count; the receiver may not, once it applies its own line filters
+    /// (ANSI-only lines, idler markers, grep mode).
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true", skip_serializing_if = "is_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default, skip_serializing_if = "Option::is_none")] end_seq: Option<u64>, #[serde(default, skip_serializing_if = "is_false")] marked_new: bool, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
@@ -548,11 +557,16 @@ pub enum WsMessage {
     /// seq > after_seq) - used for the reconnect gap-fill path, where the client kept its
     /// buffer across the reconnect and only wants what accumulated while it was away.
     /// At most one of before_seq/after_seq should be set; before_seq takes precedence.
+    /// request_id: client-chosen correlator, echoed back on the matching `ScrollbackLines`
+    /// reply (seq-drift fix, PROTOCOL-ROADMAP.md follow-on). `#[serde(default)]` so an old
+    /// client omitting it is unaffected; the server just echoes back whatever it received
+    /// (including nothing, via the `Option`'s own default).
     RequestScrollback {
         world_index: usize,
         count: usize,
         #[serde(default)] before_seq: Option<u64>,
         #[serde(default)] after_seq: Option<u64>,
+        #[serde(default)] request_id: Option<u64>,
     },
 
     // Remote instance handling (server -> client)
@@ -564,8 +578,13 @@ pub enum WsMessage {
     },
     /// Periodic pending count update (sent every 2 seconds when pending count changes)
     PendingCountUpdate { world_index: usize, count: usize },
-    /// Response to RequestScrollback with historical lines
-    ScrollbackLines { world_index: usize, lines: Vec<TimestampedLine>, #[serde(default)] backfill_complete: bool },
+    /// Response to RequestScrollback with historical lines. request_id echoes the
+    /// originating `RequestScrollback.request_id` when the reply was solicited by one; the
+    /// RESERVED value `Some(0)` marks a server-initiated UNPROMPTED resume replay (the
+    /// `AuthRequest.resume` path, `App::handle_ws_auth_initial_state`) - see that path's
+    /// callers. `None` means either an old server that predates this field, or (defensively)
+    /// a reply the server couldn't correlate to any specific request.
+    ScrollbackLines { world_index: usize, lines: Vec<TimestampedLine>, #[serde(default)] backfill_complete: bool, #[serde(default)] request_id: Option<u64> },
     /// World switch result with appropriate initial data
     WorldSwitchResult {
         world_index: usize,

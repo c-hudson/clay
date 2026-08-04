@@ -2235,6 +2235,209 @@
     }
 
     #[test]
+    fn test_release_pending_screenful_broadcasts_exactly_what_it_releases() {
+        // Regression guard: release_pending_screenful used to size its broadcast set with
+        // visual_line_count (a full-width, div_ceil estimate) while World::release_pending
+        // itself decided what to actually move into output_lines using nli_visual_rows
+        // (NLI-narrowed width + real wrap_ansi_line wrapping). For a marked_new line with NLI
+        // enabled, nli_visual_rows is always >= visual_line_count's estimate, so the old code
+        // could broadcast more lines than were actually released - the surplus stayed in
+        // pending_lines and was broadcast AGAIN on the next release, with no way for any
+        // client to detect the duplicate (release batches use seq: 0).
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.output_width = 80;
+        app.output_height = 8; // visual_budget = output_height - 2 = 6
+        app.settings.new_line_indicator = true;
+
+        // 79 columns: at the full 80-col width that's 1 row (visual_line_count's estimate),
+        // but marked_new + NLI narrows the wrap width to 78, wrapping it to 2 rows
+        // (nli_visual_rows' real answer) - this is exactly where the two formulas diverge.
+        let line_text = "x".repeat(79);
+        for i in 0..6 {
+            let mut line = OutputLine::new(line_text.clone(), i as u64);
+            line.marked_new = true;
+            app.worlds[0].pending_lines.push(line);
+        }
+        app.worlds[0].paused = true;
+
+        let broadcast_line_count = |app: &App| -> usize {
+            let log = app.ws_broadcast_log.lock().unwrap();
+            log.iter().filter_map(|m| {
+                if let WsMessage::ServerData { data, .. } = m { Some(data.lines().count()) } else { None }
+            }).sum()
+        };
+
+        app.release_pending_screenful();
+        let remaining_after_first = app.worlds[0].pending_lines.len();
+        let actually_released_first = 6 - remaining_after_first;
+        // With the corrected accounting, budget 6 / nli_visual_rows 2-per-line releases
+        // exactly 3 lines - not all 6, which is what the old visual_line_count-based
+        // broadcast estimate would have sent.
+        assert_eq!(actually_released_first, 3, "sanity check on the crafted budget/row-count divergence");
+        assert_eq!(broadcast_line_count(&app), actually_released_first,
+            "broadcast line count must exactly match the lines actually moved into output_lines");
+
+        // Second release: confirm the previously-released lines are never re-sent.
+        app.ws_broadcast_log.lock().unwrap().clear();
+        app.release_pending_screenful();
+        let remaining_after_second = app.worlds[0].pending_lines.len();
+        let actually_released_second = remaining_after_first - remaining_after_second;
+        assert_eq!(broadcast_line_count(&app), actually_released_second,
+            "second release must not re-broadcast lines already sent in the first batch");
+    }
+
+    #[test]
+    fn test_released_pending_carries_real_seqs_no_false_duplicate() {
+        // Regression guard: release broadcasts used to send seq: 0 unconditionally ("bypass
+        // client-side dedup"), hiding the real seq from clients entirely. Step 6 of the
+        // seq-drift fix makes real seqs safe here (World::output_lines is guaranteed
+        // seq-sorted through a pause as of Step 4's gagged-line fix) and sends the true span
+        // instead, so a client's dedup/gap-tracking sees the real seq range rather than being
+        // unable to reason about it at all.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+
+        // Simulate 3 lines already delivered (seq 0,1,2) - the "already broadcast" baseline.
+        for i in 0..3u64 {
+            let seq = app.worlds[0].next_seq;
+            app.worlds[0].next_seq += 1;
+            app.worlds[0].output_lines.push(OutputLine::new(format!("line {i}"), seq));
+        }
+        let last_broadcast_seq = app.worlds[0].output_lines.last().unwrap().seq;
+
+        // Pause and accumulate two pending lines (seq 3, 4).
+        app.worlds[0].paused = true;
+        for i in 3..5u64 {
+            let seq = app.worlds[0].next_seq;
+            app.worlds[0].next_seq += 1;
+            app.worlds[0].pending_lines.push(OutputLine::new(format!("line {i}"), seq));
+        }
+
+        app.ws_broadcast_log.lock().unwrap().clear();
+        app.release_pending_screenful();
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data: Vec<(u64, Option<u64>)> = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { seq, end_seq, .. } = m { Some((*seq, *end_seq)) } else { None }
+        }).collect();
+        assert_eq!(server_data.len(), 1, "expected one batch for two contiguous same-flag lines: {server_data:?}");
+        let (seq, end_seq) = server_data[0];
+        assert_eq!(seq, 3);
+        assert_eq!(end_seq, Some(4));
+        assert!(seq > last_broadcast_seq,
+            "released batch's seq ({seq}) must be strictly greater than what was already broadcast ({last_broadcast_seq})");
+    }
+
+    #[test]
+    fn test_selective_flush_emits_contiguous_seq_runs() {
+        // Regression guard: selective_flush's kept lines are typically NOT seq-contiguous
+        // (only lines matching the highlight filter survive; the rest are discarded), so
+        // broadcast_released_lines' batch grouping must treat a seq gap as a batch boundary
+        // even when marked_new/from_server don't change - otherwise a single batch's
+        // seq..=end_seq span would claim to cover a gap it doesn't actually contain.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].paused = true;
+
+        for i in 0..5u64 {
+            let seq = app.worlds[0].next_seq;
+            app.worlds[0].next_seq += 1;
+            let mut line = OutputLine::new(format!("line {i}"), seq);
+            if i == 1 || i == 3 {
+                line.highlight_color = Some("red".to_string());
+            }
+            app.worlds[0].pending_lines.push(line);
+        }
+
+        app.selective_flush(0);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data: Vec<(u64, Option<u64>)> = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { seq, end_seq, .. } = m { Some((*seq, *end_seq)) } else { None }
+        }).collect();
+        assert_eq!(server_data.len(), 2,
+            "two non-contiguous highlighted lines must produce two separate batches: {server_data:?}");
+        assert_eq!(server_data[0], (1, Some(1)));
+        assert_eq!(server_data[1], (3, Some(3)));
+    }
+
+    #[test]
+    fn test_add_output_broadcasts_real_seq() {
+        // Regression guard: App::add_output used to broadcast the raw input text with
+        // seq: 0 unconditionally, regardless of the real seq the line actually got in
+        // output_lines (and without checking whether it landed there at all vs.
+        // pending_lines while paused). Assert the emitted ServerData carries the real seq.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        // Seed a couple of real seqs first so the new line's seq is non-zero - proves it's
+        // a real derived value, not coincidentally matching the old seq: 0 sentinel.
+        for i in 0..2u64 {
+            let seq = app.worlds[0].next_seq;
+            app.worlds[0].next_seq += 1;
+            app.worlds[0].output_lines.push(OutputLine::new(format!("line {i}"), seq));
+        }
+
+        app.ws_broadcast_log.lock().unwrap().clear();
+        app.add_output("a system message");
+
+        let expected_seq = app.worlds[0].output_lines.last().unwrap().seq;
+        assert_eq!(expected_seq, 2);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data: Vec<(u64, Option<u64>)> = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { seq, end_seq, .. } = m { Some((*seq, *end_seq)) } else { None }
+        }).collect();
+        assert_eq!(server_data.len(), 1, "{server_data:?}");
+        assert_eq!(server_data[0], (expected_seq, Some(expected_seq)));
+    }
+
+    #[test]
+    fn test_add_output_to_world_broadcasts_real_seq() {
+        // Same regression guard as test_add_output_broadcasts_real_seq, for the
+        // background-world variant - also confirms marked_new correctly reflects
+        // !is_current (the old hardcoded `marked_new: false` was inconsistent with what
+        // World::add_output itself stores on a line pushed for a non-current world).
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("current"));
+        app.worlds.push(World::new("background"));
+        app.current_world_index = 0;
+
+        for i in 0..2u64 {
+            let seq = app.worlds[1].next_seq;
+            app.worlds[1].next_seq += 1;
+            app.worlds[1].output_lines.push(OutputLine::new(format!("line {i}"), seq));
+        }
+
+        app.ws_broadcast_log.lock().unwrap().clear();
+        app.add_output_to_world(1, "background world message");
+
+        let expected_seq = app.worlds[1].output_lines.last().unwrap().seq;
+        assert_eq!(expected_seq, 2);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data: Vec<(usize, u64, Option<u64>, bool)> = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { world_index, seq, end_seq, marked_new, .. } = m {
+                Some((*world_index, *seq, *end_seq, *marked_new))
+            } else { None }
+        }).collect();
+        assert_eq!(server_data.len(), 1, "{server_data:?}");
+        assert_eq!(server_data[0], (1, expected_seq, Some(expected_seq), true),
+            "must carry the real seq and marked_new: true (background world, not current)");
+    }
+
+    #[test]
     fn test_clear_connection_state_resets_all_negotiation_and_session_fields() {
         // Regression guard for the daemon.rs /disconnect fix (T3 of the command-
         // duplication audit): daemon.rs used to hand-roll 7 field resets inline
@@ -4495,6 +4698,97 @@ if you're more curious.\"";
         }
     }
 
+    /// Asserts `world.output_lines` is strictly increasing by `seq` - the invariant
+    /// `App::broadcast_released_lines`'s real-seq broadcasts (once wired up, see Step 6 of
+    /// the seq-drift fix) depend on. Reusable across any test that pushes/releases lines.
+    fn assert_output_lines_seq_sorted(world: &World) {
+        for pair in world.output_lines.windows(2) {
+            assert!(pair[0].seq < pair[1].seq,
+                "output_lines must be strictly increasing by seq, found {} immediately followed by {}: {:?}",
+                pair[0].seq, pair[1].seq,
+                world.output_lines.iter().map(|l| l.seq).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn test_gagged_line_while_paused_does_not_jump_ahead_of_pending() {
+        // Regression guard: process_server_data's gagged-line loop used to push straight
+        // into output_lines unconditionally, even while the world was paused with
+        // pending_lines holding earlier (lower-seq) lines not yet released. That gave a
+        // gagged line a NEWER seq immediately visible in output_lines, while an OLDER-seq
+        // line sat in pending_lines - so once that pending line was eventually released and
+        // appended after it, output_lines ended up with a seq dip in the middle. This is the
+        // real root cause the release paths' `seq: 0` hack was working around (see
+        // App::broadcast_released_lines' doc comment).
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("test");
+        world.paused = true;
+        world.settings.keep_alive_type = KeepAliveType::Custom;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+
+        // "hello world" is a normal server line - while paused with more-mode on, it goes
+        // to pending_lines (World::add_output's goes_to_pending path). The idler marker is
+        // unconditionally gagged regardless of action config (process_server_data's
+        // idler-keepalive handling). Both arrive in the SAME chunk, exercising the exact
+        // scenario the fix targets: a gagged line processed alongside pending non-gagged
+        // output from the same read.
+        app.process_server_data(0, b"hello world\r\n###_idler_message_1_###\r\n", 24, 80, false);
+
+        assert!(app.worlds[0].output_lines.is_empty(),
+            "nothing should have been released to output_lines while paused - the gagged line must not jump ahead");
+        assert_eq!(app.worlds[0].pending_lines.len(), 2,
+            "both the visible line and the gagged line must be queued in pending_lines: {:?}",
+            app.worlds[0].pending_lines.iter().map(|l| (l.seq, l.gagged)).collect::<Vec<_>>());
+        assert!(!app.worlds[0].pending_lines[0].gagged, "the visible line must be first (lower seq)");
+        assert!(app.worlds[0].pending_lines[1].gagged, "the gagged line must be second (higher seq)");
+        assert!(app.worlds[0].pending_lines[0].seq < app.worlds[0].pending_lines[1].seq,
+            "pending_lines must stay seq-ordered");
+
+        // Release everything and confirm output_lines comes out seq-sorted, not dipping.
+        // release_all_pending() already moves the lines into output_lines itself (Step 1's
+        // refactor) - no separate extend needed here.
+        let released = app.worlds[0].release_all_pending();
+        assert_eq!(released.len(), 2);
+        assert_eq!(app.worlds[0].output_lines.len(), 2);
+        assert_output_lines_seq_sorted(&app.worlds[0]);
+    }
+
+    #[test]
+    fn test_server_data_end_seq_covers_filtered_lines() {
+        // Regression guard for the seq-drift fix: ServerData.end_seq must span the full
+        // batch as the server actually pushed it to output_lines, independent of what a
+        // client might locally filter out for display (e.g. ANSI-only lines - the server
+        // does NOT gag/drop those, only web/GUI/Android clients filter them for rendering).
+        // A client deriving _max_seq from its own locally-filtered line count instead of
+        // trusting end_seq is exactly the drift this field exists to eliminate.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        // Two real lines - the second is ANSI-reset-only with no visible content.
+        app.process_server_data(0, b"visible line\r\n\x1b[0m\r\n", 24, 80, false);
+
+        let expected_seqs: Vec<u64> = app.worlds[0].output_lines.iter().map(|l| l.seq).collect();
+        assert_eq!(expected_seqs.len(), 2, "both lines should have been pushed to output_lines: {expected_seqs:?}");
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data_msgs: Vec<(u64, Option<u64>)> = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { world_index, seq, end_seq, .. } = m {
+                if *world_index == 0 { Some((*seq, *end_seq)) } else { None }
+            } else { None }
+        }).collect();
+
+        assert_eq!(server_data_msgs.len(), 1, "expected exactly one ServerData broadcast for this batch: {server_data_msgs:?}");
+        let (seq, end_seq) = server_data_msgs[0];
+        assert_eq!(seq, expected_seqs[0]);
+        assert_eq!(end_seq, Some(expected_seqs[1]),
+            "end_seq must span the full batch as pushed to output_lines, not a locally-filtered count");
+    }
+
     // --- Integration test with test harness ---
 
     #[tokio::test]
@@ -4849,7 +5143,8 @@ if you're more curious.\"";
         // World 0 has local lines: backfill_next should anchor on its oldest seq and ask
         // for just enough to reach the phase 1 target (75 - 10 = 65), not a fixed chunk.
         app.backfill_advance_to_next();
-        assert_eq!(app.backfill_next, Some((0, Some(0), 65)),
+        let (w0, seq0, count0, _rid0) = app.backfill_next.take().expect("phase 1 should still be issuing requests");
+        assert_eq!((w0, seq0, count0), (0, Some(0), 65),
             "world 0 already has local lines, should backfill older history from its oldest \
              seq, requesting only enough to reach the phase 1 target");
 
@@ -4857,7 +5152,8 @@ if you're more curious.\"";
         // not silently dropped. before_seq: None is the correct request - the daemon
         // handles it as "send the last N lines". It needs the full phase 1 target (75).
         app.backfill_advance_to_next();
-        assert_eq!(app.backfill_next, Some((1, None, 75)),
+        let (w1, seq1, count1, _rid1) = app.backfill_next.take().expect("phase 1 should still be issuing requests");
+        assert_eq!((w1, seq1, count1), (1, None, 75),
             "a budget-starved world (real history, zero local lines) must still be requested \
              via RequestScrollback{{before_seq: None}}, not silently dropped from the queue");
     }
@@ -4895,7 +5191,7 @@ if you're more curious.\"";
         // prepending lines directly - no further advance needed until the next iteration.
         for expected_world in [0usize, 1, 2] {
             app.backfill_advance_to_next();
-            let (world_idx, before_seq, count) = app.backfill_next.take()
+            let (world_idx, before_seq, count, _request_id) = app.backfill_next.take()
                 .expect("phase 1 should still be issuing requests");
             assert_eq!(world_idx, expected_world, "phase 1 should proceed in queue order");
             assert_eq!(count, 75, "phase 1 chunk for an empty world should request the full target");
@@ -4919,7 +5215,7 @@ if you're more curious.\"";
             guard += 1;
             assert!(guard < 100, "backfill should terminate, not loop forever");
             app.backfill_advance_to_next();
-            let Some((world_idx, before_seq, count)) = app.backfill_next.take() else {
+            let Some((world_idx, before_seq, count, _request_id)) = app.backfill_next.take() else {
                 break; // backfill fully complete
             };
             assert_eq!(app.backfill_phase, 2, "should have auto-transitioned to phase 2");
@@ -5037,10 +5333,15 @@ if you're more curious.\"";
         // (PROTOCOL-ROADMAP.md Step 8).
         while let Ok(item) = rx.try_recv() {
             if let Outbound::Message(msg) = item {
-                if let WsMessage::ScrollbackLines { world_index, lines, backfill_complete } = *msg {
+                if let WsMessage::ScrollbackLines { world_index, lines, backfill_complete, request_id } = *msg {
                     assert_eq!(world_index, 0);
                     assert!(backfill_complete,
                         "the whole gap fits in one reply, so backfill should be reported complete");
+                    // Step 11 (seq-drift fix, on-the-android-app-calm-curry plan): a
+                    // server-initiated unprompted resume replay always carries the reserved
+                    // request_id Some(0), distinguishing it from a client-solicited reply.
+                    assert_eq!(request_id, Some(0),
+                        "resume replay must use the reserved request_id Some(0)");
                     assert!(scrollback_lines.is_none(), "resume replay must send exactly one ScrollbackLines reply per world, not several");
                     scrollback_lines = Some(lines);
                 }
@@ -5119,6 +5420,123 @@ if you're more curious.\"";
         assert!(!saw_scrollback, "an empty resume list must not trigger any replay - first-time connections must be unaffected");
     }
 
+    /// Step 11 (seq-drift fix, on-the-android-app-calm-curry plan): a client-supplied
+    /// `RequestScrollback.request_id` must be echoed back verbatim on the matching
+    /// `ScrollbackLines` reply, so the client can correlate replies to requests instead of
+    /// routing purely on ambiguous local state (the app.js `_gapFillPending`
+    /// stuck-true-after-RequestState bug this correlator exists to fix).
+    #[test]
+    fn test_request_scrollback_echoes_request_id() {
+        use crate::websocket::{WsMessage, WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=10u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true,
+                tx,
+                current_world: None,
+                username: None,
+                received_initial_state: true,
+                client_type: RemoteClientType::Web,
+                viewport_height: 24,
+                ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                paused: false,
+                acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        app.handle_request_scrollback(client_id, 0, 5, None, None, Some(42));
+
+        let mut request_id = None;
+        while let Ok(item) = rx.try_recv() {
+            if let Outbound::Message(msg) = item {
+                if let WsMessage::ScrollbackLines { request_id: rid, .. } = *msg {
+                    request_id = Some(rid);
+                }
+            }
+        }
+        assert_eq!(request_id, Some(Some(42)), "the client-supplied request_id must be echoed back verbatim");
+
+        // A request with no request_id (an old client, or one with nothing to correlate)
+        // must echo back None, not silently invent a value.
+        app.handle_request_scrollback(client_id, 0, 5, None, None, None);
+        let mut second_request_id = None;
+        while let Ok(item) = rx.try_recv() {
+            if let Outbound::Message(msg) = item {
+                if let WsMessage::ScrollbackLines { request_id: rid, .. } = *msg {
+                    second_request_id = Some(rid);
+                }
+            }
+        }
+        assert_eq!(second_request_id, Some(None), "an absent request_id must be echoed back as None, not fabricated");
+    }
+
+    /// `App::ws_broadcast` used to check only `client.authenticated`, unlike its three
+    /// `WebSocketServer` siblings (`broadcast_to_owner`/`broadcast_to_all`/
+    /// `broadcast_to_world_viewers`), which all also require `received_initial_state` -
+    /// specifically to stop a broadcast reaching a client before the InitialState that (for
+    /// output messages) contains the same lines, which causes SEQ MISMATCH/duplicate errors
+    /// once that InitialState arrives. A whitelisted client is inserted with
+    /// `authenticated: true` before the app loop ever sees the connection, so this window was
+    /// real, not just theoretical.
+    #[test]
+    fn test_ws_broadcast_skips_client_without_initial_state() {
+        use crate::websocket::{WsMessage, WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        let mut app = App::new();
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true,
+                tx,
+                current_world: None,
+                username: None,
+                received_initial_state: false,
+                client_type: RemoteClientType::Web,
+                viewport_height: 24,
+                ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                paused: false,
+                acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        app.ws_broadcast(WsMessage::PendingReleased { world_index: 0, count: 3 });
+        assert!(rx.try_recv().is_err(), "a client that hasn't received InitialState must not get a broadcast");
+
+        // Flip the flag and confirm the same broadcast now goes through - proves the
+        // filter is the reason for the earlier miss, not something else swallowing it.
+        {
+            let mut clients = app.ws_server.as_ref().unwrap().clients.write().unwrap();
+            clients.get_mut(&client_id).unwrap().received_initial_state = true;
+        }
+        app.ws_broadcast(WsMessage::PendingReleased { world_index: 0, count: 3 });
+        let received = rx.try_recv();
+        assert!(received.is_ok(), "the same broadcast must be delivered once received_initial_state is true");
+    }
+
     // --- PROTOCOL-ROADMAP.md Step 3: bounded channel + ResyncRequired on overflow ---
 
     /// A client whose outbound channel overflows must not have the overflow silently
@@ -5163,6 +5581,7 @@ if you're more curious.\"";
             ts: 0,
             from_server: true,
             seq,
+            end_seq: None,
             marked_new: false,
             flush: false,
             gagged: false,
@@ -5234,6 +5653,7 @@ if you're more curious.\"";
             ts: 0,
             from_server: true,
             seq,
+            end_seq: None,
             marked_new: false,
             flush: false,
             gagged: false,
@@ -5284,7 +5704,7 @@ if you're more curious.\"";
         app.handle_remote_ws_message(WsMessage::ResyncRequired { world_index: 0, from_seq: 5 });
         let sent = rx.try_recv().expect("ResyncRequired must trigger a RequestScrollback");
         match sent {
-            WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
+            WsMessage::RequestScrollback { world_index, count, before_seq, after_seq, .. } => {
                 assert_eq!(world_index, 0);
                 assert_eq!(before_seq, None);
                 assert_eq!(after_seq, Some(5));
@@ -5310,6 +5730,7 @@ if you're more curious.\"";
             world_index: 0,
             lines: gap_lines,
             backfill_complete: true,
+            request_id: None,
         });
 
         // Complete: all 15 lines present, no permanent loss.
@@ -5322,6 +5743,69 @@ if you're more curious.\"";
         let expected: Vec<String> = (1..=15u64).map(|n| format!("line{n}")).collect();
         assert_eq!(texts, expected, "gap-filled lines must be spliced back into their exact \
             chronological position, producing a complete, in-order buffer");
+    }
+
+    /// PROTOCOL-ROADMAP.md's seq-drift fix, Step 12b: a scroll-triggered `before_seq`
+    /// backfill reply arriving while `world.pending_gap` happens to be open (from an
+    /// unrelated outstanding resync) must be routed by its own registered `request_id`
+    /// kind, not misrouted into the gap-fill splice path purely because `pending_gap` is
+    /// `Some`. Before this fix, EVERY line in a genuine older-history reply would fail the
+    /// splice path's `l.seq > last_contiguous_seq` filter (they're all older, by
+    /// definition) and be silently dropped instead of prepended.
+    #[test]
+    fn test_console_client_scroll_backfill_reply_not_treated_as_gap_fill() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("world0"));
+        app.current_world_index = 0;
+
+        let (tx, mut _rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        app.ws_client_tx = Some(tx);
+
+        // Establish a buffer starting at seq 101 (leaving room "below" it for an
+        // older-history backfill reply) and open a gap the same way
+        // test_console_client_resync_gap_fill_restores_order_no_loss does: a batch that
+        // jumps ahead of max_received_seq.
+        app.handle_remote_ws_message(console_server_data(0, 101,
+            &["line101", "line102", "line103", "line104", "line105"]));
+        app.handle_remote_ws_message(console_server_data(0, 111,
+            &["line111", "line112", "line113", "line114", "line115"]));
+        assert_eq!(app.worlds[0].pending_gap, Some((5, 105)),
+            "sanity check: a gap must be open before this test's actual scenario begins");
+        let lines_before = app.worlds[0].output_lines.len();
+
+        // Register a genuine Backfill request (mirrors scroll_page_up's registration in
+        // remote_client.rs) and receive its reply while pending_gap is STILL open - the
+        // exact race this fix targets.
+        let backfill_id = app.register_scrollback_request(0, ScrollbackRequestKind::Backfill);
+        let older_lines: Vec<TimestampedLine> = (90..=100u64).map(|seq| TimestampedLine {
+            text: format!("line{seq}"),
+            ts: 0,
+            gagged: false,
+            from_server: true,
+            seq,
+            highlight_color: None,
+            marked_new: false,
+            from_archive: false,
+        }).collect();
+        let older_count = older_lines.len();
+        app.handle_remote_ws_message(WsMessage::ScrollbackLines {
+            world_index: 0,
+            lines: older_lines,
+            backfill_complete: true,
+            request_id: Some(backfill_id),
+        });
+
+        assert_eq!(app.worlds[0].output_lines.len(), lines_before + older_count,
+            "the older-history reply must be prepended (all lines kept), not dropped by the \
+             gap-fill splice path's seq > last_contiguous_seq filter");
+        assert_eq!(app.worlds[0].output_lines.first().map(|l| l.text.as_str()), Some("line90"),
+            "the oldest line must end up at the very front of the buffer (prepended)");
+        assert_eq!(app.worlds[0].pending_gap, Some((5, 105)),
+            "pending_gap must be completely untouched by this reply - it belongs to a \
+             different, still-unanswered request");
+        assert!(!app.pending_scrollback_requests.contains_key(&backfill_id),
+            "the resolved request must be removed from pending_scrollback_requests");
     }
 
     /// `PongCheck.acked` must report the last *contiguous* seq, not the highest seq seen -
@@ -5875,6 +6359,11 @@ if you're more curious.\"";
             ts: 12345,
             from_server: true,
             seq: 7,
+            // Step 5 (seq-drift fix): end_seq is None whenever the sender doesn't know a
+            // batch's true span (the overwhelming majority of ServerData sites - ephemeral
+            // system/command-reply messages) and must stay omitted from the wire in that
+            // case, same skip_serializing_if treatment as flush/gagged.
+            end_seq: None,
             marked_new: false,
             flush: false,
             gagged: false,
@@ -5884,16 +6373,18 @@ if you're more curious.\"";
         assert!(!json.contains("marked_new"), "marked_new should be omitted when false: {}", json);
         assert!(!json.contains("flush"), "flush should still be omitted when false: {}", json);
         assert!(!json.contains("gagged"), "gagged should still be omitted when false: {}", json);
+        assert!(!json.contains("end_seq"), "end_seq should be omitted when None: {}", json);
 
         let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
         match round_tripped {
-            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, marked_new, flush, gagged } => {
+            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, end_seq, marked_new, flush, gagged } => {
                 assert_eq!(world_index, 0);
                 assert_eq!(data, "hello\n");
                 assert!(is_viewed);
                 assert_eq!(ts, 12345);
                 assert!(from_server, "from_server must default back to true");
                 assert_eq!(seq, 7);
+                assert_eq!(end_seq, None, "end_seq must default back to None");
                 assert!(!marked_new, "marked_new must default back to false");
                 assert!(!flush);
                 assert!(!gagged);
@@ -5904,7 +6395,9 @@ if you're more curious.\"";
 
     /// Companion to the above: confirms the non-default values (from_server: false,
     /// marked_new: true) are still explicitly present on the wire, so the new
-    /// `skip_serializing_if` is conditional on the default, not a blanket omission.
+    /// `skip_serializing_if` is conditional on the default, not a blanket omission. Also
+    /// covers end_seq's present case: a real Some(u64) value must round-trip on the wire,
+    /// not be trimmed - only None is omitted.
     #[test]
     fn test_server_data_non_default_from_server_and_marked_new_are_serialized() {
         let msg = WsMessage::ServerData {
@@ -5914,6 +6407,7 @@ if you're more curious.\"";
             ts: 0,
             from_server: false,
             seq: 0,
+            end_seq: Some(5),
             marked_new: true,
             flush: false,
             gagged: false,
@@ -5921,12 +6415,14 @@ if you're more curious.\"";
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"from_server\":false"), "from_server:false must be present on the wire: {}", json);
         assert!(json.contains("\"marked_new\":true"), "marked_new:true must be present on the wire: {}", json);
+        assert!(json.contains("\"end_seq\":5"), "end_seq:Some(5) must be present on the wire, not trimmed: {}", json);
 
         let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
         match round_tripped {
-            WsMessage::ServerData { from_server, marked_new, .. } => {
+            WsMessage::ServerData { from_server, marked_new, end_seq, .. } => {
                 assert!(!from_server);
                 assert!(marked_new);
+                assert_eq!(end_seq, Some(5));
             }
             other => panic!("expected ServerData, got {:?}", other),
         }

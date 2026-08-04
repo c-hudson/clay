@@ -177,12 +177,37 @@ highest-seen seq," which could silently miss an older hole a later batch had
 leapfrogged. That client-side heuristic machinery (`_seqGaps`,
 `recordSeqGapIfAny`/`findOverlappingSeqGap`/`shrinkSeqGap`/
 `insertLinesBySeq` in `app.js`) is still present as a defense-in-depth safety
-net for mid-stream reordering on transports that can still reorder locally
-(notably the Android WebView bridge before PROTOCOL-ROADMAP.md Step 7), but
-it is no longer what reconnect gap recovery depends on — `resume`/`acked`/
-`ResyncRequired` is now the authoritative contract, and the exact server-side
-replay it drives is unbounded and precise rather than capped and
-best-effort.
+net — no longer the primary defense against Android WebView bridge
+reordering (PROTOCOL-ROADMAP.md Step 7 shipped: `evaluateJavascript`
+fire-and-forget push replaced by an ordered-queue pull, `drainWsQueue()`),
+but still load-bearing for the `ResyncRequired`/channel-overflow case above,
+where a recovered batch legitimately belongs mid-buffer and must be spliced,
+not appended. It is no longer what reconnect gap recovery depends on —
+`resume`/`acked`/`ResyncRequired` is now the authoritative contract, and the
+exact server-side replay it drives is unbounded and precise rather than
+capped and best-effort.
+
+**`request_id` — correlating a reply to the request that caused it.**
+`RequestScrollback` carries an optional `request_id: Option<u64>`
+(`#[serde(default)]`); the matching `ScrollbackLines` reply echoes it back
+verbatim. This exists because `world_index` + `backfill_complete` alone
+don't disambiguate *why* a client asked — a client can have both a gap-fill
+(catch-up) request and an ordinary older-history backfill request
+outstanding for the same world at once, and the two replies must be handled
+differently (append-and-splice vs. prepend). `Some(0)` is **reserved**: it
+marks a reply the client never asked for — the server-initiated unprompted
+resume replay driven by `AuthRequest.resume`
+(`App::handle_ws_auth_initial_state` and its daemon/multiuser equivalents).
+A client that sent no `request_id` (or receives one it doesn't recognize —
+an old server, or a stale id from a since-abandoned request) falls back to
+whatever local heuristic it used before this field existed (`app.js`:
+`world._gapFillPending`; the `--console` client: `World::pending_gap`) —
+`request_id` is an optimization that removes an ambiguity those heuristics
+couldn't resolve on their own, not a replacement for them; both clients keep
+their heuristic as the fallback path. See PROTOCOL-ROADMAP.md's
+seq-drift-fix Phase B, Steps 11-12b, for the full incident this closes (a
+scrollback-progress indicator that could get permanently stuck, and in the
+`--console` client's case, silently dropped backfill replies).
 
 ## `ServerData`: the live-output message
 
@@ -201,28 +226,45 @@ Full field list (`src/websocket.rs`, the `ServerData` variant):
 `world_index: usize`, `data: String`, `is_viewed: bool`, `ts: u64`
 (`#[serde(default)]`), `from_server: bool` (`#[serde(default =
 "default_true", skip_serializing_if = "is_true")]`), `seq: u64`
-(`#[serde(default)]`), `marked_new: bool` (`#[serde(default,
-skip_serializing_if = "is_false")]`), `flush: bool` (`#[serde(default,
-skip_serializing_if = "is_false")]`), `gagged: bool` (`#[serde(default,
-skip_serializing_if = "is_false")]`).
+(`#[serde(default)]`), `end_seq: Option<u64>` (`#[serde(default,
+skip_serializing_if = "Option::is_none")]`), `marked_new: bool`
+(`#[serde(default, skip_serializing_if = "is_false")]`), `flush: bool`
+(`#[serde(default, skip_serializing_if = "is_false")]`), `gagged: bool`
+(`#[serde(default, skip_serializing_if = "is_false")]`).
 
 Four of these fields are omitted from the wire entirely when they hold their
 common-case value (bandwidth — `ServerData` is by far the highest-volume
 message type, so trimming a few bytes per line adds up): `from_server`
 (omitted when `true`, the overwhelming common case by message volume — real
 MUD output), `marked_new` (omitted when `false`), `flush` (omitted when
-`false`), and `gagged` (omitted when `false`). A client must treat an absent
-field as its documented default, not as "unknown" — `serde`'s `#[default]`
-attributes reconstruct the true value on decode, and this is round-trip
-tested (`src/tests.rs`,
+`false`), and `gagged` (omitted when `false`). `end_seq` is a fifth,
+omitted whenever it's `None`. A client must treat an absent field as its
+documented default, not as "unknown" — `serde`'s `#[default]` attributes
+reconstruct the true value on decode, and this is round-trip tested
+(`src/tests.rs`,
 `test_server_data_common_case_omits_from_server_and_marked_new` /
 `test_server_data_non_default_from_server_and_marked_new_are_serialized`).
 `world_index`, `data`, `is_viewed`, `seq`, and `ts` are always present —
 `seq` in particular must never be silently omitted-as-zero, since 0 is a
 legitimate value (a client-generated/pending-release marker) and needs to
-stay distinguishable from "field absent."
+stay distinguishable from "field absent." `end_seq` follows the same rule
+for the same reason (see below) and is why it's `Option<u64>` rather than a
+trimmed `u64`, unlike `from_server`/`marked_new`/`flush`/`gagged`.
 
 Field meanings:
+- `end_seq`: the seq of the **last** line in this batch, present only when
+  the sender actually built `data` from a contiguous slice of real,
+  seq-assigned lines (the live MUD-output path and the release-pending
+  paths) — `None` for the ~50 ephemeral system/command-reply broadcast
+  sites, which never consumed real seqs (`seq: 0` there is correct and
+  unrelated to trimming). A batch's true line count is therefore
+  `end_seq - seq + 1` when `end_seq` is present; a client deriving a
+  per-line seq from `seq + <local index into its own filtered line count>`
+  instead of the true `end_seq` will drift the moment it drops any line the
+  server didn't (ANSI-only lines, idler markers, grep-mode filtering) — this
+  drift, compounding over a session, is what produced phantom seq gaps and
+  spurious duplicate lines on reconnect before `end_seq` existed. See
+  PROTOCOL-ROADMAP.md's seq-drift-fix Phase B for the full incident.
 - `is_viewed`: true if any connected interface is currently viewing this
   world. Note this does **not** mean the server only sends `ServerData` to
   clients focused on that world — every authenticated client receives every
@@ -287,9 +329,9 @@ keybind editor (`RequestKeybindEditorState`, `UpdateKeybindEditorBindings`,
 `UpdateNote`, `NoteEditorState`, `NotesChanged`).
 
 **Scrollback / resume**: `RequestScrollback { world_index, count,
-before_seq, after_seq }`, `ScrollbackLines { world_index, lines,
-backfill_complete }`, `ResyncRequired { world_index, from_seq }`. See the
-ordering contract section above.
+before_seq, after_seq, request_id }`, `ScrollbackLines { world_index, lines,
+backfill_complete, request_id }`, `ResyncRequired { world_index, from_seq }`.
+See the ordering contract section above.
 
 **Diagnostics** (client -> server, telemetry only — not part of the delivery
 contract itself): `ReportSeqMismatch`, `ReportDuplicate`,

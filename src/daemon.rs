@@ -1,6 +1,6 @@
 use std::io::{self, Write as IoWrite};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio::{
@@ -19,7 +19,6 @@ use crate::{
 use crate::actions::{action_commands_to_run,
     find_invocable_action, rewrite_slashless_action};
 use crate::commands::{connect_slack, connect_discord};
-use crate::websocket::TimestampedLine;
 // Only used by the #[cfg(test)] helpers below (RemoteConsole's own non-test use moved into
 // the now-shared App::handle_cycle_world in main.rs - T39).
 #[cfg(test)]
@@ -352,7 +351,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 // main.rs) so a single replay always covers the entire ring.
                                 const RESUME_REPLAY_MAX: usize = 10_000;
                                 for &(world_index, last_seq) in resume {
-                                    app.handle_request_scrollback(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq));
+                                    // request_id: Some(0) is the reserved value marking a
+                                    // server-initiated unprompted resume replay (see
+                                    // ScrollbackLines' doc comment in websocket.rs).
+                                    app.handle_request_scrollback(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq), Some(0));
                                 }
                             }
                         } else {
@@ -383,7 +385,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                             }),
@@ -398,7 +400,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                             });
@@ -619,7 +621,7 @@ pub async fn handle_daemon_ws_message(
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                             });
@@ -697,7 +699,7 @@ pub async fn handle_daemon_ws_message(
                                     is_viewed: false,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
-                                    seq: 0,
+                                    seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                                 });
@@ -813,7 +815,7 @@ pub async fn handle_daemon_ws_message(
                                     is_viewed: false,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
-                                    seq: 0,
+                                    seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                                 });
@@ -826,7 +828,7 @@ pub async fn handle_daemon_ws_message(
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                             });
@@ -867,7 +869,7 @@ pub async fn handle_daemon_ws_message(
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                         });
@@ -879,7 +881,7 @@ pub async fn handle_daemon_ws_message(
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                         });
@@ -943,7 +945,7 @@ pub async fn handle_daemon_ws_message(
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                         });
@@ -966,7 +968,7 @@ pub async fn handle_daemon_ws_message(
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                         });
@@ -982,7 +984,7 @@ pub async fn handle_daemon_ws_message(
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                         });
@@ -995,7 +997,7 @@ pub async fn handle_daemon_ws_message(
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                         });
@@ -1015,7 +1017,7 @@ pub async fn handle_daemon_ws_message(
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                     marked_new: false,
                     flush: false, gagged: false,
                     });
@@ -1059,7 +1061,7 @@ pub async fn handle_daemon_ws_message(
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                             });
@@ -1071,7 +1073,7 @@ pub async fn handle_daemon_ws_message(
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                             });
@@ -1092,7 +1094,7 @@ pub async fn handle_daemon_ws_message(
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -1107,7 +1109,7 @@ pub async fn handle_daemon_ws_message(
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -1132,7 +1134,7 @@ pub async fn handle_daemon_ws_message(
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                     marked_new: false,
                     flush: false, gagged: false,
                     });
@@ -1228,7 +1230,7 @@ pub async fn handle_daemon_ws_message(
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                             });
@@ -1264,7 +1266,7 @@ pub async fn handle_daemon_ws_message(
                                     is_viewed: false,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
-                                    seq: 0,
+                                    seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                                 });
@@ -1276,7 +1278,7 @@ pub async fn handle_daemon_ws_message(
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                             });
@@ -1376,7 +1378,7 @@ pub async fn handle_daemon_ws_message(
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                     marked_new: false,
                     flush: false, gagged: false,
                     });
@@ -1390,7 +1392,7 @@ pub async fn handle_daemon_ws_message(
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
-                    seq: 0,
+                    seq: 0, end_seq: None,
                 marked_new: false,
                 flush: false, gagged: false,
                 });
@@ -1430,7 +1432,7 @@ pub async fn handle_daemon_ws_message(
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                     marked_new: false,
                     flush: false, gagged: false,
                     });
@@ -1459,7 +1461,7 @@ pub async fn handle_daemon_ws_message(
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
-                    seq: 0,
+                    seq: 0, end_seq: None,
                     marked_new: false,
                     flush: false, gagged: false,
                 });
@@ -1820,8 +1822,8 @@ pub async fn handle_daemon_ws_message(
         WsMessage::CycleWorld { direction } => {
             app.handle_cycle_world(client_id, &direction);
         }
-        WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
-            app.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq);
+        WsMessage::RequestScrollback { world_index, count, before_seq, after_seq, request_id } => {
+            app.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq, request_id);
         }
         WsMessage::RequestWorldState { world_index } => {
             app.handle_request_world_state(client_id, world_index);
@@ -2135,7 +2137,7 @@ keep_alive_type=Generic
                                         is_viewed: true,
                                         ts: current_timestamp_secs(),
                                         from_server: false,
-                                        seq: 0,
+                                        seq: 0, end_seq: None,
                                         marked_new: false,
                                         flush: false, gagged: false,
                                     }, Some(&requesting_username));
@@ -2171,7 +2173,7 @@ keep_alive_type=Generic
                                         is_viewed: true,
                                         ts: current_timestamp_secs(),
                                         from_server: false,
-                                        seq: 0,
+                                        seq: 0, end_seq: None,
                                         marked_new: false,
                                         flush: false, gagged: false,
                                     }, Some(&requesting_username));
@@ -2208,7 +2210,7 @@ keep_alive_type=Generic
                                     is_viewed: true,
                                     ts: current_timestamp_secs(),
                                     from_server: true,
-                                    seq: 0,
+                                    seq: 0, end_seq: None,
                                     marked_new: false,
                                     flush: false, gagged: false,
                                 }, Some(&username));
@@ -3035,6 +3037,17 @@ pub async fn connect_daemon_world(
 /// which both key off position == server-global `world_index`. Only the sensitive
 /// connection-identifying fields are redacted for worlds this user doesn't own.
 pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
+    // Send only the most recent lines in InitialState for fast initial load, same
+    // remote_initial_lines-driven aggregate-plus-per-world budget single-user's
+    // build_initial_state uses (main.rs) - previously this function had NO cap at all, so a
+    // long-running multiuser connection could send its entire accumulated per-user output
+    // buffer in one InitialState message. Uses the same shared
+    // App::build_initial_output_lines helper so the two implementations can't silently
+    // diverge on this budget again.
+    let per_world_cap = app.settings.remote_initial_lines.max(1) as usize;
+    let total_line_budget = per_world_cap.max(500);
+    let mut budget_remaining = total_line_budget;
+
     // Show all worlds with per-user connection state
     let worlds: Vec<WorldStateMsg> = app.worlds.iter().enumerate()
         .map(|(idx, world)| {
@@ -3050,71 +3063,47 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
 
             // Use user's connection state or empty defaults
             let empty_output: Vec<OutputLine> = vec![];
-            let empty_pending: Vec<OutputLine> = vec![];
-            let (connected, output_lines, pending_lines, prompt, scroll_offset, paused, unseen_lines, last_send, last_recv) =
+            let (connected, output_lines, prompt, scroll_offset, paused, unseen_lines, last_send, last_recv, has_trailing_partial) =
                 if let Some(conn) = user_conn {
                     (
                         conn.connected,
                         &conn.output_lines,
-                        &conn.pending_lines,
                         conn.prompt.clone(),
                         conn.scroll_offset,
                         conn.paused,
                         conn.unseen_lines,
                         conn.last_send_time,
                         conn.last_receive_time,
+                        !conn.partial_line.is_empty() && !conn.partial_in_pending,
                     )
                 } else {
-                    (false, &empty_output, &empty_pending, String::new(), 0, false, 0, None, None)
+                    (false, &empty_output, String::new(), 0, false, 0, None, None, false)
                 };
 
-            let clean_output: Vec<String> = output_lines.iter()
-                .map(|s| s.text.replace('\r', ""))
-                .collect();
-            let clean_pending: Vec<String> = pending_lines.iter()
-                .map(|s| s.text.replace('\r', ""))
-                .collect();
+            let max_initial_lines = per_world_cap.min(budget_remaining);
             // Text stays prefix-free here, same as live ServerData broadcasts - the
             // "✨ " client-line marker is added at display time only (rendering.rs::
             // process_output_line for console/remote console, applyClientPrefix() in
             // web/app.js), keyed on `from_server` below.
-            let output_lines_ts: Vec<TimestampedLine> = output_lines.iter()
-                .map(|s| {
-                    TimestampedLine {
-                        text: s.text.replace('\r', ""),
-                        ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                        gagged: s.gagged,
-                        from_server: s.from_server,
-                        seq: s.seq,
-                        highlight_color: s.highlight_color.clone(),
-                        marked_new: s.marked_new,
-                        from_archive: s.from_archive,
-                    }
-                })
-                .collect();
-            let pending_lines_ts: Vec<TimestampedLine> = pending_lines.iter()
-                .map(|s| {
-                    TimestampedLine {
-                        text: s.text.replace('\r', ""),
-                        ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                        gagged: s.gagged,
-                        from_server: s.from_server,
-                        seq: s.seq,
-                        highlight_color: s.highlight_color.clone(),
-                        marked_new: s.marked_new,
-                        from_archive: s.from_archive,
-                    }
-                })
-                .collect();
+            let output_lines_ts = App::build_initial_output_lines(output_lines, has_trailing_partial, max_initial_lines);
+            budget_remaining = budget_remaining.saturating_sub(output_lines_ts.len());
 
             WorldStateMsg {
                 index: idx,
                 name: world.name.clone(),
                 connected,
-                output_lines: clean_output,
-                pending_lines: clean_pending,
+                // Legacy output_lines/pending_lines left empty - all clients prefer the
+                // _ts variants (see CLAUDE.md's "WebSocket InitialState" pattern; matches
+                // single-user's build_initial_state). pending_lines_ts is also left empty
+                // deliberately: pending lines stay server-side and are released via
+                // PgDn/Tab/ReleasePending, then broadcast to clients normally - sending them
+                // here too would double-deliver them once released (App::init_from_initial_state,
+                // the --console remote client's InitialState handler, populates
+                // world.pending_lines straight from pending_lines_ts with no dedup).
+                output_lines: Vec::new(),
+                pending_lines: Vec::new(),
                 output_lines_ts,
-                pending_lines_ts,
+                pending_lines_ts: Vec::new(),
                 prompt: prompt.replace('\r', ""),
                 scroll_offset,
                 paused,
@@ -3247,18 +3236,21 @@ pub async fn handle_multiuser_ws_message(
                         // so a single replay always covers the entire ring if needed.
                         const RESUME_REPLAY_MAX: usize = 10_000;
                         for (world_index, last_seq) in owned {
-                            app.handle_request_scrollback_owned(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq), uname);
+                            // request_id: Some(0) is the reserved value marking a
+                            // server-initiated unprompted resume replay (see
+                            // ScrollbackLines' doc comment in websocket.rs).
+                            app.handle_request_scrollback_owned(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq), Some(0), uname);
                         }
                     }
                 }
             }
         }
-        WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
+        WsMessage::RequestScrollback { world_index, count, before_seq, after_seq, request_id } => {
             // Owner-scoped (PROTOCOL-ROADMAP.md Step 6a) — multiuser previously had no
             // handler for this at all, so a client couldn't scroll back further than its
             // initial state. Reuses the same owner check as the AuthRequest.resume path.
             if let Some(ref uname) = username {
-                app.handle_request_scrollback_owned(client_id, world_index, count, before_seq, after_seq, uname);
+                app.handle_request_scrollback_owned(client_id, world_index, count, before_seq, after_seq, request_id, uname);
             }
         }
         WsMessage::PongCheck { acked, .. } => {
@@ -3412,6 +3404,39 @@ pub async fn handle_multiuser_ws_message(
                 let initial_state = build_multiuser_initial_state(app, uname);
                 if let Some(ws) = &app.ws_server {
                     ws.send_initial_state_and_mark(client_id, initial_state);
+                }
+                // Also send activity count and pause state, matching the single-user
+                // RequestState handler (App::handle_request_state, main.rs) - previously
+                // omitted here entirely (CLAUDE.md's three-dispatch-path rule). Computed
+                // per-user rather than reusing App::activity_count()/a shared paused flag:
+                // those iterate/read global World state with no owner filtering, which would
+                // leak another user's unseen-activity count or pause state across the
+                // multiuser boundary. current_world_index mirrors
+                // build_multiuser_initial_state's own "first world this user is connected
+                // to" convention, so the reported paused state matches what the InitialState
+                // just sent.
+                let activity_count = app.worlds.iter().enumerate()
+                    .filter(|(idx, _)| {
+                        app.user_connections.get(&(*idx, uname.clone()))
+                            .map(|c| c.unseen_lines > 0)
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if let Some(ws) = &app.ws_server {
+                    ws.send_to_client(client_id, WsMessage::ActivityUpdate { count: activity_count });
+                }
+                let current_world_index = app.user_connections.keys()
+                    .filter(|(_, u)| u == uname)
+                    .map(|(idx, _)| *idx)
+                    .min();
+                let is_paused = current_world_index
+                    .and_then(|idx| app.user_connections.get(&(idx, uname.clone())))
+                    .map(|c| c.paused)
+                    .unwrap_or(false);
+                if is_paused {
+                    if let Some(ws) = &app.ws_server {
+                        ws.send_to_client(client_id, WsMessage::PausedState { paused: true });
+                    }
                 }
             }
         }
@@ -3881,17 +3906,21 @@ mod resume_owner_scoping_tests {
         }
 
         // Attack 2: same thing, but via a direct RequestScrollback (the pre-existing gap
-        // this step also closes) instead of resume.
+        // this step also closes) instead of resume. request_id is a real, non-None value
+        // here (Step 11 of the seq-drift fix) - the correlator is purely a reply-routing
+        // hint for the client and must carry no authority of its own; attaching one must
+        // not change the security outcome.
         handle_multiuser_ws_message(&mut app, alice_id, WsMessage::RequestScrollback {
             world_index: 1,
             count: 10_000,
             before_seq: None,
             after_seq: Some(0),
+            request_id: Some(99),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);
         assert!(replies.is_empty(),
-            "alice must never receive ScrollbackLines for bob's world via a direct RequestScrollback naming his world_index, got {replies:?}");
+            "alice must never receive ScrollbackLines for bob's world via a direct RequestScrollback naming his world_index, got {replies:?} (attaching a request_id must not bypass the owner check)");
     }
 
     /// Positive companion to the leak test above (mirrors Step 2's single-user resume
@@ -3930,5 +3959,75 @@ mod resume_owner_scoping_tests {
         let clients = app.ws_server.as_ref().unwrap().clients.read().unwrap();
         let alice_client = clients.get(&alice_id).unwrap();
         assert_eq!(alice_client.acked_seq.get(&0), Some(&7));
+    }
+}
+
+#[cfg(test)]
+mod multiuser_initial_state_tests {
+    // Step 3 of the seq-drift/scrollback-reachability plan (on-the-android-app-calm-curry):
+    // build_multiuser_initial_state used to send a user's ENTIRE accumulated per-connection
+    // output buffer with no cap at all, unlike single-user's build_initial_state (which
+    // deliberately limits to remote_initial_lines-driven per-world/aggregate budgets - see
+    // CLAUDE.md's "WebSocket InitialState" pattern), and also populated pending_lines_ts
+    // (single-user deliberately sends none, since pending lines are delivered later via
+    // ServerData on release).
+    use super::*;
+
+    #[test]
+    fn test_multiuser_initial_state_caps_lines_and_omits_pending() {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+        let mut world = World::new("alice-world");
+        world.owner = Some("alice".to_string());
+        app.worlds.push(world);
+
+        let mut conn = UserConnection::new();
+        conn.connected = true;
+        for seq in 0..3000u64 {
+            conn.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.user_connections.insert((0, "alice".to_string()), conn);
+
+        let initial_state = build_multiuser_initial_state(&app, "alice");
+        if let WsMessage::InitialState { worlds, .. } = initial_state {
+            assert_eq!(worlds.len(), 1);
+            let cap = app.settings.remote_initial_lines.max(1) as usize;
+            assert!(worlds[0].output_lines_ts.len() <= cap,
+                "output_lines_ts must be capped (remote_initial_lines-driven budget), got {} lines with cap {}",
+                worlds[0].output_lines_ts.len(), cap);
+            assert!(worlds[0].output_lines_ts.len() < 3000,
+                "sanity check: the full 3000-line buffer must not have been sent uncapped");
+            assert!(worlds[0].pending_lines_ts.is_empty(),
+                "pending_lines_ts must stay empty in InitialState - pending lines are delivered via later ServerData on release, not here");
+            assert!(worlds[0].pending_lines.is_empty(), "legacy pending_lines must also stay empty");
+            assert!(worlds[0].output_lines.is_empty(), "legacy output_lines must also stay empty - clients prefer output_lines_ts");
+        } else {
+            panic!("expected InitialState");
+        }
+    }
+
+    /// A world the requesting user has no connection to (never connected, or a world owned
+    /// by someone else) must still produce a well-formed empty entry, not panic or leak
+    /// another user's per-connection buffer.
+    #[test]
+    fn test_multiuser_initial_state_empty_for_user_with_no_connection() {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+        let mut world = World::new("bobs-world");
+        world.owner = Some("bob".to_string());
+        app.worlds.push(world);
+        // No entry in app.user_connections for ("alice", 0) at all.
+
+        let initial_state = build_multiuser_initial_state(&app, "alice");
+        if let WsMessage::InitialState { worlds, .. } = initial_state {
+            assert_eq!(worlds.len(), 1);
+            assert!(worlds[0].output_lines_ts.is_empty());
+            assert!(worlds[0].pending_lines_ts.is_empty());
+            assert!(!worlds[0].connected);
+        } else {
+            panic!("expected InitialState");
+        }
     }
 }

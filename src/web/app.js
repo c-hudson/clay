@@ -51,16 +51,20 @@
     // --- Out-of-order ServerData recovery (D-Termux-lines) ---------------------------
     // The server used to be able to deliver two ServerData batches for the same world
     // out of order under lock contention (fixed server-side too, see
-    // WsServer::broadcast_to_world_viewers), and the WebView->Java->JS bridge on Android
-    // (evaluateJavascript, fire-and-forget) can still reorder frames on its own — that
-    // bridge fix is tracked separately as PROTOCOL-ROADMAP.md Step 7 and has NOT shipped
-    // yet, so this live mid-stream compensation must stay in place until it does. The old
-    // dedup check here treated ANY batch whose seq was <= world._max_seq as a full
-    // duplicate and silently dropped it — which is correct for a genuine resync replay,
-    // but wrong for a batch that arrived late: that batch's lines were never actually
-    // appended, yet _max_seq had already been bumped past them by the batch that
-    // leapfrogged it, so they looked like "old" data and were discarded for good (and a
-    // resync couldn't recover them either, since _max_seq no longer pointed at the hole).
+    // WsServer::broadcast_to_world_viewers). PROTOCOL-ROADMAP.md Step 7 (Android's
+    // WebView->Java->JS bridge: evaluateJavascript fire-and-forget push replaced by an
+    // ordered-queue pull, see drainWsQueue() / onNativeWsQueueReady below) has shipped, so
+    // that specific reordering source is closed - this machinery is now a defense-in-depth
+    // safety net, not the primary defense, and is kept for that reason (also still
+    // load-bearing for the Step 3 ResyncRequired channel-overflow path, where a recovered
+    // batch legitimately belongs mid-buffer and must be spliced, not appended - see Step 9
+    // of the later seq-drift fix). The old dedup check here treated ANY batch whose seq was
+    // <= world._max_seq as a full duplicate and silently dropped it — which is correct for
+    // a genuine resync replay, but wrong for a batch that arrived late: that batch's lines
+    // were never actually appended, yet _max_seq had already been bumped past them by the
+    // batch that leapfrogged it, so they looked like "old" data and were discarded for good
+    // (and a resync couldn't recover them either, since _max_seq no longer pointed at the
+    // hole).
     //
     // world._seqGaps tracks seq ranges we know are MISSING below world._max_seq (recorded
     // when a batch skips ahead of the expected next seq). A later low-seq batch is only
@@ -71,11 +75,13 @@
     // lastContiguousSeq() below, which feeds AuthRequest.resume and PongCheck.acked. The
     // old *reconnect*-time recovery (guessing what was lost across a disconnect from a
     // capped/lossy record) is gone — resume+the server's exact scrollback replay replaced
-    // it. What remains here is purely the live mid-stream safety net for the still-open
-    // Android bridge risk; do not remove it before Step 7 lands. Because lastContiguousSeq
-    // now also feeds the reconnect contract, a gap that ages out of this bounded array
-    // (see MAX_TRACKED_SEQ_GAPS) would in theory also be invisible to resume/acked — kept
-    // generous below so that's a pathological-only corner case, not a practical one.
+    // it. What remains here is purely the live mid-stream safety net described above (now
+    // for the ResyncRequired/overflow case primarily, Android's bridge secondarily). Because
+    // lastContiguousSeq now also feeds the reconnect contract, a gap that ages out of this
+    // bounded array (see MAX_TRACKED_SEQ_GAPS) would in theory also be invisible to
+    // resume/acked — kept generous below so that's a pathological-only corner case, not a
+    // practical one. _seqGaps is also carried across InitialState (the seq-drift fix's
+    // Step 9) so a hole recorded before a reconnect isn't silently forgotten.
     const MAX_TRACKED_SEQ_GAPS = 2000;
 
     function recordSeqGapIfAny(world, oldMax, newBatchStartSeq) {
@@ -153,6 +159,41 @@
             }
         }
         world.output_lines.splice(insertAt, 0, ...newLineObjs);
+    }
+
+    // One-time dedup pass for lines that may already have been duplicated by the seq-drift
+    // bug Step 8/9 fix (PROTOCOL-ROADMAP.md's seq-drift fix): a client-side seq that had
+    // drifted below the server's true value could record a phantom gap, and the server's
+    // resume replay would then faithfully re-send lines the client already had, which got
+    // appended as duplicates - both into a live reconnect's in-memory buffer and, once
+    // persisted via scheduleWorldCacheSave, into the IndexedDB cache too. Applied on hydrate
+    // (both the priorWorld and cachedWorld branches below) so a client/cache that already
+    // picked up duplicates before this fix shipped gets cleaned up on its next
+    // reconnect/cold-start, without needing a cache DB version bump - which would silently
+    // discard every user's cached scrollback (see the CLIENT_LINE_PREFIX migration's
+    // precedent just below). Deliberately seq-keyed (exact, not a heuristic text match) so it
+    // can never misfire on legitimately repeated text (e.g. a MUD prompt repeated verbatim).
+    // Lines without a real seq (_has_real_seq === false, or absent - see the recompute
+    // loops' `!== false` reasoning) are left untouched; they have no seq to key on and were
+    // never a product of the resume-replay duplication this targets.
+    //
+    // Residual case, not covered here: a duplicate that entered via a `seq: 0` release
+    // broadcast (before PROTOCOL-ROADMAP.md's Step 6 made release broadcasts carry real
+    // seqs) has no real seq at all and is invisible to this pass. Step 6 means no *new*
+    // seq-less duplicates are produced going forward, so this is only a residual risk for
+    // buffers/caches that predate that fix; add a bounded heuristic text-repeat pass here
+    // only if field reports show it's still needed.
+    function dedupBySeq(lines) {
+        const seen = new Set();
+        const result = [];
+        for (const line of lines) {
+            if (line && line._has_real_seq !== false && line.seq !== undefined) {
+                if (seen.has(line.seq)) continue;
+                seen.add(line.seq);
+            }
+            result.push(line);
+        }
+        return result;
     }
 
     // DOM elements
@@ -519,6 +560,83 @@
     // yield to the event loop between requests, not to pace against the server.
     const BACKFILL_PHASE2_CHUNK_SIZE = 500;
     const BACKFILL_DELAY_MS = 30;
+
+    // --- ScrollbackLines request/reply correlation (PROTOCOL-ROADMAP.md's seq-drift fix,
+    // Bug 2: the 90%-stuck scrollback indicator) --------------------------------------
+    // Before this, a ScrollbackLines reply was routed purely on world._gapFillPending -
+    // ambiguous whenever a gap-fill and an ordinary backfill chunk could both be
+    // outstanding for the same world, and permanently wrong after a RequestState-driven
+    // resync (see _resumedFromServer below), which left _gapFillPending stuck true with no
+    // server reply ever coming to clear it. request_id (websocket.rs) lets the reply name
+    // exactly which request it answers. id 0 is reserved for a server-initiated unprompted
+    // resume replay (never sent by this client, only received); ids from
+    // nextScrollbackRequestId are used for every client-initiated request this client
+    // tracks. A reply whose request_id isn't in pendingScrollbackRequests and isn't 0 (an
+    // old server, or a request this client didn't itself register) falls back to the
+    // legacy world._gapFillPending heuristic.
+    let nextScrollbackRequestId = 1;
+    const pendingScrollbackRequests = new Map(); // id -> { kind: 'gapfill'|'backfill', worldIndex, timer }
+    const SCROLLBACK_REQUEST_TIMEOUT_MS = 15000;
+
+    // Registers a new outstanding scrollback request and returns its id. `kind` is
+    // 'gapfill' (a reconnect/resync catch-up, handled as an append) or 'backfill' (an
+    // older-history request, handled as a prepend). The watchdog fires if no reply ever
+    // arrives - covers the two documented silent-no-reply cases server-side:
+    // handle_request_scrollback returning nothing for an out-of-range world_index
+    // (main.rs), and handle_request_scrollback_owned's deliberate multiuser no-op on an
+    // owner mismatch (main.rs) - either of which would otherwise leave the backfill pump
+    // stalled forever with no way to recover.
+    function registerScrollbackRequest(worldIndex, kind) {
+        const id = nextScrollbackRequestId++;
+        const timer = setTimeout(function() {
+            if (!pendingScrollbackRequests.has(id)) return;
+            pendingScrollbackRequests.delete(id);
+            console.warn('ScrollbackLines request timed out, advancing pump anyway', { id, worldIndex, kind });
+            const world = worlds[worldIndex];
+            if (world && kind === 'gapfill') world._gapFillPending = false;
+            updateScrollbackProgress();
+            backfillNextWorld();
+        }, SCROLLBACK_REQUEST_TIMEOUT_MS);
+        pendingScrollbackRequests.set(id, { kind: kind, worldIndex: worldIndex, timer: timer });
+        return id;
+    }
+
+    // Clears the bookkeeping for a request once its reply has arrived (or the request is
+    // being abandoned, e.g. on flush/world removal) - cancels the watchdog timer so it
+    // doesn't fire spuriously after the fact.
+    function resolveScrollbackRequest(id) {
+        const entry = pendingScrollbackRequests.get(id);
+        if (entry) {
+            clearTimeout(entry.timer);
+            pendingScrollbackRequests.delete(id);
+        }
+        return entry;
+    }
+
+    // Tracks the exact AuthRequest.resume list sent on THIS connection attempt, keyed by
+    // world NAME (matched at InitialState time, mirroring priorWorldsByName), so
+    // world._resumedFromServer can be derived from "did we actually ask the server to
+    // resume this world" rather than a heuristic (priorWorld && lastContiguousSeq(priorWorld)
+    // > 0). That heuristic stayed true across a RequestState-driven resync (window.
+    // triggerResync(), Android's background-wake path) even though RequestState carries no
+    // resume list and the server sends no unprompted replay for it - permanently stuck
+    // _gapFillPending with nothing ever able to clear it. Cleared on every socket close
+    // (handleSessionDisconnect) so a stale entry from a previous connection attempt can't
+    // be misread as "sent this connection".
+    let resumeSentThisConnection = new Map(); // world name -> { index }
+
+    // Builds the AuthRequest.resume list AND records it into resumeSentThisConnection -
+    // used only at AuthRequest send sites. PongCheck.acked reuses buildResumeAckList()
+    // directly without recording, since a periodic keepalive ack is not a resume request.
+    function buildResumeAckListForAuthRequest() {
+        const list = buildResumeAckList();
+        resumeSentThisConnection = new Map();
+        for (const pair of list) {
+            const w = worlds[pair[0]];
+            if (w && w.name) resumeSentThisConnection.set(w.name, { index: pair[0] });
+        }
+        return list;
+    }
 
     // Coalesced repaint for the current world while it's at the bottom during
     // backfill (see the ScrollbackLines handler). A fast backfill can deliver many
@@ -1479,7 +1597,7 @@
         setTimeout(hideConnectionLog, 800);
 
         if (window.AUTO_PASSWORD) {
-            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckList() }));
+            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest() }));
             return;
         }
 
@@ -1644,6 +1762,15 @@
         if (ws && !(ws instanceof WebSocket)) ws.readyState = WebSocket.CLOSED;
         authenticated = false;
         winnerAttemptId = null;
+        // A stale entry from a previous connection attempt must never be misread as
+        // "sent this connection" by the next InitialState's _resumedFromServer derivation.
+        resumeSentThisConnection = new Map();
+        // Any outstanding ScrollbackLines requests belong to the dead connection and will
+        // never get a reply now - clear them rather than letting their watchdogs fire late
+        // against whatever new state exists after reconnecting.
+        for (const id of Array.from(pendingScrollbackRequests.keys())) {
+            resolveScrollbackRequest(id);
+        }
 
         if (reloadReconnect) {
             reloadReconnectAttempts++;
@@ -2258,7 +2385,7 @@
                 // page on its pre-connection state (blank world name, splash screen)
                 // with no way to recover short of a manual reload.
                 try {
-                worlds.forEach((world) => {
+                worlds.forEach((world, idx) => {
                     const priorWorld = world.name ? priorWorldsByName[world.name] : null;
                     const cachedWorld = (!priorWorld && world.name) ? worldCacheLoaded[world.name] : null;
                     // Whether this world was seeded from a local buffer (in-memory
@@ -2266,25 +2393,43 @@
                     // freshly-sent slice - startBackfill() uses this to gap-fill
                     // instead of doing a full backfill for this world.
                     world._hydratedFromLocal = !!(priorWorld || (cachedWorld && cachedWorld.lines && cachedWorld.lines.length > 0));
-                    // PROTOCOL-ROADMAP.md Step 5: was this world covered by the
-                    // AuthRequest.resume we just sent (see buildResumeAckList(), built
-                    // from the pre-reconnect `worlds` array priorWorldsByName also
-                    // captured, using the same stable indices)? Only the in-memory
-                    // reconnect case (priorWorld) qualifies - a cachedWorld hit (the
-                    // cross-session IndexedDB cache) has no server-assigned index until
-                    // this very InitialState arrives, so it structurally cannot have
-                    // been part of resume and still needs the client-driven
-                    // requestGapFill() fallback below. When true, the server is already
-                    // about to push exactly the missing lines unprompted as
-                    // ScrollbackLines - startBackfill() must not also request them
-                    // itself (redundant round trip), but does need _gapFillPending set
-                    // so that unprompted reply is handled as an append, not a prepend.
-                    world._resumedFromServer = !!(priorWorld && lastContiguousSeq(priorWorld) > 0);
+                    // Was this world covered by the AuthRequest.resume we just sent THIS
+                    // connection (resumeSentThisConnection, recorded by
+                    // buildResumeAckListForAuthRequest at send time)? Deliberately NOT the
+                    // old heuristic `priorWorld && lastContiguousSeq(priorWorld) > 0` - that
+                    // stayed true across a RequestState-driven resync (no resume list is
+                    // ever sent for that path), permanently sticking _gapFillPending true
+                    // with no server reply ever coming to clear it (the stuck-at-90%
+                    // scrollback indicator bug). Matched by name AND index - a world whose
+                    // server-assigned index shifted between the resume send and this
+                    // InitialState (e.g. another world was added/removed concurrently) did
+                    // not actually get replayed at ITS current index, so it must not be
+                    // treated as resumed either. Only the in-memory reconnect case
+                    // (priorWorld) qualifies - a cachedWorld hit (the cross-session
+                    // IndexedDB cache) has no server-assigned index until this very
+                    // InitialState arrives, so it structurally cannot have been part of
+                    // resume and still needs the client-driven requestGapFill() fallback
+                    // below. When true, the server is already about to push exactly the
+                    // missing lines unprompted as ScrollbackLines (request_id: 0) -
+                    // startBackfill() must not also request them itself (redundant round
+                    // trip), but does need _gapFillPending set so that unprompted reply is
+                    // handled as an append, not a prepend.
+                    const resumeEntry = priorWorld && world.name ? resumeSentThisConnection.get(world.name) : undefined;
+                    world._resumedFromServer = !!(priorWorld && resumeEntry && resumeEntry.index === idx);
                     if (priorWorld) {
                         // Reconnect: keep what we already had in memory - it's at
                         // least as complete as the fresh InitialState's front-loaded
                         // slice, and losing it is exactly the bug this preserves.
-                        world.output_lines = priorWorld.output_lines;
+                        // dedupBySeq (Step 10): a phantom-gap resume replay before this fix
+                        // shipped could have appended duplicates into this exact buffer.
+                        world.output_lines = dedupBySeq(priorWorld.output_lines);
+                        // Carry over any open gaps too (PROTOCOL-ROADMAP.md's seq-drift fix,
+                        // Step 9) - priorWorld._seqGaps otherwise gets silently dropped here
+                        // (only output_lines/_max_seq/_oldest_seq were preserved), making a
+                        // real unrecovered hole invisible to lastContiguousSeq() and therefore
+                        // to the next AuthRequest.resume/PongCheck.acked, which would then
+                        // wrongly tell the server "I have everything up to _max_seq".
+                        world._seqGaps = priorWorld._seqGaps || [];
                     } else if (cachedWorld && cachedWorld.lines && cachedWorld.lines.length > 0) {
                         // Cold start / full reload with a persistent cache hit: seed
                         // from the cache, then gap-fill (see startBackfill()) to pick
@@ -2296,11 +2441,18 @@
                         // snapshots never do, so this is a no-op from then on - strip
                         // it here rather than bumping the cache DB version, which
                         // would silently discard every user's cached scrollback.
-                        world.output_lines = cachedWorld.lines.map(l =>
+                        // dedupBySeq (Step 10, same rationale as above): this persistent
+                        // cache can already hold duplicates baked in before this fix shipped.
+                        world.output_lines = dedupBySeq(cachedWorld.lines.map(l =>
                             (l && l.from_server === false && typeof l.text === 'string'
                                 && l.text.startsWith(CLIENT_LINE_PREFIX))
                                 ? Object.assign({}, l, { text: l.text.slice(CLIENT_LINE_PREFIX.length) })
-                                : l);
+                                : l));
+                        // Restore any gaps persisted alongside this cache entry
+                        // (scheduleWorldCacheSave) - same rationale as the priorWorld branch
+                        // above. Older cache entries written before Step 9 have no seqGaps
+                        // field at all, which is equivalent to "no known gaps".
+                        world._seqGaps = cachedWorld.seqGaps || [];
                     } else if (world.output_lines_ts && world.output_lines_ts.length > 0) {
                         // Use output_lines_ts if available (has timestamps)
                         world.output_lines = world.output_lines_ts;
@@ -2319,17 +2471,37 @@
                     // from re-queuing a world that has nothing left to give.
                     world._backfill_exhausted = false;
                     world._gapFillPending = world._resumedFromServer;
+                    // Both recompute loops below exclude lines explicitly marked
+                    // _has_real_seq: false - an ephemeral ServerData message that never
+                    // touched output_lines server-side (seq: 0, the "bypass dedup" sentinel
+                    // used by ~50 system/command-reply broadcast sites) gets
+                    // lineSeq = world.output_lines.length (an ARRAY INDEX, not a seq) when
+                    // first appended by the live ServerData handler, which tags it
+                    // _has_real_seq: false at that point. Without this guard, a single such
+                    // line anywhere in the buffer poisons _oldest_seq to a tiny value, making
+                    // the first before_seq backfill request return almost nothing and
+                    // permanently marking the world's history "exhausted" - deep scrollback
+                    // then silently stops working for that world (PROTOCOL-ROADMAP.md's
+                    // seq-drift fix). Deliberately `!== false` rather than requiring an
+                    // explicit `true`: lines from server-authoritative sources this handler
+                    // populates directly (output_lines_ts, the legacy plain-string
+                    // conversion, an older cache entry saved before this field existed) never
+                    // set _has_real_seq at all, but their `seq` (when present) is always
+                    // genuinely real - only the live handler's fake-index fallback ever
+                    // explicitly sets `false`. The same guard on _max_seq is defensive: an
+                    // index is always <= the real seq at that position, so it can't currently
+                    // regress _max_seq, but leaving it unguarded would be a landmine later.
                     if (world.output_lines.length > 0) {
                         let minSeq = Infinity;
                         for (const line of world.output_lines) {
-                            if (line.seq !== undefined && line.seq < minSeq) minSeq = line.seq;
+                            if (line._has_real_seq !== false && line.seq !== undefined && line.seq < minSeq) minSeq = line.seq;
                         }
                         if (minSeq !== Infinity) world._oldest_seq = minSeq;
                     }
                     // Track max seq for duplicate detection
                     world._max_seq = 0;
                     for (const line of world.output_lines) {
-                        if (line.seq !== undefined && line.seq > world._max_seq) {
+                        if (line._has_real_seq !== false && line.seq !== undefined && line.seq > world._max_seq) {
                             world._max_seq = line.seq;
                         }
                     }
@@ -2651,8 +2823,14 @@
                         // it (see insertLinesBySeq / findOverlappingSeqGap above).
                         let fillsGapIdx = -1;
                         if (msg.seq && msg.seq > 0 && world._max_seq && msg.seq <= world._max_seq) {
+                            // Prefer the server-authoritative end_seq (PROTOCOL-ROADMAP.md's
+                            // seq-drift fix) over a locally-approximated line count when the
+                            // sender provided one - the approximation can undercount relative
+                            // to the server's real batch span (e.g. a trailing partial line
+                            // folded into the next batch), which would make this overlap check
+                            // miss a real gap-fill match.
                             const approxLineCount = msg.data.split(/\r\n|\n|\r/).length;
-                            const batchEndApprox = msg.seq + Math.max(approxLineCount - 1, 0);
+                            const batchEndApprox = msg.end_seq !== undefined ? msg.end_seq : msg.seq + Math.max(approxLineCount - 1, 0);
                             fillsGapIdx = findOverlappingSeqGap(world, msg.seq, batchEndApprox);
                             if (fillsGapIdx === -1) {
                                 const dupInfo = {
@@ -2712,7 +2890,16 @@
 
                         let appendedLineCount = 0;
                         const gapFillLineObjs = []; // only populated when isGapFill
-                        rawLines.forEach(line => {
+                        // rawIdx (this line's position in the FULL split batch, before any of
+                        // the filters below) is what lineSeq must be derived from, not a
+                        // running count of lines actually kept - the server assigned one real
+                        // seq per line in the original batch regardless of what this client
+                        // later decides to filter for display (ANSI-only lines, idler markers,
+                        // grep mode). Deriving seq from a post-filter count let every filtered
+                        // line permanently drift _max_seq below the server's true high-water
+                        // seq, which then produced phantom gaps and duplicate lines on the next
+                        // reconnect (see PROTOCOL-ROADMAP.md's seq-drift fix).
+                        rawLines.forEach((line, rawIdx) => {
                             // Skip lines that are ONLY ANSI codes with no visible content
                             // (e.g., trailing reset codes after newlines), but keep blank lines
                             if (line.length > 0 && line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').length === 0) {
@@ -2730,8 +2917,12 @@
                                     return;
                                 }
                             }
-                            const hasRealSeq = msg.seq !== undefined && msg.seq > 0;
-                            const lineSeq = hasRealSeq ? msg.seq + appendedLineCount : (isGapFill ? -1 : world.output_lines.length);
+                            // msg.seq === 0 is a legitimate real seq (a world's very first
+                            // line, see next_seq's initial value server-side) - end_seq being
+                            // present is what distinguishes "seq: 0, a real value" from
+                            // "seq field absent/defaulted", so a real end_seq widens this too.
+                            const hasRealSeq = msg.seq !== undefined && (msg.seq > 0 || msg.end_seq !== undefined);
+                            const lineSeq = hasRealSeq ? msg.seq + rawIdx : (isGapFill ? -1 : world.output_lines.length);
                             const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, marked_new: msg.marked_new || false, gagged: msg.gagged || false };
 
                             if (isGapFill) {
@@ -2797,13 +2988,23 @@
                                     renderOutput();
                                 }
                             }
-                        } else if (msg.seq && msg.seq > 0 && appendedLineCount > 0) {
-                            // Update _max_seq after appending lines, recording a gap first if this
-                            // batch skipped ahead of the expected next seq — so a later
-                            // out-of-order batch can still recover it instead of being treated as
-                            // a duplicate.
+                        } else if (msg.seq !== undefined && (msg.seq > 0 || msg.end_seq !== undefined)) {
+                            // Update _max_seq for the batch's TRUE span - using the
+                            // server-authoritative end_seq when present, else rawLines.length
+                            // (the full pre-filter batch size, matching the rawIdx-based lineSeq
+                            // above) rather than appendedLineCount. This must run whenever the
+                            // batch has a real seq, NOT only when appendedLineCount > 0: a batch
+                            // that's entirely filtered out client-side (e.g. a lone idler/gagged
+                            // line, or every line stripped by grep mode) still consumed real
+                            // seqs server-side and must still advance _max_seq, or the client
+                            // permanently drifts behind and reports phantom gaps on every later
+                            // batch (see PROTOCOL-ROADMAP.md's seq-drift fix). Record the gap
+                            // first if this batch skipped ahead of the expected next seq, so a
+                            // later out-of-order batch can still recover it instead of being
+                            // treated as a duplicate.
                             recordSeqGapIfAny(world, world._max_seq || 0, msg.seq);
-                            world._max_seq = Math.max(world._max_seq || 0, msg.seq + appendedLineCount - 1);
+                            const batchEndSeq = msg.end_seq !== undefined ? msg.end_seq : msg.seq + rawLines.length - 1;
+                            world._max_seq = Math.max(world._max_seq || 0, batchEndSeq);
                         }
                         if (msg.world_index !== currentWorldIndex) {
                             updateStatusBar();
@@ -3130,6 +3331,38 @@
                         // world got new traffic.
                         if (remoteLinesChanged) {
                             worlds.forEach((w, idx) => { if (w && w.name) scheduleWorldCacheSave(idx); });
+                        }
+                        // Recompute backfillTotalTarget live (PROTOCOL-ROADMAP.md's
+                        // scrollback-reachability fix) - previously this was only ever
+                        // computed once, inside startBackfill() at connect time, so raising
+                        // Remote Lines without reconnecting had no visible effect: the
+                        // extra history was never fetched (backfillInProgress had already
+                        // finished and nothing restarted the pump against the new target).
+                        // A backfill genuinely still IN PROGRESS doesn't need special
+                        // handling here - it already reads backfillTotalTarget fresh on
+                        // every check (the ScrollbackLines handler's phase-2 requeue test),
+                        // so it naturally picks up the new value on its own.
+                        if (remoteLinesChanged) {
+                            backfillTotalTarget = Math.max(remoteInitialLines || 100, backfillPhase1Target);
+                            // _backfill_exhausted reflects the server's own "no more history"
+                            // signal (backfill_complete), which is usually a genuine
+                            // exhaustion - but it can also be an artifact of a since-fixed
+                            // poisoned _oldest_seq (a tiny before_seq request that returned
+                            // almost nothing and got misread as exhaustion, see the
+                            // _has_real_seq guards in the InitialState handler). Clearing it
+                            // here means worst case one extra wasted round-trip per
+                            // genuinely-exhausted world, which just re-sets the flag.
+                            worlds.forEach((w) => { if (w) w._backfill_exhausted = false; });
+                            if (!backfillInProgress) {
+                                const anyWorldNeedsMore = worlds.some((w) => {
+                                    const received = w && w.output_lines ? w.output_lines.length : 0;
+                                    return received < backfillTotalTarget;
+                                });
+                                if (anyWorldNeedsMore) {
+                                    backfillInProgress = true;
+                                    startBackfillPhase2();
+                                }
+                            }
                         }
                     }
                     if (msg.settings.gui_transparency !== undefined) {
@@ -3470,19 +3703,47 @@
                 }
                 break;
 
-            case 'ScrollbackLines':
-                // A world with _gapFillPending is catching up after a reconnect (see
-                // requestGapFill()) - these lines are NEWER than what we have (an
-                // after_seq request), so they're appended and deduped, and the
-                // response is handled entirely separately from the ordinary phase 1/2
-                // backfill machinery below (no queue, no progress bar - a gap-fill is
-                // normally tiny and finishes in one or two requests).
-                if (msg.world_index !== undefined && worlds[msg.world_index] && worlds[msg.world_index]._gapFillPending) {
-                    const world = worlds[msg.world_index];
+            case 'ScrollbackLines': {
+                if (msg.world_index === undefined || !worlds[msg.world_index]) break;
+                const world = worlds[msg.world_index];
+
+                // Resolve which outstanding request this reply answers, and route on THAT
+                // instead of the ambiguous world._gapFillPending flag alone (the stuck-at-90%
+                // scrollback indicator bug, PROTOCOL-ROADMAP.md's seq-drift fix Bug 2): a
+                // before_seq backfill reply landing while _gapFillPending happened to be true
+                // (e.g. stuck true after a RequestState resync that never sent a resume list)
+                // used to be misrouted into the gap-fill branch, which silently dropped its
+                // lines (they're older, so isNew is false and no gap overlaps) and `break`d
+                // before ever advancing the pump - leaving backfillInProgress stuck forever.
+                // request_id 0 is reserved for a server-initiated unprompted resume replay
+                // (never registered - the client didn't ask for it); a registered id names
+                // its own recorded kind; anything else (undefined, or unrecognized - an old
+                // server, or a request this client didn't itself track) falls back to the
+                // legacy heuristic so behavior is unchanged against a server that predates
+                // this field.
+                let kind;
+                if (msg.request_id === 0) {
+                    kind = 'gapfill';
+                } else if (msg.request_id !== undefined && pendingScrollbackRequests.has(msg.request_id)) {
+                    const entry = resolveScrollbackRequest(msg.request_id);
+                    if (entry.worldIndex !== msg.world_index) {
+                        console.warn('ScrollbackLines request_id/world_index mismatch', { request_id: msg.request_id, expected: entry.worldIndex, got: msg.world_index });
+                    }
+                    kind = entry.kind;
+                } else {
+                    kind = world._gapFillPending ? 'gapfill' : 'backfill';
+                }
+
+                if (kind === 'gapfill') {
+                    // These lines are NEWER than what we have (an after_seq request), so
+                    // they're appended and deduped - handled entirely separately from the
+                    // phase 1/2 backfill prepend logic below (a gap-fill is normally tiny and
+                    // finishes in one or two requests).
                     const wasBottom = isAtBottom();
                     const container = elements.outputContainer;
                     const oldScrollHeight = container.scrollHeight;
                     let appended = false;
+                    let droppedCount = 0;
 
                     (msg.lines || []).forEach((line) => {
                         const isNew = line.seq === undefined || !world._max_seq || line.seq > world._max_seq;
@@ -3502,8 +3763,15 @@
                             insertLinesBySeq(world, [line]);
                             shrinkSeqGap(world, gapIdx, line.seq, line.seq);
                             appended = true;
+                        } else {
+                            droppedCount++;
                         }
                     });
+                    if (droppedCount > 0) {
+                        console.warn('ScrollbackLines gap-fill reply: dropped lines that were neither new nor gap-filling', {
+                            world_index: msg.world_index, dropped: droppedCount, msg_seq_range: (msg.lines || []).map(l => l.seq)
+                        });
+                    }
 
                     if (appended && msg.world_index === currentWorldIndex) {
                         if (!wasBottom || grepRegex) {
@@ -3523,58 +3791,53 @@
                         // high-water mark until the daemon says we're caught up.
                         requestGapFill(msg.world_index);
                     }
-                    break;
-                }
+                } else {
+                    // Response to RequestScrollback - prepend lines to output.
+                    if (msg.lines && msg.lines.length > 0) {
+                        const wasBottom = isAtBottom();
+                        const container = elements.outputContainer;
+                        const oldScrollHeight = container.scrollHeight;
 
-                // Response to RequestScrollback - prepend lines to output
-                if (msg.world_index !== undefined && worlds[msg.world_index] && msg.lines && msg.lines.length > 0) {
-                    const world = worlds[msg.world_index];
-                    const wasBottom = isAtBottom();
-                    const container = elements.outputContainer;
-                    const oldScrollHeight = container.scrollHeight;
+                        // Prepend received lines (they are older than what we have)
+                        world.output_lines = msg.lines.concat(world.output_lines);
 
-                    // Prepend received lines (they are older than what we have)
-                    world.output_lines = msg.lines.concat(world.output_lines);
-
-                    // Update oldest seq for next backfill request
-                    let minSeq = Infinity;
-                    for (const line of msg.lines) {
-                        if (line.seq !== undefined && line.seq < minSeq) minSeq = line.seq;
-                    }
-                    if (minSeq !== Infinity) world._oldest_seq = minSeq;
-
-                    if (msg.world_index === currentWorldIndex) {
-                        if (!wasBottom || grepRegex) {
-                            // Scrolled up into history, or grep mode: the user needs to
-                            // see the new content immediately, so render synchronously
-                            // and correct scrollTop for the height added above.
-                            renderOutput();
-                            const newScrollHeight = container.scrollHeight;
-                            container.scrollTop += (newScrollHeight - oldScrollHeight);
-                        } else {
-                            // At the bottom: the backfilled lines are old content added
-                            // above the fold, not currently visible, so there's no rush
-                            // to paint this exact chunk - but skipping the repaint
-                            // entirely (as this used to do whenever the world already had
-                            // a full screen) left the current/initial world's history
-                            // unreachable by scrolling until something else forced a
-                            // renderOutput() (e.g. a world switch). Coalesce instead: a
-                            // fast backfill can deliver many chunks in quick succession,
-                            // and rebuilding the DOM on every single one would restart
-                            // CSS animations (e.g. blink) on whatever's currently visible.
-                            scheduleCurrentWorldRepaint();
+                        // Update oldest seq for next backfill request
+                        let minSeq = Infinity;
+                        for (const line of msg.lines) {
+                            if (line.seq !== undefined && line.seq < minSeq) minSeq = line.seq;
                         }
+                        if (minSeq !== Infinity) world._oldest_seq = minSeq;
+
+                        if (msg.world_index === currentWorldIndex) {
+                            if (!wasBottom || grepRegex) {
+                                // Scrolled up into history, or grep mode: the user needs to
+                                // see the new content immediately, so render synchronously
+                                // and correct scrollTop for the height added above.
+                                renderOutput();
+                                const newScrollHeight = container.scrollHeight;
+                                container.scrollTop += (newScrollHeight - oldScrollHeight);
+                            } else {
+                                // At the bottom: the backfilled lines are old content added
+                                // above the fold, not currently visible, so there's no rush
+                                // to paint this exact chunk - but skipping the repaint
+                                // entirely (as this used to do whenever the world already had
+                                // a full screen) left the current/initial world's history
+                                // unreachable by scrolling until something else forced a
+                                // renderOutput() (e.g. a world switch). Coalesce instead: a
+                                // fast backfill can deliver many chunks in quick succession,
+                                // and rebuilding the DOM on every single one would restart
+                                // CSS animations (e.g. blink) on whatever's currently visible.
+                                scheduleCurrentWorldRepaint();
+                            }
+                        }
+                        scheduleWorldCacheSave(msg.world_index);
                     }
-                    scheduleWorldCacheSave(msg.world_index);
-                }
-                // Continue or finish backfill.
-                // Phase 1 is one chunk per world - always advance to the next
-                // world in the queue regardless of backfill_complete.
-                // Phase 2 is round-robin - re-queue this world at the back if it
-                // still needs more (and history isn't exhausted), then advance
-                // to whichever world is now at the front (may be a different one).
-                if (msg.world_index !== undefined && worlds[msg.world_index]) {
-                    const world = worlds[msg.world_index];
+                    // Continue or finish backfill.
+                    // Phase 1 is one chunk per world - always advance to the next
+                    // world in the queue regardless of backfill_complete.
+                    // Phase 2 is round-robin - re-queue this world at the back if it
+                    // still needs more (and history isn't exhausted), then advance
+                    // to whichever world is now at the front (may be a different one).
                     if (msg.backfill_complete) {
                         world._backfill_exhausted = true;
                     }
@@ -3585,11 +3848,17 @@
                         }
                     }
                 }
+
+                // Shared tail (PROTOCOL-ROADMAP.md's seq-drift fix): both branches must
+                // advance the pump, not just the backfill one - the old bare `break` in the
+                // gap-fill branch is exactly what let backfillInProgress get stuck forever
+                // whenever a reply was misrouted there.
                 updateScrollbackProgress();
                 setTimeout(function() {
                     backfillNextWorld();
                 }, backfillPhase === 1 ? 0 : BACKFILL_DELAY_MS);
                 break;
+            }
 
             case 'ServerReloading':
                 reloadReconnect = true;
@@ -3752,11 +4021,19 @@
         // are excluded here too (handled above) unless they're still short of a
         // screenful even after being seeded locally, in which case they still
         // want older history on top of the gap-fill.
+        // Worlds with an outstanding gap-fill are excluded here too (in addition to the
+        // _resumedFromServer skip above) - a world can reach this point with
+        // _gapFillPending already true from the requestGapFill() call in the loop just
+        // above, or from a cache-hydrated world's own gap-fill request queued at
+        // InitialState time. Queuing it into phase 1 as well would race the two request
+        // kinds against each other for the same undifferentiated world, which is exactly
+        // the ambiguity the request_id correlator (see the ScrollbackLines handler) exists
+        // to resolve - excluding it here is cheaper and avoids the race outright.
         const queue = [];
         worlds.forEach((world, idx) => {
             const total = world.total_output_lines || 0;
             const received = world.output_lines ? world.output_lines.length : 0;
-            if (total > received && received < backfillPhase1Target) {
+            if (total > received && received < backfillPhase1Target && !world._gapFillPending) {
                 if (idx === currentWorldIndex) {
                     queue.unshift(idx);
                 } else {
@@ -3803,7 +4080,10 @@
         const queue = [];
         worlds.forEach((world, idx) => {
             const received = world.output_lines ? world.output_lines.length : 0;
-            if (received < backfillTotalTarget && !world._backfill_exhausted) {
+            // !world._gapFillPending: same race-avoidance as the phase 1 queue builder
+            // above - don't queue an ordinary backfill chunk request for a world that
+            // already has a gap-fill outstanding.
+            if (received < backfillTotalTarget && !world._backfill_exhausted && !world._gapFillPending) {
                 if (idx === currentWorldIndex) {
                     queue.unshift(idx);
                 } else {
@@ -3878,11 +4158,13 @@
         // before_seq may legitimately be null here (a world that received zero
         // lines in InitialState despite having real history) - the daemon handles
         // that as "send the last N lines", so send it through rather than skipping.
+        const requestId = registerScrollbackRequest(worldIndex, 'backfill');
         send({
             type: 'RequestScrollback',
             world_index: worldIndex,
             count: count,
-            before_seq: world._oldest_seq
+            before_seq: world._oldest_seq,
+            request_id: requestId
         });
     }
 
@@ -4033,11 +4315,16 @@
             const cap = Math.max(10, remoteInitialLines || 100);
             const lines = (w.output_lines || []).slice(-cap);
             const maxSeq = w._max_seq || 0;
+            // Persist any open gaps too (PROTOCOL-ROADMAP.md's seq-drift fix, Step 9) - without
+            // this, a gap recorded mid-session is silently forgotten across a full reload
+            // (cold-start hydrate from this cache), making lastContiguousSeq() wrongly report
+            // _max_seq as if the hole had never existed.
+            const seqGaps = w._seqGaps || [];
             openWorldCacheDb().then((db) => {
                 if (!db) return;
                 try {
                     const tx = db.transaction(WORLD_CACHE_STORE, 'readwrite');
-                    tx.objectStore(WORLD_CACHE_STORE).put({ lines: lines, maxSeq: maxSeq }, worldCacheKey(worldCacheServerId, name));
+                    tx.objectStore(WORLD_CACHE_STORE).put({ lines: lines, maxSeq: maxSeq, seqGaps: seqGaps }, worldCacheKey(worldCacheServerId, name));
                 } catch (e) { /* ignore */ }
             });
         }, WORLD_CACHE_SAVE_DEBOUNCE_MS);
@@ -4061,11 +4348,16 @@
             return;
         }
         world._gapFillPending = true;
+        // request_id: 0 is RESERVED for the server-initiated unprompted resume replay (see
+        // pendingScrollbackRequests' doc comment) - this is a client-initiated request, so
+        // it always gets a real allocated id, never 0.
+        const requestId = registerScrollbackRequest(worldIndex, 'gapfill');
         send({
             type: 'RequestScrollback',
             world_index: worldIndex,
             count: BACKFILL_PHASE2_CHUNK_SIZE,
-            after_seq: seq
+            after_seq: seq,
+            request_id: requestId
         });
     }
 
@@ -4107,7 +4399,7 @@
             auth_key: keyValue,
             challenge_response: usesChallenge,
             request_key: false,
-            resume: buildResumeAckList()
+            resume: buildResumeAckListForAuthRequest()
         };
         if (currentWorldIndex !== undefined) {
             msg.current_world = currentWorldIndex;
@@ -4176,7 +4468,7 @@
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
             const challengeHash = serverChallenge ? await hashPassword(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckList() };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest() };
             if (username) {
                 msg.username = username;
             }
@@ -4189,7 +4481,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             const challengeHash = serverChallenge ? sha256Fallback(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckList() };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest() };
             if (username) {
                 msg.username = username;
             }
@@ -4846,6 +5138,11 @@
             if (oldWorld && oldWorld.output_lines) {
                 oldWorld.output_lines.forEach(l => { l.marked_new = false; });
             }
+            // Reset the render window on the world we're leaving too, so returning to it
+            // later starts fresh at RENDER_WINDOW_INITIAL rather than wherever a previous
+            // deep-scroll session left it - keeps per-world DOM cost bounded across
+            // multiple world visits, not just within one.
+            if (oldWorld) oldWorld._renderWindow = RENDER_WINDOW_INITIAL;
             currentWorldIndex = index;
             // Clear splash on world switch, but only for a world that has actually
             // connected before - a fresh/never-connected world's output_lines is
@@ -5534,7 +5831,54 @@
         return CLIENT_LINE_PREFIX + text;
     }
 
-    function renderOutput() {
+    // Expandable DOM render window (scrollback-reachability fix, PROTOCOL-ROADMAP.md
+    // follow-on): the DOM used to hard-cap at the newest 500 lines regardless of how much
+    // history a world actually held, with a stale comment claiming PageUp re-rendered to
+    // reveal more (it only ever moved scrollTop - handlePgUp does not call renderOutput()).
+    // The window now grows in RENDER_WINDOW_STEP increments as the user scrolls toward the
+    // top (see the outputContainer.onscroll handler), up to RENDER_WINDOW_MAX - matching
+    // remote_initial_lines' own upper clamp, so a --gui/Android client can reach everything
+    // it's permitted to hold locally. The ceiling is a deliberate performance bound for
+    // WebKitGTK/Android WebView (tested-safe, not arbitrary) - lower RENDER_WINDOW_MAX if a
+    // low-end device struggles, don't remove the mechanism.
+    const RENDER_WINDOW_INITIAL = 500;
+    const RENDER_WINDOW_STEP = 500;
+    const RENDER_WINDOW_MAX = 5000;
+    // How close to the top (px) triggers growing the window - large enough to grow before
+    // the user actually hits the physical top and sees a hard stop.
+    const RENDER_WINDOW_GROW_TRIGGER_PX = 300;
+
+    // rAF-throttled: outputContainer.onscroll can fire many times per animation frame, but
+    // growing the window triggers a full renderOutput() rebuild, which is not something to
+    // do more than once per frame.
+    let renderWindowCheckScheduled = false;
+    function scheduleRenderWindowCheck() {
+        if (renderWindowCheckScheduled) return;
+        renderWindowCheckScheduled = true;
+        requestAnimationFrame(function() {
+            renderWindowCheckScheduled = false;
+            const world = worlds[currentWorldIndex];
+            if (!world) return;
+            const container = elements.outputContainer;
+            const totalHeld = world.output_lines ? world.output_lines.length : 0;
+            const currentWindow = world._renderWindow || RENDER_WINDOW_INITIAL;
+            const ceiling = Math.min(RENDER_WINDOW_MAX, totalHeld);
+            if (container.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && currentWindow < ceiling) {
+                world._renderWindow = Math.min(currentWindow + RENDER_WINDOW_STEP, ceiling);
+                renderOutput({ preserveScroll: true });
+            } else if (isAtBottom() && currentWindow !== RENDER_WINDOW_INITIAL) {
+                // Back at the bottom: reset so the DOM shrinks back down on the next full
+                // render (world switch away and back, resync, etc.) rather than staying
+                // elevated indefinitely after a single deep scroll-back. Not itself a reason
+                // to force a rebuild right now - the user is reading live output at the
+                // bottom, and rebuilding would only disrupt that for no benefit.
+                world._renderWindow = RENDER_WINDOW_INITIAL;
+            }
+        });
+    }
+
+    function renderOutput(opts) {
+        const preserveScroll = !!(opts && opts.preserveScroll);
         const world = worlds[currentWorldIndex];
 
         // If no world selected (multiuser mode before connecting), show splash
@@ -5572,10 +5916,13 @@
             searchEndIdx = searchMatchIndices[searchCurrentPos] + 1;
         }
 
-        // Limit initial render to last 500 lines to avoid overwhelming WebKitGTK
-        // Full scrollback is available via PageUp which triggers a re-render
-        const maxRenderLines = 500;
-        const startIdx = Math.max(0, searchEndIdx - maxRenderLines);
+        // Render window: starts at RENDER_WINDOW_INITIAL, grows toward RENDER_WINDOW_MAX as
+        // the user scrolls up (see the outputContainer.onscroll handler below). searchEndIdx
+        // above already anchors the window's END at a search match when one is active, same
+        // as before this change - a match is always the newest line in the window regardless
+        // of _renderWindow's current size.
+        const renderWindow = world._renderWindow || RENDER_WINDOW_INITIAL;
+        const startIdx = Math.max(0, searchEndIdx - renderWindow);
 
         // Build lines as HTML with explicit <br> line breaks
         const htmlParts = [];
@@ -5650,8 +5997,21 @@
         // spans separated by <br>).
         // Defense-in-depth: strip any event handler attributes that slipped through
         // (e.g. from MUD-supplied text) before it ever reaches the DOM.
-        elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
-        scrollToBottom();
+        if (preserveScroll) {
+            // Growing the render window while scrolled up must not jump the view - capture
+            // the height before rebuilding and restore scrollTop by the delta, the same
+            // pattern the ScrollbackLines handler already uses for a prepend. Deliberately
+            // does NOT call scrollToBottom() (that's the whole point of preserving position).
+            const container = elements.outputContainer;
+            const oldScrollHeight = container.scrollHeight;
+            const oldScrollTop = container.scrollTop;
+            elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
+            const newScrollHeight = container.scrollHeight;
+            container.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
+        } else {
+            elements.output.innerHTML = sanitizeHtml(htmlParts.join(''));
+            scrollToBottom();
+        }
 
         // Clear unseen for current world
         world.unseen_lines = 0;
@@ -10039,6 +10399,7 @@
                     releaseAll();
                 }
             }
+            scheduleRenderWindowCheck();
         };
 
         // Filter input handler

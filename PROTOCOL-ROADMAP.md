@@ -1035,3 +1035,232 @@ run required or performed.
 
 
 All required steps (1-11, plus the 6a security fix) complete as of 2026-07-31. Step 12 measured and deliberately not pursued (see its entry above). Nothing in this roadmap has been committed to git yet.
+
+## Phase B — seq drift, stuck scrollback indicator, and unreachable deep scrollback
+
+Design record for a second incident, distinct from Phase A above but living in the same
+delivery contract: a user reported (1) the last ~9 lines of one world's output duplicated on
+Android after several app backgrounds/resumes, surviving a manual resync; (2) the Android
+scrollback-download indicator sticking at 90% after resuming the app, clearing only on a
+resync; (3) `clay --gui=remote` unable to scroll back past ~500 lines, with raising the
+Remote Lines setting from 1000 to 5000 and reconnecting having no visible effect. Full plan
+file: `on-the-android-app-calm-curry` (session-local; superseded by this section as the
+permanent record). Scrollback depth policy set by the user for Phase B: clients that fetch a
+screenful on demand (the `--console` remote TUI) should reach as far back as the master
+instance holds in memory; clients that download their history up front (`--gui`, Android)
+stay bounded by the Remote Lines (`remote_initial_lines`) setting.
+
+**Root cause of (1):** the client (`app.js`) derived each line's seq from
+`msg.seq + appendedLineCount` — a count of lines the client *kept* after filtering (ANSI-only
+lines, idler markers, grep mode) — rather than the server's true per-line seq assignment.
+Every filtered line permanently drifted the client's `_max_seq` one below the server's true
+value. Once drifted, the next real batch's seq exceeded `_max_seq + 1`, recording a phantom
+gap; `lastContiguousSeq()` then reported a stale boundary to `AuthRequest.resume`, and the
+server's resume replay faithfully re-sent exactly the drifted-away tail as "new" — appended
+as duplicates. `D ≈ 9` from a color test's ANSI-only lines matched the report precisely.
+Four independent duplicate sources were found and fixed in the same broadcast path (Steps 1,
+2, 3, 6 below) — not all of them required the drift mechanism above.
+
+**Root cause of (2):** `ScrollbackLines` carried no way to correlate a reply to the request
+that caused it; the client routed purely on `world._gapFillPending`. A `before_seq` backfill
+reply landing while that flag happened to be (wrongly) true was misrouted into the gap-fill
+splice branch, which silently dropped every line (they're older than `_max_seq`) and `break`d
+before ever advancing the backfill pump — `backfillInProgress` stayed true forever, and the
+percentage (floored to multiples of 10, hidden only at 100%) froze at whatever it last
+computed. `_gapFillPending` got stuck specifically because Android's background-wake
+`RequestState` resync set it from a heuristic (`priorWorld && lastContiguousSeq(priorWorld) >
+0`) that stayed true even though `RequestState` sends no resume list and triggers no server
+replay to ever clear it.
+
+**Root cause of (3):** two independent client-side caps, both in `app.js`, neither
+server-side: `renderOutput()` hard-capped the DOM at the newest 500 lines with a stale comment
+claiming PageUp re-rendered to reveal more (it only ever moved `scrollTop`); and
+`backfillTotalTarget` was computed once, at connect time, so raising Remote Lines without
+reconnecting fetched nothing new. A third, independent bug (`_oldest_seq` recomputed without
+checking `_has_real_seq`, so one ephemeral `seq: 0` line poisoned it to a near-zero value) had
+already been silently capping *fetched* history in some sessions before the render cap was
+even reached.
+
+### Progress checklist
+
+Same resume protocol as Phase A: find the first unchecked box, verify against the tree
+whether it's actually done, continue from there. One step at a time. Verify
+`cargo build --target x86_64-unknown-linux-musl --no-default-features --features
+rustls-backend,ssh-transport` and `cargo test` after every Rust step; `node --check
+src/web/app.js` plus a standalone Node harness (no browser in this sandbox — same
+constraint Phase A hit) after every `app.js` step.
+
+**Phase 0 — server-side duplicate elimination (no wire change):**
+- [x] **Step 1** — `App::broadcast_released_lines` (was five separately hand-rolled copies):
+      `World::release_pending`/`release_all_pending` now return the drained lines so the
+      broadcast can never diverge from what was actually released.
+      `release_pending_screenful` previously sized its broadcast with `visual_line_count`
+      (a full-width estimate) while `release_pending` decided what to actually drain with
+      `nli_visual_rows` (NLI-narrowed, real wrapping) — surplus lines were broadcast but
+      stayed pending, re-broadcast on the next release. Test:
+      `test_release_pending_screenful_broadcasts_exactly_what_it_releases`.
+      **Found, out of scope:** multiuser's `ReleasePending`/`SelectiveFlush` handlers
+      (`daemon.rs`) are separate hand-rolled implementations (need `broadcast_to_owner`, not
+      the single-user broadcast primitives) that never broadcast the released text at all —
+      only `PendingReleased`/`PendingLinesUpdate` metadata. Independent bug, deferred.
+- [x] **Step 2** — `App::ws_broadcast` gained the `received_initial_state` gate its three
+      `WebSocketServer` siblings already had (whitelisted clients can be `authenticated: true`
+      before the app loop ever processes their connection). Test:
+      `test_ws_broadcast_skips_client_without_initial_state`.
+- [x] **Step 3** — `build_multiuser_initial_state` had no cap at all (unlike single-user's
+      `remote_initial_lines`-driven budget) and sent `pending_lines_ts` (single-user
+      deliberately sends none). Extracted `App::build_initial_output_lines`, shared by both.
+      Also removed `UserConnection.pending_lines` (dead code — never written anywhere).
+      Tests: `test_multiuser_initial_state_caps_lines_and_omits_pending`,
+      `test_multiuser_initial_state_empty_for_user_with_no_connection`.
+
+**Phase 1 — make `seq` authoritative on the wire:**
+- [x] **Step 4** — Established the invariant **`World::output_lines` is always sorted by
+      `seq`** (now documented in CLAUDE.md's Key Design Patterns). A gagged line while paused
+      with more-mode on used to jump straight into `output_lines` with a fresh (higher) seq
+      even while lower-seq pending lines sat unreleased — now routed into `pending_lines`
+      instead (`process_server_data`'s `hold_gagged_in_pending`) when that's the case;
+      `release_pending`'s budget loop skips gagged lines' visual-row cost (always released,
+      never counted against the row budget). Test:
+      `test_gagged_line_while_paused_does_not_jump_ahead_of_pending`.
+- [x] **Step 5** — Added `ServerData.end_seq: Option<u64>` (never trimmed to a bare `u64` —
+      seq 0 is real, same reasoning as `seq` itself). `App::broadcast_output_range` computes
+      `seq`/`end_seq` from the actual `output_lines` slice; used by `process_server_data` and
+      `emit_client_lines`. ~66 other construction sites mechanically get `end_seq: None`
+      (confirmed ephemeral, `seq: 0` there is correct). Tests:
+      `test_server_data_end_seq_covers_filtered_lines`, plus `end_seq` assertions folded into
+      the existing from_server/marked_new trim tests.
+- [x] **Step 6** — Release-path broadcasts (`broadcast_released_lines`) switched from the
+      `seq: 0` "bypass dedup" sentinel to the real per-batch span, safe now that Step 4
+      guarantees `output_lines` stays seq-sorted through a pause. Batch grouping extended to
+      `(marked_new, from_server, seq contiguity)` — `selective_flush`'s kept-lines subset is
+      not seq-contiguous, so a seq gap now also forces a new batch. Tests:
+      `test_released_pending_carries_real_seqs_no_false_duplicate`,
+      `test_selective_flush_emits_contiguous_seq_runs`.
+- [x] **Step 7** — `App::add_output`/`add_output_to_world` routed through
+      `broadcast_output_range` instead of hand-rolling a `seq: 0` broadcast of the raw input
+      text. Fixed two latent bugs this exposed: neither function previously checked whether
+      its text landed in `output_lines` vs. `pending_lines` while paused (could double-
+      broadcast); `add_output_to_world` hardcoded `marked_new: false` even for a background
+      world, inconsistent with what `World::add_output` itself stores on the line. Tests:
+      `test_add_output_broadcasts_real_seq`, `test_add_output_to_world_broadcasts_real_seq`.
+
+**Phase 2 — client seq correctness (`src/web/app.js`):**
+- [x] **Step 8** — `case 'ServerData'` derives `lineSeq = msg.seq + rawIdx` (the line's
+      position in the full pre-filter split) instead of `msg.seq + appendedLineCount` — the
+      seq-drift root cause. `hasRealSeq` widened to recognize a real seq-0 first line via
+      `end_seq`. `_max_seq` now advances from `end_seq` (or the full pre-filter batch length)
+      whenever the batch has a real seq, not gated on `appendedLineCount > 0` — an
+      all-filtered batch (a lone idler line) must still advance it. Verified via a standalone
+      Node harness (T8a-T8d); confirmed non-vacuous by reverting to the old formulas and
+      rerunning (5/11 assertions fail, reproducing the exact phantom-gap pattern).
+- [x] **Step 9** — `world._seqGaps` now carried across `InitialState` (`priorWorld` branch)
+      and persisted/restored alongside the IndexedDB cache (`cachedWorld` branch;
+      `scheduleWorldCacheSave` gained a `seqGaps` field) — previously silently dropped every
+      reconnect, hiding real holes from `lastContiguousSeq()`. The `_oldest_seq`/`_max_seq`
+      recompute loops guard on `line._has_real_seq !== false` (deliberately not a truthy
+      check — server-provided lines from `output_lines_ts`/cache never set the field at all
+      but always carry a real seq; only the live handler's fake-index fallback ever sets
+      `false` explicitly). Harness (T9a-T9c) confirmed non-vacuous twice: once for the
+      carry-over, once for the `!== false` vs. truthy distinction (a truthy-only guard broke
+      `_oldest_seq`/`_max_seq` on every ordinary fresh connect).
+- [x] **Step 10** — `dedupBySeq()`: one-time, seq-keyed (exact, not a text heuristic) dedup
+      pass applied on hydrate (both `priorWorld` and `cachedWorld` branches), cleaning up any
+      duplicate a client already picked up before Steps 8-9 shipped, without a cache DB
+      version bump (would silently discard everyone's cached scrollback — same precedent as
+      the existing `CLIENT_LINE_PREFIX` migration). Harness (T10/T10b/T10c) reproduces the
+      exact bug-report shape (20 real lines + a duplicated 9-line tail) and confirms correct
+      dedup, no false-positive on genuinely repeated text, and no interference with
+      no-real-seq lines.
+
+**Phase 3 — request/response correlation (the stuck-90% indicator):**
+- [x] **Step 11** — `RequestScrollback`/`ScrollbackLines` gained `request_id: Option<u64>`
+      (`#[serde(default)]`); `Some(0)` reserved for the server-initiated unprompted resume
+      replay, wired at all three server dispatch paths (master-WS, `-D`, multiuser). Also
+      closed a divergence the three-path audit turned up: multiuser's `RequestState` handler
+      was missing the `ActivityUpdate`/`PausedState` sends the single-user handler always
+      made — added, computed per-user from `user_connections` (not
+      `App::activity_count()`/a shared paused flag, which would leak across the multiuser
+      boundary). Test: `test_request_scrollback_echoes_request_id`; extended
+      `test_resume_replay_on_reconnect_sends_exact_gap_no_duplicate` and the multiuser
+      owner-scoping negative test (a real `request_id` attached to the leak attempt must not
+      bypass the owner check).
+- [x] **Step 12** — `app.js`'s `ScrollbackLines` handler now resolves which outstanding
+      request a reply answers via `request_id` (a `pendingScrollbackRequests` Map +
+      `registerScrollbackRequest`/`resolveScrollbackRequest`, with a
+      `SCROLLBACK_REQUEST_TIMEOUT_MS = 15000` watchdog) instead of routing purely on
+      `world._gapFillPending`. The bare `break` that skipped the pump-advance tail for
+      gap-fill replies is gone — both branches converge on
+      `updateScrollbackProgress()` + `backfillNextWorld()`. `_resumedFromServer` is now
+      derived from a `resumeSentThisConnection` map (populated by a new
+      `buildResumeAckListForAuthRequest()`, cleared on socket close) recording exactly what
+      was sent in `AuthRequest.resume` this connection, instead of a heuristic that stayed
+      true across a `RequestState` resync (no resume list is ever sent for that path) —
+      the actual stuck-flag mechanism. Both backfill queue builders now exclude worlds with
+      an outstanding gap-fill. Harness (T12a-T12e, 17 assertions) covers the routing decision,
+      the reserved id, the `_resumedFromServer` fix (with an old-heuristic comparison), the
+      watchdog, and watchdog-cancellation-on-resolve.
+- [x] **Step 12b** — Same correlation for the `--console` remote client (Rust): a
+      `ScrollbackRequestKind` enum + `App::register_scrollback_request`/
+      `pending_scrollback_requests` (mirroring `app.js`'s Map), threaded through
+      `backfill_next`'s tuple and the `scroll_page_up` scroll-triggered request in
+      `remote_client.rs`. `App::handle_remote_ws_message`'s `ScrollbackLines` handler
+      resolves `is_gap_fill` from `request_id` first, falling back to the legacy
+      `World::pending_gap`-presence heuristic. No watchdog needed here (unlike `app.js`) —
+      every request site already has a correctly-behaving `pending_gap` fallback, so a
+      stuck-forever state was never possible for this client. Test:
+      `test_console_client_scroll_backfill_reply_not_treated_as_gap_fill`; confirmed
+      non-vacuous by temporarily reverting to the legacy-only heuristic (fails exactly as
+      predicted — all 11 older-history lines dropped instead of prepended).
+
+**Phase 4 — reachable scrollback in `--gui`/Android:**
+- [x] **Step 13** — `backfillTotalTarget` recomputes live when Remote Lines changes
+      mid-session (previously computed once, at connect, inside `startBackfill()` — the
+      literal "raised it, reconnected, nothing changed" bug report). Only kicks
+      `startBackfillPhase2()` when a backfill isn't already in progress (one already running
+      picks up the new target on its own next check); `_backfill_exhausted` is cleared on
+      every world since a prior verdict may have been an artifact of Step 9's now-fixed
+      `_oldest_seq` poisoning. Harness (T13a-T13d).
+- [x] **Step 14** — The DOM render window (`renderOutput()`) is now expandable:
+      `RENDER_WINDOW_INITIAL/STEP = 500`, `RENDER_WINDOW_MAX = 5000` (matching
+      `remote_initial_lines`'s own upper clamp), grown on scroll-toward-top
+      (`scheduleRenderWindowCheck()`, rAF-throttled) via a new `renderOutput({preserveScroll})`
+      mode that corrects `scrollTop` by the height delta instead of jumping to the bottom.
+      Resets to the initial window on reaching the bottom and on world switch, so per-world
+      DOM cost doesn't stay elevated indefinitely. The 5000 ceiling is a deliberate,
+      tested-safe performance bound for WebKitGTK/Android WebView — lower it, don't remove
+      the mechanism, if a low-end device struggles. Harness (T14a-T14f).
+      **Noted, not fixed:** live incoming lines while parked at the bottom are still appended
+      via unbounded `insertAdjacentHTML`, independent of the render window (which only
+      governs a full rebuild) — pre-existing, out of this phase's scope.
+      **Deliberately not built:** unbounded scroll-triggered history *fetching* for
+      `--gui`/Android — per the scrollback policy above, those clients stay bounded by
+      Remote Lines; the render window just makes what they already hold reachable. The
+      `--console` remote client already had on-demand fetch (Step 12b fixed its one
+      correctness bug); nothing else was needed there.
+- [x] **Step 15** — Docs: this section; `end_seq`/`request_id`/the reserved `request_id: 0`
+      documented in `websockets.readme`; the `output_lines`-is-seq-sorted invariant added to
+      CLAUDE.md's Key Design Patterns; the stale `app.js` comment claiming Phase A's Step 7
+      (Android bridge ordering) "has NOT shipped yet" corrected — it shipped in Phase A.
+
+### Deliberately out of scope for Phase B
+
+- **SQLite archive (`scrollback.db`) for remote clients.** `handle_request_scrollback` reads
+  only `world.output_lines`; the archive is read solely by the local TUI's
+  `try_load_archive_lines`, and `-D`/multiuser never call `init_scrollback()` at all. Making
+  it remotely reachable needs an archive-backed branch in `handle_request_scrollback`,
+  `init_scrollback()` in both daemon entry points, seq assignment for archive lines, and
+  `from_archive` plumbed through `ScrollbackLines` — a separate project.
+- **Changing `World::next_seq` to start at 1** (reserving seq 0 entirely) instead of Step 8's
+  client-side `hasRealSeq` widening. Cleaner in the abstract, but touches three `next_seq`
+  recompute sites and invalidates every existing client's cached seq-0 lines. Revisit only if
+  the seq-0 ambiguity bites again in practice.
+- **Multiuser pause/pending support**, found broadly incomplete during Step 1 (no live
+  `ServerData` broadcast for released pending lines) and Step 4 (no gagged-line/pause concept
+  in `AppEvent::MultiuserServerData` at all). Real gaps, but outside this incident's three
+  reported symptoms (all single-user: `--gui`, Android, `--console`) — flagged for a future,
+  separately-scoped multiuser pass.
+
+All 15 steps (12b included) complete. `cargo build`/`cargo test` green throughout (677/677 at
+completion, up from the 665/665 baseline this phase started from). Nothing in this section
+has been committed to git yet.

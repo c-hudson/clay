@@ -13,7 +13,6 @@ use crate::{
     WsMessage,
     Theme, WorldSwitchMode,
     Encoding, AutoConnectType, KeepAliveType, WorldType,
-    current_timestamp_secs,
     App, World, EditorFocus, EditorSide, TabsMode, IconBarMode, DEBUG_ENABLED,
     handle_new_popup_key, NewPopupAction,
     WorldSelectorAction, ActionsListAction, NotesListAction, RecentWorldsAction,
@@ -1662,42 +1661,15 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                 }
                 if released > 0 {
                     let lines: Vec<_> = app.worlds[world_idx].pending_lines.drain(..released).collect();
-                    // Group consecutive lines by marked_new for correct per-line indicators
-                    let ts = current_timestamp_secs();
-                    let mut batch: Vec<String> = Vec::new();
-                    let mut batch_marked_new = lines.first().map(|l| l.marked_new).unwrap_or(false);
-                    for line in &lines {
-                        if line.marked_new != batch_marked_new && !batch.is_empty() {
-                            let ws_data = batch.join("\n") + "\n";
-                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                                world_index: world_idx,
-                                data: ws_data,
-                                is_viewed: true,
-                                ts,
-                                from_server: true,
-                                seq: 0,
-                                marked_new: batch_marked_new,
-                                flush: false, gagged: false,
-                            });
-                            batch.clear();
-                            batch_marked_new = line.marked_new;
-                        }
-                        batch.push(line.text.replace('\r', ""));
-                    }
-                    if !batch.is_empty() {
-                        let ws_data = batch.join("\n") + "\n";
-                        app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                            world_index: world_idx,
-                            data: ws_data,
-                            is_viewed: true,
-                            ts,
-                            from_server: true,
-                            seq: 0,
-                            marked_new: batch_marked_new,
-                            flush: false, gagged: false,
-                        });
-                    }
-                    app.worlds[world_idx].output_lines.extend(lines);
+                    app.worlds[world_idx].output_lines.extend(lines.iter().cloned());
+                    // Route through the shared release broadcaster (see its doc comment on
+                    // App::broadcast_released_lines) instead of a local copy of the batching
+                    // loop that hardcoded `from_server: true` for every line - pending_lines
+                    // can hold a mix of real server output and client-generated content (e.g.
+                    // a /recall that overflowed a screenful while paused), and forcing
+                    // from_server: true mismarked the latter, losing its "✨ " client-line
+                    // marker on the receiving end.
+                    app.broadcast_released_lines(world_idx, &lines);
                     if app.worlds[world_idx].pending_lines.is_empty() {
                         app.worlds[world_idx].paused = false;
                         app.worlds[world_idx].lines_since_pause = 0;
@@ -1715,50 +1687,12 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
         "flush_output" => {
             if app.current_world().paused {
                 let world_idx = app.current_world_index;
-                let lines_with_flags: Vec<(String, bool)> = app.worlds[world_idx]
-                    .pending_lines
-                    .iter()
-                    .map(|line| (line.text.replace('\r', ""), line.marked_new))
-                    .collect();
-                let released = lines_with_flags.len();
-                app.current_world_mut().release_all_pending();
-                if !lines_with_flags.is_empty() {
-                    // Group consecutive lines by marked_new for correct per-line indicators
-                    let ts = current_timestamp_secs();
-                    let mut batch: Vec<&str> = Vec::new();
-                    let mut batch_marked_new = lines_with_flags[0].1;
-                    for (text, marked_new) in &lines_with_flags {
-                        if *marked_new != batch_marked_new && !batch.is_empty() {
-                            let ws_data = batch.join("\n") + "\n";
-                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                                world_index: world_idx,
-                                data: ws_data,
-                                is_viewed: true,
-                                ts,
-                                from_server: true,
-                                seq: 0,
-                                marked_new: batch_marked_new,
-                                flush: false, gagged: false,
-                            });
-                            batch.clear();
-                            batch_marked_new = *marked_new;
-                        }
-                        batch.push(text);
-                    }
-                    if !batch.is_empty() {
-                        let ws_data = batch.join("\n") + "\n";
-                        app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                            world_index: world_idx,
-                            data: ws_data,
-                            is_viewed: true,
-                            ts,
-                            from_server: true,
-                            seq: 0,
-                            marked_new: batch_marked_new,
-                            flush: false, gagged: false,
-                        });
-                    }
-                }
+                // release_all_pending() returns exactly the lines it moved into output_lines,
+                // so the broadcast (via the shared App::broadcast_released_lines) can never
+                // diverge from what was actually released - see that helper's doc comment.
+                let released_lines = app.current_world_mut().release_all_pending();
+                let released = released_lines.len();
+                app.broadcast_released_lines(world_idx, &released_lines);
                 app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
                 app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
                 app.broadcast_activity();
@@ -1779,20 +1713,12 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                         kept.push(line);
                     }
                 }
-                for line in &kept {
-                    let ws_data = line.text.replace('\r', "") + "\n";
-                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                        world_index: world_idx,
-                        data: ws_data,
-                        is_viewed: true,
-                        ts: current_timestamp_secs(),
-                        from_server: line.from_server,
-                        seq: line.seq,
-                        marked_new: line.marked_new,
-                        flush: false, gagged: false,
-                    });
-                }
-                app.worlds[world_idx].output_lines.extend(kept);
+                app.worlds[world_idx].output_lines.extend(kept.iter().cloned());
+                // Shared release broadcaster (see App::broadcast_released_lines' doc comment)
+                // instead of a local per-line loop that sent each line's original `seq` - a
+                // value that can be <= the client's _max_seq, causing kept lines to be
+                // silently dropped as false duplicates instead of shown.
+                app.broadcast_released_lines(world_idx, &kept);
                 app.worlds[world_idx].paused = false;
                 app.worlds[world_idx].lines_since_pause = 0;
                 app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });

@@ -365,11 +365,16 @@ pub(crate) async fn run_grep_client(
             let before_seq = world_lines.get(&world_index)
                 .and_then(|lines| lines.iter().map(|l| l.seq).min())
                 .filter(|&s| s > 0);
+            // request_id: None - this client (history-search mode) has no correlator state
+            // to track; it drains ScrollbackLines replies purely by pending_worlds/
+            // backfill_complete and never has more than one outstanding request per world at
+            // a time, so there's nothing for a request_id to disambiguate here.
             let _ = ws_tx.send(WsMessage::RequestScrollback {
                 world_index,
                 count: 10000,
                 before_seq,
                 after_seq: None,
+                request_id: None,
             });
         }
 
@@ -378,7 +383,7 @@ pub(crate) async fn run_grep_client(
             match ws_read.next().await {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<WsMessage>(&text) {
-                        Ok(WsMessage::ScrollbackLines { world_index, lines, backfill_complete }) => {
+                        Ok(WsMessage::ScrollbackLines { world_index, lines, backfill_complete, .. }) => {
                             if let Some(existing) = world_lines.get_mut(&world_index) {
                                 // Scrollback lines come before existing lines
                                 let mut merged = lines;
@@ -396,6 +401,7 @@ pub(crate) async fn run_grep_client(
                                         count: 10000,
                                         before_seq: min_seq,
                                         after_seq: None,
+                                        request_id: None,
                                     });
                                 }
                             }
@@ -1326,12 +1332,13 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                         if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                             app.handle_remote_ws_message(ws_msg);
                             // After processing ScrollbackLines, backfill_next may be set
-                            if let Some((world_idx, before_seq, count)) = app.backfill_next.take() {
+                            if let Some((world_idx, before_seq, count, request_id)) = app.backfill_next.take() {
                                 let _ = ws_tx.send(WsMessage::RequestScrollback {
                                     world_index: world_idx,
                                     count,
                                     before_seq,
                                     after_seq: None,
+                                    request_id: Some(request_id),
                                 });
                             }
                             // Check if an /update was requested via ExecuteLocalCommand
@@ -1389,12 +1396,13 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                 backfill_timer_active = false;
                 // Start backfill from the first world in the queue
                 app.backfill_advance_to_next();
-                if let Some((world_idx, before_seq, count)) = app.backfill_next.take() {
+                if let Some((world_idx, before_seq, count, request_id)) = app.backfill_next.take() {
                     let _ = ws_tx.send(WsMessage::RequestScrollback {
                         world_index: world_idx,
                         count,
                         before_seq,
                         after_seq: None,
+                        request_id: Some(request_id),
                     });
                 }
             }
@@ -2179,11 +2187,17 @@ pub(crate) fn dispatch_remote_action(
             app.current_world_mut().scroll_offset = new_offset;
             if new_offset == 0 {
                 let before_seq = app.current_world().output_lines.first().map(|l| l.seq);
+                // Registered as Backfill (PROTOCOL-ROADMAP.md's seq-drift fix, Step 12b): a
+                // scroll-triggered request must never be misrouted into the gap-fill splice
+                // path even if pending_gap happens to be set from an unrelated outstanding
+                // resync at the same time - the fix this client-side correlator exists for.
+                let request_id = app.register_scrollback_request(app.current_world_index, crate::ScrollbackRequestKind::Backfill);
                 let _ = ws_tx.send(WsMessage::RequestScrollback {
                     world_index: app.current_world_index,
                     count: scroll_amount.max(1),
                     before_seq,
                     after_seq: None,
+                    request_id: Some(request_id),
                 });
             }
             app.needs_output_redraw = true;

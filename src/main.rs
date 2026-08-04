@@ -3252,20 +3252,37 @@ impl World {
 
     /// Release pending lines, counting by VISUAL lines (wrapped line count) to fill
     /// approximately one screenful. Always releases at least one logical line.
-    pub fn release_pending(&mut self, visual_budget: usize, output_width: usize, nli_enabled: bool, wrapspace: usize) {
+    /// Releases up to `visual_budget` visual rows worth of pending lines into `output_lines`
+    /// and returns exactly the `OutputLine`s that were moved (in order). Callers MUST derive
+    /// what they broadcast to WS clients from this return value rather than re-deriving their
+    /// own count with a second copy of the budget logic — a prior bug
+    /// (`release_pending_screenful` sizing its broadcast with `visual_line_count` while this
+    /// function released fewer lines per `nli_visual_rows`) let surplus lines be broadcast
+    /// while remaining in `pending_lines`, so they were broadcast AGAIN on the next release.
+    pub fn release_pending(&mut self, visual_budget: usize, output_width: usize, nli_enabled: bool, wrapspace: usize) -> Vec<OutputLine> {
         // Reset visual_line_offset so truncated wrapped lines from the pause trigger
         // are fully visible after releasing.
         self.visual_line_offset = 0;
         if self.pending_lines.is_empty() {
             self.paused = false;
             self.lines_since_pause = 0;
-            return;
+            return Vec::new();
         }
         let width = output_width.max(1);
         let mut visual_total = 0;
         let mut logical_count = 0;
 
         for line in &self.pending_lines {
+            if line.gagged {
+                // Gagged lines render as nothing unless F2/show_tags is on (see
+                // process_server_data's hold_gagged_in_pending path, which is what can put a
+                // gagged line in pending_lines in the first place) and never trigger more-mode
+                // pausing either - they shouldn't consume this release's visual budget. Always
+                // included in this release batch alongside whatever visible lines fit,
+                // uncounted for the row budget itself.
+                logical_count += 1;
+                continue;
+            }
             let vl = nli_visual_rows(&line.text, width, line.marked_new, nli_enabled, wrapspace);
             // If adding this line would exceed budget AND we already have at least one,
             // stop before adding it. Always release at least 1 line.
@@ -3288,11 +3305,11 @@ impl World {
             .pending_lines
             .drain(..logical_count.min(self.pending_lines.len()))
             .collect();
-        for line in to_release {
+        for line in &to_release {
             if line.marked_new && self.first_marked_new_index.is_none() {
                 self.first_marked_new_index = Some(self.output_lines.len());
             }
-            self.output_lines.push(line);
+            self.output_lines.push(line.clone());
         }
         if self.pending_lines.is_empty() {
             self.paused = false;
@@ -3309,13 +3326,18 @@ impl World {
             self.lines_since_pause = 0;
         }
         self.scroll_to_bottom();
+        to_release
     }
 
-    pub fn release_all_pending(&mut self) {
+    /// Releases every pending line into `output_lines` and returns exactly the lines that
+    /// were moved (in order) — see `release_pending`'s doc comment for why callers must
+    /// broadcast from this return value rather than re-deriving their own copy.
+    pub fn release_all_pending(&mut self) -> Vec<OutputLine> {
         if self.first_marked_new_index.is_none() && self.pending_lines.iter().any(|l| l.marked_new) {
             self.first_marked_new_index = Some(self.output_lines.len());
         }
-        self.output_lines.append(&mut self.pending_lines);
+        let released: Vec<OutputLine> = std::mem::take(&mut self.pending_lines);
+        self.output_lines.extend(released.iter().cloned());
         self.paused = false;
         self.lines_since_pause = 0;
         self.pending_since = None; // Clear pending timestamp
@@ -3325,6 +3347,7 @@ impl World {
             self.partial_in_pending = false;
         }
         self.scroll_to_bottom();
+        released
     }
 
     /// Filter output to hide client-generated lines (mark them as gagged instead of removing).
@@ -3401,6 +3424,21 @@ impl World {
             OutputLine::new_with_timestamp("".to_string(), now, 11),
         ]
     }
+}
+
+/// Kind of an outstanding client-initiated `RequestScrollback`, tracked by request_id so a
+/// `ScrollbackLines` reply can be routed correctly (PROTOCOL-ROADMAP.md's seq-drift fix,
+/// Step 12b - the Rust `--console` remote client's analog of app.js's request_id
+/// correlator). `GapFill` covers reconnect/resync catch-up (spliced via `World::pending_gap`,
+/// appended relative to it); `Backfill` covers an older-history request (prepended). The
+/// wire-reserved id `0` (a server-initiated unprompted resume replay) is never registered
+/// here — this client never sends `AuthRequest.resume` (see the comments at its `AuthRequest`
+/// construction sites in `remote_client.rs`), so it should never legitimately receive one
+/// either; routing still treats it as `GapFill` defensively if one ever arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScrollbackRequestKind {
+    GapFill,
+    Backfill,
 }
 
 pub struct App {
@@ -3514,8 +3552,19 @@ pub struct App {
     /// Remote client backfill: worlds whose history is known exhausted (server returned fewer
     /// lines than requested for a prior chunk) - stops phase 2 from re-queuing them forever.
     pub backfill_exhausted: std::collections::HashSet<usize>,
-    /// Remote client backfill: next request to send (world_index, before_seq, count)
-    pub backfill_next: Option<(usize, Option<u64>, usize)>,
+    /// Remote client backfill: next request to send (world_index, before_seq, count, request_id)
+    pub backfill_next: Option<(usize, Option<u64>, usize, u64)>,
+    /// Remote client (`--console`): next id to hand out via `register_scrollback_request`.
+    /// PROTOCOL-ROADMAP.md's seq-drift fix, Step 12b - the Rust console client's analog of
+    /// app.js's request_id correlator, disambiguating a `ScrollbackLines` reply from
+    /// `World::pending_gap` alone (which stayed ambiguous whenever a gap-fill and an
+    /// ordinary backfill chunk could both be outstanding for the same world).
+    pub next_scrollback_request_id: u64,
+    /// Remote client (`--console`): outstanding client-initiated RequestScrollback requests,
+    /// keyed by the id sent on the wire, to `(world_index, kind)`. request_id 0 is reserved
+    /// for a server-initiated unprompted resume replay and is never registered here (see
+    /// `ScrollbackRequestKind`'s doc comment).
+    pub(crate) pending_scrollback_requests: std::collections::HashMap<u64, (usize, ScrollbackRequestKind)>,
     /// Master GUI mode: channel to send messages to the embedded GUI
     pub gui_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Master GUI mode: callback to wake the GUI for immediate repaint
@@ -3626,6 +3675,8 @@ impl App {
             backfill_queue: Vec::new(),
             backfill_exhausted: std::collections::HashSet::new(),
             backfill_next: None,
+            next_scrollback_request_id: 1,
+            pending_scrollback_requests: std::collections::HashMap::new(),
             gui_tx: None, // Set when running in master GUI mode (--gui)
             gui_repaint: None,
             audio_backend: audio::AudioBackend::None, // Lazy init on first use
@@ -4443,7 +4494,7 @@ impl App {
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, marked_new, flush, gagged, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq: None, marked_new, flush, gagged, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Flush: clear output buffer before appending new lines
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
@@ -4782,7 +4833,38 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
-            WsMessage::ScrollbackLines { world_index, lines, backfill_complete } => {
+            WsMessage::ScrollbackLines { world_index, lines, backfill_complete, request_id } => {
+                // Resolve which outstanding request this reply answers (PROTOCOL-ROADMAP.md's
+                // seq-drift fix, Step 12b) instead of routing purely on World::pending_gap,
+                // which stays ambiguous whenever a gap-fill and an ordinary backfill chunk
+                // could both be outstanding for the same world: a before_seq backfill reply
+                // landing while pending_gap happens to be set from an unrelated request used
+                // to be misrouted into the gap-fill splice branch below, where every one of
+                // its (older) lines fails the `seq > last_contiguous_seq` filter and is
+                // silently dropped. request_id 0 is reserved for a server-initiated
+                // unprompted resume replay (this client never sends AuthRequest.resume, so it
+                // should never legitimately receive one either - treated as GapFill
+                // defensively if it ever does); a registered id names its own recorded kind;
+                // anything else (no id, or an id this client doesn't recognize - an old
+                // server) falls back to the legacy pending_gap-presence heuristic.
+                let is_gap_fill = if request_id == Some(0) {
+                    true
+                } else if let Some(rid) = request_id {
+                    match self.pending_scrollback_requests.remove(&rid) {
+                        Some((expected_world, kind)) => {
+                            if expected_world != world_index {
+                                debug_log(true, &format!(
+                                    "ScrollbackLines request_id/world_index mismatch: request {} was for world {}, reply names world {}",
+                                    rid, expected_world, world_index));
+                            }
+                            kind == ScrollbackRequestKind::GapFill
+                        }
+                        None => self.worlds.get(world_index).map(|w| w.pending_gap.is_some()).unwrap_or(false),
+                    }
+                } else {
+                    self.worlds.get(world_index).map(|w| w.pending_gap.is_some()).unwrap_or(false)
+                };
+
                 // A gap-fill reply (our RequestScrollback{after_seq} sent from the
                 // ResyncRequired handler below) must be spliced back into the exact
                 // position the gap was first noticed (`World::pending_gap`), not prepended
@@ -4790,40 +4872,45 @@ impl App {
                 // field's doc comment and PROTOCOL-ROADMAP.md Step 6. Handled first and
                 // returns early: it's unrelated to the historical-backfill state machine
                 // (backfill_queue/backfill_exhausted/backfill_advance_to_next) below, which
-                // only concerns before_seq requests for older scrollback history.
-                if let Some((insert_at, last_contiguous_seq)) = self.worlds.get(world_index).and_then(|w| w.pending_gap) {
-                    if let Some(world) = self.worlds.get_mut(world_index) {
-                        world.pending_gap = None;
-                        // Defensive filter: the request may have used an older boundary
-                        // than our own tracked one (the server's from_seq can lag behind
-                        // ours if we haven't acked recently), so the reply can legitimately
-                        // include lines we already have — drop those instead of duplicating.
-                        let new_lines: Vec<OutputLine> = lines.into_iter()
-                            .filter(|l| l.seq > last_contiguous_seq)
-                            .map(|line| OutputLine {
-                                text: line.text,
-                                timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
-                                from_server: line.from_server,
-                                gagged: line.gagged,
-                                seq: line.seq,
-                                highlight_color: line.highlight_color,
-                                marked_new: line.marked_new,
-                                from_archive: line.from_archive,
-                            }).collect();
-                        let insert_at = insert_at.min(world.output_lines.len());
-                        let inserted = new_lines.len();
-                        for (i, line) in new_lines.into_iter().enumerate() {
-                            world.output_lines.insert(insert_at + i, line);
+                // only concerns before_seq requests for older scrollback history. If
+                // is_gap_fill is true but pending_gap has no data to splice against (a stale
+                // claim), fall through to the prepend path below instead of dropping the
+                // reply outright.
+                if is_gap_fill {
+                    if let Some((insert_at, last_contiguous_seq)) = self.worlds.get(world_index).and_then(|w| w.pending_gap) {
+                        if let Some(world) = self.worlds.get_mut(world_index) {
+                            world.pending_gap = None;
+                            // Defensive filter: the request may have used an older boundary
+                            // than our own tracked one (the server's from_seq can lag behind
+                            // ours if we haven't acked recently), so the reply can legitimately
+                            // include lines we already have — drop those instead of duplicating.
+                            let new_lines: Vec<OutputLine> = lines.into_iter()
+                                .filter(|l| l.seq > last_contiguous_seq)
+                                .map(|line| OutputLine {
+                                    text: line.text,
+                                    timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
+                                    from_server: line.from_server,
+                                    gagged: line.gagged,
+                                    seq: line.seq,
+                                    highlight_color: line.highlight_color,
+                                    marked_new: line.marked_new,
+                                    from_archive: line.from_archive,
+                                }).collect();
+                            let insert_at = insert_at.min(world.output_lines.len());
+                            let inserted = new_lines.len();
+                            for (i, line) in new_lines.into_iter().enumerate() {
+                                world.output_lines.insert(insert_at + i, line);
+                            }
+                            // Only the view needs shifting if the splice landed at or before
+                            // it — content spliced in after the current scroll position
+                            // doesn't move what's already on screen.
+                            if insert_at <= world.scroll_offset {
+                                world.scroll_offset += inserted;
+                            }
+                            self.needs_output_redraw = true;
                         }
-                        // Only the view needs shifting if the splice landed at or before
-                        // it — content spliced in after the current scroll position
-                        // doesn't move what's already on screen.
-                        if insert_at <= world.scroll_offset {
-                            world.scroll_offset += inserted;
-                        }
-                        self.needs_output_redraw = true;
+                        return;
                     }
-                    return;
                 }
 
                 // Response to RequestScrollback - prepend lines to output
@@ -4908,12 +4995,17 @@ impl App {
                     from_seq
                 };
                 if let Some(ref tx) = self.ws_client_tx {
+                    // request_id: None for now - Step 12b of the seq-drift fix
+                    // (PROTOCOL-ROADMAP.md follow-on) wires real correlation IDs into this
+                    // client's requests generally; this specific reply is already
+                    // unambiguously routed via world.pending_gap (set above).
                     let _ = tx.send(WsMessage::RequestScrollback {
                         world_index,
                         count: 10_000, // Matches the server's RESUME_REPLAY_MAX (main.rs) — the
                                        // scrollback ring can never hold more than that per world.
                         before_seq: None,
                         after_seq: Some(after_seq),
+                        request_id: None,
                     });
                 }
             }
@@ -5043,6 +5135,24 @@ impl App {
         }
     }
 
+    /// Registers a new outstanding client-initiated `RequestScrollback` and returns its
+    /// id (PROTOCOL-ROADMAP.md's seq-drift fix, Step 12b). `kind` lets the `ScrollbackLines`
+    /// handler route the reply correctly instead of relying solely on `World::pending_gap`,
+    /// which stays ambiguous whenever a gap-fill and an ordinary backfill chunk could both
+    /// be outstanding for the same world (a `before_seq` backfill reply landing while
+    /// `pending_gap` happens to be set from an unrelated request would otherwise be
+    /// misrouted into the gap-fill splice path, where every one of its lines fails the
+    /// `seq > last_contiguous_seq` filter and is silently dropped). No watchdog here (unlike
+    /// app.js's equivalent): the console client's request sites all already have a `pending_gap`
+    /// fallback path that behaves correctly if a reply is lost, so a stuck-forever state
+    /// isn't possible the way it was for app.js's `_gapFillPending`.
+    pub(crate) fn register_scrollback_request(&mut self, world_index: usize, kind: ScrollbackRequestKind) -> u64 {
+        let id = self.next_scrollback_request_id;
+        self.next_scrollback_request_id += 1;
+        self.pending_scrollback_requests.insert(id, (world_index, kind));
+        id
+    }
+
     /// Advance backfill to the next world in the queue (current phase).
     /// Sets backfill_next so the main loop can send the request. When the phase 1
     /// queue drains, automatically starts phase 2 and continues from there.
@@ -5071,7 +5181,8 @@ impl App {
                     // the phase 2 queue while received < target, so this is always >= 1.
                     self.backfill_total_target.saturating_sub(received).clamp(1, BACKFILL_PHASE2_CHUNK_SIZE)
                 };
-                self.backfill_next = Some((world_idx, oldest_seq, count));
+                let request_id = self.register_scrollback_request(world_idx, ScrollbackRequestKind::Backfill);
+                self.backfill_next = Some((world_idx, oldest_seq, count, request_id));
                 return;
             }
         }
@@ -5589,7 +5700,7 @@ impl App {
 
     /// `WsMessage::RequestScrollback` handling — shared by master-WS and daemon (T40).
     /// Confirmed byte-identical between the two previous copies — pure duplication.
-    pub(crate) fn handle_request_scrollback(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>) {
+    pub(crate) fn handle_request_scrollback(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>, request_id: Option<u64>) {
         if world_index >= self.worlds.len() {
             return;
         }
@@ -5679,6 +5790,7 @@ impl App {
             world_index,
             lines,
             backfill_complete,
+            request_id,
         });
     }
 
@@ -5695,10 +5807,10 @@ impl App {
     /// this silently no-ops (no reply at all) rather than sending an error — an error
     /// reply would itself leak whether `world_index` exists, which a bare 404-style
     /// silence avoids.
-    pub(crate) fn handle_request_scrollback_owned(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>, owner: &str) {
+    pub(crate) fn handle_request_scrollback_owned(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>, request_id: Option<u64>, owner: &str) {
         match self.worlds.get(world_index) {
             Some(world) if world.owner.as_deref() == Some(owner) => {
-                self.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq);
+                self.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq, request_id);
             }
             _ => {
                 // Deliberate silent no-op — see doc comment above.
@@ -5908,20 +6020,38 @@ impl App {
         } else {
             format!("{}\n", text)
         };
+
+        let pending_before = self.worlds[world_idx].pending_lines.len();
+        let output_before = self.worlds[world_idx].output_lines.len();
+        // If there's a partial (unterminated) line already in output_lines, it wasn't
+        // broadcast yet (partials are excluded from broadcasts) - mirrors
+        // emit_client_lines/process_server_data's had_partial_in_output handling.
+        let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
+            && !self.worlds[world_idx].partial_in_pending;
+
         self.current_world_mut()
             .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
 
-        // Broadcast to WebSocket clients viewing this world
-        self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-            world_index: world_idx,
-            data: text_with_newline,
-            is_viewed: true,
-            ts: current_timestamp_secs(),
-            from_server: false,  // Client-generated message
-            seq: 0,
-            marked_new: false,
-            flush: false, gagged: false,
-        });
+        let output_after = self.worlds[world_idx].output_lines.len();
+        let pending_after = self.worlds[world_idx].pending_lines.len();
+        let mut skip_count = output_before;
+        let mut lines_to_output = output_after.saturating_sub(output_before);
+        if had_partial_in_output && skip_count > 0 {
+            skip_count -= 1;
+            lines_to_output = output_after.saturating_sub(skip_count);
+        }
+
+        // Broadcast only what actually landed in output_lines, built from the real pushed
+        // lines (real seq/end_seq, \r-stripped) instead of re-broadcasting the raw input
+        // text with seq: 0. A message sent while paused with more-mode on can be diverted
+        // to pending_lines instead (World::add_output's goes_to_pending path) - that's
+        // broadcast later via the release paths (App::broadcast_released_lines) when the
+        // pause ends, not here, or it would be sent twice.
+        self.broadcast_output_range(world_idx, skip_count, lines_to_output, true, false, false, false);
+
+        if pending_after != pending_before {
+            self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
+        }
 
         // Mark output for redraw since we added content
         self.needs_output_redraw = true;
@@ -6009,20 +6139,31 @@ impl App {
         } else {
             format!("{}\n", text)
         };
+
+        let pending_before = self.worlds[world_idx].pending_lines.len();
+        let output_before = self.worlds[world_idx].output_lines.len();
+        let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
+            && !self.worlds[world_idx].partial_in_pending;
+
         self.worlds[world_idx]
             .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
 
-        // Broadcast to WebSocket clients viewing this world
-        self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-            world_index: world_idx,
-            data: text_with_newline,
-            is_viewed: is_current,
-            ts: current_timestamp_secs(),
-            from_server: false,  // Client-generated message
-            seq: 0,
-            marked_new: false,
-            flush: false, gagged: false,
-        });
+        let output_after = self.worlds[world_idx].output_lines.len();
+        let pending_after = self.worlds[world_idx].pending_lines.len();
+        let mut skip_count = output_before;
+        let mut lines_to_output = output_after.saturating_sub(output_before);
+        if had_partial_in_output && skip_count > 0 {
+            skip_count -= 1;
+            lines_to_output = output_after.saturating_sub(skip_count);
+        }
+
+        // Broadcast only what actually landed in output_lines - see add_output's identical
+        // comment on why a message diverted to pending_lines must not also be broadcast here.
+        self.broadcast_output_range(world_idx, skip_count, lines_to_output, is_current, false, !is_current, false);
+
+        if pending_after != pending_before {
+            self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
+        }
 
         if world_idx == self.current_world_index {
             self.needs_output_redraw = true;
@@ -6040,6 +6181,43 @@ impl App {
     /// the parts that don't apply to client-generated text (splash-clear,
     /// highlight-map, gagged-line handling, TTS). Keep in sync with that
     /// function if the broadcast contract changes.
+    /// Broadcasts a contiguous slice `world.output_lines[skip..skip+count]` as one
+    /// `ServerData` message, computing `seq`/`end_seq` from the ACTUAL lines in that slice
+    /// rather than a locally re-derived count - the seq-drift fix's model for any broadcast
+    /// of freshly-pushed `output_lines` content. `count == 0` is a no-op except for the
+    /// `flush`-with-no-lines case (splash cleared, nothing to send but clients still need
+    /// their buffer flushed). Shared by `process_server_data` (real MUD output) and
+    /// `emit_client_lines` (client-generated blocks, e.g. `/recall`).
+    fn broadcast_output_range(&mut self, world_idx: usize, skip: usize, count: usize, is_viewed: bool, from_server: bool, marked_new: bool, flush: bool) {
+        if count == 0 {
+            if flush {
+                self.ws_broadcast(WsMessage::WorldFlushed { world_index: world_idx });
+            }
+            return;
+        }
+        let world = &self.worlds[world_idx];
+        let first_seq = world.output_lines.get(skip).map(|l| l.seq).unwrap_or(0);
+        let end_seq = world.output_lines.get(skip + count - 1).map(|l| l.seq);
+        let data: String = world.output_lines.iter()
+            .skip(skip)
+            .take(count)
+            .map(|line| line.text.replace('\r', ""))
+            .collect::<Vec<_>>()
+            .join("\n") + "\n";
+        self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            world_index: world_idx,
+            data,
+            is_viewed,
+            ts: current_timestamp_secs(),
+            from_server,
+            seq: first_seq,
+            end_seq,
+            marked_new,
+            flush,
+            gagged: false,
+        });
+    }
+
     pub(crate) fn emit_client_lines(&mut self, world_idx: usize, lines: &[String], is_daemon_mode: bool) {
         if world_idx >= self.worlds.len() || lines.is_empty() {
             return;
@@ -6083,31 +6261,7 @@ impl App {
             lines_to_output = output_after.saturating_sub(skip_count);
         }
 
-        if lines_to_output > 0 {
-            let first_seq = self.worlds[world_idx]
-                .output_lines
-                .get(skip_count)
-                .map(|l| l.seq)
-                .unwrap_or(0);
-            let data: String = self.worlds[world_idx]
-                .output_lines
-                .iter()
-                .skip(skip_count)
-                .take(lines_to_output)
-                .map(|line| line.text.replace('\r', ""))
-                .collect::<Vec<_>>()
-                .join("\n") + "\n";
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                world_index: world_idx,
-                data,
-                is_viewed: is_current,
-                ts: current_timestamp_secs(),
-                from_server: false,
-                seq: first_seq,
-                marked_new: !is_current,
-                flush: false, gagged: false,
-            });
-        }
+        self.broadcast_output_range(world_idx, skip_count, lines_to_output, is_current, false, !is_current, false);
 
         if lines_to_pending > 0 || pending_after != pending_before {
             self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
@@ -6505,6 +6659,80 @@ impl App {
         }
     }
 
+    /// Broadcasts a set of just-released pending lines (from `World::release_pending` /
+    /// `release_all_pending`) to WS clients viewing `world_idx`, grouped into batches by
+    /// `(marked_new, from_server)` so each batch gets the correct new-line indicator and
+    /// client-line marker. This is the single broadcast implementation shared by every
+    /// release site (`release_pending_lines`, `release_pending_screenful`, `selective_flush`,
+    /// and the `input_handler.rs` release actions) — previously each site either duplicated
+    /// this grouping logic with its own copy of the release budget calculation (a divergence
+    /// that let `release_pending_screenful` broadcast lines it hadn't actually released, see
+    /// its call site) or hardcoded `from_server: true` for an entire batch regardless of each
+    /// line's real flag. Taking `released: &[OutputLine]` directly — the exact lines that were
+    /// moved into `output_lines` — makes both bugs structurally impossible: what's broadcast
+    /// can never diverge from what was released, and each line's own flags travel with it.
+    ///
+    /// `seq`/`end_seq` are the real span of each contiguous-seq sub-batch (Step 6 of the
+    /// seq-drift fix) rather than the old `seq: 0` "bypass dedup" convention — safe now that
+    /// `World::output_lines` is guaranteed seq-sorted through a pause (see the invariant note
+    /// on `process_server_data`'s gagged-line handling). Grouping is therefore
+    /// `(marked_new, from_server, seq contiguity)`: `released` is normally one contiguous run
+    /// (`release_pending`/`release_all_pending` always drain a contiguous prefix), but
+    /// `selective_flush`'s caller can pass a non-contiguous subset (only lines matching some
+    /// filter), so a seq gap also starts a new batch even when `marked_new`/`from_server`
+    /// don't change — otherwise a batch's `seq..=end_seq` span would claim to cover lines it
+    /// doesn't actually contain.
+    pub(crate) fn broadcast_released_lines(&mut self, world_idx: usize, released: &[OutputLine]) {
+        if released.is_empty() {
+            return;
+        }
+        let ts = current_timestamp_secs();
+        let mut batch: Vec<String> = Vec::new();
+        let mut batch_marked_new = released[0].marked_new;
+        let mut batch_from_server = released[0].from_server;
+        let mut batch_start_seq = released[0].seq;
+        let mut batch_end_seq = released[0].seq;
+        let mut prev_seq: Option<u64> = None;
+        for line in released {
+            let seq_contiguous = prev_seq.map(|p| line.seq == p + 1).unwrap_or(true);
+            if (line.marked_new != batch_marked_new || line.from_server != batch_from_server || !seq_contiguous) && !batch.is_empty() {
+                let ws_data = batch.join("\n") + "\n";
+                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                    world_index: world_idx,
+                    data: ws_data,
+                    is_viewed: true,
+                    ts,
+                    from_server: batch_from_server,
+                    seq: batch_start_seq,
+                    end_seq: Some(batch_end_seq),
+                    marked_new: batch_marked_new,
+                    flush: false, gagged: false,
+                });
+                batch.clear();
+                batch_marked_new = line.marked_new;
+                batch_from_server = line.from_server;
+                batch_start_seq = line.seq;
+            }
+            batch_end_seq = line.seq;
+            batch.push(line.text.replace('\r', ""));
+            prev_seq = Some(line.seq);
+        }
+        if !batch.is_empty() {
+            let ws_data = batch.join("\n") + "\n";
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data: ws_data,
+                is_viewed: true,
+                ts,
+                from_server: batch_from_server,
+                seq: batch_start_seq,
+                end_seq: Some(batch_end_seq),
+                marked_new: batch_marked_new,
+                flush: false, gagged: false,
+            });
+        }
+    }
+
     /// `WsMessage::ReleasePending` handling — shared by master-WS and daemon (T38).
     ///
     /// Reconciles two real divergences found between the previous per-transport copies, not
@@ -6537,84 +6765,9 @@ impl App {
         // count == 0 means release all; otherwise treat count as visual budget
         let visual_budget = if count == 0 { usize::MAX } else { count };
 
-        // Pre-calculate logical lines to release (mirrors release_pending logic)
-        let width = client_width.max(1);
-        let nli = self.settings.new_line_indicator;
-        let mut visual_total = 0;
-        let mut logical_count = 0;
-        for line in &self.worlds[world_index].pending_lines {
-            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli, self.settings.wrapspace as usize);
-            if visual_total > 0 && visual_total + vl > visual_budget {
-                break;
-            }
-            visual_total += vl;
-            logical_count += 1;
-            if visual_total >= visual_budget {
-                break;
-            }
-        }
-        if logical_count == 0 && pending_count > 0 {
-            logical_count = 1;
-        }
-        let to_release = logical_count.min(pending_count);
-
-        // Get text, marked_new, and from_server of lines that will be released. from_server
-        // must travel with each line (not be assumed true) - pending can hold a mix of real
-        // server output and client-generated content (e.g. a /recall that overflowed a
-        // screenful while paused), and clients key the "✨ " marker off this exact flag.
-        let lines_with_flags: Vec<(String, bool, bool)> = self.worlds[world_index]
-            .pending_lines
-            .iter()
-            .take(to_release)
-            .map(|line| (line.text.replace('\r', ""), line.marked_new, line.from_server))
-            .collect();
-
-        self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator, self.settings.wrapspace as usize);
-
-        // Broadcast the released lines to clients viewing this world. Group consecutive
-        // lines by (marked_new, from_server) so each batch gets the correct indicator and
-        // the correct client-line marker.
-        if !lines_with_flags.is_empty() {
-            let ts = current_timestamp_secs();
-            let mut batch: Vec<&str> = Vec::new();
-            let mut batch_marked_new = lines_with_flags[0].1;
-            let mut batch_from_server = lines_with_flags[0].2;
-            for (text, marked_new, from_server) in &lines_with_flags {
-                if (*marked_new != batch_marked_new || *from_server != batch_from_server) && !batch.is_empty() {
-                    let ws_data = batch.join("\n") + "\n";
-                    self.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                        world_index,
-                        data: ws_data,
-                        is_viewed: true,
-                        ts,
-                        from_server: batch_from_server,
-                        // Use seq 0 to bypass client-side dedup check. Released pending
-                        // lines have old seqs that may be lower than _max_seq if new data
-                        // arrived after reconnect, causing false duplicate detection.
-                        seq: 0,
-                        marked_new: batch_marked_new,
-                        flush: false, gagged: false,
-                    });
-                    batch.clear();
-                    batch_marked_new = *marked_new;
-                    batch_from_server = *from_server;
-                }
-                batch.push(text);
-            }
-            if !batch.is_empty() {
-                let ws_data = batch.join("\n") + "\n";
-                self.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                    world_index,
-                    data: ws_data,
-                    is_viewed: true,
-                    ts,
-                    from_server: batch_from_server,
-                    seq: 0,
-                    marked_new: batch_marked_new,
-                    flush: false, gagged: false,
-                });
-            }
-        }
+        let released = self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator, self.settings.wrapspace as usize);
+        let to_release = released.len();
+        self.broadcast_released_lines(world_index, &released);
 
         // Broadcast release event and updated pending count
         self.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
@@ -6649,20 +6802,16 @@ impl App {
                 kept.push(line);
             }
         }
-        for line in &kept {
-            let ws_data = line.text.replace('\r', "") + "\n";
-            self.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                world_index,
-                data: ws_data,
-                is_viewed: true,
-                ts: current_timestamp_secs(),
-                from_server: line.from_server,
-                seq: line.seq,
-                marked_new: false,
-                flush: false, gagged: false,
-            });
-        }
-        self.worlds[world_index].output_lines.extend(kept);
+        self.worlds[world_index].output_lines.extend(kept.iter().cloned());
+        // Route through the shared release broadcaster (see its doc comment) instead of the
+        // old per-line loop, which forced `marked_new: false` for every line regardless of
+        // its real flag and broadcast the line's original `seq` — a value that can be <=
+        // `_max_seq` on the client, causing kept lines to be dropped as false duplicates
+        // instead of shown. `broadcast_released_lines` batches consecutive lines sharing
+        // `(marked_new, from_server)` and currently sends `seq: 0` like every other release
+        // site (Step 6 of the seq-drift fix makes this real once `output_lines` is guaranteed
+        // seq-sorted through a pause).
+        self.broadcast_released_lines(world_index, &kept);
         self.worlds[world_index].paused = false;
         self.worlds[world_index].lines_since_pause = 0;
         self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
@@ -7095,7 +7244,19 @@ impl App {
             {
                 let clients_guard = server.clients.read().unwrap();
                 for (&id, client) in clients_guard.iter() {
-                    if client.authenticated {
+                    // Only broadcast to clients that are authenticated AND have received
+                    // InitialState - mirrors the identical gate + rationale in
+                    // WebSocketServer::broadcast_to_owner/broadcast_to_all/
+                    // broadcast_to_world_viewers (websocket.rs). This method was the one
+                    // fan-out that lacked it (predates the gating; never updated): a
+                    // whitelisted client is inserted with `authenticated: true` before the
+                    // app loop ever sees the connection (websocket.rs's client-insert site),
+                    // and `authenticated` is set synchronously in the WS reader task before
+                    // AuthRequest is even queued to the app event loop - so without this
+                    // check, a broadcast could reach such a client before its later-built
+                    // InitialState, causing SEQ MISMATCH errors and duplicate/flickering
+                    // messages once that InitialState arrives with the same lines.
+                    if client.authenticated && client.received_initial_state {
                         // Bounded channel (PROTOCOL-ROADMAP.md Step 3) — try_send instead
                         // of the old infallible unbounded send. A `Full` here is turned
                         // into a `ResyncRequired` via `reconcile_resync` below. The
@@ -7704,42 +7865,13 @@ impl App {
 
             // For synchronized more-mode: only broadcast lines that went to output_lines
             // Lines that went to pending_lines will be broadcast when released
-            // Only send to clients viewing this world (Phase 2 output routing)
-            if lines_to_output > 0 {
-                // Get the seq of the first line being broadcast (for client-side dedup)
-                let first_seq = self.worlds[world_idx]
-                    .output_lines
-                    .get(skip_count)
-                    .map(|l| l.seq)
-                    .unwrap_or(0);
-
-                // Get only the lines that went to output_lines
-                let output_lines_to_broadcast: Vec<String> = self.worlds[world_idx]
-                    .output_lines
-                    .iter()
-                    .skip(skip_count)
-                    .take(lines_to_output)
-                    .map(|line| line.text.replace('\r', ""))
-                    .collect();
-                let ws_data = output_lines_to_broadcast.join("\n") + "\n";
-
-                // Route output only to clients viewing this world
-                // If splash was cleared, set flush flag so client clears buffer atomically
-                // before appending new lines (avoids race with separate WorldFlushed message)
-                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                    world_index: world_idx,
-                    data: ws_data,
-                    is_viewed: true,  // Clients viewing this world consider it "viewed"
-                    ts: current_timestamp_secs(),
-                    from_server: true,
-                    seq: first_seq,
-                    marked_new: !is_current,
-                    flush: splash_was_cleared, gagged: false,
-                });
-            } else if splash_was_cleared {
-                // Splash cleared but no output lines to send — still need to flush client buffers
-                self.ws_broadcast(WsMessage::WorldFlushed { world_index: world_idx });
-            }
+            // Only send to clients viewing this world (Phase 2 output routing).
+            // is_viewed: true unconditionally - clients viewing this world consider it
+            // "viewed". flush: splash_was_cleared, so the client clears its buffer
+            // atomically before appending new lines (avoids a race with a separate
+            // WorldFlushed message) - broadcast_output_range's count==0 branch still sends
+            // WorldFlushed on its own when there's nothing else to send alongside it.
+            self.broadcast_output_range(world_idx, skip_count, lines_to_output, true, true, !is_current, splash_was_cleared);
 
             // Broadcast pending count update if it changed (for synchronized more-mode indicator)
             // Use filtered broadcast to skip clients that received pending in InitialState
@@ -7801,13 +7933,26 @@ impl App {
         // Add gagged lines to output (they'll only show with F2)
         // Also broadcast to WebSocket clients so F2 works on all interfaces
         let was_at_bottom = self.worlds[world_idx].is_at_bottom();
+        // Invariant: World::output_lines is always sorted by seq (see the doc comment on
+        // App::broadcast_released_lines, which real-seq release broadcasts depend on). Pushing
+        // a gagged line straight into output_lines unconditionally used to violate that: while
+        // paused with pending_lines holding earlier (lower-seq) lines that haven't been
+        // released yet, a gagged line pushed here gets a NEWER/higher seq but lands in
+        // output_lines immediately, ahead of those still-pending lower-seq lines - so when
+        // they're eventually released and appended after it, output_lines ends up with a seq
+        // dip in the middle. Route the gagged line into pending_lines instead in that case; it
+        // rides the same release batch (and its own broadcast) when the pause ends.
+        let hold_gagged_in_pending = self.settings.more_mode_enabled
+            && self.worlds[world_idx].paused
+            && !self.worlds[world_idx].pending_lines.is_empty();
         for (line, highlight) in gagged_lines {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
             output_line.highlight_color = highlight;
-            self.worlds[world_idx].output_lines.push(output_line);
-            // Archive gagged server lines to long-term scrollback (with gagged=true)
+            // Archive gagged server lines to long-term scrollback (with gagged=true) -
+            // unconditional on which buffer it lands in, since archiving is a timestamped
+            // log, not a seq-ordered live buffer other code indexes into.
             if let Some(ref tx) = self.worlds[world_idx].scrollback_tx {
                 let ts_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -7816,6 +7961,14 @@ impl App {
                 let world_name = self.worlds[world_idx].name.clone();
                 let _ = tx.try_send((world_name, ts_ms, line.to_string(), true));
             }
+            if hold_gagged_in_pending {
+                output_line.marked_new = !is_current;
+                self.worlds[world_idx].pending_lines.push(output_line);
+                // Not broadcast here - it goes out with the pending release batch via
+                // App::broadcast_released_lines, same as every other pending line.
+                continue;
+            }
+            self.worlds[world_idx].output_lines.push(output_line);
             // Broadcast gagged line to WebSocket clients
             let ws_data = line.to_string().replace('\r', "") + "\n";
             self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
@@ -7824,7 +7977,7 @@ impl App {
                 is_viewed: is_current,
                 ts: current_timestamp_secs(),
                 from_server: true,
-                seq,
+                seq, end_seq: None,
                 marked_new: !is_current,
                 flush: false,
                 gagged: true,
@@ -7897,7 +8050,7 @@ impl App {
             is_viewed: true,
             ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             from_server: false,
-            seq,
+            seq, end_seq: None,
             marked_new: false,
             flush: false, gagged: false,
         });
@@ -7919,7 +8072,7 @@ impl App {
                 is_viewed: true,
                 ts: msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                 from_server: false,
-                seq,
+                seq, end_seq: None,
                 marked_new: false,
                 flush: false, gagged: false,
             });
@@ -8379,7 +8532,9 @@ impl App {
             // hold more than that many lines per world regardless of how big the gap is.
             const RESUME_REPLAY_MAX: usize = 10_000;
             for (world_index, last_seq) in resume {
-                self.handle_request_scrollback(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq));
+                // request_id: Some(0) is the reserved value marking a server-initiated
+                // unprompted resume replay (see ScrollbackLines' doc comment in websocket.rs).
+                self.handle_request_scrollback(client_id, world_index, RESUME_REPLAY_MAX, None, Some(last_seq), Some(0));
             }
         }
     }
@@ -8591,7 +8746,7 @@ impl App {
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                             });
@@ -8620,7 +8775,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
-                    seq: 0,
+                    seq: 0, end_seq: None,
                     marked_new: false,
                     flush: false, gagged: false,
                 });
@@ -8680,7 +8835,7 @@ impl App {
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                             });
@@ -8693,7 +8848,7 @@ impl App {
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                         });
@@ -8731,7 +8886,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -8769,7 +8924,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -8781,7 +8936,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -8847,7 +9002,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -8870,7 +9025,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -8887,7 +9042,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -8901,7 +9056,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
-                        seq: 0,
+                        seq: 0, end_seq: None,
                         marked_new: false,
                         flush: false, gagged: false,
                     });
@@ -8921,7 +9076,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
-                    seq: 0,
+                    seq: 0, end_seq: None,
                     marked_new: false,
                     flush: false, gagged: false,
                 });
@@ -8997,7 +9152,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
-                    seq: 0,
+                    seq: 0, end_seq: None,
                     marked_new: false,
                     flush: false, gagged: false,
                 });
@@ -9069,7 +9224,7 @@ impl App {
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                         });
@@ -9158,7 +9313,7 @@ impl App {
                     for line in help_text.lines() {
                         self.ws_send_to_client(client_id, WsMessage::ServerData {
                             world_index, data: line.to_string(), is_viewed: false,
-                            ts: current_timestamp_secs(), from_server: false, seq: 0,
+                            ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
                             marked_new: false, flush: false, gagged: false,
                         });
                     }
@@ -9188,7 +9343,7 @@ impl App {
         let data = if help_text.ends_with('\n') { help_text } else { format!("{}\n", help_text) };
         self.ws_send_to_client(client_id, WsMessage::ServerData {
             world_index, data, is_viewed: false,
-            ts: current_timestamp_secs(), from_server: false, seq: 0,
+            ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
             marked_new: false, flush: false, gagged: false,
         });
     }
@@ -9412,7 +9567,7 @@ impl App {
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                         });
@@ -9798,8 +9953,8 @@ impl App {
             WsMessage::CycleWorld { direction } => {
                 self.handle_cycle_world(client_id, &direction);
             }
-            WsMessage::RequestScrollback { world_index, count, before_seq, after_seq } => {
-                self.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq);
+            WsMessage::RequestScrollback { world_index, count, before_seq, after_seq, request_id } => {
+                self.handle_request_scrollback(client_id, world_index, count, before_seq, after_seq, request_id);
             }
             WsMessage::ToggleWorldGmcp { world_index } => {
                 if world_index < self.worlds.len() {
@@ -9943,6 +10098,63 @@ impl App {
     /// Build initial state message for a newly authenticated client.
     /// Only sends output_lines (not pending_lines) - clients see the More indicator
     /// and release pending via PgDn/Tab, avoiding duplicate line bugs.
+    /// Builds the trimmed, timestamp-tagged `InitialState` line slice for one world's output
+    /// history: at least `max_initial_lines` *visible* (non-gagged) lines, newest-first,
+    /// walking back from the end of `lines` (excluding any trailing partial line the caller
+    /// has already accounted for via `has_trailing_partial`). Shared by `build_initial_state`
+    /// (single-user, `main.rs`) and `build_multiuser_initial_state` (multiuser, `daemon.rs`)
+    /// so the two can't silently diverge on this budget again — multiuser previously had no
+    /// cap at all, unlike single-user's deliberate `remote_initial_lines`-driven limit (see
+    /// CLAUDE.md's "WebSocket InitialState" pattern). `max_initial_lines` should already be
+    /// the caller's `per_world_cap.min(budget_remaining)` — the aggregate cross-world budget
+    /// lives in the caller, since only the caller knows how many worlds it's building state
+    /// for and how much of the shared budget earlier worlds already spent.
+    pub(crate) fn build_initial_output_lines(lines: &[OutputLine], has_trailing_partial: bool, max_initial_lines: usize) -> Vec<TimestampedLine> {
+        let total_lines = if has_trailing_partial {
+            lines.len().saturating_sub(1)
+        } else {
+            lines.len()
+        };
+        // max_initial_lines == 0 (this world's share of the aggregate budget ran out) must
+        // yield zero lines, not one - the loop below only breaks *after* counting a line, so
+        // without this guard `visible_count >= 0` is trivially true right after the first
+        // line and one line slips through per exhausted world.
+        let skip = if max_initial_lines == 0 {
+            total_lines
+        } else {
+            let mut visible_count = 0;
+            let mut start = total_lines;
+            for i in (0..total_lines).rev() {
+                start = i;
+                if !lines[i].gagged {
+                    visible_count += 1;
+                    if visible_count >= max_initial_lines {
+                        break;
+                    }
+                }
+            }
+            start
+        };
+        lines.iter()
+            .skip(skip)
+            .take(total_lines - skip)
+            .map(|s| {
+                // Text stays prefix-free here, same as live ServerData broadcasts - the
+                // "✨ " client-line marker is added at display time only.
+                TimestampedLine {
+                    text: s.text.replace('\r', ""),
+                    ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    gagged: s.gagged,
+                    from_server: s.from_server,
+                    seq: s.seq,
+                    highlight_color: s.highlight_color.clone(),
+                    marked_new: s.marked_new,
+                    from_archive: s.from_archive,
+                }
+            })
+            .collect()
+    }
+
     fn build_initial_state(&self) -> WsMessage {
         // Send only the most recent lines in InitialState for fast initial load.
         // Clients backfill remaining history via RequestScrollback after rendering.
@@ -9969,53 +10181,7 @@ impl App {
             // Exclude trailing partial line (text without trailing newline, e.g., prompt).
             // It will be included in the next broadcast when completed by subsequent data.
             let has_trailing_partial = !world.partial_line.is_empty() && !world.partial_in_pending;
-            let total_lines = if has_trailing_partial {
-                world.output_lines.len().saturating_sub(1)
-            } else {
-                world.output_lines.len()
-            };
-            // Find skip index so that at least MAX_INITIAL_LINES *visible* (non-gagged) lines
-            // are included. Walk backwards counting visible lines. max_initial_lines == 0
-            // (this world's share of the aggregate budget above ran out) must yield zero
-            // lines, not one - the loop below only breaks *after* counting a line, so
-            // without this guard `visible_count >= 0` is trivially true right after the
-            // first line and one line slips through per exhausted world.
-            let skip = if max_initial_lines == 0 {
-                total_lines
-            } else {
-                let mut visible_count = 0;
-                let mut start = total_lines;
-                for i in (0..total_lines).rev() {
-                    start = i;
-                    if !world.output_lines[i].gagged {
-                        visible_count += 1;
-                        if visible_count >= max_initial_lines {
-                            break;
-                        }
-                    }
-                }
-                start
-            };
-            let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
-                .skip(skip)
-                .take(total_lines - skip)
-                .map(|s| {
-                    // Text stays prefix-free here, same as live ServerData broadcasts -
-                    // the "✨ " client-line marker is added at display time only
-                    // (rendering.rs::process_output_line for console/remote console,
-                    // applyClientPrefix() in web/app.js), keyed on `from_server` below.
-                    TimestampedLine {
-                        text: s.text.replace('\r', ""),
-                        ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                        gagged: s.gagged,
-                        from_server: s.from_server,
-                        seq: s.seq,
-                        highlight_color: s.highlight_color.clone(),
-                        marked_new: s.marked_new,
-                        from_archive: s.from_archive,
-                    }
-                })
-                .collect();
+            let output_lines_ts = Self::build_initial_output_lines(&world.output_lines, has_trailing_partial, max_initial_lines);
             let output_len = output_lines_ts.len();
             budget_remaining = budget_remaining.saturating_sub(output_len);
             let pending_lines_ts: Vec<TimestampedLine> = Vec::new();
@@ -10674,84 +10840,20 @@ impl App {
             }
         }
 
-        // Pre-calculate how many logical lines fit in the visual budget
-        // (mirrors the logic in release_pending so we can collect lines for broadcasting)
-        let mut visual_total = 0;
-        let mut logical_count = 0;
-        for line in &self.worlds[world_idx].pending_lines {
-            let vl = visual_line_count(&line.text, width, self.settings.wrapspace as usize);
-            if visual_total > 0 && visual_total + vl > visual_budget {
-                break;
-            }
-            visual_total += vl;
-            logical_count += 1;
-            if visual_total >= visual_budget {
-                break;
-            }
-        }
-        if logical_count == 0 && !self.worlds[world_idx].pending_lines.is_empty() {
-            logical_count = 1;
-        }
-
-        // Collect per-line text, marked_new, and from_server for broadcasting.
-        // from_server must travel with each line rather than being assumed true:
-        // pending_lines can hold a mix of real server output and client-generated
-        // content (e.g. a /recall that overflowed a screenful while paused), and
-        // clients key the "✨ " marker off this exact flag.
-        let lines_with_flags: Vec<(String, bool, bool)> = self.worlds[world_idx]
-            .pending_lines
-            .iter()
-            .take(logical_count)
-            .map(|line| (line.text.replace('\r', ""), line.marked_new, line.from_server))
-            .collect();
-
-        let pending_before = self.worlds[world_idx].pending_lines.len();
+        // Release exactly visual_budget's worth of pending lines and broadcast exactly what
+        // was released (via the shared release broadcaster - see its doc comment). This used
+        // to pre-calculate a separate broadcast set with `visual_line_count` (a plain
+        // width/div_ceil estimate) while `release_pending` itself decided what to actually
+        // drain using `nli_visual_rows` (NLI-narrowed width + real `wrap_ansi_line` wrapping,
+        // which is always >= visual_line_count's estimate) — so more lines were broadcast than
+        // released, the surplus stayed in `pending_lines`, and got broadcast AGAIN on the next
+        // Tab/PgDn with no way for any client to detect the duplicate (release batches use
+        // `seq: 0`). Taking the actual return value makes that divergence impossible.
         let nli_enabled = self.settings.new_line_indicator;
         let wrapspace = self.settings.wrapspace as usize;
-        self.current_world_mut().release_pending(visual_budget, output_width, nli_enabled, wrapspace);
-        let released = pending_before - self.worlds[world_idx].pending_lines.len();
-
-        // Broadcast released lines to clients viewing this world.
-        // Group consecutive lines by (marked_new, from_server) so each batch gets
-        // the correct indicator and the correct client-line marker.
-        if !lines_with_flags.is_empty() {
-            let ts = current_timestamp_secs();
-            let mut batch: Vec<&str> = Vec::new();
-            let mut batch_marked_new = lines_with_flags[0].1;
-            let mut batch_from_server = lines_with_flags[0].2;
-            for (text, marked_new, from_server) in &lines_with_flags {
-                if (*marked_new != batch_marked_new || *from_server != batch_from_server) && !batch.is_empty() {
-                    let ws_data = batch.join("\n") + "\n";
-                    self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                        world_index: world_idx,
-                        data: ws_data,
-                        is_viewed: true,
-                        ts,
-                        from_server: batch_from_server,
-                        seq: 0,
-                        marked_new: batch_marked_new,
-                        flush: false, gagged: false,
-                    });
-                    batch.clear();
-                    batch_marked_new = *marked_new;
-                    batch_from_server = *from_server;
-                }
-                batch.push(text);
-            }
-            if !batch.is_empty() {
-                let ws_data = batch.join("\n") + "\n";
-                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                    world_index: world_idx,
-                    data: ws_data,
-                    is_viewed: true,
-                    ts,
-                    from_server: batch_from_server,
-                    seq: 0,
-                    marked_new: batch_marked_new,
-                    flush: false, gagged: false,
-                });
-            }
-        }
+        let released_lines = self.current_world_mut().release_pending(visual_budget, output_width, nli_enabled, wrapspace);
+        let released = released_lines.len();
+        self.broadcast_released_lines(world_idx, &released_lines);
 
         // Mark output for redraw so released lines are rendered
         self.needs_output_redraw = true;
@@ -10854,7 +10956,6 @@ pub struct UserConnection {
     pub connected: bool,
     pub command_tx: Option<mpsc::Sender<WriteCommand>>,
     output_lines: Vec<OutputLine>,
-    pending_lines: Vec<OutputLine>,
     pub scroll_offset: usize,
     pub unseen_lines: usize,
     pub paused: bool,
@@ -10880,7 +10981,6 @@ impl UserConnection {
             connected: false,
             command_tx: None,
             output_lines: Vec::new(),
-            pending_lines: Vec::new(),
             scroll_offset: 0,
             unseen_lines: 0,
             paused: false,
@@ -14305,7 +14405,7 @@ pub async fn run_app_headless(
                             is_viewed: true,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                         });
@@ -14405,7 +14505,7 @@ pub async fn run_app_headless(
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                             }),
@@ -14425,7 +14525,7 @@ pub async fn run_app_headless(
                                     is_viewed: false,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
-                                    seq: 0,
+                                    seq: 0, end_seq: None,
                                     marked_new: false,
                                     flush: false, gagged: false,
                                 });
@@ -16491,7 +16591,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     is_viewed: is_current,
                                     ts: current_timestamp_secs(),
                                     from_server: true,
-                                    seq,
+                                    seq, end_seq: None,
                                     marked_new: !is_current,
                                     flush: false, gagged: true,
                                 });
@@ -16548,7 +16648,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         is_viewed: is_current,
                                         ts: current_timestamp_secs(),
                                         from_server: false,
-                                        seq: 0,
+                                        seq: 0, end_seq: None,
                                         marked_new: false,
                                         flush: false, gagged: false,
                                     });
@@ -16744,7 +16844,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                             }),
@@ -16764,7 +16864,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     is_viewed: false,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
-                                    seq: 0,
+                                    seq: 0, end_seq: None,
                                     marked_new: false,
                                     flush: false, gagged: false,
                                 });
@@ -17374,7 +17474,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 is_viewed: is_current,
                                 ts: current_timestamp_secs(),
                                 from_server: true,
-                                seq,
+                                seq, end_seq: None,
                                 marked_new: !is_current,
                                 flush: false, gagged: true,
                             });
@@ -17399,7 +17499,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 is_viewed: is_current,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
-                                seq: 0,
+                                seq: 0, end_seq: None,
                                 marked_new: false,
                                 flush: false, gagged: false,
                             });
@@ -17545,7 +17645,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                         }),
@@ -17560,7 +17660,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
-                            seq: 0,
+                            seq: 0, end_seq: None,
                             marked_new: false,
                             flush: false, gagged: false,
                         });
