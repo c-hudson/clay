@@ -2498,11 +2498,6 @@ pub struct OutputLine {
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
 const MAX_LINE_LENGTH: usize = 10_000;
 
-/// Remote client backfill: phase 2 (background round-robin deep fill) chunk size.
-/// Kept small and round-robin (one chunk per world per cycle) rather than draining
-/// one world fully, so a world with deep history doesn't block others from filling.
-const BACKFILL_PHASE2_CHUNK_SIZE: usize = 200;
-
 impl OutputLine {
     /// Truncate text if it exceeds MAX_LINE_LENGTH to prevent performance issues
     fn truncate_if_needed(text: String) -> String {
@@ -3536,22 +3531,20 @@ pub struct App {
     pub pending_remote_switch: Option<String>,
     /// Activity count from server (used in remote client mode, i.e. --console)
     pub server_activity_count: usize,
-    /// Remote client backfill: current phase (1 = fast per-world screenful pass,
-    /// 2 = round-robin deep fill up to backfill_total_target). See backfill_advance_to_next.
-    pub backfill_phase: u8,
-    /// Remote client backfill: phase 1 per-world target line count (a guaranteed screenful -
-    /// max(75, visible viewport rows)), computed once at connect by init_backfill.
+    /// Remote client (`--console`) backfill: a guaranteed screenful (max(75, visible viewport
+    /// rows)) per world, computed once at connect by `init_backfill`. This is the ONLY
+    /// auto-fetch the console client does - unlike app.js's app/gui clients, `--console`
+    /// never proactively deep-fills beyond the current screen: anything older comes entirely
+    /// from `scroll_page_up`'s existing on-demand, deliberately-unbounded fetch (the console
+    /// can already reach as far back as the master instance holds by scrolling; it just
+    /// shouldn't pre-download it). A prior version of this mechanism had a Remote-Lines-capped
+    /// "phase 2" round-robin deep-fill mirroring app.js's - removed per user decision: the
+    /// console populates only what fills the current screen, on demand handles the rest.
     pub backfill_phase1_target: usize,
-    /// Remote client backfill: phase 2 per-world total target line count (the "Remote Lines"
-    /// setting, or backfill_phase1_target if larger) - backfill stops for a world once its
-    /// local line count reaches this, even if more history exists server-side.
-    pub backfill_total_target: usize,
-    /// Remote client backfill: queue of world indices awaiting a backfill request in the
-    /// current phase. Phase 2 re-appends a world here after each chunk if it still needs more.
+    /// Remote client backfill: queue of world indices awaiting their one-time initial
+    /// screenful request. Never re-appended to (see backfill_phase1_target's doc comment) -
+    /// once drained, backfill_next simply becomes None and nothing further is auto-requested.
     pub backfill_queue: Vec<usize>,
-    /// Remote client backfill: worlds whose history is known exhausted (server returned fewer
-    /// lines than requested for a prior chunk) - stops phase 2 from re-queuing them forever.
-    pub backfill_exhausted: std::collections::HashSet<usize>,
     /// Remote client backfill: next request to send (world_index, before_seq, count, request_id)
     pub backfill_next: Option<(usize, Option<u64>, usize, u64)>,
     /// Remote client (`--console`): next id to hand out via `register_scrollback_request`.
@@ -3669,11 +3662,8 @@ impl App {
             pending_remote_detach: false,
             pending_remote_switch: None,
             server_activity_count: 0, // Activity count from server (remote client mode)
-            backfill_phase: 1,
             backfill_phase1_target: 75,
-            backfill_total_target: 100,
             backfill_queue: Vec::new(),
-            backfill_exhausted: std::collections::HashSet::new(),
             backfill_next: None,
             next_scrollback_request_id: 1,
             pending_scrollback_requests: std::collections::HashMap::new(),
@@ -4833,7 +4823,7 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
-            WsMessage::ScrollbackLines { world_index, lines, backfill_complete, request_id } => {
+            WsMessage::ScrollbackLines { world_index, lines, backfill_complete: _, request_id } => {
                 // Resolve which outstanding request this reply answers (PROTOCOL-ROADMAP.md's
                 // seq-drift fix, Step 12b) instead of routing purely on World::pending_gap,
                 // which stays ambiguous whenever a gap-fill and an ordinary backfill chunk
@@ -4871,8 +4861,8 @@ impl App {
                 // to the front like a normal older-history backfill reply — see that
                 // field's doc comment and PROTOCOL-ROADMAP.md Step 6. Handled first and
                 // returns early: it's unrelated to the historical-backfill state machine
-                // (backfill_queue/backfill_exhausted/backfill_advance_to_next) below, which
-                // only concerns before_seq requests for older scrollback history. If
+                // (backfill_queue/backfill_advance_to_next) below, which only concerns
+                // before_seq requests for the one-time initial screenful. If
                 // is_gap_fill is true but pending_gap has no data to splice against (a stale
                 // claim), fall through to the prepend path below instead of dropping the
                 // reply outright.
@@ -4936,23 +4926,12 @@ impl App {
                     world.scroll_offset += prepended_count;
                     self.needs_output_redraw = true;
                 }
-                // Track backfill progress for remote console.
-                // Phase 1 is one chunk per world - always advance to the next world in
-                // the queue regardless of backfill_complete (see backfill_advance_to_next).
-                // Phase 2 is round-robin - re-queue this world at the back if it still
-                // needs more (and history isn't exhausted), then advance to whichever
-                // world is now at the front (may be a different one).
-                if backfill_complete {
-                    self.backfill_exhausted.insert(world_index);
-                }
-                if self.backfill_phase == 2 {
-                    if let Some(world) = self.worlds.get(world_index) {
-                        let received = world.output_lines.len();
-                        if received < self.backfill_total_target && !self.backfill_exhausted.contains(&world_index) {
-                            self.backfill_queue.push(world_index);
-                        }
-                    }
-                }
+                // Track backfill progress for remote console. This is a one-time, one-chunk-
+                // per-world initial screenful fetch - always just advance to the next world
+                // in the queue (see backfill_advance_to_next's doc comment). The console
+                // never deep-fills further, regardless of whether more history exists:
+                // anything beyond the initial screenful is fetched only on demand, via
+                // scroll_page_up.
                 self.backfill_advance_to_next();
             }
             WsMessage::GlobalSettingsUpdated { settings, input_height: _ } => {
@@ -5153,9 +5132,13 @@ impl App {
         id
     }
 
-    /// Advance backfill to the next world in the queue (current phase).
-    /// Sets backfill_next so the main loop can send the request. When the phase 1
-    /// queue drains, automatically starts phase 2 and continues from there.
+    /// Advance backfill to the next world in the queue. Sets backfill_next so the
+    /// main loop can send the request. This queue is populated exactly once, by
+    /// init_backfill, with (at most) one entry per world - the console's backfill
+    /// is a single guaranteed-screenful request per world at connect, never a
+    /// deep-fill. Once the queue drains, backfill_next simply becomes None and
+    /// nothing further is auto-requested; any history beyond the initial screenful
+    /// is fetched only on demand, via scroll_page_up.
     fn backfill_advance_to_next(&mut self) {
         while let Some(world_idx) = self.backfill_queue.first().copied() {
             self.backfill_queue.remove(0);
@@ -5173,51 +5156,13 @@ impl App {
                 // through to try the next queue entry below.
                 let oldest_seq = world.output_lines.first().map(|l| l.seq);
                 let received = world.output_lines.len();
-                let count = if self.backfill_phase == 1 {
-                    self.backfill_phase1_target.saturating_sub(received).max(1)
-                } else {
-                    // Clamp to what's still needed so the final chunk for a world
-                    // never overshoots backfill_total_target - a world only enters
-                    // the phase 2 queue while received < target, so this is always >= 1.
-                    self.backfill_total_target.saturating_sub(received).clamp(1, BACKFILL_PHASE2_CHUNK_SIZE)
-                };
+                let count = self.backfill_phase1_target.saturating_sub(received).max(1);
                 let request_id = self.register_scrollback_request(world_idx, ScrollbackRequestKind::Backfill);
                 self.backfill_next = Some((world_idx, oldest_seq, count, request_id));
                 return;
             }
         }
-        // This phase's queue is empty. Phase 1 -> phase 2 automatically; phase 2
-        // draining means backfill is fully complete.
-        if self.backfill_phase == 1 {
-            self.start_backfill_phase2();
-            if !self.backfill_queue.is_empty() {
-                self.backfill_advance_to_next();
-                return;
-            }
-        }
         self.backfill_next = None;
-    }
-
-    /// Build the phase 2 round-robin queue: every world still short of
-    /// backfill_total_target (and not already known to be exhausted), current
-    /// world first. Each cycle through the queue sends one chunk per world -
-    /// see the ScrollbackLines handler, which re-appends a world here after each
-    /// chunk if it still needs more, rather than draining it in one go.
-    fn start_backfill_phase2(&mut self) {
-        self.backfill_phase = 2;
-        let current = self.current_world_index;
-        let mut queue: Vec<usize> = Vec::new();
-        for (idx, world) in self.worlds.iter().enumerate() {
-            let received = world.output_lines.len();
-            if received < self.backfill_total_target && !self.backfill_exhausted.contains(&idx) {
-                if idx == current {
-                    queue.insert(0, idx);
-                } else {
-                    queue.push(idx);
-                }
-            }
-        }
-        self.backfill_queue = queue;
     }
 
     /// Initialize backfill queue from InitialState worlds data.
@@ -5228,17 +5173,15 @@ impl App {
     fn init_backfill(&mut self, world_totals: &[(usize, usize)], phase1_target: usize) {
         self.backfill_queue.clear();
         self.backfill_next = None;
-        self.backfill_exhausted.clear();
-        self.backfill_phase = 1;
         self.backfill_phase1_target = phase1_target.max(1);
-        let per_world_cap = self.settings.remote_initial_lines.max(1) as usize;
-        self.backfill_total_target = per_world_cap.max(self.backfill_phase1_target);
 
-        // Build the phase 1 queue: current world first, then others. Only worlds
-        // still short of a screenful belong in phase 1 - a world that already has
-        // >= backfill_phase1_target lines locally (but still has more total
-        // history) skips straight to phase 2 instead of getting a wasteful
-        // near-empty request here.
+        // Build the queue: current world first, then others. Only worlds still
+        // short of a screenful are queued - this is the ONLY auto-fetch the
+        // console client ever does (no deep-fill beyond this; see
+        // backfill_advance_to_next's doc comment). A world that already has
+        // >= backfill_phase1_target lines locally isn't queued even if more
+        // history exists server-side - reaching further back is left entirely to
+        // scroll_page_up's on-demand fetch.
         let mut queue: Vec<usize> = Vec::new();
         for &(idx, total) in world_totals {
             let received = self.worlds.get(idx).map(|w| w.output_lines.len()).unwrap_or(0);
@@ -5253,17 +5196,12 @@ impl App {
         self.backfill_queue = queue;
     }
 
-    /// True if any world still needs backfilling in either phase - i.e. it's worth
-    /// starting/continuing the backfill timer. A phase 1 queue that's already empty
-    /// does NOT mean nothing is needed: a world can be phase-1-satisfied (has its
-    /// screenful) while still short of backfill_total_target, which only phase 2
-    /// (built lazily by start_backfill_phase2 once phase 1 drains) would catch -
-    /// checking backfill_queue alone here would silently skip phase 2 entirely.
+    /// True if any world still needs its initial screenful - i.e. it's worth
+    /// starting/continuing the backfill timer. The queue is populated once by
+    /// init_backfill and only ever drains (see backfill_advance_to_next), so
+    /// checking it directly is sufficient - there's no further phase to catch.
     pub fn backfill_needed(&self) -> bool {
         !self.backfill_queue.is_empty()
-            || self.worlds.iter().enumerate().any(|(idx, w)| {
-                w.output_lines.len() < self.backfill_total_target && !self.backfill_exhausted.contains(&idx)
-            })
     }
 
     /// Find world index by name (case-insensitive), also checks reader_name for renamed worlds
@@ -5706,14 +5644,17 @@ impl App {
         }
         let world = &self.worlds[world_index];
 
-        // Find lines to send based on before_seq/after_seq
-        let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
+        // `count` means N VISIBLE (non-gagged) lines - gagged lines interspersed in the
+        // returned range ride along for free rather than eating into the client's download
+        // budget (same shape as build_initial_output_lines' per-world slice and
+        // World::release_pending's budget loop; see take_visible_range's doc comment).
+        let (lines, visible_count): (Vec<TimestampedLine>, usize) = if let Some(seq) = before_seq {
             // Send lines with seq < before_seq (older than what client has)
             let eligible: Vec<_> = world.output_lines.iter()
                 .filter(|l| l.seq < seq)
                 .collect();
-            let start = eligible.len().saturating_sub(count);
-            eligible[start..].iter()
+            let (range, visible_count) = Self::take_visible_range(&eligible, count, true, |l| l.gagged);
+            let lines = eligible[range].iter()
                 .map(|line| {
                     let ts = line.timestamp
                         .duration_since(std::time::UNIX_EPOCH)
@@ -5730,7 +5671,8 @@ impl App {
                         from_archive: line.from_archive,
                     }
                 })
-                .collect()
+                .collect();
+            (lines, visible_count)
         } else if let Some(seq) = after_seq {
             // Reconnect gap-fill: the client kept its buffer across the reconnect and only
             // wants lines newer than the highest seq it already has. Oldest-first (unlike
@@ -5738,8 +5680,8 @@ impl App {
             let eligible: Vec<_> = world.output_lines.iter()
                 .filter(|l| l.seq > seq)
                 .collect();
-            let take = count.min(eligible.len());
-            eligible[..take].iter()
+            let (range, visible_count) = Self::take_visible_range(&eligible, count, false, |l| l.gagged);
+            let lines = eligible[range].iter()
                 .map(|line| {
                     let ts = line.timestamp
                         .duration_since(std::time::UNIX_EPOCH)
@@ -5756,12 +5698,12 @@ impl App {
                         from_archive: line.from_archive,
                     }
                 })
-                .collect()
+                .collect();
+            (lines, visible_count)
         } else {
-            // No before_seq/after_seq - send last N lines (backwards compatible)
-            let total_lines = world.output_lines.len();
-            let start = total_lines.saturating_sub(count);
-            world.output_lines[start..].iter()
+            // No before_seq/after_seq - send last N visible lines (backwards compatible)
+            let (range, visible_count) = Self::take_visible_range(&world.output_lines, count, true, |l| l.gagged);
+            let lines = world.output_lines[range].iter()
                 .map(|line| {
                     let ts = line.timestamp
                         .duration_since(std::time::UNIX_EPOCH)
@@ -5778,14 +5720,15 @@ impl App {
                         from_archive: line.from_archive,
                     }
                 })
-                .collect()
+                .collect();
+            (lines, visible_count)
         };
 
-        // Works for both directions: before_seq slices the newest `count` eligible lines
-        // (so `lines.len() < count` means we ran out of older history); after_seq takes
-        // `count.min(eligible.len())` (so `lines.len() < count` means we returned every
-        // newer line available, i.e. the gap is fully closed).
-        let backfill_complete = lines.len() < count;
+        // Derived from the VISIBLE count actually returned, not lines.len() (the raw count) -
+        // a long run of gagged lines right at the history boundary can make the raw count
+        // look "not exhausted" (>= count) while take_visible_range genuinely returned every
+        // line left in history with far fewer than `count` visible among them.
+        let backfill_complete = visible_count < count;
         self.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
             world_index,
             lines,
@@ -6366,6 +6309,7 @@ impl App {
             is_proxy: false,
             gmcp_user_enabled: world.gmcp_user_enabled,
             total_output_lines: 0,
+            total_visible_lines: Some(0),
             pending_count: 0,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
@@ -10095,6 +10039,56 @@ impl App {
         }
     }
 
+    /// Walks `items` from one end, accumulating only VISIBLE (non-gagged, per `is_gagged`)
+    /// items toward `target`, but including every item (gagged or not) encountered along the
+    /// way in the returned range - mirrors `World::release_pending`'s "gagged lines don't
+    /// consume the budget, but still ride along in what's returned" shape (see that
+    /// function's doc comment). This is the scrollback-download budget's visible-line-only
+    /// counting: gagged lines must never eat into a client's "Remote Lines" allowance, since
+    /// they're invisible unless F2/show_tags is on.
+    ///
+    /// `reverse: true` walks newest-to-oldest (`before_seq`/no-anchor "last N" cases, and
+    /// `build_initial_output_lines`'s per-world initial slice); `false` walks oldest-to-newest
+    /// (`after_seq`'s reconnect gap-fill). Returns the resulting index range into `items` AND
+    /// the number of visible items actually included (== `target` unless the slice ran out of
+    /// items first, i.e. total available visible items < `target` - the caller needs this
+    /// exact count, not `items.len()` of the returned range, to correctly detect exhaustion:
+    /// a long run of gagged lines right at the history boundary can make the raw returned
+    /// count look "not exhausted" while genuinely returning everything left with far fewer
+    /// than `target` visible among them).
+    fn take_visible_range<T>(items: &[T], target: usize, reverse: bool, is_gagged: impl Fn(&T) -> bool) -> (std::ops::Range<usize>, usize) {
+        let total = items.len();
+        if target == 0 || total == 0 {
+            return if reverse { (total..total, 0) } else { (0..0, 0) };
+        }
+        let mut visible_count = 0;
+        if reverse {
+            let mut start = 0;
+            for i in (0..total).rev() {
+                start = i;
+                if !is_gagged(&items[i]) {
+                    visible_count += 1;
+                    if visible_count >= target {
+                        break;
+                    }
+                }
+            }
+            (start..total, visible_count)
+        } else {
+            let mut end = total;
+            for i in 0..total {
+                end = i + 1;
+                if !is_gagged(&items[i]) {
+                    visible_count += 1;
+                    if visible_count >= target {
+                        break;
+                    }
+                }
+            }
+            (0..end, visible_count)
+        }
+    }
+
     /// Build initial state message for a newly authenticated client.
     /// Only sends output_lines (not pending_lines) - clients see the More indicator
     /// and release pending via PgDn/Tab, avoiding duplicate line bugs.
@@ -10108,36 +10102,19 @@ impl App {
     /// CLAUDE.md's "WebSocket InitialState" pattern). `max_initial_lines` should already be
     /// the caller's `per_world_cap.min(budget_remaining)` — the aggregate cross-world budget
     /// lives in the caller, since only the caller knows how many worlds it's building state
-    /// for and how much of the shared budget earlier worlds already spent.
-    pub(crate) fn build_initial_output_lines(lines: &[OutputLine], has_trailing_partial: bool, max_initial_lines: usize) -> Vec<TimestampedLine> {
+    /// for and how much of the shared budget earlier worlds already spent. Returns the visible
+    /// line count actually included alongside the lines themselves, so the caller can
+    /// decrement its aggregate budget by the true visible cost instead of the raw slice
+    /// length (which would double-count gagged lines against the budget).
+    pub(crate) fn build_initial_output_lines(lines: &[OutputLine], has_trailing_partial: bool, max_initial_lines: usize) -> (Vec<TimestampedLine>, usize) {
         let total_lines = if has_trailing_partial {
             lines.len().saturating_sub(1)
         } else {
             lines.len()
         };
-        // max_initial_lines == 0 (this world's share of the aggregate budget ran out) must
-        // yield zero lines, not one - the loop below only breaks *after* counting a line, so
-        // without this guard `visible_count >= 0` is trivially true right after the first
-        // line and one line slips through per exhausted world.
-        let skip = if max_initial_lines == 0 {
-            total_lines
-        } else {
-            let mut visible_count = 0;
-            let mut start = total_lines;
-            for i in (0..total_lines).rev() {
-                start = i;
-                if !lines[i].gagged {
-                    visible_count += 1;
-                    if visible_count >= max_initial_lines {
-                        break;
-                    }
-                }
-            }
-            start
-        };
-        lines.iter()
-            .skip(skip)
-            .take(total_lines - skip)
+        let (range, visible_count) = Self::take_visible_range(&lines[..total_lines], max_initial_lines, true, |l| l.gagged);
+        let ts_lines = lines[range]
+            .iter()
             .map(|s| {
                 // Text stays prefix-free here, same as live ServerData broadcasts - the
                 // "✨ " client-line marker is added at display time only.
@@ -10152,7 +10129,8 @@ impl App {
                     from_archive: s.from_archive,
                 }
             })
-            .collect()
+            .collect();
+        (ts_lines, visible_count)
     }
 
     fn build_initial_state(&self) -> WsMessage {
@@ -10181,9 +10159,13 @@ impl App {
             // Exclude trailing partial line (text without trailing newline, e.g., prompt).
             // It will be included in the next broadcast when completed by subsequent data.
             let has_trailing_partial = !world.partial_line.is_empty() && !world.partial_in_pending;
-            let output_lines_ts = Self::build_initial_output_lines(&world.output_lines, has_trailing_partial, max_initial_lines);
+            let (output_lines_ts, visible_count) = Self::build_initial_output_lines(&world.output_lines, has_trailing_partial, max_initial_lines);
             let output_len = output_lines_ts.len();
-            budget_remaining = budget_remaining.saturating_sub(output_len);
+            // Decrement the aggregate budget by the VISIBLE line count, not the raw slice
+            // length - otherwise gagged lines that "rode along free" in this world's own
+            // per-world slice (build_initial_output_lines already counts only visible lines
+            // toward max_initial_lines) would still eat into what's left for other worlds.
+            budget_remaining = budget_remaining.saturating_sub(visible_count);
             let pending_lines_ts: Vec<TimestampedLine> = Vec::new();
             WorldStateMsg {
                 index: idx,
@@ -10228,6 +10210,15 @@ impl App {
                 is_proxy: world.proxy_pid.is_some(),
                 gmcp_user_enabled: world.gmcp_user_enabled,
                 total_output_lines: world.output_lines.len(),
+                // Visible (non-gagged) total, so the client can know how many VISIBLE lines
+                // still remain to fetch without being able to derive that itself - gagged
+                // status of not-yet-downloaded lines is server-only knowledge. Plain O(n)
+                // scan: InitialState building runs once per connect/resync, not per line, so
+                // this isn't a hot path - see build_initial_output_lines' doc comment for why
+                // an incrementally-maintained counter was considered and rejected (Ctrl+L's
+                // World::filter_to_server_output retroactively regags client lines in bulk,
+                // which would force a full recount at that site anyway).
+                total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
                 pending_count: world.pending_lines.len(),
             }
         }).collect();

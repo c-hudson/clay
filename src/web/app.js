@@ -3842,7 +3842,7 @@
                         world._backfill_exhausted = true;
                     }
                     if (backfillPhase === 2) {
-                        const received = world.output_lines ? world.output_lines.length : 0;
+                        const received = visibleLineCount(world);
                         if (received < backfillTotalTarget && !world._backfill_exhausted) {
                             backfillWorldQueue.push(msg.world_index);
                         }
@@ -3970,6 +3970,36 @@
 
     // --- Lazy Backfill Orchestration ---
 
+    // The scrollback-download budget (Remote Lines) must be spent only on VISIBLE
+    // (non-gagged) lines, never on gagged ones - they're invisible unless F2/show_tags is on,
+    // so counting them against the budget means the client can finish "downloaded" while
+    // showing far fewer visible lines than Remote Lines implies (including this indicator's
+    // own percentage). Recomputing a full filter over output_lines on every check is fine at
+    // this scale (client-side output_lines is hundreds to low thousands of lines, checked on
+    // backfill-pump ticks, not per rendered frame) - no incremental counter needed.
+    function visibleLineCount(world) {
+        if (!world.output_lines) return 0;
+        let count = 0;
+        for (const line of world.output_lines) {
+            if (!line.gagged) count++;
+        }
+        return count;
+    }
+
+    // Total VISIBLE lines available server-side for a world - prefers the
+    // server-authoritative total_visible_lines field (added alongside this fix) over
+    // total_output_lines (raw, gagged included), which the client can't turn into a visible
+    // count on its own since it has no knowledge of gagged status for lines it hasn't
+    // downloaded yet. Falls back to total_output_lines only against an older server that
+    // predates total_visible_lines (see websocket.rs's field doc comment) - an
+    // overcount there, but strictly better than treating "no data" as zero.
+    function totalVisibleLines(world) {
+        if (world.total_visible_lines !== undefined && world.total_visible_lines !== null) {
+            return world.total_visible_lines;
+        }
+        return world.total_output_lines || 0;
+    }
+
     // Start backfill after InitialState is processed.
     // Phase 1: give every under-filled world a screenful, current world first,
     // one request per world, no waiting for full history.
@@ -4031,8 +4061,8 @@
         // to resolve - excluding it here is cheaper and avoids the race outright.
         const queue = [];
         worlds.forEach((world, idx) => {
-            const total = world.total_output_lines || 0;
-            const received = world.output_lines ? world.output_lines.length : 0;
+            const total = totalVisibleLines(world);
+            const received = visibleLineCount(world);
             if (total > received && received < backfillPhase1Target && !world._gapFillPending) {
                 if (idx === currentWorldIndex) {
                     queue.unshift(idx);
@@ -4079,7 +4109,7 @@
         backfillPhase = 2;
         const queue = [];
         worlds.forEach((world, idx) => {
-            const received = world.output_lines ? world.output_lines.length : 0;
+            const received = visibleLineCount(world);
             // !world._gapFillPending: same race-avoidance as the phase 1 queue builder
             // above - don't queue an ordinary backfill chunk request for a world that
             // already has a gap-fill outstanding.
@@ -4127,8 +4157,8 @@
         let totalReceived = 0;
         let totalGoal = 0;
         worlds.forEach((world) => {
-            const goal = Math.min(backfillTotalTarget, world.total_output_lines || 0);
-            const received = world.output_lines ? world.output_lines.length : 0;
+            const goal = Math.min(backfillTotalTarget, totalVisibleLines(world));
+            const received = visibleLineCount(world);
             totalGoal += goal;
             totalReceived += Math.min(received, goal);
         });
@@ -4151,7 +4181,10 @@
             backfillNextWorld();
             return;
         }
-        const received = world.output_lines ? world.output_lines.length : 0;
+        const received = visibleLineCount(world);
+        // count now means "N visible lines" server-side (handle_request_scrollback), so
+        // sizing it from the visible received count keeps this request from over/under
+        // asking relative to what's actually still needed to reach the target.
         const count = backfillPhase === 1
             ? Math.max(1, backfillPhase1Target - received)
             : Math.max(1, Math.min(BACKFILL_PHASE2_CHUNK_SIZE, backfillTotalTarget - received));

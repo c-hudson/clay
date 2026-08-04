@@ -1037,10 +1037,13 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                     version_mismatch_shown = true;
                                 }
                             }
-                            // Initialize backfill queue. Phase 1 target is a guaranteed
-                            // screenful (max(75, visible rows)) so switching to any world
-                            // shows content immediately; phase 2 then tops each world up
-                            // to the "Remote Lines" setting, round-robin (see init_backfill).
+                            // Initialize backfill queue: a one-time guaranteed screenful per
+                            // world (max(75, visible rows)) so switching to any world shows
+                            // content immediately. That's the only auto-fetch this client
+                            // ever does - it does NOT deep-fill further toward "Remote Lines"
+                            // (that setting only bounds the app/gui/web clients' download);
+                            // anything older than the initial screenful is fetched exclusively
+                            // on demand, via scroll_page_up. See init_backfill.
                             let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
                             let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
                             app.init_backfill(&world_totals, visible_lines.max(75));

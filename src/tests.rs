@@ -5106,6 +5106,186 @@ if you're more curious.\"";
             "a world past the aggregate budget should get zero lines in InitialState, not a per-world floor");
     }
 
+    /// The scrollback-download budget (Remote Lines) must count only VISIBLE (non-gagged)
+    /// lines - gagged lines interspersed in a `before_seq` reply must ride along for free
+    /// rather than eating into `count`. Also covers `backfill_complete`'s derivation: it must
+    /// reflect whether `count` VISIBLE lines were actually found, not the raw returned line
+    /// count (which can look "not exhausted" even when every line left in history was
+    /// returned, if a long run of gagged lines sits at the boundary).
+    #[test]
+    fn test_handle_request_scrollback_before_seq_counts_only_visible_lines() {
+        use crate::websocket::{WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        // seq 1..=20: odd seqs visible, even seqs gagged (10 of each).
+        for seq in 1..=20u64 {
+            if seq % 2 == 0 {
+                world.output_lines.push(OutputLine::new_gagged(format!("gagged {seq}"), seq));
+            } else {
+                world.output_lines.push(OutputLine::new(format!("visible {seq}"), seq));
+            }
+        }
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true, tx, current_world: None, username: None,
+                received_initial_state: true, client_type: RemoteClientType::Web,
+                viewport_height: 24, ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
+                paused: false, acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        // Ask for 5 VISIBLE lines older than seq 21 (everything). Walking back from seq 20:
+        // 5 visible lines (19,17,15,13,11) are found after passing 5 gagged ones (20,18,16,14,12).
+        app.handle_request_scrollback(client_id, 0, 5, Some(21), None, None);
+        let (lines, backfill_complete) = drain_one_scrollback_reply(&mut rx);
+        let visible_in_reply = lines.iter().filter(|l| !l.gagged).count();
+        assert_eq!(visible_in_reply, 5, "must return exactly 5 visible lines, got {lines:?}");
+        assert_eq!(lines.len(), 10, "the 5 gagged lines interspersed in that range must ride along, not be skipped or counted against the budget");
+        let seqs: Vec<u64> = lines.iter().map(|l| l.seq).collect();
+        assert_eq!(seqs, vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20], "range must be contiguous and oldest-to-newest");
+        assert!(!backfill_complete, "more visible history remains below seq 11 (seqs 1,3,5,7,9) - must not report exhausted");
+
+        // Now ask for more visible lines than exist at all (20, but only 10 visible total).
+        // The walk must exhaust the ENTIRE world and correctly report exhaustion based on the
+        // visible count (10 < 20), not the raw returned count (20 lines returned, which would
+        // look "not exhausted" under the old count: raw-line-count logic).
+        app.handle_request_scrollback(client_id, 0, 20, Some(21), None, None);
+        let (lines, backfill_complete) = drain_one_scrollback_reply(&mut rx);
+        assert_eq!(lines.len(), 20, "must return every line in history when asking for more visible lines than exist");
+        assert_eq!(lines.iter().filter(|l| !l.gagged).count(), 10, "only 10 visible lines actually exist");
+        assert!(backfill_complete, "must report exhausted: only 10 visible lines exist despite 20 raw lines returned");
+    }
+
+    /// Same as the `before_seq` test above, but for `after_seq`'s forward (oldest-first) walk
+    /// - the reconnect gap-fill direction.
+    #[test]
+    fn test_handle_request_scrollback_after_seq_counts_only_visible_lines() {
+        use crate::websocket::{WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=20u64 {
+            if seq % 2 == 0 {
+                world.output_lines.push(OutputLine::new_gagged(format!("gagged {seq}"), seq));
+            } else {
+                world.output_lines.push(OutputLine::new(format!("visible {seq}"), seq));
+            }
+        }
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true, tx, current_world: None, username: None,
+                received_initial_state: true, client_type: RemoteClientType::Web,
+                viewport_height: 24, ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
+                paused: false, acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        // Ask for 5 VISIBLE lines newer than seq 0 (everything). Walking forward from seq 1:
+        // 5 visible lines (1,3,5,7,9) are found after passing 4 gagged ones (2,4,6,8).
+        app.handle_request_scrollback(client_id, 0, 5, None, Some(0), None);
+        let (lines, backfill_complete) = drain_one_scrollback_reply(&mut rx);
+        assert_eq!(lines.iter().filter(|l| !l.gagged).count(), 5, "must return exactly 5 visible lines, got {lines:?}");
+        let seqs: Vec<u64> = lines.iter().map(|l| l.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6, 7, 8, 9], "range must be contiguous and oldest-to-newest");
+        assert!(!backfill_complete, "more visible history remains above seq 9 - must not report exhausted");
+
+        // Exhaustion case, forward direction.
+        app.handle_request_scrollback(client_id, 0, 20, None, Some(0), None);
+        let (lines, backfill_complete) = drain_one_scrollback_reply(&mut rx);
+        assert_eq!(lines.len(), 20);
+        assert_eq!(lines.iter().filter(|l| !l.gagged).count(), 10);
+        assert!(backfill_complete, "must report exhausted based on the visible count (10 < 20), not the raw returned count (20)");
+    }
+
+    /// Drains exactly one `ScrollbackLines` reply from a test WS channel, returning
+    /// `(lines, backfill_complete)`. Panics if none (or more than one) is found - callers
+    /// issue exactly one `handle_request_scrollback` call per drain.
+    fn drain_one_scrollback_reply(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) -> (Vec<TimestampedLine>, bool) {
+        let mut result = None;
+        while let Ok(item) = rx.try_recv() {
+            if let crate::websocket::Outbound::Message(msg) = item {
+                if let WsMessage::ScrollbackLines { lines, backfill_complete, .. } = *msg {
+                    assert!(result.is_none(), "expected exactly one ScrollbackLines reply");
+                    result = Some((lines, backfill_complete));
+                }
+            }
+        }
+        result.expect("expected a ScrollbackLines reply")
+    }
+
+    /// `build_initial_state`'s aggregate cross-world budget must be spent only on VISIBLE
+    /// lines - a world heavy with gagged content (active /gag rules, watchdog spam
+    /// suppression) must not starve OTHER worlds' share of the budget just because its own
+    /// slice happened to include a lot of invisible lines riding along for free.
+    #[test]
+    fn test_build_initial_state_budget_counts_only_visible_lines() {
+        let mut app = App::new();
+        app.worlds.clear();
+
+        // World 0: 100 lines, 90% gagged (only 10 visible) - under the old raw-count
+        // accounting this would burn ~100 lines of the aggregate budget; under visible-only
+        // accounting it should burn only ~10, leaving far more for world 1.
+        let mut world0 = World::new("world0");
+        for seq in 0..100u64 {
+            if seq % 10 == 0 {
+                world0.output_lines.push(OutputLine::new(format!("visible {seq}"), seq));
+            } else {
+                world0.output_lines.push(OutputLine::new_gagged(format!("gagged {seq}"), seq));
+            }
+        }
+        app.worlds.push(world0);
+
+        // World 1: plenty of plain visible history, no gagged lines at all.
+        let mut world1 = World::new("world1");
+        for seq in 0..300u64 {
+            world1.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.worlds.push(world1);
+        app.current_world_index = 0;
+
+        let per_world_cap = app.settings.remote_initial_lines.max(1) as usize; // default 100
+
+        let initial_state = app.build_initial_state();
+        let WsMessage::InitialState { worlds, .. } = initial_state else {
+            panic!("build_initial_state() must return WsMessage::InitialState");
+        };
+
+        let world0_visible = worlds[0].output_lines_ts.iter().filter(|l| !l.gagged).count();
+        assert_eq!(world0_visible, 10, "world0 should get all 10 of its visible lines (well under its per-world cap)");
+        assert!(worlds[0].output_lines_ts.len() >= 10, "world0's slice must include its gagged lines too (they ride along free)");
+
+        // World 1 must NOT be starved by world0's gagged lines consuming the aggregate
+        // budget - it should still get its full per-world cap, since world0's real visible
+        // cost (10) left the vast majority of the aggregate budget untouched.
+        assert_eq!(worlds[1].output_lines_ts.len(), per_world_cap,
+            "world1 must get its full per-world cap - world0's gagged lines must not have \
+             eaten into the shared budget on world1's behalf. Got {} (cap {per_world_cap})",
+            worlds[1].output_lines_ts.len());
+    }
+
     /// Regression test for the follow-on bug where a budget-starved world (real history
     /// server-side, but zero lines locally after InitialState - see the aggregate-budget
     /// test above) was silently dropped from the auto-backfill queue instead of being
@@ -5158,115 +5338,64 @@ if you're more curious.\"";
              via RequestScrollback{{before_seq: None}}, not silently dropped from the queue");
     }
 
-    /// Regression/behavior test for the two-phase backfill redesign: phase 1 gives every
-    /// under-filled world a single fast chunk (current world first) before phase 2 starts;
-    /// phase 2 then round-robins 200-line chunks across worlds (one chunk per world per
-    /// cycle, not draining one world before moving to the next) and stops each world at
-    /// backfill_total_target - both because it's had enough (target reached) and because
-    /// the daemon can report a world's history as exhausted before it reaches home target.
+    /// Regression test for the console's backfill scope: it must fetch exactly one
+    /// guaranteed screenful per world at connect and NEVER deep-fill beyond that,
+    /// no matter how much more history the server reports or how high Remote Lines
+    /// is set. This replaces a prior two-phase design (phase 1 screenful + phase 2
+    /// round-robin deep fill up to Remote Lines) that was removed per the user's
+    /// explicit direction: the console should only ever populate what fills the
+    /// current screen - anything older is reached exclusively via scroll_page_up's
+    /// existing on-demand, unbounded fetch, never proactively downloaded.
     #[test]
-    fn test_backfill_phase2_is_round_robin_and_stops_at_total_target() {
+    fn test_console_backfill_never_deep_fills_past_initial_screenful() {
         let mut app = App::new();
         app.worlds.clear();
-        // Total target set well past phase1_target + one phase 2 chunk (75 + 200 = 275)
-        // so each world needs two round-robin cycles (200 then 50) to reach it - this is
-        // what actually exercises round-robin ordering rather than finishing in one pass.
-        app.settings.remote_initial_lines = 325;
+        // Remote Lines set far above the phase-1 screenful target, and each world has
+        // far more server-side history than either value - if any deep-fill machinery
+        // remained, this is exactly the scenario that would trigger it.
+        app.settings.remote_initial_lines = 5000;
 
-        // Three worlds, all starting empty with plenty of server-side history.
         for name in ["world0", "world1", "world2"] {
             app.worlds.push(World::new(name));
         }
         app.current_world_index = 0;
 
-        let world_totals = vec![(0, 1000), (1, 1000), (2, 1000)];
+        let world_totals = vec![(0, 100_000), (1, 100_000), (2, 100_000)];
         app.init_backfill(&world_totals, 75);
-        assert_eq!(app.backfill_total_target, 325,
-            "total target should be max(remote_initial_lines, phase1_target) = max(325, 75)");
 
-        // Drive phase 1 to completion: one chunk per world, each landing exactly on the
-        // phase 1 target (75) since the simulated daemon always has enough to give. Each
-        // loop iteration mirrors one round-trip: advance_to_next sets backfill_next (what
-        // the main loop would send as a RequestScrollback), then we simulate the reply by
-        // prepending lines directly - no further advance needed until the next iteration.
+        // Drive the one-time phase-1 queue to completion: one chunk per world, each
+        // reply reporting plenty more history still available server-side
+        // (backfill_complete: false) - if any deep-fill logic survived, this is what
+        // it would key off of to keep requesting.
         for expected_world in [0usize, 1, 2] {
             app.backfill_advance_to_next();
             let (world_idx, before_seq, count, _request_id) = app.backfill_next.take()
-                .expect("phase 1 should still be issuing requests");
-            assert_eq!(world_idx, expected_world, "phase 1 should proceed in queue order");
-            assert_eq!(count, 75, "phase 1 chunk for an empty world should request the full target");
-            // Simulate the daemon's ScrollbackLines reply: full chunk, more available.
+                .expect("the initial screenful request should still be issued for this world");
+            assert_eq!(world_idx, expected_world, "queue order should be current world first, then the rest");
+            assert_eq!(count, 75, "the one-time request should ask for exactly a screenful");
+            // Simulate the daemon's ScrollbackLines reply: full chunk given, and it
+            // explicitly reports there's plenty more where that came from.
             let lines: Vec<OutputLine> = (0..count as u64)
-                .map(|i| OutputLine::new(format!("line {i}"), before_seq.unwrap_or(1000).wrapping_sub(i + 1)))
+                .map(|i| OutputLine::new(format!("line {i}"), before_seq.unwrap_or(100_000).wrapping_sub(i + 1)))
                 .collect();
             let mut combined = lines;
             combined.append(&mut app.worlds[world_idx].output_lines);
             app.worlds[world_idx].output_lines = combined;
-        }
-        assert!(app.backfill_queue.is_empty(), "phase 1 queue should be fully drained");
-
-        // Drive the rest via backfill_advance_to_next alone (same as the real
-        // ScrollbackLines handler would, minus the network round-trip): the first call
-        // below finds the phase 1 queue empty and auto-transitions to phase 2 via
-        // start_backfill_phase2, then returns the first phase 2 request already.
-        let mut requests: Vec<usize> = Vec::new();
-        let mut guard = 0;
-        loop {
-            guard += 1;
-            assert!(guard < 100, "backfill should terminate, not loop forever");
-            app.backfill_advance_to_next();
-            let Some((world_idx, before_seq, count, _request_id)) = app.backfill_next.take() else {
-                break; // backfill fully complete
-            };
-            assert_eq!(app.backfill_phase, 2, "should have auto-transitioned to phase 2");
-            requests.push(world_idx);
-            let received_before = app.worlds[world_idx].output_lines.len();
-            let remaining_to_target = app.backfill_total_target - received_before;
-            // Phase 2 requests are clamped to min(BACKFILL_PHASE2_CHUNK_SIZE, remaining) so a
-            // world's final chunk never overshoots the target - so count should always equal
-            // exactly what's still needed, capped at the round-robin chunk size.
-            assert_eq!(count, remaining_to_target.min(200),
-                "phase 2 chunk size should be clamped to what's still needed, capped at 200");
-
-            // Simulate the daemon: ample history, so it always returns the full requested
-            // count (never less) - backfill_complete only fires when a world's real history
-            // runs out before reaching the target, which this scenario doesn't exercise.
-            let give = count;
-            let backfill_complete = give < count;
-            let lines: Vec<OutputLine> = (0..give as u64)
-                .map(|i| OutputLine::new(format!("line {i}"), before_seq.unwrap_or(1000).wrapping_sub(i + 1)))
-                .collect();
-            let mut combined = lines;
-            combined.append(&mut app.worlds[world_idx].output_lines);
-            app.worlds[world_idx].output_lines = combined;
-
-            if backfill_complete {
-                app.backfill_exhausted.insert(world_idx);
-            }
-            if app.backfill_phase == 2 {
-                let received = app.worlds[world_idx].output_lines.len();
-                if received < app.backfill_total_target && !app.backfill_exhausted.contains(&world_idx) {
-                    app.backfill_queue.push(world_idx);
-                }
-            }
+            // backfill_complete would have been false here (plenty more available) -
+            // per the ScrollbackLines handler, that must not matter: it just calls
+            // backfill_advance_to_next() unconditionally, which the next loop
+            // iteration exercises.
         }
 
-        // Round-robin: with three equally-starved worlds, no world should receive a second
-        // phase 2 chunk before the other two have each received one.
-        assert!(requests.len() >= 6, "expected multiple round-robin cycles, got {requests:?}");
-        assert_eq!(&requests[0..3], &[0, 1, 2],
-            "first cycle should visit every world once in queue order: {requests:?}");
-        assert_eq!(&requests[3..6], &[0, 1, 2],
-            "second cycle should also visit every world once before any gets a third \
-             chunk: {requests:?}");
+        // Nothing further should ever be auto-requested, however much history remains.
+        assert!(app.backfill_queue.is_empty(), "the queue must be fully (and permanently) drained after one pass");
+        assert!(app.backfill_next.is_none(), "no further auto-request should be pending");
+        assert!(!app.backfill_needed(), "backfill_needed must report false once every world has its screenful");
 
-        // Every world should be capped at backfill_total_target, never exceeding it.
+        // Each world should hold exactly its screenful - not one line more.
         for (idx, world) in app.worlds.iter().enumerate() {
-            assert!(world.output_lines.len() <= app.backfill_total_target,
-                "world {idx} has {} lines, exceeding backfill_total_target {}",
-                world.output_lines.len(), app.backfill_total_target);
-            assert_eq!(world.output_lines.len(), app.backfill_total_target,
-                "world {idx} should be filled all the way to the target (ample history was simulated)");
+            assert_eq!(world.output_lines.len(), 75,
+                "world {idx} should hold exactly the one-time screenful (75 lines), never deep-filled further");
         }
     }
 

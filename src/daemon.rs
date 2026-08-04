@@ -3085,8 +3085,10 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
             // "✨ " client-line marker is added at display time only (rendering.rs::
             // process_output_line for console/remote console, applyClientPrefix() in
             // web/app.js), keyed on `from_server` below.
-            let output_lines_ts = App::build_initial_output_lines(output_lines, has_trailing_partial, max_initial_lines);
-            budget_remaining = budget_remaining.saturating_sub(output_lines_ts.len());
+            let (output_lines_ts, visible_count) = App::build_initial_output_lines(output_lines, has_trailing_partial, max_initial_lines);
+            // Decrement by the VISIBLE count, not the raw slice length - see the identical
+            // comment on the single-user build_initial_state (main.rs).
+            budget_remaining = budget_remaining.saturating_sub(visible_count);
 
             WorldStateMsg {
                 index: idx,
@@ -3136,6 +3138,9 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 is_proxy: world.proxy_pid.is_some(),
                 gmcp_user_enabled: world.gmcp_user_enabled,
                 total_output_lines: world.output_lines.len(),
+                // Matches total_output_lines' existing source (world.output_lines, not the
+                // per-user conn.output_lines) - see the field's doc comment in websocket.rs.
+                total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
                 pending_count: world.pending_lines.len(),
             }
         }).collect();
@@ -4029,5 +4034,58 @@ mod multiuser_initial_state_tests {
         } else {
             panic!("expected InitialState");
         }
+    }
+
+    /// Multiuser equivalent of single-user's
+    /// `test_build_initial_state_budget_counts_only_visible_lines` (main.rs): the aggregate
+    /// cross-world budget must be spent only on VISIBLE lines, shared via
+    /// `App::build_initial_output_lines` so the two implementations can't silently diverge.
+    #[test]
+    fn test_multiuser_initial_state_budget_counts_only_visible_lines() {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+
+        // World 0 (alice's): 100 lines in her connection buffer, 90% gagged.
+        let mut alice_world = World::new("alice-world");
+        alice_world.owner = Some("alice".to_string());
+        app.worlds.push(alice_world);
+        let mut alice_conn = UserConnection::new();
+        alice_conn.connected = true;
+        for seq in 0..100u64 {
+            if seq % 10 == 0 {
+                alice_conn.output_lines.push(OutputLine::new(format!("visible {seq}"), seq));
+            } else {
+                alice_conn.output_lines.push(OutputLine::new_gagged(format!("gagged {seq}"), seq));
+            }
+        }
+        app.user_connections.insert((0, "alice".to_string()), alice_conn);
+
+        // World 1 (also alice's, a second world): plenty of plain visible history.
+        let mut alice_world2 = World::new("alice-world-2");
+        alice_world2.owner = Some("alice".to_string());
+        app.worlds.push(alice_world2);
+        let mut alice_conn2 = UserConnection::new();
+        alice_conn2.connected = true;
+        for seq in 0..300u64 {
+            alice_conn2.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.user_connections.insert((1, "alice".to_string()), alice_conn2);
+
+        let per_world_cap = app.settings.remote_initial_lines.max(1) as usize;
+
+        let initial_state = build_multiuser_initial_state(&app, "alice");
+        let WsMessage::InitialState { worlds, .. } = initial_state else {
+            panic!("expected InitialState");
+        };
+
+        let world0_visible = worlds[0].output_lines_ts.iter().filter(|l| !l.gagged).count();
+        assert_eq!(world0_visible, 10, "world 0 should get all 10 of its visible lines");
+        assert!(worlds[0].output_lines_ts.len() >= 10, "world 0's gagged lines must ride along in its own slice");
+
+        assert_eq!(worlds[1].output_lines_ts.len(), per_world_cap,
+            "world 1 must get its full per-world cap - world 0's gagged lines must not have \
+             eaten into the shared aggregate budget on world 1's behalf. Got {} (cap {per_world_cap})",
+            worlds[1].output_lines_ts.len());
     }
 }

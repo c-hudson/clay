@@ -743,6 +743,15 @@ pub struct WorldStateMsg {
     // Total number of output lines on the server (for lazy backfill)
     #[serde(default)]
     pub total_output_lines: usize,
+    // Total number of VISIBLE (non-gagged) output lines on the server - the download budget
+    // (Remote Lines) is spent only on visible lines, so the client needs this (not
+    // total_output_lines, which includes gagged lines it can't see) to know how much visible
+    // history genuinely remains to fetch. `Option`, not a bare `usize`: 0 is a real value (a
+    // world with no visible lines yet), so "field absent" (an older server that predates this)
+    // must stay distinguishable from "genuinely zero" - the same reasoning `end_seq` uses.
+    // app.js falls back to total_output_lines when this is `None`.
+    #[serde(default)]
+    pub total_visible_lines: Option<usize>,
     // Number of pending lines on the server (for More indicator on connect)
     #[serde(default)]
     pub pending_count: usize,
