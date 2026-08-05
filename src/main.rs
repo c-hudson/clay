@@ -30,7 +30,7 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-pub(crate) const VERSION: &str = "1.5.5";
+pub(crate) const VERSION: &str = "1.5.6";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
