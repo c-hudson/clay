@@ -6557,3 +6557,223 @@ if you're more curious.\"";
         }
     }
 
+    // ========== Stale new-line (▶) indicator after world switch (reconnect gap) ==========
+    // See when-switching-between-worlds-majestic-salamander.md: MarkWorldSeen's
+    // previous_world_index lets a client tell the server which world it's leaving even
+    // after a reconnect (new client_id), when the server's own ws_client_worlds tracking of
+    // the client's prior world has been lost.
+
+    /// A client that has never been seen before (fresh client_id, no ws_client_worlds
+    /// entry - simulating a reconnect after backgrounding) still gets the world it's
+    /// leaving cleared, because it tells the server directly via previous_world_index.
+    /// Before the fix, this depended entirely on the stale-by-then ws_client_worlds lookup
+    /// and cleared nothing.
+    #[test]
+    fn test_mark_world_seen_previous_world_index_clears_across_reconnect() {
+        let mut app = App::new();
+        app.worlds.clear();
+
+        let mut world_a = World::new("a");
+        for i in 0..5 {
+            let mut line = OutputLine::new(format!("a-line-{}", i), i as u64);
+            line.marked_new = true;
+            world_a.output_lines.push(line);
+        }
+        world_a.first_marked_new_index = Some(0);
+        app.worlds.push(world_a);
+        app.worlds.push(World::new("b"));
+
+        let fresh_client_id = 999; // never inserted into ws_client_worlds
+        assert!(app.ws_client_worlds.get(&fresh_client_id).is_none(),
+            "precondition: this client_id must be unknown to the server, like after a reconnect");
+
+        app.handle_mark_world_seen(fresh_client_id, 1, Some(0));
+
+        assert!(app.worlds[0].output_lines.iter().all(|l| !l.marked_new),
+            "world 'a' (the world being left) must have marked_new cleared via previous_world_index, \
+             even though the server had no prior ws_client_worlds entry for this client_id");
+        assert!(app.worlds[0].first_marked_new_index.is_none());
+        assert_eq!(app.worlds[1].unseen_lines, 0, "mark_seen() must clear the new world's unseen count");
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(log.iter().any(|m| matches!(m, WsMessage::UnseenCleared { world_index: 1 })),
+            "expected UnseenCleared(1). Log: {:?}", log);
+        assert!(log.iter().any(|m| matches!(m, WsMessage::ActivityUpdate { .. })),
+            "expected an ActivityUpdate broadcast. Log: {:?}", log);
+    }
+
+    /// Without a client-supplied previous_world_index (older client, or the remote-console
+    /// path that doesn't send one), the server still falls back to its own ws_client_worlds
+    /// tracking - the pre-existing behavior must be preserved.
+    #[test]
+    fn test_mark_world_seen_falls_back_to_ws_client_worlds_when_no_previous_index() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world_a = World::new("a");
+        let mut line = OutputLine::new("a-line".to_string(), 0);
+        line.marked_new = true;
+        world_a.output_lines.push(line);
+        world_a.first_marked_new_index = Some(0);
+        app.worlds.push(world_a);
+        app.worlds.push(World::new("b"));
+
+        let client_id = 5;
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 0,
+            visible_lines: 24,
+            visible_columns: 80,
+            dimensions: None,
+            paused: false,
+            disconnected_at: None,
+        });
+
+        app.handle_mark_world_seen(client_id, 1, None);
+
+        assert!(app.worlds[0].output_lines.iter().all(|l| !l.marked_new),
+            "world 'a' must still be cleared via the ws_client_worlds fallback lookup");
+        assert_eq!(app.ws_client_worlds.get(&client_id).map(|s| s.world_index), Some(1));
+    }
+
+    /// MarkWorldSeen for the world the client is already viewing (world_index ==
+    /// previous_world_index) must not clear that world's own indicators.
+    #[test]
+    fn test_mark_world_seen_same_world_does_not_clear_itself() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world_a = World::new("a");
+        let mut line = OutputLine::new("a-line".to_string(), 0);
+        line.marked_new = true;
+        world_a.output_lines.push(line);
+        world_a.first_marked_new_index = Some(0);
+        app.worlds.push(world_a);
+
+        app.handle_mark_world_seen(1, 0, Some(0));
+
+        assert!(app.worlds[0].output_lines[0].marked_new,
+            "marking the world you're already on as seen must not clear its own ▶ markers \
+             (those only clear when switching AWAY, per World::clear_new_line_indicators)");
+    }
+
+    // ========== Resume semantics: grace window for a briefly-disconnected WS client ==========
+
+    #[test]
+    fn test_ws_client_viewing_true_within_grace_window_after_disconnect() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("a"));
+        app.ws_client_worlds.insert(1, ClientViewState {
+            world_index: 0,
+            visible_lines: 24,
+            visible_columns: 80,
+            dimensions: None,
+            paused: false,
+            disconnected_at: Some(std::time::Instant::now()), // just disconnected
+        });
+        assert!(app.ws_client_viewing(0),
+            "a client that disconnected moments ago must still count as viewing its world, \
+             so output arriving during a brief background/reconnect gap isn't wrongly marked_new");
+    }
+
+    #[test]
+    fn test_ws_client_viewing_false_after_grace_window_expires() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("a"));
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(16 * 60))
+            .expect("test host must have > 16 minutes of monotonic clock uptime");
+        app.ws_client_worlds.insert(1, ClientViewState {
+            world_index: 0,
+            visible_lines: 24,
+            visible_columns: 80,
+            dimensions: None,
+            paused: false,
+            disconnected_at: Some(long_ago),
+        });
+        assert!(!app.ws_client_viewing(0),
+            "a client disconnected well past the grace window must no longer count as viewing");
+    }
+
+    #[test]
+    fn test_min_viewer_lines_excludes_disconnected_clients() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("a"));
+        // Actively connected client with the larger viewport.
+        app.ws_client_worlds.insert(1, ClientViewState {
+            world_index: 0, visible_lines: 40, visible_columns: 100,
+            dimensions: None, paused: false, disconnected_at: None,
+        });
+        // Disconnected (but within grace) client with a smaller viewport - must not
+        // constrain more-mode pagination for the still-present viewer above.
+        app.ws_client_worlds.insert(2, ClientViewState {
+            world_index: 0, visible_lines: 10, visible_columns: 40,
+            dimensions: None, paused: false, disconnected_at: Some(std::time::Instant::now()),
+        });
+        assert_eq!(app.min_viewer_lines(0), Some(40),
+            "the disconnected client's smaller viewport must be excluded from the min");
+        assert_eq!(app.min_viewer_width(0), Some(100));
+    }
+
+    #[test]
+    fn test_reap_stale_ws_client_worlds_removes_only_expired_entries() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("a"));
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(16 * 60))
+            .expect("test host must have > 16 minutes of monotonic clock uptime");
+        app.ws_client_worlds.insert(1, ClientViewState { // still connected: keep
+            world_index: 0, visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, disconnected_at: None,
+        });
+        app.ws_client_worlds.insert(2, ClientViewState { // disconnected, within grace: keep
+            world_index: 0, visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, disconnected_at: Some(std::time::Instant::now()),
+        });
+        app.ws_client_worlds.insert(3, ClientViewState { // disconnected, expired: reap
+            world_index: 0, visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, disconnected_at: Some(long_ago),
+        });
+
+        app.reap_stale_ws_client_worlds();
+
+        assert!(app.ws_client_worlds.contains_key(&1));
+        assert!(app.ws_client_worlds.contains_key(&2));
+        assert!(!app.ws_client_worlds.contains_key(&3));
+    }
+
+    // ========== Resume semantics: pending lines are always ▶, the non-pending screenful isn't ==========
+
+    #[test]
+    fn test_pending_lines_marked_new_even_when_current() {
+        // A line that must be released with PgDn/Tab is unseen by definition, even on the
+        // world you're currently viewing - it wasn't shown to you yet.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+        world.paused = true; // already paused: new output goes straight to pending_lines
+
+        world.add_output("held back line\n", true /* is_current */, &settings, 24, 80, false, true);
+
+        assert_eq!(world.pending_lines.len(), 1);
+        assert!(world.pending_lines[0].marked_new,
+            "a pending (more-mode held-back) line must be marked_new even when is_current is true");
+        // unseen_lines stays gated on !is_current - a pending line on the world you're
+        // looking at isn't "unseen" in the aggregate-activity sense, only "not yet displayed".
+        assert_eq!(world.unseen_lines, 0);
+    }
+
+    #[test]
+    fn test_output_lines_not_marked_new_when_current_and_not_pending() {
+        // The non-pending screenful shown immediately on a world you're viewing must NOT
+        // get the ▶ marker - only PgDn/Tab-gated pending lines do.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        world.add_output("visible line\n", true /* is_current */, &settings, 24, 80, false, true);
+
+        assert_eq!(world.output_lines.len(), 1);
+        assert!(!world.output_lines[0].marked_new);
+        assert!(world.pending_lines.is_empty());
+    }
+

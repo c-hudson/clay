@@ -3643,6 +3643,16 @@
             case 'WorldSwitchResult':
                 // Response to CycleWorld - update local world index and state
                 if (msg.world_index !== undefined) {
+                    const previousWorldIndex = currentWorldIndex;
+                    // Clear new line indicators on the world we're LEAVING - previously only
+                    // switchWorldLocal did this, so cycling worlds (Escape+w/Alt+w, which
+                    // reply with WorldSwitchResult rather than going through
+                    // switchWorldLocal) left stale ▶ markers behind on the world being left.
+                    // No-op when the result is for the world we're already on (e.g. only one
+                    // cycleable world), same as clearLeavingWorldState always was.
+                    if (msg.world_index !== previousWorldIndex) {
+                        clearLeavingWorldState(previousWorldIndex);
+                    }
                     currentWorldIndex = msg.world_index;
                     if (worlds[msg.world_index]) {
                         worlds[msg.world_index].pending_count = msg.pending_count || 0;
@@ -3650,10 +3660,13 @@
                     }
                     updateStatusBar();
                     renderOutput();
-                    // Send MarkWorldSeen since we're now viewing this world
+                    // Send MarkWorldSeen since we're now viewing this world; tell the server
+                    // which world we left so it can clear that world's indicators even across
+                    // a reconnect (see MarkWorldSeen's doc comment in websocket.rs).
                     send({
                         type: 'MarkWorldSeen',
-                        world_index: currentWorldIndex
+                        world_index: currentWorldIndex,
+                        previous_world_index: previousWorldIndex
                     });
                 }
                 break;
@@ -5161,21 +5174,32 @@
         if (promptAfter) redisplayCurrentPrompt();
     }
 
+    // Clear local per-line new-line indicators and reset the render window for the world
+    // being left, mirroring the console's World::clear_new_line_indicators() (called from
+    // switch_world()). Shared by switchWorldLocal and the WorldSwitchResult handler so both
+    // world-switch paths leave a clean trail behind them - previously only switchWorldLocal
+    // did this, so switching via CycleWorld (WorldSwitchResult) left stale ▶ markers on the
+    // world being left.
+    function clearLeavingWorldState(oldIndex) {
+        const oldWorld = worlds[oldIndex];
+        if (oldWorld && oldWorld.output_lines) {
+            oldWorld.output_lines.forEach(l => { l.marked_new = false; });
+        }
+        // Reset the render window on the world we're leaving too, so returning to it
+        // later starts fresh at RENDER_WINDOW_INITIAL rather than wherever a previous
+        // deep-scroll session left it - keeps per-world DOM cost bounded across
+        // multiple world visits, not just within one.
+        if (oldWorld) oldWorld._renderWindow = RENDER_WINDOW_INITIAL;
+    }
+
     // Switch world locally (does not affect console)
     function switchWorldLocal(index) {
         if (lockedWorld) return; // Don't switch worlds in locked windows
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
+            const previousWorldIndex = currentWorldIndex;
             // Clear new line indicators on the world we're LEAVING (matches console behavior)
-            const oldWorld = worlds[currentWorldIndex];
-            if (oldWorld && oldWorld.output_lines) {
-                oldWorld.output_lines.forEach(l => { l.marked_new = false; });
-            }
-            // Reset the render window on the world we're leaving too, so returning to it
-            // later starts fresh at RENDER_WINDOW_INITIAL rather than wherever a previous
-            // deep-scroll session left it - keeps per-world DOM cost bounded across
-            // multiple world visits, not just within one.
-            if (oldWorld) oldWorld._renderWindow = RENDER_WINDOW_INITIAL;
+            clearLeavingWorldState(previousWorldIndex);
             currentWorldIndex = index;
             // Clear splash on world switch, but only for a world that has actually
             // connected before - a fresh/never-connected world's output_lines is
@@ -5198,8 +5222,12 @@
             } else {
                 elements.prompt.textContent = '';
             }
-            // Notify server that this world has been seen (syncs unseen count)
-            send({ type: 'MarkWorldSeen', world_index: index });
+            // Notify server that this world has been seen (syncs unseen count). Tell it
+            // which world we're leaving (previous_world_index) so it can clear that world's
+            // marked_new indicators server-side even across a reconnect, when the server's
+            // own per-client "current world" tracking (keyed by an ephemeral client id) has
+            // been lost - see MarkWorldSeen's doc comment in websocket.rs.
+            send({ type: 'MarkWorldSeen', world_index: index, previous_world_index: previousWorldIndex });
             // Request current state for this world (more indicator, prompt, etc)
             send({ type: 'RequestWorldState', world_index: index });
             // Update view state for synchronized more-mode
@@ -7091,9 +7119,13 @@
     }
 
     // Mirrors main.rs's World::has_activity(): a world counts as having activity
-    // if it has unseen lines or held-back (paused/more-mode) pending lines.
+    // if it has unseen lines or held-back (paused/more-mode) pending lines. Was
+    // previously shadowed by a second, unseen-only declaration later in this file
+    // (hoisting made that one win everywhere, silently dropping the pending_count term
+    // and disagreeing with the server's own ActivityUpdate whenever a background world
+    // was more-mode paused) - that duplicate is now removed, this is the only definition.
     function worldHasActivity(w) {
-        return (w.unseen_lines || 0) > 0 || (w.pending_count || 0) > 0;
+        return ((w.unseen_lines || 0) > 0) || ((w.pending_count || 0) > 0);
     }
 
     // Update status bar
@@ -8912,12 +8944,6 @@
     // Check if a world should be included in cycling (connected OR has activity)
     function isWorldActive(world) {
         return world.connected || worldHasActivity(world);
-    }
-
-    // Check if a world has activity (unseen lines only)
-    // Note: pending_count is server-side more-mode concept, not meaningful for web activity
-    function worldHasActivity(world) {
-        return world.unseen_lines && world.unseen_lines > 0;
     }
 
     // Check if a world has unseen output (for pending_first prioritization)

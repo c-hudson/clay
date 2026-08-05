@@ -1998,8 +1998,9 @@ pub(crate) fn handle_remote_client_key(
                     Command::WorldSwitch { ref name } => {
                         // /worlds <name> - switch to world if it exists
                         if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                            let previous_idx = app.current_world_index;
                             app.current_world_index = idx;
-                            let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                            let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
                             // If not connected, request connection
                             if !app.worlds[idx].connected {
                                 let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
@@ -2017,8 +2018,9 @@ pub(crate) fn handle_remote_client_key(
                     Command::WorldConnectNoLogin { ref name } => {
                         // /worlds -l <name> - send to server as SendCommand so skip_auto_login is set
                         if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                            let previous_idx = app.current_world_index;
                             app.current_world_index = idx;
-                            let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                            let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
                             if !app.worlds[idx].connected {
                                 // Send as command so server parses -l flag and sets skip_auto_login
                                 let _ = ws_tx.send(WsMessage::SendCommand {

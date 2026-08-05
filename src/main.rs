@@ -1914,6 +1914,14 @@ impl User {
     }
 }
 
+/// How long a disconnected WS client's `ClientViewState` entry is kept (and still counts as
+/// "viewing" its world) after its socket drops, before being reaped. Covers a background/
+/// reconnect gap (e.g. Android backgrounding the app, a brief network blip) without letting
+/// a client that's truly gone forever keep constraining more-mode thresholds
+/// (`min_viewer_lines`/`min_viewer_width`) or suppressing its world's `marked_new` flags
+/// (`ws_client_viewing`) indefinitely.
+const WS_VIEWER_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// Tracks a WebSocket client's view state for synchronized more-mode
 #[derive(Clone, Debug)]
 pub struct ClientViewState {
@@ -1927,6 +1935,14 @@ pub struct ClientViewState {
     pub dimensions: Option<(u16, u16)>,
     /// Mirrors WsClientInfo.paused — cached here for lock-free reads in output path
     pub paused: bool,
+    /// When this client's WebSocket disconnected, if it currently has no live connection.
+    /// `None` means "actively connected" (the normal case). Kept (rather than removing the
+    /// entry outright) for a grace window after disconnect so a client's own current world
+    /// doesn't get treated as unviewed - and therefore have its arriving output wrongly
+    /// marked_new - during a brief background/reconnect gap (e.g. Android backgrounding the
+    /// app). See `ws_client_viewing()`/`min_viewer_lines()`/`min_viewer_width()` and
+    /// `handle_ws_client_disconnected()`.
+    pub disconnected_at: Option<std::time::Instant>,
 }
 
 // ============================================================================
@@ -3048,14 +3064,21 @@ impl World {
                 }
             }
 
+            // Track if this line goes to pending (for partial tracking)
+            let goes_to_pending = self.paused && settings.more_mode_enabled;
+            // A pending line is always marked_new, even on the world you're currently
+            // viewing: you must press PgDn/Tab to release it, so it's unseen by
+            // definition (unlike a line that lands directly in output_lines while
+            // is_current, which you're looking at right now). Must be computed before
+            // nli_visual_rows below so the reserved-NLI-prefix-width budgeting matches
+            // the marked_new value actually used.
+            let will_be_marked_new = goes_to_pending || !is_current;
             // Use nli_visual_rows for accurate visual line count — it uses wrap_ansi_line
             // with the same effective width the renderer uses (reduced by NLI_PREFIX_WIDTH
             // when the NLI setting is on and the line is marked_new), so that
             // pause/partial-display budgeting stays in sync with what's drawn.
-            let visual_lines = nli_visual_rows(line, (output_width as usize).max(1), !is_current, settings.new_line_indicator, settings.wrapspace as usize);
+            let visual_lines = nli_visual_rows(line, (output_width as usize).max(1), will_be_marked_new, settings.new_line_indicator, settings.wrapspace as usize);
 
-            // Track if this line goes to pending (for partial tracking)
-            let goes_to_pending = self.paused && settings.more_mode_enabled;
             // Use projected line count (current + this line's visual lines) for pause trigger
             let triggers_pause = !goes_to_pending
                 && settings.more_mode_enabled
@@ -3080,7 +3103,7 @@ impl World {
                     }
                 }
 
-                new_line.marked_new = !is_current;
+                new_line.marked_new = true;
                 self.pending_lines.push(new_line);
                 if !is_current { self.unseen_lines += 1; }
                 if is_partial {
@@ -3241,7 +3264,7 @@ impl World {
     }
 
     /// Returns true if this world has activity (unseen lines or pending output)
-    fn has_activity(&self) -> bool {
+    pub(crate) fn has_activity(&self) -> bool {
         self.unseen_lines > 0 || !self.pending_lines.is_empty()
     }
 
@@ -4672,15 +4695,18 @@ impl App {
             WsMessage::CalculatedWorld { index: Some(idx) } => {
                 // Server calculated next/prev world for us - switch to it
                 if idx < self.worlds.len() {
+                    let previous_idx = self.current_world_index;
                     self.current_world_index = idx;
                     // Clear unseen for the world we're switching to
                     if let Some(world) = self.worlds.get_mut(idx) {
                         world.unseen_lines = 0;
                     }
                     self.needs_output_redraw = true;
-                    // Send MarkWorldSeen to notify server
+                    // Send MarkWorldSeen to notify server, telling it which world we're
+                    // leaving so it can clear that world's marked_new indicators even
+                    // across a reconnect (see MarkWorldSeen's previous_world_index doc).
                     if let Some(ref tx) = self.ws_client_tx {
-                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx, previous_world_index: Some(previous_idx) });
                     }
                 }
             }
@@ -5563,6 +5589,7 @@ impl App {
             visible_columns,
             dimensions,
             paused,
+            disconnected_at: None,
         });
         // Update client's world in WebSocket server (async state)
         self.ws_set_client_world(client_id, Some(idx));
@@ -5750,6 +5777,7 @@ impl App {
     /// this silently no-ops (no reply at all) rather than sending an error — an error
     /// reply would itself leak whether `world_index` exists, which a bare 404-style
     /// silence avoids.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_request_scrollback_owned(&mut self, client_id: u64, world_index: usize, count: usize, before_seq: Option<u64>, after_seq: Option<u64>, request_id: Option<u64>, owner: &str) {
         match self.worlds.get(world_index) {
             Some(world) if world.owner.as_deref() == Some(owner) => {
@@ -5817,6 +5845,52 @@ impl App {
             scroll_offset: world.scroll_offset,
             recent_lines,
         });
+    }
+
+    /// `WsMessage::MarkWorldSeen` handling — shared by master-WS and daemon single-user
+    /// paths. `previous_world_index` (sent by the client when it knows the world it's
+    /// leaving) takes priority over the `ws_client_worlds` lookup, which goes stale across
+    /// a reconnect: a new `client_id` has no entry, so without the client-supplied hint the
+    /// previous world's `marked_new` indicators never get cleared (they'd otherwise only
+    /// clear once the client happens to revisit that world with an unbroken connection).
+    pub(crate) fn handle_mark_world_seen(&mut self, client_id: u64, world_index: usize, previous_world_index: Option<usize>) {
+        if world_index >= self.worlds.len() {
+            return;
+        }
+        // Check if client is switching to a different world
+        let old_world_idx = previous_world_index
+            .or_else(|| self.ws_client_worlds.get(&client_id).map(|s| s.world_index));
+        let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
+        // When switching away from the old world, clear its new line indicators
+        // and reset lines_since_pause if more-mode hasn't triggered
+        if let Some(old_idx) = old_world_idx {
+            if old_idx != world_index && old_idx < self.worlds.len() {
+                self.worlds[old_idx].clear_new_line_indicators();
+                if self.worlds[old_idx].pending_lines.is_empty() {
+                    self.worlds[old_idx].lines_since_pause = 0;
+                }
+            }
+        }
+        // Track which world this client is viewing (sync cache)
+        let prev = self.ws_client_worlds.get(&client_id);
+        let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
+        let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
+        let dimensions = prev.and_then(|s| s.dimensions);
+        let paused = prev.map(|v| v.paused).unwrap_or(false);
+        self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
+        // Update client's world in WebSocket server (async state)
+        self.ws_set_client_world(client_id, Some(world_index));
+
+        self.worlds[world_index].mark_seen();
+        // Broadcast to all clients so they update their UI
+        self.ws_broadcast(WsMessage::UnseenCleared { world_index });
+        // Broadcast activity count since a world was just marked as seen
+        self.broadcast_activity();
+        // Trigger console redraw to update activity indicator
+        self.needs_output_redraw = true;
+        if switched {
+            self.ws_send_active_media_to_client(client_id, world_index);
+        }
     }
 
     /// `WsMessage::UpdateActions` handling — shared by master-WS and daemon (T40).
@@ -6131,6 +6205,7 @@ impl App {
     /// `flush`-with-no-lines case (splash cleared, nothing to send but clients still need
     /// their buffer flushed). Shared by `process_server_data` (real MUD output) and
     /// `emit_client_lines` (client-generated blocks, e.g. `/recall`).
+    #[allow(clippy::too_many_arguments)]
     fn broadcast_output_range(&mut self, world_idx: usize, skip: usize, count: usize, is_viewed: bool, from_server: bool, marked_new: bool, flush: bool) {
         if count == 0 {
             if flush {
@@ -7364,6 +7439,7 @@ impl App {
                 visible_columns: 0,
                 dimensions: None,
                 paused: new_paused,
+                disconnected_at: None,
             });
         }
         Some((new_paused, ip))
@@ -7409,29 +7485,53 @@ impl App {
 
     /// Check if any non-paused WS client is currently viewing a specific world.
     /// Paused clients don't suppress activity notices for their world.
+    /// A recently-disconnected client (within WS_VIEWER_GRACE) still counts as viewing its
+    /// world - otherwise a brief background/reconnect gap (e.g. Android backgrounding the
+    /// app) makes that client's own current world look unviewed the instant its socket
+    /// drops, so any output arriving in that window gets wrongly marked_new even though the
+    /// client never actually looked away.
     fn ws_client_viewing(&self, world_index: usize) -> bool {
-        self.ws_client_worlds.values().any(|v| v.world_index == world_index && !v.paused)
+        self.ws_client_worlds.values().any(|v| v.world_index == world_index && !v.paused
+            && v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true))
     }
 
     /// Get the minimum visible lines among all viewers of a world (for more-mode threshold)
-    /// Returns None if no WS clients are viewing the world (use console output_height)
+    /// Returns None if no WS clients are viewing the world (use console output_height).
+    /// Disconnected clients are excluded even during their grace window: unlike
+    /// `ws_client_viewing` (which only needs a yes/no "is anyone still looking"),
+    /// more-mode's viewport budget must reflect only viewers who can actually see output
+    /// right now - counting a backgrounded phone's stale/smaller viewport here would
+    /// wrongly constrain pagination for every other, actually-present viewer.
     fn min_viewer_lines(&self, world_index: usize) -> Option<usize> {
         let ws_min = self.ws_client_worlds
             .values()
-            .filter(|v| v.world_index == world_index && v.visible_lines > 0)
+            .filter(|v| v.world_index == world_index && v.visible_lines > 0 && v.disconnected_at.is_none())
             .map(|v| v.visible_lines)
             .min();
         ws_min
     }
 
     /// Get the minimum visible columns among WS clients viewing a world (for wrap width)
-    /// Returns None if no WS clients have reported their width
+    /// Returns None if no WS clients have reported their width. Excludes disconnected
+    /// clients for the same reason as `min_viewer_lines`.
     fn min_viewer_width(&self, world_index: usize) -> Option<usize> {
         self.ws_client_worlds
             .values()
-            .filter(|v| v.world_index == world_index && v.visible_columns > 0)
+            .filter(|v| v.world_index == world_index && v.visible_columns > 0 && v.disconnected_at.is_none())
             .map(|v| v.visible_columns)
             .min()
+    }
+
+    /// Reap `ws_client_worlds` entries whose client disconnected more than WS_VIEWER_GRACE
+    /// ago. Purely a memory-bound cleanup - `ws_client_viewing`/`min_viewer_lines`/
+    /// `min_viewer_width` already re-check the grace window themselves on every read, so
+    /// correctness doesn't depend on this running promptly. Called from each event loop's
+    /// existing once-a-minute keepalive tick (main.rs's `run_app`/`run_app_headless`,
+    /// daemon.rs's `run_daemon_server`) rather than on its own timer.
+    pub(crate) fn reap_stale_ws_client_worlds(&mut self) {
+        self.ws_client_worlds.retain(|_, v| {
+            v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true)
+        });
     }
 
     /// Process incoming server data - shared logic for both console and daemon modes
@@ -8281,22 +8381,32 @@ impl App {
     }
 
     /// Handle WsClientDisconnected event.
+    ///
+    /// Keeps the `ClientViewState` entry (stamped with `disconnected_at`) instead of
+    /// removing it outright, for WS_VIEWER_GRACE - so a client that reconnects shortly after
+    /// (e.g. Android backgrounding/resuming the app) doesn't have its own current world
+    /// treated as unviewed in between, which would wrongly mark arriving output as new (see
+    /// `ws_client_viewing`). `min_viewer_lines`/`min_viewer_width` still exclude it
+    /// immediately (its viewport no longer exists to budget against), and the entry is
+    /// eventually reaped by `reap_stale_ws_client_worlds`.
     fn handle_ws_client_disconnected(&mut self, client_id: u64) {
         // Check if this client had NAWS dimensions, and recalculate if needed
-        if let Some(state) = self.ws_client_worlds.get(&client_id) {
-            if state.dimensions.is_some() {
-                // Client had dimensions - need to recalculate NAWS after removal
-                self.ws_client_worlds.remove(&client_id);
-                // Recalculate NAWS for all worlds that might be affected
-                for i in 0..self.worlds.len() {
-                    if self.worlds[i].naws_enabled && self.worlds[i].connected {
-                        self.send_naws_if_changed(i);
-                    }
+        let had_dimensions = self.ws_client_worlds.get(&client_id)
+            .map(|s| s.dimensions.is_some())
+            .unwrap_or(false);
+        if let Some(state) = self.ws_client_worlds.get_mut(&client_id) {
+            state.disconnected_at = Some(std::time::Instant::now());
+            state.dimensions = None;
+        }
+        if had_dimensions {
+            // Recalculate NAWS for all worlds that might be affected, now that this
+            // client's dimensions no longer count.
+            for i in 0..self.worlds.len() {
+                if self.worlds[i].naws_enabled && self.worlds[i].connected {
+                    self.send_naws_if_changed(i);
                 }
-                return;
             }
         }
-        self.ws_client_worlds.remove(&client_id);
     }
 
     /// Handle WsAuthKeyValidation event.
@@ -8343,6 +8453,7 @@ impl App {
                     visible_columns: 0,
                     dimensions: None,
                     paused: false,
+                    disconnected_at: None,
                 });
                 // Signal event loop to trigger web reconnects
                 self.web_reconnect_needed = true;
@@ -8455,6 +8566,7 @@ impl App {
             visible_columns: 0,
             dimensions: None,
             paused: false,
+            disconnected_at: None,
         });
         // Broadcast activity count to new client
         self.broadcast_activity();
@@ -9195,7 +9307,7 @@ impl App {
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, visible_columns, dimensions, paused });
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(idx));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                     // Also send ExecuteLocalCommand so web clients can switch their local view
@@ -9479,7 +9591,7 @@ impl App {
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused });
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(world_index));
                 }
 
@@ -9493,7 +9605,7 @@ impl App {
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused });
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(world_index));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                     // Send active media for the new world
@@ -9550,43 +9662,8 @@ impl App {
             WsMessage::DeleteWorld { world_index } => {
                 self.delete_world(world_index);
             }
-            WsMessage::MarkWorldSeen { world_index } => {
-                // A remote client has viewed this world - update their current_world
-                if world_index < self.worlds.len() {
-                    // Check if client is switching to a different world
-                    let old_world_idx = self.ws_client_worlds.get(&client_id).map(|s| s.world_index);
-                    let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
-                    // When switching away from the old world, clear its new line indicators
-                    // and reset lines_since_pause if more-mode hasn't triggered
-                    if let Some(old_idx) = old_world_idx {
-                        if old_idx != world_index && old_idx < self.worlds.len() {
-                            self.worlds[old_idx].clear_new_line_indicators();
-                            if self.worlds[old_idx].pending_lines.is_empty() {
-                                self.worlds[old_idx].lines_since_pause = 0;
-                            }
-                        }
-                    }
-                    // Track which world this client is viewing (sync cache)
-                    let prev = self.ws_client_worlds.get(&client_id);
-                    let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
-                    let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
-                    let dimensions = prev.and_then(|s| s.dimensions);
-                    let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused });
-                    // Update client's world in WebSocket server (async state)
-                    self.ws_set_client_world(client_id, Some(world_index));
-
-                    self.worlds[world_index].mark_seen();
-                    // Broadcast to all clients so they update their UI
-                    self.ws_broadcast(WsMessage::UnseenCleared { world_index });
-                    // Broadcast activity count since a world was just marked as seen
-                    self.broadcast_activity();
-                    // Trigger console redraw to update activity indicator
-                    self.needs_output_redraw = true;
-                    if switched {
-                        self.ws_send_active_media_to_client(client_id, world_index);
-                    }
-                }
+            WsMessage::MarkWorldSeen { world_index, previous_world_index } => {
+                self.handle_mark_world_seen(client_id, world_index, previous_world_index);
             }
             WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
                 // A remote client is reporting its view state (for more-mode threshold calculation)
@@ -9595,7 +9672,7 @@ impl App {
                     let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
                     let vc = visible_columns.unwrap_or_else(|| self.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
                     let paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused });
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, disconnected_at: None });
                     // Update client's world in WebSocket server so broadcast_to_world_viewers works
                     self.ws_set_client_world(client_id, Some(world_index));
                 }
@@ -10076,9 +10153,9 @@ impl App {
             (start..total, visible_count)
         } else {
             let mut end = total;
-            for i in 0..total {
+            for (i, item) in items.iter().enumerate() {
                 end = i + 1;
-                if !is_gagged(&items[i]) {
+                if !is_gagged(item) {
                     visible_count += 1;
                     if visible_count >= target {
                         break;
@@ -14568,6 +14645,9 @@ pub async fn run_app_headless(
 
             // Keepalive timer
             _ = keepalive_interval.tick() => {
+                // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE);
+                // piggybacking on this existing once-a-minute tick rather than a new timer.
+                app.reap_stale_ws_client_worlds();
                 for world in &mut app.worlds {
                     if world.connected {
                         // Only check last_send_time: server kicks us when WE go idle.
@@ -16901,6 +16981,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Periodic timer for clock updates and keepalive checks (once per minute)
             _ = keepalive_interval.tick() => {
                 needs_draw = true; // Clock display updates every minute
+                // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE).
+                app.reap_stale_ws_client_worlds();
 
                 // Clear popup error messages after timeout
                 if let Some(state) = app.popup_manager.current_mut() {

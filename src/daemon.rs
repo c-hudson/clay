@@ -443,6 +443,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
             // errors) gets a chance to be noticed rather than just looking connected
             // forever with no more lines ever arriving.
             _ = keepalive_interval.tick() => {
+                // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE);
+                // piggybacking on this existing once-a-minute tick rather than a new timer.
+                app.reap_stale_ws_client_worlds();
                 for world in &mut app.worlds {
                     if world.connected {
                         // Only check last_send_time: server kicks us when WE go idle.
@@ -1760,7 +1763,7 @@ pub async fn handle_daemon_ws_message(
                 let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
                 let vc = visible_columns.unwrap_or_else(|| app.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
                 let paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
-                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused });
+                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, disconnected_at: None });
             }
         }
         // Was entirely absent from this handler (T40) - a daemon-attached client reporting its
@@ -1775,14 +1778,8 @@ pub async fn handle_daemon_ws_message(
                 }
             }
         }
-        WsMessage::MarkWorldSeen { world_index } => {
-            if world_index < app.worlds.len() {
-                app.worlds[world_index].mark_seen();
-                app.ws_broadcast(WsMessage::UnseenCleared { world_index });
-                app.broadcast_activity();
-                // Trigger console redraw to update activity indicator
-                app.needs_output_redraw = true;
-            }
+        WsMessage::MarkWorldSeen { world_index, previous_world_index } => {
+            app.handle_mark_world_seen(client_id, world_index, previous_world_index);
         }
         WsMessage::ReleasePending { world_index, count } => {
             app.release_pending_lines(client_id, world_index, count);
@@ -3484,14 +3481,52 @@ pub async fn handle_multiuser_ws_message(
                 }
             }
         }
-        WsMessage::MarkWorldSeen { world_index } => {
+        WsMessage::MarkWorldSeen { world_index, previous_world_index } => {
             // Verify the client owns this world
             if let Some(world) = app.worlds.get_mut(world_index) {
                 if world.owner.as_ref() == username.as_ref() {
-                    world.unseen_lines = 0;
+                    // mark_seen() also resets first_unseen_at (unlike the bare
+                    // `unseen_lines = 0` this replaced), matching the single-user path's
+                    // World::mark_seen().
+                    world.mark_seen();
+                    let owner = world.owner.clone();
+                    // Clear the previous world's new-line indicators too, same as the
+                    // single-user handle_mark_world_seen - only meaningful when the client
+                    // also owns that world (an owner check, not just an index bound check,
+                    // since world_index in this message is client-supplied - see
+                    // CLAUDE.md's D7 ConnectWorld/SwitchWorld ownership invariant).
+                    if let Some(old_idx) = previous_world_index {
+                        if old_idx != world_index {
+                            if let Some(old_world) = app.worlds.get_mut(old_idx) {
+                                if old_world.owner.as_ref() == username.as_ref() {
+                                    old_world.clear_new_line_indicators();
+                                    if old_world.pending_lines.is_empty() {
+                                        old_world.lines_since_pause = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Broadcast to all clients of this owner
                     if let Some(ws) = &app.ws_server {
-                        ws.broadcast_to_owner(WsMessage::UnseenCleared { world_index }, world.owner.as_deref());
+                        ws.broadcast_to_owner(WsMessage::UnseenCleared { world_index }, owner.as_deref());
+                    }
+                    // Owner-scoped activity count, mirroring RequestState's per-user
+                    // computation above - NOT App::broadcast_activity()/activity_count(),
+                    // which read global World state with no owner filtering and would leak
+                    // another user's activity across the multiuser boundary.
+                    // Note: UserConnection::unseen_lines (the field this count *should*
+                    // read, matching RequestState's) is never incremented anywhere in
+                    // multiuser mode, so it's permanently 0 - a pre-existing bug, out of
+                    // scope here. Recomputed from World::has_activity() (owner-filtered)
+                    // instead so this broadcast isn't equally dead on arrival.
+                    if let Some(ref uname) = username {
+                        let activity_count = app.worlds.iter()
+                            .filter(|w| w.owner.as_deref() == Some(uname.as_str()) && w.has_activity())
+                            .count();
+                        if let Some(ws) = &app.ws_server {
+                            ws.broadcast_to_owner(WsMessage::ActivityUpdate { count: activity_count }, Some(uname.as_str()));
+                        }
                     }
                 }
             }

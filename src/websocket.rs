@@ -378,7 +378,12 @@ pub enum WsMessage {
     ReleasePending { world_index: usize, count: usize },
     /// Selective flush: release only highlighted pending lines, discard rest
     SelectiveFlush { world_index: usize },
-    MarkWorldSeen { world_index: usize },
+    /// `previous_world_index` is the world the client is leaving, so its `marked_new`
+    /// indicators can be cleared even after a reconnect (new `client_id`) that lost the
+    /// server's `ws_client_worlds` tracking of the client's prior world. Optional/defaulted
+    /// for wire compat with older clients that don't send it (falls back to the
+    /// `ws_client_worlds` lookup).
+    MarkWorldSeen { world_index: usize, #[serde(default)] previous_world_index: Option<usize> },
     /// Update client's view state (world index and visible lines for more-mode calculation)
     UpdateViewState { world_index: usize, visible_lines: usize, #[serde(default)] visible_columns: Option<usize> },
     /// Update client's output dimensions (for NAWS - report smallest across all instances)
