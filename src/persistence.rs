@@ -1868,11 +1868,29 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         // Output lines count (we'll save the actual lines separately due to size)
         writeln!(file, "output_count={}", world.output_lines.len())?;
         writeln!(file, "pending_count={}", world.pending_lines.len())?;
+        // New-text (▶) watermark - see World::new_from_seq's doc comment in main.rs. If
+        // this world is currently being viewed (console or any WS client), widen what we
+        // persist to cover everything currently displayed: otherwise quitting while
+        // viewing a world would resurrect ▶ markers on its already-seen output after
+        // reload. Pending lines are deliberately excluded from this widening - they
+        // haven't been displayed regardless of who's "viewing" the world (that's what
+        // pending means), so their markers must survive the restart unchanged; leaving
+        // new_from_seq at its stored value (never higher than the lowest pending seq)
+        // guarantees that.
+        let persisted_new_from_seq = if idx == app.current_world_index || app.ws_client_viewing(idx) {
+            let last_output_seq_plus_one = world.output_lines.last().map(|l| l.seq + 1).unwrap_or(0);
+            world.new_from_seq.max(last_output_seq_plus_one)
+        } else {
+            world.new_from_seq
+        };
+        writeln!(file, "new_from_seq={}", persisted_new_from_seq)?;
     }
 
     // Save output lines in a separate section (can be large)
     // Format: timestamp_secs|flags|seq|escaped_text
-    // Flags: s = from_server, g = gagged, n = marked_new (omit if false)
+    // Flags: s = from_server, g = gagged (the legacy 'n' = marked_new flag is no longer
+    // written - the ▶ indicator is now derived from the world's new_from_seq watermark,
+    // written above, not a per-line flag)
     for (idx, world) in app.worlds.iter().enumerate() {
         writeln!(file)?;
         writeln!(file, "[output:{}]", idx)?;
@@ -1881,7 +1899,6 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             let mut flags = String::new();
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
-            if line.marked_new { flags.push('n'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -1891,7 +1908,6 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             let mut flags = String::new();
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
-            if line.marked_new { flags.push('n'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -2014,10 +2030,19 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         msdp_enabled: bool,
         mcmp_default_url: String,
         gmcp_user_enabled: bool,
+        /// New-text (▶) watermark, see World::new_from_seq's doc comment in main.rs.
+        /// `None` means the reload-state file predates this field (written by an older
+        /// binary just before a `/reload`/`/update`) - resolved to `next_seq` ("nothing is
+        /// new") once `next_seq` is known, rather than defaulting to 0, which would mark
+        /// every already-displayed line new on that one reload.
+        new_from_seq: Option<u64>,
     }
 
     // Parse a saved output/pending line with timestamp
-    // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged, n=marked_new)
+    // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged - the
+    // legacy 'n'=marked_new flag, if present in an older file, is simply ignored: the ▶
+    // indicator is derived from the world's new_from_seq watermark now, see TempWorld's
+    // new_from_seq field doc comment for how an old file lacking it is handled)
     // Older format: timestamp_secs|flags|text (flags: s=from_server, g=gagged) - seq=0
     // Old format: timestamp_secs|text (for backward compatibility) - seq=0
     fn parse_timestamped_line(line: &str) -> OutputLine {
@@ -2034,7 +2059,6 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     let text = unescape_string(parts[3]);
                     let from_server = flags.contains('s');
                     let gagged = flags.contains('g');
-                    let marked_new = flags.contains('n');
                     return OutputLine {
                         text,
                         timestamp,
@@ -2042,7 +2066,6 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         gagged,
                         seq,
                         highlight_color: None,
-                        marked_new,
                         from_archive: false,
                     };
                 } else if parts.len() == 3 {
@@ -2058,7 +2081,6 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         gagged,
                         seq: 0,
                         highlight_color: None,
-                        marked_new: false,
                         from_archive: false,
                     };
                 } else {
@@ -2070,7 +2092,6 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         gagged: false,
                         seq: 0,
                         highlight_color: None,
-                        marked_new: false,
                         from_archive: false,
                     };
                 }
@@ -2125,6 +2146,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         msdp_enabled: false,
                         mcmp_default_url: String::new(),
                         gmcp_user_enabled: false,
+                        new_from_seq: None,
                     });
                 }
             } else if let Some(suffix) = section.strip_prefix("output:") {
@@ -2490,6 +2512,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
                             "proxy_socket_fd" => tw.proxy_socket_fd = value.parse().ok(),
                             "next_seq" => tw.next_seq = value.parse().unwrap_or(0),
+                            "new_from_seq" => tw.new_from_seq = value.parse().ok(),
                             "partial_line" => tw.partial_line = unescape_string(value),
                             "partial_in_pending" => tw.partial_in_pending = value == "true",
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
@@ -2604,7 +2627,6 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
     for tw in temp_worlds {
         let mut world = World::new(&tw.name);
         world.output_lines = tw.output_lines;
-        world.first_marked_new_index = world.output_lines.iter().position(|l| l.marked_new);
         world.scroll_offset = tw.scroll_offset;
         world.connected = tw.connected;
         world.unseen_lines = tw.unseen_lines;
@@ -2625,6 +2647,10 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
         world.next_seq = tw.next_seq;
+        // See TempWorld::new_from_seq's doc comment: an absent value means this reload-state
+        // file predates the field, so treat everything already loaded as not-new rather than
+        // defaulting to 0 (which would mark every line new on this one reload).
+        world.new_from_seq = tw.new_from_seq.unwrap_or(tw.next_seq);
         world.partial_line = tw.partial_line;
         world.partial_in_pending = tw.partial_in_pending;
         world.gmcp_enabled = tw.gmcp_enabled;

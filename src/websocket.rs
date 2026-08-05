@@ -61,6 +61,7 @@ pub(crate) fn message_world_index(msg: &WsMessage) -> Option<usize> {
         | WsMessage::PendingReleased { world_index, .. }
         | WsMessage::UnseenCleared { world_index, .. }
         | WsMessage::UnseenUpdate { world_index, .. }
+        | WsMessage::NewWatermark { world_index, .. }
         | WsMessage::WorldFlushed { world_index, .. }
         | WsMessage::ServerSpeak { world_index, .. }
         | WsMessage::AnsiMusic { world_index, .. }
@@ -303,7 +304,7 @@ pub enum WsMessage {
     /// filtered lines locally (see PROTOCOL-ROADMAP.md's seq-drift fix) - the sender always
     /// knows the true count; the receiver may not, once it applies its own line filters
     /// (ANSI-only lines, idler markers, grep mode).
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true", skip_serializing_if = "is_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default, skip_serializing_if = "Option::is_none")] end_seq: Option<u64>, #[serde(default, skip_serializing_if = "is_false")] marked_new: bool, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool },
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true", skip_serializing_if = "is_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default, skip_serializing_if = "Option::is_none")] end_seq: Option<u64>, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
@@ -317,6 +318,13 @@ pub enum WsMessage {
     PendingReleased { world_index: usize, count: usize },
     UnseenCleared { world_index: usize },
     UnseenUpdate { world_index: usize, count: usize },
+    /// New-text (▶) watermark for a world changed: every line with `seq < new_from_seq` is no
+    /// longer new. Broadcast to ALL clients (not just viewers of that world) whenever
+    /// `World::new_from_seq` advances - live arrival on a viewed world, leaving a world,
+    /// Ctrl+L, or MarkWorldSeen - so every instance's copy stays authoritative without ever
+    /// storing (and risking staleness on) a per-line flag. See `World::new_from_seq`'s doc
+    /// comment in main.rs for the full model.
+    NewWatermark { world_index: usize, new_from_seq: u64 },
     /// Broadcast server's activity count (number of worlds with activity)
     ActivityUpdate { count: usize },
     /// Sent to a specific client when its server-side pause state changes
@@ -705,8 +713,6 @@ pub struct TimestampedLine {
     #[serde(default)]
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
     #[serde(default)]
-    pub marked_new: bool, // true if line arrived while user wasn't viewing (unseen/pending)
-    #[serde(default)]
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive
 }
 
@@ -760,6 +766,11 @@ pub struct WorldStateMsg {
     // Number of pending lines on the server (for More indicator on connect)
     #[serde(default)]
     pub pending_count: usize,
+    /// New-text (▶) watermark at connect/reconnect time — see `WsMessage::NewWatermark`'s
+    /// doc comment for the model. A client renders ▶ on any `from_server` line with
+    /// `seq >= new_from_seq`.
+    #[serde(default)]
+    pub new_from_seq: u64,
 }
 
 /// World settings for WebSocket protocol

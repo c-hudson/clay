@@ -2118,7 +2118,6 @@ pub(crate) fn handle_remote_client_key(
                 world.showing_splash = false;
                 world.needs_redraw = true;
                 world.output_lines.clear();
-                world.first_marked_new_index = None;
                 world.scroll_offset = 0;
                 app.needs_output_redraw = true;
             }

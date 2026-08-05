@@ -2923,7 +2923,7 @@
                             // "seq field absent/defaulted", so a real end_seq widens this too.
                             const hasRealSeq = msg.seq !== undefined && (msg.seq > 0 || msg.end_seq !== undefined);
                             const lineSeq = hasRealSeq ? msg.seq + rawIdx : (isGapFill ? -1 : world.output_lines.length);
-                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, marked_new: msg.marked_new || false, gagged: msg.gagged || false };
+                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false };
 
                             if (isGapFill) {
                                 // This batch fills a historical hole, not the tail — collect it
@@ -2954,7 +2954,11 @@
                                 }
                             }
                             if (msg.world_index === currentWorldIndex) {
-                                const lineMarkedNew = msg.marked_new || false;
+                                // world.new_from_seq was already updated (if this message
+                                // pushed it forward) - see the NewWatermark note and the
+                                // is_current-driven advance in World::add_output. Live
+                                // ServerData never carries archived lines.
+                                const lineMarkedNew = lineIsNew(lineObj, world);
                                 // Gagged lines are stored but not rendered (only visible with F2)
                                 // They bypass more-mode entirely
                                 if (msg.gagged) {
@@ -3474,6 +3478,23 @@
                 }
                 break;
 
+            case 'NewWatermark':
+                // The ▶ new-text boundary for a world moved - server-authoritative, see
+                // WsMessage::NewWatermark's doc comment in websocket.rs. Re-render if it's
+                // the world currently on screen so already-appended lines pick up the change
+                // (renderOutput() re-evaluates lineIsNew() fresh from world.new_from_seq;
+                // incrementally-appended lines via appendNewLine() do not retroactively
+                // update, which is why the server sends this BEFORE the content that moved
+                // it whenever possible - see process_server_data's ordering comment).
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    const wmWorld = worlds[msg.world_index];
+                    wmWorld.new_from_seq = Math.max(wmWorld.new_from_seq || 0, msg.new_from_seq || 0);
+                    if (msg.world_index === currentWorldIndex) {
+                        renderOutput();
+                    }
+                }
+                break;
+
             case 'NotesChanged':
                 // Notes for a world were saved (from this client, another
                 // client, or the console) - update the note icon's visibility.
@@ -3684,7 +3705,6 @@
                             from_server: line.from_server !== false,
                             seq: line.seq || 0,
                             highlight_color: line.highlight_color,
-                            marked_new: line.marked_new || false,
                             from_archive: line.from_archive || false
                         });
                     }
@@ -5174,17 +5194,17 @@
         if (promptAfter) redisplayCurrentPrompt();
     }
 
-    // Clear local per-line new-line indicators and reset the render window for the world
-    // being left, mirroring the console's World::clear_new_line_indicators() (called from
-    // switch_world()). Shared by switchWorldLocal and the WorldSwitchResult handler so both
-    // world-switch paths leave a clean trail behind them - previously only switchWorldLocal
-    // did this, so switching via CycleWorld (WorldSwitchResult) left stale ▶ markers on the
-    // world being left.
+    // Reset the render window for the world being left. ▶ markers are no longer cleared
+    // here: the server is the sole source of truth for the new-text watermark
+    // (world.new_from_seq, see lineIsNew()) and broadcasts NewWatermark itself once the
+    // MarkWorldSeen this triggers reaches it (World::mark_displayed() in main.rs) - clearing
+    // a local per-line flag here would just be a second, driftable copy of that, which is
+    // exactly what caused stale ▶ markers on OTHER instances after a world switch before
+    // this model (see World::new_from_seq's doc comment in main.rs). Shared by
+    // switchWorldLocal and the WorldSwitchResult handler so both world-switch paths reset it
+    // - previously only switchWorldLocal did.
     function clearLeavingWorldState(oldIndex) {
         const oldWorld = worlds[oldIndex];
-        if (oldWorld && oldWorld.output_lines) {
-            oldWorld.output_lines.forEach(l => { l.marked_new = false; });
-        }
         // Reset the render window on the world we're leaving too, so returning to it
         // later starts fresh at RENDER_WINDOW_INITIAL rather than wherever a previous
         // deep-scroll session left it - keeps per-world DOM cost bounded across
@@ -5938,6 +5958,23 @@
         });
     }
 
+    // Whether a line renders with the ▶ new-text indicator, per the server-authoritative
+    // new-text watermark (world.new_from_seq - see WsMessage::NewWatermark's doc comment in
+    // websocket.rs / World::new_from_seq's in main.rs). Mirrors the console renderer's
+    // line_is_new(): real seq, from the server (not client-generated or loaded from the
+    // scrollback archive), at or past the watermark. `_has_real_seq === false` only ever
+    // appears on lines built from a live ServerData message with a synthesized seq (see the
+    // ServerData handler); lines sourced from TimestampedLine (InitialState, OutputLines
+    // backfill) never set it and always carry a genuine numeric seq.
+    function lineIsNew(lineObj, world) {
+        if (!lineObj || !world) return false;
+        if (lineObj.from_server === false) return false;
+        if (lineObj.from_archive) return false;
+        if (lineObj._has_real_seq === false) return false;
+        if (typeof lineObj.seq !== 'number') return false;
+        return lineObj.seq >= (world.new_from_seq || 0);
+    }
+
     function renderOutput(opts) {
         const preserveScroll = !!(opts && opts.preserveScroll);
         const world = worlds[currentWorldIndex];
@@ -5996,7 +6033,7 @@
             const lineTs = typeof lineObj === 'object' ? lineObj.ts : null;
             const lineGagged = typeof lineObj === 'object' ? lineObj.gagged : false;
             const lineHighlightColor = typeof lineObj === 'object' ? lineObj.highlight_color : null;
-            const lineMarkedNew = typeof lineObj === 'object' ? lineObj.marked_new : false;
+            const lineMarkedNew = typeof lineObj === 'object' ? lineIsNew(lineObj, world) : false;
             const lineFromArchive = typeof lineObj === 'object' ? lineObj.from_archive : false;
             const lineFromServer = typeof lineObj === 'object' ? lineObj.from_server : true;
 
@@ -9356,8 +9393,17 @@
                 return true;
             case 'redraw':
                 if (worlds[currentWorldIndex]) {
-                    worlds[currentWorldIndex].output_lines = worlds[currentWorldIndex].output_lines.filter(l => l.from_server !== false);
-                    worlds[currentWorldIndex].output_lines.forEach(l => { l.marked_new = false; });
+                    const redrawWorld = worlds[currentWorldIndex];
+                    redrawWorld.output_lines = redrawWorld.output_lines.filter(l => l.from_server !== false);
+                    // Mark everything now on screen as displayed (rule 2) - the local
+                    // equivalent of the console's Ctrl+L / World::mark_displayed(). This
+                    // action has no server round trip (there's no ClayCommand for "redraw"),
+                    // so - same as before this model - it's a local-only optimistic update
+                    // and does not propagate to other instances.
+                    redrawWorld.new_from_seq = redrawWorld.output_lines.reduce(
+                        (m, l) => (typeof l.seq === 'number' && l.seq >= m) ? l.seq + 1 : m,
+                        redrawWorld.new_from_seq || 0
+                    );
                     worldOutputCache[currentWorldIndex] = {};
                 }
                 renderOutput();

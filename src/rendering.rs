@@ -381,6 +381,16 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     render_new_popup(f, app);
 }
 
+/// Whether `line` should render with the ▶ new-text indicator, per the watermark model (see
+/// `World::new_from_seq`'s doc comment in main.rs): text from the world, not loaded from the
+/// scrollback archive, with a `seq` at or past the world's watermark. Replaces the old
+/// per-line `marked_new` flag - the watermark is the single source of truth broadcast to
+/// every instance, so there's no per-line copy that can drift out of sync.
+#[inline]
+fn line_is_new(line: &OutputLine, new_from_seq: u64) -> bool {
+    line.from_server && !line.from_archive && line.seq >= new_from_seq
+}
+
 /// Process an output line for display. Returns None if the line should be skipped.
 /// Returns Some(processed_text) with emoji colorization, client prefix, timestamp/tags, and tab expansion applied.
 pub(crate) fn process_output_line(line: &OutputLine, show_tags: bool, temp_convert_enabled: bool, zwj_enabled: bool, cached_now: &CachedNow) -> Option<String> {
@@ -448,6 +458,7 @@ pub fn build_display_lines(
     let new_line_indicator = settings.new_line_indicator;
     let nli_prefix_width: usize = NLI_PREFIX_WIDTH;
     let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
+    let new_from_seq = world.new_from_seq;
     let cached_now = CachedNow::new();
 
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool)> {
@@ -463,7 +474,7 @@ pub fn build_display_lines(
             convert_discord_emojis_with_links(&with_links)
         };
         let hl_color = line.highlight_color.clone();
-        let mn = line.marked_new;
+        let mn = line_is_new(line, new_from_seq);
         let wrap_width = if new_line_indicator && mn {
             term_width.saturating_sub(nli_prefix_width)
         } else {
@@ -499,7 +510,7 @@ pub fn build_display_lines(
             applied_vlo = true;
         }
 
-        let is_new = line.marked_new;
+        let is_new = line_is_new(line, new_from_seq);
         for w in wrapped.into_iter().rev() {
             rev_lines.push(w);
         }
@@ -670,6 +681,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
     let nli_prefix_width: usize = NLI_PREFIX_WIDTH;
     // Minimum old (non-new) context lines to show at top when switching worlds
     let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
+    let new_from_seq = world.new_from_seq;
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool, bool)> {
         let expanded = match process_output_line(line, show_tags, temp_convert_enabled, zwj_enabled, cached_now) {
             Some(text) if text.is_empty() => return vec![("".to_string(), false, None, false, false)],
@@ -686,7 +698,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
             convert_discord_emojis_with_links(&with_links)
         };
         let hl_color = line.highlight_color.clone();
-        let mn = line.marked_new;
+        let mn = line_is_new(line, new_from_seq);
         let fa = line.from_archive;
         // Reduce wrap width to reserve space for any prefixes printed separately in the draw loop.
         // The NLI "▶ " and the archive "🛢️ " prefixes are printed by the draw loop, NOT baked into
@@ -785,7 +797,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
                 applied_vlo = true;
             }
 
-            let is_new = line.marked_new;
+            let is_new = line_is_new(line, new_from_seq);
             for w in wrapped.into_iter().rev() {
                 rev_lines.push(w);
             }
@@ -1253,7 +1265,7 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
         for line_idx in (0..=end_line).rev() {
             let line = &world.output_lines[line_idx];
-            let is_new = new_line_indicator && line.marked_new;
+            let is_new = new_line_indicator && line_is_new(line, world.new_from_seq);
             let is_archive = line.from_archive;
 
             let expanded = match process_output_line(line, app.show_tags, app.settings.temp_convert_enabled, app.settings.zwj_enabled, &cached_now) {

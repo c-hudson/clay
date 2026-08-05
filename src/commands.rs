@@ -2282,7 +2282,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         Command::Flush => {
             let line_count = app.current_world().output_lines.len();
             app.current_world_mut().output_lines.clear();
-            app.current_world_mut().first_marked_new_index = None;
             app.current_world_mut().pending_lines.clear();
             app.current_world_mut().scroll_offset = 0;
             app.current_world_mut().lines_since_pause = 0;

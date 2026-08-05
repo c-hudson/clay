@@ -47,8 +47,12 @@ pub enum TestEvent {
     WsBroadcastReleased(usize, usize),
     /// WS broadcast: UnseenCleared { world_index }
     WsBroadcastUnseenCleared(usize),
-    /// WS broadcast: ServerData { world_index, marked_new }
-    WsBroadcastServerData(usize, bool),
+    /// WS broadcast: ServerData { world_index } (content only - the ▶ new-text watermark is
+    /// no longer part of ServerData, see WsBroadcastNewWatermark)
+    WsBroadcastServerData(usize),
+    /// WS broadcast: NewWatermark { world_index, new_from_seq } - see
+    /// WsMessage::NewWatermark's doc comment in websocket.rs.
+    WsBroadcastNewWatermark(usize, u64),
 }
 
 /// State checks for AssertState action
@@ -406,7 +410,7 @@ pub async fn run_test_scenario(
                         // Clear new line indicators on the old world (like real handler)
                         if let Some(old_idx) = ws_client_world {
                             if old_idx != idx && old_idx < app.worlds.len() {
-                                app.worlds[old_idx].clear_new_line_indicators();
+                                app.worlds[old_idx].mark_displayed();
                             }
                         }
                         ws_client_world = Some(idx);
@@ -437,15 +441,13 @@ pub async fn run_test_scenario(
                     let expected_count = *expected_count;
                     action_iter.next();
                     if let Some(idx) = app.find_world_index(&world_name) {
-                        let actual = app.worlds[idx].output_lines.iter()
-                            .filter(|l| l.marked_new).count()
-                            + app.worlds[idx].pending_lines.iter()
-                            .filter(|l| l.marked_new).count();
+                        let world = &app.worlds[idx];
+                        let output_new = world.output_lines.iter().filter(|l| world.line_is_new(l)).count();
+                        let pending_new = world.pending_lines.iter().filter(|l| world.line_is_new(l)).count();
+                        let actual = output_new + pending_new;
                         assert_eq!(actual, expected_count,
-                            "World '{}': expected {} marked_new lines, got {} (output: {}, pending: {})",
-                            world_name, expected_count, actual,
-                            app.worlds[idx].output_lines.iter().filter(|l| l.marked_new).count(),
-                            app.worlds[idx].pending_lines.iter().filter(|l| l.marked_new).count());
+                            "World '{}': expected {} marked_new (▶) lines, got {} (output: {}, pending: {})",
+                            world_name, expected_count, actual, output_new, pending_new);
                     } else {
                         panic!("AssertMarkedNew: world '{}' not found", world_name);
                     }
@@ -735,8 +737,11 @@ fn check_state_changes(
                 WsMessage::UnseenCleared { world_index } => {
                     events.push(TestEvent::WsBroadcastUnseenCleared(world_index));
                 }
-                WsMessage::ServerData { world_index, marked_new, .. } => {
-                    events.push(TestEvent::WsBroadcastServerData(world_index, marked_new));
+                WsMessage::ServerData { world_index, .. } => {
+                    events.push(TestEvent::WsBroadcastServerData(world_index));
+                }
+                WsMessage::NewWatermark { world_index, new_from_seq } => {
+                    events.push(TestEvent::WsBroadcastNewWatermark(world_index, new_from_seq));
                 }
                 _ => {
                     // Other WsMessage variants are not tracked

@@ -1918,9 +1918,11 @@ impl User {
 /// "viewing" its world) after its socket drops, before being reaped. Covers a background/
 /// reconnect gap (e.g. Android backgrounding the app, a brief network blip) without letting
 /// a client that's truly gone forever keep constraining more-mode thresholds
-/// (`min_viewer_lines`/`min_viewer_width`) or suppressing its world's `marked_new` flags
-/// (`ws_client_viewing`) indefinitely.
-const WS_VIEWER_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// (`min_viewer_lines`/`min_viewer_width`) or suppressing its world's new-text watermark
+/// (`ws_client_viewing`) indefinitely. Deliberately short (was 15 min): a client absent
+/// longer than this is genuinely "not viewing", so its world should start accumulating ▶
+/// markers again rather than staying artificially suppressed.
+const WS_VIEWER_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Tracks a WebSocket client's view state for synchronized more-mode
 #[derive(Clone, Debug)]
@@ -2507,8 +2509,19 @@ pub struct OutputLine {
     pub gagged: bool,       // true if line was gagged by an action (only shown with F2)
     pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
-    pub marked_new: bool,   // true if line arrived while user wasn't viewing (unseen/pending)
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive (not current session)
+}
+
+/// Whether a line should render with the ▶ new-text indicator, given a world's new-text
+/// watermark (`World::new_from_seq` - see its doc comment). Free-function form (as opposed to
+/// `World::line_is_new`) for call sites already holding an exclusive borrow into
+/// `world.output_lines`/`pending_lines` (e.g. `World::add_output`'s partial-line handling,
+/// which mutates a `&mut OutputLine` from `.last_mut()`) - calling a `&self` method there
+/// would conflict with that borrow, since Rust doesn't see the two as disjoint through a
+/// method-call boundary. This takes the watermark as a plain `u64` instead, so it borrows
+/// nothing from `World`.
+fn line_is_new_at(line: &OutputLine, new_from_seq: u64) -> bool {
+    line.from_server && !line.from_archive && line.seq >= new_from_seq
 }
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
@@ -2552,7 +2565,6 @@ impl OutputLine {
             gagged: false,
             seq,
             highlight_color: None,
-            marked_new: false,
             from_archive: false,
         }
     }
@@ -2565,7 +2577,6 @@ impl OutputLine {
             gagged: false,
             seq,
             highlight_color: None,
-            marked_new: false,
             from_archive: false,
         }
     }
@@ -2578,13 +2589,12 @@ impl OutputLine {
             gagged: true,
             seq,
             highlight_color: None,
-            marked_new: false,
             from_archive: false,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None, marked_new: false, from_archive: false }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None, from_archive: false }
     }
 
     /// Format timestamp using a pre-computed "now" value for batch rendering
@@ -2686,7 +2696,12 @@ pub struct World {
     /// no reordering compensation layer" design (unlike `app.js`'s `_seqGaps`, which
     /// exists for a different, still-open problem - see PROTOCOL-ROADMAP.md Step 7).
     pub pending_gap: Option<(usize, u64)>,
-    pub first_marked_new_index: Option<usize>, // Index of first marked_new line in output_lines (for fast clear)
+    /// Watermark for the ▶ new-text indicator: the lowest `seq` that is still "new". A line
+    /// renders with ▶ iff `line.seq >= new_from_seq && line.from_server && !line.from_archive`.
+    /// Server-authoritative and broadcast to every client (`ServerData.new_from_seq`,
+    /// `WsMessage::NewWatermark`) so remote instances can never hold a stale per-line copy -
+    /// see the design note above `mark_displayed()`. Never retreats.
+    pub new_from_seq: u64,
     pub visual_line_offset: usize, // When > 0, show only first N visual lines of scroll_offset line (partial display for more-mode)
     pub watchdog_history: std::collections::VecDeque<String>,  // Rolling window of recent lines (stripped) for /watchdog
     pub watchname_history: std::collections::VecDeque<String>, // Rolling window of first-words for /watchname
@@ -2768,7 +2783,7 @@ impl World {
             connection_id: 0,
             max_received_seq: 0,
             pending_gap: None,
-            first_marked_new_index: None,
+            new_from_seq: 0,
             visual_line_offset: 0,
             watchdog_history: std::collections::VecDeque::new(),
             watchname_history: std::collections::VecDeque::new(),
@@ -2920,7 +2935,6 @@ impl World {
             self.needs_redraw = true; // Signal terminal needs full redraw
             self.output_lines.clear();
             self.scroll_offset = 0;
-            self.first_marked_new_index = None;
         }
         let max_lines = (output_height as usize).saturating_sub(2);
 
@@ -2933,7 +2947,7 @@ impl World {
             let nli = settings.new_line_indicator;
             let mut visible = 0;
             for line in self.output_lines.iter().rev() {
-                let vl = nli_visual_rows(&line.text, width, line.marked_new, nli, settings.wrapspace as usize);
+                let vl = nli_visual_rows(&line.text, width, self.line_is_new(line), nli, settings.wrapspace as usize);
                 if visible + vl > max_lines {
                     break;
                 }
@@ -2985,7 +2999,7 @@ impl World {
                 0
             } else {
                 self.output_lines.last()
-                    .map(|l| nli_visual_rows(&l.text, width, l.marked_new, nli, wrapspace))
+                    .map(|l| nli_visual_rows(&l.text, width, self.line_is_new(l), nli, wrapspace))
                     .unwrap_or(0)
             };
 
@@ -2996,12 +3010,6 @@ impl World {
                 } else {
                     self.output_lines.pop();
                     self.lines_since_pause = self.lines_since_pause.saturating_sub(old_visual);
-                    // Invalidate tracked index if we popped the last marked_new line
-                    if let Some(idx) = self.first_marked_new_index {
-                        if self.output_lines.len() <= idx {
-                            self.first_marked_new_index = None;
-                        }
-                    }
                 }
             } else {
                 // Update the partial line with combined content
@@ -3011,7 +3019,10 @@ impl World {
                     }
                 } else if let Some(last) = self.output_lines.last_mut() {
                     last.text = completed_line.to_string();
-                    let new_visual = nli_visual_rows(&last.text, width, last.marked_new, nli, wrapspace);
+                    // Free-function form, not self.line_is_new(last): `last` is a `&mut`
+                    // borrow from last_mut(), which a `&self` method call would conflict with.
+                    let last_is_new = line_is_new_at(last, self.new_from_seq);
+                    let new_visual = nli_visual_rows(&last.text, width, last_is_new, nli, wrapspace);
                     // Re-count at the completed line's final wrapped height. Does
                     // NOT retroactively trigger a pause even if this pushes over
                     // budget — the very next line will pause correctly, and
@@ -3066,13 +3077,15 @@ impl World {
 
             // Track if this line goes to pending (for partial tracking)
             let goes_to_pending = self.paused && settings.more_mode_enabled;
-            // A pending line is always marked_new, even on the world you're currently
-            // viewing: you must press PgDn/Tab to release it, so it's unseen by
-            // definition (unlike a line that lands directly in output_lines while
-            // is_current, which you're looking at right now). Must be computed before
-            // nli_visual_rows below so the reserved-NLI-prefix-width budgeting matches
-            // the marked_new value actually used.
-            let will_be_marked_new = goes_to_pending || !is_current;
+            // New-text rule (▶ indicator): a line is new iff it came from the world (not
+            // client-generated) AND no instance is currently viewing this world. Arrival
+            // wins over display state — a pending line on the world you're viewing right
+            // now is still not new, because rule 1 only cares whether anyone was watching
+            // when it arrived, not whether it's been paged into view yet (contrast the old
+            // model, which flagged every pending line unconditionally). Must be computed
+            // before nli_visual_rows below so the reserved-NLI-prefix-width budgeting
+            // matches the marked_new value actually used.
+            let will_be_marked_new = from_server && !is_current;
             // Use nli_visual_rows for accurate visual line count — it uses wrap_ansi_line
             // with the same effective width the renderer uses (reduced by NLI_PREFIX_WIDTH
             // when the NLI setting is on and the line is marked_new), so that
@@ -3087,7 +3100,12 @@ impl World {
             // Create OutputLine with appropriate from_server flag
             let seq = self.next_seq;
             self.next_seq += 1;
-            let mut new_line = if from_server {
+            // Someone is watching this world right now: everything from here is displayed
+            // as it arrives, so the new-text watermark advances past it immediately (rule 1).
+            if is_current {
+                self.new_from_seq = seq + 1;
+            }
+            let new_line = if from_server {
                 OutputLine::new(line.to_string(), seq)
             } else {
                 OutputLine::new_client(line.to_string(), seq)
@@ -3103,7 +3121,6 @@ impl World {
                     }
                 }
 
-                new_line.marked_new = true;
                 self.pending_lines.push(new_line);
                 if !is_current { self.unseen_lines += 1; }
                 if is_partial {
@@ -3112,10 +3129,6 @@ impl World {
                 }
             } else if triggers_pause {
                 // Line fits on screen (single-line or small overflow) — add to output then pause
-                new_line.marked_new = !is_current;
-                if !is_current && self.first_marked_new_index.is_none() {
-                    self.first_marked_new_index = Some(self.output_lines.len());
-                }
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -3139,10 +3152,6 @@ impl World {
                     self.partial_in_pending = false;
                 }
             } else {
-                new_line.marked_new = !is_current;
-                if !is_current && self.first_marked_new_index.is_none() {
-                    self.first_marked_new_index = Some(self.output_lines.len());
-                }
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -3163,12 +3172,6 @@ impl World {
             self.paused = false;
             // Release any pending lines immediately
             if !self.pending_lines.is_empty() {
-                if self.first_marked_new_index.is_none() {
-                    // Check if any pending line has marked_new before bulk append
-                    if self.pending_lines.iter().any(|l| l.marked_new) {
-                        self.first_marked_new_index = Some(self.output_lines.len());
-                    }
-                }
                 self.output_lines.append(&mut self.pending_lines);
             }
         }
@@ -3213,7 +3216,7 @@ impl World {
             idx -= 1;
         }
         let line = &self.output_lines[idx];
-        let total = nli_visual_rows(&line.text, output_width.max(1), line.marked_new, nli_enabled, wrapspace);
+        let total = nli_visual_rows(&line.text, output_width.max(1), self.line_is_new(line), nli_enabled, wrapspace);
         total.saturating_sub(self.visual_line_offset)
     }
 
@@ -3246,21 +3249,53 @@ impl World {
     pub fn mark_seen(&mut self) {
         self.unseen_lines = 0;
         self.first_unseen_at = None;
-        // Note: marked_new indicators are NOT cleared here. They persist while
-        // viewing the world and are only cleared when switching AWAY from it
-        // (via clear_new_line_indicators in switch_world).
+        // Note: ▶ indicators are NOT cleared here. Rule 2 is "displayed", not "seen the
+        // activity counter" - they persist while viewing the world and are only cleared
+        // once the world is actually left (via mark_displayed() in switch_world), or on
+        // Ctrl+L for whatever's on screen right now.
     }
 
-    /// Clear new line indicator flags on output lines.
-    /// Called when switching away from a world or on Ctrl+L.
-    /// Only iterates from the first marked_new line to avoid O(n) scan of large buffers.
-    pub fn clear_new_line_indicators(&mut self) {
-        if let Some(first) = self.first_marked_new_index {
-            for line in &mut self.output_lines[first..] {
-                line.marked_new = false;
+    /// Advance the new-text watermark (`new_from_seq`, see its doc comment) past every line
+    /// currently in `output_lines` — i.e. mark everything displayed so far as no longer new.
+    /// Called when switching away from a world, on Ctrl+L, and (for whichever world a client
+    /// is currently viewing) at settings-save time so a quit-while-viewing doesn't resurrect
+    /// markers on reload.
+    ///
+    /// Deliberately does NOT touch `pending_lines`: rule 2 is "displayed", and pending lines
+    /// haven't been - that's what pending means. They keep their ▶ until PgDn/Tab releases
+    /// them into `output_lines`, with no exception for Ctrl+L or leaving the world (a pending
+    /// line's `seq` is always higher than anything already in `output_lines`, so it naturally
+    /// stays above the watermark once this only advances past what's displayed).
+    pub fn mark_displayed(&mut self) {
+        if let Some(last) = self.output_lines.last() {
+            let candidate = last.seq + 1;
+            if candidate > self.new_from_seq {
+                self.new_from_seq = candidate;
             }
-            self.first_marked_new_index = None;
         }
+    }
+
+    /// Advance the new-text watermark past `seq` when `is_current` is true — for code paths
+    /// that push an `OutputLine` directly instead of going through `add_output` (gagged
+    /// lines, prompt-as-output on a disconnected world) but still need rule 1's "arrived
+    /// while viewed = not new" to apply. Mirrors the `is_current` branch inside `add_output`.
+    /// No-op when `!is_current`: an unviewed world's line is exactly what rule 1 says should
+    /// become new, so the watermark is deliberately left behind it.
+    pub fn advance_watermark_if_current(&mut self, seq: u64, is_current: bool) {
+        if is_current {
+            let candidate = seq + 1;
+            if candidate > self.new_from_seq {
+                self.new_from_seq = candidate;
+            }
+        }
+    }
+
+    /// Whether `line` should render with the ▶ new-text indicator, per this world's
+    /// new-text watermark (`new_from_seq` - see its doc comment). Mirrors
+    /// `rendering::line_is_new()` (a separate copy: that one lives in a different module and
+    /// takes the watermark as a plain arg since it doesn't have a `World` to call this on).
+    pub fn line_is_new(&self, line: &OutputLine) -> bool {
+        line_is_new_at(line, self.new_from_seq)
     }
 
     /// Returns true if this world has activity (unseen lines or pending output)
@@ -3301,7 +3336,7 @@ impl World {
                 logical_count += 1;
                 continue;
             }
-            let vl = nli_visual_rows(&line.text, width, line.marked_new, nli_enabled, wrapspace);
+            let vl = nli_visual_rows(&line.text, width, self.line_is_new(line), nli_enabled, wrapspace);
             // If adding this line would exceed budget AND we already have at least one,
             // stop before adding it. Always release at least 1 line.
             if visual_total > 0 && visual_total + vl > visual_budget {
@@ -3324,9 +3359,6 @@ impl World {
             .drain(..logical_count.min(self.pending_lines.len()))
             .collect();
         for line in &to_release {
-            if line.marked_new && self.first_marked_new_index.is_none() {
-                self.first_marked_new_index = Some(self.output_lines.len());
-            }
             self.output_lines.push(line.clone());
         }
         if self.pending_lines.is_empty() {
@@ -3351,9 +3383,6 @@ impl World {
     /// were moved (in order) — see `release_pending`'s doc comment for why callers must
     /// broadcast from this return value rather than re-deriving their own copy.
     pub fn release_all_pending(&mut self) -> Vec<OutputLine> {
-        if self.first_marked_new_index.is_none() && self.pending_lines.iter().any(|l| l.marked_new) {
-            self.first_marked_new_index = Some(self.output_lines.len());
-        }
         let released: Vec<OutputLine> = std::mem::take(&mut self.pending_lines);
         self.output_lines.extend(released.iter().cloned());
         self.paused = false;
@@ -3381,15 +3410,10 @@ impl World {
                 line.gagged = true;
             }
         }
-        // Clear new line indicators (Ctrl+L clears them)
-        // Note: retain() invalidates first_marked_new_index, so reset and scan
-        self.first_marked_new_index = None;
-        for line in &mut self.output_lines {
-            line.marked_new = false;
-        }
-        for line in &mut self.pending_lines {
-            line.marked_new = false;
-        }
+        // Ctrl+L marks whatever's currently displayed (output_lines) as seen. Pending lines
+        // are deliberately left alone - they haven't been displayed yet, so rule 2 says they
+        // keep their ▶ regardless of Ctrl+L (see mark_displayed()'s doc comment).
+        self.mark_displayed();
         self.reset_visual_truncation();
         // Adjust scroll offset if it's now past the end
         if self.scroll_offset > 0 && self.scroll_offset >= self.output_lines.len() {
@@ -4507,13 +4531,12 @@ impl App {
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq: None, marked_new, flush, gagged, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq: None, flush, gagged, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Flush: clear output buffer before appending new lines
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
                     if flush {
                         world.output_lines.clear();
-                        world.first_marked_new_index = None;
                         world.pending_lines.clear();
                         world.showing_splash = false;
                         world.paused = false;
@@ -4575,11 +4598,7 @@ impl App {
                             } else {
                                 OutputLine::new_client(line.to_string(), seq)
                             };
-                            output_line.marked_new = marked_new;
                             output_line.gagged = gagged;
-                            if marked_new && world.first_marked_new_index.is_none() {
-                                world.first_marked_new_index = Some(world.output_lines.len());
-                            }
                             world.output_lines.push(output_line);
                             // Track max received seq from server
                             if msg_seq > 0 {
@@ -4631,6 +4650,17 @@ impl App {
                     world.unseen_lines = count;
                 }
             }
+            WsMessage::NewWatermark { world_index, new_from_seq } => {
+                // This remote console mirror never computes the ▶ watermark itself - it's
+                // purely a display of whatever the master last told us (see
+                // WsMessage::NewWatermark's doc comment). max() guards against a
+                // hypothetically-reordered message retreating it; the master itself never
+                // sends a lower value.
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.new_from_seq = world.new_from_seq.max(new_from_seq);
+                    self.needs_output_redraw = true;
+                }
+            }
             WsMessage::PendingLinesUpdate { world_index, count } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Track pending count from daemon (no actual lines stored client-side)
@@ -4670,7 +4700,6 @@ impl App {
                             gagged: tl.gagged,
                             seq,
                             highlight_color: tl.highlight_color,
-                            marked_new: tl.marked_new,
                             from_archive: false,
                         });
                         if tl.seq > 0 {
@@ -4684,7 +4713,6 @@ impl App {
                 // World's output buffer was cleared (e.g., splash screen replaced with MUD data)
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     world.output_lines.clear();
-                    world.first_marked_new_index = None;
                     world.pending_count = 0;
                     world.paused = false;
                     world.scroll_offset = 0;
@@ -4827,7 +4855,6 @@ impl App {
                             gagged: line.gagged,
                             seq: line.seq,
                             highlight_color: line.highlight_color,
-                            marked_new: line.marked_new,
                             from_archive: line.from_archive,
                         };
                         world.output_lines.push(output_line);
@@ -4909,7 +4936,6 @@ impl App {
                                     gagged: line.gagged,
                                     seq: line.seq,
                                     highlight_color: line.highlight_color,
-                                    marked_new: line.marked_new,
                                     from_archive: line.from_archive,
                                 }).collect();
                             let insert_at = insert_at.min(world.output_lines.len());
@@ -4940,7 +4966,6 @@ impl App {
                             gagged: line.gagged,
                             seq: line.seq,
                             highlight_color: line.highlight_color,
-                            marked_new: line.marked_new,
                             from_archive: line.from_archive,
                         }
                     }).collect();
@@ -5065,7 +5090,6 @@ impl App {
                     gagged: tl.gagged,
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
-                    marked_new: tl.marked_new,
                     from_archive: tl.from_archive,
                 }
             }).collect();
@@ -5088,7 +5112,6 @@ impl App {
                     gagged: tl.gagged,
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
-                    marked_new: tl.marked_new,
                     from_archive: tl.from_archive,
                 }
             }).collect();
@@ -5100,6 +5123,7 @@ impl App {
             world.prompt = w.prompt;
             world.showing_splash = w.showing_splash;
             world.gmcp_user_enabled = w.gmcp_user_enabled;
+            world.new_from_seq = w.new_from_seq;
             world.settings = WorldSettings {
                 hostname: w.settings.hostname,
                 port: w.settings.port,
@@ -5129,7 +5153,7 @@ impl App {
                         .enumerate()
                         .map(|(i, line)| {
                             let seq = world.next_seq + i as u64;
-                            OutputLine::new(line, seq)
+                            OutputLine::new_client(line, seq)
                         })
                         .collect();
                     world.next_seq += world.output_lines.len() as u64;
@@ -5303,7 +5327,9 @@ impl App {
                 self.worlds[old_index].lines_since_pause = 0;
             }
             // Clear new line indicators on the world we're leaving
-            self.worlds[old_index].clear_new_line_indicators();
+            let watermark_before = self.worlds[old_index].new_from_seq;
+            self.worlds[old_index].mark_displayed();
+            self.broadcast_watermark_if_changed(old_index, watermark_before);
             // Track previous world for Alt+w fallback
             self.previous_world_index = Some(self.current_world_index);
             self.current_world_index = index;
@@ -5641,7 +5667,6 @@ impl App {
                         from_server: line.from_server,
                         seq: line.seq,
                         highlight_color: line.highlight_color.clone(),
-                        marked_new: line.marked_new,
                         from_archive: line.from_archive,
                     }
                 })
@@ -5694,7 +5719,6 @@ impl App {
                         from_server: line.from_server,
                         seq: line.seq,
                         highlight_color: line.highlight_color.clone(),
-                        marked_new: line.marked_new,
                         from_archive: line.from_archive,
                     }
                 })
@@ -5721,7 +5745,6 @@ impl App {
                         from_server: line.from_server,
                         seq: line.seq,
                         highlight_color: line.highlight_color.clone(),
-                        marked_new: line.marked_new,
                         from_archive: line.from_archive,
                     }
                 })
@@ -5743,7 +5766,6 @@ impl App {
                         from_server: line.from_server,
                         seq: line.seq,
                         highlight_color: line.highlight_color.clone(),
-                        marked_new: line.marked_new,
                         from_archive: line.from_archive,
                     }
                 })
@@ -5828,7 +5850,6 @@ impl App {
                 from_server: line.from_server,
                 seq: line.seq,
                 highlight_color: line.highlight_color.clone(),
-                marked_new: line.marked_new,
                 from_archive: line.from_archive,
             })
             .collect::<Vec<_>>()
@@ -5865,7 +5886,9 @@ impl App {
         // and reset lines_since_pause if more-mode hasn't triggered
         if let Some(old_idx) = old_world_idx {
             if old_idx != world_index && old_idx < self.worlds.len() {
-                self.worlds[old_idx].clear_new_line_indicators();
+                let watermark_before = self.worlds[old_idx].new_from_seq;
+                self.worlds[old_idx].mark_displayed();
+                self.broadcast_watermark_if_changed(old_idx, watermark_before);
                 if self.worlds[old_idx].pending_lines.is_empty() {
                     self.worlds[old_idx].lines_since_pause = 0;
                 }
@@ -6064,7 +6087,7 @@ impl App {
         // to pending_lines instead (World::add_output's goes_to_pending path) - that's
         // broadcast later via the release paths (App::broadcast_released_lines) when the
         // pause ends, not here, or it would be sent twice.
-        self.broadcast_output_range(world_idx, skip_count, lines_to_output, true, false, false, false);
+        self.broadcast_output_range(world_idx, skip_count, lines_to_output, true, false, false);
 
         if pending_after != pending_before {
             self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
@@ -6161,9 +6184,15 @@ impl App {
         let output_before = self.worlds[world_idx].output_lines.len();
         let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
             && !self.worlds[world_idx].partial_in_pending;
+        let watermark_before = self.worlds[world_idx].new_from_seq;
 
         self.worlds[world_idx]
             .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
+        // If this world is currently viewed, add_output already advanced new_from_seq past
+        // this line (rule 1 applies to arrival-while-viewed regardless of from_server - see
+        // its is_current branch) - tell every instance before broadcasting the content, same
+        // ordering reason as process_server_data's identical comment.
+        self.broadcast_watermark_if_changed(world_idx, watermark_before);
 
         let output_after = self.worlds[world_idx].output_lines.len();
         let pending_after = self.worlds[world_idx].pending_lines.len();
@@ -6176,7 +6205,7 @@ impl App {
 
         // Broadcast only what actually landed in output_lines - see add_output's identical
         // comment on why a message diverted to pending_lines must not also be broadcast here.
-        self.broadcast_output_range(world_idx, skip_count, lines_to_output, is_current, false, !is_current, false);
+        self.broadcast_output_range(world_idx, skip_count, lines_to_output, is_current, false, false);
 
         if pending_after != pending_before {
             self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
@@ -6206,7 +6235,7 @@ impl App {
     /// their buffer flushed). Shared by `process_server_data` (real MUD output) and
     /// `emit_client_lines` (client-generated blocks, e.g. `/recall`).
     #[allow(clippy::too_many_arguments)]
-    fn broadcast_output_range(&mut self, world_idx: usize, skip: usize, count: usize, is_viewed: bool, from_server: bool, marked_new: bool, flush: bool) {
+    fn broadcast_output_range(&mut self, world_idx: usize, skip: usize, count: usize, is_viewed: bool, from_server: bool, flush: bool) {
         if count == 0 {
             if flush {
                 self.ws_broadcast(WsMessage::WorldFlushed { world_index: world_idx });
@@ -6230,7 +6259,6 @@ impl App {
             from_server,
             seq: first_seq,
             end_seq,
-            marked_new,
             flush,
             gagged: false,
         });
@@ -6279,7 +6307,7 @@ impl App {
             lines_to_output = output_after.saturating_sub(skip_count);
         }
 
-        self.broadcast_output_range(world_idx, skip_count, lines_to_output, is_current, false, !is_current, false);
+        self.broadcast_output_range(world_idx, skip_count, lines_to_output, is_current, false, false);
 
         if lines_to_pending > 0 || pending_after != pending_before {
             self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
@@ -6386,6 +6414,7 @@ impl App {
             total_output_lines: 0,
             total_visible_lines: Some(0),
             pending_count: 0,
+            new_from_seq: 0,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
         let _ = persistence::save_settings(self);
@@ -6680,41 +6709,45 @@ impl App {
 
     /// Broadcasts a set of just-released pending lines (from `World::release_pending` /
     /// `release_all_pending`) to WS clients viewing `world_idx`, grouped into batches by
-    /// `(marked_new, from_server)` so each batch gets the correct new-line indicator and
-    /// client-line marker. This is the single broadcast implementation shared by every
-    /// release site (`release_pending_lines`, `release_pending_screenful`, `selective_flush`,
-    /// and the `input_handler.rs` release actions) — previously each site either duplicated
-    /// this grouping logic with its own copy of the release budget calculation (a divergence
-    /// that let `release_pending_screenful` broadcast lines it hadn't actually released, see
-    /// its call site) or hardcoded `from_server: true` for an entire batch regardless of each
-    /// line's real flag. Taking `released: &[OutputLine]` directly — the exact lines that were
-    /// moved into `output_lines` — makes both bugs structurally impossible: what's broadcast
-    /// can never diverge from what was released, and each line's own flags travel with it.
+    /// `from_server` so each batch gets the correct client-line marker. This is the single
+    /// broadcast implementation shared by every release site (`release_pending_lines`,
+    /// `release_pending_screenful`, `selective_flush`, and the `input_handler.rs` release
+    /// actions) — previously each site either duplicated this grouping logic with its own copy
+    /// of the release budget calculation (a divergence that let `release_pending_screenful`
+    /// broadcast lines it hadn't actually released, see its call site) or hardcoded
+    /// `from_server: true` for an entire batch regardless of each line's real flag. Taking
+    /// `released: &[OutputLine]` directly — the exact lines that were moved into `output_lines`
+    /// — makes both bugs structurally impossible: what's broadcast can never diverge from what
+    /// was released, and each line's own flag travels with it.
     ///
     /// `seq`/`end_seq` are the real span of each contiguous-seq sub-batch (Step 6 of the
     /// seq-drift fix) rather than the old `seq: 0` "bypass dedup" convention — safe now that
     /// `World::output_lines` is guaranteed seq-sorted through a pause (see the invariant note
     /// on `process_server_data`'s gagged-line handling). Grouping is therefore
-    /// `(marked_new, from_server, seq contiguity)`: `released` is normally one contiguous run
+    /// `(from_server, seq contiguity)`: `released` is normally one contiguous run
     /// (`release_pending`/`release_all_pending` always drain a contiguous prefix), but
     /// `selective_flush`'s caller can pass a non-contiguous subset (only lines matching some
-    /// filter), so a seq gap also starts a new batch even when `marked_new`/`from_server`
-    /// don't change — otherwise a batch's `seq..=end_seq` span would claim to cover lines it
-    /// doesn't actually contain.
+    /// filter), so a seq gap also starts a new batch even when `from_server` doesn't change -
+    /// otherwise a batch's `seq..=end_seq` span would claim to cover lines it doesn't actually
+    /// contain. The ▶ new-text watermark is no longer part of this grouping: it's a single
+    /// per-world value (`World::new_from_seq`) broadcast separately via `NewWatermark`
+    /// whenever it moves, not a per-line flag riding along with the content - see
+    /// `World::new_from_seq`'s doc comment. Callers are responsible for calling
+    /// `App::broadcast_watermark_if_changed` themselves around whatever advanced it (typically
+    /// nothing here, since released pending lines already arrived not-new by rule 1).
     pub(crate) fn broadcast_released_lines(&mut self, world_idx: usize, released: &[OutputLine]) {
         if released.is_empty() {
             return;
         }
         let ts = current_timestamp_secs();
         let mut batch: Vec<String> = Vec::new();
-        let mut batch_marked_new = released[0].marked_new;
         let mut batch_from_server = released[0].from_server;
         let mut batch_start_seq = released[0].seq;
         let mut batch_end_seq = released[0].seq;
         let mut prev_seq: Option<u64> = None;
         for line in released {
             let seq_contiguous = prev_seq.map(|p| line.seq == p + 1).unwrap_or(true);
-            if (line.marked_new != batch_marked_new || line.from_server != batch_from_server || !seq_contiguous) && !batch.is_empty() {
+            if (line.from_server != batch_from_server || !seq_contiguous) && !batch.is_empty() {
                 let ws_data = batch.join("\n") + "\n";
                 self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                     world_index: world_idx,
@@ -6724,11 +6757,9 @@ impl App {
                     from_server: batch_from_server,
                     seq: batch_start_seq,
                     end_seq: Some(batch_end_seq),
-                    marked_new: batch_marked_new,
                     flush: false, gagged: false,
                 });
                 batch.clear();
-                batch_marked_new = line.marked_new;
                 batch_from_server = line.from_server;
                 batch_start_seq = line.seq;
             }
@@ -6746,7 +6777,6 @@ impl App {
                 from_server: batch_from_server,
                 seq: batch_start_seq,
                 end_seq: Some(batch_end_seq),
-                marked_new: batch_marked_new,
                 flush: false, gagged: false,
             });
         }
@@ -7490,9 +7520,27 @@ impl App {
     /// app) makes that client's own current world look unviewed the instant its socket
     /// drops, so any output arriving in that window gets wrongly marked_new even though the
     /// client never actually looked away.
-    fn ws_client_viewing(&self, world_index: usize) -> bool {
+    pub(crate) fn ws_client_viewing(&self, world_index: usize) -> bool {
         self.ws_client_worlds.values().any(|v| v.world_index == world_index && !v.paused
             && v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true))
+    }
+
+    /// Broadcast `WsMessage::NewWatermark` for `world_idx` iff its `new_from_seq` actually
+    /// advanced past `before`. Centralizes the "did the ▶ boundary move" broadcast so every
+    /// call site that might advance the watermark (live arrival while viewed, or
+    /// `mark_displayed()` on leaving a world / Ctrl+L / MarkWorldSeen) only needs to snapshot
+    /// `before` and call this - no per-site broadcast duplication to keep in sync. This
+    /// replaces the old per-line `marked_new` model, whose cross-instance drift (a client
+    /// that left a world never told other instances to stop rendering ▶ on its old lines)
+    /// was exactly this class of "forgot to tell everyone" bug.
+    fn broadcast_watermark_if_changed(&mut self, world_idx: usize, before: u64) {
+        if world_idx >= self.worlds.len() {
+            return;
+        }
+        let after = self.worlds[world_idx].new_from_seq;
+        if after != before {
+            self.ws_broadcast(WsMessage::NewWatermark { world_index: world_idx, new_from_seq: after });
+        }
     }
 
     /// Get the minimum visible lines among all viewers of a world (for more-mode threshold)
@@ -7603,6 +7651,16 @@ impl App {
         is_daemon_mode: bool,
     ) -> Vec<String> {
         self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
+        // Snapshot the new-text watermark once up front: real MUD text arriving while someone's
+        // viewing this world (rule 1) can advance it via the non-gagged add_output call below.
+        // Broadcast NewWatermark for that BEFORE broadcast_output_range sends the content it
+        // describes (not after, and not batched with the gagged-lines loop's own broadcasts
+        // further down) - a remote client must learn the watermark moved before it renders the
+        // very lines that moved it, or it briefly (permanently, until the next full re-render)
+        // shows ▶ on live output arriving on the world it's currently looking at, since ▶ is
+        // baked into the DOM at append time and never re-evaluated. The gagged-lines loop
+        // handles its own ordering per line since it broadcasts per line already.
+        let watermark_before_process = self.worlds[world_idx].new_from_seq;
 
         // FANSI client detection: check for "Detecting client..." within 2s window
         if let Some(deadline) = self.worlds[world_idx].fansi_detect_until {
@@ -7907,6 +7965,10 @@ impl App {
             // Mark output for redraw whenever output changes
             self.needs_output_redraw = true;
 
+            // Tell every instance where the ▶ boundary now sits BEFORE sending the content
+            // that moved it - see the ordering note on watermark_before_process above.
+            self.broadcast_watermark_if_changed(world_idx, watermark_before_process);
+
             // For synchronized more-mode: only broadcast lines that went to output_lines
             // Lines that went to pending_lines will be broadcast when released
             // Only send to clients viewing this world (Phase 2 output routing).
@@ -7915,7 +7977,7 @@ impl App {
             // atomically before appending new lines (avoids a race with a separate
             // WorldFlushed message) - broadcast_output_range's count==0 branch still sends
             // WorldFlushed on its own when there's nothing else to send alongside it.
-            self.broadcast_output_range(world_idx, skip_count, lines_to_output, true, true, !is_current, splash_was_cleared);
+            self.broadcast_output_range(world_idx, skip_count, lines_to_output, true, true, splash_was_cleared);
 
             // Broadcast pending count update if it changed (for synchronized more-mode indicator)
             // Use filtered broadcast to skip clients that received pending in InitialState
@@ -7994,6 +8056,10 @@ impl App {
             self.worlds[world_idx].next_seq += 1;
             let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
             output_line.highlight_color = highlight;
+            // Gagged or not, this is still text from the world (rule 1) — advance the
+            // watermark past it when someone's viewing, same as add_output does for
+            // non-gagged lines. Bypasses add_output entirely so this must be done by hand.
+            self.worlds[world_idx].advance_watermark_if_current(seq, is_current);
             // Archive gagged server lines to long-term scrollback (with gagged=true) -
             // unconditional on which buffer it lands in, since archiving is a timestamped
             // log, not a seq-ordered live buffer other code indexes into.
@@ -8006,7 +8072,6 @@ impl App {
                 let _ = tx.try_send((world_name, ts_ms, line.to_string(), true));
             }
             if hold_gagged_in_pending {
-                output_line.marked_new = !is_current;
                 self.worlds[world_idx].pending_lines.push(output_line);
                 // Not broadcast here - it goes out with the pending release batch via
                 // App::broadcast_released_lines, same as every other pending line.
@@ -8022,7 +8087,6 @@ impl App {
                 ts: current_timestamp_secs(),
                 from_server: true,
                 seq, end_seq: None,
-                marked_new: !is_current,
                 flush: false,
                 gagged: true,
             });
@@ -8065,7 +8129,9 @@ impl App {
             let prompt_text = self.worlds[world_idx].prompt.trim().to_string();
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
+            let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
             self.worlds[world_idx].push_line_respecting_pending(OutputLine::new(prompt_text, seq), more_mode);
+            self.worlds[world_idx].advance_watermark_if_current(seq, is_current);
         }
         self.worlds[world_idx].clear_connection_state(true, true);
         // Show disconnection message
@@ -8095,7 +8161,6 @@ impl App {
             ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             from_server: false,
             seq, end_seq: None,
-            marked_new: false,
             flush: false, gagged: false,
         });
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
@@ -8117,7 +8182,6 @@ impl App {
                 ts: msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                 from_server: false,
                 seq, end_seq: None,
-                marked_new: false,
                 flush: false, gagged: false,
             });
         }
@@ -8227,7 +8291,9 @@ impl App {
         if !self.worlds[world_idx].connected {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
+            let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
             self.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string(), seq));
+            self.worlds[world_idx].advance_watermark_if_current(seq, is_current);
             self.worlds[world_idx].scroll_to_bottom();
             self.worlds[world_idx].prompt.clear();
             if world_idx == self.current_world_index {
@@ -8803,7 +8869,6 @@ impl App {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                marked_new: false,
                                 flush: false, gagged: false,
                             });
                         }
@@ -8832,7 +8897,6 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    marked_new: false,
                     flush: false, gagged: false,
                 });
             }
@@ -8892,7 +8956,6 @@ impl App {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                marked_new: false,
                                 flush: false, gagged: false,
                             });
                         }
@@ -8905,7 +8968,6 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            marked_new: false,
                             flush: false, gagged: false,
                         });
                     }
@@ -8943,7 +9005,6 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                 } else if cancel {
@@ -8981,7 +9042,6 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                     self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
@@ -8993,7 +9053,6 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                 }
@@ -9003,7 +9062,6 @@ impl App {
                 if world_index < self.worlds.len() {
                     let line_count = self.worlds[world_index].output_lines.len();
                     self.worlds[world_index].output_lines.clear();
-                    self.worlds[world_index].first_marked_new_index = None;
                     self.worlds[world_index].pending_lines.clear();
                     self.worlds[world_index].scroll_offset = 0;
                     self.worlds[world_index].lines_since_pause = 0;
@@ -9059,7 +9117,6 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                 } else {
@@ -9082,7 +9139,6 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                 }
@@ -9099,7 +9155,6 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                     // Broadcast updated ban list
@@ -9113,7 +9168,6 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                     self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
@@ -9133,7 +9187,6 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    marked_new: false,
                     flush: false, gagged: false,
                 });
             }
@@ -9209,7 +9262,6 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    marked_new: false,
                     flush: false, gagged: false,
                 });
             }
@@ -9281,7 +9333,6 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            marked_new: false,
                             flush: false, gagged: false,
                         });
                     }
@@ -9370,7 +9421,7 @@ impl App {
                         self.ws_send_to_client(client_id, WsMessage::ServerData {
                             world_index, data: line.to_string(), is_viewed: false,
                             ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
-                            marked_new: false, flush: false, gagged: false,
+                            flush: false, gagged: false,
                         });
                     }
                 } else {
@@ -9400,7 +9451,7 @@ impl App {
         self.ws_send_to_client(client_id, WsMessage::ServerData {
             world_index, data, is_viewed: false,
             ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
-            marked_new: false, flush: false, gagged: false,
+            flush: false, gagged: false,
         });
     }
 
@@ -9624,7 +9675,6 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            marked_new: false,
                             flush: false, gagged: false,
                         });
                     } else {
@@ -10202,7 +10252,6 @@ impl App {
                     from_server: s.from_server,
                     seq: s.seq,
                     highlight_color: s.highlight_color.clone(),
-                    marked_new: s.marked_new,
                     from_archive: s.from_archive,
                 }
             })
@@ -10297,6 +10346,7 @@ impl App {
                 // which would force a full recount at that site anyway).
                 total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
                 pending_count: world.pending_lines.len(),
+                new_from_seq: world.new_from_seq,
             }
         }).collect();
 
@@ -10888,7 +10938,8 @@ impl App {
             }
             if partial_idx < self.worlds[world_idx].output_lines.len() {
                 let partial_line = &self.worlds[world_idx].output_lines[partial_idx];
-                let total_vl = nli_visual_rows(&partial_line.text, width, partial_line.marked_new, self.settings.new_line_indicator, self.settings.wrapspace as usize);
+                let partial_is_new = self.worlds[world_idx].line_is_new(partial_line);
+                let total_vl = nli_visual_rows(&partial_line.text, width, partial_is_new, self.settings.new_line_indicator, self.settings.wrapspace as usize);
                 let remaining = total_vl.saturating_sub(self.worlds[world_idx].visual_line_offset);
                 if remaining > visual_budget {
                     // More of this line than fits on screen — advance offset, done
@@ -10946,9 +10997,6 @@ impl App {
             return false;
         }
         let world = self.current_world_mut();
-        if world.first_marked_new_index.is_none() && world.pending_lines.iter().any(|l| l.marked_new) {
-            world.first_marked_new_index = Some(world.output_lines.len());
-        }
         world.output_lines.append(&mut world.pending_lines);
         world.pending_since = None;
         world.paused = false;
@@ -14160,7 +14208,7 @@ pub async fn run_app_headless(
                 world.paused = false;
                 let seq = world.next_seq;
                 world.next_seq += 1;
-                world.output_lines.push(OutputLine::new(
+                world.output_lines.push(OutputLine::new_client(
                     "Connection was not restored during reload. Use /worlds to reconnect.".to_string(), seq
                 ));
             }
@@ -14474,7 +14522,6 @@ pub async fn run_app_headless(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            marked_new: false,
                             flush: false, gagged: false,
                         });
                     }
@@ -14574,7 +14621,6 @@ pub async fn run_app_headless(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                marked_new: false,
                                 flush: false, gagged: false,
                             }),
                         }
@@ -14594,7 +14640,6 @@ pub async fn run_app_headless(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    marked_new: false,
                                     flush: false, gagged: false,
                                 });
                             }
@@ -14706,7 +14751,7 @@ pub async fn run_app_headless(
                                 world.clear_connection_state(false, false);
                                 let seq = world.next_seq;
                                 world.next_seq += 1;
-                                world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string(), seq));
+                                world.output_lines.push(OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq));
                             }
                         }
                     }
@@ -15380,7 +15425,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.worlds[world_idx].clear_connection_state(false, false);
                     let seq = app.worlds[world_idx].next_seq;
                     app.worlds[world_idx].next_seq += 1;
-                    app.worlds[world_idx].output_lines.push(OutputLine::new(
+                    app.worlds[world_idx].output_lines.push(OutputLine::new_client(
                         "TLS proxy terminated during reload. Use /worlds to reconnect.".to_string(), seq
                     ));
                     continue;
@@ -15571,7 +15616,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].clear_connection_state(false, false);
                         let seq = app.worlds[world_idx].next_seq;
                         app.worlds[world_idx].next_seq += 1;
-                        app.worlds[world_idx].output_lines.push(OutputLine::new(
+                        app.worlds[world_idx].output_lines.push(OutputLine::new_client(
                             "Failed to reconnect to TLS proxy. Use /worlds to reconnect.".to_string(), seq
                         ));
                     }
@@ -15594,7 +15639,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.worlds[world_idx].clear_connection_state(false, false);
                     let seq = app.worlds[world_idx].next_seq;
                     app.worlds[world_idx].next_seq += 1;
-                    app.worlds[world_idx].output_lines.push(OutputLine::new(
+                    app.worlds[world_idx].output_lines.push(OutputLine::new_client(
                         "TLS proxy terminated during reload. Use /worlds to reconnect.".to_string(), seq
                     ));
                     continue;
@@ -15754,7 +15799,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].clear_connection_state(false, false);
                         let seq = app.worlds[world_idx].next_seq;
                         app.worlds[world_idx].next_seq += 1;
-                        app.worlds[world_idx].output_lines.push(OutputLine::new(
+                        app.worlds[world_idx].output_lines.push(OutputLine::new_client(
                             "Failed to reconnect to TLS proxy. Use /worlds to reconnect.".to_string(), seq
                         ));
                     }
@@ -15771,7 +15816,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let seq = world.next_seq;
                 world.next_seq += 1;
                 world.output_lines
-                    .push(OutputLine::new("Connection was not restored during reload. Use /worlds to reconnect.".to_string(), seq));
+                    .push(OutputLine::new_client("Connection was not restored during reload. Use /worlds to reconnect.".to_string(), seq));
             }
 
             // For ALL worlds: flush pending_lines to output_lines so content isn't lost,
@@ -16169,8 +16214,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     match handle_key_event(key, &mut app) {
                         KeyAction::Quit => return Ok(()),
                         KeyAction::Redraw => {
-                            // Filter output to only show server data (remove client-generated lines)
+                            // Filter output to only show server data (remove client-generated lines).
+                            // Also marks whatever's on screen as displayed (rule 2) and tells every
+                            // other instance so their copies stop showing ▶ on it too.
+                            let redraw_idx = app.current_world_index;
+                            let watermark_before = app.worlds[redraw_idx].new_from_seq;
                             app.current_world_mut().filter_to_server_output();
+                            app.broadcast_watermark_if_changed(redraw_idx, watermark_before);
                             // Full terminal reset: unconditionally tear down and re-setup
                             // Always disable mouse capture to clear any stuck state
                             let _ = execute!(std::io::stdout(), DisableMouseCapture);
@@ -16257,7 +16307,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 world.showing_splash = false;
                                 world.needs_redraw = true;
                                 world.output_lines.clear();
-                                world.first_marked_new_index = None;
                                 world.scroll_offset = 0;
                                 terminal.clear()?;
                                 terminal.resize(terminal.size()?)?;
@@ -16632,6 +16681,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
+                            let watermark_before = app.worlds[world_idx].new_from_seq;
                             let world_name_for_triggers = world_name.clone();
                             let actions = app.settings.actions.clone();
 
@@ -16650,6 +16700,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
                                 app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                                // Gagged or not, still text from the world (rule 1) - advance the
+                                // watermark past it when someone's viewing. Uses the broader
+                                // is_current from the top of this handler (console OR any WS
+                                // viewer), not the narrower console-only one the ServerData
+                                // broadcast below uses for its own is_viewed field.
+                                app.worlds[world_idx].advance_watermark_if_current(seq, is_current);
                                 if !app.worlds[world_idx].paused {
                                     app.worlds[world_idx].scroll_to_bottom();
                                 }
@@ -16663,7 +16719,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ts: current_timestamp_secs(),
                                     from_server: true,
                                     seq, end_seq: None,
-                                    marked_new: !is_current,
                                     flush: false, gagged: true,
                                 });
                             } else {
@@ -16696,6 +16751,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let output_before = app.worlds[world_idx].output_lines.len();
 
                                 app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
+                                // Tell every instance where the ▶ boundary now sits BEFORE the
+                                // ServerData broadcast below sends the content that moved it -
+                                // otherwise a remote client viewing this world renders its own
+                                // live-arriving line as new (baked into the DOM at append time,
+                                // never re-evaluated) before learning the watermark passed it.
+                                app.broadcast_watermark_if_changed(world_idx, watermark_before);
 
                                 // Calculate what went where
                                 let pending_after = app.worlds[world_idx].pending_lines.len();
@@ -16720,7 +16781,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         ts: current_timestamp_secs(),
                                         from_server: false,
                                         seq: 0, end_seq: None,
-                                        marked_new: false,
                                         flush: false, gagged: false,
                                     });
                                 }
@@ -16743,6 +16803,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Broadcast activity count to keep all clients in sync
                                 app.broadcast_activity();
                             }
+                            // Catches the gagged branch above, which already broadcast its own
+                            // ServerData before this point - unlike the non-gagged path (fixed
+                            // above), a gagged line's watermark update can still arrive a
+                            // message late on a remote client. Accepted: gagged content is
+                            // hidden unless F2/show_tags is on, so the practical impact is low.
+                            // (Redundant, harmless re-broadcast of the same value when the
+                            // non-gagged branch above already sent it - `watermark_before` is
+                            // the snapshot from before either branch ran, not updated after.)
+                            app.broadcast_watermark_if_changed(world_idx, watermark_before);
 
                             // Mark output for redraw if this is the current world
                             if world_idx == app.current_world_index {
@@ -16916,7 +16985,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                marked_new: false,
                                 flush: false, gagged: false,
                             }),
                         }
@@ -16936,7 +17004,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    marked_new: false,
                                     flush: false, gagged: false,
                                 });
                             }
@@ -17060,7 +17127,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 world.clear_connection_state(false, false);
                                 let seq = world.next_seq;
                                 world.next_seq += 1;
-                                world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string(), seq));
+                                world.output_lines.push(OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq));
                             }
                         }
                     }
@@ -17517,6 +17584,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
+                        let watermark_before = app.worlds[world_idx].new_from_seq;
                         let world_name_for_triggers = world_name.clone();
                         let actions = app.settings.actions.clone();
 
@@ -17535,6 +17603,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let seq = app.worlds[world_idx].next_seq;
                             app.worlds[world_idx].next_seq += 1;
                             app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                            // Gagged or not, still text from the world (rule 1) - advance the
+                            // watermark past it when someone's viewing. Uses the broader
+                            // is_current from the top of this handler (console OR any WS
+                            // viewer), not the narrower console-only one the ServerData
+                            // broadcast below uses for its own is_viewed field.
+                            app.worlds[world_idx].advance_watermark_if_current(seq, is_current);
                             if !app.worlds[world_idx].paused {
                                 app.worlds[world_idx].scroll_to_bottom();
                             }
@@ -17548,7 +17622,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ts: current_timestamp_secs(),
                                 from_server: true,
                                 seq, end_seq: None,
-                                marked_new: !is_current,
                                 flush: false, gagged: true,
                             });
                         } else {
@@ -17565,6 +17638,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 (false, None) => console_width,
                             };
                             app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
+                            // Tell every instance where the ▶ boundary now sits BEFORE the
+                            // ServerData broadcast below sends the content that moved it - see
+                            // the identical ordering note in the master-loop copy of this
+                            // handler above.
+                            app.broadcast_watermark_if_changed(world_idx, watermark_before);
                             // Broadcast to WebSocket clients (only non-gagged)
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index: world_idx,
@@ -17573,10 +17651,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                marked_new: false,
                                 flush: false, gagged: false,
                             });
                         }
+                        // Catches the gagged branch above (see the master-loop copy's identical
+                        // comment) - redundant, harmless re-broadcast for the non-gagged branch,
+                        // which already sent this above.
+                        app.broadcast_watermark_if_changed(world_idx, watermark_before);
 
                         // Mark output for redraw if this is the current world
                         if world_idx == app.current_world_index {
@@ -17719,7 +17800,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            marked_new: false,
                             flush: false, gagged: false,
                         }),
                     }
@@ -17734,7 +17814,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            marked_new: false,
                             flush: false, gagged: false,
                         });
                     }

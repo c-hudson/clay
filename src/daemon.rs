@@ -386,7 +386,6 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                marked_new: false,
                                 flush: false, gagged: false,
                             }),
                         }
@@ -401,7 +400,6 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                marked_new: false,
                                 flush: false, gagged: false,
                             });
                         }
@@ -504,7 +502,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 world.clear_connection_state(false, false);
                                 let seq = world.next_seq;
                                 world.next_seq += 1;
-                                world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string(), seq));
+                                world.output_lines.push(OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq));
                             }
                         }
                     }
@@ -625,8 +623,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                            marked_new: false,
-                            flush: false, gagged: false,
+                                flush: false, gagged: false,
                             });
                         } else {
                             let mut sent_to_server = false;
@@ -703,8 +700,7 @@ pub async fn handle_daemon_ws_message(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                marked_new: false,
-                                flush: false, gagged: false,
+                                    flush: false, gagged: false,
                                 });
                             }
                         }
@@ -819,8 +815,7 @@ pub async fn handle_daemon_ws_message(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                marked_new: false,
-                                flush: false, gagged: false,
+                                    flush: false, gagged: false,
                                 });
                             }
                         } else {
@@ -832,8 +827,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                            marked_new: false,
-                            flush: false, gagged: false,
+                                flush: false, gagged: false,
                             });
                         }
                     } else if world_index < app.worlds.len() {
@@ -873,8 +867,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                        marked_new: false,
-                        flush: false, gagged: false,
+                            flush: false, gagged: false,
                         });
                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                     } else {
@@ -885,8 +878,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                        marked_new: false,
-                        flush: false, gagged: false,
+                            flush: false, gagged: false,
                         });
                     }
                 }
@@ -894,7 +886,6 @@ pub async fn handle_daemon_ws_message(
                     if world_index < app.worlds.len() {
                         let line_count = app.worlds[world_index].output_lines.len();
                         app.worlds[world_index].output_lines.clear();
-                        app.worlds[world_index].first_marked_new_index = None;
                         app.worlds[world_index].pending_lines.clear();
                         app.worlds[world_index].scroll_offset = 0;
                         app.worlds[world_index].lines_since_pause = 0;
@@ -949,8 +940,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                        marked_new: false,
-                        flush: false, gagged: false,
+                            flush: false, gagged: false,
                         });
                     } else {
                         let mut output = String::new();
@@ -972,8 +962,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                        marked_new: false,
-                        flush: false, gagged: false,
+                            flush: false, gagged: false,
                         });
                     }
                     app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -988,8 +977,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                        marked_new: false,
-                        flush: false, gagged: false,
+                            flush: false, gagged: false,
                         });
                         app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
                         app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
@@ -1001,8 +989,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                        marked_new: false,
-                        flush: false, gagged: false,
+                            flush: false, gagged: false,
                         });
                         app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                     }
@@ -1021,8 +1008,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                    marked_new: false,
-                    flush: false, gagged: false,
+                        flush: false, gagged: false,
                     });
                 }
                 Command::Notify { message } => {
@@ -1065,8 +1051,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                            marked_new: false,
-                            flush: false, gagged: false,
+                                flush: false, gagged: false,
                             });
                         }
                         Err(e) => {
@@ -1077,8 +1062,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                            marked_new: false,
-                            flush: false, gagged: false,
+                                flush: false, gagged: false,
                             });
                         }
                     }
@@ -1098,7 +1082,6 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                 }
@@ -1113,7 +1096,6 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        marked_new: false,
                         flush: false, gagged: false,
                     });
                 }
@@ -1138,8 +1120,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                    marked_new: false,
-                    flush: false, gagged: false,
+                        flush: false, gagged: false,
                     });
                 }
                 // AddWorld - add or update world definition
@@ -1234,8 +1215,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                            marked_new: false,
-                            flush: false, gagged: false,
+                                flush: false, gagged: false,
                             });
 
                             app.worlds[world_index].connection_id += 1;
@@ -1270,8 +1250,7 @@ pub async fn handle_daemon_ws_message(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                marked_new: false,
-                                flush: false, gagged: false,
+                                    flush: false, gagged: false,
                                 });
                             }
                         } else {
@@ -1282,8 +1261,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                            marked_new: false,
-                            flush: false, gagged: false,
+                                flush: false, gagged: false,
                             });
                         }
                     }
@@ -1382,8 +1360,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                    marked_new: false,
-                    flush: false, gagged: false,
+                        flush: false, gagged: false,
                     });
                     return;
                 }
@@ -1396,8 +1373,7 @@ pub async fn handle_daemon_ws_message(
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                marked_new: false,
-                flush: false, gagged: false,
+                    flush: false, gagged: false,
                 });
 
                 // Attempt connection
@@ -1436,8 +1412,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                    marked_new: false,
-                    flush: false, gagged: false,
+                        flush: false, gagged: false,
                     });
                 }
             }
@@ -1465,7 +1440,6 @@ pub async fn handle_daemon_ws_message(
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    marked_new: false,
                     flush: false, gagged: false,
                 });
                 if !app.worlds[world_index].connected {
@@ -2135,7 +2109,6 @@ keep_alive_type=Generic
                                         ts: current_timestamp_secs(),
                                         from_server: false,
                                         seq: 0, end_seq: None,
-                                        marked_new: false,
                                         flush: false, gagged: false,
                                     }, Some(&requesting_username));
                                 }
@@ -2171,7 +2144,6 @@ keep_alive_type=Generic
                                         ts: current_timestamp_secs(),
                                         from_server: false,
                                         seq: 0, end_seq: None,
-                                        marked_new: false,
                                         flush: false, gagged: false,
                                     }, Some(&requesting_username));
                                 }
@@ -2208,7 +2180,6 @@ keep_alive_type=Generic
                                     ts: current_timestamp_secs(),
                                     from_server: true,
                                     seq: 0, end_seq: None,
-                                    marked_new: false,
                                     flush: false, gagged: false,
                                 }, Some(&username));
                             }
@@ -3139,6 +3110,14 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 // per-user conn.output_lines) - see the field's doc comment in websocket.rs.
                 total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
                 pending_count: world.pending_lines.len(),
+                // Multiuser has never supported the ▶ new-text indicator - MUD data for
+                // multiuser worlds flows through per-user UserConnection.output_lines, not
+                // World, and its ServerData broadcasts already hardcode marked_new: false /
+                // is_viewed: true unconditionally (see AppEvent::MultiuserServerData). A
+                // constant 0 ("everything already displayed") preserves that, rather than
+                // reading World::new_from_seq, which tracks the shared World's own
+                // (unused-by-multiuser) output_lines and would be meaningless here.
+                new_from_seq: 0,
             }
         }).collect();
 
@@ -3499,7 +3478,7 @@ pub async fn handle_multiuser_ws_message(
                         if old_idx != world_index {
                             if let Some(old_world) = app.worlds.get_mut(old_idx) {
                                 if old_world.owner.as_ref() == username.as_ref() {
-                                    old_world.clear_new_line_indicators();
+                                    old_world.mark_displayed();
                                     if old_world.pending_lines.is_empty() {
                                         old_world.lines_since_pause = 0;
                                     }

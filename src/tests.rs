@@ -2257,8 +2257,10 @@
         // (nli_visual_rows' real answer) - this is exactly where the two formulas diverge.
         let line_text = "x".repeat(79);
         for i in 0..6 {
-            let mut line = OutputLine::new(line_text.clone(), i as u64);
-            line.marked_new = true;
+            // World::new_from_seq defaults to 0, and these lines are from_server (the
+            // OutputLine::new default) with seq >= 0, so they're "new" (▶) without any
+            // extra setup - see World::line_is_new().
+            let line = OutputLine::new(line_text.clone(), i as u64);
             app.worlds[0].pending_lines.push(line);
         }
         app.worlds[0].paused = true;
@@ -2405,9 +2407,11 @@
     #[test]
     fn test_add_output_to_world_broadcasts_real_seq() {
         // Same regression guard as test_add_output_broadcasts_real_seq, for the
-        // background-world variant - also confirms marked_new correctly reflects
-        // !is_current (the old hardcoded `marked_new: false` was inconsistent with what
-        // World::add_output itself stores on a line pushed for a non-current world).
+        // background-world variant - also confirms this client-generated system message
+        // never advances the ▶ watermark (World::add_output_to_world always passes
+        // from_server: false, and rule 1's "only text from the world is new" gates on
+        // from_server - see World::line_is_new()), unlike the old model, which used to
+        // mark it new purely because the world wasn't current, regardless of origin.
         let mut app = App::new();
         app.worlds.clear();
         app.worlds.push(World::new("current"));
@@ -2421,20 +2425,25 @@
         }
 
         app.ws_broadcast_log.lock().unwrap().clear();
+        let watermark_before = app.worlds[1].new_from_seq;
         app.add_output_to_world(1, "background world message");
 
         let expected_seq = app.worlds[1].output_lines.last().unwrap().seq;
         assert_eq!(expected_seq, 2);
+        assert_eq!(app.worlds[1].new_from_seq, watermark_before,
+            "a client-generated message on a background world must not advance new_from_seq");
 
         let log = app.ws_broadcast_log.lock().unwrap();
-        let server_data: Vec<(usize, u64, Option<u64>, bool)> = log.iter().filter_map(|m| {
-            if let WsMessage::ServerData { world_index, seq, end_seq, marked_new, .. } = m {
-                Some((*world_index, *seq, *end_seq, *marked_new))
+        let server_data: Vec<(usize, u64, Option<u64>)> = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { world_index, seq, end_seq, .. } = m {
+                Some((*world_index, *seq, *end_seq))
             } else { None }
         }).collect();
         assert_eq!(server_data.len(), 1, "{server_data:?}");
-        assert_eq!(server_data[0], (1, expected_seq, Some(expected_seq), true),
-            "must carry the real seq and marked_new: true (background world, not current)");
+        assert_eq!(server_data[0], (1, expected_seq, Some(expected_seq)),
+            "must carry the real seq");
+        assert!(!log.iter().any(|m| matches!(m, WsMessage::NewWatermark { world_index: 1, .. })),
+            "no NewWatermark broadcast should fire since the watermark never moved");
     }
 
     #[test]
@@ -3975,14 +3984,14 @@
         let events = testharness::run_test_scenario(config, vec![]).await;
 
         // Should have WsBroadcastServerData for world1 (index 0)
-        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0, _))),
-            "Expected WsBroadcastServerData(0, _). ServerData events: {:?}",
-            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_, _))).collect::<Vec<_>>());
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0))),
+            "Expected WsBroadcastServerData(0). ServerData events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_))).collect::<Vec<_>>());
 
         // Should have WsBroadcastServerData for world2 (index 1)
-        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(1, _))),
-            "Expected WsBroadcastServerData(1, _). ServerData events: {:?}",
-            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_, _))).collect::<Vec<_>>());
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(1))),
+            "Expected WsBroadcastServerData(1). ServerData events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_))).collect::<Vec<_>>());
 
         let _ = server1.await;
         let _ = server2.await;
@@ -4027,23 +4036,28 @@
             max_duration: Duration::from_secs(10),
         };
 
-        // World 0 is current. Both worlds receive basic_output (5 lines).
-        // World 0's broadcasts should have marked_new=false, world 1's should have marked_new=true.
-        let events = testharness::run_test_scenario(config, vec![]).await;
+        // World 0 is current. Both worlds receive basic_output (5 lines). Per rule 1 (see
+        // World::new_from_seq's doc comment), world 0's lines must never render ▶ - the
+        // watermark itself still advances (someone's watching), which is exactly what keeps
+        // its own lines below it - while world 1's lines, arriving with nobody viewing, stay
+        // ▶ until it's switched to.
+        let actions = vec![
+            // Both worlds run basic_output (5 lines each) - wait for all 10, not 5, or this
+            // can race and check world2 before its own lines have arrived.
+            TestAction::WaitForEvent(WaitCondition::TextReceivedCount(10)),
+            TestAction::AssertMarkedNew { world_name: "world1".to_string(), expected_count: 0 },
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 5 },
+        ];
+        let events = testharness::run_test_scenario(config, actions).await;
 
-        // Current world (index 0) should have marked_new=false
-        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0, false))),
-            "Expected WsBroadcastServerData(0, false) for current world. Events: {:?}",
-            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(0, _))).collect::<Vec<_>>());
-
-        // Non-current world (index 1) should have marked_new=true
-        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(1, true))),
-            "Expected WsBroadcastServerData(1, true) for non-current world. Events: {:?}",
-            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(1, _))).collect::<Vec<_>>());
-
-        // Verify no marked_new=true broadcasts for current world
-        assert!(!events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0, true))),
-            "Current world should never have marked_new=true broadcasts");
+        // A NewWatermark broadcast for world 0 confirms the watermark itself moved on arrival
+        // (it's what keeps world 0's own lines from ever being new); world 1's watermark
+        // never advances since nobody's viewing it, so no such broadcast is expected there.
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastNewWatermark(0, _))),
+            "Expected a NewWatermark broadcast for the current world (0). Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastNewWatermark(_, _))).collect::<Vec<_>>());
+        assert!(!events.iter().any(|e| matches!(e, TestEvent::WsBroadcastNewWatermark(1, _))),
+            "Non-current world (1) should never get a NewWatermark broadcast - its watermark never moves");
 
         let _ = server1.await;
         let _ = server2.await;
@@ -4345,15 +4359,19 @@
             max_duration: Duration::from_secs(10),
         };
 
-        let events = testharness::run_test_scenario(config, vec![]).await;
+        let actions = vec![
+            TestAction::WaitForEvent(WaitCondition::TextReceivedCount(5)),
+            TestAction::AssertMarkedNew { world_name: "world1".to_string(), expected_count: 0 },
+        ];
+        let events = testharness::run_test_scenario(config, actions).await;
 
-        // All ServerData broadcasts for the current (only) world should have marked_new=false
+        // Should still have real ServerData broadcasts (content arrived) - the watermark
+        // itself moved (see the NewWatermark note in test_marked_new_on_non_current_world),
+        // which is what AssertMarkedNew above just confirmed keeps every line non-new.
         let server_data_events: Vec<_> = events.iter()
-            .filter(|e| matches!(e, TestEvent::WsBroadcastServerData(0, _)))
+            .filter(|e| matches!(e, TestEvent::WsBroadcastServerData(0)))
             .collect();
         assert!(!server_data_events.is_empty(), "Should have ServerData broadcasts");
-        assert!(server_data_events.iter().all(|e| matches!(e, TestEvent::WsBroadcastServerData(0, false))),
-            "Current world should never have marked_new=true. Events: {:?}", server_data_events);
 
         let _ = server1.await;
     }
@@ -4466,16 +4484,22 @@
 
     // --- build_display_lines tests ---
 
-    /// Helper: create an OutputLine with the given text and marked_new flag
+    /// Helper: create an OutputLine that will render with (or without) the ▶ new-text
+    /// indicator once pushed into a world whose `new_from_seq` watermark is 1 (see the two
+    /// buckets below) - there's no per-line marked_new flag anymore (see
+    /// World::new_from_seq's doc comment in main.rs), so the desired old/new split is
+    /// encoded via seq instead: bucket 0 for "old" (seq < watermark), bucket 1 for "new"
+    /// (seq >= watermark). Callers that care about the distinction must set
+    /// `world.new_from_seq = 1` after construction; tests that don't check old/new at all
+    /// can ignore this and it's a harmless no-op.
     fn make_output_line(text: &str, marked_new: bool) -> OutputLine {
         OutputLine {
             text: text.to_string(),
             timestamp: std::time::SystemTime::now(),
             from_server: true,
             gagged: false,
-            seq: 0,
+            seq: if marked_new { 1 } else { 0 },
             highlight_color: None,
-            marked_new,
             from_archive: false,
         }
     }
@@ -4494,6 +4518,7 @@
         for i in 0..20 {
             world.output_lines.push(make_output_line(&format!("New line {}", i + 1), true));
         }
+        world.new_from_seq = 1; // see make_output_line's doc comment
         // scroll_offset at the end
         world.scroll_offset = world.output_lines.len() - 1;
 
@@ -4529,6 +4554,7 @@
         for i in 0..21 {
             world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
         }
+        world.new_from_seq = 1; // see make_output_line's doc comment
         world.scroll_offset = world.output_lines.len() - 1;
 
         let settings = Settings { new_line_indicator: true, ..Settings::default() };
@@ -4564,6 +4590,7 @@
         for i in 0..100 {
             world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
         }
+        world.new_from_seq = 1; // see make_output_line's doc comment
         world.scroll_offset = world.output_lines.len() - 1;
 
         let settings = Settings { new_line_indicator: true, ..Settings::default() };
@@ -4593,6 +4620,7 @@
         for i in 0..20 {
             world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
         }
+        world.new_from_seq = 1; // see make_output_line's doc comment
         world.scroll_offset = world.output_lines.len() - 1;
 
         let settings = Settings { new_line_indicator: false, ..Settings::default() };
@@ -4919,6 +4947,7 @@ if you're more curious.\"";
         for i in 0..19 {
             world.output_lines.push(make_output_line(&format!("Pending {}", i + 1), true));
         }
+        world.new_from_seq = 1; // see make_output_line's doc comment
         world.scroll_offset = world.output_lines.len() - 1;
         // Still have 11 more in pending
         world.paused = true;
@@ -5711,7 +5740,6 @@ if you're more curious.\"";
             from_server: true,
             seq,
             end_seq: None,
-            marked_new: false,
             flush: false,
             gagged: false,
         };
@@ -5783,7 +5811,6 @@ if you're more curious.\"";
             from_server: true,
             seq,
             end_seq: None,
-            marked_new: false,
             flush: false,
             gagged: false,
         }
@@ -5852,7 +5879,6 @@ if you're more curious.\"";
             from_server: true,
             seq,
             highlight_color: None,
-            marked_new: false,
             from_archive: false,
         }).collect();
         app.handle_remote_ws_message(WsMessage::ScrollbackLines {
@@ -5914,7 +5940,6 @@ if you're more curious.\"";
             from_server: true,
             seq,
             highlight_color: None,
-            marked_new: false,
             from_archive: false,
         }).collect();
         let older_count = older_lines.len();
@@ -6181,7 +6206,6 @@ if you're more curious.\"";
             gagged: false,
             seq: 0,
             highlight_color: if highlighted { Some("red".to_string()) } else { None },
-            marked_new: false,
             from_archive: false,
         }
     }
@@ -6473,14 +6497,17 @@ if you're more curious.\"";
         assert!(close > open + 1, "empty platform/arch tag: {:?}", s);
     }
 
-    /// Step 10 (PROTOCOL-ROADMAP.md): `ServerData.from_server`/`marked_new` now skip
-    /// serialization when they equal their defaults (true/false respectively), mirroring
-    /// `flush`/`gagged`. Confirms the omission round-trips correctly: the common-case
-    /// values are dropped from the JSON, and deserializing that trimmed JSON reconstructs
-    /// the exact same struct via the `#[serde(default = "default_true")]`/`#[serde(default)]`
-    /// fallbacks already present for wire compatibility with old clients/servers.
+    /// Step 10 (PROTOCOL-ROADMAP.md): `ServerData.from_server` skips serialization when it
+    /// equals its default (true), mirroring `flush`/`gagged`. Confirms the omission
+    /// round-trips correctly: the common-case value is dropped from the JSON, and
+    /// deserializing that trimmed JSON reconstructs the exact same struct via the
+    /// `#[serde(default = "default_true")]` fallback already present for wire compatibility
+    /// with old clients/servers. (`marked_new` used to be covered by this same test - removed
+    /// along with the field itself, see World::new_from_seq's doc comment in main.rs; an old
+    /// server that still sends it is simply ignored, per persistence.rs's TimestampedLine
+    /// note on unknown-field tolerance.)
     #[test]
-    fn test_server_data_common_case_omits_from_server_and_marked_new() {
+    fn test_server_data_common_case_omits_from_server() {
         let msg = WsMessage::ServerData {
             world_index: 0,
             data: "hello\n".to_string(),
@@ -6493,20 +6520,18 @@ if you're more curious.\"";
             // system/command-reply messages) and must stay omitted from the wire in that
             // case, same skip_serializing_if treatment as flush/gagged.
             end_seq: None,
-            marked_new: false,
             flush: false,
             gagged: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("from_server"), "from_server should be omitted when true: {}", json);
-        assert!(!json.contains("marked_new"), "marked_new should be omitted when false: {}", json);
         assert!(!json.contains("flush"), "flush should still be omitted when false: {}", json);
         assert!(!json.contains("gagged"), "gagged should still be omitted when false: {}", json);
         assert!(!json.contains("end_seq"), "end_seq should be omitted when None: {}", json);
 
         let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
         match round_tripped {
-            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, end_seq, marked_new, flush, gagged } => {
+            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, end_seq, flush, gagged } => {
                 assert_eq!(world_index, 0);
                 assert_eq!(data, "hello\n");
                 assert!(is_viewed);
@@ -6514,7 +6539,6 @@ if you're more curious.\"";
                 assert!(from_server, "from_server must default back to true");
                 assert_eq!(seq, 7);
                 assert_eq!(end_seq, None, "end_seq must default back to None");
-                assert!(!marked_new, "marked_new must default back to false");
                 assert!(!flush);
                 assert!(!gagged);
             }
@@ -6522,13 +6546,12 @@ if you're more curious.\"";
         }
     }
 
-    /// Companion to the above: confirms the non-default values (from_server: false,
-    /// marked_new: true) are still explicitly present on the wire, so the new
-    /// `skip_serializing_if` is conditional on the default, not a blanket omission. Also
-    /// covers end_seq's present case: a real Some(u64) value must round-trip on the wire,
-    /// not be trimmed - only None is omitted.
+    /// Companion to the above: confirms the non-default value (from_server: false) is still
+    /// explicitly present on the wire, so the `skip_serializing_if` is conditional on the
+    /// default, not a blanket omission. Also covers end_seq's present case: a real Some(u64)
+    /// value must round-trip on the wire, not be trimmed - only None is omitted.
     #[test]
-    fn test_server_data_non_default_from_server_and_marked_new_are_serialized() {
+    fn test_server_data_non_default_from_server_is_serialized() {
         let msg = WsMessage::ServerData {
             world_index: 1,
             data: "system message".to_string(),
@@ -6537,23 +6560,35 @@ if you're more curious.\"";
             from_server: false,
             seq: 0,
             end_seq: Some(5),
-            marked_new: true,
             flush: false,
             gagged: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"from_server\":false"), "from_server:false must be present on the wire: {}", json);
-        assert!(json.contains("\"marked_new\":true"), "marked_new:true must be present on the wire: {}", json);
         assert!(json.contains("\"end_seq\":5"), "end_seq:Some(5) must be present on the wire, not trimmed: {}", json);
 
         let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
         match round_tripped {
-            WsMessage::ServerData { from_server, marked_new, end_seq, .. } => {
+            WsMessage::ServerData { from_server, end_seq, .. } => {
                 assert!(!from_server);
-                assert!(marked_new);
                 assert_eq!(end_seq, Some(5));
             }
             other => panic!("expected ServerData, got {:?}", other),
+        }
+    }
+
+    /// New-text (▶) watermark: WsMessage::NewWatermark round-trips on the wire.
+    #[test]
+    fn test_new_watermark_round_trips() {
+        let msg = WsMessage::NewWatermark { world_index: 2, new_from_seq: 42 };
+        let json = serde_json::to_string(&msg).unwrap();
+        let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            WsMessage::NewWatermark { world_index, new_from_seq } => {
+                assert_eq!(world_index, 2);
+                assert_eq!(new_from_seq, 42);
+            }
+            other => panic!("expected NewWatermark, got {:?}", other),
         }
     }
 
@@ -6573,26 +6608,26 @@ if you're more curious.\"";
         let mut app = App::new();
         app.worlds.clear();
 
+        // World::new_from_seq defaults to 0, so these 5 lines (seq 0..5, from_server by
+        // OutputLine::new's default) are all ▶ (new) without any extra setup.
         let mut world_a = World::new("a");
         for i in 0..5 {
-            let mut line = OutputLine::new(format!("a-line-{}", i), i as u64);
-            line.marked_new = true;
-            world_a.output_lines.push(line);
+            world_a.output_lines.push(OutputLine::new(format!("a-line-{}", i), i as u64));
         }
-        world_a.first_marked_new_index = Some(0);
         app.worlds.push(world_a);
         app.worlds.push(World::new("b"));
 
         let fresh_client_id = 999; // never inserted into ws_client_worlds
-        assert!(app.ws_client_worlds.get(&fresh_client_id).is_none(),
+        assert!(!app.ws_client_worlds.contains_key(&fresh_client_id),
             "precondition: this client_id must be unknown to the server, like after a reconnect");
 
         app.handle_mark_world_seen(fresh_client_id, 1, Some(0));
 
-        assert!(app.worlds[0].output_lines.iter().all(|l| !l.marked_new),
-            "world 'a' (the world being left) must have marked_new cleared via previous_world_index, \
-             even though the server had no prior ws_client_worlds entry for this client_id");
-        assert!(app.worlds[0].first_marked_new_index.is_none());
+        assert!(app.worlds[0].output_lines.iter().all(|l| !app.worlds[0].line_is_new(l)),
+            "world 'a' (the world being left) must have its ▶ watermark advanced via \
+             previous_world_index, even though the server had no prior ws_client_worlds entry \
+             for this client_id");
+        assert!(app.worlds[0].new_from_seq >= 5, "watermark must pass every line in world 'a'");
         assert_eq!(app.worlds[1].unseen_lines, 0, "mark_seen() must clear the new world's unseen count");
 
         let log = app.ws_broadcast_log.lock().unwrap();
@@ -6600,6 +6635,9 @@ if you're more curious.\"";
             "expected UnseenCleared(1). Log: {:?}", log);
         assert!(log.iter().any(|m| matches!(m, WsMessage::ActivityUpdate { .. })),
             "expected an ActivityUpdate broadcast. Log: {:?}", log);
+        assert!(log.iter().any(|m| matches!(m, WsMessage::NewWatermark { world_index: 0, .. })),
+            "expected a NewWatermark broadcast for world 'a' so other instances stop showing ▶ \
+             on it too - this is the multi-instance sync the watermark model exists for. Log: {:?}", log);
     }
 
     /// Without a client-supplied previous_world_index (older client, or the remote-console
@@ -6610,10 +6648,7 @@ if you're more curious.\"";
         let mut app = App::new();
         app.worlds.clear();
         let mut world_a = World::new("a");
-        let mut line = OutputLine::new("a-line".to_string(), 0);
-        line.marked_new = true;
-        world_a.output_lines.push(line);
-        world_a.first_marked_new_index = Some(0);
+        world_a.output_lines.push(OutputLine::new("a-line".to_string(), 0));
         app.worlds.push(world_a);
         app.worlds.push(World::new("b"));
 
@@ -6629,8 +6664,8 @@ if you're more curious.\"";
 
         app.handle_mark_world_seen(client_id, 1, None);
 
-        assert!(app.worlds[0].output_lines.iter().all(|l| !l.marked_new),
-            "world 'a' must still be cleared via the ws_client_worlds fallback lookup");
+        assert!(app.worlds[0].output_lines.iter().all(|l| !app.worlds[0].line_is_new(l)),
+            "world 'a' must still have its ▶ watermark advanced via the ws_client_worlds fallback lookup");
         assert_eq!(app.ws_client_worlds.get(&client_id).map(|s| s.world_index), Some(1));
     }
 
@@ -6641,17 +6676,14 @@ if you're more curious.\"";
         let mut app = App::new();
         app.worlds.clear();
         let mut world_a = World::new("a");
-        let mut line = OutputLine::new("a-line".to_string(), 0);
-        line.marked_new = true;
-        world_a.output_lines.push(line);
-        world_a.first_marked_new_index = Some(0);
+        world_a.output_lines.push(OutputLine::new("a-line".to_string(), 0));
         app.worlds.push(world_a);
 
         app.handle_mark_world_seen(1, 0, Some(0));
 
-        assert!(app.worlds[0].output_lines[0].marked_new,
+        assert!(app.worlds[0].line_is_new(&app.worlds[0].output_lines[0]),
             "marking the world you're already on as seen must not clear its own ▶ markers \
-             (those only clear when switching AWAY, per World::clear_new_line_indicators)");
+             (those only clear when switching AWAY, per World::mark_displayed())");
     }
 
     // ========== Resume semantics: grace window for a briefly-disconnected WS client ==========
@@ -6743,12 +6775,16 @@ if you're more curious.\"";
         assert!(!app.ws_client_worlds.contains_key(&3));
     }
 
-    // ========== Resume semantics: pending lines are always ▶, the non-pending screenful isn't ==========
+    // ========== Rule 1: arrival wins - a viewed world is never ▶, pending or not ==========
 
     #[test]
-    fn test_pending_lines_marked_new_even_when_current() {
-        // A line that must be released with PgDn/Tab is unseen by definition, even on the
-        // world you're currently viewing - it wasn't shown to you yet.
+    fn test_pending_lines_not_marked_new_when_current() {
+        // Rule 1 (see World::new_from_seq's doc comment): a line is new iff nobody was
+        // viewing the world when it arrived. Someone IS viewing here (is_current: true), so
+        // even though this line lands in pending_lines (must be released with PgDn/Tab), it
+        // must NOT be ▶ - arrival state decides new-ness, not display state. This is the
+        // opposite of the old per-line model, which unconditionally flagged every pending
+        // line regardless of who was watching when it arrived.
         let mut world = World::new("test");
         let settings = Settings { more_mode_enabled: true, ..Settings::default() };
         world.paused = true; // already paused: new output goes straight to pending_lines
@@ -6756,8 +6792,8 @@ if you're more curious.\"";
         world.add_output("held back line\n", true /* is_current */, &settings, 24, 80, false, true);
 
         assert_eq!(world.pending_lines.len(), 1);
-        assert!(world.pending_lines[0].marked_new,
-            "a pending (more-mode held-back) line must be marked_new even when is_current is true");
+        assert!(!world.line_is_new(&world.pending_lines[0]),
+            "a pending line arriving while the world is viewed must not be ▶ - arrival wins over display state");
         // unseen_lines stays gated on !is_current - a pending line on the world you're
         // looking at isn't "unseen" in the aggregate-activity sense, only "not yet displayed".
         assert_eq!(world.unseen_lines, 0);
@@ -6766,14 +6802,42 @@ if you're more curious.\"";
     #[test]
     fn test_output_lines_not_marked_new_when_current_and_not_pending() {
         // The non-pending screenful shown immediately on a world you're viewing must NOT
-        // get the ▶ marker - only PgDn/Tab-gated pending lines do.
+        // get the ▶ marker either - consistent with the pending case above, since is_current
+        // is what actually decides new-ness now, not the pending/output split.
         let mut world = World::new("test");
         let settings = Settings { more_mode_enabled: true, ..Settings::default() };
 
         world.add_output("visible line\n", true /* is_current */, &settings, 24, 80, false, true);
 
         assert_eq!(world.output_lines.len(), 1);
-        assert!(!world.output_lines[0].marked_new);
+        assert!(!world.line_is_new(&world.output_lines[0]));
         assert!(world.pending_lines.is_empty());
+    }
+
+    #[test]
+    fn test_filter_to_server_output_clears_output_but_preserves_pending_markers() {
+        // Ctrl+L (World::filter_to_server_output) marks whatever's currently displayed as
+        // seen, but must NOT touch pending_lines - they haven't been displayed yet (that's
+        // what pending means), so rule 2 says they keep their ▶ regardless of Ctrl+L. This
+        // is a deliberate behavior change from the old model, which used to blanket-clear
+        // marked_new on both output_lines and pending_lines.
+        let mut world = World::new("test");
+        for i in 0..3u64 {
+            world.output_lines.push(OutputLine::new(format!("output {i}"), i));
+        }
+        for i in 3..6u64 {
+            world.pending_lines.push(OutputLine::new(format!("pending {i}"), i));
+        }
+        // Defaults: new_from_seq = 0, so everything above (output and pending) starts ▶.
+        assert!(world.output_lines.iter().all(|l| world.line_is_new(l)));
+        assert!(world.pending_lines.iter().all(|l| world.line_is_new(l)));
+
+        world.filter_to_server_output();
+
+        assert!(world.output_lines.iter().all(|l| !world.line_is_new(l)),
+            "output_lines must lose their ▶ marker after Ctrl+L");
+        assert!(world.pending_lines.iter().all(|l| world.line_is_new(l)),
+            "pending_lines must KEEP their ▶ marker after Ctrl+L - they're still undisplayed");
+        assert_eq!(world.new_from_seq, 3, "watermark must land exactly past the last displayed seq");
     }
 
