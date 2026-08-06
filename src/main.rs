@@ -3183,7 +3183,13 @@ impl World {
 
     /// Push a pre-built client OutputLine honoring more-mode: queued into pending_lines
     /// when paused so it appears after already-queued output; otherwise shown immediately.
-    fn push_line_respecting_pending(&mut self, line: OutputLine, more_mode_enabled: bool) {
+    /// Returns `true` if the line landed in `output_lines` (displayed now, safe for a caller
+    /// to broadcast its seq immediately) or `false` if it was deferred into `pending_lines`
+    /// (not yet displayed - a caller must NOT broadcast this seq now, or a client's dedup
+    /// high-water-mark advances past still-queued lower-seq pending content, which then gets
+    /// silently dropped as a false duplicate when it's eventually released via
+    /// `broadcast_released_lines`. See `handle_disconnected`'s callers for why this matters.)
+    fn push_line_respecting_pending(&mut self, line: OutputLine, more_mode_enabled: bool) -> bool {
         if self.paused && more_mode_enabled {
             if self.pending_lines.is_empty() {
                 self.pending_since = Some(std::time::Instant::now());
@@ -3192,9 +3198,11 @@ impl World {
                 }
             }
             self.pending_lines.push(line);
+            false
         } else {
             self.output_lines.push(line);
             self.scroll_to_bottom();
+            true
         }
     }
 
@@ -6719,28 +6727,38 @@ impl App {
 
     /// Broadcasts a set of just-released pending lines (from `World::release_pending` /
     /// `release_all_pending`) to WS clients viewing `world_idx`, grouped into batches by
-    /// `from_server` so each batch gets the correct client-line marker. This is the single
-    /// broadcast implementation shared by every release site (`release_pending_lines`,
-    /// `release_pending_screenful`, `selective_flush`, and the `input_handler.rs` release
-    /// actions) — previously each site either duplicated this grouping logic with its own copy
-    /// of the release budget calculation (a divergence that let `release_pending_screenful`
-    /// broadcast lines it hadn't actually released, see its call site) or hardcoded
-    /// `from_server: true` for an entire batch regardless of each line's real flag. Taking
-    /// `released: &[OutputLine]` directly — the exact lines that were moved into `output_lines`
-    /// — makes both bugs structurally impossible: what's broadcast can never diverge from what
-    /// was released, and each line's own flag travels with it.
+    /// `(from_server, gagged)` so each batch gets the correct client-line marker and gagged
+    /// status. This is the single broadcast implementation shared by every release site
+    /// (`release_pending_lines`, `release_pending_screenful`, `selective_flush`, and the
+    /// `input_handler.rs` release actions) — previously each site either duplicated this
+    /// grouping logic with its own copy of the release budget calculation (a divergence that
+    /// let `release_pending_screenful` broadcast lines it hadn't actually released, see its
+    /// call site) or hardcoded `from_server: true` for an entire batch regardless of each
+    /// line's real flag. Taking `released: &[OutputLine]` directly — the exact lines that were
+    /// moved into `output_lines` — makes both bugs structurally impossible: what's broadcast
+    /// can never diverge from what was released, and each line's own flags travel with it.
+    ///
+    /// `gagged` is part of the grouping (not just read off the first line and hardcoded) for
+    /// the same reason `from_server` is: a gagged line arriving while a world is already
+    /// paused with a backlog is routed into `pending_lines` right alongside ordinary content
+    /// instead of getting its own immediate broadcast (see `process_server_data`'s
+    /// `hold_gagged_in_pending`), so `released` can genuinely mix gagged and non-gagged lines.
+    /// The old code hardcoded `gagged: false` on every emitted message regardless, which - since
+    /// a client applies a `ServerData` message's `gagged` flag to every line it contains, not
+    /// per-line - made a previously-gagged line render as ordinary visible text the moment its
+    /// backlog was released.
     ///
     /// `seq`/`end_seq` are the real span of each contiguous-seq sub-batch (Step 6 of the
     /// seq-drift fix) rather than the old `seq: 0` "bypass dedup" convention — safe now that
     /// `World::output_lines` is guaranteed seq-sorted through a pause (see the invariant note
     /// on `process_server_data`'s gagged-line handling). Grouping is therefore
-    /// `(from_server, seq contiguity)`: `released` is normally one contiguous run
+    /// `(from_server, gagged, seq contiguity)`: `released` is normally one contiguous run
     /// (`release_pending`/`release_all_pending` always drain a contiguous prefix), but
     /// `selective_flush`'s caller can pass a non-contiguous subset (only lines matching some
-    /// filter), so a seq gap also starts a new batch even when `from_server` doesn't change -
-    /// otherwise a batch's `seq..=end_seq` span would claim to cover lines it doesn't actually
-    /// contain. The ▶ new-text watermark is no longer part of this grouping: it's a single
-    /// per-world value (`World::new_from_seq`) broadcast separately via `NewWatermark`
+    /// filter), so a seq gap also starts a new batch even when `from_server`/`gagged` don't
+    /// change - otherwise a batch's `seq..=end_seq` span would claim to cover lines it doesn't
+    /// actually contain. The ▶ new-text watermark is no longer part of this grouping: it's a
+    /// single per-world value (`World::new_from_seq`) broadcast separately via `NewWatermark`
     /// whenever it moves, not a per-line flag riding along with the content - see
     /// `World::new_from_seq`'s doc comment. Callers are responsible for calling
     /// `App::broadcast_watermark_if_changed` themselves around whatever advanced it (typically
@@ -6752,12 +6770,13 @@ impl App {
         let ts = current_timestamp_secs();
         let mut batch: Vec<String> = Vec::new();
         let mut batch_from_server = released[0].from_server;
+        let mut batch_gagged = released[0].gagged;
         let mut batch_start_seq = released[0].seq;
         let mut batch_end_seq = released[0].seq;
         let mut prev_seq: Option<u64> = None;
         for line in released {
             let seq_contiguous = prev_seq.map(|p| line.seq == p + 1).unwrap_or(true);
-            if (line.from_server != batch_from_server || !seq_contiguous) && !batch.is_empty() {
+            if (line.from_server != batch_from_server || line.gagged != batch_gagged || !seq_contiguous) && !batch.is_empty() {
                 let ws_data = batch.join("\n") + "\n";
                 self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                     world_index: world_idx,
@@ -6767,10 +6786,11 @@ impl App {
                     from_server: batch_from_server,
                     seq: batch_start_seq,
                     end_seq: Some(batch_end_seq),
-                    flush: false, gagged: false,
+                    flush: false, gagged: batch_gagged,
                 });
                 batch.clear();
                 batch_from_server = line.from_server;
+                batch_gagged = line.gagged;
                 batch_start_seq = line.seq;
             }
             batch_end_seq = line.seq;
@@ -6787,7 +6807,7 @@ impl App {
                 from_server: batch_from_server,
                 seq: batch_start_seq,
                 end_seq: Some(batch_end_seq),
-                flush: false, gagged: false,
+                flush: false, gagged: batch_gagged,
             });
         }
     }
@@ -8148,7 +8168,7 @@ impl App {
         let seq = self.worlds[world_idx].next_seq;
         self.worlds[world_idx].next_seq += 1;
         let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
-        self.worlds[world_idx].push_line_respecting_pending(disconnect_msg.clone(), more_mode);
+        let disconnect_msg_displayed = self.worlds[world_idx].push_line_respecting_pending(disconnect_msg.clone(), more_mode);
 
         // If this is not the current world, increment unseen_lines for activity indicator
         if world_idx != self.current_world_index {
@@ -8163,16 +8183,26 @@ impl App {
             self.needs_output_redraw = true;
         }
 
-        // Broadcast disconnect message to WebSocket clients viewing this world
-        self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-            world_index: world_idx,
-            data: "Disconnected.\n".to_string(),
-            is_viewed: true,
-            ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-            from_server: false,
-            seq, end_seq: None,
-            flush: false, gagged: false,
-        });
+        // Broadcast disconnect message to WebSocket clients viewing this world - but only if
+        // it was actually displayed (push_line_respecting_pending returned true). If the world
+        // was already paused with a backlog, this line's real seq went into pending_lines
+        // instead, still waiting behind older, lower-seq content; broadcasting it here anyway
+        // would advance a client's dedup high-water-mark past that still-queued content,
+        // making it look like an already-seen duplicate once actually released later via
+        // broadcast_released_lines - which is exactly what used to silently swallow a paused
+        // world's pending output after a disconnect/reconnect. Deferred messages ride along
+        // with the rest of the backlog on release instead, same as every other pending line.
+        if disconnect_msg_displayed {
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data: "Disconnected.\n".to_string(),
+                is_viewed: true,
+                ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                from_server: false,
+                seq, end_seq: None,
+                flush: false, gagged: false,
+            });
+        }
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
 
         // Schedule auto-reconnect if configured and world was previously connected
@@ -8184,16 +8214,20 @@ impl App {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             let msg = OutputLine::new_client(format!("Reconnecting in {} seconds...", secs), seq);
-            self.worlds[world_idx].push_line_respecting_pending(msg.clone(), more_mode);
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                world_index: world_idx,
-                data: format!("Reconnecting in {} seconds...\n", secs),
-                is_viewed: true,
-                ts: msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                from_server: false,
-                seq, end_seq: None,
-                flush: false, gagged: false,
-            });
+            let reconnect_msg_displayed = self.worlds[world_idx].push_line_respecting_pending(msg.clone(), more_mode);
+            // Same reasoning as the "Disconnected." broadcast above: only send this now if it
+            // was actually displayed, not deferred into pending_lines behind older content.
+            if reconnect_msg_displayed {
+                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                    world_index: world_idx,
+                    data: format!("Reconnecting in {} seconds...\n", secs),
+                    is_viewed: true,
+                    ts: msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    from_server: false,
+                    seq, end_seq: None,
+                    flush: false, gagged: false,
+                });
+            }
         }
     }
 

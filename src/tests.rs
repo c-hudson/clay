@@ -2372,6 +2372,98 @@
     }
 
     #[test]
+    fn test_broadcast_released_lines_preserves_per_line_gagged_status() {
+        // Regression guard: broadcast_released_lines used to hardcode gagged: false on every
+        // emitted ServerData regardless of the actual lines' gagged status, and didn't split a
+        // batch when gagged-ness changed between consecutive lines - both structurally possible
+        // since a gagged line arriving while a world is already paused with a backlog gets
+        // routed into pending_lines right alongside ordinary content (process_server_data's
+        // hold_gagged_in_pending). A client applies a message's gagged flag to every line it
+        // contains, so a mixed batch sent as gagged: false made previously-gagged text render
+        // as ordinary visible text the moment its backlog was released.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        // Contiguous seqs 0..5, gagged pattern: visible, GAGGED, GAGGED, visible, visible -
+        // two boundaries, so three batches expected.
+        let gagged_pattern = [false, true, true, false, false];
+        let released: Vec<OutputLine> = (0..5u64).map(|i| {
+            let mut line = OutputLine::new(format!("line {i}"), i);
+            line.gagged = gagged_pattern[i as usize];
+            line
+        }).collect();
+
+        app.broadcast_released_lines(0, &released);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let server_data: Vec<(u64, Option<u64>, bool)> = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { seq, end_seq, gagged, .. } = m { Some((*seq, *end_seq, *gagged)) } else { None }
+        }).collect();
+        assert_eq!(server_data.len(), 3,
+            "a gagged-status change must start a new batch, even with contiguous seqs: {server_data:?}");
+        assert_eq!(server_data[0], (0, Some(0), false), "line 0 (visible) alone");
+        assert_eq!(server_data[1], (1, Some(2), true), "lines 1-2 (gagged) batched together");
+        assert_eq!(server_data[2], (3, Some(4), false), "lines 3-4 (visible) batched together");
+    }
+
+    #[test]
+    fn test_disconnect_message_not_broadcast_when_deferred_to_pending() {
+        // Regression guard: handle_disconnected used to broadcast "Disconnected."'s real seq
+        // unconditionally, even when push_line_respecting_pending deferred it into
+        // pending_lines (world already paused with a backlog) rather than displaying it now.
+        // That advanced a client's dedup high-water-mark (world._max_seq) past still-queued,
+        // lower-seq pending content, which then got silently dropped as a false duplicate once
+        // actually released via broadcast_released_lines (seq-drift fix broadcasts real seqs,
+        // no longer the old seq: 0 sentinel that used to make this harmless) - the entire
+        // backlog for that world became permanently unrecoverable after a disconnect/reconnect
+        // while paused.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+        app.worlds[0].paused = true;
+
+        // Existing backlog: 3 lines already queued (seq 0,1,2), not yet delivered to the client.
+        for i in 0..3u64 {
+            let seq = app.worlds[0].next_seq;
+            app.worlds[0].next_seq += 1;
+            app.worlds[0].pending_lines.push(OutputLine::new(format!("backlog {i}"), seq));
+        }
+
+        app.ws_broadcast_log.lock().unwrap().clear();
+        app.handle_disconnected(0);
+
+        // The "Disconnected." message must have been deferred into pending_lines (world was
+        // paused with a non-empty backlog), not displayed - and therefore must NOT have been
+        // broadcast yet.
+        assert_eq!(app.worlds[0].pending_lines.len(), 4, "backlog (3) + deferred Disconnected. message");
+        assert_eq!(app.worlds[0].pending_lines.last().unwrap().text, "Disconnected.");
+        {
+            let log = app.ws_broadcast_log.lock().unwrap();
+            let disconnected_broadcasts: Vec<_> = log.iter().filter(|m| {
+                matches!(m, WsMessage::ServerData { data, .. } if data.contains("Disconnected."))
+            }).collect();
+            assert!(disconnected_broadcasts.is_empty(),
+                "Disconnected. must not be broadcast while still sitting in pending_lines: {disconnected_broadcasts:?}");
+        }
+
+        // Once the backlog (including the deferred Disconnected. message) is actually
+        // released, it must show up exactly once, with its real seq intact.
+        app.ws_broadcast_log.lock().unwrap().clear();
+        app.release_pending_lines(1, 0, 0); // count: 0 = release all
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let combined_data: String = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { data, .. } = m { Some(data.clone()) } else { None }
+        }).collect();
+        assert!(combined_data.contains("Disconnected."),
+            "Disconnected. must be delivered once the backlog is released: {combined_data:?}");
+        assert!(app.worlds[0].pending_lines.is_empty());
+    }
+
+    #[test]
     fn test_add_output_broadcasts_real_seq() {
         // Regression guard: App::add_output used to broadcast the raw input text with
         // seq: 0 unconditionally, regardless of the real seq the line actually got in
