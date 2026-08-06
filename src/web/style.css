@@ -2624,16 +2624,16 @@ body.device-phone .settings-content {
 /* Help popup */
 .help-modal-content {
     min-width: min(500px, 95vw);
-    max-width: min(90vw, 700px);
+    max-width: min(90vw, 640px);
     width: 90vw;
-    padding: 12px;
+    padding: 14px;
     box-sizing: border-box;
-    font-family: var(--mono);
+    font-family: var(--sans);
     font-size: 13px;
 }
 
 .help-content {
-    max-height: 60vh;
+    max-height: 65vh;
     overflow-y: auto;
     white-space: normal;
     line-height: 1.4;
@@ -2641,47 +2641,158 @@ body.device-phone .settings-content {
     color: var(--text-color);
 }
 
-.help-table {
+/* Quick-start cards: task-oriented ("tap X to do Y"), no /command syntax -
+   written for web/GUI/Android users who tap menus rather than type commands.
+   Console keeps its own separate, terser getting-started help (see
+   src/popup/definitions/help.rs) - deliberately not the same content.
+   Box-free by design: a hairline divider separates rows instead of a
+   bordered card, so items stay compact on a phone screen. */
+.help-quickstart {
+    display: flex;
+    flex-direction: column;
+}
+
+.help-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--theme-border-subtle, #333);
+}
+
+body.device-phone .help-card {
+    padding: 6px 0;
+}
+
+.help-card:last-child {
+    border-bottom: 0;
+}
+
+.help-card-icon {
+    flex-shrink: 0;
+    width: 26px;
+    height: 26px;
+    color: var(--theme-accent, #00cdcd);
+}
+
+.help-card-icon svg {
+    width: 17px;
+    height: 17px;
+}
+
+.help-card h3 {
+    font-size: 13px;
+    margin: 0 0 2px;
+    font-weight: 700;
+    color: var(--text-color);
+}
+
+.help-card p {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--theme-fg-secondary, #999);
+    /* Hard cap at two lines - overflow is trimmed rather than pushing the
+       list taller, which is what keeps the phone view scannable. */
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+}
+
+.help-card p a {
+    color: var(--theme-prompt, #0cc);
+}
+
+.help-card kbd {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    background: var(--theme-bg-elevated, #1f1f1f);
+    color: var(--text-color);
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--theme-border-medium, #404040);
+}
+
+/* Full command & keybinding reference - everything the old flat table had,
+   collapsed by default and reorganized into per-category disclosures so it
+   doesn't have to be the first (or only) thing anyone sees. */
+.help-ref-toggle {
+    margin-top: 8px;
+    border: 1px dashed var(--theme-border-medium, #404040);
+    border-radius: 8px;
+}
+
+.help-ref-toggle > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 9px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--theme-fg-secondary, #999);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.help-ref-toggle > summary::-webkit-details-marker { display: none; }
+.help-ref-toggle > summary .help-ref-chev { margin-left: auto; transition: transform 0.15s ease; }
+.help-ref-toggle[open] > summary .help-ref-chev { transform: rotate(180deg); }
+
+.help-ref-body {
+    padding: 2px 10px 10px;
+}
+
+.help-ref-group {
+    border-top: 1px solid var(--theme-border-subtle, #333);
+}
+
+.help-ref-group summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 8px 2px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--theme-fg-muted, #666);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.help-ref-group summary::-webkit-details-marker { display: none; }
+.help-ref-group summary .help-ref-chev { margin-left: auto; transition: transform 0.15s ease; }
+.help-ref-group[open] summary .help-ref-chev { transform: rotate(180deg); }
+
+.help-ref-table {
     width: 100%;
     border-collapse: collapse;
-    text-align: left;
+    font-family: var(--mono);
+    margin: 2px 0 6px;
 }
 
-.help-table td {
-    padding: 1px 4px;
+.help-ref-table td {
+    padding: 3px 2px;
     vertical-align: top;
+    font-size: 11.5px;
 }
 
-.help-section-heading {
-    font-weight: bold;
-    color: var(--theme-separator-text, #fff);
-    padding-top: 4px !important;
+.help-ref-table td:first-child {
     white-space: nowrap;
+    color: var(--text-color);
+    padding-right: 10px;
 }
 
-.help-note {
-    font-weight: normal;
-    color: var(--theme-separator-dim, #666);
-    font-size: 0.9em;
+body.device-phone .help-ref-table td:first-child {
+    white-space: normal;
+    word-break: break-word;
 }
 
-.help-sub-heading {
-    color: var(--theme-prompt, #0cc);
-    padding-left: 8px !important;
-    padding-top: 2px !important;
-}
-
-.help-left {
-    white-space: nowrap;
-    padding-left: 16px !important;
-    color: var(--theme-separator-text, #ddd);
-    width: 1%;
-}
-
-.help-right {
-    text-align: left;
-    color: var(--theme-separator-dim, #999);
-    padding-left: 24px !important;
+.help-ref-table td:last-child {
+    font-family: var(--sans);
+    color: var(--theme-fg-secondary, #999);
 }
 
 .help-content a {

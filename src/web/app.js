@@ -5394,8 +5394,10 @@
     }
 
     // Help popup functions (/help)
-    // Help content as structured sections: [heading, [left, right], ...]
-    // Empty right = continuation line; null right = section heading
+    // Full command/keybinding reference, structured as sections of {l, r} rows with
+    // occasional {heading} markers for sub-groups. This is no longer the primary Help
+    // view (see buildHelpQuickStartCards below) - renderHelpReferenceHtml() turns it
+    // into the collapsed "full reference" disclosure instead.
     const helpSections = [
         { heading: 'Commands', note: '(/help &lt;command&gt; for details)', rows: [
             { heading: 'Connection' },
@@ -5562,30 +5564,122 @@
         }
     }
 
+    // Task-oriented quick-start cards for the web/GUI/Android Help popup - "tap X to do
+    // Y", never /command syntax, since this audience taps menus rather than typing
+    // commands (unlike console, which keeps its own separate, terser getting-started
+    // help - see src/popup/definitions/help.rs; deliberately different content, not a
+    // CLAUDE.md parity gap). Icons are inline stroke-style SVGs (24x24 viewBox,
+    // stroke-width 1.6) so they render crisp at any zoom without an icon font.
+    // "Make it yours" gets its editor links filled in at render time (needs baseUrl).
+    function buildHelpQuickStartCards(baseUrl) {
+        return [
+            {
+                icon: '<path d="M9 2v4M15 2v4M6 6h12v5a6 6 0 0 1-12 0V6z"/><path d="M12 17v5"/>',
+                title: 'Connect to a world',
+                desc: 'Tap the world name, or open <strong>World Selector</strong> and hit <strong>Add</strong> to set one up.'
+            },
+            {
+                icon: '<path d="M4 8h13l-3-3M20 16H7l3 3"/>',
+                title: 'Switch between worlds',
+                desc: 'Tap the world name, swipe the tabs, or use <kbd>&#9650;</kbd>/<kbd>&#9660;</kbd> at the bottom.'
+            },
+            {
+                icon: '<path d="M3 12l18-8-8 18-2-8-8-2z"/>',
+                title: 'Type &amp; send',
+                desc: 'Type below and tap <strong>Send</strong>. Hold <kbd>&#9650;</kbd>/<kbd>&#9660;</kbd> to reuse something you typed before.'
+            },
+            {
+                icon: '<path d="M4 8l8-4 8 4-8 4-8-4z"/><path d="M4 13l8 4 8-4"/>',
+                title: 'Catch up on output',
+                desc: '<strong>MORE</strong> means text is waiting, tap to reveal it. <strong>ACT</strong> flags other busy worlds.'
+            },
+            {
+                icon: '<path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/>',
+                title: 'Automate with Actions',
+                desc: '<strong>Actions</strong> auto-respond to things the world sends. Pin one to the toolbar as a button.'
+            },
+            {
+                icon: '<path d="M4 6h6M14 6h6M4 12h10M18 12h2M4 18h13M20 18h1"/><circle cx="12" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="19" cy="18" r="2"/>',
+                title: 'Make it yours',
+                desc: 'Settings links to the <a href="' + baseUrl + '/theme-editor" target="_blank">Theme</a> and ' +
+                    '<a href="' + baseUrl + '/keybind-editor" target="_blank">Keybind</a> editors. The A&nbsp;&mdash;&nbsp;A slider resizes text.'
+            },
+            {
+                icon: '<path d="M2 8.5a16 16 0 0 1 20 0M5.5 12a11 11 0 0 1 13 0M9 15.5a6 6 0 0 1 6 0"/><circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"/>',
+                title: 'Use it from anywhere',
+                desc: 'Turn on remote access in <strong>Settings &rarr; Web</strong>, and manage this device&rsquo;s key there.'
+            },
+            {
+                icon: '<rect x="4.5" y="4" width="12" height="16" rx="1.5"/><path d="M8 9.5h5M8 13h5"/><path d="M15.5 15l4-4 2 2-4 4h-2v-2z"/>',
+                title: 'Keep notes',
+                desc: 'The notepad icon (when a world has notes) opens a simple editor for it.'
+            }
+        ];
+    }
+
+    // Transforms helpSections (the exhaustive command/keybinding list, unchanged) into
+    // one <details> per category for the collapsed "full reference" section - same
+    // content the old flat table had, single source of truth, just not the first thing
+    // shown anymore. Commands' rows contain inline {heading} markers for sub-groups
+    // (Connection, Communication, ...); other top-level sections become one group each.
+    function renderHelpRefGroup(label, rows) {
+        let html = '<details class="help-ref-group"><summary>' + label +
+            '<svg class="help-ref-chev" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></summary>';
+        html += '<table class="help-ref-table">';
+        for (const row of rows) {
+            html += '<tr><td>' + row.l + '</td><td>' + row.r + '</td></tr>';
+        }
+        html += '</table></details>';
+        return html;
+    }
+
+    function renderHelpReferenceHtml() {
+        let html = '';
+        for (const section of helpSections) {
+            if (section.heading === 'Commands') {
+                let label = null;
+                let rows = [];
+                const flush = () => {
+                    if (label && rows.length) html += renderHelpRefGroup(label, rows);
+                    rows = [];
+                };
+                for (const row of section.rows) {
+                    if (row.heading) {
+                        flush();
+                        label = row.heading;
+                    } else {
+                        rows.push(row);
+                    }
+                }
+                flush();
+            } else {
+                // "Display" is reused for two different groups (a Commands sub-heading,
+                // and this top-level function-key list) - rename the keybinding one so
+                // the collapsed group labels aren't ambiguous duplicates.
+                const label = section.heading === 'Display' ? 'Function Keys' : section.heading;
+                html += renderHelpRefGroup(label, section.rows);
+            }
+        }
+        return html;
+    }
+
     function openHelpPopup() {
         helpPopupOpen = true;
         const baseUrl = getBaseUrl();
-        let html = '<table class="help-table">';
-        for (const section of helpSections) {
-            html += '<tr><td colspan="2" class="help-section-heading">' + section.heading;
-            if (section.note) html += ' <span class="help-note">' + section.note + '</span>';
-            html += '</td></tr>';
-            for (const row of section.rows) {
-                if (row.heading) {
-                    html += '<tr><td colspan="2" class="help-sub-heading">' + row.heading + '</td></tr>';
-                } else {
-                    html += '<tr><td class="help-left">' + row.l + '</td><td class="help-right">' + row.r + '</td></tr>';
-                }
-            }
-            html += '<tr><td colspan="2">&nbsp;</td></tr>';
+
+        let html = '<div class="help-quickstart">';
+        for (const card of buildHelpQuickStartCards(baseUrl)) {
+            html += '<div class="help-card">' +
+                '<span class="help-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' + card.icon + '</svg></span>' +
+                '<div><h3>' + card.title + '</h3><p>' + card.desc + '</p></div>' +
+                '</div>';
         }
-        // Editor links
-        html += '<tr><td colspan="2" class="help-section-heading">Editors</td></tr>';
-        html += '<tr><td class="help-left"><a href="' + baseUrl + '/theme-editor" target="_blank">Theme Editor</a></td>';
-        html += '<td class="help-right">Customize GUI/web colors</td></tr>';
-        html += '<tr><td class="help-left"><a href="' + baseUrl + '/keybind-editor" target="_blank">Keybind Editor</a></td>';
-        html += '<td class="help-right">Configure keyboard bindings</td></tr>';
-        html += '</table>';
+        html += '</div>';
+
+        html += '<details class="help-ref-toggle"><summary>Show full command &amp; keybinding reference' +
+            '<svg class="help-ref-chev" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></summary>' +
+            '<div class="help-ref-body">' + renderHelpReferenceHtml() + '</div></details>';
+
         elements.helpContent.innerHTML = html;
         elements.helpModal.classList.add('visible');
     }
