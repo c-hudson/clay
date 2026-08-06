@@ -3118,6 +3118,12 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 // reading World::new_from_seq, which tracks the shared World's own
                 // (unused-by-multiuser) output_lines and would be meaningless here.
                 new_from_seq: 0,
+                // Same reasoning as new_from_seq above: multiuser ServerData always hardcodes
+                // seq: 0, so a multiuser client's cached/in-memory _max_seq for this world can
+                // never be a real positive value either - the app.js server-restart-detection
+                // guard this field feeds only fires when the cache claims a real (> 0) seq, so
+                // a constant 0 here is inert, not a false "server restarted" trigger.
+                next_seq: 0,
             }
         }).collect();
 

@@ -771,6 +771,17 @@ pub struct WorldStateMsg {
     /// `seq >= new_from_seq`.
     #[serde(default)]
     pub new_from_seq: u64,
+    /// The server-authoritative "highest seq issued so far this process" counter
+    /// (`World::next_seq`) at connect/reconnect time. Lets a reconnecting client detect a
+    /// server restart: seq counters reset to 0 on every fresh process start (only the
+    /// hot-reload state file persists them across a `/reload`, not a real restart), so if a
+    /// client's cached/in-memory buffer for this world claims a max seq >= this value, that
+    /// buffer predates the current server session and must not be trusted for dedup/hydration
+    /// (see the InitialState handler in app.js). A value of zero is a legitimate real value
+    /// for a freshly-created world, so this is unconditionally serialized like `seq`/`ts`
+    /// elsewhere in this file, not trimmed via `skip_serializing_if`.
+    #[serde(default)]
+    pub next_seq: u64,
 }
 
 /// World settings for WebSocket protocol

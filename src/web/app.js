@@ -2386,8 +2386,37 @@
                 // with no way to recover short of a manual reload.
                 try {
                 worlds.forEach((world, idx) => {
-                    const priorWorld = world.name ? priorWorldsByName[world.name] : null;
-                    const cachedWorld = (!priorWorld && world.name) ? worldCacheLoaded[world.name] : null;
+                    const rawPriorWorld = world.name ? priorWorldsByName[world.name] : null;
+                    const rawCachedWorld = (!rawPriorWorld && world.name) ? worldCacheLoaded[world.name] : null;
+                    // Server-restart detection: seq counters are only monotonic within a
+                    // single server process (see WorldStateMsg.next_seq's doc comment in
+                    // websocket.rs) - a real (>0) seq restart resets to 0. A cached/in-memory
+                    // buffer that claims a real seq at or past what THIS fresh session has
+                    // produced so far (world.next_seq) cannot belong to the current server
+                    // run; it predates a restart. Trusting it anyway is exactly the bug this
+                    // guards against: every subsequent live ServerData batch for this world
+                    // would satisfy the "already seen" dedup check below (world._max_seq) and
+                    // be silently dropped forever - output frozen at connect time, surviving
+                    // even a manual resync, since RequestState re-runs this same hydration
+                    // and lands on the same poisoned buffer again. `> 0` on the candidate's
+                    // own max seq (not just `>=`) avoids a false positive when neither side
+                    // has ever recorded a real seq yet (a brand-new world, or multiuser mode,
+                    // where World.next_seq is always sent as a hardcoded 0 - see its doc
+                    // comment in daemon.rs's InitialState builder).
+                    const serverNextSeq = world.next_seq || 0;
+                    const priorWorldStale = !!(rawPriorWorld && rawPriorWorld._max_seq > 0 && rawPriorWorld._max_seq >= serverNextSeq);
+                    const cachedWorldStale = !!(rawCachedWorld && rawCachedWorld.maxSeq > 0 && rawCachedWorld.maxSeq >= serverNextSeq);
+                    if (priorWorldStale || cachedWorldStale) {
+                        const staleSeq = priorWorldStale ? rawPriorWorld._max_seq : rawCachedWorld.maxSeq;
+                        console.warn('Clay: server session reset detected for world "' + (world.name || ('#' + idx)) +
+                            '" - discarding stale ' + (priorWorldStale ? 'in-memory' : 'cached') +
+                            ' scrollback (had seq up to ' + staleSeq + ', server session is only at ' + serverNextSeq + ')');
+                        if (cachedWorldStale && world.name) {
+                            clearWorldCacheEntry(world.name);
+                        }
+                    }
+                    const priorWorld = priorWorldStale ? null : rawPriorWorld;
+                    const cachedWorld = cachedWorldStale ? null : rawCachedWorld;
                     // Whether this world was seeded from a local buffer (in-memory
                     // reconnect or persistent cache) rather than the server's
                     // freshly-sent slice - startBackfill() uses this to gap-fill
@@ -4369,6 +4398,22 @@
     // the cache can never grow past what a fresh connect would download anyway.
     let worldCacheSaveTimers = {};
     const WORLD_CACHE_SAVE_DEBOUNCE_MS = 2000;
+    // Delete a world's persistent scrollback cache entry outright - used when the
+    // InitialState handler detects the entry is stale relative to the server's current
+    // session (see the server-restart-detection guard there) so a reconnect within the same
+    // stale window doesn't hydrate from the same poisoned buffer again before fresh data
+    // naturally overwrites it via scheduleWorldCacheSave.
+    function clearWorldCacheEntry(worldName) {
+        if (!worldName || !worldCacheServerId) return;
+        openWorldCacheDb().then((db) => {
+            if (!db) return;
+            try {
+                const tx = db.transaction(WORLD_CACHE_STORE, 'readwrite');
+                tx.objectStore(WORLD_CACHE_STORE).delete(worldCacheKey(worldCacheServerId, worldName));
+            } catch (e) { /* ignore */ }
+        });
+    }
+
     function scheduleWorldCacheSave(worldIndex) {
         const world = worlds[worldIndex];
         if (!world || !world.name || !worldCacheServerId) return;

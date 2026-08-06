@@ -4531,7 +4531,16 @@ impl App {
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq: None, flush, gagged, .. } => {
+            // `end_seq` is intentionally not matched/bound here (absorbed by `..`): this arm
+            // used to require `end_seq: None` as a literal pattern, which meant any batch
+            // carrying a real `end_seq: Some(..)` - i.e. every live MUD output batch since
+            // the seq-drift fix (`broadcast_output_range`/`broadcast_released_lines` always
+            // set it) - fell through to the `_ => {}` catch-all below and was silently
+            // dropped. Only synthetic system/command-reply messages (which still send
+            // `end_seq: None`) ever reached this handler. Regression from 99fe3dc
+            // (2026-08-04); this arm's body never actually needed `end_seq`'s value, only
+            // `msg_seq`, so dropping the literal match is a complete fix.
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, flush, gagged, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Flush: clear output buffer before appending new lines
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
@@ -6415,6 +6424,7 @@ impl App {
             total_visible_lines: Some(0),
             pending_count: 0,
             new_from_seq: 0,
+            next_seq: 0,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
         let _ = persistence::save_settings(self);
@@ -10347,6 +10357,7 @@ impl App {
                 total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
                 pending_count: world.pending_lines.len(),
                 new_from_seq: world.new_from_seq,
+                next_seq: world.next_seq,
             }
         }).collect();
 
