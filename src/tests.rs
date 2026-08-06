@@ -6933,3 +6933,239 @@ if you're more curious.\"";
         assert_eq!(world.new_from_seq, 3, "watermark must land exactly past the last displayed seq");
     }
 
+    // ============================================================================
+    // Round-3 seq-dedup-poisoning audit regression tests
+    // ============================================================================
+
+    #[test]
+    fn test_gagged_line_respects_pending_backlog_when_more_mode_off() {
+        // Fix 1 regression guard: hold_gagged_in_pending used to also gate on
+        // settings.more_mode_enabled, but a background world can stay paused with a
+        // non-empty pending_lines backlog even after more-mode is toggled off globally -
+        // World::add_output's "more-mode off => drain pending" branch only fires for a
+        // world actively receiving new non-gagged output at the moment of the toggle, so a
+        // paused background world not currently receiving non-gagged output keeps its
+        // stale paused/pending_lines state regardless of the current setting value. The
+        // condition that actually matters is "is there an existing backlog this line would
+        // otherwise jump ahead of" - paused && !pending_lines.is_empty() alone.
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("test");
+        world.paused = true;
+        world.settings.keep_alive_type = KeepAliveType::Custom;
+        // Existing backlog already queued, as if it arrived while more-mode was on.
+        world.pending_lines.push(OutputLine::new("earlier backlog line".to_string(), world.next_seq));
+        world.next_seq += 1;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        // more-mode now toggled OFF globally - but this world's stale paused/pending_lines
+        // state survives regardless (see comment above), since it isn't currently
+        // receiving non-gagged output to trigger the drain branch.
+        app.settings.more_mode_enabled = false;
+
+        app.ws_broadcast_log.lock().unwrap().clear();
+        app.process_server_data(0, b"###_idler_message_1_###\r\n", 24, 80, false);
+
+        assert_eq!(app.worlds[0].pending_lines.len(), 2,
+            "the gagged line must be queued behind the existing backlog, not jump into output_lines: {:?}",
+            app.worlds[0].pending_lines.iter().map(|l| (l.seq, l.gagged)).collect::<Vec<_>>());
+        assert!(app.worlds[0].pending_lines[1].gagged, "the idler keepalive line must be gagged");
+        assert!(app.worlds[0].output_lines.is_empty(),
+            "nothing should have landed in output_lines ahead of the still-queued backlog");
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(log.is_empty(), "the gagged line must not be broadcast while deferred to pending: {log:?}");
+    }
+
+    #[test]
+    fn test_handle_prompt_on_disconnected_paused_world_respects_pending_backlog() {
+        // Fix 3 regression guard: handle_prompt's disconnected-world branch used to push
+        // the prompt straight into output_lines via a raw push, bypassing
+        // push_line_respecting_pending - the same class of bug already fixed once in
+        // handle_disconnected. That could plant a fresh, high seq into output_lines while
+        // older pending content sat behind it, violating the "pending seqs always exceed
+        // output_lines seqs" invariant the release path depends on.
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("test");
+        world.connected = false;
+        world.paused = true;
+        world.prompt = "> ".to_string();
+        for i in 0..3u64 {
+            world.pending_lines.push(OutputLine::new(format!("backlog {i}"), i));
+        }
+        world.next_seq = 3;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+
+        app.handle_prompt(0, b"> ");
+
+        assert!(app.worlds[0].output_lines.is_empty(),
+            "the prompt must not jump ahead of the still-queued backlog into output_lines");
+        assert_eq!(app.worlds[0].pending_lines.len(), 4, "backlog (3) + the deferred prompt line");
+        assert_eq!(app.worlds[0].pending_lines.last().unwrap().text, ">");
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_broadcasts_content() {
+        // Fix 4 regression guard: release_orphaned_pending used to move pending_lines into
+        // output_lines purely locally (append + local state flip) with zero broadcast -
+        // every other release site broadcasts the released content and an updated pending
+        // count. WS clients (e.g. a remote Android session on this exact world) never
+        // received the content and never learned pending_count dropped to 0.
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("test");
+        world.paused = true;
+        for i in 0..3u64 {
+            world.pending_lines.push(OutputLine::new(format!("orphaned {i}"), i));
+        }
+        world.next_seq = 3;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        // more-mode disabled but this world still holds a pending backlog (e.g. the
+        // setting was toggled off from another client while paused) - the exact scenario
+        // release_orphaned_pending exists to clean up.
+        app.settings.more_mode_enabled = false;
+
+        app.ws_broadcast_log.lock().unwrap().clear();
+        let did_release = app.release_orphaned_pending();
+
+        assert!(did_release);
+        assert_eq!(app.worlds[0].output_lines.len(), 3);
+        assert!(app.worlds[0].pending_lines.is_empty());
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let combined_data: String = log.iter().filter_map(|m| {
+            if let WsMessage::ServerData { data, .. } = m { Some(data.clone()) } else { None }
+        }).collect();
+        for i in 0..3 {
+            assert!(combined_data.contains(&format!("orphaned {i}")),
+                "released line {i} missing from broadcast content: {combined_data:?}");
+        }
+        let saw_pending_update_zero = log.iter().any(|m| matches!(m, WsMessage::PendingLinesUpdate { count: 0, .. }));
+        assert!(saw_pending_update_zero, "must broadcast that pending_count dropped to 0: {log:?}");
+    }
+
+    #[test]
+    fn test_handle_request_scrollback_after_seq_excludes_lines_past_pending_floor() {
+        use crate::websocket::{WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        // Fix 5 regression guard (defense in depth): if any code path ever violates the
+        // "pending seqs always exceed output_lines seqs" invariant - planting a
+        // higher-seq line into output_lines while lower-seq content still sits in
+        // pending_lines - handle_request_scrollback's after_seq gap-fill reply must not
+        // hand that too-high-seq line to a client. Doing so would advance the client's
+        // dedup high-water-mark (_max_seq in app.js) past content it was never actually
+        // sent, which is exactly the poisoning mechanism this whole audit round is about.
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("test");
+        // Contrived invariant violation: output_lines has a line at seq 5, but
+        // pending_lines' lowest queued seq is 3 (should never legitimately happen, but
+        // this test exists specifically to guard against it happening anyway).
+        world.output_lines.push(OutputLine::new("seq 1".to_string(), 1));
+        world.output_lines.push(OutputLine::new("seq 5 (violates invariant)".to_string(), 5));
+        world.pending_lines.push(OutputLine::new("pending floor at seq 3".to_string(), 3));
+        world.pending_lines.push(OutputLine::new("pending seq 4".to_string(), 4));
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true, tx, current_world: None, username: None,
+                received_initial_state: true, client_type: RemoteClientType::Web,
+                viewport_height: 24, ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
+                paused: false, acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        app.handle_request_scrollback(client_id, 0, 20, None, Some(0), None);
+        let (lines, _backfill_complete) = drain_one_scrollback_reply(&mut rx);
+        let seqs: Vec<u64> = lines.iter().map(|l| l.seq).collect();
+
+        assert!(seqs.contains(&1), "seq 1 is below the pending floor and must still be returned: {seqs:?}");
+        assert!(!seqs.contains(&5),
+            "seq 5 is >= the pending backlog's floor (3) and must be excluded from the gap-fill reply: {seqs:?}");
+    }
+
+    #[tokio::test]
+    async fn test_multiuser_release_pending_broadcasts_content_not_just_count() {
+        use crate::websocket::{WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+
+        // Fix 6 regression guard: multiuser's ReleasePending handler used to drain
+        // pending_lines into output_lines and broadcast only PendingReleased's count -
+        // never the actual text via ServerData. A client seeing only the count-only
+        // broadcast would clear its "More" indicator with no matching content ever having
+        // arrived - the same "indicator clears, no output appears" symptom this whole
+        // audit round is about, just scoped to multiuser mode.
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("test");
+        world.owner = Some("alice".to_string());
+        world.paused = true;
+        for i in 0..3u64 {
+            world.pending_lines.push(OutputLine::new(format!("backlog {i}"), i));
+        }
+        world.next_seq = 3;
+        app.worlds.push(world);
+
+        let server = WebSocketServer::new("", 0, "*", None, true /* multiuser */, BanList::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true, tx, current_world: None, username: Some("alice".to_string()),
+                received_initial_state: true, client_type: RemoteClientType::Web,
+                viewport_height: 24, ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
+                paused: false, acked_seq: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        crate::daemon::handle_multiuser_ws_message(
+            &mut app, client_id,
+            WsMessage::ReleasePending { world_index: 0, count: 0 },
+            &event_tx,
+        ).await;
+
+        let mut server_data_texts: Vec<String> = Vec::new();
+        let mut saw_pending_released_count = None;
+        while let Ok(item) = rx.try_recv() {
+            // broadcast_to_owner sends pre-serialized JSON (Outbound::Shared), not a boxed
+            // WsMessage (Outbound::Message) - unlike the single-recipient ws_send_to_client
+            // path the other tests in this file exercise.
+            let parsed: Option<WsMessage> = match item {
+                Outbound::Message(msg) => Some(*msg),
+                Outbound::Shared(json) => serde_json::from_str(&json).ok(),
+            };
+            match parsed {
+                Some(WsMessage::ServerData { data, .. }) => server_data_texts.push(data),
+                Some(WsMessage::PendingReleased { count, .. }) => saw_pending_released_count = Some(count),
+                _ => {}
+            }
+        }
+        assert!(!server_data_texts.is_empty(),
+            "released pending content must be broadcast as ServerData, not just a count");
+        let combined: String = server_data_texts.concat();
+        for i in 0..3 {
+            assert!(combined.contains(&format!("backlog {i}")),
+                "released line {i} missing from broadcast content: {combined:?}");
+        }
+        assert_eq!(saw_pending_released_count, Some(3), "PendingReleased count broadcast must still be sent");
+        assert_eq!(app.worlds[0].output_lines.len(), 3);
+        assert!(app.worlds[0].pending_lines.is_empty());
+    }
+

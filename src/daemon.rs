@@ -3188,6 +3188,58 @@ fn owner_filtered_pairs(app: &App, uname: &str, pairs: &[(usize, u64)]) -> Vec<(
         .collect()
 }
 
+/// Broadcast the actual text of just-released pending lines to one owner's clients
+/// (multiuser `ReleasePending`/`SelectiveFlush` - see their call sites below). Deliberately
+/// NOT `App::broadcast_released_lines`/`ws_broadcast_to_world`, which fan out to every
+/// connected client regardless of world ownership and would leak this owner's MUD output to
+/// other users (CLAUDE.md's D7 owner-scoping invariant - see `ConnectWorld`/`SwitchWorld`'s
+/// `world.owner == username` checks elsewhere in this file for the same rule). Grouped by
+/// `(from_server, gagged)` like the single-user path so gagged status survives release intact
+/// (the same bug class fixed for `App::broadcast_released_lines` in v1.5.8). Always uses
+/// `seq: 0, end_seq: None` - multiuser never sends real per-line seqs today (its `World`
+/// instances hold only owner-agnostic template data; the real per-user MUD data lives in
+/// `UserConnection`), so this stays consistent with every other multiuser `ServerData`
+/// broadcast rather than introducing multiuser's first real-seq broadcast.
+fn broadcast_owner_scoped_released_lines(ws: &WebSocketServer, world_index: usize, owner: Option<&str>, released: &[OutputLine]) {
+    if released.is_empty() {
+        return;
+    }
+    let ts = current_timestamp_secs();
+    let mut batch: Vec<String> = Vec::new();
+    let mut batch_from_server = released[0].from_server;
+    let mut batch_gagged = released[0].gagged;
+    for line in released {
+        if (line.from_server != batch_from_server || line.gagged != batch_gagged) && !batch.is_empty() {
+            let ws_data = batch.join("\n") + "\n";
+            ws.broadcast_to_owner(WsMessage::ServerData {
+                world_index,
+                data: ws_data,
+                is_viewed: true,
+                ts,
+                from_server: batch_from_server,
+                seq: 0, end_seq: None,
+                flush: false, gagged: batch_gagged,
+            }, owner);
+            batch.clear();
+            batch_from_server = line.from_server;
+            batch_gagged = line.gagged;
+        }
+        batch.push(line.text.replace('\r', ""));
+    }
+    if !batch.is_empty() {
+        let ws_data = batch.join("\n") + "\n";
+        ws.broadcast_to_owner(WsMessage::ServerData {
+            world_index,
+            data: ws_data,
+            is_viewed: true,
+            ts,
+            from_server: batch_from_server,
+            seq: 0, end_seq: None,
+            flush: false, gagged: batch_gagged,
+        }, owner);
+    }
+}
+
 pub async fn handle_multiuser_ws_message(
     app: &mut App,
     client_id: u64,
@@ -3522,15 +3574,22 @@ pub async fn handle_multiuser_ws_message(
                 if world.owner.as_ref() == username.as_ref() {
                     let release_count = if count == 0 { world.pending_lines.len() } else { count.min(world.pending_lines.len()) };
                     let released: Vec<OutputLine> = world.pending_lines.drain(..release_count).collect();
-                    world.output_lines.extend(released);
+                    world.output_lines.extend(released.iter().cloned());
 
                     if world.pending_lines.is_empty() {
                         world.paused = false;
                     }
 
+                    let owner = world.owner.clone();
                     // Broadcast to all clients of this owner
                     if let Some(ws) = &app.ws_server {
-                        ws.broadcast_to_owner(WsMessage::PendingReleased { world_index, count: release_count }, world.owner.as_deref());
+                        // Send the actual released text first, then the count update - a
+                        // client that only sees PendingReleased's count would clear its
+                        // "More" indicator with no matching content ever having arrived
+                        // (the exact "indicator clears, no output appears" symptom this
+                        // whole audit round is about, just scoped to multiuser mode).
+                        broadcast_owner_scoped_released_lines(ws, world_index, owner.as_deref(), &released);
+                        ws.broadcast_to_owner(WsMessage::PendingReleased { world_index, count: release_count }, owner.as_deref());
                     }
                 }
             }
@@ -3552,11 +3611,15 @@ pub async fn handle_multiuser_ws_message(
                 if world.owner.as_ref() == username.as_ref() && world.paused {
                     let pending = std::mem::take(&mut world.pending_lines);
                     let kept: Vec<OutputLine> = pending.into_iter().filter(|l| l.highlight_color.is_some()).collect();
-                    world.output_lines.extend(kept);
+                    world.output_lines.extend(kept.iter().cloned());
                     world.paused = false;
                     world.lines_since_pause = 0;
+                    let owner = world.owner.clone();
                     if let Some(ws) = &app.ws_server {
-                        ws.broadcast_to_owner(WsMessage::PendingLinesUpdate { world_index, count: 0 }, world.owner.as_deref());
+                        // Same reasoning as ReleasePending above: broadcast the kept lines'
+                        // actual text before the count update, not just the count.
+                        broadcast_owner_scoped_released_lines(ws, world_index, owner.as_deref(), &kept);
+                        ws.broadcast_to_owner(WsMessage::PendingLinesUpdate { world_index, count: 0 }, owner.as_deref());
                     }
                 }
             }

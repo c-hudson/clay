@@ -5745,8 +5745,20 @@ impl App {
             // Reconnect gap-fill: the client kept its buffer across the reconnect and only
             // wants lines newer than the highest seq it already has. Oldest-first (unlike
             // before_seq's newest-first slice) so the client can append+dedup in order.
+            //
+            // Defensive clamp: if pending_lines is non-empty, never hand back an output_lines
+            // entry whose seq is >= the lowest seq still queued in pending_lines. Under the
+            // "pending seqs always exceed output_lines seqs" invariant this should never
+            // trigger, but several past bugs (fixed elsewhere) have violated it by planting a
+            // fresh, high-seq line into output_lines while older content sat in pending_lines
+            // behind it. If that ever happens again (here or via some future code path not yet
+            // discovered), this clamp keeps a gap-fill reply from advancing a client's dedup
+            // high-water-mark (_max_seq in app.js) past content it was never actually sent -
+            // the poisoning this whole audit round is about. See PROTOCOL-ROADMAP.md's
+            // seq-drift-fix notes and CLAUDE.md's output_lines-sorted-by-seq invariant.
+            let pending_floor = world.pending_lines.first().map(|l| l.seq);
             let eligible: Vec<_> = world.output_lines.iter()
-                .filter(|l| l.seq > seq)
+                .filter(|l| l.seq > seq && pending_floor.map_or(true, |floor| l.seq < floor))
                 .collect();
             let (range, visible_count) = Self::take_visible_range(&eligible, count, false, |l| l.gagged);
             let lines = eligible[range].iter()
@@ -8078,8 +8090,16 @@ impl App {
         // they're eventually released and appended after it, output_lines ends up with a seq
         // dip in the middle. Route the gagged line into pending_lines instead in that case; it
         // rides the same release batch (and its own broadcast) when the pause ends.
-        let hold_gagged_in_pending = self.settings.more_mode_enabled
-            && self.worlds[world_idx].paused
+        //
+        // Deliberately NOT gated on settings.more_mode_enabled: pending_lines can be
+        // non-empty even after more-mode is toggled off globally - add_output's "more-mode
+        // off => drain pending" branch only fires for a world actively receiving new
+        // non-gagged output at the moment of the toggle, so a paused background world that
+        // isn't currently receiving non-gagged output keeps its stale paused/pending_lines
+        // state regardless of the current setting value. The condition that actually matters
+        // is "is there an existing backlog this line would otherwise jump ahead of", which is
+        // exactly `paused && !pending_lines.is_empty()` on its own.
+        let hold_gagged_in_pending = self.worlds[world_idx].paused
             && !self.worlds[world_idx].pending_lines.is_empty();
         for (line, highlight) in gagged_lines {
             let seq = self.worlds[world_idx].next_seq;
@@ -8336,9 +8356,15 @@ impl App {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
-            self.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string(), seq));
+            let more_mode = self.settings.more_mode_enabled;
+            // Route through push_line_respecting_pending instead of a raw output_lines.push -
+            // a raw push here could plant a fresh, high seq into output_lines while older
+            // pending content is still queued behind it on this world, violating the "pending
+            // seqs always exceed output_lines seqs" invariant the release path depends on
+            // (same class of bug already fixed in handle_disconnected for this exact
+            // disconnected-world code path).
+            self.worlds[world_idx].push_line_respecting_pending(OutputLine::new(prompt_normalized.trim().to_string(), seq), more_mode);
             self.worlds[world_idx].advance_watermark_if_current(seq, is_current);
-            self.worlds[world_idx].scroll_to_bottom();
             self.worlds[world_idx].prompt.clear();
             if world_idx == self.current_world_index {
                 self.needs_output_redraw = true;
@@ -11041,8 +11067,10 @@ impl App {
         if self.settings.more_mode_enabled || self.current_world().pending_lines.is_empty() {
             return false;
         }
+        let world_idx = self.current_world_index;
         let world = self.current_world_mut();
-        world.output_lines.append(&mut world.pending_lines);
+        let released_lines: Vec<OutputLine> = std::mem::take(&mut world.pending_lines);
+        world.output_lines.extend(released_lines.iter().cloned());
         world.pending_since = None;
         world.paused = false;
         // If partial was in pending, it's now in output
@@ -11050,6 +11078,15 @@ impl App {
             world.partial_in_pending = false;
         }
         world.scroll_to_bottom();
+        // Broadcast the actual released content, not just a count - every other release site
+        // (release_pending_screenful, process_server_data's more-mode-off drain) does this;
+        // this site previously moved pending_lines to output_lines purely locally, so WS
+        // clients (e.g. a remote Android session on this exact world) never received the
+        // content and never learned pending_count dropped to 0.
+        self.broadcast_released_lines(world_idx, &released_lines);
+        self.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released_lines.len() });
+        self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
+        self.broadcast_activity();
         self.needs_output_redraw = true;
         true
     }
@@ -16744,28 +16781,44 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Add as gagged line (only visible with F2)
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
-                                app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
                                 // Gagged or not, still text from the world (rule 1) - advance the
                                 // watermark past it when someone's viewing. Uses the broader
                                 // is_current from the top of this handler (console OR any WS
                                 // viewer), not the narrower console-only one the ServerData
                                 // broadcast below uses for its own is_viewed field.
                                 app.worlds[world_idx].advance_watermark_if_current(seq, is_current);
-                                if !app.worlds[world_idx].paused {
-                                    app.worlds[world_idx].scroll_to_bottom();
+                                // Route into pending_lines instead of output_lines when the world
+                                // is already paused with a backlog - same reasoning as
+                                // process_server_data's hold_gagged_in_pending: otherwise this
+                                // line's real seq lands in output_lines (and gets broadcast)
+                                // ahead of older, still-queued pending content, poisoning a
+                                // client's dedup high-water-mark against that undelivered
+                                // backlog.
+                                let hold_in_pending = app.worlds[world_idx].paused
+                                    && !app.worlds[world_idx].pending_lines.is_empty();
+                                if hold_in_pending {
+                                    app.worlds[world_idx].pending_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                                    // Not broadcast here - rides out with the pending release
+                                    // batch via App::broadcast_released_lines, same as every
+                                    // other pending line.
+                                } else {
+                                    app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                                    if !app.worlds[world_idx].paused {
+                                        app.worlds[world_idx].scroll_to_bottom();
+                                    }
+                                    // Broadcast gagged line to WebSocket clients
+                                    let is_current = world_idx == app.current_world_index;
+                                    let ws_data = message.replace('\r', "") + "\n";
+                                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                                        world_index: world_idx,
+                                        data: ws_data,
+                                        is_viewed: is_current,
+                                        ts: current_timestamp_secs(),
+                                        from_server: true,
+                                        seq, end_seq: None,
+                                        flush: false, gagged: true,
+                                    });
                                 }
-                                // Broadcast gagged line to WebSocket clients
-                                let is_current = world_idx == app.current_world_index;
-                                let ws_data = message.replace('\r', "") + "\n";
-                                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: ws_data,
-                                    is_viewed: is_current,
-                                    ts: current_timestamp_secs(),
-                                    from_server: true,
-                                    seq, end_seq: None,
-                                    flush: false, gagged: true,
-                                });
                             } else {
                                 // Add non-gagged output normally
                                 let settings = app.settings.clone();
@@ -17647,13 +17700,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Add as gagged line (only visible with F2)
                             let seq = app.worlds[world_idx].next_seq;
                             app.worlds[world_idx].next_seq += 1;
-                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
                             // Gagged or not, still text from the world (rule 1) - advance the
                             // watermark past it when someone's viewing. Uses the broader
                             // is_current from the top of this handler (console OR any WS
                             // viewer), not the narrower console-only one the ServerData
                             // broadcast below uses for its own is_viewed field.
                             app.worlds[world_idx].advance_watermark_if_current(seq, is_current);
+                            // Route into pending_lines instead of output_lines when the world
+                            // is already paused with a backlog - same reasoning as
+                            // process_server_data's hold_gagged_in_pending: otherwise this
+                            // line's real seq lands in output_lines (and gets broadcast) ahead
+                            // of older, still-queued pending content, poisoning a client's
+                            // dedup high-water-mark against that undelivered backlog.
+                            let hold_in_pending = app.worlds[world_idx].paused
+                                && !app.worlds[world_idx].pending_lines.is_empty();
+                            if hold_in_pending {
+                                app.worlds[world_idx].pending_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                                // Not broadcast here - rides out with the pending release batch
+                                // via App::broadcast_released_lines, same as every other
+                                // pending line.
+                            } else {
+                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
                             if !app.worlds[world_idx].paused {
                                 app.worlds[world_idx].scroll_to_bottom();
                             }
@@ -17669,6 +17736,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 seq, end_seq: None,
                                 flush: false, gagged: true,
                             });
+                            }
                         } else {
                             // Add non-gagged output normally
                             let settings = app.settings.clone();
