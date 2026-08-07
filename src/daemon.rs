@@ -681,7 +681,15 @@ pub async fn handle_daemon_ws_message(
                                 app.emit_tf_error(world_index, &err, true);
                             }
                             tf::TfCommandResult::SendToMud(text) => {
-                                app.send_to_world_and_mark_sent(world_index, text);
+                                // Not send_to_world_and_mark_sent(): that shared helper is
+                                // also used by non-user-typed callers, so recording is done
+                                // here at this specific typed-command site instead - see
+                                // App::record_user_input's doc comment.
+                                let text_for_record = text.clone();
+                                if app.send_to_world(world_index, text) {
+                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                    app.record_user_input(world_index, &text_for_record);
+                                }
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                 app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
@@ -709,11 +717,12 @@ pub async fn handle_daemon_ws_message(
                 Command::NotACommand { text } => {
                     // Regular text - send to MUD
                     if world_index < app.worlds.len() {
-                        if let Some(tx) = &app.worlds[world_index].command_tx {
-                            if tx.try_send(WriteCommand::Text(text)).is_ok() {
-                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                app.worlds[world_index].prompt.clear();
-                            }
+                        let sent = app.worlds[world_index].command_tx.as_ref()
+                            .is_some_and(|tx| tx.try_send(WriteCommand::Text(text.clone())).is_ok());
+                        if sent {
+                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                            app.worlds[world_index].prompt.clear();
+                            app.record_user_input(world_index, &text);
                         }
                     }
                 }
@@ -1230,6 +1239,9 @@ pub async fn handle_daemon_ws_message(
                                 app.settings.tls_proxy_enabled,
                             ).await {
                                 app.worlds[world_index].connected = true;
+                                // Re-arm the login-capture guard for this fresh connection -
+                                // see World::login_capture_guard's doc comment.
+                                app.worlds[world_index].login_capture_guard = 6;
                                 app.worlds[world_index].command_tx = Some(cmd_tx);
                                 app.worlds[world_index].was_connected = true;
                                 app.worlds[world_index].skip_auto_login = false;
@@ -1277,6 +1289,7 @@ pub async fn handle_daemon_ws_message(
                                 app.worlds[idx].connection_id, false, app.settings.tls_proxy_enabled,
                             ).await {
                                 app.worlds[idx].connected = true;
+                                app.worlds[idx].login_capture_guard = 6; // see World::login_capture_guard
                                 app.worlds[idx].command_tx = Some(cmd_tx);
                                 app.worlds[idx].was_connected = true;
                                 app.worlds[idx].socket_fd = socket_fd;
@@ -1324,6 +1337,7 @@ pub async fn handle_daemon_ws_message(
                                 app.settings.tls_proxy_enabled,
                             ).await {
                                 app.worlds[idx].connected = true;
+                                app.worlds[idx].login_capture_guard = 6; // see World::login_capture_guard
                                 app.worlds[idx].command_tx = Some(cmd_tx);
                                 app.worlds[idx].was_connected = true;
                                 app.worlds[idx].skip_auto_login = false;
@@ -1390,6 +1404,7 @@ pub async fn handle_daemon_ws_message(
                 ).await {
                     // Connection succeeded
                     app.worlds[world_index].connected = true;
+                    app.worlds[world_index].login_capture_guard = 6; // see World::login_capture_guard
                     app.worlds[world_index].command_tx = Some(cmd_tx);
                     app.worlds[world_index].was_connected = true;
                     app.worlds[world_index].skip_auto_login = false;
@@ -1457,6 +1472,7 @@ pub async fn handle_daemon_ws_message(
                         app.settings.tls_proxy_enabled,
                     ).await {
                         app.worlds[world_index].connected = true;
+                        app.worlds[world_index].login_capture_guard = 6; // see World::login_capture_guard
                         app.worlds[world_index].command_tx = Some(cmd_tx);
                         app.worlds[world_index].was_connected = true;
                         app.worlds[world_index].skip_auto_login = false;

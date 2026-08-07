@@ -1867,6 +1867,210 @@
         );
     }
 
+    // ========== /recall -i / -l / -g: captured user input ==========
+    // Regression coverage for /recall -i being a dead no-op (RecallSource::Input's arm in
+    // actions.rs used to be an unconditional `continue`, so /recall -i never matched
+    // anything) and for the deeper gap it was papering over: user-typed input was never
+    // captured anywhere with a timestamp. See App::record_user_input/World::record_input_line
+    // in main.rs and the source filter in actions.rs's execute_recall.
+
+    #[test]
+    fn test_recall_i_returns_captured_input() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0; // past the login-capture window
+
+        app.record_user_input(0, "north");
+
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::Input,
+            pattern: Some("north".to_string()),
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        };
+        let matches = app.recall_matches(&opts, 0).unwrap();
+        assert_eq!(matches, vec!["\u{00BB} north".to_string()],
+            "the RecallSource::Input arm used to be an unconditional `continue` - /recall -i always returned no matches");
+    }
+
+    #[test]
+    fn test_recall_default_source_excludes_input() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+
+        let seq = app.worlds[0].next_seq; app.worlds[0].next_seq += 1;
+        app.worlds[0].output_lines.push(OutputLine::new("You go north.".to_string(), seq));
+        app.record_user_input(0, "north");
+
+        let opts = tf::RecallOptions {
+            pattern: Some("north".to_string()),
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default() // default source: CurrentWorld
+        };
+        let matches = app.recall_matches(&opts, 0).unwrap();
+        assert_eq!(matches, vec!["You go north.".to_string()],
+            "plain /recall (no source flag) must stay server-output-only, excluding captured input");
+    }
+
+    #[test]
+    fn test_recall_local_and_global_include_input() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+
+        let seq = app.worlds[0].next_seq; app.worlds[0].next_seq += 1;
+        app.worlds[0].output_lines.push(OutputLine::new("You go north.".to_string(), seq));
+        let seq = app.worlds[0].next_seq; app.worlds[0].next_seq += 1;
+        app.worlds[0].output_lines.push(OutputLine::new_client("Disconnected.".to_string(), seq));
+        app.record_user_input(0, "north");
+
+        let local_opts = tf::RecallOptions {
+            source: tf::RecallSource::Local,
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        };
+        let local_matches = app.recall_matches(&local_opts, 0).unwrap();
+        assert_eq!(local_matches, vec!["Disconnected.".to_string(), "\u{00BB} north".to_string()],
+            "-l must include both client-generated notices AND captured input, but not server output");
+
+        let global_opts = tf::RecallOptions {
+            source: tf::RecallSource::Global,
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        };
+        let global_matches = app.recall_matches(&global_opts, 0).unwrap();
+        assert_eq!(global_matches, vec!["You go north.".to_string(), "Disconnected.".to_string(), "\u{00BB} north".to_string()],
+            "-g must include server output + client notices + captured input, all together");
+    }
+
+    #[test]
+    fn test_input_line_invisible_until_show_tags() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+
+        let lines_before = app.worlds[0].lines_since_pause;
+        let unseen_before = app.worlds[0].unseen_lines;
+        let paused_before = app.worlds[0].paused;
+
+        app.record_user_input(0, "secretcmd");
+
+        assert_eq!(app.worlds[0].lines_since_pause, lines_before, "capturing input must not consume the more-mode budget");
+        assert_eq!(app.worlds[0].unseen_lines, unseen_before, "capturing input must not count as unseen activity");
+        assert_eq!(app.worlds[0].paused, paused_before, "capturing input must never trigger a pause");
+
+        let settings = Settings::default();
+        let hidden = build_display_lines(&app.worlds[0], &settings, 21, 80, false);
+        assert!(!hidden.iter().any(|l| l.text.contains("secretcmd")),
+            "captured input must not appear in normal display (show_tags: false)");
+
+        let shown = build_display_lines(&app.worlds[0], &settings, 21, 80, true);
+        assert!(shown.iter().any(|l| l.text.contains("secretcmd")),
+            "captured input must appear when show_tags (F2) is on");
+    }
+
+    #[test]
+    fn test_input_line_interleaves_by_seq_and_timestamp() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        let settings = Settings::default();
+
+        app.record_user_input(0, "north");
+        app.worlds[0].add_output("You go north.\n", true, &settings, 24, 80, false, true);
+
+        let seqs: Vec<u64> = app.worlds[0].output_lines.iter().map(|l| l.seq).collect();
+        for pair in seqs.windows(2) {
+            assert!(pair[0] < pair[1], "output_lines must stay strictly increasing by seq: {:?}", seqs);
+        }
+        assert_eq!(app.worlds[0].output_lines.len(), 2);
+        assert!(app.worlds[0].output_lines[0].is_input);
+        assert!(!app.worlds[0].output_lines[1].is_input);
+        assert!(app.worlds[0].output_lines[0].timestamp <= app.worlds[0].output_lines[1].timestamp,
+            "captured input's timestamp must not be later than a server line that arrived after it");
+    }
+
+    #[test]
+    fn test_input_capture_survives_trailing_partial() {
+        // Regression guard for the prerequisite fix (last_visible_output_idx): a gagged/
+        // input line pushed after an outstanding partial (prompt) used to be silently
+        // clobbered the next time that partial completed, because add_output assumed
+        // output_lines.last()/pending_lines.last() was always the partial.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        let settings = Settings::default();
+
+        // MUD prompt with no trailing newline.
+        app.worlds[0].add_output("prompt> ", true, &settings, 24, 80, false, true);
+        assert!(!app.worlds[0].partial_line.is_empty());
+
+        // The player types a command while the prompt is still outstanding.
+        app.record_user_input(0, "north");
+
+        // The rest of the line (with a newline) arrives, completing the prompt.
+        app.worlds[0].add_output("rest of line\n", true, &settings, 24, 80, false, true);
+
+        // The captured input line must still exist, untouched.
+        let input_lines: Vec<&OutputLine> = app.worlds[0].output_lines.iter().filter(|l| l.is_input).collect();
+        assert_eq!(input_lines.len(), 1, "captured input must not have been clobbered by the partial's completion");
+        assert_eq!(input_lines[0].text, "north");
+
+        // And the prompt must have completed correctly, not been overwritten by "north".
+        let prompt_line = app.worlds[0].output_lines.iter().find(|l| !l.is_input).unwrap();
+        assert_eq!(prompt_line.text, "prompt> rest of line");
+    }
+
+    #[test]
+    fn test_login_capture_guard_skips_first_six_sends_and_rearms_on_logout() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test")); // login_capture_guard starts at 6, matching a fresh connect
+        app.current_world_index = 0;
+        assert_eq!(app.worlds[0].login_capture_guard, 6);
+
+        // First 6 sends after "connecting" must not be captured.
+        for i in 0..6 {
+            app.record_user_input(0, &format!("secret{}", i));
+        }
+        assert_eq!(app.worlds[0].login_capture_guard, 0);
+        assert!(app.worlds[0].output_lines.iter().all(|l| !l.is_input),
+            "none of the first 6 sends after connecting should have been captured");
+
+        // The 7th send is captured normally.
+        app.record_user_input(0, "look");
+        assert_eq!(app.worlds[0].output_lines.iter().filter(|l| l.is_input).count(), 1);
+        assert_eq!(app.worlds[0].output_lines.iter().find(|l| l.is_input).unwrap().text, "look");
+
+        // Typing "logout" re-arms the guard for the next 6 sends - and isn't itself captured.
+        app.record_user_input(0, "logout");
+        assert_eq!(app.worlds[0].login_capture_guard, 6);
+        assert_eq!(app.worlds[0].output_lines.iter().filter(|l| l.is_input).count(), 1,
+            "the logout line itself must not be captured");
+
+        for i in 0..6 {
+            app.record_user_input(0, &format!("relogin{}", i));
+        }
+        assert_eq!(app.worlds[0].output_lines.iter().filter(|l| l.is_input).count(), 1,
+            "the re-login window after logout must also be skipped");
+
+        app.record_user_input(0, "look again");
+        assert_eq!(app.worlds[0].output_lines.iter().filter(|l| l.is_input).count(), 2);
+    }
+
     #[test]
     fn test_recall_without_more_mode_emits_all() {
         let mut app = App::new();
@@ -4590,6 +4794,7 @@
             timestamp: std::time::SystemTime::now(),
             from_server: true,
             gagged: false,
+            is_input: false,
             seq: if marked_new { 1 } else { 0 },
             highlight_color: None,
             from_archive: false,
@@ -6296,6 +6501,7 @@ if you're more curious.\"";
             timestamp: std::time::SystemTime::now(),
             from_server: true,
             gagged: false,
+            is_input: false,
             seq: 0,
             highlight_color: if highlighted { Some("red".to_string()) } else { None },
             from_archive: false,

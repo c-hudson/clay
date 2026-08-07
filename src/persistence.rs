@@ -1888,7 +1888,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
 
     // Save output lines in a separate section (can be large)
     // Format: timestamp_secs|flags|seq|escaped_text
-    // Flags: s = from_server, g = gagged (the legacy 'n' = marked_new flag is no longer
+    // Flags: s = from_server, g = gagged, i = is_input (a captured user-typed command -
+    // see OutputLine::is_input's doc comment; always paired with g, since gagged is what
+    // makes it invisible in normal display) (the legacy 'n' = marked_new flag is no longer
     // written - the ▶ indicator is now derived from the world's new_from_seq watermark,
     // written above, not a per-line flag)
     for (idx, world) in app.worlds.iter().enumerate() {
@@ -1899,6 +1901,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             let mut flags = String::new();
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
+            if line.is_input { flags.push('i'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -1908,6 +1911,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             let mut flags = String::new();
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
+            if line.is_input { flags.push('i'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -2039,8 +2043,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
     }
 
     // Parse a saved output/pending line with timestamp
-    // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged - the
-    // legacy 'n'=marked_new flag, if present in an older file, is simply ignored: the ▶
+    // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged,
+    // i=is_input - a captured user-typed command, see OutputLine::is_input's doc comment -
+    // the legacy 'n'=marked_new flag, if present in an older file, is simply ignored: the ▶
     // indicator is derived from the world's new_from_seq watermark now, see TempWorld's
     // new_from_seq field doc comment for how an old file lacking it is handled)
     // Older format: timestamp_secs|flags|text (flags: s=from_server, g=gagged) - seq=0
@@ -2059,26 +2064,33 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     let text = unescape_string(parts[3]);
                     let from_server = flags.contains('s');
                     let gagged = flags.contains('g');
+                    let is_input = flags.contains('i');
                     return OutputLine {
                         text,
                         timestamp,
                         from_server,
                         gagged,
+                        is_input,
                         seq,
                         highlight_color: None,
                         from_archive: false,
                     };
                 } else if parts.len() == 3 {
-                    // Older format: timestamp|flags|text (no seq)
+                    // Older format: timestamp|flags|text (no seq) - predates is_input, but
+                    // parse it the same way in case a file written by a newer build (which
+                    // could in principle still hit this 3-part branch via some other path)
+                    // carries the flag; absence just means is_input stays false.
                     let flags = parts[1];
                     let text = unescape_string(parts[2]);
                     let from_server = flags.contains('s');
                     let gagged = flags.contains('g');
+                    let is_input = flags.contains('i');
                     return OutputLine {
                         text,
                         timestamp,
                         from_server,
                         gagged,
+                        is_input,
                         seq: 0,
                         highlight_color: None,
                         from_archive: false,
@@ -2090,6 +2102,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         timestamp,
                         from_server: true,
                         gagged: false,
+                        is_input: false,
                         seq: 0,
                         highlight_color: None,
                         from_archive: false,

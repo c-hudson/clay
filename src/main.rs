@@ -2507,10 +2507,34 @@ pub struct OutputLine {
     pub timestamp: SystemTime,
     pub from_server: bool,  // true if from MUD server, false if client-generated
     pub gagged: bool,       // true if line was gagged by an action (only shown with F2)
+    /// true if this line is a user-typed command captured on its way to the MUD. ALWAYS
+    /// created together with `gagged: true`, so every existing gagged-line filter
+    /// (rendering::process_output_line, build_display_lines, search_line_visible,
+    /// World::release_pending's budget loop, lines_from_bottom, take_visible_range, and
+    /// app.js's gagged-skip) hides it from normal display for free - that is the whole
+    /// invisibility mechanism, `is_input` adds none of its own. `is_input` exists ONLY so
+    /// /recall's source filter and the per-world file log can tell "the user typed this"
+    /// apart from "an action gagged this" / "Ctrl+L gagged this" (World::filter_to_server_output
+    /// already sets gagged on every from_server:false line, so the gagged+!from_server pair
+    /// is not a usable discriminator on its own). Deliberately NOT on the WS wire: /recall
+    /// always runs server-side (remote consoles forward typed commands as SendCommand; web/
+    /// GUI/Android only ever send SendCommand), so no client needs to read it.
+    pub is_input: bool,
     pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive (not current session)
 }
+
+/// Display/log marker for captured user input. Applied at RENDER time only (in
+/// /recall's result formatting, and in World::record_input_line's log write) - never baked
+/// into OutputLine.text, same rule as the "✨ " client-line marker (see emit_client_text's
+/// doc comment / the note near build_initial_output_lines). Baking it in would also break
+/// /recall's default Glob match style, which anchors patterns with ^...$
+/// (actions::wildcard_to_regex), so `/recall -i north` would silently stop matching.
+/// Deliberately NOT "✨ " - that means "client-generated notice" (Disconnected., /echo
+/// output, recall results) and reusing it would make /recall -g output unable to tell
+/// input apart from notices.
+pub const INPUT_LINE_PREFIX: &str = "\u{00BB} "; // "» "
 
 /// Whether a line should render with the ▶ new-text indicator, given a world's pair of
 /// new-text watermarks (`World::new_from_seq`/`World::viewed_from_seq` - see their doc
@@ -2563,6 +2587,7 @@ impl OutputLine {
             timestamp: SystemTime::now(),
             from_server: true,  // Default to server output
             gagged: false,
+            is_input: false,
             seq,
             highlight_color: None,
             from_archive: false,
@@ -2575,6 +2600,7 @@ impl OutputLine {
             timestamp: SystemTime::now(),
             from_server: false,
             gagged: false,
+            is_input: false,
             seq,
             highlight_color: None,
             from_archive: false,
@@ -2587,6 +2613,7 @@ impl OutputLine {
             timestamp: SystemTime::now(),
             from_server: true,
             gagged: true,
+            is_input: false,
             seq,
             highlight_color: None,
             from_archive: false,
@@ -2594,7 +2621,23 @@ impl OutputLine {
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None, from_archive: false }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false }
+    }
+
+    /// A user-typed command captured on its way to the MUD. `gagged: true` is what makes it
+    /// invisible in normal display; `from_server: false` keeps it out of the default
+    /// /recall source and out of the ▶ new-text rule (line_is_new_at requires from_server).
+    pub(crate) fn new_input(text: String, seq: u64) -> Self {
+        Self {
+            text: Self::truncate_if_needed(text),
+            timestamp: SystemTime::now(),
+            from_server: false,
+            gagged: true,
+            is_input: true,
+            seq,
+            highlight_color: None,
+            from_archive: false,
+        }
     }
 
     /// Format timestamp using a pre-computed "now" value for batch rendering
@@ -2671,6 +2714,16 @@ pub struct World {
     naws_enabled: bool,          // True if NAWS telnet option was negotiated
     naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
     pub next_seq: u64,               // Next sequence number for output lines (for debugging)
+    /// Number of upcoming user-typed sends to skip capturing entirely (see
+    /// `App::record_user_input`). Set to 6 whenever this world connects, so a manually-typed
+    /// MUD login line (e.g. `connect Bob hunter2`) or a password/PIN prompt response in the
+    /// first few exchanges is never written to the log or made /recall-able. Reset to 6
+    /// again whenever the user types `logout`, covering a mid-session re-login. Decremented
+    /// (not reset) by ordinary captured sends once it reaches 0. Clay's own auto-login
+    /// (`connect <user> <pass>` sent by AutoConnectType logic) is never hooked to
+    /// `record_user_input` at all, so it needs no interaction with this guard - this only
+    /// protects manually-typed input during that same window.
+    pub(crate) login_capture_guard: u8,
     reader_name: Option<String>, // Name used by active reader task (for lookup after rename)
     pub gmcp_enabled: bool,          // True if GMCP was negotiated with the server
     pub msdp_enabled: bool,          // True if MSDP was negotiated with the server
@@ -2796,6 +2849,7 @@ impl World {
             naws_enabled: false,
             naws_sent_size: None,
             next_seq: 0,
+            login_capture_guard: 6,
             reader_name: None,
             gmcp_enabled: false,
             msdp_enabled: false,
@@ -2943,6 +2997,37 @@ impl World {
         }
     }
 
+    /// Capture a user-typed command into this world's history. The line is invisible in
+    /// normal display (gagged - see `OutputLine::is_input`'s doc comment) but is written to
+    /// the per-world log immediately (with `INPUT_LINE_PREFIX` baked into the logged text,
+    /// since the `[HH:MM:SS] line` log format has no other way to carry the distinction)
+    /// and is surfaced by F2/show_tags and by `/recall -i`/`-l`/`-g`.
+    ///
+    /// Deliberately does NOT touch `lines_since_pause`, `unseen_lines`, `paused`,
+    /// `scroll_offset` or `visual_line_offset` - an invisible line must not consume the
+    /// more-mode budget, trigger a pause, or count as unseen activity, exactly as a gagged
+    /// line already doesn't (see `release_pending`'s gagged branch).
+    ///
+    /// Returns `(seq, landed_in_output_lines)` - the caller (`App::record_user_input`)
+    /// needs both to decide whether to broadcast it.
+    pub(crate) fn record_input_line(&mut self, text: &str) -> (u64, bool) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.write_log_line(&format!("{}{}", INPUT_LINE_PREFIX, text));
+        let line = OutputLine::new_input(text.to_string(), seq);
+        // Same seq-ordering rule as process_server_data's hold_gagged_in_pending: while
+        // paused with a backlog, pushing straight into output_lines would jump this line
+        // ahead of lower-seq pending lines and break the sorted-by-seq invariant that
+        // App::broadcast_released_lines depends on.
+        if self.paused && !self.pending_lines.is_empty() {
+            self.pending_lines.push(line);
+            (seq, false)
+        } else {
+            self.output_lines.push(line);
+            (seq, true)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn add_output(
         &mut self,
@@ -3022,34 +3107,45 @@ impl World {
             let width = (output_width as usize).max(1);
             let nli = settings.new_line_indicator;
             let wrapspace = settings.wrapspace as usize;
+            // Walk back past any invisible (gagged/input) lines appended after the partial
+            // arrived - the partial itself is always the last VISIBLE line, not necessarily
+            // output_lines.last()/pending_lines.last() (see last_visible_output_idx's doc
+            // comment: a gagged keepalive line or captured user input can land after the
+            // partial while it's still outstanding, e.g. a MUD prompt with no trailing
+            // newline followed by the player typing a command).
             let old_visual = if partial_was_in_pending {
                 0
+            } else if let Some(i) = self.last_visible_output_idx() {
+                let is_new = self.line_is_new(&self.output_lines[i]);
+                nli_visual_rows(&self.output_lines[i].text, width, is_new, nli, wrapspace)
             } else {
-                self.output_lines.last()
-                    .map(|l| nli_visual_rows(&l.text, width, self.line_is_new(l), nli, wrapspace))
-                    .unwrap_or(0)
+                0
             };
 
             if should_filter {
                 // Remove the partial line instead of updating it
                 if partial_was_in_pending {
-                    self.pending_lines.pop();
+                    if let Some(i) = self.last_visible_pending_idx() {
+                        self.pending_lines.remove(i);
+                    }
                 } else {
-                    self.output_lines.pop();
+                    if let Some(i) = self.last_visible_output_idx() {
+                        self.output_lines.remove(i);
+                    }
                     self.lines_since_pause = self.lines_since_pause.saturating_sub(old_visual);
                 }
             } else {
                 // Update the partial line with combined content
                 if partial_was_in_pending {
-                    if let Some(last) = self.pending_lines.last_mut() {
-                        last.text = completed_line.to_string();
+                    if let Some(i) = self.last_visible_pending_idx() {
+                        self.pending_lines[i].text = completed_line.to_string();
                     }
-                } else if let Some(last) = self.output_lines.last_mut() {
-                    last.text = completed_line.to_string();
-                    // Free-function form, not self.line_is_new(last): `last` is a `&mut`
-                    // borrow from last_mut(), which a `&self` method call would conflict with.
-                    let last_is_new = line_is_new_at(last, self.new_from_seq, self.viewed_from_seq);
-                    let new_visual = nli_visual_rows(&last.text, width, last_is_new, nli, wrapspace);
+                } else if let Some(i) = self.last_visible_output_idx() {
+                    self.output_lines[i].text = completed_line.to_string();
+                    // Free-function form, not self.line_is_new(...): matches the
+                    // existing convention here, avoids holding a borrow across statements.
+                    let last_is_new = line_is_new_at(&self.output_lines[i], self.new_from_seq, self.viewed_from_seq);
+                    let new_visual = nli_visual_rows(&self.output_lines[i].text, width, last_is_new, nli, wrapspace);
                     // Re-count at the completed line's final wrapped height. Does
                     // NOT retroactively trigger a pause even if this pushes over
                     // budget — the very next line will pause correctly, and
@@ -3252,6 +3348,24 @@ impl World {
         let line = &self.output_lines[idx];
         let total = nli_visual_rows(&line.text, output_width.max(1), self.line_is_new(line), nli_enabled, wrapspace);
         total.saturating_sub(self.visual_line_offset)
+    }
+
+    /// Index of the last non-gagged line in `output_lines` - i.e. where an outstanding
+    /// partial (prompt) actually lives once invisible lines (action-gagged lines, captured
+    /// user input) have been appended after it. `add_output`'s partial-completion branch
+    /// used to assume `output_lines.last()`, which would silently clobber any invisible
+    /// line pushed since the partial arrived (the MUD's own prompt-then-you-type-a-command
+    /// pattern - the single most common case). Same walk-back rule as `hidden_visual_rows`
+    /// and `release_pending_screenful`.
+    fn last_visible_output_idx(&self) -> Option<usize> {
+        self.output_lines.iter().rposition(|l| !l.gagged)
+    }
+
+    /// Same as `last_visible_output_idx`, but for `pending_lines` - needed because
+    /// `hold_gagged_in_pending`/`record_input_line` can append invisible lines there too
+    /// while a partial line is still sitting in the pending queue.
+    fn last_visible_pending_idx(&self) -> Option<usize> {
+        self.pending_lines.iter().rposition(|l| !l.gagged)
     }
 
     /// Reset VLO truncation and, when nothing else is held back and the user is
@@ -4791,6 +4905,9 @@ impl App {
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                             from_server: tl.from_server,
                             gagged: tl.gagged,
+                            // Remote-console mirror: input provenance isn't on the wire and
+                            // nothing on this side reads it - /recall executes server-side.
+                            is_input: false,
                             seq,
                             highlight_color: tl.highlight_color,
                             from_archive: false,
@@ -4946,6 +5063,7 @@ impl App {
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
                             from_server: line.from_server,
                             gagged: line.gagged,
+                            is_input: false, // remote-console mirror: see the note above
                             seq: line.seq,
                             highlight_color: line.highlight_color,
                             from_archive: line.from_archive,
@@ -5027,6 +5145,7 @@ impl App {
                                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
                                     from_server: line.from_server,
                                     gagged: line.gagged,
+                                    is_input: false, // remote-console mirror: see the note above
                                     seq: line.seq,
                                     highlight_color: line.highlight_color,
                                     from_archive: line.from_archive,
@@ -5057,6 +5176,7 @@ impl App {
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
                             from_server: line.from_server,
                             gagged: line.gagged,
+                            is_input: false, // remote-console mirror: see the note above
                             seq: line.seq,
                             highlight_color: line.highlight_color,
                             from_archive: line.from_archive,
@@ -5181,6 +5301,7 @@ impl App {
                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                     from_server: tl.from_server,
                     gagged: tl.gagged,
+                    is_input: false, // remote-console mirror: see the note above
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
                     from_archive: tl.from_archive,
@@ -5203,6 +5324,7 @@ impl App {
                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                     from_server: tl.from_server,
                     gagged: tl.gagged,
+                    is_input: false, // remote-console mirror: see the note above
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
                     from_archive: tl.from_archive,
@@ -5367,6 +5489,14 @@ impl App {
         fallback_idx: usize,
     ) -> Result<Vec<OutputLine>, String> {
         if opts.archive {
+            // Input isn't archived (see OutputLine::is_input's doc comment - captured input
+            // only lives in output_lines/pending_lines and the per-world file log, never
+            // scrollback.db), so -D -i would otherwise silently return "No matches" forever
+            // with no indication why. Archive rows are always reconstructed via
+            // OutputLine::new_with_timestamp below, which is always is_input: false.
+            if opts.source == tf::RecallSource::Input {
+                return Err("Input history isn't archived — use /recall -i without -D".to_string());
+            }
             if !self.settings.scrollback_enabled {
                 return Err("Archive is off — enable \"Archive Output\" in Setup first".to_string());
             }
@@ -7012,6 +7142,71 @@ impl App {
     pub(crate) fn send_to_world_and_mark_sent(&mut self, world_idx: usize, text: String) {
         if self.send_to_world(world_idx, text) {
             self.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Record a command the user actually typed (console Enter, web/GUI/Android
+    /// SendCommand, or a typed `/command` that resolved to `TfCommandResult::SendToMud`)
+    /// into `world_idx`'s history. Call AFTER a successful send, so a failed send isn't
+    /// recorded.
+    ///
+    /// Deliberately NOT called from `send_to_world`/`send_to_world_and_mark_sent`
+    /// themselves: those are also used by GMCP/MSDP hook results, action-trigger command
+    /// execution, and `/repeat` batches — not user typing.
+    pub(crate) fn record_user_input(&mut self, world_idx: usize, text: &str) {
+        if world_idx >= self.worlds.len() || text.is_empty() {
+            return; // matches InputArea::take_input, which also skips empty input
+        }
+        // Login-window guard - see World::login_capture_guard's doc comment. Checked before
+        // anything else so a manually-typed password/PIN response near connect time is
+        // never written to the log or made /recall-able.
+        if self.worlds[world_idx].login_capture_guard > 0 {
+            self.worlds[world_idx].login_capture_guard -= 1;
+            return;
+        }
+        if text.trim().eq_ignore_ascii_case("logout") {
+            // Re-arm: a re-login sequence (new character, new password prompt) is likely to
+            // follow. Don't capture the "logout" line itself either - simpler and harmless,
+            // since it isn't sensitive either way.
+            self.worlds[world_idx].login_capture_guard = 6;
+            return;
+        }
+        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let was_at_bottom = self.worlds[world_idx].is_at_bottom();
+        for part in text.split('\n') {
+            if part.is_empty() {
+                continue;
+            }
+            let (seq, in_output) = self.worlds[world_idx].record_input_line(part);
+            // from_server: false, so per note_line_arrival's doc comment this can only latch
+            // a viewing episode - it can never end one or cost a background world its ▶
+            // markers.
+            self.worlds[world_idx].note_line_arrival(seq, is_current, false);
+            if !in_output {
+                continue; // held in pending_lines; rides the release batch via broadcast_released_lines
+            }
+            let ws_data = part.replace('\r', "") + "\n";
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data: ws_data,
+                is_viewed: is_current,
+                ts: current_timestamp_secs(),
+                from_server: false,
+                seq, end_seq: None,
+                flush: false,
+                gagged: true, // clients store it and skip rendering unless F2/show-tags
+            });
+        }
+        // Same reasoning as the existing gagged-line release paths: output_lines just grew,
+        // so is_at_bottom() would go false and Tab would scroll instead of releasing.
+        // Preserve visual_line_offset since an invisible line changes nothing about what's
+        // drawn. Guarded on was_at_bottom so a user scrolled up into scrollback keeps their
+        // viewport - an unconditional scroll_to_bottom() here would yank it out from under
+        // them just because they typed a command.
+        if was_at_bottom {
+            let saved_vlo = self.worlds[world_idx].visual_line_offset;
+            self.worlds[world_idx].scroll_to_bottom();
+            self.worlds[world_idx].visual_line_offset = saved_vlo;
         }
     }
 
@@ -8820,6 +9015,9 @@ impl App {
     fn handle_connection_success(&mut self, world_name: &str, cmd_tx: mpsc::Sender<WriteCommand>, socket_fd: Option<SocketFd>, is_tls: bool) {
         if let Some(world_idx) = self.find_world_index(world_name) {
             self.worlds[world_idx].connected = true;
+            // Re-arm the login-capture guard for this fresh connection - see
+            // World::login_capture_guard's doc comment.
+            self.worlds[world_idx].login_capture_guard = 6;
             self.worlds[world_idx].was_connected = true;
             self.worlds[world_idx].prompt_count = 0;
             let now = std::time::Instant::now();
@@ -9002,7 +9200,15 @@ impl App {
                             self.emit_tf_error(world_index, &err, false);
                         }
                         tf::TfCommandResult::SendToMud(text) => {
-                            self.send_to_world_and_mark_sent(world_index, text);
+                            // Not send_to_world_and_mark_sent(): that shared helper is also
+                            // used by non-user-typed callers (GMCP/MSDP hooks, /repeat), so
+                            // recording is done here at this specific typed-command site
+                            // instead - see App::record_user_input's doc comment.
+                            let text_for_record = text.clone();
+                            if self.send_to_world(world_index, text) {
+                                self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                self.record_user_input(world_index, &text_for_record);
+                            }
                         }
                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                             self.dispatch_ws_clay_command(client_id, clay_cmd, event_tx);
@@ -9033,11 +9239,12 @@ impl App {
             Command::NotACommand { text } => {
                 // Regular text - send to MUD
                 if world_index < self.worlds.len() {
-                    if let Some(tx) = &self.worlds[world_index].command_tx {
-                        if tx.try_send(WriteCommand::Text(text)).is_ok() {
-                            self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                            self.worlds[world_index].prompt.clear();
-                        }
+                    let sent = self.worlds[world_index].command_tx.as_ref()
+                        .is_some_and(|tx| tx.try_send(WriteCommand::Text(text.clone())).is_ok());
+                    if sent {
+                        self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                        self.worlds[world_index].prompt.clear();
+                        self.record_user_input(world_index, &text);
                     }
                 }
             }
@@ -16544,6 +16751,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     tf::TfCommandResult::SendToMud(text) => {
                                         if app.current_world().connected {
                                             if let Some(tx) = &app.current_world().command_tx {
+                                                let world_idx_for_record = app.current_world_index;
+                                                let text_for_record = text.clone();
                                                 if tx.send(WriteCommand::Text(text)).await.is_err() {
                                                     app.add_tf_output("Failed to send command");
                                                 } else {
@@ -16553,6 +16762,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     app.current_world_mut().prompt.clear();
                                                     // Reset more-mode counter after successfully sending
                                                     app.current_world_mut().lines_since_pause = 0;
+                                                    app.record_user_input(world_idx_for_record, &text_for_record);
                                                 }
                                             }
                                         } else {
@@ -16648,6 +16858,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.process_pending_keyboard_ops();
                             } else if app.current_world().connected {
                                 if let Some(tx) = &app.current_world().command_tx {
+                                    let world_idx_for_record = app.current_world_index;
+                                    let cmd_for_record = cmd.clone();
                                     if tx.send(WriteCommand::Text(cmd)).await.is_err() {
                                         app.add_output("Failed to send command");
                                     } else {
@@ -16658,6 +16870,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // Reset more-mode counter after successfully sending command
                                         // This ensures the counter is 0 when the server response arrives
                                         app.current_world_mut().lines_since_pause = 0;
+                                        app.record_user_input(world_idx_for_record, &cmd_for_record);
                                     }
                                 }
                             } else {

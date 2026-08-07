@@ -500,31 +500,41 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], sho
     for (rel_idx, line) in lines_to_check.iter().enumerate() {
         let abs_idx = start_idx + rel_idx;
 
-        // Skip gagged lines unless show_gagged is set
-        if line.gagged && !opts.show_gagged {
+        // Skip gagged lines unless show_gagged is set. Captured user input carries
+        // gagged:true purely as its invisibility mechanism (see OutputLine::is_input's doc
+        // comment), NOT because an action gagged it - so -ag must not be required to
+        // /recall it. The source match below is what decides whether input is in scope.
+        if line.gagged && !line.is_input && !opts.show_gagged {
             continue;
         }
 
         // Filter by source: -w (default) = server only, -l = local only, -g = all
         match &opts.source {
             tf::RecallSource::CurrentWorld | tf::RecallSource::World(_) => {
-                // Default: only MUD server output (not client-generated)
-                if !line.from_server {
+                // Default (no source flag): MUD server output only. Captured input is
+                // from_server:false so it's already excluded via the from_server check;
+                // the explicit is_input check is belt-and-braces so this stays correct if
+                // input ever gains from_server:true for some reason.
+                if line.is_input || !line.from_server {
                     continue;
                 }
             }
             tf::RecallSource::Local => {
-                // -l: only client-generated output (TF output, system messages)
+                // -l: client-generated output (TF output, system messages) AND the user's
+                // own typed input - both are from_server:false, so no extra check needed.
                 if line.from_server {
                     continue;
                 }
             }
             tf::RecallSource::Global => {
-                // -g: all lines (server + local)
+                // -g: server output + client-generated output + the user's typed input.
             }
             tf::RecallSource::Input => {
-                // -i: input history - handled separately, skip all output lines
-                continue;
+                // -i: the user's typed input only. Was an unconditional `continue` (dead
+                // code - always skipped every line, so /recall -i never matched anything).
+                if !line.is_input {
+                    continue;
+                }
             }
         }
 
@@ -549,6 +559,15 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], sho
             } else {
                 strip_mud_tag(&line.text)
             };
+
+            // Mark captured user input so it's visually distinguishable from world output
+            // and client notices in mixed -l/-g results - applied at render time only,
+            // never baked into OutputLine.text (see INPUT_LINE_PREFIX's doc comment in
+            // main.rs). Before the -t/# prefixes below, so the result reads
+            // "12: [14:22:01] » north".
+            if line.is_input {
+                display_line = format!("{}{}", crate::INPUT_LINE_PREFIX, display_line);
+            }
 
             // Add timestamp if requested, honoring the optional -t[format] (default %H:%M:%S)
             if opts.show_timestamps {

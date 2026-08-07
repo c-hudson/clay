@@ -2353,6 +2353,14 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_i_parses_input_source() {
+        // Cheap parser lock so a future flag refactor can't silently re-break -i (it was a
+        // dead no-op for a while - see actions.rs's RecallSource::Input arm).
+        assert_eq!(recall_opts("-i north").source, RecallSource::Input);
+        assert_eq!(recall_opts("-i *tell*").pattern.as_deref(), Some("*tell*"));
+    }
+
+    #[test]
     fn test_recall_t_no_format() {
         // -t alone → show_timestamps true, no custom format, range applied
         let opts = recall_opts("-t /5");

@@ -1681,9 +1681,9 @@ Search output history.
 
 Options:
   -w[world]   Search specific world (default: current)
-  -l          Search local (TF) output only
-  -g          Search all worlds + local
-  -i          Search input history
+  -l          Search local (TF) output + your typed input
+  -g          Search all worlds + local + your typed input
+  -i          Search your typed input only
   -D          Search long-term archive (~/.clay/scrollback.db)
   -t[format]  Show timestamps
   -v          Invert match (show non-matching)
@@ -1694,11 +1694,16 @@ Options:
   -Bn         Show n lines before each match
   #           Show line numbers
 
+Your typed input is captured invisibly - it never appears in normal output.
+Press F2 (show tags) to see it inline, or use /recall -i/-l/-g. Not archived,
+so -D can't be combined with -i.
+
 Range: N (last N), -N (Nth previous), N-M, N-
 
 Examples:
   /recall 20                       - Last 20 lines
   /recall -i /def                  - Input history matching /def
+  /recall -i *tell*                - Commands you typed containing "tell"
   /recall -mregexp \d{3}-\d{4}     - Regex match
   /recall -D dragon                - Search archive for "dragon"
   /recall -D -wmud.example.com *   - All archived lines for a world"#.to_string()
