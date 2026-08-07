@@ -503,6 +503,9 @@ pub enum WsMessage {
         tts_speak_mode: String,
         #[serde(default)]
         scrollback_enabled: bool,
+        /// See `Settings::log_input_enabled`'s doc comment in main.rs.
+        #[serde(default)]
+        log_input_enabled: bool,
         #[serde(default = "default_keyboard_always_visible")]
         keyboard_always_visible: bool,
         #[serde(default)]
@@ -901,6 +904,9 @@ pub struct GlobalSettingsMsg {
     pub tts_speak_mode: String,
     #[serde(default)]
     pub scrollback_enabled: bool,
+    /// See `Settings::log_input_enabled`'s doc comment in main.rs.
+    #[serde(default)]
+    pub log_input_enabled: bool,
     /// Force the on-screen keyboard visible on phone/tablet web clients (Android
     /// app included); ignored when a hardware keyboard is attached.
     #[serde(default = "default_keyboard_always_visible")]

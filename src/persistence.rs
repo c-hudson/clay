@@ -380,6 +380,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
+    writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
 
@@ -1017,6 +1018,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     }
                     "scrollback_enabled" => {
                         app.settings.scrollback_enabled = value == "true";
+                    }
+                    "log_input_enabled" => {
+                        app.settings.log_input_enabled = value == "true";
                     }
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
@@ -1718,6 +1722,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "tts_mode={}", app.settings.tts_mode.name())?;
     writeln!(file, "tts_speak_mode={}", app.settings.tts_speak_mode.name())?;
     writeln!(file, "scrollback_enabled={}", app.settings.scrollback_enabled)?;
+    writeln!(file, "log_input_enabled={}", app.settings.log_input_enabled)?;
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
 
@@ -2459,6 +2464,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "scrollback_enabled" => {
                         app.settings.scrollback_enabled = value == "true";
                     }
+                    "log_input_enabled" => {
+                        app.settings.log_input_enabled = value == "true";
+                    }
                     "tabs" => {
                         app.settings.tabs = crate::TabsMode::from_name(value);
                     }
@@ -2799,6 +2807,7 @@ mod tests {
             web_font_line_height: 1.8,         // default: 1.2
             web_font_word_spacing: 2.0,        // default: 0.0
             scrollback_enabled: true,          // default: false
+            log_input_enabled: true,           // default: false
             keyboard_always_visible: false,    // default: true
             tabs: TabsMode::Top,               // default: None
             icon_bar: IconBarMode::All,        // default: AppTablet
@@ -2891,6 +2900,7 @@ mod tests {
         assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
         assert_eq!(a.tts_mode, b.tts_mode, "{context}: tts_mode");
         assert_eq!(a.scrollback_enabled, b.scrollback_enabled, "{context}: scrollback_enabled");
+        assert_eq!(a.log_input_enabled, b.log_input_enabled, "{context}: log_input_enabled");
         assert_eq!(a.keyboard_always_visible, b.keyboard_always_visible, "{context}: keyboard_always_visible");
         assert_eq!(a.tabs, b.tabs, "{context}: tabs");
         assert_eq!(a.icon_bar, b.icon_bar, "{context}: icon_bar");
@@ -3226,6 +3236,7 @@ pattern=foo
         assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
         assert_ne!(non_default.tts_mode, default.tts_mode, "tts_mode should differ");
         assert_ne!(non_default.scrollback_enabled, default.scrollback_enabled, "scrollback_enabled should differ");
+        assert_ne!(non_default.log_input_enabled, default.log_input_enabled, "log_input_enabled should differ");
         assert_ne!(non_default.keyboard_always_visible, default.keyboard_always_visible, "keyboard_always_visible should differ");
         assert_ne!(non_default.tabs, default.tabs, "tabs should differ");
         assert_ne!(non_default.icon_bar, default.icon_bar, "icon_bar should differ");

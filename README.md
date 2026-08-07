@@ -202,7 +202,7 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 | Command | Description |
 |---------|-------------|
 | `/recall [options] [range] [pattern]` | Search output/input history (see `/help recall` for the full option list) |
-| `/recall -D <pattern>` | Search the long-term scrollback archive (requires "Archive Output" in `/setup`) |
+| `/recall -D <pattern>` | Search the long-term scrollback archive (requires "Archive Input/Output" in `/setup`) |
 
 **Lookup & Utility:**
 

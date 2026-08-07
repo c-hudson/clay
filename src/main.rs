@@ -1691,6 +1691,16 @@ pub struct Settings {
     pub tts_speak_mode: tts::TtsSpeakMode,
     pub tts_muted: bool,  // Runtime-only, toggled by F9
     pub scrollback_enabled: bool,
+    /// Whether captured user-typed input (see `OutputLine::is_input`) additionally gets
+    /// written to the per-world offline log file (`World::write_log_line`, gated there by
+    /// the world's own `log_enabled`). Only shown in Setup once `scrollback_enabled` is on
+    /// (see `update_setup_visibility` in `popup/definitions/setup.rs`) - purely a
+    /// discoverability nesting, not a functional dependency on the archive. Does NOT affect
+    /// `/recall`: the captured `OutputLine` always lands in `output_lines`/`pending_lines`
+    /// regardless of this setting - only the file write is gated (see
+    /// `World::record_input_line`'s `log_input` parameter). Default off since it writes
+    /// potentially-sensitive typed text to a plaintext file.
+    pub log_input_enabled: bool,
     // Number of visible (non-gagged) lines of scrollback sent to a remote/web/GUI
     // client per world on initial connect. Older history is backfilled on demand
     // via RequestScrollback. See build_initial_state().
@@ -1751,6 +1761,7 @@ impl Default for Settings {
             tts_speak_mode: tts::TtsSpeakMode::All,
             tts_muted: false,
             scrollback_enabled: false,
+            log_input_enabled: false,
             remote_initial_lines: 100,
             keyboard_always_visible: true,
         }
@@ -2998,10 +3009,16 @@ impl World {
     }
 
     /// Capture a user-typed command into this world's history. The line is invisible in
-    /// normal display (gagged - see `OutputLine::is_input`'s doc comment) but is written to
-    /// the per-world log immediately (with `INPUT_LINE_PREFIX` baked into the logged text,
-    /// since the `[HH:MM:SS] line` log format has no other way to carry the distinction)
-    /// and is surfaced by F2/show_tags and by `/recall -i`/`-l`/`-g`.
+    /// normal display (gagged - see `OutputLine::is_input`'s doc comment) and is surfaced
+    /// by F2/show_tags and by `/recall -i`/`-l`/`-g` UNCONDITIONALLY - `log_input` only
+    /// controls whether it's ALSO written to the per-world log file immediately (with
+    /// `INPUT_LINE_PREFIX` baked into the logged text, since the `[HH:MM:SS] line` log
+    /// format has no other way to carry the distinction). Pass
+    /// `App::settings.log_input_enabled` (the global "Log Input" setting, itself only
+    /// shown once "Archive Input/Output" is on - see `update_setup_visibility` in
+    /// `popup/definitions/setup.rs`); this is unrelated to `self.settings.log_enabled`
+    /// (the per-world switch `write_log_line` itself checks), which still gates the write
+    /// too - both must be true for the file write to happen.
     ///
     /// Deliberately does NOT touch `lines_since_pause`, `unseen_lines`, `paused`,
     /// `scroll_offset` or `visual_line_offset` - an invisible line must not consume the
@@ -3010,10 +3027,12 @@ impl World {
     ///
     /// Returns `(seq, landed_in_output_lines)` - the caller (`App::record_user_input`)
     /// needs both to decide whether to broadcast it.
-    pub(crate) fn record_input_line(&mut self, text: &str) -> (u64, bool) {
+    pub(crate) fn record_input_line(&mut self, text: &str, log_input: bool) -> (u64, bool) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.write_log_line(&format!("{}{}", INPUT_LINE_PREFIX, text));
+        if log_input {
+            self.write_log_line(&format!("{}{}", INPUT_LINE_PREFIX, text));
+        }
         let line = OutputLine::new_input(text.to_string(), seq);
         // Same seq-ordering rule as process_server_data's hold_gagged_in_pending: while
         // paused with a backlog, pushing straight into output_lines would jump this line
@@ -4005,6 +4024,7 @@ impl App {
             tts_mode: self.settings.tts_mode.name().to_string(),
             tts_speak_mode: self.settings.tts_speak_mode.name().to_string(),
             scrollback_enabled: self.settings.scrollback_enabled,
+            log_input_enabled: self.settings.log_input_enabled,
             keyboard_always_visible: self.settings.keyboard_always_visible,
             tabs: self.settings.tabs.name().to_string(),
             icon_bar: self.settings.icon_bar.name().to_string(),
@@ -4082,6 +4102,7 @@ impl App {
             self.settings.tts_muted = false;
         }
         self.settings.scrollback_enabled = settings.scrollback_enabled;
+        self.settings.log_input_enabled = settings.log_input_enabled;
         self.settings.keyboard_always_visible = settings.keyboard_always_visible;
         // Sync keybindings from master
         if !settings.keybindings_json.is_empty() {
@@ -4466,6 +4487,7 @@ impl App {
             self.settings.tts_mode.name(),
             self.settings.tts_speak_mode.name(),
             self.settings.scrollback_enabled,
+            self.settings.log_input_enabled,
             self.settings.wrapspace as i64,
             self.settings.keyboard_always_visible,
             self.settings.tabs.name(),
@@ -5498,7 +5520,7 @@ impl App {
                 return Err("Input history isn't archived — use /recall -i without -D".to_string());
             }
             if !self.settings.scrollback_enabled {
-                return Err("Archive is off — enable \"Archive Output\" in Setup first".to_string());
+                return Err("Archive is off — enable \"Archive Input/Output\" in Setup first".to_string());
             }
             let world_name = match &opts.source {
                 tf::RecallSource::World(name) => Some(name.as_str()),
@@ -6816,6 +6838,7 @@ impl App {
         tts_mode: String,
         tts_speak_mode: String,
         scrollback_enabled: bool,
+        log_input_enabled: bool,
         keyboard_always_visible: bool,
         tabs: String,
         icon_bar: String,
@@ -6900,6 +6923,7 @@ impl App {
         if scrollback_changed {
             self.init_scrollback();
         }
+        self.settings.log_input_enabled = log_input_enabled;
         self.settings.keyboard_always_visible = keyboard_always_visible;
         // Save settings to persist changes. Tag the (debug-mode-only) audit log
         // with which kind of client pushed this, so a future settings-loss report
@@ -7177,7 +7201,7 @@ impl App {
             if part.is_empty() {
                 continue;
             }
-            let (seq, in_output) = self.worlds[world_idx].record_input_line(part);
+            let (seq, in_output) = self.worlds[world_idx].record_input_line(part, self.settings.log_input_enabled);
             // from_server: false, so per note_line_arrival's doc comment this can only latch
             // a viewing episode - it can never end one or cost a background world its ▶
             // markers.
@@ -10112,7 +10136,7 @@ impl App {
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 );
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, keyboard_always_visible, tabs, icon_bar } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
                 self.update_global_settings(
                     client_id, more_mode_enabled, spell_check_enabled, temp_convert_enabled,
                     world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme,
@@ -10122,7 +10146,7 @@ impl App {
                     web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path,
                     ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path,
                     mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled,
-                    keyboard_always_visible, tabs, icon_bar,
+                    log_input_enabled, keyboard_always_visible, tabs, icon_bar,
                 );
             }
             WsMessage::UpdateActions { actions } => {
@@ -11644,6 +11668,7 @@ pub(crate) struct SetupSettings {
     pub(crate) tts_mode: String,
     pub(crate) tts_speak_mode: String,
     pub(crate) scrollback: bool,
+    pub(crate) log_input: bool,
     pub(crate) wrapspace: i64,
     pub(crate) keyboard_always_visible: bool,
     pub(crate) tabs: String,
@@ -11799,9 +11824,10 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_NEW_LINE_INDICATOR, SETUP_FIELD_TTS, SETUP_FIELD_TTS_SPEAK_MODE,
-        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
+        SETUP_FIELD_SCROLLBACK, SETUP_FIELD_LOG_INPUT, SETUP_FIELD_WRAPSPACE, SETUP_FIELD_KEYBOARD_VISIBLE,
         SETUP_FIELD_TABS, SETUP_FIELD_ICON_BAR,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
+        update_setup_visibility,
     };
     use popup::definitions::web::{
         WEB_FIELD_PORT, WEB_FIELD_CUSTOM_PORT, WEB_FIELD_WEB_PATH,
@@ -12050,6 +12076,11 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     tts_mode: state.get_selected(SETUP_FIELD_TTS).unwrap_or("off").to_string(),
                     tts_speak_mode: state.get_selected(SETUP_FIELD_TTS_SPEAK_MODE).unwrap_or("all").to_string(),
                     scrollback: state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false),
+                    // Read regardless of the field's current visibility: if Archive
+                    // Input/Output was just unchecked in this same edit (hiding Log
+                    // Input), the field's last value should still round-trip rather than
+                    // silently resetting to false.
+                    log_input: state.get_bool(SETUP_FIELD_LOG_INPUT).unwrap_or(false),
                     wrapspace: state.get_number(SETUP_FIELD_WRAPSPACE).unwrap_or(0),
                     keyboard_always_visible: state.get_bool(SETUP_FIELD_KEYBOARD_VISIBLE).unwrap_or(true),
                     tabs: state.get_selected(SETUP_FIELD_TABS).unwrap_or("none").to_string(),
@@ -12085,6 +12116,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             state.start_edit();
                         } else {
                             state.toggle_current();
+                            update_setup_visibility(state);
                         }
                     }
                 }
@@ -12102,6 +12134,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     } else {
                         // Toggle current field
                         state.toggle_current();
+                        update_setup_visibility(state);
                     }
                 }
                 Up => {
@@ -13804,7 +13837,7 @@ async fn main() -> io::Result<()> {
     if grep_archive_mode {
         let db_path = clay_config_path("scrollback.db");
         if !db_path.exists() {
-            eprintln!("Error: Archive database not found at {}. Enable \"Archive Output\" in Clay Setup first.", db_path.display());
+            eprintln!("Error: Archive database not found at {}. Enable \"Archive Input/Output\" in Clay Setup first.", db_path.display());
             std::process::exit(1);
         }
         let pattern = grep_pattern.as_deref().unwrap_or("*");
@@ -13838,7 +13871,7 @@ async fn main() -> io::Result<()> {
     if dump_mode {
         let db_path = clay_config_path("scrollback.db");
         if !db_path.exists() {
-            eprintln!("Error: Archive database not found at {}. Enable \"Archive Output\" in Clay Setup first.", db_path.display());
+            eprintln!("Error: Archive database not found at {}. Enable \"Archive Input/Output\" in Clay Setup first.", db_path.display());
             std::process::exit(1);
         }
         let out_dir = match dump_out_dir {

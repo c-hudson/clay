@@ -393,6 +393,8 @@
         setupKeyboardVisibleToggle: document.getElementById('setup-keyboard-visible-toggle'),
         setupDebugToggle: document.getElementById('setup-debug-toggle'),
         setupArchiveToggle: document.getElementById('setup-archive-toggle'),
+        setupLogInputField: document.getElementById('setup-log-input-field'),
+        setupLogInputToggle: document.getElementById('setup-log-input-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
         setupHeightMinus: document.getElementById('setup-height-minus'),
@@ -764,6 +766,7 @@
     let setupNewLineIndicator = false;
     let setupKeyboardAlwaysVisible = true;
     let setupArchive = false;
+    let setupLogInput = false;
     let setupDebug = false;
     let setupInputHeightValue = 1;
     let setupWrapspace = 0;
@@ -882,6 +885,7 @@
     let mouseEnabled = true;  // Console mouse support
     let debugEnabled = false;  // Debug logging
     let scrollbackEnabled = false;  // Long-term archive output
+    let logInputEnabled = false;  // Write captured user input to the per-world log file too
     let dictionaryPath = '';  // Custom dictionary path
     let spellCheckEnabled = true;  // Spell checking
     // Track whether the last edit was a deletion - mirrors Rust's
@@ -2607,6 +2611,9 @@
                     if (msg.settings.scrollback_enabled !== undefined) {
                         scrollbackEnabled = msg.settings.scrollback_enabled;
                     }
+                    if (msg.settings.log_input_enabled !== undefined) {
+                        logInputEnabled = msg.settings.log_input_enabled;
+                    }
                     if (msg.settings.dictionary_path !== undefined) {
                         dictionaryPath = msg.settings.dictionary_path;
                     }
@@ -3275,6 +3282,9 @@
                     }
                     if (msg.settings.scrollback_enabled !== undefined) {
                         scrollbackEnabled = msg.settings.scrollback_enabled;
+                    }
+                    if (msg.settings.log_input_enabled !== undefined) {
+                        logInputEnabled = msg.settings.log_input_enabled;
                     }
                     if (msg.settings.dictionary_path !== undefined) {
                         dictionaryPath = msg.settings.dictionary_path;
@@ -8174,6 +8184,7 @@
         setupKeyboardAlwaysVisible = keyboardAlwaysVisible;
         setupDebug = debugEnabled;
         setupArchive = scrollbackEnabled;
+        setupLogInput = logInputEnabled;
         setupInputHeightValue = inputHeight;
         setupWrapspace = wrapspace;
         setupGuiTheme = guiTheme;
@@ -8272,6 +8283,17 @@
         } else {
             elements.setupArchiveToggle.classList.remove('active');
         }
+        // Log Input is only shown once Archive Input/Output is on - see
+        // update_setup_visibility's doc comment in popup/definitions/setup.rs (the
+        // console equivalent of this same conditional).
+        if (elements.setupLogInputField) {
+            elements.setupLogInputField.style.display = setupArchive ? 'flex' : 'none';
+        }
+        if (setupLogInput) {
+            elements.setupLogInputToggle.classList.add('active');
+        } else {
+            elements.setupLogInputToggle.classList.remove('active');
+        }
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
         updateCustomDropdown(elements.setupWorldSwitchSelect);
@@ -8342,6 +8364,7 @@
             debug_enabled: debugEnabled,
             dictionary_path: dictionaryPath,
             scrollback_enabled: scrollbackEnabled,
+            log_input_enabled: logInputEnabled,
             keyboard_always_visible: keyboardAlwaysVisible
         };
     }
@@ -8453,6 +8476,7 @@
         applyKeyboardForceState();
         debugEnabled = setupDebug;
         scrollbackEnabled = setupArchive;
+        logInputEnabled = setupLogInput;
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
         wrapspace = setupWrapspace;
@@ -11352,6 +11376,10 @@
         };
         elements.setupArchiveToggle.onclick = function() {
             setupArchive = !setupArchive;
+            updateSetupPopupUI();
+        };
+        elements.setupLogInputToggle.onclick = function() {
+            setupLogInput = !setupLogInput;
             updateSetupPopupUI();
         };
         elements.setupWorldSwitchSelect.onchange = function() {

@@ -1564,6 +1564,7 @@ pub(crate) fn handle_remote_client_key(
                 app.settings.icon_bar = IconBarMode::from_name(&settings.icon_bar);
                 app.settings.tts_mode = crate::tts::TtsMode::from_name(&settings.tts_mode);
                 app.settings.scrollback_enabled = settings.scrollback;
+                app.settings.log_input_enabled = settings.log_input;
                 // No local needs_output_redraw here — this is a remote console client; the
                 // master (which owns rendering for its own TUI) applies its own redraw when
                 // it processes the resulting UpdateGlobalSettings message below.
@@ -1616,6 +1617,7 @@ pub(crate) fn handle_remote_client_key(
                     tts_mode: app.settings.tts_mode.name().to_string(),
                     tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
                     scrollback_enabled: app.settings.scrollback_enabled,
+                    log_input_enabled: app.settings.log_input_enabled,
                     keyboard_always_visible: app.settings.keyboard_always_visible,
                     tabs: app.settings.tabs.name().to_string(),
                     icon_bar: app.settings.icon_bar.name().to_string(),
@@ -2421,6 +2423,7 @@ pub(crate) fn apply_remote_web_settings(
         tts_mode: app.settings.tts_mode.name().to_string(),
         tts_speak_mode: app.settings.tts_speak_mode.name().to_string(),
         scrollback_enabled: app.settings.scrollback_enabled,
+        log_input_enabled: app.settings.log_input_enabled,  // unchanged — this function only touches web settings
         keyboard_always_visible: app.settings.keyboard_always_visible,
         tabs: app.settings.tabs.name().to_string(),  // unchanged — this function only touches web settings
         icon_bar: app.settings.icon_bar.name().to_string(),  // unchanged — this function only touches web settings

@@ -2072,6 +2072,38 @@
     }
 
     #[test]
+    fn test_record_input_line_respects_log_input_gate() {
+        let mut world = World::new("test");
+        world.settings.log_enabled = true; // per-world log switch, must ALSO be on
+        world.log_date = Some(World::get_current_date_string()); // avoid real file rollover
+
+        let tmp_path = std::env::temp_dir().join(format!("clay_test_log_input_{}.log", std::process::id()));
+        let file = std::fs::File::create(&tmp_path).unwrap();
+        world.log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+
+        // log_input: false - captured line must still land in output_lines (so /recall -i
+        // still finds it), but must NOT be written to the log file.
+        let (_, in_output) = world.record_input_line("secretcmd", false);
+        assert!(in_output);
+        assert_eq!(world.output_lines.len(), 1);
+        assert!(world.output_lines[0].is_input);
+        assert_eq!(world.output_lines[0].text, "secretcmd");
+
+        // log_input: true - captured line lands in output_lines AND is written to the file.
+        let (_, in_output2) = world.record_input_line("visiblecmd", true);
+        assert!(in_output2);
+        assert_eq!(world.output_lines.len(), 2);
+
+        drop(world); // release the Arc<Mutex<File>> so the write is flushed/closed before reading
+        let contents = std::fs::read_to_string(&tmp_path).unwrap();
+        let _ = std::fs::remove_file(&tmp_path);
+
+        assert!(!contents.contains("secretcmd"), "log_input: false must not write to the file");
+        assert!(contents.contains("visiblecmd"), "log_input: true must write to the file");
+        assert!(contents.contains('\u{00BB}'), "the logged line must carry the input marker");
+    }
+
+    #[test]
     fn test_recall_without_more_mode_emits_all() {
         let mut app = App::new();
         app.worlds.clear();
@@ -6457,7 +6489,7 @@ if you're more curious.\"";
             String::new(), false, false, 9000, String::new(),
             String::new(), String::new(), ws_password.to_string(),
             false, String::new(), true, true, false,
-            "off".to_string(), "off".to_string(), false, true,
+            "off".to_string(), "off".to_string(), false, false, true,
             "none".to_string(), "app_tablet".to_string(),
         );
     }

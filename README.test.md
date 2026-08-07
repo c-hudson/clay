@@ -177,7 +177,7 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'   # live grep, tail
 
 | Command | Description |
 |---------|-------------|
-| `/recall [options] [range] [pattern] [-D]` | Search output/input history; `-D` searches the long-term scrollback archive (requires "Archive Output" in `/setup`) — see `/help recall` for the full option list |
+| `/recall [options] [range] [pattern] [-D]` | Search output/input history; `-D` searches the long-term scrollback archive (requires "Archive Input/Output" in `/setup`) — see `/help recall` for the full option list |
 
 **Lookup & Utility:**
 

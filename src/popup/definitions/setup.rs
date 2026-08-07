@@ -31,6 +31,9 @@ pub const SETUP_FIELD_WRAPSPACE: FieldId = FieldId(22);
 pub const SETUP_FIELD_KEYBOARD_VISIBLE: FieldId = FieldId(23);
 pub const SETUP_FIELD_TABS: FieldId = FieldId(24);
 pub const SETUP_FIELD_ICON_BAR: FieldId = FieldId(25);
+// Only visible while SETUP_FIELD_SCROLLBACK ("Archive Input/Output") is checked - see
+// update_setup_visibility/update_setup_visibility_def below.
+pub const SETUP_FIELD_LOG_INPUT: FieldId = FieldId(26);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -115,6 +118,7 @@ pub fn create_setup_popup(
     tts_mode: &str,
     tts_speak_mode: &str,
     scrollback: bool,
+    log_input: bool,
     wrapspace: i64,
     keyboard_always_visible: bool,
     tabs: &str,
@@ -132,7 +136,7 @@ pub fn create_setup_popup(
     let tabs_idx = tabs_options().iter().position(|o| o.value == tabs).unwrap_or(0);
     let icon_bar_idx = icon_bar_options().iter().position(|o| o.value == icon_bar).unwrap_or(1);
 
-    PopupDefinition::new(PopupId("setup"), "Setup")
+    let mut def = PopupDefinition::new(PopupId("setup"), "Setup")
         .with_field(Field::new(
             SETUP_FIELD_MORE_MODE,
             "More Mode",
@@ -220,8 +224,13 @@ pub fn create_setup_popup(
         ))
         .with_field(Field::new(
             SETUP_FIELD_SCROLLBACK,
-            "Archive Output",
+            "Archive Input/Output",
             FieldKind::toggle(scrollback),
+        ))
+        .with_field(Field::new(
+            SETUP_FIELD_LOG_INPUT,
+            "Log Input",
+            FieldKind::toggle(log_input),
         ))
         .with_field(Field::new(
             SETUP_FIELD_WRAPSPACE,
@@ -257,7 +266,32 @@ pub fn create_setup_popup(
             anchor_bottom_left: false,
             anchor_x: 0,
         })
-        .with_help(setup_help_text())
+        .with_help(setup_help_text());
+
+    update_setup_visibility_def(&mut def);
+
+    def
+}
+
+/// Update visibility of the Log Input field based on the current Archive Input/Output
+/// (SETUP_FIELD_SCROLLBACK) toggle state - it's only shown once that's checked (see
+/// SETUP_FIELD_LOG_INPUT's doc comment). Mirrors update_web_visibility in web.rs.
+pub fn update_setup_visibility(state: &mut crate::popup::PopupState) {
+    let show_log_input = state.get_bool(SETUP_FIELD_SCROLLBACK).unwrap_or(false);
+    if let Some(field) = state.field_mut(SETUP_FIELD_LOG_INPUT) {
+        field.visible = show_log_input;
+    }
+}
+
+/// Same as `update_setup_visibility` but operates directly on a `PopupDefinition` (used
+/// at creation time, before a `PopupState` wraps it). Mirrors update_web_visibility_def.
+fn update_setup_visibility_def(def: &mut PopupDefinition) {
+    let show_log_input = def.get_field(SETUP_FIELD_SCROLLBACK)
+        .and_then(|f| if let FieldKind::Toggle { value } = &f.kind { Some(*value) } else { None })
+        .unwrap_or(false);
+    if let Some(field) = def.get_field_mut(SETUP_FIELD_LOG_INPUT) {
+        field.visible = show_log_input;
+    }
 }
 
 /// Help text for the Setup popup
@@ -317,11 +351,17 @@ fn setup_help_text() -> Vec<String> {
         "  Web/Android always use the browser's Speech API.",
         "  Use /say <text> to speak manually when TTS is off.",
         "",
-        "Archive Output: Saves all world output to",
+        "Archive Input/Output: Saves all world output to",
         "  ~/.clay/scrollback.db for permanent storage.",
         "  Enables /recall -D <pattern> to search the archive",
         "  and pg-up past the top of the scrollback buffer.",
         "  Changes take effect on next restart or /reload.",
+        "",
+        "Log Input: Only shown while Archive Input/Output is",
+        "  on. Also writes your typed commands to the",
+        "  per-world log file (if Log is on for that world).",
+        "  Off by default. Does not affect /recall -i, which",
+        "  always works regardless of this setting.",
         "",
         "Wrap Space: Number of spaces to hang-indent wrapped",
         "  continuation lines of long MUD output (0 = off).",
@@ -352,13 +392,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            false, "off", "words", false, 0, true, "none", "app_tablet",
+            false, "off", "words", false, false, 0, true, "none", "app_tablet",
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 21);
+        assert_eq!(state.definition.fields.len(), 22);
         assert_eq!(state.definition.buttons.len(), 3); // ?, Cancel, Save
     }
 
@@ -367,7 +407,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            false, "edge", "sentences", true, 4, false, "top", "all",
+            false, "edge", "sentences", true, false, 4, false, "top", "all",
         );
         let state = PopupState::new(def);
 

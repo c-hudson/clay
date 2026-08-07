@@ -638,6 +638,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 if scrollback_changed {
                     app.init_scrollback();
                 }
+                app.settings.log_input_enabled = settings.log_input;
                 // Rewrap already-visible output immediately (mirrors a terminal resize) only
                 // when wrapspace actually changed, so an unrelated setup save doesn't force
                 // a spurious redraw. No clamp beyond the popup's 0-20 field range — the
