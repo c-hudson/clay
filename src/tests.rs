@@ -6669,16 +6669,18 @@ if you're more curious.\"";
         }
     }
 
-    /// New-text (▶) watermark: WsMessage::NewWatermark round-trips on the wire.
+    /// New-text (▶) watermark: WsMessage::NewWatermark round-trips on the wire, including
+    /// the viewed_from_seq ceiling.
     #[test]
     fn test_new_watermark_round_trips() {
-        let msg = WsMessage::NewWatermark { world_index: 2, new_from_seq: 42 };
+        let msg = WsMessage::NewWatermark { world_index: 2, new_from_seq: 42, viewed_from_seq: 99 };
         let json = serde_json::to_string(&msg).unwrap();
         let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
         match round_tripped {
-            WsMessage::NewWatermark { world_index, new_from_seq } => {
+            WsMessage::NewWatermark { world_index, new_from_seq, viewed_from_seq } => {
                 assert_eq!(world_index, 2);
                 assert_eq!(new_from_seq, 42);
+                assert_eq!(viewed_from_seq, 99);
             }
             other => panic!("expected NewWatermark, got {:?}", other),
         }
@@ -6931,6 +6933,127 @@ if you're more curious.\"";
         assert!(world.pending_lines.iter().all(|l| world.line_is_new(l)),
             "pending_lines must KEEP their ▶ marker after Ctrl+L - they're still undisplayed");
         assert_eq!(world.new_from_seq, 3, "watermark must land exactly past the last displayed seq");
+    }
+
+    // ========== Rule 1 vs. rule 2: arrivals must not clear OTHER lines' markers ==========
+    //
+    // Regression guard for a bug where a single monotonic new_from_seq floor, advanced to
+    // exclude a brand-new arriving line while a world was being viewed, ALSO retroactively
+    // swept every older, still-legitimately-new backlog line below it - even though nothing
+    // had actually been "displayed" in the rule-2 sense (leaving the world / Ctrl+L). Fixed
+    // by adding a second watermark, World::viewed_from_seq (see its doc comment), which
+    // excludes only the lines that arrived during the current viewing episode without
+    // touching new_from_seq at all.
+
+    #[test]
+    fn test_arrival_while_viewing_keeps_older_backlog_markers() {
+        // THE regression: text arriving on the world you are looking at must not strip ▶
+        // from older backlog that arrived while nobody was watching. Only a display event
+        // (leaving / Ctrl+L / MarkWorldSeen -> mark_displayed()) clears those.
+        let mut world = World::new("test");
+        let settings = Settings::default();
+
+        // Backlog: arrived with nobody viewing -> ▶.
+        world.add_output("backlog 1\n", false, &settings, 24, 80, false, true);
+        world.add_output("backlog 2\n", false, &settings, 24, 80, false, true);
+        assert!(world.output_lines.iter().all(|l| world.line_is_new(l)),
+            "precondition: unviewed arrivals start ▶");
+
+        // Now the user is looking at the world and live output arrives. No display event
+        // has happened (no world switch, no Ctrl+L).
+        world.add_output("live 1\n", true, &settings, 24, 80, false, true);
+        world.add_output("live 2\n", true, &settings, 24, 80, false, true);
+
+        let flags: Vec<bool> = world.output_lines.iter().map(|l| world.line_is_new(l)).collect();
+        assert_eq!(flags, vec![true, true, false, false],
+            "backlog must KEEP ▶ while you sit in the world; only the lines that arrived \
+             while you were watching are excluded (a single monotonic floor could not do \
+             this - see World::viewed_from_seq)");
+
+        // Leaving the world is what actually clears them.
+        world.mark_displayed();
+        assert!(world.output_lines.iter().all(|l| !world.line_is_new(l)),
+            "mark_displayed() must still clear everything displayed");
+        assert_eq!(world.viewed_from_seq, u64::MAX,
+            "with nothing pending, mark_displayed() releases the episode ceiling");
+    }
+
+    #[test]
+    fn test_unviewed_arrival_after_a_viewing_episode_is_new_again() {
+        // A viewer can stop viewing with no display event at all: a WS client switching
+        // world, hitting --More-- (ws_client_viewing() excludes paused clients), or having
+        // its WS_VIEWER_GRACE expire. Text arriving after that must be ▶ again - the episode
+        // ceiling must not keep suppressing it forever.
+        let mut world = World::new("test");
+        let settings = Settings::default();
+
+        world.add_output("watched\n", true, &settings, 24, 80, false, true);
+        assert!(!world.line_is_new(&world.output_lines[0]));
+
+        world.add_output("unwatched\n", false, &settings, 24, 80, false, true);
+
+        assert!(!world.line_is_new(&world.output_lines[0]),
+            "a line that arrived while watched must stay not-new");
+        assert!(world.line_is_new(&world.output_lines[1]),
+            "text arriving once the last viewer stopped watching must be ▶ again");
+        assert_eq!(world.viewed_from_seq, u64::MAX, "the episode ceiling must be released");
+    }
+
+    #[test]
+    fn test_client_generated_line_does_not_end_a_viewing_episode() {
+        // Only real world text ends a viewing episode. A client-generated line landing on
+        // an unviewed world (a /world message, a status notice) must not collapse the
+        // watermark and cost that world its genuine markers.
+        let mut world = World::new("test");
+        let settings = Settings::default();
+
+        world.add_output("backlog\n", false, &settings, 24, 80, false, true);
+        world.add_output("watched\n", true, &settings, 24, 80, false, true);
+        world.add_output("client note\n", false, &settings, 24, 80, false, false /* from_server */);
+
+        assert!(world.line_is_new(&world.output_lines[0]),
+            "a client-generated arrival must not sweep real backlog markers");
+        assert!(!world.line_is_new(&world.output_lines[1]));
+        assert!(!world.line_is_new(&world.output_lines[2]),
+            "client-generated lines are never ▶ (rule 1 gates on from_server)");
+    }
+
+    #[test]
+    fn test_watermark_broadcast_fires_for_a_ceiling_only_change() {
+        // A viewing episode starting moves ONLY the ceiling, not the floor - so the
+        // broadcast's before/after comparison must cover both, or WS clients keep painting
+        // ▶ on live output on the world they are watching.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("current"));
+        app.current_world_index = 0;
+        app.ws_broadcast_log.lock().unwrap().clear();
+
+        app.add_output_to_world(0, "hello");
+
+        assert_eq!(app.worlds[0].new_from_seq, 0, "the floor must NOT move on a viewed arrival");
+        assert_eq!(app.worlds[0].viewed_from_seq, 0, "the ceiling latches at the arriving seq");
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(log.iter().any(|m| matches!(m,
+            WsMessage::NewWatermark { world_index: 0, new_from_seq: 0, viewed_from_seq: 0 })),
+            "a ceiling-only change must still broadcast. Log: {:?}", log);
+    }
+
+    #[test]
+    fn test_new_watermark_missing_ceiling_defaults_to_no_restriction() {
+        // An older peer omits viewed_from_seq entirely; it must decode as u64::MAX ("no
+        // viewing episode"), never 0 ("nothing is ever new") - #[serde(default)] on a bare
+        // u64 gives 0.
+        let json = r#"{"type":"NewWatermark","world_index":0,"new_from_seq":7}"#;
+        match serde_json::from_str::<WsMessage>(json).unwrap() {
+            WsMessage::NewWatermark { new_from_seq, viewed_from_seq, .. } => {
+                assert_eq!(new_from_seq, 7);
+                assert_eq!(viewed_from_seq, u64::MAX,
+                    "a missing ceiling must mean 'no restriction', not 'suppress everything'");
+            }
+            other => panic!("expected NewWatermark, got {:?}", other),
+        }
     }
 
     // ============================================================================

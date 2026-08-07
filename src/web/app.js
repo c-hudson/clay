@@ -3518,6 +3518,12 @@
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     const wmWorld = worlds[msg.world_index];
                     wmWorld.new_from_seq = Math.max(wmWorld.new_from_seq || 0, msg.new_from_seq || 0);
+                    // Plain assignment, NOT Math.max: viewed_from_seq is not monotonic (it
+                    // drops from "no episode" to a small seq whenever a viewing episode
+                    // starts), so a max merge would pin it at Infinity forever after the
+                    // first episode ends - see the matching note in World::viewed_from_seq /
+                    // the Rust NewWatermark handler.
+                    wmWorld.viewed_from_seq = (typeof msg.viewed_from_seq === 'number') ? msg.viewed_from_seq : Infinity;
                     if (msg.world_index === currentWorldIndex) {
                         renderOutput();
                     }
@@ -6098,20 +6104,26 @@
     }
 
     // Whether a line renders with the ▶ new-text indicator, per the server-authoritative
-    // new-text watermark (world.new_from_seq - see WsMessage::NewWatermark's doc comment in
-    // websocket.rs / World::new_from_seq's in main.rs). Mirrors the console renderer's
-    // line_is_new(): real seq, from the server (not client-generated or loaded from the
-    // scrollback archive), at or past the watermark. `_has_real_seq === false` only ever
-    // appears on lines built from a live ServerData message with a synthesized seq (see the
-    // ServerData handler); lines sourced from TimestampedLine (InitialState, OutputLines
-    // backfill) never set it and always carry a genuine numeric seq.
+    // new-text watermark pair (world.new_from_seq/world.viewed_from_seq - see
+    // WsMessage::NewWatermark's doc comment in websocket.rs / World::new_from_seq's and
+    // World::viewed_from_seq's in main.rs). Mirrors the console renderer's line_is_new():
+    // real seq, from the server (not client-generated or loaded from the scrollback
+    // archive), at or past the floor and before the viewing-episode ceiling.
+    // `_has_real_seq === false` only ever appears on lines built from a live ServerData
+    // message with a synthesized seq (see the ServerData handler); lines sourced from
+    // TimestampedLine (InitialState, OutputLines backfill) never set it and always carry a
+    // genuine numeric seq.
     function lineIsNew(lineObj, world) {
         if (!lineObj || !world) return false;
         if (lineObj.from_server === false) return false;
         if (lineObj.from_archive) return false;
         if (lineObj._has_real_seq === false) return false;
         if (typeof lineObj.seq !== 'number') return false;
-        return lineObj.seq >= (world.new_from_seq || 0);
+        // Missing/non-number viewed_from_seq (stale cached state, or an older server) means
+        // "no viewing episode in progress" - Infinity, NOT 0, which would suppress every
+        // marker.
+        const viewedFrom = (typeof world.viewed_from_seq === 'number') ? world.viewed_from_seq : Infinity;
+        return lineObj.seq >= (world.new_from_seq || 0) && lineObj.seq < viewedFrom;
     }
 
     function renderOutput(opts) {
@@ -9606,6 +9618,12 @@
                         (m, l) => (typeof l.seq === 'number' && l.seq >= m) ? l.seq + 1 : m,
                         redrawWorld.new_from_seq || 0
                     );
+                    // Deliberately NOT touching redrawWorld.viewed_from_seq here: the floor
+                    // recompute above already pushes past every line currently on screen, so
+                    // nothing on screen can resurrect via the floor. Resetting the ceiling
+                    // here (this path has no server round trip to correct a wrong reset)
+                    // could permanently resurrect ▶ on a pending line the server still
+                    // excludes - see World::mark_displayed()'s pending_lines guard in main.rs.
                     worldOutputCache[currentWorldIndex] = {};
                 }
                 renderOutput();

@@ -211,6 +211,12 @@ fn default_true() -> bool { true }
 fn is_false(v: &bool) -> bool { !v }
 fn is_true(v: &bool) -> bool { *v }
 
+/// Default for the ▶ window's upper bound (`World::viewed_from_seq` in main.rs) when absent
+/// from an older peer's message. A bare `#[serde(default)]` on a `u64` yields `0`, which
+/// means "exclude every line" - the exact opposite of the intended "no viewing episode in
+/// progress, no exclusion" sentinel.
+fn default_u64_max() -> u64 { u64::MAX }
+
 /// WebSocket protocol messages for client-server communication
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
@@ -318,13 +324,20 @@ pub enum WsMessage {
     PendingReleased { world_index: usize, count: usize },
     UnseenCleared { world_index: usize },
     UnseenUpdate { world_index: usize, count: usize },
-    /// New-text (▶) watermark for a world changed: every line with `seq < new_from_seq` is no
-    /// longer new. Broadcast to ALL clients (not just viewers of that world) whenever
-    /// `World::new_from_seq` advances - live arrival on a viewed world, leaving a world,
-    /// Ctrl+L, or MarkWorldSeen - so every instance's copy stays authoritative without ever
-    /// storing (and risking staleness on) a per-line flag. See `World::new_from_seq`'s doc
-    /// comment in main.rs for the full model.
-    NewWatermark { world_index: usize, new_from_seq: u64 },
+    /// New-text (▶) watermark pair for a world changed: a line is ▶ iff `seq >= new_from_seq
+    /// && seq < viewed_from_seq`. Broadcast to ALL clients (not just viewers of that world)
+    /// whenever either bound changes - live arrival on a viewed/unviewed world, leaving a
+    /// world, Ctrl+L, or MarkWorldSeen - so every instance's copy stays authoritative without
+    /// ever storing (and risking staleness on) a per-line flag. See `World::new_from_seq`'s
+    /// and `World::viewed_from_seq`'s doc comments in main.rs for the full model.
+    NewWatermark {
+        world_index: usize,
+        new_from_seq: u64,
+        /// Upper bound of the ▶ window - see `World::viewed_from_seq` in main.rs. Absent from
+        /// an older peer's message, hence the explicit `u64::MAX` ("no exclusion") default.
+        #[serde(default = "default_u64_max")]
+        viewed_from_seq: u64,
+    },
     /// Broadcast server's activity count (number of worlds with activity)
     ActivityUpdate { count: usize },
     /// Sent to a specific client when its server-side pause state changes
@@ -768,9 +781,13 @@ pub struct WorldStateMsg {
     pub pending_count: usize,
     /// New-text (▶) watermark at connect/reconnect time — see `WsMessage::NewWatermark`'s
     /// doc comment for the model. A client renders ▶ on any `from_server` line with
-    /// `seq >= new_from_seq`.
+    /// `seq >= new_from_seq && seq < viewed_from_seq`.
     #[serde(default)]
     pub new_from_seq: u64,
+    /// Upper bound of the ▶ window at connect/reconnect time - see `World::viewed_from_seq`
+    /// in main.rs. `u64::MAX` means "no viewing episode in progress".
+    #[serde(default = "default_u64_max")]
+    pub viewed_from_seq: u64,
     /// The server-authoritative "highest seq issued so far this process" counter
     /// (`World::next_seq`) at connect/reconnect time. Lets a reconnecting client detect a
     /// server restart: seq counters reset to 0 on every fresh process start (only the

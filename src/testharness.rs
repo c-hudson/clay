@@ -740,7 +740,7 @@ fn check_state_changes(
                 WsMessage::ServerData { world_index, .. } => {
                     events.push(TestEvent::WsBroadcastServerData(world_index));
                 }
-                WsMessage::NewWatermark { world_index, new_from_seq } => {
+                WsMessage::NewWatermark { world_index, new_from_seq, .. } => {
                     events.push(TestEvent::WsBroadcastNewWatermark(world_index, new_from_seq));
                 }
                 _ => {

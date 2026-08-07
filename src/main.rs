@@ -2512,16 +2512,16 @@ pub struct OutputLine {
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive (not current session)
 }
 
-/// Whether a line should render with the ▶ new-text indicator, given a world's new-text
-/// watermark (`World::new_from_seq` - see its doc comment). Free-function form (as opposed to
-/// `World::line_is_new`) for call sites already holding an exclusive borrow into
-/// `world.output_lines`/`pending_lines` (e.g. `World::add_output`'s partial-line handling,
-/// which mutates a `&mut OutputLine` from `.last_mut()`) - calling a `&self` method there
-/// would conflict with that borrow, since Rust doesn't see the two as disjoint through a
-/// method-call boundary. This takes the watermark as a plain `u64` instead, so it borrows
-/// nothing from `World`.
-fn line_is_new_at(line: &OutputLine, new_from_seq: u64) -> bool {
-    line.from_server && !line.from_archive && line.seq >= new_from_seq
+/// Whether a line should render with the ▶ new-text indicator, given a world's pair of
+/// new-text watermarks (`World::new_from_seq`/`World::viewed_from_seq` - see their doc
+/// comments). Free-function form (as opposed to `World::line_is_new`) for call sites already
+/// holding an exclusive borrow into `world.output_lines`/`pending_lines` (e.g.
+/// `World::add_output`'s partial-line handling, which mutates a `&mut OutputLine` from
+/// `.last_mut()`) - calling a `&self` method there would conflict with that borrow, since Rust
+/// doesn't see the two as disjoint through a method-call boundary. This takes both watermarks
+/// as plain `u64`s instead, so it borrows nothing from `World`.
+fn line_is_new_at(line: &OutputLine, new_from_seq: u64, viewed_from_seq: u64) -> bool {
+    line.from_server && !line.from_archive && line.seq >= new_from_seq && line.seq < viewed_from_seq
 }
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
@@ -2697,11 +2697,37 @@ pub struct World {
     /// exists for a different, still-open problem - see PROTOCOL-ROADMAP.md Step 7).
     pub pending_gap: Option<(usize, u64)>,
     /// Watermark for the ▶ new-text indicator: the lowest `seq` that is still "new". A line
-    /// renders with ▶ iff `line.seq >= new_from_seq && line.from_server && !line.from_archive`.
-    /// Server-authoritative and broadcast to every client (`ServerData.new_from_seq`,
-    /// `WsMessage::NewWatermark`) so remote instances can never hold a stale per-line copy -
-    /// see the design note above `mark_displayed()`. Never retreats.
+    /// renders with ▶ iff `line.seq >= new_from_seq && line.seq < viewed_from_seq &&
+    /// line.from_server && !line.from_archive` (see `viewed_from_seq` below for the second
+    /// half of that condition). Server-authoritative and broadcast to every client
+    /// (`ServerData.new_from_seq`, `WsMessage::NewWatermark`) so remote instances can never
+    /// hold a stale per-line copy - see the design note above `mark_displayed()`. Never
+    /// retreats.
     pub new_from_seq: u64,
+    /// Upper bound of the ▶ window: the `seq` of the first line that arrived while somebody
+    /// was viewing this world during the CURRENT viewing episode. A line is ▶ only when
+    /// `seq < viewed_from_seq`, so everything from that point on - all of which arrived while
+    /// being watched, since seqs are monotonic - is excluded by rule 1 ("text arriving while
+    /// someone is viewing is not new") WITHOUT dragging the `new_from_seq` floor forward over
+    /// older, still-unseen backlog. A single floor cannot express both at once: `seq >=
+    /// new_from_seq` makes "new" a suffix of seq-space, and rule 1 needs part of that suffix
+    /// (the freshest arrivals) to be excluded while an even-older prefix stays included -
+    /// that's why this is a second value, not a tweak to `new_from_seq` itself.
+    ///
+    /// `u64::MAX` is the "no viewing episode in progress" sentinel (no exclusion at all).
+    /// Latched once per episode, and released again, by `World::note_line_arrival()` - see
+    /// its doc comment for exactly when. Also released (conditionally) by
+    /// `World::mark_displayed()`.
+    ///
+    /// Deliberately NOT monotonic, unlike `new_from_seq`: it drops from `u64::MAX` back down
+    /// to a small value at the start of every viewing episode. Any code that merges an
+    /// *inbound* copy of this value (the remote-console `NewWatermark` handler, `app.js`'s
+    /// equivalent) must use a plain assignment, never `.max()` - a max-merge would pin it at
+    /// `u64::MAX` forever after the first episode anywhere ever ends.
+    ///
+    /// Live-session state only - never persisted; a reload always restarts at `u64::MAX`,
+    /// same as a freshly created `World`.
+    pub viewed_from_seq: u64,
     pub visual_line_offset: usize, // When > 0, show only first N visual lines of scroll_offset line (partial display for more-mode)
     pub watchdog_history: std::collections::VecDeque<String>,  // Rolling window of recent lines (stripped) for /watchdog
     pub watchname_history: std::collections::VecDeque<String>, // Rolling window of first-words for /watchname
@@ -2784,6 +2810,7 @@ impl World {
             max_received_seq: 0,
             pending_gap: None,
             new_from_seq: 0,
+            viewed_from_seq: u64::MAX,
             visual_line_offset: 0,
             watchdog_history: std::collections::VecDeque::new(),
             watchname_history: std::collections::VecDeque::new(),
@@ -3021,7 +3048,7 @@ impl World {
                     last.text = completed_line.to_string();
                     // Free-function form, not self.line_is_new(last): `last` is a `&mut`
                     // borrow from last_mut(), which a `&self` method call would conflict with.
-                    let last_is_new = line_is_new_at(last, self.new_from_seq);
+                    let last_is_new = line_is_new_at(last, self.new_from_seq, self.viewed_from_seq);
                     let new_visual = nli_visual_rows(&last.text, width, last_is_new, nli, wrapspace);
                     // Re-count at the completed line's final wrapped height. Does
                     // NOT retroactively trigger a pause even if this pushes over
@@ -3100,11 +3127,10 @@ impl World {
             // Create OutputLine with appropriate from_server flag
             let seq = self.next_seq;
             self.next_seq += 1;
-            // Someone is watching this world right now: everything from here is displayed
-            // as it arrives, so the new-text watermark advances past it immediately (rule 1).
-            if is_current {
-                self.new_from_seq = seq + 1;
-            }
+            // Rule 1 bookkeeping for this arrival (viewed vs unviewed) - see
+            // note_line_arrival()'s doc comment. Safe to call before the push since it's
+            // expressed purely in terms of seq.
+            self.note_line_arrival(seq, is_current, from_server);
             let new_line = if from_server {
                 OutputLine::new(line.to_string(), seq)
             } else {
@@ -3281,29 +3307,75 @@ impl World {
                 self.new_from_seq = candidate;
             }
         }
-    }
-
-    /// Advance the new-text watermark past `seq` when `is_current` is true — for code paths
-    /// that push an `OutputLine` directly instead of going through `add_output` (gagged
-    /// lines, prompt-as-output on a disconnected world) but still need rule 1's "arrived
-    /// while viewed = not new" to apply. Mirrors the `is_current` branch inside `add_output`.
-    /// No-op when `!is_current`: an unviewed world's line is exactly what rule 1 says should
-    /// become new, so the watermark is deliberately left behind it.
-    pub fn advance_watermark_if_current(&mut self, seq: u64, is_current: bool) {
-        if is_current {
-            let candidate = seq + 1;
-            if candidate > self.new_from_seq {
-                self.new_from_seq = candidate;
-            }
+        // Release the viewing-episode ceiling so the next episode can latch a fresh one -
+        // but only when nothing is queued. A pending line above the ceiling arrived while
+        // the world was being watched, so rule 1 says it is NOT new; the floor above
+        // deliberately never covers pending (see this function's doc comment), so
+        // viewed_from_seq is the ONLY thing still holding that for a queued line, and
+        // dropping it here unconditionally would resurrect ▶ on it. Leaving it latched is
+        // always safe: a latched ceiling only ever excludes lines that arrived while
+        // viewed, and note_line_arrival() releases it for real on the next unviewed
+        // server-originated arrival.
+        if self.pending_lines.is_empty() {
+            self.viewed_from_seq = u64::MAX;
         }
     }
 
-    /// Whether `line` should render with the ▶ new-text indicator, per this world's
-    /// new-text watermark (`new_from_seq` - see its doc comment). Mirrors
-    /// `rendering::line_is_new()` (a separate copy: that one lives in a different module and
-    /// takes the watermark as a plain arg since it doesn't have a `World` to call this on).
+    /// Record that a line with `seq` just arrived on this world, applying rule 1 ("text that
+    /// arrives while somebody is watching is not new"). Called for every line this world
+    /// issues a seq for: by `add_output` for its own lines, and by hand from the paths that
+    /// build an `OutputLine` directly (gagged lines, prompt-as-output on a disconnected
+    /// world, Slack/Discord gagged messages).
+    ///
+    /// Replaces the old `advance_watermark_if_current()`, which applied rule 1 by shoving
+    /// `new_from_seq` past the arriving line — correct for that one line, but since seqs are
+    /// monotonic it also swept every OLDER, still-unseen line below the floor with it (the
+    /// bug where new output arriving on the world you're viewing cleared OTHER lines' ▶).
+    /// This instead latches the separate `viewed_from_seq` ceiling (see its doc comment) at
+    /// the first line of a viewing episode, leaving older backlog and `new_from_seq`
+    /// untouched.
+    ///
+    /// Deliberately expressed in terms of `seq` alone rather than the buffers, so it's safe
+    /// to call either before or after the line is pushed — existing call sites do both.
+    pub fn note_line_arrival(&mut self, seq: u64, is_current: bool, from_server: bool) {
+        if is_current {
+            // Start of a viewing episode: latch at the first line to arrive while watched.
+            // Every later line in the same episode has a higher seq and is excluded by the
+            // same value, so this fires exactly once per episode.
+            if self.viewed_from_seq == u64::MAX {
+                self.viewed_from_seq = seq;
+            }
+        } else if from_server && self.viewed_from_seq != u64::MAX {
+            // The last viewer stopped watching without any display event firing - a WS
+            // client switched world, hit --More-- (ws_client_viewing() excludes paused
+            // clients), or its WS_VIEWER_GRACE expired - and real world text is arriving
+            // again. End the episode: everything up to here stops being new (same outcome
+            // as having left the world, which is what "nobody is viewing" amounts to), and
+            // this line and everything after it must be free to become new again, which a
+            // still-latched ceiling would otherwise prevent forever.
+            //
+            // Gated on from_server so a client-generated line (a /world message, a
+            // "Disconnected." notice) can never end an episode and cost a background world
+            // its markers - see test_add_output_to_world_broadcasts_real_seq.
+            self.new_from_seq = self.new_from_seq.max(seq);
+            self.viewed_from_seq = u64::MAX;
+        }
+    }
+
+    /// Snapshot of both ▶ watermarks, for `App::broadcast_watermark_if_changed`'s
+    /// before/after comparison. Both must be compared: a viewing episode starting moves
+    /// only `viewed_from_seq`, not `new_from_seq`.
+    pub fn watermark_state(&self) -> (u64, u64) {
+        (self.new_from_seq, self.viewed_from_seq)
+    }
+
+    /// Whether `line` should render with the ▶ new-text indicator, per this world's pair of
+    /// new-text watermarks (`new_from_seq`/`viewed_from_seq` - see their doc comments).
+    /// Mirrors `rendering::line_is_new()` (a separate copy: that one lives in a different
+    /// module and takes both watermarks as plain args since it doesn't have a `World` to call
+    /// this on).
     pub fn line_is_new(&self, line: &OutputLine) -> bool {
-        line_is_new_at(line, self.new_from_seq)
+        line_is_new_at(line, self.new_from_seq, self.viewed_from_seq)
     }
 
     /// Returns true if this world has activity (unseen lines or pending output)
@@ -4667,14 +4739,18 @@ impl App {
                     world.unseen_lines = count;
                 }
             }
-            WsMessage::NewWatermark { world_index, new_from_seq } => {
-                // This remote console mirror never computes the ▶ watermark itself - it's
+            WsMessage::NewWatermark { world_index, new_from_seq, viewed_from_seq } => {
+                // This remote console mirror never computes the ▶ watermarks itself - it's
                 // purely a display of whatever the master last told us (see
-                // WsMessage::NewWatermark's doc comment). max() guards against a
+                // WsMessage::NewWatermark's doc comment). max() guards new_from_seq against a
                 // hypothetically-reordered message retreating it; the master itself never
-                // sends a lower value.
+                // sends a lower value there. viewed_from_seq is the opposite: it's NOT
+                // monotonic (it deliberately drops back to u64::MAX at the end of every
+                // viewing episode), so it must be a plain assignment - a max() merge would
+                // pin it at u64::MAX forever after the first episode anywhere ever ends.
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     world.new_from_seq = world.new_from_seq.max(new_from_seq);
+                    world.viewed_from_seq = viewed_from_seq;
                     self.needs_output_redraw = true;
                 }
             }
@@ -5141,6 +5217,7 @@ impl App {
             world.showing_splash = w.showing_splash;
             world.gmcp_user_enabled = w.gmcp_user_enabled;
             world.new_from_seq = w.new_from_seq;
+            world.viewed_from_seq = w.viewed_from_seq;
             world.settings = WorldSettings {
                 hostname: w.settings.hostname,
                 port: w.settings.port,
@@ -5344,7 +5421,7 @@ impl App {
                 self.worlds[old_index].lines_since_pause = 0;
             }
             // Clear new line indicators on the world we're leaving
-            let watermark_before = self.worlds[old_index].new_from_seq;
+            let watermark_before = self.worlds[old_index].watermark_state();
             self.worlds[old_index].mark_displayed();
             self.broadcast_watermark_if_changed(old_index, watermark_before);
             // Track previous world for Alt+w fallback
@@ -5915,7 +5992,7 @@ impl App {
         // and reset lines_since_pause if more-mode hasn't triggered
         if let Some(old_idx) = old_world_idx {
             if old_idx != world_index && old_idx < self.worlds.len() {
-                let watermark_before = self.worlds[old_idx].new_from_seq;
+                let watermark_before = self.worlds[old_idx].watermark_state();
                 self.worlds[old_idx].mark_displayed();
                 self.broadcast_watermark_if_changed(old_idx, watermark_before);
                 if self.worlds[old_idx].pending_lines.is_empty() {
@@ -6213,14 +6290,14 @@ impl App {
         let output_before = self.worlds[world_idx].output_lines.len();
         let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
             && !self.worlds[world_idx].partial_in_pending;
-        let watermark_before = self.worlds[world_idx].new_from_seq;
+        let watermark_before = self.worlds[world_idx].watermark_state();
 
         self.worlds[world_idx]
             .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
-        // If this world is currently viewed, add_output already advanced new_from_seq past
+        // If this world is currently viewed, add_output already latched viewed_from_seq past
         // this line (rule 1 applies to arrival-while-viewed regardless of from_server - see
-        // its is_current branch) - tell every instance before broadcasting the content, same
-        // ordering reason as process_server_data's identical comment.
+        // note_line_arrival's is_current branch) - tell every instance before broadcasting the
+        // content, same ordering reason as process_server_data's identical comment.
         self.broadcast_watermark_if_changed(world_idx, watermark_before);
 
         let output_after = self.worlds[world_idx].output_lines.len();
@@ -6444,6 +6521,7 @@ impl App {
             total_visible_lines: Some(0),
             pending_count: 0,
             new_from_seq: 0,
+            viewed_from_seq: u64::MAX,
             next_seq: 0,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
@@ -7567,21 +7645,28 @@ impl App {
             && v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true))
     }
 
-    /// Broadcast `WsMessage::NewWatermark` for `world_idx` iff its `new_from_seq` actually
-    /// advanced past `before`. Centralizes the "did the ▶ boundary move" broadcast so every
-    /// call site that might advance the watermark (live arrival while viewed, or
-    /// `mark_displayed()` on leaving a world / Ctrl+L / MarkWorldSeen) only needs to snapshot
-    /// `before` and call this - no per-site broadcast duplication to keep in sync. This
-    /// replaces the old per-line `marked_new` model, whose cross-instance drift (a client
-    /// that left a world never told other instances to stop rendering ▶ on its old lines)
-    /// was exactly this class of "forgot to tell everyone" bug.
-    fn broadcast_watermark_if_changed(&mut self, world_idx: usize, before: u64) {
+    /// Broadcast `WsMessage::NewWatermark` for `world_idx` iff either of its two ▶ watermarks
+    /// (`new_from_seq`, `viewed_from_seq`) actually changed vs. `before` (a `(new_from_seq,
+    /// viewed_from_seq)` snapshot from `World::watermark_state()`). Both must be compared: a
+    /// viewing episode starting moves only `viewed_from_seq`, not `new_from_seq` - without
+    /// this, a WS client would keep painting ▶ on its own live output. Centralizes the "did
+    /// the ▶ boundary move" broadcast so every call site that might advance either watermark
+    /// (live arrival while viewed, or `mark_displayed()` on leaving a world / Ctrl+L /
+    /// MarkWorldSeen) only needs to snapshot `before` and call this - no per-site broadcast
+    /// duplication to keep in sync. This replaces the old per-line `marked_new` model, whose
+    /// cross-instance drift (a client that left a world never told other instances to stop
+    /// rendering ▶ on its old lines) was exactly this class of "forgot to tell everyone" bug.
+    fn broadcast_watermark_if_changed(&mut self, world_idx: usize, before: (u64, u64)) {
         if world_idx >= self.worlds.len() {
             return;
         }
-        let after = self.worlds[world_idx].new_from_seq;
+        let after = self.worlds[world_idx].watermark_state();
         if after != before {
-            self.ws_broadcast(WsMessage::NewWatermark { world_index: world_idx, new_from_seq: after });
+            self.ws_broadcast(WsMessage::NewWatermark {
+                world_index: world_idx,
+                new_from_seq: after.0,
+                viewed_from_seq: after.1,
+            });
         }
     }
 
@@ -7702,7 +7787,7 @@ impl App {
         // shows ▶ on live output arriving on the world it's currently looking at, since ▶ is
         // baked into the DOM at append time and never re-evaluated. The gagged-lines loop
         // handles its own ordering per line since it broadcasts per line already.
-        let watermark_before_process = self.worlds[world_idx].new_from_seq;
+        let watermark_before_process = self.worlds[world_idx].watermark_state();
 
         // FANSI client detection: check for "Detecting client..." within 2s window
         if let Some(deadline) = self.worlds[world_idx].fansi_detect_until {
@@ -8109,7 +8194,7 @@ impl App {
             // Gagged or not, this is still text from the world (rule 1) — advance the
             // watermark past it when someone's viewing, same as add_output does for
             // non-gagged lines. Bypasses add_output entirely so this must be done by hand.
-            self.worlds[world_idx].advance_watermark_if_current(seq, is_current);
+            self.worlds[world_idx].note_line_arrival(seq, is_current, true);
             // Archive gagged server lines to long-term scrollback (with gagged=true) -
             // unconditional on which buffer it lands in, since archiving is a timestamped
             // log, not a seq-ordered live buffer other code indexes into.
@@ -8181,7 +8266,7 @@ impl App {
             self.worlds[world_idx].next_seq += 1;
             let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
             self.worlds[world_idx].push_line_respecting_pending(OutputLine::new(prompt_text, seq), more_mode);
-            self.worlds[world_idx].advance_watermark_if_current(seq, is_current);
+            self.worlds[world_idx].note_line_arrival(seq, is_current, true);
         }
         self.worlds[world_idx].clear_connection_state(true, true);
         // Show disconnection message
@@ -8364,7 +8449,7 @@ impl App {
             // (same class of bug already fixed in handle_disconnected for this exact
             // disconnected-world code path).
             self.worlds[world_idx].push_line_respecting_pending(OutputLine::new(prompt_normalized.trim().to_string(), seq), more_mode);
-            self.worlds[world_idx].advance_watermark_if_current(seq, is_current);
+            self.worlds[world_idx].note_line_arrival(seq, is_current, true);
             self.worlds[world_idx].prompt.clear();
             if world_idx == self.current_world_index {
                 self.needs_output_redraw = true;
@@ -10417,6 +10502,7 @@ impl App {
                 total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
                 pending_count: world.pending_lines.len(),
                 new_from_seq: world.new_from_seq,
+                viewed_from_seq: world.viewed_from_seq,
                 next_seq: world.next_seq,
             }
         }).collect();
@@ -16300,7 +16386,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Also marks whatever's on screen as displayed (rule 2) and tells every
                             // other instance so their copies stop showing ▶ on it too.
                             let redraw_idx = app.current_world_index;
-                            let watermark_before = app.worlds[redraw_idx].new_from_seq;
+                            let watermark_before = app.worlds[redraw_idx].watermark_state();
                             app.current_world_mut().filter_to_server_output();
                             app.broadcast_watermark_if_changed(redraw_idx, watermark_before);
                             // Full terminal reset: unconditionally tear down and re-setup
@@ -16763,7 +16849,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                            let watermark_before = app.worlds[world_idx].new_from_seq;
+                            let watermark_before = app.worlds[world_idx].watermark_state();
                             let world_name_for_triggers = world_name.clone();
                             let actions = app.settings.actions.clone();
 
@@ -16786,7 +16872,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // is_current from the top of this handler (console OR any WS
                                 // viewer), not the narrower console-only one the ServerData
                                 // broadcast below uses for its own is_viewed field.
-                                app.worlds[world_idx].advance_watermark_if_current(seq, is_current);
+                                app.worlds[world_idx].note_line_arrival(seq, is_current, true);
                                 // Route into pending_lines instead of output_lines when the world
                                 // is already paused with a backlog - same reasoning as
                                 // process_server_data's hold_gagged_in_pending: otherwise this
@@ -17682,7 +17768,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                        let watermark_before = app.worlds[world_idx].new_from_seq;
+                        let watermark_before = app.worlds[world_idx].watermark_state();
                         let world_name_for_triggers = world_name.clone();
                         let actions = app.settings.actions.clone();
 
@@ -17705,7 +17791,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // is_current from the top of this handler (console OR any WS
                             // viewer), not the narrower console-only one the ServerData
                             // broadcast below uses for its own is_viewed field.
-                            app.worlds[world_idx].advance_watermark_if_current(seq, is_current);
+                            app.worlds[world_idx].note_line_arrival(seq, is_current, true);
                             // Route into pending_lines instead of output_lines when the world
                             // is already paused with a backlog - same reasoning as
                             // process_server_data's hold_gagged_in_pending: otherwise this
