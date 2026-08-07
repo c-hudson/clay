@@ -6385,6 +6385,26 @@
         }
         let colorNameToRgb = null;
 
+        // Read a single theme color CSS var (e.g. --theme-fg, --theme-bg) as RGB, with
+        // a fallback if the var is missing/malformed. Mirrors getThemeAnsiPalette()'s
+        // pattern of reading theme vars set by the server, just for a single color
+        // instead of the 16-entry ANSI palette.
+        function getThemeVarRgb(varName, fallbackRgb) {
+            const val = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+            if (val && val.startsWith('#') && val.length === 7) {
+                return [parseInt(val.slice(1, 3), 16), parseInt(val.slice(3, 5), 16), parseInt(val.slice(5, 7), 16)];
+            }
+            return fallbackRgb;
+        }
+
+        // Resolves the theme's default background - needed for reverse-video (SGR 7):
+        // "no explicit background" normally just lets the parent element's CSS
+        // background show through, but reversing text requires a concrete color to
+        // swap *in as* the new foreground, so the default has to be resolved here too.
+        function getThemeBgRgb() {
+            return getThemeVarRgb('--theme-bg', [19, 25, 38]); // #131926, Clay's dark theme default
+        }
+
         // Get RGB from class name or style
         function getFgRgb(classes, style) {
             if (!colorNameToRgb) colorNameToRgb = getColorNameToRgb();
@@ -6398,7 +6418,7 @@
                     if (colorNameToRgb[colorName]) return colorNameToRgb[colorName];
                 }
             }
-            return [232, 228, 236]; // Default text color (matches theme fg)
+            return getThemeVarRgb('--theme-fg', [232, 228, 236]); // Default text color (matches theme fg)
         }
 
         function getBgRgb(classes, style) {
@@ -6414,6 +6434,25 @@
                 }
             }
             return null; // No background
+        }
+
+        // SGR 7 (reverse video): swap foreground and background, resolving both to
+        // concrete RGB first - a swap can land on an arbitrary theme color that has no
+        // ansi-* class of its own (e.g. reversed default-colored text becomes a
+        // background of the theme's fg color), so this can't be expressed by just
+        // toggling classes the way bold/italic/underline are. Deliberately not a CSS
+        // filter:invert() - that inverts each color channel independently rather than
+        // swapping two colors, which is wrong whenever the background isn't pure black.
+        // Non-color classes (bold/italic/underline/blink) pass through untouched.
+        function applyReverseVideo(classes, fgStyle, bgStyle) {
+            const fgRgb = getFgRgb(classes, fgStyle);
+            const bgRgb = getBgRgb(classes, bgStyle) || getThemeBgRgb();
+            const kept = classes.filter(c => c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
+            return {
+                classes: kept,
+                fgStyle: `color:rgb(${bgRgb[0]},${bgRgb[1]},${bgRgb[2]});`,
+                bgStyle: `background-color:rgb(${fgRgb[0]},${fgRgb[1]},${fgRgb[2]});`
+            };
         }
 
         // Adjust foreground color for contrast when it's too similar to background
@@ -6544,6 +6583,17 @@
         let currentClasses = [];
         let currentFgStyle = '';
         let currentBgStyle = '';
+        let currentReversed = false;
+
+        // Resolves the style actually used to emit a span, applying the reverse-video
+        // swap (see applyReverseVideo) when active. Both emission sites below call this
+        // instead of reading currentClasses/currentFgStyle/currentBgStyle directly, so
+        // the swap logic lives in exactly one place. The non-reversed path returns the
+        // current state as-is (no extra work), so normal-case rendering is unaffected.
+        function currentEffectiveStyle() {
+            if (!currentReversed) return { classes: currentClasses, fgStyle: currentFgStyle, bgStyle: currentBgStyle };
+            return applyReverseVideo(currentClasses, currentFgStyle, currentBgStyle);
+        }
 
         let match;
         while ((match = ansiRegex.exec(text)) !== null) {
@@ -6551,11 +6601,16 @@
             if (match.index > lastIndex) {
                 const rawText = text.substring(lastIndex, match.index);
 
+                // Resolve reverse-video (swaps fg/bg) before anything else uses the
+                // style state - contrast adjustment and shade blending below then run
+                // on top of the already-swapped colors, same as for any other color.
+                const { classes: effClasses, fgStyle: effFgStyle, bgStyle: effBgStyle } = currentEffectiveStyle();
+
                 // Apply color contrast adjustment if enabled
-                let adjustedFgStyle = currentFgStyle;
+                let adjustedFgStyle = effFgStyle;
                 if (colorOffsetPercent > 0) {
-                    const fgRgb = getFgRgb(currentClasses, currentFgStyle);
-                    const bgRgb = getBgRgb(currentClasses, currentBgStyle);
+                    const fgRgb = getFgRgb(effClasses, effFgStyle);
+                    const bgRgb = getBgRgb(effClasses, effBgStyle);
                     const adjustedFg = adjustFgForContrast(fgRgb, bgRgb, colorOffsetPercent);
                     // Check if color was actually adjusted
                     if (adjustedFg[0] !== fgRgb[0] || adjustedFg[1] !== fgRgb[1] || adjustedFg[2] !== fgRgb[2]) {
@@ -6563,11 +6618,11 @@
                     }
                 }
 
-                const classes = currentClasses.length > 0 ? ` class="${currentClasses.join(' ')}"` : '';
-                const styles = (adjustedFgStyle || currentBgStyle) ? ` style="${adjustedFgStyle}${currentBgStyle}"` : '';
+                const classes = effClasses.length > 0 ? ` class="${effClasses.join(' ')}"` : '';
+                const styles = (adjustedFgStyle || effBgStyle) ? ` style="${adjustedFgStyle}${effBgStyle}"` : '';
 
                 // Check for shade characters that need blending
-                const shadeResult = processShadeChars(rawText, currentClasses, currentFgStyle, currentBgStyle);
+                const shadeResult = processShadeChars(rawText, effClasses, effFgStyle, effBgStyle);
                 if (shadeResult.wasProcessed) {
                     // Shade chars were processed, use the pre-built HTML
                     result += `<span${classes}${styles}>${shadeResult.processedHtml}</span>`;
@@ -6591,6 +6646,7 @@
                     currentClasses = [];
                     currentFgStyle = '';
                     currentBgStyle = '';
+                    currentReversed = false;
                 } else if (code === 1) {
                     currentClasses.push('ansi-bold');
                     // Bold upgrades standard colors to bright variants
@@ -6608,6 +6664,10 @@
                     currentClasses.push('ansi-underline');
                 } else if (code === 5 || code === 6) {
                     currentClasses.push('ansi-blink');
+                } else if (code === 7) {
+                    currentReversed = true;
+                } else if (code === 27) {
+                    currentReversed = false;
                 } else if (code >= 30 && code <= 37) {
                     // Basic foreground colors - use bright variant if bold is active
                     currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
@@ -6688,11 +6748,14 @@
         if (lastIndex < text.length) {
             const remaining = escapeHtml(text.substring(lastIndex));
 
+            // Resolve reverse-video first, same as the mid-text emission site above.
+            const { classes: effClasses, fgStyle: effFgStyle, bgStyle: effBgStyle } = currentEffectiveStyle();
+
             // Apply color contrast adjustment if enabled
-            let adjustedFgStyle = currentFgStyle;
+            let adjustedFgStyle = effFgStyle;
             if (colorOffsetPercent > 0) {
-                const fgRgb = getFgRgb(currentClasses, currentFgStyle);
-                const bgRgb = getBgRgb(currentClasses, currentBgStyle);
+                const fgRgb = getFgRgb(effClasses, effFgStyle);
+                const bgRgb = getBgRgb(effClasses, effBgStyle);
                 const adjustedFg = adjustFgForContrast(fgRgb, bgRgb, colorOffsetPercent);
                 // Check if color was actually adjusted
                 if (adjustedFg[0] !== fgRgb[0] || adjustedFg[1] !== fgRgb[1] || adjustedFg[2] !== fgRgb[2]) {
@@ -6700,8 +6763,8 @@
                 }
             }
 
-            const classes = currentClasses.length > 0 ? ` class="${currentClasses.join(' ')}"` : '';
-            const styles = (adjustedFgStyle || currentBgStyle) ? ` style="${adjustedFgStyle}${currentBgStyle}"` : '';
+            const classes = effClasses.length > 0 ? ` class="${effClasses.join(' ')}"` : '';
+            const styles = (adjustedFgStyle || effBgStyle) ? ` style="${adjustedFgStyle}${effBgStyle}"` : '';
             if (classes || styles) {
                 result += `<span${classes}${styles}>${remaining}</span>`;
             } else {
