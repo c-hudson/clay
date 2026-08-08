@@ -1262,5 +1262,121 @@ constraint Phase A hit) after every `app.js` step.
   separately-scoped multiuser pass.
 
 All 15 steps (12b included) complete. `cargo build`/`cargo test` green throughout (677/677 at
-completion, up from the 665/665 baseline this phase started from). Nothing in this section
-has been committed to git yet.
+completion, up from the 665/665 baseline this phase started from). Shipped as `99fe3dc`
+("Fix Android duplicate output, stuck scrollback indicator, and 500-line scrollback wall").
+
+---
+
+# Phase C — end the seq-watermark bug class
+
+Phase B closed one poisoning path. Three more turned up within days, each the same shape and
+each fixed the same way:
+
+| Commit | Symptom | Poisoning path |
+|---|---|---|
+| `03ab4f9` | remote output freezes after a server restart | cached buffer's `_max_seq` outlived a `next_seq` reset to 0 |
+| `bbb8837` | one world silently stops updating on Android | `handle_disconnected` broadcast a real seq for a line `push_line_respecting_pending` had deferred into `pending_lines` |
+| `6c846db` | periodic Android output loss | six further paths where a seq reached a client before its line was ordered in `output_lines` |
+
+The pattern is not a run of unrelated bugs. Every one of them was survivable only because the
+protocol had two structural weaknesses, and neither was addressed by fixing the individual
+paths:
+
+1. **The client's dedup mark was a one-way ratchet.** `world._max_seq` only moved forward. A
+   `ServerData` batch with `seq <= _max_seq` was dropped *whole* unless it happened to overlap
+   a *recorded* `_seqGaps` entry — and `_seqGaps` could only ever record "a batch skipped ahead
+   of the expected next seq". Neither structure could represent "lines I was never sent", so a
+   mark that got ahead of the buffer ate that world's output permanently. Worse, the repair was
+   re-dropped by the same test: `ScrollbackLines`' gap-fill branch required a line to be newer
+   than `_max_seq` or to overlap a recorded gap, and `requestGapFill()` asked from `_max_seq`
+   rather than the contiguous frontier, so it never even requested the damaged range.
+2. **Nothing on the server detected loss.** `ResyncRequired` fired *only* on outbound-channel
+   backpressure (`reconcile_resync`). `WsClientInfo::acked_seq` was tracked per client per
+   world and refreshed every 30 s from `PongCheck.acked`, but never compared against anything.
+   `ReportSeqMismatch`/`ReportDuplicate`/`ReportOutOfOrder` were logged and ignored. All real
+   gap *detection* lived on the client, resting on the very value the bugs corrupted.
+
+## What changed
+
+**Client — `_seenRanges` replaces `_max_seq` + `_seqGaps` (`src/web/app.js`).** A sorted,
+coalesced, non-overlapping array of inclusive seq ranges recording every seq the server has
+actually delivered. `_max_seq` becomes `last().end`, the resume/ack boundary becomes
+`ranges[0].end` (`contiguousFrontier`), and dedup becomes exact set membership (`hasSeenSeq` /
+`hasSeenRange`, both O(log n)). Holes are simply the spaces between ranges, so a hole exists
+whether or not anything noticed it opening. Ranges are recorded for the **whole delivered batch
+span**, never per surviving line, so client-side display filtering (ANSI-only lines, idler
+markers, grep) can't punch phantom holes — the property Phase B's `rawIdx` fix established.
+Bounded by coalescing (normally exactly one range); `MAX_SEEN_SEQ_RANGES = 512` is a backstop
+that merges the oldest hole shut, which only ever moves the frontier forward.
+
+Carried across `InitialState` (both the in-memory reconnect and IndexedDB paths) and persisted
+in the cache as `seenRanges`. Legacy `{maxSeq, seqGaps}` entries convert exactly via
+`seenRangesFromLegacyGaps()` — no IndexedDB version bump, which would discard every user's
+cached scrollback (the `CLIENT_LINE_PREFIX` precedent).
+
+Consequences at the three decision points that used to drop data:
+- `ServerData`: a batch is a duplicate only if *every* seq it spans is already seen; otherwise
+  it is accepted and only the individually-seen lines are skipped.
+- `ScrollbackLines` gap-fill: accepts any line whose exact seq is unseen. **This is what lets a
+  resync repair actually land** — previously those lines went into `droppedCount`.
+- `requestGapFill()`: asks from `contiguousFrontier(world)`, not `_max_seq`.
+
+Deliberately *excluded* from `_seenRanges`: `before_seq` backfill replies. That's the
+downward-growing deep-history region; folding a not-yet-adjacent older chunk in would drag
+`ranges[0]` — and therefore the frontier — backwards. Pre-Phase-C code excluded backfill from
+`_max_seq`/`_seqGaps` for the same reason.
+
+**Server — periodic ack audit (`App::audit_client_acks`, `WebSocketServer::evaluate_ack_audit`).**
+The detector the protocol was missing. `World::deliverable_high_seq()` reports the highest seq a
+world owes a caught-up client — the greatest seq in `output_lines` strictly below
+`pending_floor_seq()`, so a paused world's withheld backlog doesn't make every client look
+behind. On each `PongCheck.acked` (a ~30 s per-client cadence that already carries the data, so
+no new timer in any of the three event loops) each client's ack is compared against it, and a
+world behind *at the same position across two consecutive audits* gets a
+`ResyncRequired { from_seq: acked }`. The client repairs through the existing
+`ResyncRequired → RequestScrollback{after_seq} → ScrollbackLines` path that web/Android
+(`app.js`) and `--console` (`handle_remote_ws_message`) both already implement.
+
+`AckAuditOutcome` distinguishes `CaughtUp` / `Lagging` / `Fired` / `StillStalled` / `Recovered`.
+Guards, each for a distinct false-positive:
+- Two-audit stall requirement — ordinary in-flight lag never fires.
+- Never-acked and explicitly-zero-acked worlds are exempt — that's the "`build_initial_state`'s
+  aggregate line budget ran out before this world" case, which `startBackfill()`'s phase-1 queue
+  already covers; firing from 0 would pull the whole in-memory ring per world per connect.
+- One fire per stall point (`audit_fired_at`) — a genuinely undeliverable seq costs one message,
+  not one per keepalive forever.
+- `next_seq == 0` worlds skipped. **Not wired into multiuser at all**: `daemon.rs` emits
+  `seq: 0, end_seq: None` universally, so an ack and `deliverable_high_seq` there aren't in the
+  same units. Multiuser's missing seq support remains the separate item noted in Phase B.
+
+**Switch-time verification.** `WsMessage::WorldStateResponse` gains `deliverable_high_seq`
+(`#[serde(default)]`, so older clients are unaffected). Clients already send `RequestWorldState`
+on every world switch, which makes the reply the cheapest place to verify a world the user is
+about to *look at* — previously the one moment nothing checked, since `SwitchWorld` sends no
+content and the client renders straight from its local buffer. Both `app.js` and the `--console`
+client request a gap-fill on the spot when their own frontier is behind.
+
+**Diagnostics.** `SEQ-AUDIT` events in `~/.clay/remote.log` for every transition
+(`Fired`/`StillStalled`/`Recovered`); the two steady states are logged only under debug mode, or
+N worlds × M clients would write a line each per keepalive and drown the log this exists to
+serve. `/dump` gains a `SEQ RECONCILIATION` table of acked / prev-audit / deliverable / next_seq
+/ pending / behind per client per world — the live picture on demand.
+
+## Status
+
+720/720 `cargo test` (713 baseline + 7 new), clean `cargo clippy` and musl build. The range
+algebra was additionally exercised outside the test suite (no JS runtime is available in the
+development sandbox — see "Verification gaps" below). The four new server-side behaviours were
+mutation-checked: removing the stall requirement, ignoring the pending floor, removing the
+re-fire suppression, and auditing zero-ack worlds each fail a specific test.
+
+## Verification gaps
+
+- **No JS runtime in the sandbox**, so `app.js` was not executed. The `_seenRanges` helpers were
+  transliterated line-for-line into Python and fuzzed against a brute-force set model
+  (membership, coalescing, order-independence, the overflow cap's forward-only frontier, legacy
+  conversion, and the poisoned-mark case); the surrounding handler edits are reviewed, not run.
+  A browser/Node pass over the `ServerData` and `ScrollbackLines` handlers is still owed.
+- **No on-device run.** The end-to-end claim — Android backgrounded past the heartbeat, resumed,
+  every world compared against the TUI, `SEQ-AUDIT` lines and the `/dump` table inspected — has
+  not been performed.

@@ -3027,6 +3027,36 @@ impl World {
     ///
     /// Returns `(seq, landed_in_output_lines)` - the caller (`App::record_user_input`)
     /// needs both to decide whether to broadcast it.
+    /// Lowest seq still queued in `pending_lines`, if any — the boundary below which
+    /// `output_lines` content is genuinely owed to a remote client, and at/above which it
+    /// isn't yet (the server is still holding it for more-mode). Single definition shared by
+    /// `handle_request_scrollback`'s `after_seq` gap-fill clamp and `deliverable_high_seq`
+    /// below, so the repair and the audit that triggers it can never disagree about what a
+    /// client is owed. `pending_lines` is sorted by seq (same invariant as `output_lines` —
+    /// see CLAUDE.md and `record_input_line`/`hold_gagged_in_pending` below), so `first()`
+    /// is the floor.
+    pub(crate) fn pending_floor_seq(&self) -> Option<u64> {
+        self.pending_lines.first().map(|l| l.seq)
+    }
+
+    /// Highest seq this world currently owes a caught-up remote client
+    /// (PROTOCOL-ROADMAP.md Phase C): the greatest seq in `output_lines` that is strictly
+    /// below `pending_floor_seq()`. Returns `None` when there is nothing deliverable at all.
+    ///
+    /// The pending clamp is what makes this safe to compare a client's ack against. Lines
+    /// held in `pending_lines` have real seqs but have deliberately not been broadcast yet,
+    /// so counting them would make every client with a paused world look permanently behind
+    /// and produce an endless stream of pointless resyncs. `output_lines` is sorted by seq,
+    /// so the scan short-circuits at the first entry at/above the floor.
+    pub(crate) fn deliverable_high_seq(&self) -> Option<u64> {
+        let floor = self.pending_floor_seq();
+        self.output_lines
+            .iter()
+            .rev()
+            .find(|l| floor.map_or(true, |f| l.seq < f))
+            .map(|l| l.seq)
+    }
+
     pub(crate) fn record_input_line(&mut self, text: &str, log_input: bool) -> (u64, bool) {
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -4906,7 +4936,30 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
-            WsMessage::WorldStateResponse { world_index, pending_count, prompt, scroll_offset, recent_lines } => {
+            WsMessage::WorldStateResponse { world_index, pending_count, prompt, scroll_offset, recent_lines, deliverable_high_seq } => {
+                // Switch-time delivery check (PROTOCOL-ROADMAP.md Phase C), mirroring the
+                // web/Android client's handler for the same message: if this world owes us
+                // more than we've received, ask for the difference now rather than waiting
+                // for the periodic server-side ack audit to notice. `max_received_seq > 0`
+                // skips a world we hold nothing for - that's a full backfill's job, not a
+                // gap-fill's.
+                if deliverable_high_seq > 0 {
+                    let behind = self.worlds.get(world_index).is_some_and(|w| {
+                        w.max_received_seq > 0 && w.max_received_seq < deliverable_high_seq
+                    });
+                    if behind {
+                        let after_seq = self.worlds[world_index].max_received_seq;
+                        if let Some(ref tx) = self.ws_client_tx {
+                            let _ = tx.send(WsMessage::RequestScrollback {
+                                world_index,
+                                count: 500,
+                                before_seq: None,
+                                after_seq: Some(after_seq),
+                                request_id: None,
+                            });
+                        }
+                    }
+                }
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     world.scroll_offset = scroll_offset;
                     world.prompt = prompt;
@@ -5985,7 +6038,7 @@ impl App {
             // high-water-mark (_max_seq in app.js) past content it was never actually sent -
             // the poisoning this whole audit round is about. See PROTOCOL-ROADMAP.md's
             // seq-drift-fix notes and CLAUDE.md's output_lines-sorted-by-seq invariant.
-            let pending_floor = world.pending_lines.first().map(|l| l.seq);
+            let pending_floor = world.pending_floor_seq();
             let eligible: Vec<_> = world.output_lines.iter()
                 .filter(|l| l.seq > seq && pending_floor.map_or(true, |floor| l.seq < floor))
                 .collect();
@@ -6123,6 +6176,7 @@ impl App {
             prompt: world.prompt.clone(),
             scroll_offset: world.scroll_offset,
             recent_lines,
+            deliverable_high_seq: world.deliverable_high_seq().unwrap_or(0),
         });
     }
 
@@ -7308,6 +7362,45 @@ impl App {
         for (cid, cv) in &self.ws_client_worlds {
             writeln!(file, "  client {}: world_index={}, visible_lines={}, visible_columns={}, dimensions={:?}",
                 cid, cv.world_index, cv.visible_lines, cv.visible_columns, cv.dimensions)?;
+        }
+        writeln!(file)?;
+
+        // Per-client x per-world seq reconciliation (PROTOCOL-ROADMAP.md Phase C). This is
+        // the table to read when a remote client is missing output: `behind` is how many
+        // seqs this client has not acked that the server considers deliverable to it. A
+        // non-zero `behind` that persists across two /dump runs is exactly what the periodic
+        // ack audit fires on; a `fired_at` value that never clears means the client cannot
+        // recover that seq (see AckAuditOutcome::StillStalled). `deliverable` excludes
+        // anything still held in pending_lines, so a paused world reading 0 behind with a
+        // large pending_count is correct, not a symptom.
+        writeln!(file, "=== SEQ RECONCILIATION (client acks vs server deliverable) ===")?;
+        if let Some(ref server) = self.ws_server {
+            let snapshot = server.ack_audit_snapshot();
+            if snapshot.is_empty() {
+                writeln!(file, "(no authenticated WebSocket clients)")?;
+            }
+            for (cid, ip, acked, prev, fired) in snapshot {
+                writeln!(file, "  client {} [{}]:", cid, ip)?;
+                for (wi, world) in self.worlds.iter().enumerate() {
+                    let deliverable = world.deliverable_high_seq();
+                    let a = acked.get(&wi).copied();
+                    let behind = match (a, deliverable) {
+                        (Some(a), Some(d)) => d.saturating_sub(a),
+                        _ => 0,
+                    };
+                    writeln!(file, "    world {} [{}]: acked={} prev_audit={} deliverable={} next_seq={} pending={} behind={}{}",
+                        wi, world.name,
+                        a.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                        prev.get(&wi).map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                        deliverable.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                        world.next_seq,
+                        world.pending_lines.len(),
+                        behind,
+                        fired.get(&wi).map(|v| format!(" fired_at={}", v)).unwrap_or_default())?;
+                }
+            }
+        } else {
+            writeln!(file, "(no WebSocket server running)")?;
         }
         writeln!(file)?;
 
@@ -9035,6 +9128,58 @@ impl App {
         }
     }
 
+    /// Per-client delivery audit (PROTOCOL-ROADMAP.md Phase C). Called once per
+    /// `PongCheck.acked` — a ~30s per-client cadence that already carries fresh per-world ack
+    /// data, so this needs no timer of its own in any of the three event loops.
+    ///
+    /// Compares what each client says it has (`WsClientInfo::acked_seq`) against what this
+    /// world actually owes it (`World::deliverable_high_seq`) and pushes a `ResyncRequired`
+    /// at any world that has been behind, at the same position, across two consecutive
+    /// audits. The client then repairs through the existing
+    /// `ResyncRequired -> RequestScrollback{after_seq} -> ScrollbackLines` path, which every
+    /// client type already implements (`app.js`'s ResyncRequired handler for web/Android,
+    /// `handle_remote_ws_message` for `--console`).
+    ///
+    /// This exists because gap *detection* used to be entirely client-side, resting on a
+    /// high-water mark that any server-side ordering slip could push past the client's real
+    /// buffer — after which that world's output was silently dropped forever, and the client
+    /// could not even ask for the right range because it didn't know a hole existed. A
+    /// server-authoritative check doesn't depend on the client's bookkeeping being
+    /// self-consistent, so it still fires for a poisoning path nobody has found yet.
+    ///
+    /// Not wired into multiuser: `daemon.rs` emits `seq: 0, end_seq: None` universally, so
+    /// there are no real seqs there to audit.
+    pub(crate) fn audit_client_acks(&mut self, client_id: u64) {
+        // Worlds with real seqs only. `next_seq == 0` means nothing has ever been assigned
+        // (a brand-new world), so there is nothing to be behind on.
+        let deliverables: Vec<(usize, u64)> = self.worlds.iter().enumerate()
+            .filter(|(_, w)| w.next_seq > 0)
+            .filter_map(|(idx, w)| w.deliverable_high_seq().map(|seq| (idx, seq)))
+            .collect();
+        if deliverables.is_empty() {
+            return;
+        }
+        let Some(ref server) = self.ws_server else { return };
+        let decisions = server.evaluate_ack_audit(client_id, &deliverables);
+        let ip = server.get_client_ip(client_id).unwrap_or_default();
+        let verbose = is_debug_enabled();
+        for (world_index, acked, deliverable, outcome) in decisions {
+            // Transitions always; the two steady states only under debug, or remote.log
+            // fills with one line per world per client per keepalive - see
+            // AckAuditOutcome::is_noteworthy. `/dump` has the full live table either way.
+            if outcome.is_noteworthy() || verbose {
+                let world_name = self.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
+                crate::http::log_remote_event("SEQ-AUDIT", &ip, &format!(
+                    "client={} world={}:'{}' acked={} deliverable={} behind={} {}",
+                    client_id, world_index, world_name, acked, deliverable,
+                    deliverable.saturating_sub(acked), outcome.label()));
+            }
+            if outcome == websocket::AckAuditOutcome::Fired {
+                self.ws_send_to_client(client_id, WsMessage::ResyncRequired { world_index, from_seq: acked });
+            }
+        }
+    }
+
     /// Handle ConnectionSuccess event (used in headless and console modes).
     fn handle_connection_success(&mut self, world_name: &str, cmd_tx: mpsc::Sender<WriteCommand>, socket_fd: Option<SocketFd>, is_tls: bool) {
         if let Some(world_idx) = self.find_world_index(world_name) {
@@ -10461,6 +10606,11 @@ impl App {
                         server.record_acked_seq(client_id, &acked);
                     }
                 }
+                // ...then check that ack against what we actually owe this client
+                // (PROTOCOL-ROADMAP.md Phase C). Runs even when `acked` is empty: a client
+                // that has gone quiet is exactly the one worth auditing, and the audit reads
+                // the recorded state rather than this payload.
+                self.audit_client_acks(client_id);
             }
             _ => {
                 // Other message types handled elsewhere or ignored

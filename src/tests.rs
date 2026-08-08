@@ -5498,7 +5498,7 @@ if you're more curious.\"";
                 received_initial_state: true, client_type: RemoteClientType::Web,
                 viewport_height: 24, ip_address: "127.0.0.1".to_string(),
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
-                paused: false, acked_seq: std::collections::HashMap::new(),
+                paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5555,7 +5555,7 @@ if you're more curious.\"";
                 received_initial_state: true, client_type: RemoteClientType::Web,
                 viewport_height: 24, ip_address: "127.0.0.1".to_string(),
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
-                paused: false, acked_seq: std::collections::HashMap::new(),
+                paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5805,7 +5805,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(),
                 last_activity: std::time::Instant::now(),
                 paused: false,
-                acked_seq: std::collections::HashMap::new(),
+                acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5850,6 +5850,334 @@ if you're more curious.\"";
             "acked_seq must be seeded from AuthRequest.resume on (re)connect");
     }
 
+    // ========================================================================
+    // PROTOCOL-ROADMAP.md Phase C — server-side delivery audit
+    // ========================================================================
+
+    /// Registers a fake authenticated WS client on `app`, returning its id and receiver.
+    /// Same bypass the resume tests above use — the TCP handshake isn't what's under test.
+    fn phase_c_register_client(app: &mut App) -> (u64, tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) {
+        use crate::websocket::{WsClientInfo, WebSocketServer, RemoteClientType};
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::websocket::Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true,
+                tx,
+                current_world: None,
+                username: None,
+                // The audit only considers clients that have been sent InitialState.
+                received_initial_state: true,
+                client_type: RemoteClientType::Web,
+                viewport_height: 24,
+                ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                paused: false,
+                acked_seq: std::collections::HashMap::new(),
+                audit_prev_acked: std::collections::HashMap::new(),
+                audit_fired_at: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+        (client_id, rx)
+    }
+
+    /// Drains the client's outbound queue and returns every `ResyncRequired` in it.
+    fn phase_c_drain_resyncs(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) -> Vec<(usize, u64)> {
+        use crate::websocket::{WsMessage, Outbound};
+        let mut out = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            if let Outbound::Message(msg) = item {
+                if let WsMessage::ResyncRequired { world_index, from_seq } = *msg {
+                    out.push((world_index, from_seq));
+                }
+            }
+        }
+        out
+    }
+
+    /// `World::deliverable_high_seq` must report the highest seq actually owed to a remote
+    /// client — which is NOT simply the tail of `output_lines`. Anything at or above the
+    /// pending backlog's floor seq is deliberately being withheld by more-mode and has not
+    /// been broadcast, so counting it would make every client with a paused world look
+    /// permanently behind and produce an endless stream of pointless resyncs. This mirrors
+    /// `handle_request_scrollback`'s `after_seq` clamp exactly (both now read
+    /// `pending_floor_seq`), so the audit and the repair it triggers can't disagree.
+    #[test]
+    fn test_deliverable_high_seq_excludes_pending_backlog() {
+        let mut world = World::new("w");
+        assert_eq!(world.deliverable_high_seq(), None,
+            "a world with no output at all owes nothing");
+
+        for seq in 0..=5u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        assert_eq!(world.deliverable_high_seq(), Some(5),
+            "with no pending backlog the tail of output_lines is deliverable");
+
+        // A backlog opens at seq 6: everything from there up is withheld.
+        for seq in 6..=9u64 {
+            world.pending_lines.push(OutputLine::new(format!("pending {seq}"), seq));
+        }
+        assert_eq!(world.pending_floor_seq(), Some(6));
+        assert_eq!(world.deliverable_high_seq(), Some(5),
+            "pending lines are not owed to a client yet");
+
+        // The invariant-violating shape several past bugs produced: a fresh HIGH-seq line
+        // landing in output_lines while older content still sits in pending_lines. The
+        // audit must still only claim what's below the floor, or it would advance past
+        // content the client was never sent - the exact poisoning this phase exists to stop.
+        world.output_lines.push(OutputLine::new("jumped ahead".to_string(), 12));
+        assert_eq!(world.deliverable_high_seq(), Some(5),
+            "a line planted above the pending floor must not count as deliverable");
+    }
+
+    /// The core of the audit: a client stuck behind must be sent exactly one
+    /// `ResyncRequired` naming its own acked seq, and only after it has failed to advance
+    /// across two consecutive audits.
+    #[test]
+    fn test_ack_audit_fires_resync_only_after_a_stall() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=10u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        world.next_seq = 11;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        // Client reports it only has up to seq 4 while the server owes 10.
+        app.ws_server.as_ref().unwrap().record_acked_seq(client_id, &[(0, 4)]);
+
+        // First audit: behind, but we've never seen this client's position before, so it
+        // could simply be lag with lines still in flight. Must not fire.
+        app.audit_client_acks(client_id);
+        assert!(phase_c_drain_resyncs(&mut rx).is_empty(),
+            "the first audit that sees a client behind must not fire - it can't yet tell \
+             a stall from ordinary in-flight lag");
+
+        // Second audit with no progress: now it's a stall.
+        app.audit_client_acks(client_id);
+        assert_eq!(phase_c_drain_resyncs(&mut rx), vec![(0, 4)],
+            "a client stalled at the same seq across two audits must be sent \
+             ResyncRequired naming that seq");
+
+        // Third audit, still stuck at 4: suppressed, or an undeliverable seq would produce
+        // one resync per keepalive forever.
+        app.audit_client_acks(client_id);
+        assert!(phase_c_drain_resyncs(&mut rx).is_empty(),
+            "re-firing at the same stall point must be suppressed");
+
+        // It recovers to 8 (still behind), then stalls there: a NEW stall point, so the
+        // suppression must not carry over.
+        app.ws_server.as_ref().unwrap().record_acked_seq(client_id, &[(0, 8)]);
+        app.audit_client_acks(client_id);
+        assert!(phase_c_drain_resyncs(&mut rx).is_empty(), "progress is not a stall");
+        app.audit_client_acks(client_id);
+        assert_eq!(phase_c_drain_resyncs(&mut rx), vec![(0, 8)],
+            "a stall at a new position must fire again");
+    }
+
+    /// A client that is keeping up, or that the server owes nothing to, must never be sent
+    /// a resync no matter how many audits run.
+    #[test]
+    fn test_ack_audit_silent_when_caught_up() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=10u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        world.next_seq = 11;
+        app.worlds.push(world);
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.ws_server.as_ref().unwrap().record_acked_seq(client_id, &[(0, 10)]);
+        for _ in 0..5 {
+            app.audit_client_acks(client_id);
+        }
+        assert!(phase_c_drain_resyncs(&mut rx).is_empty(),
+            "a fully caught-up client must never be resynced");
+
+        // Advancing content the client then acks: still silent.
+        app.worlds[0].output_lines.push(OutputLine::new("line 11".to_string(), 11));
+        app.worlds[0].next_seq = 12;
+        app.ws_server.as_ref().unwrap().record_acked_seq(client_id, &[(0, 11)]);
+        app.audit_client_acks(client_id);
+        app.audit_client_acks(client_id);
+        assert!(phase_c_drain_resyncs(&mut rx).is_empty(),
+            "a client that keeps acking must never be resynced");
+    }
+
+    /// Three ways a world is exempt from the audit entirely, each for a different reason.
+    #[test]
+    fn test_ack_audit_skips_worlds_it_must_not_touch() {
+        let mut app = App::new();
+        app.worlds.clear();
+
+        // World 0: real seqs, but the client has never acked it at all. That's the
+        // "InitialState's aggregate line budget ran out before this world" case - the
+        // client's own phase-1 backfill covers it, and firing from 0 would instead pull the
+        // entire in-memory ring for every such world on every connect.
+        let mut w0 = World::new("never-acked");
+        for seq in 1..=10u64 {
+            w0.output_lines.push(OutputLine::new(format!("a {seq}"), seq));
+        }
+        w0.next_seq = 11;
+        app.worlds.push(w0);
+
+        // World 1: next_seq == 0, i.e. no seq was ever assigned. Nothing to be behind on.
+        app.worlds.push(World::new("no-seqs-yet"));
+
+        // World 2: everything the client hasn't acked is held in the pending backlog, so
+        // nothing is actually owed - a paused world must not look like a stalled client.
+        let mut w2 = World::new("all-pending");
+        w2.output_lines.push(OutputLine::new("visible".to_string(), 1));
+        for seq in 2..=9u64 {
+            w2.pending_lines.push(OutputLine::new(format!("held {seq}"), seq));
+        }
+        w2.next_seq = 10;
+        app.worlds.push(w2);
+
+        // World 3: the client sent an EXPLICIT ack of 0. Distinct from world 0 (which has
+        // no acked_seq entry at all and short-circuits earlier) - this one does have an
+        // entry, so it reaches the zero check. Same reasoning: acking 0 means "I have
+        // nothing", which is a backfill's job, not a resync's.
+        let mut w3 = World::new("acked-zero");
+        for seq in 1..=10u64 {
+            w3.output_lines.push(OutputLine::new(format!("d {seq}"), seq));
+        }
+        w3.next_seq = 11;
+        app.worlds.push(w3);
+
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        app.ws_server.as_ref().unwrap().record_acked_seq(client_id, &[(2, 1), (3, 0)]);
+        {
+            // record_acked_seq only raises the stored value, so confirm the explicit zero
+            // really did land as an entry - otherwise this case would silently degrade
+            // into world 0's "never acked" path and stop testing what it claims to.
+            let clients = app.ws_server.as_ref().unwrap().clients.read().unwrap();
+            assert_eq!(clients.get(&client_id).unwrap().acked_seq.get(&3), Some(&0),
+                "an explicit ack of 0 must be recorded as an entry, not skipped");
+        }
+
+        for _ in 0..4 {
+            app.audit_client_acks(client_id);
+        }
+        assert!(phase_c_drain_resyncs(&mut rx).is_empty(),
+            "a never-acked world, a world with no seqs, a world whose whole remainder is \
+             pending, and a world explicitly acked at 0 must all be exempt from the audit");
+    }
+
+    /// The audit must be per-world: one stalled world must not silence or trigger another.
+    #[test]
+    fn test_ack_audit_is_per_world() {
+        let mut app = App::new();
+        app.worlds.clear();
+        for name in ["w0", "w1"] {
+            let mut w = World::new(name);
+            for seq in 1..=10u64 {
+                w.output_lines.push(OutputLine::new(format!("{name} {seq}"), seq));
+            }
+            w.next_seq = 11;
+            app.worlds.push(w);
+        }
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        // Caught up on w0, stalled on w1.
+        app.ws_server.as_ref().unwrap().record_acked_seq(client_id, &[(0, 10), (1, 3)]);
+        app.audit_client_acks(client_id);
+        app.audit_client_acks(client_id);
+
+        assert_eq!(phase_c_drain_resyncs(&mut rx), vec![(1, 3)],
+            "only the stalled world should be resynced, naming its own acked seq");
+    }
+
+    /// The repair the audit asks for must actually be serviceable: a `RequestScrollback`
+    /// with `after_seq` set to the `from_seq` the audit reported has to return exactly the
+    /// missing lines. This is the whole loop - detector, message, and repair - closing.
+    #[test]
+    fn test_audit_from_seq_drives_a_correct_gap_fill() {
+        use crate::websocket::{WsMessage, Outbound};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=10u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        world.next_seq = 11;
+        app.worlds.push(world);
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.ws_server.as_ref().unwrap().record_acked_seq(client_id, &[(0, 6)]);
+        app.audit_client_acks(client_id);
+        app.audit_client_acks(client_id);
+        let fired = phase_c_drain_resyncs(&mut rx);
+        assert_eq!(fired, vec![(0, 6)]);
+
+        // Client obeys: RequestScrollback{after_seq: from_seq}, exactly as app.js's
+        // ResyncRequired handler does via requestGapFill(world_index, msg.from_seq).
+        let (_, from_seq) = fired[0];
+        app.handle_request_scrollback(client_id, 0, 500, None, Some(from_seq), Some(1));
+
+        let mut got = None;
+        while let Ok(item) = rx.try_recv() {
+            if let Outbound::Message(msg) = item {
+                if let WsMessage::ScrollbackLines { lines, .. } = *msg {
+                    got = Some(lines);
+                }
+            }
+        }
+        let seqs: Vec<u64> = got.expect("expected a ScrollbackLines reply").iter().map(|l| l.seq).collect();
+        assert_eq!(seqs, vec![7, 8, 9, 10],
+            "the audit's from_seq must yield exactly the lines the client is missing");
+    }
+
+    /// `WorldStateResponse` carries the world's deliverable high seq so the client can
+    /// verify at the moment of a world switch (PROTOCOL-ROADMAP.md Phase C). Switching used
+    /// to be the one point where nothing checked: `SwitchWorld` sends no content and the
+    /// client renders straight from its local buffer, so a world that had quietly lost
+    /// lines just looked empty.
+    #[test]
+    fn test_world_state_response_reports_deliverable_high_seq() {
+        use crate::websocket::{WsMessage, Outbound};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=10u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        // A backlog above seq 7 must not be advertised as deliverable.
+        for seq in 11..=13u64 {
+            world.pending_lines.push(OutputLine::new(format!("held {seq}"), seq));
+        }
+        world.next_seq = 14;
+        app.worlds.push(world);
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.handle_request_world_state(client_id, 0);
+
+        let mut reported = None;
+        while let Ok(item) = rx.try_recv() {
+            if let Outbound::Message(msg) = item {
+                if let WsMessage::WorldStateResponse { deliverable_high_seq, .. } = *msg {
+                    reported = Some(deliverable_high_seq);
+                }
+            }
+        }
+        assert_eq!(reported, Some(10),
+            "WorldStateResponse must report the highest seq owed to a client, excluding \
+             anything still held in the pending backlog");
+    }
+
     /// Empty `resume` (old clients, or a fresh client with no prior state) must behave
     /// exactly as before this step: InitialState only, no unsolicited ScrollbackLines.
     #[test]
@@ -5883,7 +6211,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(),
                 last_activity: std::time::Instant::now(),
                 paused: false,
-                acked_seq: std::collections::HashMap::new(),
+                acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5942,7 +6270,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(),
                 last_activity: std::time::Instant::now(),
                 paused: false,
-                acked_seq: std::collections::HashMap::new(),
+                acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6004,7 +6332,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(),
                 last_activity: std::time::Instant::now(),
                 paused: false,
-                acked_seq: std::collections::HashMap::new(),
+                acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6056,7 +6384,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(),
                 last_activity: std::time::Instant::now(),
                 paused: false,
-                acked_seq: std::collections::HashMap::new(),
+                acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -7443,7 +7771,7 @@ if you're more curious.\"";
                 received_initial_state: true, client_type: RemoteClientType::Web,
                 viewport_height: 24, ip_address: "127.0.0.1".to_string(),
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
-                paused: false, acked_seq: std::collections::HashMap::new(),
+                paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -7489,7 +7817,7 @@ if you're more curious.\"";
                 received_initial_state: true, client_type: RemoteClientType::Web,
                 viewport_height: 24, ip_address: "127.0.0.1".to_string(),
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
-                paused: false, acked_seq: std::collections::HashMap::new(),
+                paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }

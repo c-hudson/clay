@@ -161,6 +161,24 @@ receive loop drains a message), the server makes a best-effort delivery of
 **`ResyncRequired { world_index, from_seq }`** for each flagged world, where
 `from_seq` is that client's last-known-acked seq for it.
 
+**`ResyncRequired` has a second trigger: the periodic ack audit**
+(PROTOCOL-ROADMAP.md Phase C). Backpressure only catches loss the server
+*caused and noticed*. On every `PongCheck.acked` — a ~30s per-client cadence —
+`App::audit_client_acks` compares each client's acked seq per world against
+`World::deliverable_high_seq()` (the highest seq in `output_lines` strictly
+below the pending backlog's floor, i.e. what the server actually owes a
+caught-up client; `pending_lines` content is deliberately withheld and does
+not count). A world that is behind **at the same position across two
+consecutive audits** gets a `ResyncRequired { from_seq: acked }`. The
+two-audit rule keeps ordinary in-flight lag from firing; a world the client
+has never acked (or acked at 0) is exempt, since that is the
+`build_initial_state` line-budget case that the client's own backfill covers;
+and one fire per stall point means a genuinely undeliverable seq costs one
+message rather than one per keepalive forever. Not applied in multiuser mode,
+which emits `seq: 0` universally. This matters because gap *detection* was
+otherwise entirely client-side, resting on a value that several server-side
+ordering bugs were each able to corrupt.
+
 **On receiving `ResyncRequired`** (live, without disconnecting), the client
 requests an exact gap-fill: `RequestScrollback { world_index, count,
 before_seq: None, after_seq: Some(from_seq) }`, reusing the same message
@@ -174,18 +192,40 @@ purely from local evidence — a capped table of observed seq gaps
 (`MAX_TRACKED_SEQ_GAPS`), heuristic overlap/duplicate detection, and a
 reconnect-time backfill request anchored only on "everything after my
 highest-seen seq," which could silently miss an older hole a later batch had
-leapfrogged. That client-side heuristic machinery (`_seqGaps`,
-`recordSeqGapIfAny`/`findOverlappingSeqGap`/`shrinkSeqGap`/
-`insertLinesBySeq` in `app.js`) is still present as a defense-in-depth safety
-net — no longer the primary defense against Android WebView bridge
-reordering (PROTOCOL-ROADMAP.md Step 7 shipped: `evaluateJavascript`
-fire-and-forget push replaced by an ordered-queue pull, `drainWsQueue()`),
-but still load-bearing for the `ResyncRequired`/channel-overflow case above,
-where a recovered batch legitimately belongs mid-buffer and must be spliced,
-not appended. It is no longer what reconnect gap recovery depends on —
-`resume`/`acked`/`ResyncRequired` is now the authoritative contract, and the
-exact server-side replay it drives is unbounded and precise rather than
-capped and best-effort.
+leapfrogged.
+
+**Client-side seq tracking is now exact, not heuristic** (PROTOCOL-ROADMAP.md
+Phase C). `app.js` keeps `world._seenRanges`: a sorted, coalesced,
+non-overlapping array of inclusive seq ranges recording every seq the server
+has actually delivered for that world. It replaces both `_max_seq` (now
+`ranges[last].end`) and `_seqGaps` (holes are the spaces *between* ranges),
+and it is what the following three decisions read:
+
+- **duplicate detection** — `hasSeenSeq` / `hasSeenRange`, exact set
+  membership in O(log n), rather than "is this seq below my high-water mark".
+- **the resume/ack boundary** — `contiguousFrontier(world)` is `ranges[0].end`,
+  fed to `AuthRequest.resume` and `PongCheck.acked`.
+- **what a gap-fill asks for** — `requestGapFill()` anchors on the contiguous
+  frontier, not the high-water mark.
+
+The old pair could only represent "a batch skipped ahead of the expected next
+seq", never "lines I was never sent", so a high-water mark that got ahead of
+the buffer silently dropped that world's live output *and* re-dropped its own
+repair. Exact membership has no such blind spot: a batch below the mark is
+dropped only if every seq it spans is genuinely already held.
+
+Ranges are recorded for the **whole delivered batch span**, never per surviving
+line — client-side display filtering (ANSI-only lines, idler markers, grep)
+must not punch phantom holes. `before_seq` backfill replies are deliberately
+excluded; that is the downward-growing deep-history region, and folding a
+not-yet-adjacent older chunk in would drag the frontier backwards.
+
+`insertLinesBySeq` remains, for the case where a recovered batch legitimately
+belongs mid-buffer and must be spliced rather than appended (the
+`ResyncRequired`/channel-overflow path above, and Android WebView bridge
+reordering — no longer the primary concern since PROTOCOL-ROADMAP.md Step 7
+replaced `evaluateJavascript` fire-and-forget push with an ordered-queue pull,
+`drainWsQueue()`).
 
 **`request_id` — correlating a reply to the request that caused it.**
 `RequestScrollback` carries an optional `request_id: Option<u64>`
@@ -310,6 +350,19 @@ snapshot — it does not by itself replay any live-output gap; a client that
 actually lost `ServerData` lines should rely on the `resume`/`acked`/
 `ResyncRequired` contract below, not `RequestState`, to recover them.
 
+`WorldStateResponse` carries **`deliverable_high_seq`** (PROTOCOL-ROADMAP.md
+Phase C): the highest seq that world currently owes a caught-up client, i.e.
+`World::deliverable_high_seq()`, excluding anything still held in
+`pending_lines`. Since clients already send `RequestWorldState` on every world
+switch, this makes the reply a per-world delivery checkpoint at the exact
+moment the user looks at a world — if the client's own contiguous frontier is
+below it, it issues a `RequestScrollback { after_seq }` on the spot instead of
+waiting up to two keepalive cycles for the periodic audit. Switching used to be
+the one point where nothing verified anything: `SwitchWorld` sends no content
+at all and the client renders purely from its local buffer, so a world that had
+quietly lost lines simply looked empty. `#[serde(default)]`, so a client that
+ignores the field behaves exactly as before.
+
 **Live output**: `ServerData` (above), `WorldConnected`/`WorldDisconnected`,
 `PromptUpdate`, `PendingLinesUpdate`/`PendingReleased`, `UnseenCleared`/
 `UnseenUpdate`, `ActivityUpdate`, `WorldFlushed`, `ServerSpeak`, `AnsiMusic`,
@@ -394,9 +447,14 @@ web tabs, GUI, Android, remote consoles) shares the same worlds.
   per-world seq state (e.g. the Rust `--grep` client's one-shot history-
   search mode, which fetches everything and exits) legitimately send an
   empty `resume` — there's nothing to resume from.
-- On a live (still-connected) desync — the server-side channel-overflow case
-  above — the client does not need to reconnect at all: it answers the
-  unprompted `ResyncRequired` with a targeted `RequestScrollback`.
+- On a live (still-connected) desync the client does not need to reconnect at
+  all: it answers the unprompted `ResyncRequired` with a targeted
+  `RequestScrollback`. Two things send that message — the server-side
+  channel-overflow case above, and the periodic ack audit that compares this
+  client's reported acks against what the server actually owes it.
+- On a **world switch**, the client compares its own contiguous frontier
+  against `WorldStateResponse.deliverable_high_seq` and gap-fills immediately
+  if it is behind, rather than waiting for the periodic audit.
 
 ## Encoding / enum value reference
 

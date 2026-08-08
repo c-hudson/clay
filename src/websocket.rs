@@ -420,6 +420,17 @@ pub enum WsMessage {
         scroll_offset: usize,    // Current scroll position
         /// Recent output lines (only lines received since client's last known state)
         recent_lines: Vec<TimestampedLine>,
+        /// Highest seq this world currently owes a caught-up client — `World::
+        /// deliverable_high_seq` (PROTOCOL-ROADMAP.md Phase C). Clients send
+        /// `RequestWorldState` on every world switch, which makes this the cheapest place to
+        /// verify a world the user is about to *look at*: if the client's own contiguous
+        /// frontier is below this, it has a hole and asks for a gap-fill on the spot rather
+        /// than waiting up to two keepalive cycles for the periodic ack audit to notice.
+        /// Switching to a world was previously the one moment nothing checked — `SwitchWorld`
+        /// sends no content at all and the client renders purely from its local buffer.
+        /// `serde(default)` so an older client that ignores the field is unaffected.
+        #[serde(default)]
+        deliverable_high_seq: u64,
     },
 
     // Settings updates (client -> server)
@@ -1041,6 +1052,19 @@ pub struct WsClientInfo {
     /// for that world is still owed to the client — set on a failed best-effort
     /// `try_send(ResyncRequired)` in `reconcile_resync`, cleared once one is delivered.
     pub needs_resync: std::collections::HashSet<usize>,
+    /// Snapshot of `acked_seq` taken at the previous ack audit (PROTOCOL-ROADMAP.md Phase C,
+    /// `App::audit_client_acks`): world_index -> the acked seq this client reported one audit
+    /// ago. The audit only acts on a world whose ack has NOT advanced since, which is what
+    /// distinguishes a client that is genuinely stuck from one that is merely a batch or two
+    /// behind on a busy world. Without it, ordinary in-flight lag would fire a resync on
+    /// every keepalive.
+    pub audit_prev_acked: std::collections::HashMap<usize, u64>,
+    /// The acked seq each world's last audit-driven `ResyncRequired` was fired at
+    /// (PROTOCOL-ROADMAP.md Phase C). Suppresses re-firing for a world that is stalled at the
+    /// same point — a seq the server can genuinely never deliver (trimmed out of the ring,
+    /// or consumed by a line that never reached a broadcast) would otherwise produce one
+    /// pointless resync per keepalive forever. Cleared for a world once its ack moves.
+    pub audit_fired_at: std::collections::HashMap<usize, u64>,
 }
 
 /// User credential for multiuser authentication
@@ -1347,6 +1371,130 @@ impl WebSocketServer {
                 }
             }
         }
+    }
+
+}
+
+/// Result of auditing one client's ack for one world (PROTOCOL-ROADMAP.md Phase C).
+/// See `WebSocketServer::evaluate_ack_audit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckAuditOutcome {
+    /// Ack matches what the server owes — nothing to do, and nothing worth logging at
+    /// normal verbosity (this is the steady state for every world on every keepalive).
+    CaughtUp,
+    /// Behind, but the ack moved since the previous audit — ordinary in-flight lag on a
+    /// busy world, not a stall. Deliberately does not fire.
+    Lagging,
+    /// Behind at the same position across two consecutive audits: the caller should send
+    /// `ResyncRequired { from_seq: acked }`.
+    Fired,
+    /// Still stuck at the exact seq we already fired a resync for. Suppressed so a seq the
+    /// server genuinely cannot deliver (trimmed out of the ring, or consumed by a line that
+    /// never reached a broadcast) costs one message rather than one per keepalive forever.
+    StillStalled,
+    /// Caught up again after a resync had been fired for this world — the audit worked.
+    Recovered,
+}
+
+impl AckAuditOutcome {
+    /// Whether this outcome is worth an unconditional `remote.log` entry. The two steady
+    /// states (`CaughtUp`, `Lagging`) are not: with N worlds and M clients they would write
+    /// N*M lines every keepalive and drown the log that exists to diagnose this very class
+    /// of bug. `Fired`/`StillStalled`/`Recovered` are transitions and are always logged;
+    /// the full live picture is available on demand from `/dump`.
+    pub fn is_noteworthy(&self) -> bool {
+        matches!(self, AckAuditOutcome::Fired | AckAuditOutcome::StillStalled | AckAuditOutcome::Recovered)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AckAuditOutcome::CaughtUp => "ok",
+            AckAuditOutcome::Lagging => "lagging",
+            AckAuditOutcome::Fired => "RESYNC-SENT",
+            AckAuditOutcome::StillStalled => "still-stalled (suppressed)",
+            AckAuditOutcome::Recovered => "recovered",
+        }
+    }
+}
+
+impl WebSocketServer {
+    /// Decide, for one client, which worlds have fallen behind and need an audit-driven
+    /// resync (PROTOCOL-ROADMAP.md Phase C). `deliverables` is `(world_index,
+    /// deliverable_high_seq)` for every world with real seqs, from
+    /// `World::deliverable_high_seq`.
+    ///
+    /// This is the detector the protocol was missing. `ResyncRequired` previously fired
+    /// *only* when this client's outbound channel overflowed (`reconcile_resync`), so the
+    /// server had no way to notice a client that had quietly stopped keeping up — every
+    /// gap detection lived on the client, in a high-water mark that four separate
+    /// server-side ordering bugs were each able to poison. Comparing the client's own
+    /// reported ack against what the server knows it owes needs no cooperation from the
+    /// client's bookkeeping to be correct.
+    ///
+    /// Returns `(world_index, acked, deliverable, outcome)` per audited world. Every row is
+    /// returned, including the uninteresting ones, so the caller decides what's worth
+    /// logging — see `AckAuditOutcome` for which are high-signal.
+    ///
+    /// Bookkeeping (`audit_prev_acked`/`audit_fired_at`) is updated here, so this must be
+    /// called exactly once per audit cycle per client.
+    pub fn evaluate_ack_audit(&self, client_id: u64, deliverables: &[(usize, u64)]) -> Vec<(usize, u64, u64, AckAuditOutcome)> {
+        let mut clients = self.clients.write().unwrap();
+        let Some(client) = clients.get_mut(&client_id) else { return Vec::new() };
+        if !client.authenticated || !client.received_initial_state {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for &(world_index, deliverable) in deliverables {
+            // A world this client has never acked at all is deliberately skipped. That's the
+            // "InitialState's aggregate line budget ran out before reaching this world" case
+            // (see build_initial_state), which the client's own phase-1 backfill already
+            // covers; firing a resync from 0 would instead pull the whole in-memory ring for
+            // every such world on every connect.
+            let Some(&acked) = client.acked_seq.get(&world_index) else { continue };
+            if acked == 0 {
+                continue;
+            }
+            let prev = client.audit_prev_acked.insert(world_index, acked);
+            if acked >= deliverable {
+                // Caught up. Clear any stall record so a future stall at this same seq is
+                // still allowed to fire. Whether this is merely "fine" or an actual recovery
+                // depends on whether we had previously fired at this world.
+                let had_fired = client.audit_fired_at.remove(&world_index).is_some();
+                out.push((world_index, acked, deliverable,
+                    if had_fired { AckAuditOutcome::Recovered } else { AckAuditOutcome::CaughtUp }));
+                continue;
+            }
+            // Behind. Only act once it has been behind at the SAME position across two
+            // consecutive audits — a client that is still making progress is just lagging,
+            // not stuck, and the lines it hasn't acked yet may well still be in flight.
+            let stalled = prev == Some(acked);
+            let already_fired_here = client.audit_fired_at.get(&world_index) == Some(&acked);
+            let outcome = if !stalled {
+                AckAuditOutcome::Lagging
+            } else if already_fired_here {
+                AckAuditOutcome::StillStalled
+            } else {
+                client.audit_fired_at.insert(world_index, acked);
+                AckAuditOutcome::Fired
+            };
+            out.push((world_index, acked, deliverable, outcome));
+        }
+        out
+    }
+
+    /// Read-only snapshot of every authenticated client's ack-audit state, for `/dump`
+    /// (PROTOCOL-ROADMAP.md Phase C): `(client_id, ip, acked_seq, audit_prev_acked,
+    /// audit_fired_at)`. Cloned rather than borrowed so the caller isn't holding the clients
+    /// lock while it walks `self.worlds` and writes to a file.
+    #[allow(clippy::type_complexity)]
+    pub fn ack_audit_snapshot(&self) -> Vec<(u64, String, std::collections::HashMap<usize, u64>, std::collections::HashMap<usize, u64>, std::collections::HashMap<usize, u64>)> {
+        let clients = self.clients.read().unwrap();
+        let mut out: Vec<_> = clients.iter()
+            .filter(|(_, c)| c.authenticated)
+            .map(|(&id, c)| (id, c.ip_address.clone(), c.acked_seq.clone(), c.audit_prev_acked.clone(), c.audit_fired_at.clone()))
+            .collect();
+        out.sort_by_key(|(id, ..)| *id);
+        out
     }
 
     /// Set the client type for a connected client
@@ -2026,6 +2174,8 @@ where
             last_activity: std::time::Instant::now(),
             paused: false,
             acked_seq: std::collections::HashMap::new(),
+            audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(),
             needs_resync: std::collections::HashSet::new(),
         });
     }

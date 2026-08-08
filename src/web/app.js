@@ -48,86 +48,181 @@
         return text;
     }
 
-    // --- Out-of-order ServerData recovery (D-Termux-lines) ---------------------------
-    // The server used to be able to deliver two ServerData batches for the same world
-    // out of order under lock contention (fixed server-side too, see
-    // WsServer::broadcast_to_world_viewers). PROTOCOL-ROADMAP.md Step 7 (Android's
-    // WebView->Java->JS bridge: evaluateJavascript fire-and-forget push replaced by an
-    // ordered-queue pull, see drainWsQueue() / onNativeWsQueueReady below) has shipped, so
-    // that specific reordering source is closed - this machinery is now a defense-in-depth
-    // safety net, not the primary defense, and is kept for that reason (also still
-    // load-bearing for the Step 3 ResyncRequired channel-overflow path, where a recovered
-    // batch legitimately belongs mid-buffer and must be spliced, not appended - see Step 9
-    // of the later seq-drift fix). The old dedup check here treated ANY batch whose seq was
-    // <= world._max_seq as a full duplicate and silently dropped it — which is correct for
-    // a genuine resync replay, but wrong for a batch that arrived late: that batch's lines
-    // were never actually appended, yet _max_seq had already been bumped past them by the
-    // batch that leapfrogged it, so they looked like "old" data and were discarded for good
-    // (and a resync couldn't recover them either, since _max_seq no longer pointed at the
-    // hole).
+    // --- Delivered-seq tracking (PROTOCOL-ROADMAP.md Phase C) ------------------------
+    // `world._seenRanges` is a sorted, coalesced, non-overlapping array of INCLUSIVE seq
+    // ranges [{start, end}, ...] recording every seq the server has actually DELIVERED to
+    // us for that world. It is the single source of truth for three things that used to be
+    // tracked separately and approximately:
     //
-    // world._seqGaps tracks seq ranges we know are MISSING below world._max_seq (recorded
-    // when a batch skips ahead of the expected next seq). A later low-seq batch is only
-    // treated as a genuine duplicate if it does NOT overlap a recorded gap; otherwise it's
-    // accepted and spliced into output_lines in seq order instead of being dropped.
+    //   world._max_seq          === last().end          (high-water mark)
+    //   contiguousFrontier()    === ranges[0].end       (the resume/ack boundary)
+    //   hasSeenSeq()            === set membership      (the dedup test)
     //
-    // PROTOCOL-ROADMAP.md Step 5: _seqGaps is now also the source of truth for
-    // lastContiguousSeq() below, which feeds AuthRequest.resume and PongCheck.acked. The
-    // old *reconnect*-time recovery (guessing what was lost across a disconnect from a
-    // capped/lossy record) is gone — resume+the server's exact scrollback replay replaced
-    // it. What remains here is purely the live mid-stream safety net described above (now
-    // for the ResyncRequired/overflow case primarily, Android's bridge secondarily). Because
-    // lastContiguousSeq now also feeds the reconnect contract, a gap that ages out of this
-    // bounded array (see MAX_TRACKED_SEQ_GAPS) would in theory also be invisible to
-    // resume/acked — kept generous below so that's a pathological-only corner case, not a
-    // practical one. _seqGaps is also carried across InitialState (the seq-drift fix's
-    // Step 9) so a hole recorded before a reconnect isn't silently forgotten.
-    const MAX_TRACKED_SEQ_GAPS = 2000;
+    // This replaces the old `_max_seq` + `_seqGaps` pair. `_max_seq` was a ONE-WAY RATCHET:
+    // any batch whose seq was <= it got dropped whole unless it happened to overlap a gap
+    // that had been *recorded*, and `_seqGaps` could only ever record "a batch skipped
+    // ahead of the expected next seq". Neither could represent "lines I was never sent at
+    // all", so a watermark that got ahead of the buffer - by ANY means, including a server
+    // path not yet discovered - silently ate that world's output from then on, and the
+    // repair (ResyncRequired -> gap-fill) was itself re-dropped for being "below _max_seq
+    // with no recorded gap". Four rounds of server-side fixes (03ab4f9, bbb8837, 6c846db,
+    // 122633b) each closed one poisoning path and left that design intact. Ranges are the
+    // complete inverse record: holes are simply the spaces between them, so a hole exists
+    // whether or not we ever noticed it opening, and membership is exact.
+    //
+    // A range is recorded for the WHOLE DELIVERED BATCH SPAN, never per surviving line.
+    // Lines this client filters out for display (ANSI-only lines, idler markers, grep mode
+    // - see the ServerData handler) still consumed real seqs server-side, so counting only
+    // kept lines would punch phantom holes and make us re-request data we already have.
+    // This is the same property the old `_max_seq` advance had, and the reason Phase B's
+    // rawIdx-based per-line seq derivation is load-bearing.
+    //
+    // Carried across InitialState (both the in-memory reconnect and IndexedDB cache
+    // hydration paths) and persisted alongside cached lines, so a hole known before a
+    // reconnect isn't silently forgotten.
+    //
+    // Bounded by coalescing: the array holds (number of open holes + 1) entries, which is
+    // normally exactly 1. The cap below is a backstop for a pathological stream; on
+    // overflow the OLDEST hole is declared permanently absent by merging the first two
+    // ranges. That only ever moves the frontier forward, so an unrecoverable seq can never
+    // stall the resume/ack contract behind it.
+    const MAX_SEEN_SEQ_RANGES = 512;
 
-    function recordSeqGapIfAny(world, oldMax, newBatchStartSeq) {
-        if (oldMax > 0 && newBatchStartSeq > oldMax + 1) {
-            if (!world._seqGaps) world._seqGaps = [];
-            world._seqGaps.push({ start: oldMax + 1, end: newBatchStartSeq - 1 });
-            if (world._seqGaps.length > MAX_TRACKED_SEQ_GAPS) {
-                world._seqGaps.shift();
-            }
+    // Record [start, end] (inclusive) as delivered, coalescing with any adjacent or
+    // overlapping ranges so the array stays sorted, minimal, and non-overlapping.
+    function markSeqRangeSeen(world, start, end) {
+        if (!world || start === undefined || start === null) return;
+        if (end === undefined || end === null || end < start) end = start;
+        if (!world._seenRanges) world._seenRanges = [];
+        const ranges = world._seenRanges;
+
+        // First range that could touch or follow [start, end]. `r.end >= start - 1` rather
+        // than `>= start` so an exactly-adjacent range coalesces instead of staying split.
+        let i = 0;
+        while (i < ranges.length && ranges[i].end < start - 1) i++;
+
+        // Absorb every range that touches or overlaps the new one.
+        let newStart = start;
+        let newEnd = end;
+        let removeCount = 0;
+        while (i + removeCount < ranges.length && ranges[i + removeCount].start <= end + 1) {
+            const r = ranges[i + removeCount];
+            if (r.start < newStart) newStart = r.start;
+            if (r.end > newEnd) newEnd = r.end;
+            removeCount++;
+        }
+        ranges.splice(i, removeCount, { start: newStart, end: newEnd });
+
+        // Backstop only - see MAX_SEEN_SEQ_RANGES. Merging ranges[0] into ranges[1] closes
+        // the oldest hole by fiat, which advances the frontier rather than stalling it.
+        while (ranges.length > MAX_SEEN_SEQ_RANGES) {
+            ranges[1].start = ranges[0].start;
+            ranges.shift();
         }
     }
 
-    // Returns the index into world._seqGaps of a gap overlapping [seqStart, seqEnd], or -1.
-    function findOverlappingSeqGap(world, seqStart, seqEnd) {
-        if (!world._seqGaps) return -1;
-        return world._seqGaps.findIndex(g => seqStart <= g.end && seqEnd >= g.start);
+    // Exact membership test: has the server already delivered this seq to us?
+    function hasSeenSeq(world, seq) {
+        if (!world || !world._seenRanges || seq === undefined || seq === null) return false;
+        const ranges = world._seenRanges;
+        let lo = 0;
+        let hi = ranges.length - 1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (seq < ranges[mid].start) hi = mid - 1;
+            else if (seq > ranges[mid].end) lo = mid + 1;
+            else return true;
+        }
+        return false;
     }
 
-    // Shrinks/removes the gap at `idx` after [filledStart, filledEnd] has been recovered.
-    function shrinkSeqGap(world, idx, filledStart, filledEnd) {
-        if (!world._seqGaps || idx < 0 || idx >= world._seqGaps.length) return;
-        const gap = world._seqGaps[idx];
-        const remaining = [];
-        if (gap.start < filledStart) remaining.push({ start: gap.start, end: filledStart - 1 });
-        if (gap.end > filledEnd) remaining.push({ start: filledEnd + 1, end: gap.end });
-        world._seqGaps.splice(idx, 1, ...remaining);
+    // Whole-span membership: has every seq in [start, end] already been delivered? True
+    // exactly when a single coalesced range contains both endpoints (ranges are
+    // non-overlapping and non-adjacent by construction, so no other arrangement can cover
+    // the span). Kept O(log n) rather than looping the span - a batch's end_seq comes off
+    // the wire, and a corrupt or hostile value must not turn this into an unbounded loop.
+    function hasSeenRange(world, start, end) {
+        if (!world || !world._seenRanges || start === undefined || start === null) return false;
+        if (end === undefined || end === null || end < start) end = start;
+        const ranges = world._seenRanges;
+        let lo = 0;
+        let hi = ranges.length - 1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (start < ranges[mid].start) hi = mid - 1;
+            else if (start > ranges[mid].end) lo = mid + 1;
+            else return end <= ranges[mid].end;
+        }
+        return false;
     }
 
     // --- Resume/ack contract (PROTOCOL-ROADMAP.md Step 5) ----------------------------
-    // The reconnect and keepalive-ack contract needs the highest seq such that EVERY
-    // seq up to and including it has actually been received - not just the highest seq
-    // seen (world._max_seq), which can be past an unrecovered hole left by the live
-    // mid-stream reordering compensation above (see world._seqGaps). Sending _max_seq
-    // as-is would tell the server "I have everything up to here", permanently hiding
-    // that hole from the exact resume replay this step exists to provide. If there are
-    // open gaps, the true contiguous boundary is one below the earliest of them.
-    function lastContiguousSeq(world) {
-        if (!world) return 0;
-        if (world._seqGaps && world._seqGaps.length > 0) {
-            let minGapStart = Infinity;
-            for (const g of world._seqGaps) {
-                if (g.start < minGapStart) minGapStart = g.start;
+    // The reconnect and keepalive-ack contract needs the highest seq such that EVERY seq up
+    // to and including it has actually been received - not the highest seq SEEN, which can
+    // sit past an unrecovered hole. Telling the server "I have everything up to _max_seq"
+    // when we don't permanently hides that hole from the exact resume replay meant to fix
+    // it. With ranges this is exact and O(1): everything from the start of what we track
+    // through ranges[0].end is contiguous by construction, and ranges[0].end is therefore
+    // the boundary. Also feeds the Phase C server-side ack audit, which compares it against
+    // the world's true deliverable high seq.
+    //
+    // Erring LOW here is safe and erring high is not, which is why this takes ranges[0]
+    // rather than trying to be clever about a disjoint older range. Too low costs a larger
+    // replay, and every re-sent line is now skipped exactly by hasSeenSeq() on arrival. Too
+    // high is the permanent-loss bug this whole phase exists to remove.
+    function contiguousFrontier(world) {
+        if (!world || !world._seenRanges || world._seenRanges.length === 0) return 0;
+        return world._seenRanges[0].end;
+    }
+
+    // Highest seq the server has delivered for this world (the old `_max_seq`). Kept as a
+    // function so the two can't drift; `world._max_seq` is still written in lockstep for
+    // the existing readers that only need the high-water value.
+    function maxSeenSeq(world) {
+        if (!world || !world._seenRanges || world._seenRanges.length === 0) return 0;
+        return world._seenRanges[world._seenRanges.length - 1].end;
+    }
+
+    // Recompute _seenRanges from a hydrated buffer's real per-line seqs, then union in any
+    // ranges carried over from the previous session (in-memory reconnect or IndexedDB
+    // cache). The union matters: the buffer is capped (cache) or trimmed (ring), so it can
+    // hold fewer seqs than we were actually delivered, and dropping the carried ranges
+    // would resurrect holes we'd already filled. Lines tagged _has_real_seq === false carry
+    // an array index rather than a seq (the seq: 0 ephemeral-broadcast fallback) and are
+    // excluded - see the recompute loops in the InitialState handler for the full rationale.
+    function rebuildSeenRanges(world, carriedRanges) {
+        world._seenRanges = [];
+        for (const r of (carriedRanges || [])) {
+            if (r && typeof r.start === 'number' && typeof r.end === 'number') {
+                markSeqRangeSeen(world, r.start, r.end);
             }
-            return Math.max(0, minGapStart - 1);
         }
-        return world._max_seq || 0;
+        for (const line of (world.output_lines || [])) {
+            if (line && line._has_real_seq !== false && line.seq !== undefined) {
+                markSeqRangeSeen(world, line.seq, line.seq);
+            }
+        }
+        world._max_seq = maxSeenSeq(world);
+    }
+
+    // Convert a legacy cache entry ({maxSeq, seqGaps}) into ranges, so upgrading doesn't
+    // discard anyone's persisted scrollback (no IndexedDB version bump - same reasoning as
+    // the CLIENT_LINE_PREFIX migration in the InitialState handler). The old record was
+    // "everything from 0..maxSeq except these gaps", which maps exactly onto ranges.
+    function seenRangesFromLegacyGaps(maxSeq, seqGaps) {
+        if (!maxSeq || maxSeq <= 0) return [];
+        const gaps = (seqGaps || [])
+            .filter(g => g && typeof g.start === 'number' && typeof g.end === 'number')
+            .slice()
+            .sort((a, b) => a.start - b.start);
+        const ranges = [];
+        let cursor = 0;
+        for (const g of gaps) {
+            if (g.start > cursor) ranges.push({ start: cursor, end: Math.min(g.start - 1, maxSeq) });
+            cursor = Math.max(cursor, g.end + 1);
+        }
+        if (cursor <= maxSeq) ranges.push({ start: cursor, end: maxSeq });
+        return ranges.filter(r => r.end >= r.start);
     }
 
     // Builds the (world_index, last_contiguous_seq) list shared by AuthRequest.resume
@@ -138,7 +233,7 @@
     function buildResumeAckList() {
         const list = [];
         worlds.forEach((world, idx) => {
-            const seq = lastContiguousSeq(world);
+            const seq = contiguousFrontier(world);
             if (seq > 0) list.push([idx, seq]);
         });
         return list;
@@ -618,7 +713,7 @@
     // Tracks the exact AuthRequest.resume list sent on THIS connection attempt, keyed by
     // world NAME (matched at InitialState time, mirroring priorWorldsByName), so
     // world._resumedFromServer can be derived from "did we actually ask the server to
-    // resume this world" rather than a heuristic (priorWorld && lastContiguousSeq(priorWorld)
+    // resume this world" rather than a heuristic (priorWorld && contiguousFrontier(priorWorld)
     // > 0). That heuristic stayed true across a RequestState-driven resync (window.
     // triggerResync(), Android's background-wake path) even though RequestState carries no
     // resume list and the server sends no unprompted replay for it - permanently stuck
@@ -2429,7 +2524,7 @@
                     // Was this world covered by the AuthRequest.resume we just sent THIS
                     // connection (resumeSentThisConnection, recorded by
                     // buildResumeAckListForAuthRequest at send time)? Deliberately NOT the
-                    // old heuristic `priorWorld && lastContiguousSeq(priorWorld) > 0` - that
+                    // old heuristic `priorWorld && contiguousFrontier(priorWorld) > 0` - that
                     // stayed true across a RequestState-driven resync (no resume list is
                     // ever sent for that path), permanently sticking _gapFillPending true
                     // with no server reply ever coming to clear it (the stuck-at-90%
@@ -2449,6 +2544,16 @@
                     // handled as an append, not a prepend.
                     const resumeEntry = priorWorld && world.name ? resumeSentThisConnection.get(world.name) : undefined;
                     world._resumedFromServer = !!(priorWorld && resumeEntry && resumeEntry.index === idx);
+                    // Delivered-seq ranges carried over from whichever source hydrates this
+                    // world below (PROTOCOL-ROADMAP.md Phase C). Without this the record of
+                    // what the server already delivered is silently dropped here (only
+                    // output_lines/_max_seq/_oldest_seq used to be preserved), so a real
+                    // unrecovered hole becomes invisible to contiguousFrontier() and
+                    // therefore to the next AuthRequest.resume/PongCheck.acked, which would
+                    // then wrongly tell the server "I have everything up to _max_seq".
+                    // Unioned with the hydrated buffer's own seqs by rebuildSeenRanges()
+                    // after this chain.
+                    let carriedSeenRanges = null;
                     if (priorWorld) {
                         // Reconnect: keep what we already had in memory - it's at
                         // least as complete as the fresh InitialState's front-loaded
@@ -2456,13 +2561,7 @@
                         // dedupBySeq (Step 10): a phantom-gap resume replay before this fix
                         // shipped could have appended duplicates into this exact buffer.
                         world.output_lines = dedupBySeq(priorWorld.output_lines);
-                        // Carry over any open gaps too (PROTOCOL-ROADMAP.md's seq-drift fix,
-                        // Step 9) - priorWorld._seqGaps otherwise gets silently dropped here
-                        // (only output_lines/_max_seq/_oldest_seq were preserved), making a
-                        // real unrecovered hole invisible to lastContiguousSeq() and therefore
-                        // to the next AuthRequest.resume/PongCheck.acked, which would then
-                        // wrongly tell the server "I have everything up to _max_seq".
-                        world._seqGaps = priorWorld._seqGaps || [];
+                        carriedSeenRanges = priorWorld._seenRanges || null;
                     } else if (cachedWorld && cachedWorld.lines && cachedWorld.lines.length > 0) {
                         // Cold start / full reload with a persistent cache hit: seed
                         // from the cache, then gap-fill (see startBackfill()) to pick
@@ -2481,11 +2580,13 @@
                                 && l.text.startsWith(CLIENT_LINE_PREFIX))
                                 ? Object.assign({}, l, { text: l.text.slice(CLIENT_LINE_PREFIX.length) })
                                 : l));
-                        // Restore any gaps persisted alongside this cache entry
-                        // (scheduleWorldCacheSave) - same rationale as the priorWorld branch
-                        // above. Older cache entries written before Step 9 have no seqGaps
-                        // field at all, which is equivalent to "no known gaps".
-                        world._seqGaps = cachedWorld.seqGaps || [];
+                        // Restore the delivered-seq record persisted alongside this cache
+                        // entry (scheduleWorldCacheSave) - same rationale as the priorWorld
+                        // branch above. Entries written before Phase C hold the legacy
+                        // {maxSeq, seqGaps} shape instead, which converts exactly; entries
+                        // older still have neither, which means "no known holes".
+                        carriedSeenRanges = cachedWorld.seenRanges
+                            || seenRangesFromLegacyGaps(cachedWorld.maxSeq, cachedWorld.seqGaps);
                     } else if (world.output_lines_ts && world.output_lines_ts.length > 0) {
                         // Use output_lines_ts if available (has timestamps)
                         world.output_lines = world.output_lines_ts;
@@ -2504,7 +2605,8 @@
                     // from re-queuing a world that has nothing left to give.
                     world._backfill_exhausted = false;
                     world._gapFillPending = world._resumedFromServer;
-                    // Both recompute loops below exclude lines explicitly marked
+                    // The recompute loop below and rebuildSeenRanges() both exclude lines
+                    // explicitly marked
                     // _has_real_seq: false - an ephemeral ServerData message that never
                     // touched output_lines server-side (seq: 0, the "bypass dedup" sentinel
                     // used by ~50 system/command-reply broadcast sites) gets
@@ -2521,9 +2623,10 @@
                     // conversion, an older cache entry saved before this field existed) never
                     // set _has_real_seq at all, but their `seq` (when present) is always
                     // genuinely real - only the live handler's fake-index fallback ever
-                    // explicitly sets `false`. The same guard on _max_seq is defensive: an
-                    // index is always <= the real seq at that position, so it can't currently
-                    // regress _max_seq, but leaving it unguarded would be a landmine later.
+                    // explicitly sets `false`. The same guard inside rebuildSeenRanges is
+                    // defensive: an index is always <= the real seq at that position, so it
+                    // can't currently regress the high-water mark, but leaving it unguarded
+                    // would be a landmine later.
                     if (world.output_lines.length > 0) {
                         let minSeq = Infinity;
                         for (const line of world.output_lines) {
@@ -2531,13 +2634,10 @@
                         }
                         if (minSeq !== Infinity) world._oldest_seq = minSeq;
                     }
-                    // Track max seq for duplicate detection
-                    world._max_seq = 0;
-                    for (const line of world.output_lines) {
-                        if (line._has_real_seq !== false && line.seq !== undefined && line.seq > world._max_seq) {
-                            world._max_seq = line.seq;
-                        }
-                    }
+                    // Rebuild the delivered-seq record from the hydrated buffer, unioned
+                    // with whatever the previous session knew (see carriedSeenRanges above).
+                    // Also (re)sets world._max_seq.
+                    rebuildSeenRanges(world, carriedSeenRanges);
                     // Initialize pending_count from server (for More indicator)
                     if (world.pending_count === undefined) world.pending_count = 0;
                     // Don't merge pending_lines - they stay on the server and are
@@ -2843,7 +2943,7 @@
                         worldOutputCache[msg.world_index] = [];
                         partialLines[msg.world_index] = '';
                         world._max_seq = 0; // Reset dedup tracking after flush
-                        world._seqGaps = [];
+                        world._seenRanges = [];
                         if (msg.world_index === currentWorldIndex) {
                             elements.output.innerHTML = '';
                             linesSincePause = 0;
@@ -2852,23 +2952,31 @@
                         }
                     }
                     if (msg.data) {
-                        // Dedup, gap-aware: a batch whose seq is <= our high-water mark is only
-                        // a genuine duplicate (e.g. a resync re-sending already-seen lines) if it
-                        // does NOT overlap a recorded gap. If it does, it arrived late relative to
-                        // a later batch that leapfrogged it — recover it below instead of dropping
-                        // it (see insertLinesBySeq / findOverlappingSeqGap above).
-                        let fillsGapIdx = -1;
-                        if (msg.seq && msg.seq > 0 && world._max_seq && msg.seq <= world._max_seq) {
-                            // Prefer the server-authoritative end_seq (PROTOCOL-ROADMAP.md's
-                            // seq-drift fix) over a locally-approximated line count when the
-                            // sender provided one - the approximation can undercount relative
-                            // to the server's real batch span (e.g. a trailing partial line
-                            // folded into the next batch), which would make this overlap check
-                            // miss a real gap-fill match.
+                        // Dedup by EXACT delivered-seq membership (PROTOCOL-ROADMAP.md
+                        // Phase C). A batch is a genuine duplicate only when every seq it
+                        // spans has already been delivered to us; anything else carries at
+                        // least one line we've never had and must be accepted.
+                        //
+                        // This is the fix for the one-way ratchet described at the top of
+                        // this file: the old test dropped the WHOLE batch whenever its seq
+                        // was <= world._max_seq and it didn't overlap a *recorded* gap. A
+                        // high-water mark that had run ahead of the buffer - by any of the
+                        // server-side ordering bugs found so far, or one not yet found -
+                        // therefore ate that world's live output permanently, and no resync
+                        // could recover it because the replay tripped the same test.
+                        //
+                        // Prefer the server-authoritative end_seq over a locally-approximated
+                        // line count when the sender provided one - the approximation can
+                        // undercount relative to the server's real batch span (e.g. a trailing
+                        // partial line folded into the next batch), which would understate
+                        // which seqs this batch actually covers.
+                        const hasBatchSeq = msg.seq !== undefined && (msg.seq > 0 || msg.end_seq !== undefined);
+                        let batchEndApprox = msg.seq;
+                        let isGapFill = false;
+                        if (hasBatchSeq) {
                             const approxLineCount = msg.data.split(/\r\n|\n|\r/).length;
-                            const batchEndApprox = msg.end_seq !== undefined ? msg.end_seq : msg.seq + Math.max(approxLineCount - 1, 0);
-                            fillsGapIdx = findOverlappingSeqGap(world, msg.seq, batchEndApprox);
-                            if (fillsGapIdx === -1) {
+                            batchEndApprox = msg.end_seq !== undefined ? msg.end_seq : msg.seq + Math.max(approxLineCount - 1, 0);
+                            if (hasSeenRange(world, msg.seq, batchEndApprox)) {
                                 const dupInfo = {
                                     world_index: msg.world_index,
                                     msg_seq: msg.seq,
@@ -2889,8 +2997,10 @@
                                 });
                                 break;
                             }
+                            // Belongs mid-buffer rather than at the tail: splice it into seq
+                            // order below instead of rendering it as fresh tail output.
+                            isGapFill = batchEndApprox < maxSeenSeq(world);
                         }
-                        const isGapFill = fillsGapIdx !== -1;
 
                         // Get timestamp from message or use current time
                         const lineTs = msg.ts || Math.floor(Date.now() / 1000);
@@ -2959,6 +3069,15 @@
                             // "seq field absent/defaulted", so a real end_seq widens this too.
                             const hasRealSeq = msg.seq !== undefined && (msg.seq > 0 || msg.end_seq !== undefined);
                             const lineSeq = hasRealSeq ? msg.seq + rawIdx : (isGapFill ? -1 : world.output_lines.length);
+                            // Per-line duplicate skip (Phase C). The batch as a whole passed
+                            // the all-seen check above, but it can still partially overlap
+                            // what we already hold - a resync replay that straddles the edge
+                            // of our buffer, or a retransmit that extends one. Skipping only
+                            // the seqs we've genuinely already got is what lets the rest
+                            // through, instead of the old all-or-nothing batch drop.
+                            if (hasRealSeq && hasSeenSeq(world, lineSeq)) {
+                                return;
+                            }
                             const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false };
 
                             if (isGapFill) {
@@ -3010,10 +3129,24 @@
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and sends UnseenUpdate messages to keep all clients in sync
                         });
+                        // Record the batch's TRUE delivered span - the server-authoritative
+                        // end_seq when present, else rawLines.length (the full PRE-FILTER
+                        // batch size, matching the rawIdx-based lineSeq above) rather than
+                        // appendedLineCount. This must run whenever the batch has a real seq,
+                        // NOT only when appendedLineCount > 0: a batch that's entirely
+                        // filtered out client-side (a lone idler/gagged line, or every line
+                        // stripped by grep mode) still consumed real seqs server-side. Marking
+                        // only the lines we kept would punch phantom holes and make us
+                        // re-request data we were already sent (PROTOCOL-ROADMAP.md's
+                        // seq-drift fix, and see _seenRanges' doc comment).
+                        if (hasBatchSeq) {
+                            const batchEndSeq = msg.end_seq !== undefined ? msg.end_seq : msg.seq + rawLines.length - 1;
+                            markSeqRangeSeen(world, msg.seq, batchEndSeq);
+                            world._max_seq = maxSeenSeq(world);
+                        }
                         if (isGapFill) {
                             if (gapFillLineObjs.length > 0) {
                                 insertLinesBySeq(world, gapFillLineObjs);
-                                shrinkSeqGap(world, fillsGapIdx, msg.seq, msg.seq + appendedLineCount - 1);
                                 console.warn('RECOVERED out-of-order ServerData (filled a gap):', { world_index: msg.world_index, seq: msg.seq, count: appendedLineCount });
                                 send({
                                     type: 'ReportOutOfOrder',
@@ -3028,23 +3161,6 @@
                                     renderOutput();
                                 }
                             }
-                        } else if (msg.seq !== undefined && (msg.seq > 0 || msg.end_seq !== undefined)) {
-                            // Update _max_seq for the batch's TRUE span - using the
-                            // server-authoritative end_seq when present, else rawLines.length
-                            // (the full pre-filter batch size, matching the rawIdx-based lineSeq
-                            // above) rather than appendedLineCount. This must run whenever the
-                            // batch has a real seq, NOT only when appendedLineCount > 0: a batch
-                            // that's entirely filtered out client-side (e.g. a lone idler/gagged
-                            // line, or every line stripped by grep mode) still consumed real
-                            // seqs server-side and must still advance _max_seq, or the client
-                            // permanently drifts behind and reports phantom gaps on every later
-                            // batch (see PROTOCOL-ROADMAP.md's seq-drift fix). Record the gap
-                            // first if this batch skipped ahead of the expected next seq, so a
-                            // later out-of-order batch can still recover it instead of being
-                            // treated as a duplicate.
-                            recordSeqGapIfAny(world, world._max_seq || 0, msg.seq);
-                            const batchEndSeq = msg.end_seq !== undefined ? msg.end_seq : msg.seq + rawLines.length - 1;
-                            world._max_seq = Math.max(world._max_seq || 0, batchEndSeq);
                         }
                         if (msg.world_index !== currentWorldIndex) {
                             updateStatusBar();
@@ -3111,6 +3227,11 @@
                     } else {
                         world.output_lines = [];
                     }
+                    // Seed the delivered-seq record from the lines this message carried
+                    // (PROTOCOL-ROADMAP.md Phase C). Without this the world starts claiming
+                    // nothing delivered, so the first switch-time/audit check would ask the
+                    // server to re-send history we were just handed. Also sets _max_seq.
+                    rebuildSeenRanges(world, null);
                     // Don't merge pending_lines - they stay on the server
                     // and are released via PgDn/Tab to avoid duplicates
                     // Insert at the correct index
@@ -3672,6 +3793,27 @@
                 break;
 
             case 'WorldStateResponse':
+                // Switch-time delivery check (PROTOCOL-ROADMAP.md Phase C). switchWorldLocal()
+                // sends RequestWorldState on every world switch, and the server now reports
+                // that world's authoritative deliverable_high_seq on the reply - so the exact
+                // moment the user looks at a world is also the moment we verify we actually
+                // have all of it. Previously nothing checked here at all: SwitchWorld sends no
+                // content and the client renders straight from its local buffer, so a world
+                // that quietly lost lines while unviewed just looked empty. Deliberately
+                // outside the currentWorldIndex guard below - correctness of the buffer
+                // doesn't depend on which world happens to be focused when the reply lands.
+                if (worlds[msg.world_index] && msg.deliverable_high_seq !== undefined) {
+                    const w = worlds[msg.world_index];
+                    const have = contiguousFrontier(w);
+                    // have > 0: a world we hold nothing for is startBackfill()'s job, not a
+                    // gap-fill's (asking after_seq: 0 would pull the whole server-side ring).
+                    if (have > 0 && have < msg.deliverable_high_seq && !w._gapFillPending) {
+                        console.warn('World switch: behind server, requesting gap-fill', {
+                            world_index: msg.world_index, have: have, server: msg.deliverable_high_seq
+                        });
+                        requestGapFill(msg.world_index, have);
+                    }
+                }
                 // Response to RequestWorldState - update state for the world
                 if (msg.world_index === currentWorldIndex) {
                     const world = worlds[msg.world_index];
@@ -3823,31 +3965,37 @@
                     let appended = false;
                     let droppedCount = 0;
 
+                    // Accept any line whose exact seq we have not already been delivered
+                    // (PROTOCOL-ROADMAP.md Phase C). This branch used to require the line to
+                    // be either NEWER than world._max_seq or to overlap a *recorded* gap,
+                    // and dropped everything else - which meant a repair aimed at a hole the
+                    // client never noticed opening (the poisoned-high-water-mark case that
+                    // ResyncRequired and the server-side ack audit exist to fix) was itself
+                    // discarded on arrival. Exact membership has no such blind spot: a
+                    // genuine duplicate is still skipped, and everything else lands.
                     (msg.lines || []).forEach((line) => {
-                        const isNew = line.seq === undefined || !world._max_seq || line.seq > world._max_seq;
-                        const gapIdx = !isNew && line.seq !== undefined ? findOverlappingSeqGap(world, line.seq, line.seq) : -1;
-                        if (isNew) {
-                            world.output_lines.push(line);
-                            if (line.seq !== undefined) world._max_seq = Math.max(world._max_seq || 0, line.seq);
-                            appended = true;
-                        } else if (gapIdx !== -1) {
-                            // Recovers a line this client thought it had already passed (see
-                            // the ServerData handler's gap-tracking above) — a genuine dup
-                            // (already-received line) still correctly falls through and is
-                            // skipped here. Insertion position is best-effort (this handler
-                            // doesn't consistently tag entries with _has_real_seq the way
-                            // ServerData does) but never worse than the silent drop this
-                            // replaces.
-                            insertLinesBySeq(world, [line]);
-                            shrinkSeqGap(world, gapIdx, line.seq, line.seq);
-                            appended = true;
-                        } else {
+                        if (line.seq !== undefined && hasSeenSeq(world, line.seq)) {
                             droppedCount++;
+                            return;
                         }
+                        // Tail vs. mid-buffer. Insertion position for the mid-buffer case is
+                        // best-effort (this handler doesn't consistently tag entries with
+                        // _has_real_seq the way ServerData does) but never worse than the
+                        // silent drop it replaces.
+                        if (line.seq === undefined || line.seq > maxSeenSeq(world)) {
+                            world.output_lines.push(line);
+                        } else {
+                            insertLinesBySeq(world, [line]);
+                        }
+                        if (line.seq !== undefined) {
+                            markSeqRangeSeen(world, line.seq, line.seq);
+                            world._max_seq = maxSeenSeq(world);
+                        }
+                        appended = true;
                     });
                     if (droppedCount > 0) {
-                        console.warn('ScrollbackLines gap-fill reply: dropped lines that were neither new nor gap-filling', {
-                            world_index: msg.world_index, dropped: droppedCount, msg_seq_range: (msg.lines || []).map(l => l.seq)
+                        console.warn('ScrollbackLines gap-fill reply: skipped lines already delivered', {
+                            world_index: msg.world_index, skipped: droppedCount, msg_seq_range: (msg.lines || []).map(l => l.seq)
                         });
                     }
 
@@ -3878,6 +4026,15 @@
 
                         // Prepend received lines (they are older than what we have)
                         world.output_lines = msg.lines.concat(world.output_lines);
+
+                        // Deliberately NOT marked into _seenRanges. This branch is the
+                        // downward-growing deep-history region (a before_seq request); the
+                        // resume/ack contract only ever covers the forward stream, and
+                        // folding a not-yet-adjacent older chunk in here would make
+                        // ranges[0] that chunk and drag contiguousFrontier() backwards.
+                        // Pre-Phase-C code excluded backfill from _max_seq/_seqGaps for the
+                        // same reason. Harmless for dedup: a gap-fill only ever asks for
+                        // seqs above the frontier, so it can't re-deliver these.
 
                         // Update oldest seq for next backfill request
                         let minSeq = Infinity;
@@ -4442,16 +4599,20 @@
             const cap = Math.max(10, remoteInitialLines || 100);
             const lines = (w.output_lines || []).slice(-cap);
             const maxSeq = w._max_seq || 0;
-            // Persist any open gaps too (PROTOCOL-ROADMAP.md's seq-drift fix, Step 9) - without
-            // this, a gap recorded mid-session is silently forgotten across a full reload
-            // (cold-start hydrate from this cache), making lastContiguousSeq() wrongly report
-            // _max_seq as if the hole had never existed.
-            const seqGaps = w._seqGaps || [];
+            // Persist the delivered-seq record too (PROTOCOL-ROADMAP.md Phase C) - without
+            // this, a hole known mid-session is silently forgotten across a full reload
+            // (cold-start hydrate from this cache), making contiguousFrontier() wrongly
+            // report _max_seq as if the hole had never existed. `lines` is capped, so the
+            // ranges routinely cover more seqs than the persisted slice does; that's the
+            // point (rebuildSeenRanges unions the two rather than recomputing from lines).
+            // maxSeq is still written for the benefit of an older client reading this
+            // entry after a downgrade, and is what the pre-Phase-C shape keyed on.
+            const seenRanges = w._seenRanges || [];
             openWorldCacheDb().then((db) => {
                 if (!db) return;
                 try {
                     const tx = db.transaction(WORLD_CACHE_STORE, 'readwrite');
-                    tx.objectStore(WORLD_CACHE_STORE).put({ lines: lines, maxSeq: maxSeq, seqGaps: seqGaps }, worldCacheKey(worldCacheServerId, name));
+                    tx.objectStore(WORLD_CACHE_STORE).put({ lines: lines, maxSeq: maxSeq, seenRanges: seenRanges }, worldCacheKey(worldCacheServerId, name));
                 } catch (e) { /* ignore */ }
             });
         }, WORLD_CACHE_SAVE_DEBOUNCE_MS);
@@ -4469,7 +4630,12 @@
         const world = worlds[worldIndex];
         if (!world) return;
         const hasExplicitFromSeq = (fromSeq !== undefined && fromSeq !== null);
-        const seq = hasExplicitFromSeq ? fromSeq : world._max_seq;
+        // contiguousFrontier(), NOT world._max_seq (PROTOCOL-ROADMAP.md Phase C). Asking
+        // from the high-water mark meant a hole BELOW it was never actually requested - the
+        // client-driven repair path could only ever fetch what came after the damage, never
+        // the damage itself. An explicit fromSeq (the ResyncRequired path, where the server
+        // names the range it owes us) still wins.
+        const seq = hasExplicitFromSeq ? fromSeq : contiguousFrontier(world);
         if (!hasExplicitFromSeq && !seq) {
             queueNormalBackfill(worldIndex);
             return;

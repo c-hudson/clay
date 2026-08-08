@@ -1743,6 +1743,10 @@ pub async fn handle_daemon_ws_message(
                     server.record_acked_seq(client_id, &acked);
                 }
             }
+            // ...then check it against what we owe (PROTOCOL-ROADMAP.md Phase C) - same
+            // audit the master-WS PongCheck handler runs, since `-D` serves the same
+            // single-user clients over the same protocol.
+            app.audit_client_acks(client_id);
         }
         WsMessage::Ping => {
             app.ws_send_to_client(client_id, WsMessage::Pong);
@@ -3332,6 +3336,13 @@ pub async fn handle_multiuser_ws_message(
                     }
                 }
             }
+            // Deliberately NO App::audit_client_acks() here, unlike the two single-user
+            // PongCheck handlers (PROTOCOL-ROADMAP.md Phase C). Multiuser emits
+            // `seq: 0, end_seq: None` on every ServerData (see build_multiuser_initial_state
+            // and the ~60 broadcast sites), so a client's ack and the server's
+            // deliverable_high_seq are not measured in the same units - auditing here would
+            // compare a real seq against a constant 0 and fire nonstop. Multiuser's missing
+            // seq support is tracked separately in PROTOCOL-ROADMAP.md.
         }
         WsMessage::SendCommand { world_index, command } => {
             // Send command to user's own connection
@@ -3758,6 +3769,8 @@ mod change_password_tests {
             last_activity: std::time::Instant::now(),
             paused: false,
             acked_seq: std::collections::HashMap::new(),
+            audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(),
             needs_resync: std::collections::HashSet::new(),
         });
         rx
@@ -3915,6 +3928,8 @@ mod resume_owner_scoping_tests {
             last_activity: std::time::Instant::now(),
             paused: false,
             acked_seq: std::collections::HashMap::new(),
+            audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(),
             needs_resync: std::collections::HashSet::new(),
         });
         rx
