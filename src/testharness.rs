@@ -7,12 +7,16 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::{
-    App, World, WriteCommand, AutoConnectType,
+    App, World, OutputLine, WriteCommand, AutoConnectType,
     telnet,
     find_safe_split_point,
     build_display_lines,
 };
 use crate::websocket::WsMessage;
+
+/// The ▶ ownership id used for the harness's single simulated WebSocket client. Distinct
+/// from `CONSOLE_DISPLAY_ID` so scenarios can tell console-owned markers from client-owned.
+pub const HARNESS_WS_CLIENT_ID: u64 = 1;
 
 /// Events captured during test execution
 #[derive(Debug, Clone, PartialEq)]
@@ -48,11 +52,11 @@ pub enum TestEvent {
     /// WS broadcast: UnseenCleared { world_index }
     WsBroadcastUnseenCleared(usize),
     /// WS broadcast: ServerData { world_index } (content only - the ▶ new-text watermark is
-    /// no longer part of ServerData, see WsBroadcastNewWatermark)
+    /// no longer part of ServerData, see WsClaimedNew)
     WsBroadcastServerData(usize),
-    /// WS broadcast: NewWatermark { world_index, new_from_seq } - see
-    /// WsMessage::NewWatermark's doc comment in websocket.rs.
-    WsBroadcastNewWatermark(usize, u64),
+    /// WS send: ClaimedNew - (world_index, number of lines claimed). Per-client, not a
+    /// broadcast; see WsMessage::ClaimedNew's doc comment in websocket.rs.
+    WsClaimedNew(usize, usize),
 }
 
 /// State checks for AssertState action
@@ -407,13 +411,15 @@ pub async fn run_test_scenario(
                     let name = name.clone();
                     action_iter.next();
                     if let Some(idx) = app.find_world_index(&name) {
-                        // Clear new line indicators on the old world (like real handler)
+                        // Release this simulated client's own ▶ markers on the world it left,
+                        // then claim the new one - mirroring App::handle_mark_world_seen.
                         if let Some(old_idx) = ws_client_world {
                             if old_idx != idx && old_idx < app.worlds.len() {
-                                app.worlds[old_idx].mark_displayed();
+                                app.worlds[old_idx].release_claims(HARNESS_WS_CLIENT_ID);
                             }
                         }
                         ws_client_world = Some(idx);
+                        app.worlds[idx].claim_unviewed(HARNESS_WS_CLIENT_ID);
                         app.worlds[idx].mark_seen();
                         // Broadcast UnseenCleared like the real WS handler does
                         app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
@@ -442,8 +448,15 @@ pub async fn run_test_scenario(
                     action_iter.next();
                     if let Some(idx) = app.find_world_index(&world_name) {
                         let world = &app.worlds[idx];
-                        let output_new = world.output_lines.iter().filter(|l| world.line_is_new(l)).count();
-                        let pending_new = world.pending_lines.iter().filter(|l| world.line_is_new(l)).count();
+                        // "New to somebody, or not yet shown to anybody": a line counts if it
+                        // is currently owned (renders ▶ for that viewer) OR is still unviewed
+                        // (will be claimed by whoever displays the world next). Scenario-level
+                        // assertions here are about how much genuinely-new text a world is
+                        // holding, not about whose marker it is; the per-owner distinction is
+                        // covered by the dedicated ownership tests in tests.rs.
+                        let is_new = |l: &&OutputLine| l.display_id.is_some() || !l.viewed;
+                        let output_new = world.output_lines.iter().filter(is_new).count();
+                        let pending_new = world.pending_lines.iter().filter(is_new).count();
                         let actual = output_new + pending_new;
                         assert_eq!(actual, expected_count,
                             "World '{}': expected {} marked_new (▶) lines, got {} (output: {}, pending: {})",
@@ -740,8 +753,8 @@ fn check_state_changes(
                 WsMessage::ServerData { world_index, .. } => {
                     events.push(TestEvent::WsBroadcastServerData(world_index));
                 }
-                WsMessage::NewWatermark { world_index, new_from_seq, .. } => {
-                    events.push(TestEvent::WsBroadcastNewWatermark(world_index, new_from_seq));
+                WsMessage::ClaimedNew { world_index, ref seqs } => {
+                    events.push(TestEvent::WsClaimedNew(world_index, seqs.len()));
                 }
                 _ => {
                     // Other WsMessage variants are not tracked

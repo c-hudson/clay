@@ -801,6 +801,42 @@
     // on initial connect (server-side setting, applies to future connects)
     let remoteInitialLines = 100;
 
+    // Report this client's visibility to the server (WsMessage::ClientVisibility). Guarded
+    // on an open, authenticated socket: before auth the server has no ClientViewState for us
+    // to act on, and the InitialState that follows reports the correct state anyway.
+    function sendClientVisibility(visible) {
+        try {
+            if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
+                ws.send(JSON.stringify({ type: 'ClientVisibility', visible: !!visible }));
+            }
+        } catch (e) { /* non-fatal: the next InitialState re-establishes our state */ }
+    }
+
+    // --- ▶ new-text ownership (PROTOCOL-ROADMAP.md, per-line display_id model) -----------
+    // Our server-assigned ownership id, from InitialState.your_display_id. A line renders ▶
+    // iff its display_id equals this. 0/null means "we have no id" (an older server), in
+    // which case we simply never paint ▶ rather than adopting somebody else's markers.
+    let myDisplayId = 0;
+
+    // Stable, client-generated identity that survives reconnects. The server derives our
+    // ownership id from it, so a brief transport drop - which allocates a fresh connection
+    // id server-side - still resolves to the same id and keeps our markers intact. Persisted
+    // in localStorage so it also survives a page reload; falls back to an in-memory value if
+    // storage is unavailable (private browsing), which just means markers reset on reload.
+    const clientUid = (function() {
+        const KEY = 'clay-client-uid';
+        try {
+            let v = localStorage.getItem(KEY);
+            if (!v) {
+                v = 'c-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+                localStorage.setItem(KEY, v);
+            }
+            return v;
+        } catch (e) {
+            return 'c-mem-' + Math.random().toString(36).slice(2, 10);
+        }
+    })();
+
     // Command completion state
     let lastCompletionPrefix = '';
     let lastCompletionIndex = -1;
@@ -1696,7 +1732,7 @@
         setTimeout(hideConnectionLog, 800);
 
         if (window.AUTO_PASSWORD) {
-            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest() }));
+            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), client_uid: clientUid }));
             return;
         }
 
@@ -2394,6 +2430,9 @@
                 break;
 
             case 'InitialState':
+                // Our ▶ ownership id for this session. Captured before the world hydration
+                // below so lineIsNew() is already correct for the first render.
+                myDisplayId = (typeof msg.your_display_id === 'number') ? msg.your_display_id : 0;
                 // Preserve already-downloaded scrollback across a reconnect instead
                 // of discarding it: the WebSocket may drop and reconnect (network
                 // change, resume) while the JS heap survives (always true for
@@ -3109,10 +3148,10 @@
                                 }
                             }
                             if (msg.world_index === currentWorldIndex) {
-                                // world.new_from_seq was already updated (if this message
-                                // pushed it forward) - see the NewWatermark note and the
-                                // is_current-driven advance in World::add_output. Live
-                                // ServerData never carries archived lines.
+                                // A live arrival is never owned by anyone (ownership is only
+                                // assigned when a client displays a world), so this is false
+                                // here today - evaluated anyway so the incremental-append path
+                                // stays consistent with a full renderOutput().
                                 const lineMarkedNew = lineIsNew(lineObj, world);
                                 // Gagged lines are stored but not rendered (only visible with F2)
                                 // They bypass more-mode entirely
@@ -3638,23 +3677,31 @@
                 }
                 break;
 
-            case 'NewWatermark':
-                // The ▶ new-text boundary for a world moved - server-authoritative, see
-                // WsMessage::NewWatermark's doc comment in websocket.rs. Re-render if it's
-                // the world currently on screen so already-appended lines pick up the change
-                // (renderOutput() re-evaluates lineIsNew() fresh from world.new_from_seq;
-                // incrementally-appended lines via appendNewLine() do not retroactively
-                // update, which is why the server sends this BEFORE the content that moved
-                // it whenever possible - see process_server_data's ordering comment).
+            case 'ClaimedNew':
+                // The server handed US ownership of exactly these lines' ▶ markers (we just
+                // started displaying that world). Sent to this client only - a claim never
+                // changes any other client's rendering. An explicit seq list, not a range:
+                // unviewed lines are not a contiguous tail (see WsMessage::ClaimedNew).
+                if (msg.world_index !== undefined && worlds[msg.world_index] && Array.isArray(msg.seqs)) {
+                    const cWorld = worlds[msg.world_index];
+                    const wanted = new Set(msg.seqs);
+                    for (const line of (cWorld.output_lines || [])) {
+                        if (wanted.has(line.seq)) line.display_id = myDisplayId;
+                    }
+                    if (msg.world_index === currentWorldIndex) {
+                        renderOutput();
+                    }
+                }
+                break;
+
+            case 'ReleasedNew':
+                // Our own markers on that world are cleared (we switched away, hit Ctrl+L, or
+                // backgrounded). Other clients' markers live on their own lines' display_id
+                // and are unaffected - that is the whole point of per-line ownership.
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
-                    const wmWorld = worlds[msg.world_index];
-                    wmWorld.new_from_seq = Math.max(wmWorld.new_from_seq || 0, msg.new_from_seq || 0);
-                    // Plain assignment, NOT Math.max: viewed_from_seq is not monotonic (it
-                    // drops from "no episode" to a small seq whenever a viewing episode
-                    // starts), so a max merge would pin it at Infinity forever after the
-                    // first episode ends - see the matching note in World::viewed_from_seq /
-                    // the Rust NewWatermark handler.
-                    wmWorld.viewed_from_seq = (typeof msg.viewed_from_seq === 'number') ? msg.viewed_from_seq : Infinity;
+                    for (const line of (worlds[msg.world_index].output_lines || [])) {
+                        if (line.display_id === myDisplayId) line.display_id = null;
+                    }
                     if (msg.world_index === currentWorldIndex) {
                         renderOutput();
                     }
@@ -4692,7 +4739,8 @@
             auth_key: keyValue,
             challenge_response: usesChallenge,
             request_key: false,
-            resume: buildResumeAckListForAuthRequest()
+            resume: buildResumeAckListForAuthRequest(),
+            client_uid: clientUid
         };
         if (currentWorldIndex !== undefined) {
             msg.current_world = currentWorldIndex;
@@ -4761,7 +4809,7 @@
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
             const challengeHash = serverChallenge ? await hashPassword(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest() };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), client_uid: clientUid };
             if (username) {
                 msg.username = username;
             }
@@ -4774,7 +4822,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             const challengeHash = serverChallenge ? sha256Fallback(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest() };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), client_uid: clientUid };
             if (username) {
                 msg.username = username;
             }
@@ -5421,15 +5469,11 @@
         if (promptAfter) redisplayCurrentPrompt();
     }
 
-    // Reset the render window for the world being left. ▶ markers are no longer cleared
-    // here: the server is the sole source of truth for the new-text watermark
-    // (world.new_from_seq, see lineIsNew()) and broadcasts NewWatermark itself once the
-    // MarkWorldSeen this triggers reaches it (World::mark_displayed() in main.rs) - clearing
-    // a local per-line flag here would just be a second, driftable copy of that, which is
-    // exactly what caused stale ▶ markers on OTHER instances after a world switch before
-    // this model (see World::new_from_seq's doc comment in main.rs). Shared by
-    // switchWorldLocal and the WorldSwitchResult handler so both world-switch paths reset it
-    // - previously only switchWorldLocal did.
+    // Reset the render window for the world being left. ▶ markers are NOT cleared here: the
+    // server owns them (OutputLine::display_id) and sends us a ReleasedNew once the
+    // MarkWorldSeen this triggers reaches it. Clearing them locally would be a second,
+    // driftable copy of that state. Shared by switchWorldLocal and the WorldSwitchResult
+    // handler so both world-switch paths reset it - previously only switchWorldLocal did.
     function clearLeavingWorldState(oldIndex) {
         const oldWorld = worlds[oldIndex];
         // Reset the render window on the world we're leaving too, so returning to it
@@ -6279,27 +6323,24 @@
         });
     }
 
-    // Whether a line renders with the ▶ new-text indicator, per the server-authoritative
-    // new-text watermark pair (world.new_from_seq/world.viewed_from_seq - see
-    // WsMessage::NewWatermark's doc comment in websocket.rs / World::new_from_seq's and
-    // World::viewed_from_seq's in main.rs). Mirrors the console renderer's line_is_new():
-    // real seq, from the server (not client-generated or loaded from the scrollback
-    // archive), at or past the floor and before the viewing-episode ceiling.
-    // `_has_real_seq === false` only ever appears on lines built from a live ServerData
-    // message with a synthesized seq (see the ServerData handler); lines sourced from
-    // TimestampedLine (InitialState, OutputLines backfill) never set it and always carry a
-    // genuine numeric seq.
+    // Whether a line renders with the ▶ new-text indicator FOR THIS CLIENT.
+    //
+    // Ownership is recorded per line (`display_id`, see OutputLine::display_id in main.rs)
+    // and assigned server-side when a client displays a world, so this is a plain equality
+    // test against our own id. Every rule about *when* a line becomes new lives in the
+    // server's claim/release logic, not here.
+    //
+    // Replaces a seq-window test against a per-WORLD watermark pair
+    // (new_from_seq/viewed_from_seq). One shared pair per world cannot express "new for you
+    // but not for me": with two instances on different worlds it suppressed ▶ for everyone
+    // whenever any one client viewed a world, and one client leaving a world wiped another
+    // client's markers. `myDisplayId` comes from InitialState.your_display_id and is stable
+    // across reconnects (it is derived from our own client_uid), which is what preserves our
+    // markers through a brief transport drop.
     function lineIsNew(lineObj, world) {
-        if (!lineObj || !world) return false;
-        if (lineObj.from_server === false) return false;
-        if (lineObj.from_archive) return false;
-        if (lineObj._has_real_seq === false) return false;
-        if (typeof lineObj.seq !== 'number') return false;
-        // Missing/non-number viewed_from_seq (stale cached state, or an older server) means
-        // "no viewing episode in progress" - Infinity, NOT 0, which would suppress every
-        // marker.
-        const viewedFrom = (typeof world.viewed_from_seq === 'number') ? world.viewed_from_seq : Infinity;
-        return lineObj.seq >= (world.new_from_seq || 0) && lineObj.seq < viewedFrom;
+        if (!lineObj) return false;
+        if (!myDisplayId) return false; // no id yet, or an older server: never claim a marker
+        return lineObj.display_id === myDisplayId;
     }
 
     function renderOutput(opts) {
@@ -9799,21 +9840,14 @@
                 if (worlds[currentWorldIndex]) {
                     const redrawWorld = worlds[currentWorldIndex];
                     redrawWorld.output_lines = redrawWorld.output_lines.filter(l => l.from_server !== false);
-                    // Mark everything now on screen as displayed (rule 2) - the local
-                    // equivalent of the console's Ctrl+L / World::mark_displayed(). This
-                    // action has no server round trip (there's no ClayCommand for "redraw"),
-                    // so - same as before this model - it's a local-only optimistic update
-                    // and does not propagate to other instances.
-                    redrawWorld.new_from_seq = redrawWorld.output_lines.reduce(
-                        (m, l) => (typeof l.seq === 'number' && l.seq >= m) ? l.seq + 1 : m,
-                        redrawWorld.new_from_seq || 0
-                    );
-                    // Deliberately NOT touching redrawWorld.viewed_from_seq here: the floor
-                    // recompute above already pushes past every line currently on screen, so
-                    // nothing on screen can resurrect via the floor. Resetting the ceiling
-                    // here (this path has no server round trip to correct a wrong reset)
-                    // could permanently resurrect ▶ on a pending line the server still
-                    // excludes - see World::mark_displayed()'s pending_lines guard in main.rs.
+                    for (const l of redrawWorld.output_lines) {
+                        if (l.display_id === myDisplayId) l.display_id = null;
+                    }
+                    // Drop OUR OWN ▶ markers on what's now on screen - the local equivalent
+                    // of the console's Ctrl+L. Local-only optimistic update (there's no
+                    // ClayCommand for "redraw"), and correctly so: releasing our markers must
+                    // not touch another instance's, which under per-line ownership it
+                    // structurally cannot - we only ever clear entries matching our own id.
                     worldOutputCache[currentWorldIndex] = {};
                 }
                 renderOutput();
@@ -11893,6 +11927,13 @@
         // When page becomes visible, ping the server to verify the connection is alive.
         // If pong arrives in time, resync. If not, reconnect.
         document.addEventListener('visibilitychange', function() {
+            // Tell the server either way. Backgrounding is NOT a disconnect - the socket
+            // usually stays open - so it has to be signalled explicitly: a hidden client
+            // stops counting as a viewer and releases its ▶ markers, so text arriving while
+            // it's away is unviewed and becomes ▶ when it comes back. Sent before the
+            // early-return below so the hidden transition is reported at all.
+            sendClientVisibility(document.visibilityState === 'visible');
+
             if (document.visibilityState !== 'visible') return;
 
             // If checkConnectionOnResume already started a wake check (or visibilitychange

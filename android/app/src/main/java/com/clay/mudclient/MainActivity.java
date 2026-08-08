@@ -1953,6 +1953,10 @@ public class MainActivity extends AppCompatActivity {
         registerSshNetworkCallbackIfNeeded();
         restartSshTunnel(false);
 
+        // Back on screen: we count as a viewer again and claim whatever accumulated while
+        // we were away (see notifyVisibility / WsMessage::ClientVisibility).
+        notifyVisibility(true);
+
         // Always resume WebView timers/JS execution (may have been paused in onPause)
         if (webView != null) {
             webView.onResume();
@@ -1987,11 +1991,38 @@ public class MainActivity extends AppCompatActivity {
     protected void onPause() {
         super.onPause();
         unregisterSshNetworkCallback();
+        // Tell the server we're no longer on screen so it releases our ▶ new-text markers
+        // and stops counting us as a viewer - text arriving while we're backgrounded is then
+        // genuinely new when we come back. Backgrounding is NOT a disconnect here (the socket
+        // deliberately stays open below), so the server cannot infer it: it has to be told.
+        // Sent before the WebView is paused, or the JS would never run.
+        notifyVisibility(false);
         // Don't pause WebView if connected - we want to keep receiving notifications
         // The WebView will continue running in the background with the foreground service
         if (!isConnected && webView != null) {
             webView.onPause();
         }
+    }
+
+    /// Drive app.js's ClientVisibility signal from the Android lifecycle. The WebView's own
+    /// `visibilitychange` event is not reliable for app-level backgrounding (the page stays
+    /// "visible" while the activity is not), which is why this is wired to onPause/onResume.
+    private void notifyVisibility(final boolean visible) {
+        if (webView == null || !interfaceLoaded) {
+            return;
+        }
+        final String js = "if (typeof sendClientVisibility === 'function') sendClientVisibility("
+                + (visible ? "true" : "false") + ");";
+        webView.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    webView.evaluateJavascript(js, null);
+                } catch (Exception e) {
+                    // Non-fatal: the next InitialState re-establishes our state anyway.
+                }
+            }
+        });
     }
 
     @Override

@@ -1926,14 +1926,20 @@ impl User {
 }
 
 /// How long a disconnected WS client's `ClientViewState` entry is kept (and still counts as
-/// "viewing" its world) after its socket drops, before being reaped. Covers a background/
-/// reconnect gap (e.g. Android backgrounding the app, a brief network blip) without letting
-/// a client that's truly gone forever keep constraining more-mode thresholds
-/// (`min_viewer_lines`/`min_viewer_width`) or suppressing its world's new-text watermark
-/// (`ws_client_viewing`) indefinitely. Deliberately short (was 15 min): a client absent
-/// longer than this is genuinely "not viewing", so its world should start accumulating ▶
-/// markers again rather than staying artificially suppressed.
-const WS_VIEWER_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// "viewing" its world) after its socket drops, before being reaped.
+///
+/// This covers a **transport blip only** — a brief network drop on a client that is still on
+/// screen. It deliberately does NOT cover backgrounding: Android normally keeps its socket
+/// open behind `MainActivity.onPause`, so backgrounding is a visibility change on a live
+/// connection and is signalled explicitly via `WsMessage::ClientVisibility`. A backgrounded
+/// client stops counting as a viewer immediately and releases its ▶ markers, so text arriving
+/// while it is away is unviewed and becomes ▶ when it returns — which is the whole point.
+///
+/// It was 5 minutes when it also had to absorb backgrounding; with that case handled
+/// properly it only needs to outlast a reconnect, hence 10s. Too long and a genuinely-gone
+/// client keeps constraining more-mode thresholds (`min_viewer_lines`/`min_viewer_width`) and
+/// suppressing its world's arrivals (`ws_client_viewing`) after nobody is looking.
+const WS_VIEWER_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Tracks a WebSocket client's view state for synchronized more-mode
 #[derive(Clone, Debug)]
@@ -2534,6 +2540,27 @@ pub struct OutputLine {
     pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive (not current session)
+    /// Has this line been on somebody's screen yet? Set true either at arrival (the world was
+    /// being viewed by someone, so it was never "missed") or the first time any client
+    /// displays it. Once true it never goes back to false, and the line can never again be
+    /// claimed as new by anybody - that one-way latch is what gives "first viewer wins".
+    /// See `display_id` and `App::claim_unviewed_lines`.
+    pub viewed: bool,
+    /// Which client, if any, owns the ▶ new-text marker for this line. A client renders ▶ iff
+    /// this equals its own id. Set (together with `viewed = true`) the first time a client
+    /// displays a line that was still unviewed; never stolen from an existing owner, because
+    /// the claim is gated on `!viewed`. Released back to `None` - leaving `viewed` true, so
+    /// nobody else picks it up - when the owning client switches world, does Ctrl+L,
+    /// backgrounds, or stays disconnected past `WS_VIEWER_GRACE`.
+    ///
+    /// This replaced a pair of per-world seq watermarks (`new_from_seq`/`viewed_from_seq`,
+    /// commit a23d2c1). A single shared pair cannot express "new for you but not for me", so
+    /// with two instances on different worlds it was wrong in both directions: one client's
+    /// `mark_displayed()` wiped another client's markers, and one client viewing a world
+    /// suppressed ▶ there for everyone. Per-line ownership was the previous model too
+    /// (`marked_new`), but as a bare bool with no owner - which is why a client leaving a
+    /// world could never tell the others to stop drawing it. The owner id is that fix.
+    pub display_id: Option<u64>,
 }
 
 /// Display/log marker for captured user input. Applied at RENDER time only (in
@@ -2547,16 +2574,23 @@ pub struct OutputLine {
 /// input apart from notices.
 pub const INPUT_LINE_PREFIX: &str = "\u{00BB} "; // "» "
 
-/// Whether a line should render with the ▶ new-text indicator, given a world's pair of
-/// new-text watermarks (`World::new_from_seq`/`World::viewed_from_seq` - see their doc
-/// comments). Free-function form (as opposed to `World::line_is_new`) for call sites already
-/// holding an exclusive borrow into `world.output_lines`/`pending_lines` (e.g.
-/// `World::add_output`'s partial-line handling, which mutates a `&mut OutputLine` from
-/// `.last_mut()`) - calling a `&self` method there would conflict with that borrow, since Rust
-/// doesn't see the two as disjoint through a method-call boundary. This takes both watermarks
-/// as plain `u64`s instead, so it borrows nothing from `World`.
-fn line_is_new_at(line: &OutputLine, new_from_seq: u64, viewed_from_seq: u64) -> bool {
-    line.from_server && !line.from_archive && line.seq >= new_from_seq && line.seq < viewed_from_seq
+/// Reserved `OutputLine::display_id` for the local console TUI. WebSocket client ids are
+/// allocated from a counter starting at 1, and 0 is the embedded GUI, so `u64::MAX` can never
+/// collide with a real client.
+pub const CONSOLE_DISPLAY_ID: u64 = u64::MAX;
+
+/// Whether `line` should render with the ▶ new-text indicator for the viewer identified by
+/// `viewer_id` (a WebSocket client id, or `CONSOLE_DISPLAY_ID` for the local TUI). Ownership
+/// is recorded on the line itself, so this is a plain equality test — every rule about *when*
+/// a line becomes new lives in `World::claim_unviewed`/`World::release_claims`, not here.
+///
+/// Replaces `line_is_new_at(line, new_from_seq, viewed_from_seq)`, which evaluated each line
+/// against a pair of per-WORLD watermarks. A single shared pair cannot express "new for you
+/// but not for me": with two instances on different worlds it suppressed ▶ for everyone when
+/// any one client viewed a world, and one client leaving a world wiped another client's
+/// markers. See `OutputLine::display_id`'s doc comment.
+fn line_is_new_for(line: &OutputLine, viewer_id: u64) -> bool {
+    line.display_id == Some(viewer_id)
 }
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
@@ -2602,6 +2636,8 @@ impl OutputLine {
             seq,
             highlight_color: None,
             from_archive: false,
+            viewed: false,
+            display_id: None,
         }
     }
 
@@ -2615,6 +2651,8 @@ impl OutputLine {
             seq,
             highlight_color: None,
             from_archive: false,
+            viewed: false,
+            display_id: None,
         }
     }
 
@@ -2628,11 +2666,13 @@ impl OutputLine {
             seq,
             highlight_color: None,
             from_archive: false,
+            viewed: false,
+            display_id: None,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false, viewed: false, display_id: None }
     }
 
     /// A user-typed command captured on its way to the MUD. `gagged: true` is what makes it
@@ -2648,6 +2688,8 @@ impl OutputLine {
             seq,
             highlight_color: None,
             from_archive: false,
+            viewed: false,
+            display_id: None,
         }
     }
 
@@ -2760,38 +2802,11 @@ pub struct World {
     /// no reordering compensation layer" design (unlike `app.js`'s `_seqGaps`, which
     /// exists for a different, still-open problem - see PROTOCOL-ROADMAP.md Step 7).
     pub pending_gap: Option<(usize, u64)>,
-    /// Watermark for the ▶ new-text indicator: the lowest `seq` that is still "new". A line
-    /// renders with ▶ iff `line.seq >= new_from_seq && line.seq < viewed_from_seq &&
-    /// line.from_server && !line.from_archive` (see `viewed_from_seq` below for the second
-    /// half of that condition). Server-authoritative and broadcast to every client
-    /// (`ServerData.new_from_seq`, `WsMessage::NewWatermark`) so remote instances can never
-    /// hold a stale per-line copy - see the design note above `mark_displayed()`. Never
-    /// retreats.
-    pub new_from_seq: u64,
-    /// Upper bound of the ▶ window: the `seq` of the first line that arrived while somebody
-    /// was viewing this world during the CURRENT viewing episode. A line is ▶ only when
-    /// `seq < viewed_from_seq`, so everything from that point on - all of which arrived while
-    /// being watched, since seqs are monotonic - is excluded by rule 1 ("text arriving while
-    /// someone is viewing is not new") WITHOUT dragging the `new_from_seq` floor forward over
-    /// older, still-unseen backlog. A single floor cannot express both at once: `seq >=
-    /// new_from_seq` makes "new" a suffix of seq-space, and rule 1 needs part of that suffix
-    /// (the freshest arrivals) to be excluded while an even-older prefix stays included -
-    /// that's why this is a second value, not a tweak to `new_from_seq` itself.
-    ///
-    /// `u64::MAX` is the "no viewing episode in progress" sentinel (no exclusion at all).
-    /// Latched once per episode, and released again, by `World::note_line_arrival()` - see
-    /// its doc comment for exactly when. Also released (conditionally) by
-    /// `World::mark_displayed()`.
-    ///
-    /// Deliberately NOT monotonic, unlike `new_from_seq`: it drops from `u64::MAX` back down
-    /// to a small value at the start of every viewing episode. Any code that merges an
-    /// *inbound* copy of this value (the remote-console `NewWatermark` handler, `app.js`'s
-    /// equivalent) must use a plain assignment, never `.max()` - a max-merge would pin it at
-    /// `u64::MAX` forever after the first episode anywhere ever ends.
-    ///
-    /// Live-session state only - never persisted; a reload always restarts at `u64::MAX`,
-    /// same as a freshly created `World`.
-    pub viewed_from_seq: u64,
+    // The ▶ new-text state lives on each line now (`OutputLine::viewed`/`display_id`), not
+    // in a pair of per-world watermarks here. See those fields' doc comments for why the
+    // watermark pair had to go: one shared pair per world cannot express "new for you but
+    // not for me", so with two instances on different worlds it was wrong in both
+    // directions.
     pub visual_line_offset: usize, // When > 0, show only first N visual lines of scroll_offset line (partial display for more-mode)
     pub watchdog_history: std::collections::VecDeque<String>,  // Rolling window of recent lines (stripped) for /watchdog
     pub watchname_history: std::collections::VecDeque<String>, // Rolling window of first-words for /watchname
@@ -2874,8 +2889,6 @@ impl World {
             connection_id: 0,
             max_received_seq: 0,
             pending_gap: None,
-            new_from_seq: 0,
-            viewed_from_seq: u64::MAX,
             visual_line_offset: 0,
             watchdog_history: std::collections::VecDeque::new(),
             watchname_history: std::collections::VecDeque::new(),
@@ -3057,13 +3070,18 @@ impl World {
             .map(|l| l.seq)
     }
 
-    pub(crate) fn record_input_line(&mut self, text: &str, log_input: bool) -> (u64, bool) {
+    pub(crate) fn record_input_line(&mut self, text: &str, log_input: bool, viewed: bool) -> (u64, bool) {
         let seq = self.next_seq;
         self.next_seq += 1;
         if log_input {
             self.write_log_line(&format!("{}{}", INPUT_LINE_PREFIX, text));
         }
-        let line = OutputLine::new_input(text.to_string(), seq);
+        let mut line = OutputLine::new_input(text.to_string(), seq);
+        // Born viewed when somebody is watching, same rule as add_output. A captured input
+        // line is `from_server: false` so it can never own a ▶ marker anyway (claim_unviewed
+        // skips those), but `viewed` must still be accurate to keep unviewed lines a
+        // contiguous tail, which claim_unviewed's backwards scan relies on.
+        line.viewed = viewed;
         // Same seq-ordering rule as process_server_data's hold_gagged_in_pending: while
         // paused with a backlog, pushing straight into output_lines would jump this line
         // ahead of lower-seq pending lines and break the sorted-by-seq invariant that
@@ -3108,7 +3126,7 @@ impl World {
             let nli = settings.new_line_indicator;
             let mut visible = 0;
             for line in self.output_lines.iter().rev() {
-                let vl = nli_visual_rows(&line.text, width, self.line_is_new(line), nli, settings.wrapspace as usize);
+                let vl = nli_visual_rows(&line.text, width, line_is_new_for(line, CONSOLE_DISPLAY_ID), nli, settings.wrapspace as usize);
                 if visible + vl > max_lines {
                     break;
                 }
@@ -3165,7 +3183,7 @@ impl World {
             let old_visual = if partial_was_in_pending {
                 0
             } else if let Some(i) = self.last_visible_output_idx() {
-                let is_new = self.line_is_new(&self.output_lines[i]);
+                let is_new = line_is_new_for(&self.output_lines[i], CONSOLE_DISPLAY_ID);
                 nli_visual_rows(&self.output_lines[i].text, width, is_new, nli, wrapspace)
             } else {
                 0
@@ -3191,9 +3209,7 @@ impl World {
                     }
                 } else if let Some(i) = self.last_visible_output_idx() {
                     self.output_lines[i].text = completed_line.to_string();
-                    // Free-function form, not self.line_is_new(...): matches the
-                    // existing convention here, avoids holding a borrow across statements.
-                    let last_is_new = line_is_new_at(&self.output_lines[i], self.new_from_seq, self.viewed_from_seq);
+                    let last_is_new = line_is_new_for(&self.output_lines[i], CONSOLE_DISPLAY_ID);
                     let new_visual = nli_visual_rows(&self.output_lines[i].text, width, last_is_new, nli, wrapspace);
                     // Re-count at the completed line's final wrapped height. Does
                     // NOT retroactively trigger a pause even if this pushes over
@@ -3272,15 +3288,16 @@ impl World {
             // Create OutputLine with appropriate from_server flag
             let seq = self.next_seq;
             self.next_seq += 1;
-            // Rule 1 bookkeeping for this arrival (viewed vs unviewed) - see
-            // note_line_arrival()'s doc comment. Safe to call before the push since it's
-            // expressed purely in terms of seq.
-            self.note_line_arrival(seq, is_current, from_server);
-            let new_line = if from_server {
+            let mut new_line = if from_server {
                 OutputLine::new(line.to_string(), seq)
             } else {
                 OutputLine::new_client(line.to_string(), seq)
             };
+            // A line that arrives while somebody is watching this world was never missed, so
+            // it is born already-viewed and can never be claimed as ▶ by anyone (see
+            // OutputLine::viewed). `is_current` is the existing console-or-any-WS-client
+            // predicate, unchanged - it still drives more-mode budgeting above too.
+            new_line.viewed = is_current;
 
             if goes_to_pending {
                 // Track when pending output first appeared
@@ -3395,7 +3412,7 @@ impl World {
             idx -= 1;
         }
         let line = &self.output_lines[idx];
-        let total = nli_visual_rows(&line.text, output_width.max(1), self.line_is_new(line), nli_enabled, wrapspace);
+        let total = nli_visual_rows(&line.text, output_width.max(1), line_is_new_for(line, CONSOLE_DISPLAY_ID), nli_enabled, wrapspace);
         total.saturating_sub(self.visual_line_offset)
     }
 
@@ -3452,93 +3469,64 @@ impl World {
         // Ctrl+L for whatever's on screen right now.
     }
 
-    /// Advance the new-text watermark (`new_from_seq`, see its doc comment) past every line
-    /// currently in `output_lines` — i.e. mark everything displayed so far as no longer new.
-    /// Called when switching away from a world, on Ctrl+L, and (for whichever world a client
-    /// is currently viewing) at settings-save time so a quit-while-viewing doesn't resurrect
-    /// markers on reload.
+    /// `viewer_id` displays this world: every line still unviewed becomes viewed and is
+    /// claimed by that viewer, which is what makes it render ▶ there. Returns true if
+    /// anything changed.
     ///
-    /// Deliberately does NOT touch `pending_lines`: rule 2 is "displayed", and pending lines
-    /// haven't been - that's what pending means. They keep their ▶ until PgDn/Tab releases
-    /// them into `output_lines`, with no exception for Ctrl+L or leaving the world (a pending
-    /// line's `seq` is always higher than anything already in `output_lines`, so it naturally
-    /// stays above the watermark once this only advances past what's displayed).
-    pub fn mark_displayed(&mut self) {
-        if let Some(last) = self.output_lines.last() {
-            let candidate = last.seq + 1;
-            if candidate > self.new_from_seq {
-                self.new_from_seq = candidate;
+    /// The `!viewed` guard is the whole design. It is a one-way latch, so:
+    /// - a line that arrived while somebody was watching (`viewed` already true, see
+    ///   `App::note_arrival`) can never become new for anyone, ever;
+    /// - the first viewer to display an unviewed line owns its marker, and a second viewer
+    ///   arriving later gets nothing — the claim is never stolen, so one client displaying
+    ///   text cannot disturb another client's markers.
+    ///
+    /// Deliberately skips `pending_lines`: those haven't been displayed — that's what
+    /// pending means — so they stay claimable until PgDn/Tab releases them into
+    /// `output_lines`. Also skips client-generated and archive lines, which are never ▶
+    /// (the old `line_is_new_at` enforced the same two exclusions in the render predicate;
+    /// doing it here instead means the predicate is a pure ownership check).
+    ///
+    /// Returns the seqs it actually took ownership of, so the caller can tell the client
+    /// exactly which lines are now its own.
+    ///
+    /// Scans the WHOLE buffer rather than stopping at the first already-viewed line.
+    /// Unviewed lines are *not* a contiguous tail: `viewed` is decided per line by whether
+    /// anyone was watching at that instant, and that flips back and forth with no display
+    /// event in between, so `[unviewed, viewed, unviewed]` is perfectly reachable. An earlier
+    /// version broke out of a reverse scan on the first viewed line and silently skipped
+    /// older unviewed backlog behind it.
+    pub fn claim_unviewed(&mut self, viewer_id: u64) -> Vec<u64> {
+        let mut claimed = Vec::new();
+        for line in self.output_lines.iter_mut() {
+            if line.viewed {
+                continue;
+            }
+            line.viewed = true;
+            if line.from_server && !line.from_archive {
+                line.display_id = Some(viewer_id);
+                claimed.push(line.seq);
             }
         }
-        // Release the viewing-episode ceiling so the next episode can latch a fresh one -
-        // but only when nothing is queued. A pending line above the ceiling arrived while
-        // the world was being watched, so rule 1 says it is NOT new; the floor above
-        // deliberately never covers pending (see this function's doc comment), so
-        // viewed_from_seq is the ONLY thing still holding that for a queued line, and
-        // dropping it here unconditionally would resurrect ▶ on it. Leaving it latched is
-        // always safe: a latched ceiling only ever excludes lines that arrived while
-        // viewed, and note_line_arrival() releases it for real on the next unviewed
-        // server-originated arrival.
-        if self.pending_lines.is_empty() {
-            self.viewed_from_seq = u64::MAX;
-        }
+        claimed
     }
 
-    /// Record that a line with `seq` just arrived on this world, applying rule 1 ("text that
-    /// arrives while somebody is watching is not new"). Called for every line this world
-    /// issues a seq for: by `add_output` for its own lines, and by hand from the paths that
-    /// build an `OutputLine` directly (gagged lines, prompt-as-output on a disconnected
-    /// world, Slack/Discord gagged messages).
+    /// Drop every ▶ marker owned by `viewer_id`, leaving `viewed` true so no other viewer
+    /// picks the lines up. Called when that viewer switches to another world, does Ctrl+L,
+    /// backgrounds, or stays disconnected past `WS_VIEWER_GRACE`. Returns true if anything
+    /// changed.
     ///
-    /// Replaces the old `advance_watermark_if_current()`, which applied rule 1 by shoving
-    /// `new_from_seq` past the arriving line — correct for that one line, but since seqs are
-    /// monotonic it also swept every OLDER, still-unseen line below the floor with it (the
-    /// bug where new output arriving on the world you're viewing cleared OTHER lines' ▶).
-    /// This instead latches the separate `viewed_from_seq` ceiling (see its doc comment) at
-    /// the first line of a viewing episode, leaving older backlog and `new_from_seq`
-    /// untouched.
-    ///
-    /// Deliberately expressed in terms of `seq` alone rather than the buffers, so it's safe
-    /// to call either before or after the line is pushed — existing call sites do both.
-    pub fn note_line_arrival(&mut self, seq: u64, is_current: bool, from_server: bool) {
-        if is_current {
-            // Start of a viewing episode: latch at the first line to arrive while watched.
-            // Every later line in the same episode has a higher seq and is excluded by the
-            // same value, so this fires exactly once per episode.
-            if self.viewed_from_seq == u64::MAX {
-                self.viewed_from_seq = seq;
+    /// Only touches lines this viewer owns, which is what gives each instance the "just like
+    /// there was no other client connected" behaviour the shared watermark could not: another
+    /// client's markers are invisible to this call.
+    pub fn release_claims(&mut self, viewer_id: u64) -> bool {
+        let mut changed = false;
+        for line in self.output_lines.iter_mut() {
+            if line.display_id == Some(viewer_id) {
+                line.display_id = None;
+                changed = true;
             }
-        } else if from_server && self.viewed_from_seq != u64::MAX {
-            // The last viewer stopped watching without any display event firing - a WS
-            // client switched world, hit --More-- (ws_client_viewing() excludes paused
-            // clients), or its WS_VIEWER_GRACE expired - and real world text is arriving
-            // again. End the episode: everything up to here stops being new (same outcome
-            // as having left the world, which is what "nobody is viewing" amounts to), and
-            // this line and everything after it must be free to become new again, which a
-            // still-latched ceiling would otherwise prevent forever.
-            //
-            // Gated on from_server so a client-generated line (a /world message, a
-            // "Disconnected." notice) can never end an episode and cost a background world
-            // its markers - see test_add_output_to_world_broadcasts_real_seq.
-            self.new_from_seq = self.new_from_seq.max(seq);
-            self.viewed_from_seq = u64::MAX;
         }
-    }
-
-    /// Snapshot of both ▶ watermarks, for `App::broadcast_watermark_if_changed`'s
-    /// before/after comparison. Both must be compared: a viewing episode starting moves
-    /// only `viewed_from_seq`, not `new_from_seq`.
-    pub fn watermark_state(&self) -> (u64, u64) {
-        (self.new_from_seq, self.viewed_from_seq)
-    }
-
-    /// Whether `line` should render with the ▶ new-text indicator, per this world's pair of
-    /// new-text watermarks (`new_from_seq`/`viewed_from_seq` - see their doc comments).
-    /// Mirrors `rendering::line_is_new()` (a separate copy: that one lives in a different
-    /// module and takes both watermarks as plain args since it doesn't have a `World` to call
-    /// this on).
-    pub fn line_is_new(&self, line: &OutputLine) -> bool {
-        line_is_new_at(line, self.new_from_seq, self.viewed_from_seq)
+        changed
     }
 
     /// Returns true if this world has activity (unseen lines or pending output)
@@ -3579,7 +3567,7 @@ impl World {
                 logical_count += 1;
                 continue;
             }
-            let vl = nli_visual_rows(&line.text, width, self.line_is_new(line), nli_enabled, wrapspace);
+            let vl = nli_visual_rows(&line.text, width, line_is_new_for(line, CONSOLE_DISPLAY_ID), nli_enabled, wrapspace);
             // If adding this line would exceed budget AND we already have at least one,
             // stop before adding it. Always release at least 1 line.
             if visual_total > 0 && visual_total + vl > visual_budget {
@@ -3653,10 +3641,11 @@ impl World {
                 line.gagged = true;
             }
         }
-        // Ctrl+L marks whatever's currently displayed (output_lines) as seen. Pending lines
-        // are deliberately left alone - they haven't been displayed yet, so rule 2 says they
-        // keep their ▶ regardless of Ctrl+L (see mark_displayed()'s doc comment).
-        self.mark_displayed();
+        // Ctrl+L dismisses the console's own ▶ markers. Only the console's: another client's
+        // markers on the same lines are untouched, which is the whole point of per-line
+        // ownership (`release_claims`). Pending lines are deliberately left alone - they
+        // haven't been displayed yet, so they stay claimable regardless of Ctrl+L.
+        self.release_claims(CONSOLE_DISPLAY_ID);
         self.reset_visual_truncation();
         // Adjust scroll offset if it's now past the end
         if self.scroll_offset > 0 && self.scroll_offset >= self.output_lines.len() {
@@ -3771,6 +3760,10 @@ pub struct App {
     /// Cache of each WS client's view state (for activity indicator and more-mode)
     /// Maps client_id -> ClientViewState (world_index + visible_lines)
     pub ws_client_worlds: std::collections::HashMap<u64, ClientViewState>,
+    /// Connection id -> stable ▶ ownership id, seeded from `AuthRequest.client_uid`. See
+    /// `App::display_owner_id`. Entries are dropped when the client's `ClientViewState` is
+    /// reaped, so this stays bounded by the live client count.
+    pub ws_client_owner_ids: std::collections::HashMap<u64, u64>,
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     pub is_master: bool,
@@ -3930,6 +3923,7 @@ impl App {
             https_server: None,
             popup_was_visible: false,
             ws_client_worlds: std::collections::HashMap::new(),
+            ws_client_owner_ids: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
             web_reconnect_needed: false,
             web_restart_needed: false,
@@ -4786,7 +4780,7 @@ impl App {
             // `end_seq: None`) ever reached this handler. Regression from 99fe3dc
             // (2026-08-04); this arm's body never actually needed `end_seq`'s value, only
             // `msg_seq`, so dropping the literal match is a complete fix.
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, flush, gagged, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq, flush, gagged, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Flush: clear output buffer before appending new lines
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
@@ -4843,11 +4837,37 @@ impl App {
                         // Check if user was at bottom before adding lines
                         let was_at_bottom = world.is_at_bottom();
 
+                        // Store the SERVER's seq, not a locally-invented one. `msg_seq` is the
+                        // first line's seq and each subsequent line in the batch is one higher,
+                        // derived from the PRE-FILTER index `i` exactly as app.js does
+                        // (`msg.seq + rawIdx`, PROTOCOL-ROADMAP.md Phase B Step 8) - that fix
+                        // was applied to the web client and never mirrored here. This mirror
+                        // used to take `world.next_seq` instead and keep the real seq only for
+                        // dedup, which left `output_lines` holding a MIXTURE of real seqs (from
+                        // InitialState/OutputLines/ScrollbackLines, all of which use the wire
+                        // value) and invented ones. That breaks the sorted-by-seq assumption the
+                        // ScrollbackLines gap-fill splice depends on, and any comparison against
+                        // a server-supplied seq, since the two counters are unrelated number
+                        // spaces that drift without bound (a world that received zero lines in
+                        // InitialState starts at 1 while the server is at 50000).
+                        //
+                        // `end_seq.is_some()` widens the real-seq test the same way app.js's
+                        // `hasRealSeq` does: seq 0 is a legitimate value for a world's very
+                        // first line, so a present end_seq is what distinguishes it from the
+                        // "no real seq" default.
+                        let has_real_seq = msg_seq > 0 || end_seq.is_some();
                         let line_count = data.lines().count();
                         for (i, line) in data.lines().enumerate() {
                             // Preserve from_server flag for Ctrl+L filtering
-                            let seq = world.next_seq;
-                            world.next_seq += 1;
+                            let seq = if has_real_seq {
+                                msg_seq + i as u64
+                            } else {
+                                world.next_seq
+                            };
+                            // Keep next_seq ahead of every seq actually stored, so the
+                            // no-real-seq fallback above can never collide with a real seq
+                            // delivered later.
+                            world.next_seq = world.next_seq.max(seq + 1);
                             let mut output_line = if from_server {
                                 OutputLine::new(line.to_string(), seq)
                             } else {
@@ -4905,18 +4925,32 @@ impl App {
                     world.unseen_lines = count;
                 }
             }
-            WsMessage::NewWatermark { world_index, new_from_seq, viewed_from_seq } => {
-                // This remote console mirror never computes the ▶ watermarks itself - it's
-                // purely a display of whatever the master last told us (see
-                // WsMessage::NewWatermark's doc comment). max() guards new_from_seq against a
-                // hypothetically-reordered message retreating it; the master itself never
-                // sends a lower value there. viewed_from_seq is the opposite: it's NOT
-                // monotonic (it deliberately drops back to u64::MAX at the end of every
-                // viewing episode), so it must be a plain assignment - a max() merge would
-                // pin it at u64::MAX forever after the first episode anywhere ever ends.
+            WsMessage::ClaimedNew { world_index, seqs } => {
+                // The master handed this instance ownership of exactly these lines. This
+                // mirror never decides ▶ for itself - ownership is assigned server-side, so
+                // two instances can never both claim the same line. Stamped with the local
+                // CONSOLE_DISPLAY_ID because rendering::line_is_new always draws for the
+                // local instance; the master's own id for us is irrelevant here.
                 if let Some(world) = self.worlds.get_mut(world_index) {
-                    world.new_from_seq = world.new_from_seq.max(new_from_seq);
-                    world.viewed_from_seq = viewed_from_seq;
+                    let wanted: std::collections::HashSet<u64> = seqs.into_iter().collect();
+                    for line in world.output_lines.iter_mut() {
+                        if wanted.contains(&line.seq) {
+                            line.display_id = Some(CONSOLE_DISPLAY_ID);
+                        }
+                    }
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::ReleasedNew { world_index } => {
+                // Our own markers on that world are cleared (we switched away, hit Ctrl+L, or
+                // backgrounded). Other instances' markers live on their own copies, so there
+                // is nothing else to reconcile here.
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    for line in world.output_lines.iter_mut() {
+                        if line.display_id == Some(CONSOLE_DISPLAY_ID) {
+                            line.display_id = None;
+                        }
+                    }
                     self.needs_output_redraw = true;
                 }
             }
@@ -4973,8 +5007,11 @@ impl App {
                         if tl.seq > 0 && tl.seq <= world.max_received_seq {
                             continue; // Skip duplicate line
                         }
-                        let seq = world.next_seq;
-                        world.next_seq += 1;
+                        // The server's own seq, same reasoning as the ServerData arm above -
+                        // it's already read on the dedup line just above, and inventing a
+                        // local one here put non-server seqs into output_lines.
+                        let seq = tl.seq;
+                        world.next_seq = world.next_seq.max(seq + 1);
                         world.output_lines.push(OutputLine {
                             text: tl.text,
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
@@ -4986,6 +5023,8 @@ impl App {
                             seq,
                             highlight_color: tl.highlight_color,
                             from_archive: false,
+                            viewed: false,
+                            display_id: None,
                         });
                         if tl.seq > 0 {
                             world.max_received_seq = tl.seq;
@@ -5142,6 +5181,8 @@ impl App {
                             seq: line.seq,
                             highlight_color: line.highlight_color,
                             from_archive: line.from_archive,
+                            viewed: false,
+                            display_id: None,
                         };
                         world.output_lines.push(output_line);
                         if line.seq >= world.next_seq {
@@ -5224,6 +5265,8 @@ impl App {
                                     seq: line.seq,
                                     highlight_color: line.highlight_color,
                                     from_archive: line.from_archive,
+                                    viewed: false,
+                                    display_id: None,
                                 }).collect();
                             let insert_at = insert_at.min(world.output_lines.len());
                             let inserted = new_lines.len();
@@ -5255,6 +5298,8 @@ impl App {
                             seq: line.seq,
                             highlight_color: line.highlight_color,
                             from_archive: line.from_archive,
+                            viewed: false,
+                            display_id: None,
                         }
                     }).collect();
                     let prepended_count = new_lines.len();
@@ -5380,6 +5425,8 @@ impl App {
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
                     from_archive: tl.from_archive,
+                    viewed: false,
+                    display_id: None,
                 }
             }).collect();
             // Update next_seq to continue from highest seq in output_lines
@@ -5403,6 +5450,8 @@ impl App {
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
                     from_archive: tl.from_archive,
+                    viewed: false,
+                    display_id: None,
                 }
             }).collect();
             // Update next_seq if pending_lines have higher seq values
@@ -5413,8 +5462,6 @@ impl App {
             world.prompt = w.prompt;
             world.showing_splash = w.showing_splash;
             world.gmcp_user_enabled = w.gmcp_user_enabled;
-            world.new_from_seq = w.new_from_seq;
-            world.viewed_from_seq = w.viewed_from_seq;
             world.settings = WorldSettings {
                 hostname: w.settings.hostname,
                 port: w.settings.port,
@@ -5625,13 +5672,15 @@ impl App {
             if self.worlds[old_index].pending_lines.is_empty() {
                 self.worlds[old_index].lines_since_pause = 0;
             }
-            // Clear new line indicators on the world we're leaving
-            let watermark_before = self.worlds[old_index].watermark_state();
-            self.worlds[old_index].mark_displayed();
-            self.broadcast_watermark_if_changed(old_index, watermark_before);
+            // Drop the console's own ▶ markers on the world we're leaving. Only the
+            // console's - a remote client sitting on that same world keeps its markers,
+            // which is the behaviour the shared watermark could not provide.
+            self.release_world_for(old_index, CONSOLE_DISPLAY_ID, None);
             // Track previous world for Alt+w fallback
             self.previous_world_index = Some(self.current_world_index);
             self.current_world_index = index;
+            // ...and claim whatever accumulated unviewed on the world we're arriving at.
+            self.claim_world_for(index, CONSOLE_DISPLAY_ID, None);
             // Note: mark_seen() is NOT called here - lines are only marked seen when displayed
             // Mark output for redraw since we switched worlds
             self.needs_output_redraw = true;
@@ -5967,6 +6016,8 @@ impl App {
                         seq: line.seq,
                         highlight_color: line.highlight_color.clone(),
                         from_archive: line.from_archive,
+                        viewed: false,
+                        display_id: None,
                     }
                 })
                 .collect();
@@ -6019,6 +6070,8 @@ impl App {
                         seq: line.seq,
                         highlight_color: line.highlight_color.clone(),
                         from_archive: line.from_archive,
+                        viewed: false,
+                        display_id: None,
                     }
                 })
                 .collect();
@@ -6057,6 +6110,8 @@ impl App {
                         seq: line.seq,
                         highlight_color: line.highlight_color.clone(),
                         from_archive: line.from_archive,
+                        viewed: false,
+                        display_id: None,
                     }
                 })
                 .collect();
@@ -6078,6 +6133,8 @@ impl App {
                         seq: line.seq,
                         highlight_color: line.highlight_color.clone(),
                         from_archive: line.from_archive,
+                        viewed: false,
+                        display_id: None,
                     }
                 })
                 .collect();
@@ -6126,7 +6183,7 @@ impl App {
     /// byte-identical between the two previous copies. Full state resync: web/Android ping
     /// the server on visibility change and send this when the connection looks stale.
     pub(crate) fn handle_request_state(&mut self, client_id: u64) {
-        let initial_state = self.build_initial_state();
+        let initial_state = self.build_initial_state(self.display_owner_id(client_id));
         self.ws_send_initial_state_and_mark(client_id, initial_state);
         // Set client's initial world so broadcast_to_world_viewers works immediately
         self.ws_set_client_world(client_id, Some(self.current_world_index));
@@ -6162,6 +6219,8 @@ impl App {
                 seq: line.seq,
                 highlight_color: line.highlight_color.clone(),
                 from_archive: line.from_archive,
+                viewed: false,
+                display_id: None,
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -6194,13 +6253,13 @@ impl App {
         let old_world_idx = previous_world_index
             .or_else(|| self.ws_client_worlds.get(&client_id).map(|s| s.world_index));
         let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
-        // When switching away from the old world, clear its new line indicators
-        // and reset lines_since_pause if more-mode hasn't triggered
+        // When switching away from the old world, drop THIS client's ▶ markers there
+        // and reset lines_since_pause if more-mode hasn't triggered. Other clients'
+        // markers on the same lines are untouched.
         if let Some(old_idx) = old_world_idx {
             if old_idx != world_index && old_idx < self.worlds.len() {
-                let watermark_before = self.worlds[old_idx].watermark_state();
-                self.worlds[old_idx].mark_displayed();
-                self.broadcast_watermark_if_changed(old_idx, watermark_before);
+                let owner = self.display_owner_id(client_id);
+                self.release_world_for(old_idx, owner, Some(client_id));
                 if self.worlds[old_idx].pending_lines.is_empty() {
                     self.worlds[old_idx].lines_since_pause = 0;
                 }
@@ -6215,6 +6274,12 @@ impl App {
         self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
         // Update client's world in WebSocket server (async state)
         self.ws_set_client_world(client_id, Some(world_index));
+        // This client is now displaying the new world - claim whatever accumulated unviewed
+        // there. Must run AFTER the ws_client_worlds insert above, so the client counts as a
+        // viewer. If another client already displayed these lines they are already viewed and
+        // this is a no-op, which is exactly "first viewer wins".
+        let owner = self.display_owner_id(client_id);
+        self.claim_world_for(world_index, owner, Some(client_id));
 
         self.worlds[world_index].mark_seen();
         // Broadcast to all clients so they update their UI
@@ -6496,15 +6561,12 @@ impl App {
         let output_before = self.worlds[world_idx].output_lines.len();
         let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
             && !self.worlds[world_idx].partial_in_pending;
-        let watermark_before = self.worlds[world_idx].watermark_state();
-
         self.worlds[world_idx]
             .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
-        // If this world is currently viewed, add_output already latched viewed_from_seq past
-        // this line (rule 1 applies to arrival-while-viewed regardless of from_server - see
-        // note_line_arrival's is_current branch) - tell every instance before broadcasting the
-        // content, same ordering reason as process_server_data's identical comment.
-        self.broadcast_watermark_if_changed(world_idx, watermark_before);
+        // No ▶ broadcast needed on arrival any more: an arriving line carries its own state
+        // (`OutputLine::viewed`, set from is_current) and is never owned by anyone yet, so no
+        // client's markers change here. Ownership is only ever assigned by a claim, which
+        // happens when a client displays a world - see App::claim_world_for.
 
         let output_after = self.worlds[world_idx].output_lines.len();
         let pending_after = self.worlds[world_idx].pending_lines.len();
@@ -6726,8 +6788,6 @@ impl App {
             total_output_lines: 0,
             total_visible_lines: Some(0),
             pending_count: 0,
-            new_from_seq: 0,
-            viewed_from_seq: u64::MAX,
             next_seq: 0,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
@@ -7065,6 +7125,23 @@ impl App {
         if released.is_empty() {
             return;
         }
+        // A release is a display event: the lines just moved from the server-held backlog
+        // onto somebody's screen. Anything among them that arrived while nobody was watching
+        // is still unviewed, so claim it now - without this, pending lines that accumulated
+        // on an unwatched world would move into output_lines and silently never become ▶,
+        // because the only other claim point is switching INTO a world and the releaser is
+        // already there. `claim_unviewed` is first-wins, so whichever viewer is looking gets
+        // them and a second viewer changes nothing.
+        let claimant = if world_idx == self.current_world_index {
+            Some(CONSOLE_DISPLAY_ID)
+        } else {
+            self.ws_client_worlds.iter()
+                .find(|(_, v)| v.world_index == world_idx && !v.paused && v.disconnected_at.is_none())
+                .map(|(&cid, _)| self.display_owner_id(cid))
+        };
+        if let Some(claimant) = claimant {
+            let _ = self.worlds[world_idx].claim_unviewed(claimant);
+        }
         let ts = current_timestamp_secs();
         let mut batch: Vec<String> = Vec::new();
         let mut batch_from_server = released[0].from_server;
@@ -7255,11 +7332,7 @@ impl App {
             if part.is_empty() {
                 continue;
             }
-            let (seq, in_output) = self.worlds[world_idx].record_input_line(part, self.settings.log_input_enabled);
-            // from_server: false, so per note_line_arrival's doc comment this can only latch
-            // a viewing episode - it can never end one or cost a background world its ▶
-            // markers.
-            self.worlds[world_idx].note_line_arrival(seq, is_current, false);
+            let (seq, in_output) = self.worlds[world_idx].record_input_line(part, self.settings.log_input_enabled, is_current);
             if !in_output {
                 continue; // held in pending_lines; rides the release batch via broadcast_released_lines
             }
@@ -7952,34 +8025,125 @@ impl App {
     /// app) makes that client's own current world look unviewed the instant its socket
     /// drops, so any output arriving in that window gets wrongly marked_new even though the
     /// client never actually looked away.
+    /// `WsMessage::ClientVisibility` handling. Backgrounding is NOT a disconnect — Android
+    /// keeps the socket open behind `MainActivity.onPause` — so it has to be signalled
+    /// explicitly, and it means something different from a transport drop:
+    ///
+    /// - **Hidden**: the client stops counting as a viewer immediately and releases the ▶
+    ///   markers it holds. Text arriving while it is away is therefore unviewed, and becomes
+    ///   ▶ for it when it returns and claims. This is the behaviour you want when you
+    ///   background the app mid-session.
+    /// - **Visible again**: it counts as a viewer again and claims whatever accumulated.
+    ///
+    /// A brief transport drop on a still-visible client is the opposite case and is covered
+    /// by `WS_VIEWER_GRACE` (10s), which deliberately keeps the markers intact.
+    ///
+    /// Implemented by reusing `ClientViewState::paused`, the existing "doesn't count as a
+    /// viewer" flag (`ws_client_viewing` already excludes it) — a hidden client and a
+    /// `--More--`-paused one want exactly the same treatment here.
+    fn handle_client_visibility(&mut self, client_id: u64, visible: bool) {
+        let Some(state) = self.ws_client_worlds.get_mut(&client_id) else { return };
+        if state.paused != visible {
+            return; // already in this state - nothing to release or claim
+        }
+        state.paused = !visible;
+        let world_idx = state.world_index;
+        let owner = self.display_owner_id(client_id);
+        if visible {
+            self.claim_world_for(world_idx, owner, Some(client_id));
+        } else {
+            // The socket is still open when backgrounding, so the client can and should drop
+            // its markers immediately rather than discovering it on the next render.
+            self.release_world_for(world_idx, owner, Some(client_id));
+        }
+    }
+
+    /// The id under which `client_id`'s ▶ markers are recorded. Derived from the client's
+    /// stable `AuthRequest.client_uid` when it supplied one, so a brief transport drop and
+    /// reconnect — which allocates a fresh connection id — still matches the markers that
+    /// client already owns. Falls back to the connection id for a client that sends no uid
+    /// (the one-shot Rust clients, and any older peer), which behaves exactly as before:
+    /// markers are lost on reconnect.
+    pub(crate) fn display_owner_id(&self, client_id: u64) -> u64 {
+        self.ws_client_owner_ids.get(&client_id).copied().unwrap_or(client_id)
+    }
+
+    /// Record the ownership id for a client from the `client_uid` it authenticated with.
+    /// Hashed rather than stored as a string because `OutputLine::display_id` is a `u64` on
+    /// every line; collisions would merely merge two clients' markers, and the input is a
+    /// client-chosen UUID, so the practical risk is nil.
+    pub(crate) fn set_display_owner_id(&mut self, client_id: u64, client_uid: &str) {
+        if client_uid.is_empty() {
+            self.ws_client_owner_ids.remove(&client_id);
+            return;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        client_uid.hash(&mut h);
+        // Never collide with the reserved console id or the embedded GUI's 0.
+        let mut id = h.finish();
+        if id == CONSOLE_DISPLAY_ID || id == 0 {
+            id = 1;
+        }
+        self.ws_client_owner_ids.insert(client_id, id);
+    }
+
     pub(crate) fn ws_client_viewing(&self, world_index: usize) -> bool {
         self.ws_client_worlds.values().any(|v| v.world_index == world_index && !v.paused
             && v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true))
     }
 
-    /// Broadcast `WsMessage::NewWatermark` for `world_idx` iff either of its two ▶ watermarks
-    /// (`new_from_seq`, `viewed_from_seq`) actually changed vs. `before` (a `(new_from_seq,
-    /// viewed_from_seq)` snapshot from `World::watermark_state()`). Both must be compared: a
-    /// viewing episode starting moves only `viewed_from_seq`, not `new_from_seq` - without
-    /// this, a WS client would keep painting ▶ on its own live output. Centralizes the "did
-    /// the ▶ boundary move" broadcast so every call site that might advance either watermark
-    /// (live arrival while viewed, or `mark_displayed()` on leaving a world / Ctrl+L /
-    /// MarkWorldSeen) only needs to snapshot `before` and call this - no per-site broadcast
-    /// duplication to keep in sync. This replaces the old per-line `marked_new` model, whose
-    /// cross-instance drift (a client that left a world never told other instances to stop
-    /// rendering ▶ on its old lines) was exactly this class of "forgot to tell everyone" bug.
-    fn broadcast_watermark_if_changed(&mut self, world_idx: usize, before: (u64, u64)) {
+    /// `viewer_id` is now displaying `world_idx`: claim every still-unviewed line there for
+    /// it (`World::claim_unviewed`) and, for a WebSocket client, tell it which lines it now
+    /// owns so it can paint ▶ on them.
+    ///
+    /// This is the only place ▶ ownership is ever handed out. Arrival never assigns an owner
+    /// — a line arriving on a world nobody is watching is simply left unviewed until somebody
+    /// looks at it, which is exactly when "new to you" becomes meaningful.
+    ///
+    /// The wire form is a single `from_seq` rather than a per-line list because unviewed
+    /// lines are always a contiguous tail (any display marks everything before it viewed), so
+    /// "everything from here on is yours" is complete. Sent only to the claiming client:
+    /// nobody else's rendering changes, since a claim only ever moves a line from
+    /// unowned to owned-by-someone-else.
+    ///
+    /// `owner_id` is the value stamped on the lines (stable across reconnects, see
+    /// `display_owner_id`); `notify` is the CONNECTION id to message, which is a different
+    /// number and must not be confused with it. `None` means the console, which has no socket.
+    fn claim_world_for(&mut self, world_idx: usize, owner_id: u64, notify: Option<u64>) {
         if world_idx >= self.worlds.len() {
             return;
         }
-        let after = self.worlds[world_idx].watermark_state();
-        if after != before {
-            self.ws_broadcast(WsMessage::NewWatermark {
-                world_index: world_idx,
-                new_from_seq: after.0,
-                viewed_from_seq: after.1,
-            });
+        let claimed = self.worlds[world_idx].claim_unviewed(owner_id);
+        if claimed.is_empty() {
+            return;
         }
+        if let Some(client_id) = notify {
+            self.ws_send_to_client(client_id, WsMessage::ClaimedNew { world_index: world_idx, seqs: claimed });
+        }
+        self.needs_output_redraw = true;
+    }
+
+    /// `viewer_id` stopped displaying `world_idx` (switched away, Ctrl+L, backgrounded, or its
+    /// disconnect grace expired): drop the ▶ markers it owns there, leaving the lines viewed
+    /// so nobody else picks them up. Notifies the client only when it still has a live
+    /// connection — a background/disconnect release has nobody to tell, and the state is
+    /// re-sent from scratch on its next InitialState anyway.
+    ///
+    /// Same two-id split as `claim_world_for`: `owner_id` is stamped on lines, `notify` is the
+    /// connection id to message (`None` for the console, or for a client that has already
+    /// gone away and has nothing to receive it).
+    fn release_world_for(&mut self, world_idx: usize, owner_id: u64, notify: Option<u64>) {
+        if world_idx >= self.worlds.len() {
+            return;
+        }
+        if !self.worlds[world_idx].release_claims(owner_id) {
+            return;
+        }
+        if let Some(client_id) = notify {
+            self.ws_send_to_client(client_id, WsMessage::ReleasedNew { world_index: world_idx });
+        }
+        self.needs_output_redraw = true;
     }
 
     /// Get the minimum visible lines among all viewers of a world (for more-mode threshold)
@@ -8016,9 +8180,21 @@ impl App {
     /// existing once-a-minute keepalive tick (main.rs's `run_app`/`run_app_headless`,
     /// daemon.rs's `run_daemon_server`) rather than on its own timer.
     pub(crate) fn reap_stale_ws_client_worlds(&mut self) {
-        self.ws_client_worlds.retain(|_, v| {
-            v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true)
-        });
+        // Collect the ones aging out first: each has to have its ▶ markers released before
+        // the entry (and its owner-id mapping) disappears, or the markers would be stranded
+        // on a client id nothing can ever match again — invisible to every viewer, yet still
+        // blocking the lines from being re-claimed.
+        let expired: Vec<(u64, usize)> = self.ws_client_worlds.iter()
+            .filter(|(_, v)| v.disconnected_at.map(|t| t.elapsed() >= WS_VIEWER_GRACE).unwrap_or(false))
+            .map(|(&id, v)| (id, v.world_index))
+            .collect();
+        for (client_id, world_idx) in expired {
+            let owner = self.display_owner_id(client_id);
+            // notify: None — the socket is long gone, there is nobody to tell.
+            self.release_world_for(world_idx, owner, None);
+            self.ws_client_worlds.remove(&client_id);
+            self.ws_client_owner_ids.remove(&client_id);
+        }
     }
 
     /// Process incoming server data - shared logic for both console and daemon modes
@@ -8099,8 +8275,6 @@ impl App {
         // shows ▶ on live output arriving on the world it's currently looking at, since ▶ is
         // baked into the DOM at append time and never re-evaluated. The gagged-lines loop
         // handles its own ordering per line since it broadcasts per line already.
-        let watermark_before_process = self.worlds[world_idx].watermark_state();
-
         // FANSI client detection: check for "Detecting client..." within 2s window
         if let Some(deadline) = self.worlds[world_idx].fansi_detect_until {
             if std::time::Instant::now() < deadline {
@@ -8404,10 +8578,6 @@ impl App {
             // Mark output for redraw whenever output changes
             self.needs_output_redraw = true;
 
-            // Tell every instance where the ▶ boundary now sits BEFORE sending the content
-            // that moved it - see the ordering note on watermark_before_process above.
-            self.broadcast_watermark_if_changed(world_idx, watermark_before_process);
-
             // For synchronized more-mode: only broadcast lines that went to output_lines
             // Lines that went to pending_lines will be broadcast when released
             // Only send to clients viewing this world (Phase 2 output routing).
@@ -8503,10 +8673,10 @@ impl App {
             self.worlds[world_idx].next_seq += 1;
             let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
             output_line.highlight_color = highlight;
-            // Gagged or not, this is still text from the world (rule 1) — advance the
-            // watermark past it when someone's viewing, same as add_output does for
-            // non-gagged lines. Bypasses add_output entirely so this must be done by hand.
-            self.worlds[world_idx].note_line_arrival(seq, is_current, true);
+            // Gagged or not, this is still text from the world: born viewed when someone's
+            // watching, same as add_output does for non-gagged lines. Bypasses add_output
+            // entirely so this must be set by hand.
+            output_line.viewed = is_current;
             // Archive gagged server lines to long-term scrollback (with gagged=true) -
             // unconditional on which buffer it lands in, since archiving is a timestamped
             // log, not a seq-ordered live buffer other code indexes into.
@@ -8577,8 +8747,9 @@ impl App {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
-            self.worlds[world_idx].push_line_respecting_pending(OutputLine::new(prompt_text, seq), more_mode);
-            self.worlds[world_idx].note_line_arrival(seq, is_current, true);
+            let mut prompt_line = OutputLine::new(prompt_text, seq);
+            prompt_line.viewed = is_current;
+            self.worlds[world_idx].push_line_respecting_pending(prompt_line, more_mode);
         }
         self.worlds[world_idx].clear_connection_state(true, true);
         // Show disconnection message
@@ -8760,8 +8931,9 @@ impl App {
             // seqs always exceed output_lines seqs" invariant the release path depends on
             // (same class of bug already fixed in handle_disconnected for this exact
             // disconnected-world code path).
-            self.worlds[world_idx].push_line_respecting_pending(OutputLine::new(prompt_normalized.trim().to_string(), seq), more_mode);
-            self.worlds[world_idx].note_line_arrival(seq, is_current, true);
+            let mut prompt_line = OutputLine::new(prompt_normalized.trim().to_string(), seq);
+            prompt_line.viewed = is_current;
+            self.worlds[world_idx].push_line_respecting_pending(prompt_line, more_mode);
             self.worlds[world_idx].prompt.clear();
             if world_idx == self.current_world_index {
                 self.needs_output_redraw = true;
@@ -8974,7 +9146,7 @@ impl App {
                     username: None,
                     multiuser_mode: false,
                 });
-                let initial_state = self.build_initial_state();
+                let initial_state = self.build_initial_state(self.display_owner_id(client_id));
                 self.ws_send_initial_state_and_mark(client_id, initial_state);
                 let world_idx = current_world
                     .filter(|&w| w < self.worlds.len())
@@ -9087,7 +9259,7 @@ impl App {
                 ));
             }
         }
-        let initial_state = self.build_initial_state();
+        let initial_state = self.build_initial_state(self.display_owner_id(client_id));
         self.ws_send_initial_state_and_mark(client_id, initial_state);
         let world_idx = current_world
             .filter(|&w| w < self.worlds.len())
@@ -10153,9 +10325,20 @@ impl App {
         } else {
             Vec::new()
         };
+        let auth_client_uid = if let WsMessage::AuthRequest { ref client_uid, .. } = msg {
+            client_uid.clone()
+        } else {
+            String::new()
+        };
         match msg {
             WsMessage::AuthRequest { .. } => {
+                // Record the stable ownership id BEFORE building InitialState, so the
+                // your_display_id it reports matches what any claim will stamp on lines.
+                self.set_display_owner_id(client_id, &auth_client_uid);
                 self.handle_ws_auth_initial_state(client_id, auth_current_world, auth_resume);
+            }
+            WsMessage::ClientVisibility { visible } => {
+                self.handle_client_visibility(client_id, visible);
             }
             WsMessage::SendCommand { world_index, command } => {
                 // Reset more-mode counter when ANY client sends a command
@@ -10669,7 +10852,7 @@ impl App {
                     // InitialState to the connected client to refresh its UI in place — the
                     // same mechanism WsMessage::RequestState uses — before the summary line, so
                     // the summary appears after (not wiped out by) the resync.
-                    let initial_state = self.build_initial_state();
+                    let initial_state = self.build_initial_state(self.display_owner_id(client_id));
                     self.ws_send_initial_state_and_mark(client_id, initial_state);
                     self.ws_send_to_client(client_id, WsMessage::ImportResult { success: true, summary });
                 }
@@ -10789,13 +10972,19 @@ impl App {
                     seq: s.seq,
                     highlight_color: s.highlight_color.clone(),
                     from_archive: s.from_archive,
+                    viewed: s.viewed,
+                    display_id: s.display_id,
                 }
             })
             .collect();
         (ts_lines, visible_count)
     }
 
-    fn build_initial_state(&self) -> WsMessage {
+    /// `your_display_id`: the ▶ ownership id of the client this snapshot is being built
+    /// for (`App::display_owner_id`). InitialState is always built per-connection, so this is
+    /// well-defined; it lets the receiving client tell its own markers from another
+    /// instance's on the very same lines.
+    fn build_initial_state(&self, your_display_id: u64) -> WsMessage {
         // Send only the most recent lines in InitialState for fast initial load.
         // Clients backfill remaining history via RequestScrollback after rendering.
         let per_world_cap = self.settings.remote_initial_lines.max(1) as usize;
@@ -10882,8 +11071,6 @@ impl App {
                 // which would force a full recount at that site anyway).
                 total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
                 pending_count: world.pending_lines.len(),
-                new_from_seq: world.new_from_seq,
-                viewed_from_seq: world.viewed_from_seq,
                 next_seq: world.next_seq,
             }
         }).collect();
@@ -10891,6 +11078,7 @@ impl App {
         let settings = self.build_global_settings_msg();
 
         WsMessage::InitialState {
+            your_display_id,
             worlds,
             settings,
             current_world_index: self.current_world_index,
@@ -11476,7 +11664,7 @@ impl App {
             }
             if partial_idx < self.worlds[world_idx].output_lines.len() {
                 let partial_line = &self.worlds[world_idx].output_lines[partial_idx];
-                let partial_is_new = self.worlds[world_idx].line_is_new(partial_line);
+                let partial_is_new = line_is_new_for(partial_line, CONSOLE_DISPLAY_ID);
                 let total_vl = nli_visual_rows(&partial_line.text, width, partial_is_new, self.settings.new_line_indicator, self.settings.wrapspace as usize);
                 let remaining = total_vl.saturating_sub(self.worlds[world_idx].visual_line_offset);
                 if remaining > visual_budget {
@@ -14872,7 +15060,8 @@ pub async fn run_app_headless(
     app.gui_repaint = gui_repaint_clone;
 
     // Send initial state to the GUI
-    let initial_state = app.build_initial_state();
+    // The embedded GUI is client id 0 - its own ▶ ownership id.
+    let initial_state = app.build_initial_state(app.display_owner_id(0));
     app.ws_broadcast(initial_state);
 
     // Keepalive interval
@@ -16772,13 +16961,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     match handle_key_event(key, &mut app) {
                         KeyAction::Quit => return Ok(()),
                         KeyAction::Redraw => {
-                            // Filter output to only show server data (remove client-generated lines).
-                            // Also marks whatever's on screen as displayed (rule 2) and tells every
-                            // other instance so their copies stop showing ▶ on it too.
-                            let redraw_idx = app.current_world_index;
-                            let watermark_before = app.worlds[redraw_idx].watermark_state();
+                            // Filter output to only show server data (remove client-generated
+                            // lines). Also drops the console's OWN ▶ markers (see
+                            // filter_to_server_output). No broadcast: a remote instance's
+                            // markers on the same lines are its own and must survive our
+                            // Ctrl+L, exactly as they would if we weren't connected at all.
                             app.current_world_mut().filter_to_server_output();
-                            app.broadcast_watermark_if_changed(redraw_idx, watermark_before);
                             // Full terminal reset: unconditionally tear down and re-setup
                             // Always disable mouse capture to clear any stuck state
                             let _ = execute!(std::io::stdout(), DisableMouseCapture);
@@ -17245,7 +17433,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                            let watermark_before = app.worlds[world_idx].watermark_state();
                             let world_name_for_triggers = world_name.clone();
                             let actions = app.settings.actions.clone();
 
@@ -17263,12 +17450,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Add as gagged line (only visible with F2)
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
-                                // Gagged or not, still text from the world (rule 1) - advance the
-                                // watermark past it when someone's viewing. Uses the broader
-                                // is_current from the top of this handler (console OR any WS
-                                // viewer), not the narrower console-only one the ServerData
-                                // broadcast below uses for its own is_viewed field.
-                                app.worlds[world_idx].note_line_arrival(seq, is_current, true);
+                                // Gagged or not, still text from the world: born viewed when someone's
+                                // watching. Uses the broader is_current from the top of this handler
+                                // (console OR any WS viewer), not the narrower console-only one the
+                                // ServerData broadcast below uses for its own is_viewed field.
+                                let mut gagged_line = OutputLine::new_gagged(message.clone(), seq);
+                                gagged_line.viewed = is_current;
                                 // Route into pending_lines instead of output_lines when the world
                                 // is already paused with a backlog - same reasoning as
                                 // process_server_data's hold_gagged_in_pending: otherwise this
@@ -17279,12 +17466,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let hold_in_pending = app.worlds[world_idx].paused
                                     && !app.worlds[world_idx].pending_lines.is_empty();
                                 if hold_in_pending {
-                                    app.worlds[world_idx].pending_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                                    app.worlds[world_idx].pending_lines.push(gagged_line);
                                     // Not broadcast here - rides out with the pending release
                                     // batch via App::broadcast_released_lines, same as every
                                     // other pending line.
                                 } else {
-                                    app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                                    app.worlds[world_idx].output_lines.push(gagged_line);
                                     if !app.worlds[world_idx].paused {
                                         app.worlds[world_idx].scroll_to_bottom();
                                     }
@@ -17331,12 +17518,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let output_before = app.worlds[world_idx].output_lines.len();
 
                                 app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
-                                // Tell every instance where the ▶ boundary now sits BEFORE the
-                                // ServerData broadcast below sends the content that moved it -
-                                // otherwise a remote client viewing this world renders its own
-                                // live-arriving line as new (baked into the DOM at append time,
-                                // never re-evaluated) before learning the watermark passed it.
-                                app.broadcast_watermark_if_changed(world_idx, watermark_before);
 
                                 // Calculate what went where
                                 let pending_after = app.worlds[world_idx].pending_lines.len();
@@ -17383,15 +17564,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Broadcast activity count to keep all clients in sync
                                 app.broadcast_activity();
                             }
-                            // Catches the gagged branch above, which already broadcast its own
-                            // ServerData before this point - unlike the non-gagged path (fixed
-                            // above), a gagged line's watermark update can still arrive a
-                            // message late on a remote client. Accepted: gagged content is
-                            // hidden unless F2/show_tags is on, so the practical impact is low.
-                            // (Redundant, harmless re-broadcast of the same value when the
-                            // non-gagged branch above already sent it - `watermark_before` is
-                            // the snapshot from before either branch ran, not updated after.)
-                            app.broadcast_watermark_if_changed(world_idx, watermark_before);
 
                             // Mark output for redraw if this is the current world
                             if world_idx == app.current_world_index {
@@ -18164,7 +18336,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                        let watermark_before = app.worlds[world_idx].watermark_state();
                         let world_name_for_triggers = world_name.clone();
                         let actions = app.settings.actions.clone();
 
@@ -18182,12 +18353,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Add as gagged line (only visible with F2)
                             let seq = app.worlds[world_idx].next_seq;
                             app.worlds[world_idx].next_seq += 1;
-                            // Gagged or not, still text from the world (rule 1) - advance the
-                            // watermark past it when someone's viewing. Uses the broader
-                            // is_current from the top of this handler (console OR any WS
-                            // viewer), not the narrower console-only one the ServerData
-                            // broadcast below uses for its own is_viewed field.
-                            app.worlds[world_idx].note_line_arrival(seq, is_current, true);
+                            // Gagged or not, still text from the world: born viewed when someone's
+                            // watching. Uses the broader is_current from the top of this handler
+                            // (console OR any WS viewer), not the narrower console-only one the
+                            // ServerData broadcast below uses for its own is_viewed field.
+                            let mut gagged_line = OutputLine::new_gagged(message.clone(), seq);
+                            gagged_line.viewed = is_current;
                             // Route into pending_lines instead of output_lines when the world
                             // is already paused with a backlog - same reasoning as
                             // process_server_data's hold_gagged_in_pending: otherwise this
@@ -18197,12 +18368,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let hold_in_pending = app.worlds[world_idx].paused
                                 && !app.worlds[world_idx].pending_lines.is_empty();
                             if hold_in_pending {
-                                app.worlds[world_idx].pending_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                                app.worlds[world_idx].pending_lines.push(gagged_line);
                                 // Not broadcast here - rides out with the pending release batch
                                 // via App::broadcast_released_lines, same as every other
                                 // pending line.
                             } else {
-                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
+                            app.worlds[world_idx].output_lines.push(gagged_line);
                             if !app.worlds[world_idx].paused {
                                 app.worlds[world_idx].scroll_to_bottom();
                             }
@@ -18233,11 +18404,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 (false, None) => console_width,
                             };
                             app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
-                            // Tell every instance where the ▶ boundary now sits BEFORE the
-                            // ServerData broadcast below sends the content that moved it - see
-                            // the identical ordering note in the master-loop copy of this
-                            // handler above.
-                            app.broadcast_watermark_if_changed(world_idx, watermark_before);
                             // Broadcast to WebSocket clients (only non-gagged)
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index: world_idx,
@@ -18249,10 +18415,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 flush: false, gagged: false,
                             });
                         }
-                        // Catches the gagged branch above (see the master-loop copy's identical
-                        // comment) - redundant, harmless re-broadcast for the non-gagged branch,
-                        // which already sent this above.
-                        app.broadcast_watermark_if_changed(world_idx, watermark_before);
 
                         // Mark output for redraw if this is the current world
                         if world_idx == app.current_world_index {

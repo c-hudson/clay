@@ -61,7 +61,8 @@ pub(crate) fn message_world_index(msg: &WsMessage) -> Option<usize> {
         | WsMessage::PendingReleased { world_index, .. }
         | WsMessage::UnseenCleared { world_index, .. }
         | WsMessage::UnseenUpdate { world_index, .. }
-        | WsMessage::NewWatermark { world_index, .. }
+        | WsMessage::ClaimedNew { world_index, .. }
+        | WsMessage::ReleasedNew { world_index, .. }
         | WsMessage::WorldFlushed { world_index, .. }
         | WsMessage::ServerSpeak { world_index, .. }
         | WsMessage::AnsiMusic { world_index, .. }
@@ -211,12 +212,6 @@ fn default_true() -> bool { true }
 fn is_false(v: &bool) -> bool { !v }
 fn is_true(v: &bool) -> bool { *v }
 
-/// Default for the ▶ window's upper bound (`World::viewed_from_seq` in main.rs) when absent
-/// from an older peer's message. A bare `#[serde(default)]` on a `u64` yields `0`, which
-/// means "exclude every line" - the exact opposite of the intended "no viewing episode in
-/// progress, no exclusion" sentinel.
-fn default_u64_max() -> u64 { u64::MAX }
-
 /// WebSocket protocol messages for client-server communication
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
@@ -246,6 +241,15 @@ pub enum WsMessage {
                                      // has, so the server can replay exactly the gap on reconnect.
                                      // See PROTOCOL-ROADMAP.md Step 2 (single-user) and Step 6a
                                      // (multiuser, owner-scoped).
+        /// Stable, client-generated identity that survives reconnects (localStorage on
+        /// web/Android, a per-process value on the Rust console). ▶ ownership
+        /// (`OutputLine::display_id`) is keyed on this rather than the per-connection client
+        /// id, so a brief transport drop does not lose a client's markers — a reconnect gets
+        /// a fresh connection id but the same `client_uid`, and its claims still match.
+        /// Empty from an older client, in which case ownership falls back to the connection
+        /// id and behaves as before (markers lost on reconnect).
+        #[serde(default)]
+        client_uid: String,
     },
     AuthResponse {
         success: bool,
@@ -295,6 +299,16 @@ pub enum WsMessage {
         splash_lines: Vec<String>,
         #[serde(default)]
         server_version: String,
+        /// The ▶ ownership id this client's markers are recorded under
+        /// (`OutputLine::display_id`). A line renders ▶ iff its `display_id` equals this.
+        /// Sent here rather than in `ServerHello` because it is derived from
+        /// `AuthRequest.client_uid`, which the server hasn't seen at hello time. Stable
+        /// across reconnects for a client that supplies a uid, which is what preserves its
+        /// markers through a brief transport drop. `serde(default)` = 0 against an older
+        /// server; 0 is the embedded GUI's id, so a remote client simply paints no ▶ rather
+        /// than adopting somebody else's markers.
+        #[serde(default)]
+        your_display_id: u64,
     },
 
     // Real-time updates (server -> client)
@@ -324,20 +338,28 @@ pub enum WsMessage {
     PendingReleased { world_index: usize, count: usize },
     UnseenCleared { world_index: usize },
     UnseenUpdate { world_index: usize, count: usize },
-    /// New-text (▶) watermark pair for a world changed: a line is ▶ iff `seq >= new_from_seq
-    /// && seq < viewed_from_seq`. Broadcast to ALL clients (not just viewers of that world)
-    /// whenever either bound changes - live arrival on a viewed/unviewed world, leaving a
-    /// world, Ctrl+L, or MarkWorldSeen - so every instance's copy stays authoritative without
-    /// ever storing (and risking staleness on) a per-line flag. See `World::new_from_seq`'s
-    /// and `World::viewed_from_seq`'s doc comments in main.rs for the full model.
-    NewWatermark {
-        world_index: usize,
-        new_from_seq: u64,
-        /// Upper bound of the ▶ window - see `World::viewed_from_seq` in main.rs. Absent from
-        /// an older peer's message, hence the explicit `u64::MAX` ("no exclusion") default.
-        #[serde(default = "default_u64_max")]
-        viewed_from_seq: u64,
-    },
+    /// This client now owns the ▶ new-text marker for exactly these seqs in `world_index`.
+    /// Sent to ONE client (the one that just started displaying the world), never broadcast:
+    /// a claim only moves lines from unowned to owned-by-that-client, so no other client's
+    /// rendering changes.
+    ///
+    /// An explicit seq list rather than a range: unviewed lines are NOT a contiguous tail.
+    /// `viewed` is decided per line by whether anyone was watching when it arrived, and that
+    /// flips back and forth with no display event in between, so a range would wrongly sweep
+    /// in already-viewed lines sitting between two unviewed ones. Bounded by the size of the
+    /// backlog the user is about to read. See `OutputLine::display_id` in main.rs.
+    ClaimedNew { world_index: usize, seqs: Vec<u64> },
+    /// This client's ▶ markers in `world_index` are cleared — it switched away, hit Ctrl+L, or
+    /// backgrounded. Sent to ONE client, for the same reason as `ClaimedNew`. The lines stay
+    /// `viewed`, so no other client picks them up; this is what makes one instance's clear
+    /// invisible to another instance, which the old shared watermark could not do.
+    ReleasedNew { world_index: usize },
+    /// Client → server: this client became visible or went to the background. Backgrounding
+    /// is NOT a disconnect (Android keeps its socket open behind `MainActivity.onPause`), so
+    /// it has to be signalled explicitly. A non-visible client stops counting as a viewer, so
+    /// text arriving meanwhile is unviewed and becomes ▶ when it returns, and it releases the
+    /// markers it currently holds.
+    ClientVisibility { visible: bool },
     /// Broadcast server's activity count (number of worlds with activity)
     ActivityUpdate { count: usize },
     /// Sent to a specific client when its server-side pause state changes
@@ -741,6 +763,16 @@ pub struct TimestampedLine {
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
     #[serde(default)]
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive
+    /// Mirrors `OutputLine::viewed` — see its doc comment in main.rs. Carried on the wire so a
+    /// client hydrating from InitialState/ScrollbackLines knows which lines are still
+    /// unclaimed. `serde(default)` = false, matching an older peer that doesn't send it.
+    #[serde(default)]
+    pub viewed: bool,
+    /// Mirrors `OutputLine::display_id` — the client that owns this line's ▶ marker. A client
+    /// draws ▶ iff this equals its own id (`ServerHello.client_id`). `serde(default)` = None,
+    /// so an older peer simply never shows a marker rather than showing a wrong one.
+    #[serde(default)]
+    pub display_id: Option<u64>,
 }
 
 /// World state for WebSocket protocol
@@ -793,15 +825,6 @@ pub struct WorldStateMsg {
     // Number of pending lines on the server (for More indicator on connect)
     #[serde(default)]
     pub pending_count: usize,
-    /// New-text (▶) watermark at connect/reconnect time — see `WsMessage::NewWatermark`'s
-    /// doc comment for the model. A client renders ▶ on any `from_server` line with
-    /// `seq >= new_from_seq && seq < viewed_from_seq`.
-    #[serde(default)]
-    pub new_from_seq: u64,
-    /// Upper bound of the ▶ window at connect/reconnect time - see `World::viewed_from_seq`
-    /// in main.rs. `u64::MAX` means "no viewing episode in progress".
-    #[serde(default = "default_u64_max")]
-    pub viewed_from_seq: u64,
     /// The server-authoritative "highest seq issued so far this process" counter
     /// (`World::next_seq`) at connect/reconnect time. Lets a reconnecting client detect a
     /// server restart: seq counters reset to 0 on every fresh process start (only the
@@ -2197,7 +2220,7 @@ where
         };
         try_send_local(&clients, client_id, &tx, &client_ip, response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new() }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), client_uid: String::new() }))).await;
     }
 
     // Combined receive/send/keepalive loop.

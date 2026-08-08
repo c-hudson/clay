@@ -392,7 +392,7 @@
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new() };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), client_uid: String::new() };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
@@ -1161,7 +1161,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(),
+            resume: Vec::new(), client_uid: String::new(),
         };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
@@ -1268,7 +1268,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(),
+            resume: Vec::new(), client_uid: String::new(),
         };
         sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap())).await.unwrap();
         let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
@@ -1289,7 +1289,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(),
+            resume: Vec::new(), client_uid: String::new(),
         };
         sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap())).await.unwrap();
         let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
@@ -1417,7 +1417,7 @@
             auth_key: Some("test_key".to_string()),
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(),
+            resume: Vec::new(), client_uid: String::new(),
         };
         let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string(), "test_challenge".to_string());
 
@@ -1483,7 +1483,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(),
+            resume: Vec::new(), client_uid: String::new(),
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
 
@@ -2083,14 +2083,14 @@
 
         // log_input: false - captured line must still land in output_lines (so /recall -i
         // still finds it), but must NOT be written to the log file.
-        let (_, in_output) = world.record_input_line("secretcmd", false);
+        let (_, in_output) = world.record_input_line("secretcmd", false, false);
         assert!(in_output);
         assert_eq!(world.output_lines.len(), 1);
         assert!(world.output_lines[0].is_input);
         assert_eq!(world.output_lines[0].text, "secretcmd");
 
         // log_input: true - captured line lands in output_lines AND is written to the file.
-        let (_, in_output2) = world.record_input_line("visiblecmd", true);
+        let (_, in_output2) = world.record_input_line("visiblecmd", true, false);
         assert!(in_output2);
         assert_eq!(world.output_lines.len(), 2);
 
@@ -2431,7 +2431,7 @@
         app.worlds[0].output_lines.push(OutputLine::new_client("client line".to_string(), 1));
         app.worlds[0].output_lines.push(OutputLine::new("server line".to_string(), 2));
 
-        let state = app.build_initial_state();
+        let state = app.build_initial_state(0);
         if let WsMessage::InitialState { worlds, .. } = state {
             let ts_lines = &worlds[0].output_lines_ts;
             assert_eq!(ts_lines.len(), 2);
@@ -2493,10 +2493,13 @@
         // (nli_visual_rows' real answer) - this is exactly where the two formulas diverge.
         let line_text = "x".repeat(79);
         for i in 0..6 {
-            // World::new_from_seq defaults to 0, and these lines are from_server (the
-            // OutputLine::new default) with seq >= 0, so they're "new" (▶) without any
-            // extra setup - see World::line_is_new().
-            let line = OutputLine::new(line_text.clone(), i as u64);
+            // Explicitly console-owned: the ▶ prefix is what narrows the wrap width to 78
+            // and makes each line 2 rows, which is the whole point of this fixture. Ownership
+            // is now per line (OutputLine::display_id) rather than implied by a world
+            // watermark, so it has to be set here.
+            let mut line = OutputLine::new(line_text.clone(), i as u64);
+            line.viewed = true;
+            line.display_id = Some(crate::CONSOLE_DISPLAY_ID);
             app.worlds[0].pending_lines.push(line);
         }
         app.worlds[0].paused = true;
@@ -2753,13 +2756,16 @@
         }
 
         app.ws_broadcast_log.lock().unwrap().clear();
-        let watermark_before = app.worlds[1].new_from_seq;
         app.add_output_to_world(1, "background world message");
 
         let expected_seq = app.worlds[1].output_lines.last().unwrap().seq;
         assert_eq!(expected_seq, 2);
-        assert_eq!(app.worlds[1].new_from_seq, watermark_before,
-            "a client-generated message on a background world must not advance new_from_seq");
+        let arrived = app.worlds[1].output_lines.last().unwrap();
+        assert!(!arrived.viewed,
+            "a message arriving on a world nobody is viewing must be born unviewed, so it can \
+             become ▶ for whoever looks at it next");
+        assert_eq!(arrived.display_id, None,
+            "arrival never assigns an owner - only a claim does");
 
         let log = app.ws_broadcast_log.lock().unwrap();
         let server_data: Vec<(usize, u64, Option<u64>)> = log.iter().filter_map(|m| {
@@ -2770,8 +2776,9 @@
         assert_eq!(server_data.len(), 1, "{server_data:?}");
         assert_eq!(server_data[0], (1, expected_seq, Some(expected_seq)),
             "must carry the real seq");
-        assert!(!log.iter().any(|m| matches!(m, WsMessage::NewWatermark { world_index: 1, .. })),
-            "no NewWatermark broadcast should fire since the watermark never moved");
+        assert!(!log.iter().any(|m| matches!(m, WsMessage::ClaimedNew { world_index: 1, .. })),
+            "no ClaimedNew should fire on arrival - ownership is only ever assigned when a \
+             client displays the world");
     }
 
     #[test]
@@ -4378,14 +4385,13 @@
         ];
         let events = testharness::run_test_scenario(config, actions).await;
 
-        // A NewWatermark broadcast for world 0 confirms the watermark itself moved on arrival
-        // (it's what keeps world 0's own lines from ever being new); world 1's watermark
-        // never advances since nobody's viewing it, so no such broadcast is expected there.
-        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastNewWatermark(0, _))),
-            "Expected a NewWatermark broadcast for the current world (0). Events: {:?}",
-            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastNewWatermark(_, _))).collect::<Vec<_>>());
-        assert!(!events.iter().any(|e| matches!(e, TestEvent::WsBroadcastNewWatermark(1, _))),
-            "Non-current world (1) should never get a NewWatermark broadcast - its watermark never moves");
+        // No ownership message for EITHER world: nothing was displayed in this scenario, and
+        // ownership is only ever assigned by a display event. World 0's lines are born viewed
+        // (someone is watching) so they can never be ▶; world 1's are unviewed and become ▶
+        // for whoever displays that world next - neither is an ownership change now.
+        assert!(!events.iter().any(|e| matches!(e, TestEvent::WsClaimedNew(_, _))),
+            "arrival must never assign ownership. Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsClaimedNew(_, _))).collect::<Vec<_>>());
 
         let _ = server1.await;
         let _ = server2.await;
@@ -4820,6 +4826,10 @@
     /// (seq >= watermark). Callers that care about the distinction must set
     /// `world.new_from_seq = 1` after construction; tests that don't check old/new at all
     /// can ignore this and it's a harmless no-op.
+    /// `marked_new` now sets per-line ownership directly (`display_id`), which is what the
+    /// renderer reads — the old form encoded it as `seq: 1` and relied on the test setting
+    /// `world.new_from_seq = 1` to bring it above the watermark. Ownership is the console's,
+    /// since `rendering::line_is_new` always draws for the local instance.
     fn make_output_line(text: &str, marked_new: bool) -> OutputLine {
         OutputLine {
             text: text.to_string(),
@@ -4830,6 +4840,8 @@
             seq: if marked_new { 1 } else { 0 },
             highlight_color: None,
             from_archive: false,
+            viewed: marked_new,
+            display_id: if marked_new { Some(crate::CONSOLE_DISPLAY_ID) } else { None },
         }
     }
 
@@ -4847,7 +4859,6 @@
         for i in 0..20 {
             world.output_lines.push(make_output_line(&format!("New line {}", i + 1), true));
         }
-        world.new_from_seq = 1; // see make_output_line's doc comment
         // scroll_offset at the end
         world.scroll_offset = world.output_lines.len() - 1;
 
@@ -4883,7 +4894,6 @@
         for i in 0..21 {
             world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
         }
-        world.new_from_seq = 1; // see make_output_line's doc comment
         world.scroll_offset = world.output_lines.len() - 1;
 
         let settings = Settings { new_line_indicator: true, ..Settings::default() };
@@ -4919,7 +4929,6 @@
         for i in 0..100 {
             world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
         }
-        world.new_from_seq = 1; // see make_output_line's doc comment
         world.scroll_offset = world.output_lines.len() - 1;
 
         let settings = Settings { new_line_indicator: true, ..Settings::default() };
@@ -4949,7 +4958,6 @@
         for i in 0..20 {
             world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
         }
-        world.new_from_seq = 1; // see make_output_line's doc comment
         world.scroll_offset = world.output_lines.len() - 1;
 
         let settings = Settings { new_line_indicator: false, ..Settings::default() };
@@ -5276,7 +5284,6 @@ if you're more curious.\"";
         for i in 0..19 {
             world.output_lines.push(make_output_line(&format!("Pending {}", i + 1), true));
         }
-        world.new_from_seq = 1; // see make_output_line's doc comment
         world.scroll_offset = world.output_lines.len() - 1;
         // Still have 11 more in pending
         world.paused = true;
@@ -5416,7 +5423,7 @@ if you're more curious.\"";
     /// Regression test for the bug where a daemon with many worlds could send an
     /// InitialState message exceeding the WebSocket size cap (websocket.rs's ws_config),
     /// causing ws_sink.send(...) to fail and silently drop a freshly-authenticated remote
-    /// console/GUI connection. build_initial_state() must bound the TOTAL visible-line
+    /// console/GUI connection. build_initial_state(0) must bound the TOTAL visible-line
     /// count across all worlds combined, not just cap each world independently - otherwise
     /// InitialState size scales with world_count * remote_initial_lines with no ceiling.
     #[test]
@@ -5440,9 +5447,9 @@ if you're more curious.\"";
         let per_world_cap = app.settings.remote_initial_lines.max(1) as usize;
         let expected_total_budget = per_world_cap.max(500);
 
-        let initial_state = app.build_initial_state();
+        let initial_state = app.build_initial_state(0);
         let WsMessage::InitialState { worlds, .. } = initial_state else {
-            panic!("build_initial_state() must return WsMessage::InitialState");
+            panic!("build_initial_state(0) must return WsMessage::InitialState");
         };
 
         assert_eq!(worlds.len(), world_count, "all worlds should still be represented");
@@ -5626,9 +5633,9 @@ if you're more curious.\"";
 
         let per_world_cap = app.settings.remote_initial_lines.max(1) as usize; // default 100
 
-        let initial_state = app.build_initial_state();
+        let initial_state = app.build_initial_state(0);
         let WsMessage::InitialState { worlds, .. } = initial_state else {
-            panic!("build_initial_state() must return WsMessage::InitialState");
+            panic!("build_initial_state(0) must return WsMessage::InitialState");
         };
 
         let world0_visible = worlds[0].output_lines_ts.iter().filter(|l| !l.gagged).count();
@@ -6537,6 +6544,8 @@ if you're more curious.\"";
             seq,
             highlight_color: None,
             from_archive: false,
+            viewed: false,
+            display_id: None,
         }).collect();
         app.handle_remote_ws_message(WsMessage::ScrollbackLines {
             world_index: 0,
@@ -6598,6 +6607,8 @@ if you're more curious.\"";
             seq,
             highlight_color: None,
             from_archive: false,
+            viewed: false,
+            display_id: None,
         }).collect();
         let older_count = older_lines.len();
         app.handle_remote_ws_message(WsMessage::ScrollbackLines {
@@ -6865,6 +6876,8 @@ if you're more curious.\"";
             seq: 0,
             highlight_color: if highlighted { Some("red".to_string()) } else { None },
             from_archive: false,
+            viewed: false,
+            display_id: None,
         }
     }
 
@@ -7235,20 +7248,25 @@ if you're more curious.\"";
         }
     }
 
-    /// New-text (▶) watermark: WsMessage::NewWatermark round-trips on the wire, including
-    /// the viewed_from_seq ceiling.
+    /// The two per-line ▶ ownership messages round-trip on the wire.
     #[test]
-    fn test_new_watermark_round_trips() {
-        let msg = WsMessage::NewWatermark { world_index: 2, new_from_seq: 42, viewed_from_seq: 99 };
-        let json = serde_json::to_string(&msg).unwrap();
-        let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
+    fn test_claim_release_messages_round_trip() {
+        let msg = WsMessage::ClaimedNew { world_index: 2, seqs: vec![42, 44, 45] };
+        let round_tripped: WsMessage = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         match round_tripped {
-            WsMessage::NewWatermark { world_index, new_from_seq, viewed_from_seq } => {
+            WsMessage::ClaimedNew { world_index, seqs } => {
                 assert_eq!(world_index, 2);
-                assert_eq!(new_from_seq, 42);
-                assert_eq!(viewed_from_seq, 99);
+                assert_eq!(seqs, vec![42, 44, 45],
+                    "the claimed set must survive verbatim - it is deliberately not a range");
             }
-            other => panic!("expected NewWatermark, got {:?}", other),
+            other => panic!("expected ClaimedNew, got {:?}", other),
+        }
+
+        let msg = WsMessage::ReleasedNew { world_index: 3 };
+        let round_tripped: WsMessage = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        match round_tripped {
+            WsMessage::ReleasedNew { world_index } => assert_eq!(world_index, 3),
+            other => panic!("expected ReleasedNew, got {:?}", other),
         }
     }
 
@@ -7283,11 +7301,10 @@ if you're more curious.\"";
 
         app.handle_mark_world_seen(fresh_client_id, 1, Some(0));
 
-        assert!(app.worlds[0].output_lines.iter().all(|l| !app.worlds[0].line_is_new(l)),
-            "world 'a' (the world being left) must have its ▶ watermark advanced via \
+        assert!(app.worlds[0].output_lines.iter().all(|l| l.display_id != Some(fresh_client_id)),
+            "world 'a' (the world being left) must have THIS client's ▶ markers released via \
              previous_world_index, even though the server had no prior ws_client_worlds entry \
              for this client_id");
-        assert!(app.worlds[0].new_from_seq >= 5, "watermark must pass every line in world 'a'");
         assert_eq!(app.worlds[1].unseen_lines, 0, "mark_seen() must clear the new world's unseen count");
 
         let log = app.ws_broadcast_log.lock().unwrap();
@@ -7295,9 +7312,11 @@ if you're more curious.\"";
             "expected UnseenCleared(1). Log: {:?}", log);
         assert!(log.iter().any(|m| matches!(m, WsMessage::ActivityUpdate { .. })),
             "expected an ActivityUpdate broadcast. Log: {:?}", log);
-        assert!(log.iter().any(|m| matches!(m, WsMessage::NewWatermark { world_index: 0, .. })),
-            "expected a NewWatermark broadcast for world 'a' so other instances stop showing ▶ \
-             on it too - this is the multi-instance sync the watermark model exists for. Log: {:?}", log);
+        // Deliberately NO broadcast for world 'a': releasing this client's markers must be
+        // invisible to every other instance. That is the whole point of per-line ownership -
+        // the old shared watermark broadcast here wiped other clients' ▶ as a side effect.
+        assert!(!log.iter().any(|m| matches!(m, WsMessage::ReleasedNew { world_index: 0 })),
+            "releasing one client's markers must not be broadcast to everyone. Log: {:?}", log);
     }
 
     /// Without a client-supplied previous_world_index (older client, or the remote-console
@@ -7324,8 +7343,8 @@ if you're more curious.\"";
 
         app.handle_mark_world_seen(client_id, 1, None);
 
-        assert!(app.worlds[0].output_lines.iter().all(|l| !app.worlds[0].line_is_new(l)),
-            "world 'a' must still have its ▶ watermark advanced via the ws_client_worlds fallback lookup");
+        assert!(app.worlds[0].output_lines.iter().all(|l| l.display_id != Some(client_id)),
+            "world 'a' must still have this client's ▶ markers released via the ws_client_worlds fallback lookup");
         assert_eq!(app.ws_client_worlds.get(&client_id).map(|s| s.world_index), Some(1));
     }
 
@@ -7339,11 +7358,13 @@ if you're more curious.\"";
         world_a.output_lines.push(OutputLine::new("a-line".to_string(), 0));
         app.worlds.push(world_a);
 
+        // Claim it for this client first, so there is a marker that could be wrongly cleared.
+        app.worlds[0].claim_unviewed(1);
         app.handle_mark_world_seen(1, 0, Some(0));
 
-        assert!(app.worlds[0].line_is_new(&app.worlds[0].output_lines[0]),
+        assert_eq!(app.worlds[0].output_lines[0].display_id, Some(1),
             "marking the world you're already on as seen must not clear its own ▶ markers \
-             (those only clear when switching AWAY, per World::mark_displayed())");
+             (those only clear when switching AWAY, or on Ctrl+L)");
     }
 
     // ========== Resume semantics: grace window for a briefly-disconnected WS client ==========
@@ -7452,8 +7473,10 @@ if you're more curious.\"";
         world.add_output("held back line\n", true /* is_current */, &settings, 24, 80, false, true);
 
         assert_eq!(world.pending_lines.len(), 1);
-        assert!(!world.line_is_new(&world.pending_lines[0]),
-            "a pending line arriving while the world is viewed must not be ▶ - arrival wins over display state");
+        assert!(world.pending_lines[0].viewed,
+            "a pending line arriving while the world is viewed is born viewed - arrival wins \
+             over display state, so it can never be claimed as ▶ by anyone later");
+        assert_eq!(world.pending_lines[0].display_id, None, "arrival never assigns an owner");
         // unseen_lines stays gated on !is_current - a pending line on the world you're
         // looking at isn't "unseen" in the aggregate-activity sense, only "not yet displayed".
         assert_eq!(world.unseen_lines, 0);
@@ -7470,7 +7493,12 @@ if you're more curious.\"";
         world.add_output("visible line\n", true /* is_current */, &settings, 24, 80, false, true);
 
         assert_eq!(world.output_lines.len(), 1);
-        assert!(!world.line_is_new(&world.output_lines[0]));
+        assert!(world.output_lines[0].viewed, "born viewed - somebody was watching");
+        // ...and a later claim must not be able to turn it into ▶ for anyone.
+        world.claim_unviewed(7);
+        assert_eq!(world.output_lines[0].display_id, None,
+            "a line that arrived while viewed is permanently un-new - the !viewed guard in \
+             claim_unviewed is what enforces that");
         assert!(world.pending_lines.is_empty());
     }
 
@@ -7488,17 +7516,23 @@ if you're more curious.\"";
         for i in 3..6u64 {
             world.pending_lines.push(OutputLine::new(format!("pending {i}"), i));
         }
-        // Defaults: new_from_seq = 0, so everything above (output and pending) starts ▶.
-        assert!(world.output_lines.iter().all(|l| world.line_is_new(l)));
-        assert!(world.pending_lines.iter().all(|l| world.line_is_new(l)));
+        // The console displays the world, claiming everything unviewed in output_lines.
+        // claim_unviewed deliberately does NOT touch pending_lines - they haven't been
+        // displayed yet, so they stay claimable until released.
+        world.claim_unviewed(crate::CONSOLE_DISPLAY_ID);
+        assert!(world.output_lines.iter().all(|l| l.display_id == Some(crate::CONSOLE_DISPLAY_ID)));
+        assert!(world.pending_lines.iter().all(|l| !l.viewed && l.display_id.is_none()),
+            "pending lines are untouched by a claim - still undisplayed, still claimable");
 
         world.filter_to_server_output();
 
-        assert!(world.output_lines.iter().all(|l| !world.line_is_new(l)),
-            "output_lines must lose their ▶ marker after Ctrl+L");
-        assert!(world.pending_lines.iter().all(|l| world.line_is_new(l)),
-            "pending_lines must KEEP their ▶ marker after Ctrl+L - they're still undisplayed");
-        assert_eq!(world.new_from_seq, 3, "watermark must land exactly past the last displayed seq");
+        assert!(world.output_lines.iter().all(|l| l.display_id.is_none()),
+            "output_lines must lose the console's ▶ marker after Ctrl+L");
+        assert!(world.output_lines.iter().all(|l| l.viewed),
+            "...but stay viewed, so no other client can pick them up");
+        assert!(world.pending_lines.iter().all(|l| !l.viewed),
+            "pending_lines must survive Ctrl+L unviewed - they're still undisplayed, so they \
+             become ▶ for whoever is watching when they're finally released");
     }
 
     // ========== Rule 1 vs. rule 2: arrivals must not clear OTHER lines' markers ==========
@@ -7513,63 +7547,62 @@ if you're more curious.\"";
 
     #[test]
     fn test_arrival_while_viewing_keeps_older_backlog_markers() {
-        // THE regression: text arriving on the world you are looking at must not strip ▶
-        // from older backlog that arrived while nobody was watching. Only a display event
-        // (leaving / Ctrl+L / MarkWorldSeen -> mark_displayed()) clears those.
+        // THE regression this whole area exists for: text arriving on the world you are
+        // looking at must not strip ▶ from older backlog that arrived while nobody was
+        // watching. Under per-line ownership this falls out for free - the backlog is owned,
+        // the live arrivals are born `viewed` and unowned, and nothing touches the backlog.
         let mut world = World::new("test");
         let settings = Settings::default();
 
-        // Backlog: arrived with nobody viewing -> ▶.
+        // Backlog: arrived with nobody viewing -> claimable.
         world.add_output("backlog 1\n", false, &settings, 24, 80, false, true);
         world.add_output("backlog 2\n", false, &settings, 24, 80, false, true);
-        assert!(world.output_lines.iter().all(|l| world.line_is_new(l)),
-            "precondition: unviewed arrivals start ▶");
+        assert!(world.output_lines.iter().all(|l| !l.viewed), "precondition: arrived unviewed");
 
-        // Now the user is looking at the world and live output arrives. No display event
-        // has happened (no world switch, no Ctrl+L).
+        // The user switches in and displays the world: the backlog becomes theirs.
+        world.claim_unviewed(crate::CONSOLE_DISPLAY_ID);
+        assert!(world.output_lines.iter().all(|l| l.display_id == Some(crate::CONSOLE_DISPLAY_ID)));
+
+        // Now live output arrives while they are still sitting there. No display event.
         world.add_output("live 1\n", true, &settings, 24, 80, false, true);
         world.add_output("live 2\n", true, &settings, 24, 80, false, true);
 
-        let flags: Vec<bool> = world.output_lines.iter().map(|l| world.line_is_new(l)).collect();
+        let flags: Vec<bool> = world.output_lines.iter()
+            .map(|l| l.display_id == Some(crate::CONSOLE_DISPLAY_ID)).collect();
         assert_eq!(flags, vec![true, true, false, false],
-            "backlog must KEEP ▶ while you sit in the world; only the lines that arrived \
-             while you were watching are excluded (a single monotonic floor could not do \
-             this - see World::viewed_from_seq)");
+            "backlog must KEEP ▶ while you sit in the world; lines that arrived while you \
+             were watching are born viewed and never become ▶ for anyone");
 
-        // Leaving the world is what actually clears them.
-        world.mark_displayed();
-        assert!(world.output_lines.iter().all(|l| !world.line_is_new(l)),
-            "mark_displayed() must still clear everything displayed");
-        assert_eq!(world.viewed_from_seq, u64::MAX,
-            "with nothing pending, mark_displayed() releases the episode ceiling");
+        // Leaving (or Ctrl+L) is what actually clears them - and only for this viewer.
+        world.release_claims(crate::CONSOLE_DISPLAY_ID);
+        assert!(world.output_lines.iter().all(|l| l.display_id.is_none()));
+        assert!(world.output_lines.iter().all(|l| l.viewed),
+            "released lines stay viewed, so nobody else picks them up");
     }
 
     #[test]
     fn test_unviewed_arrival_after_a_viewing_episode_is_new_again() {
         // A viewer can stop viewing with no display event at all: a WS client switching
-        // world, hitting --More-- (ws_client_viewing() excludes paused clients), or having
-        // its WS_VIEWER_GRACE expire. Text arriving after that must be ▶ again - the episode
-        // ceiling must not keep suppressing it forever.
+        // world, hitting --More--, backgrounding, or having its grace expire. Text arriving
+        // after that must be claimable again.
         let mut world = World::new("test");
         let settings = Settings::default();
 
         world.add_output("watched\n", true, &settings, 24, 80, false, true);
-        assert!(!world.line_is_new(&world.output_lines[0]));
-
         world.add_output("unwatched\n", false, &settings, 24, 80, false, true);
 
-        assert!(!world.line_is_new(&world.output_lines[0]),
-            "a line that arrived while watched must stay not-new");
-        assert!(world.line_is_new(&world.output_lines[1]),
-            "text arriving once the last viewer stopped watching must be ▶ again");
-        assert_eq!(world.viewed_from_seq, u64::MAX, "the episode ceiling must be released");
+        world.claim_unviewed(crate::CONSOLE_DISPLAY_ID);
+
+        assert_eq!(world.output_lines[0].display_id, None,
+            "a line that arrived while watched can never become ▶, even on a later claim");
+        assert_eq!(world.output_lines[1].display_id, Some(crate::CONSOLE_DISPLAY_ID),
+            "text arriving once the last viewer stopped watching must be claimable again");
     }
 
     #[test]
-    fn test_client_generated_line_does_not_end_a_viewing_episode() {
-        // Only real world text ends a viewing episode. A client-generated line landing on
-        // an unviewed world (a /world message, a status notice) must not collapse the
-        // watermark and cost that world its genuine markers.
+    fn test_client_generated_lines_are_never_claimed() {
+        // Client-generated text (a /world message, a status notice) is never ▶, and its
+        // presence must not disturb the real backlog around it.
         let mut world = World::new("test");
         let settings = Settings::default();
 
@@ -7577,18 +7610,20 @@ if you're more curious.\"";
         world.add_output("watched\n", true, &settings, 24, 80, false, true);
         world.add_output("client note\n", false, &settings, 24, 80, false, false /* from_server */);
 
-        assert!(world.line_is_new(&world.output_lines[0]),
-            "a client-generated arrival must not sweep real backlog markers");
-        assert!(!world.line_is_new(&world.output_lines[1]));
-        assert!(!world.line_is_new(&world.output_lines[2]),
-            "client-generated lines are never ▶ (rule 1 gates on from_server)");
+        world.claim_unviewed(crate::CONSOLE_DISPLAY_ID);
+
+        assert_eq!(world.output_lines[0].display_id, Some(crate::CONSOLE_DISPLAY_ID),
+            "a client-generated arrival must not cost real backlog its marker");
+        assert_eq!(world.output_lines[1].display_id, None, "arrived while watched");
+        assert_eq!(world.output_lines[2].display_id, None,
+            "client-generated lines are never ▶ - claim_unviewed gates on from_server");
     }
 
     #[test]
-    fn test_watermark_broadcast_fires_for_a_ceiling_only_change() {
-        // A viewing episode starting moves ONLY the ceiling, not the floor - so the
-        // broadcast's before/after comparison must cover both, or WS clients keep painting
-        // ▶ on live output on the world they are watching.
+    fn test_arrival_broadcasts_no_ownership_message() {
+        // Arrival never assigns an owner, so it must not emit ClaimedNew/ReleasedNew at all.
+        // The old model broadcast a watermark on every arrival to every client; that
+        // broadcast is exactly what let one client's state disturb another's.
         let mut app = App::new();
         app.worlds.clear();
         app.worlds.push(World::new("current"));
@@ -7597,29 +7632,227 @@ if you're more curious.\"";
 
         app.add_output_to_world(0, "hello");
 
-        assert_eq!(app.worlds[0].new_from_seq, 0, "the floor must NOT move on a viewed arrival");
-        assert_eq!(app.worlds[0].viewed_from_seq, 0, "the ceiling latches at the arriving seq");
-
         let log = app.ws_broadcast_log.lock().unwrap();
-        assert!(log.iter().any(|m| matches!(m,
-            WsMessage::NewWatermark { world_index: 0, new_from_seq: 0, viewed_from_seq: 0 })),
-            "a ceiling-only change must still broadcast. Log: {:?}", log);
+        assert!(!log.iter().any(|m| matches!(m,
+            WsMessage::ClaimedNew { .. } | WsMessage::ReleasedNew { .. })),
+            "arrival must not broadcast any ownership change. Log: {:?}", log);
     }
 
+    // ========================================================================
+    // Per-line ▶ ownership (OutputLine::viewed / display_id)
+    // ========================================================================
+
+    /// Push one line of SERVER-originated text onto `world_idx` exactly the way
+    /// `process_server_data` does: through `World::add_output` with the same
+    /// console-or-any-WS-client `is_current`. `App::add_output_to_world` is deliberately not
+    /// used here - it emits CLIENT-generated text (`from_server: false`), which is never ▶.
+    fn push_server_line(app: &mut App, world_idx: usize, text: &str) {
+        let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
+        let settings = app.settings.clone();
+        app.worlds[world_idx].add_output(&format!("{text}\n"), is_current, &settings, 24, 80, false, true);
+    }
+
+    /// The four arrival/claim rules, as a table.
     #[test]
-    fn test_new_watermark_missing_ceiling_defaults_to_no_restriction() {
-        // An older peer omits viewed_from_seq entirely; it must decode as u64::MAX ("no
-        // viewing episode"), never 0 ("nothing is ever new") - #[serde(default)] on a bare
-        // u64 gives 0.
-        let json = r#"{"type":"NewWatermark","world_index":0,"new_from_seq":7}"#;
-        match serde_json::from_str::<WsMessage>(json).unwrap() {
-            WsMessage::NewWatermark { new_from_seq, viewed_from_seq, .. } => {
-                assert_eq!(new_from_seq, 7);
-                assert_eq!(viewed_from_seq, u64::MAX,
-                    "a missing ceiling must mean 'no restriction', not 'suppress everything'");
-            }
-            other => panic!("expected NewWatermark, got {:?}", other),
+    fn test_ownership_arrival_and_claim_rules() {
+        let settings = Settings::default();
+
+        // Row 1: arrives on a world nobody is viewing -> unviewed, unowned.
+        let mut w = World::new("t");
+        w.add_output("a\n", false, &settings, 24, 80, false, true);
+        assert!(!w.output_lines[0].viewed);
+        assert_eq!(w.output_lines[0].display_id, None);
+
+        // Row 2: arrives on a world somebody IS viewing -> viewed, still unowned.
+        let mut w = World::new("t");
+        w.add_output("a\n", true, &settings, 24, 80, false, true);
+        assert!(w.output_lines[0].viewed);
+        assert_eq!(w.output_lines[0].display_id, None);
+
+        // Row 3: a client displays an unviewed line -> viewed, owned by that client.
+        let mut w = World::new("t");
+        w.add_output("a\n", false, &settings, 24, 80, false, true);
+        assert_eq!(w.claim_unviewed(42), vec![0]);
+        assert!(w.output_lines[0].viewed);
+        assert_eq!(w.output_lines[0].display_id, Some(42));
+
+        // Row 4: a client displays an already-viewed line -> nothing happens.
+        let mut w = World::new("t");
+        w.add_output("a\n", true, &settings, 24, 80, false, true);
+        assert!(w.claim_unviewed(42).is_empty());
+        assert_eq!(w.output_lines[0].display_id, None,
+            "a line that arrived while somebody was watching is permanently un-new");
+    }
+
+    /// THE test for this design: a second client displaying a line the first client already
+    /// owns must neither steal that marker nor clear it. Everything else follows from the
+    /// `!viewed` guard in claim_unviewed; this is the assertion that pins it down.
+    #[test]
+    fn test_second_viewer_neither_steals_nor_clears_the_first_viewers_marker() {
+        let settings = Settings::default();
+        let mut w = World::new("t");
+        w.add_output("backlog\n", false, &settings, 24, 80, false, true);
+
+        // Client 1 looks first and takes the marker.
+        assert_eq!(w.claim_unviewed(1), vec![0]);
+        assert_eq!(w.output_lines[0].display_id, Some(1));
+
+        // Client 2 now displays the same line.
+        assert!(w.claim_unviewed(2).is_empty(), "nothing left to claim");
+        assert_eq!(w.output_lines[0].display_id, Some(1),
+            "client 2 must NOT steal client 1's marker - first viewer wins");
+
+        // Client 2 switching away / Ctrl+L must not disturb client 1 either.
+        assert!(!w.release_claims(2), "client 2 owns nothing here");
+        assert_eq!(w.output_lines[0].display_id, Some(1),
+            "one client's release must be invisible to another - this is exactly what the \
+             shared watermark got wrong, wiping other clients' ▶ on every world switch");
+
+        // Only client 1's own release clears it.
+        assert!(w.release_claims(1));
+        assert_eq!(w.output_lines[0].display_id, None);
+        assert!(w.output_lines[0].viewed,
+            "released lines stay viewed so nobody re-claims them");
+    }
+
+    /// Unviewed lines are NOT a contiguous tail: `viewed` is decided per line by whether
+    /// anyone was watching at that instant, and that flips with no display event in between.
+    /// A claim must sweep the whole buffer, not stop at the first viewed line.
+    #[test]
+    fn test_claim_sweeps_unviewed_lines_behind_a_viewed_one() {
+        let settings = Settings::default();
+        let mut w = World::new("t");
+        w.add_output("unwatched 1\n", false, &settings, 24, 80, false, true);
+        w.add_output("watched\n", true, &settings, 24, 80, false, true);
+        w.add_output("unwatched 2\n", false, &settings, 24, 80, false, true);
+
+        let claimed = w.claim_unviewed(9);
+        assert_eq!(claimed, vec![0, 2],
+            "both unviewed lines must be claimed, including the one BEHIND the viewed line - \
+             a reverse scan that breaks on the first viewed line silently skips it");
+        assert_eq!(w.output_lines[1].display_id, None, "the viewed line stays unowned");
+    }
+
+    /// Ctrl+L / switching away releases only the acting viewer's markers, and pending lines
+    /// survive unviewed so they become ▶ for whoever is watching when they're released.
+    #[test]
+    fn test_release_is_per_viewer_and_pending_stays_claimable() {
+        let mut w = World::new("t");
+        for i in 0..3u64 {
+            w.output_lines.push(OutputLine::new(format!("out {i}"), i));
         }
+        w.pending_lines.push(OutputLine::new("held".to_string(), 3));
+
+        w.claim_unviewed(1);
+        // A second client owns nothing (first-wins), so give it a line of its own.
+        w.output_lines.push(OutputLine::new("later".to_string(), 4));
+        w.claim_unviewed(2);
+        assert_eq!(w.output_lines[3].display_id, Some(2));
+
+        w.release_claims(1);
+        assert!(w.output_lines[..3].iter().all(|l| l.display_id.is_none()));
+        assert_eq!(w.output_lines[3].display_id, Some(2),
+            "client 1's release must leave client 2's marker alone");
+        assert!(!w.pending_lines[0].viewed,
+            "pending lines are never claimed and never released - still undisplayed");
+    }
+
+    /// The reported scenario, end to end through the real handlers: console on world A, a WS
+    /// client on world B. Text arriving on B must be new for nobody, because the client
+    /// watching B is watching it.
+    #[test]
+    fn test_text_on_a_world_being_watched_by_a_remote_client_is_never_new() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+        app.worlds.push(World::new("B"));
+        app.current_world_index = 0; // console watches A
+
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        // The WS client is viewing world B.
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 1,
+            visible_lines: 24,
+            visible_columns: 80,
+            dimensions: None,
+            paused: false,
+            disconnected_at: None,
+        });
+        assert!(app.ws_client_viewing(1), "precondition: B counts as viewed");
+
+        push_server_line(&mut app, 1, "text on B");
+
+        let line = app.worlds[1].output_lines.last().unwrap();
+        assert!(line.viewed,
+            "text arriving on a world a remote client is watching must be born viewed - this \
+             is the reported bug: it used to be ▶ on that very client");
+        assert_eq!(line.display_id, None);
+        // ...and it must stay un-new even if that client re-displays the world.
+        let owner = app.display_owner_id(client_id);
+        app.claim_world_for(1, owner, Some(client_id));
+        assert_eq!(app.worlds[1].output_lines.last().unwrap().display_id, None);
+    }
+
+    /// A backgrounded client stops counting as a viewer and drops its markers; coming back
+    /// claims whatever arrived meanwhile. A brief transport drop is the opposite case and is
+    /// covered by WS_VIEWER_GRACE.
+    #[test]
+    fn test_backgrounding_releases_markers_and_returning_reclaims() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+        app.current_world_index = 9999; // console is not on this world
+
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        // Text arrives BEFORE the client is looking, so it's genuinely missed and claimable.
+        push_server_line(&mut app, 0, "arrived before we looked");
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 0, visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, disconnected_at: None,
+        });
+
+        let owner = app.display_owner_id(client_id);
+        app.claim_world_for(0, owner, Some(client_id));
+        assert_eq!(app.worlds[0].output_lines[0].display_id, Some(owner),
+            "displaying a world with missed text takes ownership of its ▶ markers");
+
+        // Background: markers released, and we stop counting as a viewer.
+        app.handle_client_visibility(client_id, false);
+        assert_eq!(app.worlds[0].output_lines[0].display_id, None);
+        assert!(!app.ws_client_viewing(0),
+            "a backgrounded client must not keep suppressing arrivals on its world");
+
+        // Text arriving now is genuinely missed.
+        push_server_line(&mut app, 0, "while away");
+        assert!(!app.worlds[0].output_lines.last().unwrap().viewed);
+
+        // Back on screen: claim it.
+        app.handle_client_visibility(client_id, true);
+        assert_eq!(app.worlds[0].output_lines.last().unwrap().display_id, Some(owner),
+            "text that arrived while backgrounded must become ▶ on return");
+    }
+
+    /// A stable client_uid keeps ▶ ownership across a reconnect, which is what makes a brief
+    /// transport drop non-destructive. Without one, ownership falls back to the connection id
+    /// and a reconnect loses the markers.
+    #[test]
+    fn test_stable_client_uid_survives_a_reconnect() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+
+        app.set_display_owner_id(11, "device-abc");
+        let first = app.display_owner_id(11);
+        // Same device, new connection id after a reconnect.
+        app.set_display_owner_id(12, "device-abc");
+        assert_eq!(app.display_owner_id(12), first,
+            "the same client_uid must resolve to the same ownership id across a reconnect");
+
+        // No uid -> falls back to the connection id (older client, one-shot Rust clients).
+        assert_eq!(app.display_owner_id(77), 77);
+        // ...and must never collide with the console's reserved id.
+        app.set_display_owner_id(13, "another-device");
+        assert_ne!(app.display_owner_id(13), CONSOLE_DISPLAY_ID);
     }
 
     // ============================================================================

@@ -1380,3 +1380,97 @@ re-fire suppression, and auditing zero-ack worlds each fail a specific test.
 - **No on-device run.** The end-to-end claim — Android backgrounded past the heartbeat, resumed,
   every world compared against the TUI, `SEQ-AUDIT` lines and the `/dump` table inspected — has
   not been performed.
+
+---
+
+# Phase D — per-line ▶ ownership
+
+## The report
+
+Main instance viewing world A, a second instance (`clay --console=<host>`) viewing world B.
+Text arriving on B was marked ▶ **on the instance that was watching B**.
+
+## Two defects
+
+**1. The remote console compared seqs from two different number spaces.** ▶ was decided by
+`line.seq >= new_from_seq && line.seq < viewed_from_seq`, with both watermarks mirrored from
+the server — but the mirror's live-text handler threw the server's seq away and invented its
+own (`main.rs`, the `ServerData` arm), keeping the real one only for dedup. So the
+"somebody is viewing, don't mark it" suppression could never take effect on a remote console.
+Drift is unbounded: a world that received zero lines in `InitialState` (routine — the
+aggregate budget is 500 lines across *all* worlds) starts at 1 while the server is at 50 000.
+
+`app.js` already derived `msg.seq + rawIdx` correctly — Phase B Step 8, applied to the web
+client and never mirrored into the Rust one. Fixed in both `ServerData` and
+`WorldStateResponse`; the mirror's `output_lines` had been a *mixture* of real and invented
+seqs, which also undermined the sorted-by-seq assumption the gap-fill splice relies on.
+
+**2. The ▶ watermark was per-world, shared by every client.** `new_from_seq`/`viewed_from_seq`
+were advanced from a global OR (`world_idx == current_world_index ||
+ws_client_viewing(world_idx)`) and broadcast to everyone. One shared pair cannot express "new
+for you but not for me", so it was wrong in both directions: the console on world 0 suppressed
+▶ for a remote parked on world 5, and one client leaving a world called `mark_displayed()`,
+advancing the shared floor and **wiping another client's markers**.
+
+## The model
+
+Two fields on `OutputLine` (and `TimestampedLine`):
+
+| Event | Effect |
+|---|---|
+| Line arrives, world **not** viewed anywhere | `viewed = false`, `display_id = None` |
+| Line arrives, world **is** viewed | `viewed = true`, `display_id = None` |
+| A client displays it, **and `!viewed`** | `viewed = true`, `display_id = Some(that client)` |
+| A client displays it, already `viewed` | nothing — the claim is never stolen |
+
+A client renders ▶ iff `display_id` equals its own id. The `!viewed` one-way latch is the
+whole design: it gives first-viewer-wins, makes a line that arrived while somebody was
+watching permanently un-new, and makes each client's marker untouchable by anyone else.
+
+This is a deliberate return to per-line state. Per-line `marked_new` was removed in `a23d2c1`
+because of cross-instance drift — a client that left a world never told the others to stop
+drawing ▶. An owner id is precisely that fix.
+
+- **Claim** (`World::claim_unviewed`, `App::claim_world_for`): on world switch-in, on
+  visibility-visible, and on pending release (`broadcast_released_lines`). Sweeps the **whole**
+  buffer — unviewed lines are *not* a contiguous tail, since `viewed` flips with whether
+  anyone was watching and `[unviewed, viewed, unviewed]` is reachable. An early version broke
+  out of a reverse scan on the first viewed line and silently skipped older backlog behind it;
+  caught by `test_claim_sweeps_unviewed_lines_behind_a_viewed_one`. For the same reason
+  `ClaimedNew` carries an explicit **seq list**, not a range.
+- **Release** (`World::release_claims`, `App::release_world_for`): on world switch-away, Ctrl+L,
+  visibility-hidden, and disconnect past `WS_VIEWER_GRACE`. Clears only that viewer's markers,
+  leaving `viewed` true so nobody re-claims them.
+- **Wire**: `NewWatermark` (broadcast) is replaced by `ClaimedNew { world_index, seqs }` and
+  `ReleasedNew { world_index }`, both sent to **one** client — a claim only moves a line from
+  unowned to owned-by-that-client, so nobody else's rendering changes.
+- **Identity**: `AuthRequest.client_uid` (stable, localStorage-backed on web/Android) is hashed
+  to the ownership id and reported back as `InitialState.your_display_id`, so a brief transport
+  drop keeps a client's markers even though it gets a fresh connection id. Empty uid falls back
+  to the connection id (one-shot Rust clients, older peers). `CONSOLE_DISPLAY_ID = u64::MAX` is
+  the local TUI's reserved id.
+- **Visibility**: `ClientVisibility { visible }`, driven from `app.js`'s `visibilitychange` and
+  Android's `MainActivity.onPause`/`onResume`. Backgrounding is **not** a disconnect (the socket
+  stays open), so it must be signalled: a hidden client stops counting as a viewer and releases
+  its markers, so text arriving meanwhile is unviewed and becomes ▶ on return.
+  `WS_VIEWER_GRACE` therefore drops from 5 min to **10s** — it now only has to outlast a
+  transport blip, not absorb backgrounding.
+- **Persistence**: `viewed` rides in the `[output:N]` section as a `v` flag; `display_id` is
+  deliberately not persisted (a reload has no live clients, so markers restore unowned). The
+  old save-time watermark widening is gone — a displayed line already carries `viewed: true`.
+
+## Status
+
+726/726 `cargo test` (720 baseline + 6 new, several rewritten), clean `cargo clippy`, clean
+musl build. Four mutations each fail a specific test: removing the `!viewed` guard,
+reintroducing the contiguous-tail `break`, releasing all markers instead of one viewer's, and
+ignoring `is_current` on arrival.
+
+## Verification gaps
+
+- **No JS runtime in the sandbox**, so `app.js` was not executed — the changes there
+  (`lineIsNew`, the `ClaimedNew`/`ReleasedNew` handlers, `clientUid`, `sendClientVisibility`)
+  are reviewed and brace-balance-checked only.
+- **No on-device / two-instance run.** The scenario in the report — master TUI on A, a second
+  instance on B, plus the "client 2 switching in must not disturb client 1's markers" case and
+  the Android background/foreground cycle — has not been exercised against real processes.

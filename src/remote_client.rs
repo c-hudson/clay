@@ -187,6 +187,9 @@ pub(crate) async fn run_grep_client(
         request_key: false,
         challenge_response: true,
         resume: Vec::new(),
+        // One-shot invocation: never renders output, so it owns no ▶ markers and needs no
+        // stable identity.
+        client_uid: String::new(),
     });
 
     // Wait for auth response
@@ -597,6 +600,8 @@ pub(crate) async fn run_import_client(
             request_key: false,
             challenge_response: true,
             resume: Vec::new(),
+            // /import client: fetches settings only, renders nothing, owns no ▶ markers.
+            client_uid: String::new(),
         }
     } else {
         let password_hash = hash_password(password.unwrap_or_default());
@@ -608,6 +613,8 @@ pub(crate) async fn run_import_client(
             request_key: false,
             challenge_response: true,
             resume: Vec::new(),
+            // /import client: fetches settings only, renders nothing, owns no ▶ markers.
+            client_uid: String::new(),
         }
     };
     let _ = ws_tx.send(auth_request);
@@ -916,7 +923,7 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             // for a connection that stays up is handled separately via
                             // `ResyncRequired` in `App::handle_remote_ws_message` (PROTOCOL-ROADMAP.md
                             // Step 6).
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username, current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new() });
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username, current_world: None, auth_key: None, request_key: false, challenge_response: true, resume: Vec::new(), client_uid: String::new() });
                             break;
                         }
                         KeyCode::Char(c) => {

@@ -336,7 +336,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         // Check if this is an AuthRequest (client just authenticated)
                         if let WsMessage::AuthRequest { ref resume, .. } = *msg {
                             // Send initial state after successful authentication
-                            let initial_state = app.build_initial_state();
+                            let initial_state = app.build_initial_state(app.display_owner_id(client_id));
                             app.ws_send_initial_state_and_mark(client_id, initial_state);
                             // Resume-driven replay (PROTOCOL-ROADMAP.md Step 2): reuse the
                             // exact same gap-fill logic RequestScrollback{after_seq} already
@@ -3137,11 +3137,9 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 // constant 0 ("everything already displayed") preserves that, rather than
                 // reading World::new_from_seq, which tracks the shared World's own
                 // (unused-by-multiuser) output_lines and would be meaningless here.
-                new_from_seq: 0,
                 // Same reasoning as new_from_seq above: multiuser has never supported the ▶
                 // window's upper bound either. u64::MAX ("no viewing episode in progress")
                 // is the neutral/inert value, matching a fresh World's own default.
-                viewed_from_seq: u64::MAX,
                 // Same reasoning as new_from_seq above: multiuser ServerData always hardcodes
                 // seq: 0, so a multiuser client's cached/in-memory _max_seq for this world can
                 // never be a real positive value either - the app.js server-restart-detection
@@ -3172,6 +3170,9 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
     let splash_lines = generate_splash_strings();
 
     WsMessage::InitialState {
+        // Multiuser has no per-line ▶ ownership (it emits seq: 0 universally and never
+        // claims), so there is no id to report - 0 means "no markers are mine".
+        your_display_id: 0,
         worlds,
         settings,
         current_world_index,
@@ -3567,7 +3568,10 @@ pub async fn handle_multiuser_ws_message(
                         if old_idx != world_index {
                             if let Some(old_world) = app.worlds.get_mut(old_idx) {
                                 if old_world.owner.as_ref() == username.as_ref() {
-                                    old_world.mark_displayed();
+                                    // Drop only THIS client's ▶ markers on the world it
+                                    // left - another user's markers on their own worlds are
+                                    // untouched (per-line ownership, OutputLine::display_id).
+                                    old_world.release_claims(client_id);
                                     if old_world.pending_lines.is_empty() {
                                         old_world.lines_since_pause = 0;
                                     }
@@ -4012,7 +4016,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(1, 0)],
+            resume: vec![(1, 0)], client_uid: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);
@@ -4068,7 +4072,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(0, 7)],
+            resume: vec![(0, 7)], client_uid: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);

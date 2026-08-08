@@ -5,7 +5,7 @@ communication between a Clay server (single-user master instance, `-D`
 headless daemon, or `--multiuser` server) and its clients (the web UI, the
 webview GUI, the Rust `--console`/`--grep` remote clients, and Android).
 
-It reflects the protocol as of PROTOCOL-ROADMAP.md Steps 1-10 (2026-07-31).
+It reflects the protocol as of PROTOCOL-ROADMAP.md Phase D (2026-08-08).
 For field-level ground truth, always prefer `src/websocket.rs`'s `WsMessage`
 enum over this document — this file is prose describing that enum, not a
 replacement for it, and it has gone stale before.
@@ -267,8 +267,7 @@ Full field list (`src/websocket.rs`, the `ServerData` variant):
 (`#[serde(default)]`), `from_server: bool` (`#[serde(default =
 "default_true", skip_serializing_if = "is_true")]`), `seq: u64`
 (`#[serde(default)]`), `end_seq: Option<u64>` (`#[serde(default,
-skip_serializing_if = "Option::is_none")]`), `marked_new: bool`
-(`#[serde(default, skip_serializing_if = "is_false")]`), `flush: bool`
+skip_serializing_if = "Option::is_none")]`), `flush: bool`
 (`#[serde(default, skip_serializing_if = "is_false")]`), `gagged: bool`
 (`#[serde(default, skip_serializing_if = "is_false")]`).
 
@@ -276,20 +275,20 @@ Four of these fields are omitted from the wire entirely when they hold their
 common-case value (bandwidth — `ServerData` is by far the highest-volume
 message type, so trimming a few bytes per line adds up): `from_server`
 (omitted when `true`, the overwhelming common case by message volume — real
-MUD output), `marked_new` (omitted when `false`), `flush` (omitted when
-`false`), and `gagged` (omitted when `false`). `end_seq` is a fifth,
+MUD output), `flush` (omitted when `false`), and `gagged` (omitted when
+`false`). `end_seq` is another,
 omitted whenever it's `None`. A client must treat an absent field as its
 documented default, not as "unknown" — `serde`'s `#[default]` attributes
 reconstruct the true value on decode, and this is round-trip tested
-(`src/tests.rs`,
-`test_server_data_common_case_omits_from_server_and_marked_new` /
-`test_server_data_non_default_from_server_and_marked_new_are_serialized`).
+(`src/tests.rs`, `test_server_data_common_case_omits_from_server_and_marked_new`
+/ `test_server_data_non_default_from_server_and_marked_new_are_serialized` —
+names kept from when a `marked_new` field still existed).
 `world_index`, `data`, `is_viewed`, `seq`, and `ts` are always present —
 `seq` in particular must never be silently omitted-as-zero, since 0 is a
 legitimate value (a client-generated/pending-release marker) and needs to
 stay distinguishable from "field absent." `end_seq` follows the same rule
 for the same reason (see below) and is why it's `Option<u64>` rather than a
-trimmed `u64`, unlike `from_server`/`marked_new`/`flush`/`gagged`.
+trimmed `u64`, unlike `from_server`/`flush`/`gagged`.
 
 Field meanings:
 - `end_seq`: the seq of the **last** line in this batch, present only when
@@ -323,10 +322,63 @@ Field meanings:
   UI.
 - `from_server`: true if this line originated from the MUD server; false for
   client-generated lines (system/status messages, command echo, etc.).
-- `marked_new`: true only for a previously-pending line released while the
-  client was scrolled back — a rare case, used to distinguish "genuinely new
-  arrival" from an ordinary append for UI purposes (e.g. animation/highlight
-  cues).
+There is no `marked_new` field. The ▶ new-text indicator is **not** carried on
+`ServerData` at all: a line arriving live is never owned by anyone (see below),
+so there would be nothing to report.
+
+## The ▶ new-text indicator: per-line ownership
+
+Each line carries two fields (`OutputLine` in `main.rs`, `TimestampedLine` on
+the wire): `viewed: bool` and `display_id: Option<u64>`. A client renders ▶ on
+a line iff its `display_id` equals that client's own id
+(`InitialState.your_display_id`).
+
+| Event | Effect |
+|---|---|
+| Line arrives, world not viewed anywhere | `viewed = false`, `display_id = None` |
+| Line arrives, world is viewed by anyone | `viewed = true`, `display_id = None` |
+| A client displays it, and `!viewed`     | `viewed = true`, `display_id = that client` |
+| A client displays it, already `viewed`  | nothing — the claim is never stolen |
+
+The `!viewed` one-way latch gives first-viewer-wins: the first client to display
+an unviewed line owns its marker, a second client arriving later gets nothing,
+and a line that arrived while somebody was watching can never be ▶ for anyone.
+
+**Ownership changes are sent to ONE client, never broadcast** — a claim only
+moves a line from unowned to owned-by-that-client, so no other client's
+rendering changes:
+
+- `ClaimedNew { world_index, seqs }` — you now own these lines' markers. An
+  explicit seq list, not a range: unviewed lines are **not** a contiguous tail
+  (`viewed` flips with whether anyone was watching, so
+  `[unviewed, viewed, unviewed]` is reachable), and a range would sweep in the
+  viewed line between them.
+- `ReleasedNew { world_index }` — your markers there are cleared (you switched
+  away, hit Ctrl+L, or backgrounded). The lines stay `viewed`, so nobody else
+  picks them up. This is what makes one instance's clear invisible to another,
+  which the previous per-world watermark model could not do.
+
+**`ClientVisibility { visible }`** (client → server) exists because
+backgrounding is *not* a disconnect — Android keeps its socket open behind
+`MainActivity.onPause` — so the server cannot infer it. A hidden client stops
+counting as a viewer and releases its markers, so text arriving meanwhile is
+unviewed and becomes ▶ when it returns. A brief transport drop on a *visible*
+client is the opposite case and is covered by `WS_VIEWER_GRACE` (10s), which
+deliberately keeps the markers intact.
+
+**Identity across reconnects**: `AuthRequest.client_uid` is a stable,
+client-generated id (localStorage on web/Android). The server derives the
+ownership id from it and reports it back as `InitialState.your_display_id`, so a
+reconnect — which allocates a fresh connection id — still resolves to the same
+ownership id and keeps that client's markers. An empty uid falls back to the
+connection id (one-shot Rust clients, older peers), which simply means markers
+are lost on reconnect.
+
+This replaced a per-world watermark pair (`new_from_seq`/`viewed_from_seq`,
+broadcast to everyone). A single shared pair per world cannot express "new for
+you but not for me": one client viewing a world suppressed ▶ there for every
+client, and one client leaving a world wiped every other client's markers. See
+PROTOCOL-ROADMAP.md Phase D.
 
 ## Message catalog
 

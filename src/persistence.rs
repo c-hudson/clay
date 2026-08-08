@@ -1873,31 +1873,24 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         // Output lines count (we'll save the actual lines separately due to size)
         writeln!(file, "output_count={}", world.output_lines.len())?;
         writeln!(file, "pending_count={}", world.pending_lines.len())?;
-        // New-text (▶) watermark - see World::new_from_seq's doc comment in main.rs. If
-        // this world is currently being viewed (console or any WS client), widen what we
-        // persist to cover everything currently displayed: otherwise quitting while
-        // viewing a world would resurrect ▶ markers on its already-seen output after
-        // reload. Pending lines are deliberately excluded from this widening - they
-        // haven't been displayed regardless of who's "viewing" the world (that's what
-        // pending means), so their markers must survive the restart unchanged; leaving
-        // new_from_seq at its stored value (never higher than the lowest pending seq)
-        // guarantees that.
-        let persisted_new_from_seq = if idx == app.current_world_index || app.ws_client_viewing(idx) {
-            let last_output_seq_plus_one = world.output_lines.last().map(|l| l.seq + 1).unwrap_or(0);
-            world.new_from_seq.max(last_output_seq_plus_one)
-        } else {
-            world.new_from_seq
-        };
-        writeln!(file, "new_from_seq={}", persisted_new_from_seq)?;
+        // The ▶ new-text state is per-line now (`OutputLine::viewed`, saved as the 'v' flag
+        // in the [output:N] section below), not a per-world watermark. The save-time
+        // widening this used to do - "if the world is being viewed, treat everything
+        // currently displayed as no longer new, so quitting while viewing doesn't resurrect
+        // markers" - is no longer needed: a displayed line already carries `viewed: true`,
+        // set either at arrival (world was being viewed) or by the claim sweep when a client
+        // displayed it. Pending lines correctly stay unviewed, exactly as the old widening
+        // took care to arrange.
     }
 
     // Save output lines in a separate section (can be large)
     // Format: timestamp_secs|flags|seq|escaped_text
     // Flags: s = from_server, g = gagged, i = is_input (a captured user-typed command -
     // see OutputLine::is_input's doc comment; always paired with g, since gagged is what
-    // makes it invisible in normal display) (the legacy 'n' = marked_new flag is no longer
-    // written - the ▶ indicator is now derived from the world's new_from_seq watermark,
-    // written above, not a per-line flag)
+    // makes it invisible in normal display), v = viewed (OutputLine::viewed - this line has
+    // already been on somebody's screen and can never be claimed as ▶ again). `display_id`
+    // is deliberately NOT persisted: a reload has no live clients, so every marker restores
+    // as unowned, and an unviewed line is simply re-claimable by whoever displays it first.
     for (idx, world) in app.worlds.iter().enumerate() {
         writeln!(file)?;
         writeln!(file, "[output:{}]", idx)?;
@@ -1907,6 +1900,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
             if line.is_input { flags.push('i'); }
+            if line.viewed { flags.push('v'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -1917,6 +1911,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
             if line.is_input { flags.push('i'); }
+            if line.viewed { flags.push('v'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
             writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
@@ -2039,20 +2034,13 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         msdp_enabled: bool,
         mcmp_default_url: String,
         gmcp_user_enabled: bool,
-        /// New-text (▶) watermark, see World::new_from_seq's doc comment in main.rs.
-        /// `None` means the reload-state file predates this field (written by an older
-        /// binary just before a `/reload`/`/update`) - resolved to `next_seq` ("nothing is
-        /// new") once `next_seq` is known, rather than defaulting to 0, which would mark
-        /// every already-displayed line new on that one reload.
-        new_from_seq: Option<u64>,
     }
 
     // Parse a saved output/pending line with timestamp
     // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged,
     // i=is_input - a captured user-typed command, see OutputLine::is_input's doc comment -
     // the legacy 'n'=marked_new flag, if present in an older file, is simply ignored: the ▶
-    // indicator is derived from the world's new_from_seq watermark now, see TempWorld's
-    // new_from_seq field doc comment for how an old file lacking it is handled)
+    // indicator is per-line now - see the 'v' flag written above)
     // Older format: timestamp_secs|flags|text (flags: s=from_server, g=gagged) - seq=0
     // Old format: timestamp_secs|text (for backward compatibility) - seq=0
     fn parse_timestamped_line(line: &str) -> OutputLine {
@@ -2079,6 +2067,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         seq,
                         highlight_color: None,
                         from_archive: false,
+                        viewed: flags.contains('v'),
+                        display_id: None,
                     };
                 } else if parts.len() == 3 {
                     // Older format: timestamp|flags|text (no seq) - predates is_input, but
@@ -2099,9 +2089,15 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         seq: 0,
                         highlight_color: None,
                         from_archive: false,
+                        viewed: flags.contains('v'),
+                        display_id: None,
                     };
                 } else {
                     // Old format: timestamp|text (assume from_server=true for compatibility)
+                    // No flags field at all, so no 'v' to read. Default to viewed: a line in
+                    // this format predates seq numbering entirely, and treating ancient
+                    // history as already-seen is right - the alternative would make every
+                    // such line claimable and paint a full screen of ▶ on first display.
                     return OutputLine {
                         text: unescape_string(parts[1]),
                         timestamp,
@@ -2111,6 +2107,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         seq: 0,
                         highlight_color: None,
                         from_archive: false,
+                        viewed: true,
+                        display_id: None,
                     };
                 }
             }
@@ -2164,7 +2162,6 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         msdp_enabled: false,
                         mcmp_default_url: String::new(),
                         gmcp_user_enabled: false,
-                        new_from_seq: None,
                     });
                 }
             } else if let Some(suffix) = section.strip_prefix("output:") {
@@ -2533,7 +2530,6 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
                             "proxy_socket_fd" => tw.proxy_socket_fd = value.parse().ok(),
                             "next_seq" => tw.next_seq = value.parse().unwrap_or(0),
-                            "new_from_seq" => tw.new_from_seq = value.parse().ok(),
                             "partial_line" => tw.partial_line = unescape_string(value),
                             "partial_in_pending" => tw.partial_in_pending = value == "true",
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
@@ -2668,10 +2664,10 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
         world.next_seq = tw.next_seq;
-        // See TempWorld::new_from_seq's doc comment: an absent value means this reload-state
-        // file predates the field, so treat everything already loaded as not-new rather than
-        // defaulting to 0 (which would mark every line new on this one reload).
-        world.new_from_seq = tw.new_from_seq.unwrap_or(tw.next_seq);
+        // ▶ state is per-line now and rides in with the lines themselves (the 'v' flag, see
+        // parse_timestamped_line). `display_id` is deliberately not persisted at all - a
+        // reload has no live clients, so every marker restores unowned and an unviewed line
+        // is simply re-claimable by whoever displays it first.
         world.partial_line = tw.partial_line;
         world.partial_in_pending = tw.partial_in_pending;
         world.gmcp_enabled = tw.gmcp_enabled;
