@@ -324,7 +324,16 @@ pub enum WsMessage {
     /// filtered lines locally (see PROTOCOL-ROADMAP.md's seq-drift fix) - the sender always
     /// knows the true count; the receiver may not, once it applies its own line filters
     /// (ANSI-only lines, idler markers, grep mode).
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true", skip_serializing_if = "is_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default, skip_serializing_if = "Option::is_none")] end_seq: Option<u64>, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool },
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true", skip_serializing_if = "is_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default, skip_serializing_if = "Option::is_none")] end_seq: Option<u64>, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool,
+        /// Per-line `/hilite` colours, parallel to the newline-separated lines in `data`.
+        /// Empty (and omitted from the wire) whenever no line in the batch is highlighted —
+        /// the overwhelming common case, so this costs nothing on the hot path.
+        ///
+        /// `highlight_color` used to be applied to the server-side buffer and never
+        /// transmitted on the live path at all, so a highlighted line arrived and rendered
+        /// plain on web/Android until some resync re-hydrated it from
+        /// `InitialState`/`ScrollbackLines`, both of which do carry it per line.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")] highlight_colors: Vec<Option<String>> },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },

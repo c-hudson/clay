@@ -3233,6 +3233,25 @@ impl World {
             0
         };
 
+        // If more mode is off, always unpause and release pending — BEFORE appending this
+        // call's new lines, not after.
+        //
+        // Ordering matters: pending seqs are always higher than anything already in
+        // output_lines, but LOWER than the fresh seqs the loop below is about to allocate.
+        // Draining afterwards therefore appended older seqs behind newer ones, leaving
+        // output_lines unsorted and making broadcast_output_range derive an inverted span
+        // (`end_seq < first_seq`). The client read that as a mid-buffer gap-fill and spliced
+        // the whole batch hundreds of lines up instead of appending it — "the TUI shows it,
+        // the phone doesn't". Draining first keeps the sorted-by-seq invariant (see
+        // CLAUDE.md) and puts the released lines inside the range every caller already
+        // broadcasts, so they reach clients too — they previously never did.
+        if !settings.more_mode_enabled {
+            self.paused = false;
+            if !self.pending_lines.is_empty() {
+                self.output_lines.append(&mut self.pending_lines);
+            }
+        }
+
         // Process remaining lines
         let line_count = lines.len();
         for (i, line) in lines.iter().enumerate().skip(start_idx) {
@@ -3353,14 +3372,6 @@ impl World {
                     self.partial_line = line.to_string();
                     self.partial_in_pending = false;
                 }
-            }
-        }
-        // If more mode is off, always unpause, release pending, and scroll to bottom
-        if !settings.more_mode_enabled {
-            self.paused = false;
-            // Release any pending lines immediately
-            if !self.pending_lines.is_empty() {
-                self.output_lines.append(&mut self.pending_lines);
             }
         }
         // Always scroll to bottom unless paused (and more mode is on), or search is holding the view
@@ -4780,7 +4791,7 @@ impl App {
             // `end_seq: None`) ever reached this handler. Regression from 99fe3dc
             // (2026-08-04); this arm's body never actually needed `end_seq`'s value, only
             // `msg_seq`, so dropping the literal match is a complete fix.
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq, flush, gagged, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq, flush, gagged, highlight_colors, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Flush: clear output buffer before appending new lines
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
@@ -4874,6 +4885,12 @@ impl App {
                                 OutputLine::new_client(line.to_string(), seq)
                             };
                             output_line.gagged = gagged;
+                            // Parallel to the PRE-filter split, so index by `i` - the same
+                            // reasoning as the seq derivation above. Empty means nothing in
+                            // this batch was highlighted.
+                            if let Some(Some(color)) = highlight_colors.get(i) {
+                                output_line.highlight_color = Some(color.clone());
+                            }
                             world.output_lines.push(output_line);
                             // Track max received seq from server
                             if msg_seq > 0 {
@@ -6046,6 +6063,10 @@ impl App {
         }
         let world = &self.worlds[world_index];
 
+        // Set by the after_seq branch when its result was truncated by the pending clamp
+        // rather than by running out of history - see there and `backfill_complete` below.
+        let mut clamped_by_pending = false;
+
         // `count` means N VISIBLE (non-gagged) lines - gagged lines interspersed in the
         // returned range ride along for free rather than eating into the client's download
         // budget (same shape as build_initial_output_lines' per-world slice and
@@ -6095,6 +6116,15 @@ impl App {
             let eligible: Vec<_> = world.output_lines.iter()
                 .filter(|l| l.seq > seq && pending_floor.map_or(true, |floor| l.seq < floor))
                 .collect();
+            // Was the result cut short by the clamp rather than by genuine exhaustion? If so
+            // the client is NOT caught up - there is more it is owed, just not deliverable
+            // yet. Reporting backfill_complete for that case cleared the client's
+            // _gapFillPending and stopped its pump while it was still behind, and nothing
+            // re-armed it until the next keepalive audit. See the backfill_complete
+            // computation below.
+            clamped_by_pending = pending_floor.is_some_and(|floor| {
+                world.output_lines.iter().any(|l| l.seq > seq && l.seq >= floor)
+            });
             let (range, visible_count) = Self::take_visible_range(&eligible, count, false, |l| l.gagged);
             let lines = eligible[range].iter()
                 .map(|line| {
@@ -6145,7 +6175,10 @@ impl App {
         // a long run of gagged lines right at the history boundary can make the raw count
         // look "not exhausted" (>= count) while take_visible_range genuinely returned every
         // line left in history with far fewer than `count` visible among them.
-        let backfill_complete = visible_count < count;
+        // ...but never report "complete" when the after_seq slice was cut short by the
+        // pending clamp: more IS owed, it just isn't deliverable until the backlog releases.
+        // The client keeps _gapFillPending armed and re-drives it on PendingReleased.
+        let backfill_complete = visible_count < count && !clamped_by_pending;
         self.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
             world_index,
             lines,
@@ -6609,6 +6642,50 @@ impl App {
     /// their buffer flushed). Shared by `process_server_data` (real MUD output) and
     /// `emit_client_lines` (client-generated blocks, e.g. `/recall`).
     #[allow(clippy::too_many_arguments)]
+    /// Push one already-built `OutputLine` into `world_idx` and broadcast it to WebSocket
+    /// clients iff it actually landed in `output_lines`. Returns whether it was displayed.
+    ///
+    /// Exists because a family of sites pushed a line and broadcast nothing at all — the TUI
+    /// rendered it, no client ever heard about it, and the consumed `seq` left a permanent
+    /// hole in every client's delivered-range tracking. They were duplicated 2-3x across the
+    /// console/headless/daemon loops, which is exactly why they drifted apart; route them all
+    /// through here instead of re-deriving the broadcast at each site.
+    ///
+    /// The `push_line_respecting_pending` return value is load-bearing: when the world is
+    /// already paused with a backlog the line goes into `pending_lines` behind older,
+    /// lower-seq content, and broadcasting it anyway would advance a client's delivered
+    /// high-water mark past that still-queued content — making the backlog look like an
+    /// already-seen duplicate when it is finally released. Deferred lines ride out with the
+    /// rest of the backlog via `broadcast_released_lines`.
+    ///
+    /// `end_seq: Some(seq)` is always set, never `None`: it is what marks the `seq` as a real
+    /// server-assigned value rather than a defaulted 0 (see `ServerData`'s doc comment), and
+    /// seq 0 is legitimate for a world's very first line.
+    pub(crate) fn push_and_broadcast_line(&mut self, world_idx: usize, line: OutputLine, more_mode: bool) -> bool {
+        if world_idx >= self.worlds.len() {
+            return false;
+        }
+        let seq = line.seq;
+        let ts = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let from_server = line.from_server;
+        let text = line.text.replace('\r', "");
+        let displayed = self.worlds[world_idx].push_line_respecting_pending(line, more_mode);
+        if displayed {
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data: format!("{}\n", text),
+                is_viewed: true,
+                ts,
+                from_server,
+                seq,
+                end_seq: Some(seq),
+                flush: false,
+                gagged: false, highlight_colors: Vec::new(),
+            });
+        }
+        displayed
+    }
+
     fn broadcast_output_range(&mut self, world_idx: usize, skip: usize, count: usize, is_viewed: bool, from_server: bool, flush: bool) {
         if count == 0 {
             if flush {
@@ -6617,14 +6694,33 @@ impl App {
             return;
         }
         let world = &self.worlds[world_idx];
-        let first_seq = world.output_lines.get(skip).map(|l| l.seq).unwrap_or(0);
-        let end_seq = world.output_lines.get(skip + count - 1).map(|l| l.seq);
+        // min/max over the slice rather than first/last element. Those agree whenever
+        // output_lines is sorted by seq (the documented invariant), but if anything ever
+        // violates it again the first/last form emits `end_seq < first_seq`, which the
+        // client reads as a mid-buffer gap-fill and splices far from the tail. Deriving the
+        // real bounds degrades to a harmless wide span instead of silently misplacing text.
+        let slice = world.output_lines.iter().skip(skip).take(count);
+        let (first_seq, end_seq) = slice.fold((u64::MAX, None::<u64>), |(lo, hi), l| {
+            (lo.min(l.seq), Some(hi.map_or(l.seq, |h: u64| h.max(l.seq))))
+        });
+        let first_seq = if first_seq == u64::MAX { 0 } else { first_seq };
         let data: String = world.output_lines.iter()
             .skip(skip)
             .take(count)
             .map(|line| line.text.replace('\r', ""))
             .collect::<Vec<_>>()
             .join("\n") + "\n";
+        // Parallel to the lines in `data`. Left empty (and omitted from the wire) unless at
+        // least one line is highlighted, so the common path costs nothing - see
+        // ServerData::highlight_colors.
+        let highlight_colors: Vec<Option<String>> = {
+            let colors: Vec<Option<String>> = world.output_lines.iter()
+                .skip(skip)
+                .take(count)
+                .map(|line| line.highlight_color.clone())
+                .collect();
+            if colors.iter().any(|c| c.is_some()) { colors } else { Vec::new() }
+        };
         self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
             world_index: world_idx,
             data,
@@ -6635,6 +6731,7 @@ impl App {
             end_seq,
             flush,
             gagged: false,
+            highlight_colors,
         });
     }
 
@@ -7161,7 +7258,7 @@ impl App {
                     from_server: batch_from_server,
                     seq: batch_start_seq,
                     end_seq: Some(batch_end_seq),
-                    flush: false, gagged: batch_gagged,
+                    flush: false, gagged: batch_gagged, highlight_colors: Vec::new(),
                 });
                 batch.clear();
                 batch_from_server = line.from_server;
@@ -7182,7 +7279,7 @@ impl App {
                 from_server: batch_from_server,
                 seq: batch_start_seq,
                 end_seq: Some(batch_end_seq),
-                flush: false, gagged: batch_gagged,
+                flush: false, gagged: batch_gagged, highlight_colors: Vec::new(),
             });
         }
     }
@@ -7346,6 +7443,7 @@ impl App {
                 seq, end_seq: None,
                 flush: false,
                 gagged: true, // clients store it and skip rendering unless F2/show-tags
+                highlight_colors: Vec::new(),
             });
         }
         // Same reasoning as the existing gagged-line release paths: output_lines just grew,
@@ -8705,7 +8803,7 @@ impl App {
                 from_server: true,
                 seq, end_seq: None,
                 flush: false,
-                gagged: true,
+                gagged: true, highlight_colors: Vec::new(),
             });
         }
         // Keep scroll at bottom if we were already there, even when paused.
@@ -8749,7 +8847,10 @@ impl App {
             let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
             let mut prompt_line = OutputLine::new(prompt_text, seq);
             prompt_line.viewed = is_current;
-            self.worlds[world_idx].push_line_respecting_pending(prompt_line, more_mode);
+            // Was a bare push with no broadcast: the TUI showed this final prompt and no
+            // client ever received it, leaving a permanent one-line hole at the bottom plus
+            // a consumed seq nothing could account for.
+            self.push_and_broadcast_line(world_idx, prompt_line, more_mode);
         }
         self.worlds[world_idx].clear_connection_state(true, true);
         // Show disconnection message
@@ -8788,7 +8889,7 @@ impl App {
                 ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                 from_server: false,
                 seq, end_seq: None,
-                flush: false, gagged: false,
+                flush: false, gagged: false, highlight_colors: Vec::new(),
             });
         }
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
@@ -8813,7 +8914,7 @@ impl App {
                     ts: msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                     from_server: false,
                     seq, end_seq: None,
-                    flush: false, gagged: false,
+                    flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
             }
         }
@@ -8933,7 +9034,10 @@ impl App {
             // disconnected-world code path).
             let mut prompt_line = OutputLine::new(prompt_normalized.trim().to_string(), seq);
             prompt_line.viewed = is_current;
-            self.worlds[world_idx].push_line_respecting_pending(prompt_line, more_mode);
+            // Same bug as handle_disconnected's final prompt: this branch used to push and
+            // then `return` without broadcasting anything, so a pre-connect banner/prompt
+            // showed locally and the client saw nothing.
+            self.push_and_broadcast_line(world_idx, prompt_line, more_mode);
             self.worlds[world_idx].prompt.clear();
             if world_idx == self.current_world_index {
                 self.needs_output_redraw = true;
@@ -9571,7 +9675,7 @@ impl App {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         }
                     }
@@ -9600,7 +9704,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false,
+                    flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
             }
             Command::Edit { .. } | Command::EditList => {
@@ -9659,7 +9763,7 @@ impl App {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         }
                     } else {
@@ -9671,7 +9775,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     }
                 } else {
@@ -9708,7 +9812,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 } else if cancel {
                     if self.pending_remote_connect.take().is_some() {
@@ -9745,7 +9849,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                     self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                 } else {
@@ -9756,7 +9860,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 }
             }
@@ -9820,7 +9924,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 } else {
                     let mut output = String::new();
@@ -9842,7 +9946,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 }
                 self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -9858,7 +9962,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                     // Broadcast updated ban list
                     self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
@@ -9871,7 +9975,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                     self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                 }
@@ -9890,7 +9994,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false,
+                    flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
             }
             Command::Notify { message } => {
@@ -9965,7 +10069,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false,
+                    flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
             }
             // AddWorld - add or update world definition
@@ -10036,7 +10140,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     }
                 }
@@ -10124,7 +10228,7 @@ impl App {
                         self.ws_send_to_client(client_id, WsMessage::ServerData {
                             world_index, data: line.to_string(), is_viewed: false,
                             ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     }
                 } else {
@@ -10154,7 +10258,7 @@ impl App {
         self.ws_send_to_client(client_id, WsMessage::ServerData {
             world_index, data, is_viewed: false,
             ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
-            flush: false, gagged: false,
+            flush: false, gagged: false, highlight_colors: Vec::new(),
         });
     }
 
@@ -10389,7 +10493,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     } else {
                         // Save current world index, switch to target, connect, then restore
@@ -15257,20 +15361,17 @@ pub async fn run_app_headless(
                         app.handle_ws_key_revoke(&key);
                     }
                     AppEvent::SystemMessage(msg) => {
-                        // Add to current world's output and broadcast
-                        let seq = app.current_world().next_seq;
+                        // Add to current world's output and broadcast. Routed through
+                        // push_and_broadcast_line so the broadcast carries the line's REAL
+                        // seq: it used to store a real seq server-side but send `seq: 0,
+                        // end_seq: None`, so the client never recorded that seq as delivered
+                        // and the Phase C ack audit saw a permanent gap there forever.
                         let world_idx = app.current_world_index;
+                        let seq = app.worlds[world_idx].next_seq;
                         app.worlds[world_idx].next_seq += 1;
-                        app.worlds[world_idx].output_lines.push(OutputLine::new_client(msg.clone(), seq));
-                        app.ws_broadcast(WsMessage::ServerData {
-                            world_index: world_idx,
-                            data: format!("{}\n", msg),
-                            is_viewed: true,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false,
-                        });
+                        let more_mode = app.settings.more_mode_enabled;
+                        let line = OutputLine::new_client(msg.clone(), seq);
+                        app.push_and_broadcast_line(world_idx, line, more_mode);
                     }
                     AppEvent::Sigusr1Received => {
                         #[cfg(not(target_os = "android"))]
@@ -15368,7 +15469,7 @@ pub async fn run_app_headless(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             }),
                         }
                     }
@@ -15387,7 +15488,7 @@ pub async fn run_app_headless(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    flush: false, gagged: false,
+                                    flush: false, gagged: false, highlight_colors: Vec::new(),
                                 });
                             }
                         }
@@ -15491,16 +15592,30 @@ pub async fn run_app_headless(
 
                 // Check proxy health
                 #[cfg(all(unix, not(target_os = "android")))]
-                for world in &mut app.worlds {
-                    if world.connected {
-                        if let Some(proxy_pid) = world.proxy_pid {
-                            if !is_process_alive(proxy_pid) {
-                                world.clear_connection_state(false, false);
-                                let seq = world.next_seq;
-                                world.next_seq += 1;
-                                world.output_lines.push(OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq));
+                {
+                    // Collect first: the notice has to be emitted through `app`
+                    // (push_and_broadcast_line + WorldDisconnected), which can't be called
+                    // while `app.worlds` is mutably borrowed by this loop. Previously this
+                    // just pushed a line and broadcast nothing at all - the TUI reported the
+                    // dead proxy while every client kept showing the world as connected.
+                    let mut proxy_died: Vec<usize> = Vec::new();
+                    for (world_idx, world) in app.worlds.iter_mut().enumerate() {
+                        if world.connected {
+                            if let Some(proxy_pid) = world.proxy_pid {
+                                if !is_process_alive(proxy_pid) {
+                                    world.clear_connection_state(false, false);
+                                    proxy_died.push(world_idx);
+                                }
                             }
                         }
+                    }
+                    let more_mode = app.settings.more_mode_enabled;
+                    for world_idx in proxy_died {
+                        let seq = app.worlds[world_idx].next_seq;
+                        app.worlds[world_idx].next_seq += 1;
+                        let line = OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq);
+                        app.push_and_broadcast_line(world_idx, line, more_mode);
+                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                     }
                 }
             }
@@ -15508,7 +15623,15 @@ pub async fn run_app_headless(
             // Prompt timeout check — only fires when a world has wont_echo_time set
             _ = &mut prompt_check_sleep => {
                 let now = std::time::Instant::now();
-                for world in &mut app.worlds {
+                // Deferred emissions: this loop holds a mutable borrow of app.worlds, so
+                // anything that has to go out through `app` (push_and_broadcast_line,
+                // PromptUpdate) is collected here and flushed after the loop. Both were
+                // previously missing entirely - the disconnected-world branch pushed a line
+                // that no client ever received, and the connected branch set world.prompt
+                // without telling anyone, leaving remote prompt displays stale.
+                let mut timeout_lines: Vec<(usize, String)> = Vec::new();
+                let mut timeout_prompts: Vec<(usize, String)> = Vec::new();
+                for (world_idx, world) in app.worlds.iter_mut().enumerate() {
                     if let Some(wont_echo_time) = world.wont_echo_time {
                         if now.duration_since(wont_echo_time) >= Duration::from_millis(150) {
                             if !world.trigger_partial_line.is_empty() && world.prompt.is_empty() {
@@ -15517,14 +15640,13 @@ pub async fn run_app_headless(
                                 let normalized = format!("{} ", prompt_clean.trim());
 
                                 if !world.connected {
-                                    let seq = world.next_seq;
-                                    world.next_seq += 1;
-                                    world.output_lines.push(OutputLine::new(normalized.trim().to_string(), seq));
+                                    timeout_lines.push((world_idx, normalized.trim().to_string()));
                                     world.wont_echo_time = None;
                                     continue;
                                 }
 
-                                world.prompt = normalized;
+                                world.prompt = normalized.clone();
+                                timeout_prompts.push((world_idx, normalized));
                                 world.prompt_count += 1;
 
                                 // Handle auto-login
@@ -15566,6 +15688,20 @@ pub async fn run_app_headless(
                             world.wont_echo_time = None;
                         }
                     }
+                }
+                let more_mode = app.settings.more_mode_enabled;
+                for (world_idx, text) in timeout_lines {
+                    let seq = app.worlds[world_idx].next_seq;
+                    app.worlds[world_idx].next_seq += 1;
+                    // push_line_respecting_pending (inside the helper), NOT a raw push: a
+                    // raw push planted this line's fresh high seq into output_lines ahead of
+                    // any older still-queued pending content, breaking the sorted-by-seq
+                    // invariant broadcast_released_lines depends on.
+                    let line = OutputLine::new(text, seq);
+                    app.push_and_broadcast_line(world_idx, line, more_mode);
+                }
+                for (world_idx, prompt) in timeout_prompts {
+                    app.ws_broadcast(WsMessage::PromptUpdate { world_index: world_idx, prompt });
                 }
                 // Check for expired FANSI detection windows
                 let now_fansi = std::time::Instant::now();
@@ -17485,7 +17621,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         ts: current_timestamp_secs(),
                                         from_server: true,
                                         seq, end_seq: None,
-                                        flush: false, gagged: true,
+                                        flush: false, gagged: true, highlight_colors: Vec::new(),
                                     });
                                 }
                             } else {
@@ -17527,23 +17663,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                 // For synchronized more-mode: only broadcast lines that went to output_lines
                                 if lines_to_output > 0 {
-                                    let output_lines_to_broadcast: Vec<String> = app.worlds[world_idx]
-                                        .output_lines
-                                        .iter()
-                                        .skip(output_before)
-                                        .take(lines_to_output)
-                                        .map(|line| line.text.replace('\r', ""))
-                                        .collect();
-                                    let ws_data = output_lines_to_broadcast.join("\n") + "\n";
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index: world_idx,
-                                        data: ws_data,
-                                        is_viewed: is_current,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                        seq: 0, end_seq: None,
-                                        flush: false, gagged: false,
-                                    });
+                                    // Shared range broadcaster, so the batch carries the REAL
+                                    // seqs add_output allocated. This site used to hand-roll
+                                    // the join and send `seq: 0, end_seq: None` with
+                                    // `from_server: false` for genuine world text - the client
+                                    // never recorded those seqs as delivered (a permanent gap
+                                    // for the ack audit) and mis-attributed the lines.
+                                    app.broadcast_output_range(world_idx, output_before, lines_to_output, is_current, true, false);
                                 }
 
                                 // Broadcast pending count update if it changed
@@ -17737,7 +17863,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             }),
                         }
                     }
@@ -17756,7 +17882,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    flush: false, gagged: false,
+                                    flush: false, gagged: false, highlight_colors: Vec::new(),
                                 });
                             }
                         }
@@ -17871,17 +17997,30 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
 
                 // Check proxy health for TLS proxy connections
-                for world in &mut app.worlds {
-                    if world.connected {
-                        if let Some(proxy_pid) = world.proxy_pid {
-                            if !is_process_alive(proxy_pid) {
-                                // Proxy died - mark world as disconnected
-                                world.clear_connection_state(false, false);
-                                let seq = world.next_seq;
-                                world.next_seq += 1;
-                                world.output_lines.push(OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq));
+                {
+                    // Collect first: the notice has to be emitted through `app`
+                    // (push_and_broadcast_line + WorldDisconnected), which can't be called
+                    // while `app.worlds` is mutably borrowed by this loop. Previously this
+                    // just pushed a line and broadcast nothing at all - the TUI reported the
+                    // dead proxy while every client kept showing the world as connected.
+                    let mut proxy_died: Vec<usize> = Vec::new();
+                    for (world_idx, world) in app.worlds.iter_mut().enumerate() {
+                        if world.connected {
+                            if let Some(proxy_pid) = world.proxy_pid {
+                                if !is_process_alive(proxy_pid) {
+                                    world.clear_connection_state(false, false);
+                                    proxy_died.push(world_idx);
+                                }
                             }
                         }
+                    }
+                    let more_mode = app.settings.more_mode_enabled;
+                    for world_idx in proxy_died {
+                        let seq = app.worlds[world_idx].next_seq;
+                        app.worlds[world_idx].next_seq += 1;
+                        let line = OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq);
+                        app.push_and_broadcast_line(world_idx, line, more_mode);
+                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                     }
                 }
 
@@ -17891,7 +18030,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Prompt timeout check — only fires when a world has wont_echo_time set
             _ = &mut prompt_check_sleep => {
                 let now = std::time::Instant::now();
-                for world in &mut app.worlds {
+                // Deferred emissions: this loop holds a mutable borrow of app.worlds, so
+                // anything that has to go out through `app` (push_and_broadcast_line,
+                // PromptUpdate) is collected here and flushed after the loop. Both were
+                // previously missing entirely - the disconnected-world branch pushed a line
+                // that no client ever received, and the connected branch set world.prompt
+                // without telling anyone, leaving remote prompt displays stale.
+                let mut timeout_lines: Vec<(usize, String)> = Vec::new();
+                let mut timeout_prompts: Vec<(usize, String)> = Vec::new();
+                for (world_idx, world) in app.worlds.iter_mut().enumerate() {
                     // Check if there's a partial line waiting to become a prompt
                     if let Some(wont_echo_time) = world.wont_echo_time {
                         // If 150ms+ has passed since partial line was seen
@@ -17905,14 +18052,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                 // If world is not connected, display prompt as output instead
                                 if !world.connected {
-                                    let seq = world.next_seq;
-                                    world.next_seq += 1;
-                                    world.output_lines.push(OutputLine::new(normalized.trim().to_string(), seq));
+                                    timeout_lines.push((world_idx, normalized.trim().to_string()));
                                     world.wont_echo_time = None;
                                     continue;
                                 }
 
-                                world.prompt = normalized;
+                                world.prompt = normalized.clone();
+                                timeout_prompts.push((world_idx, normalized));
                                 world.prompt_count += 1;
 
                                 // Handle auto-login (same logic as AppEvent::Prompt handler)
@@ -17954,6 +18100,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             world.wont_echo_time = None;
                         }
                     }
+                }
+                let more_mode = app.settings.more_mode_enabled;
+                for (world_idx, text) in timeout_lines {
+                    let seq = app.worlds[world_idx].next_seq;
+                    app.worlds[world_idx].next_seq += 1;
+                    // push_line_respecting_pending (inside the helper), NOT a raw push: a
+                    // raw push planted this line's fresh high seq into output_lines ahead of
+                    // any older still-queued pending content, breaking the sorted-by-seq
+                    // invariant broadcast_released_lines depends on.
+                    let line = OutputLine::new(text, seq);
+                    app.push_and_broadcast_line(world_idx, line, more_mode);
+                }
+                for (world_idx, prompt) in timeout_prompts {
+                    app.ws_broadcast(WsMessage::PromptUpdate { world_index: world_idx, prompt });
                 }
                 // Check for expired FANSI detection windows
                 let now_fansi = std::time::Instant::now();
@@ -18387,7 +18547,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ts: current_timestamp_secs(),
                                 from_server: true,
                                 seq, end_seq: None,
-                                flush: false, gagged: true,
+                                flush: false, gagged: true, highlight_colors: Vec::new(),
                             });
                             }
                         } else {
@@ -18403,17 +18563,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 (false, Some(ws_w)) => ws_w as u16,
                                 (false, None) => console_width,
                             };
+                            // Broadcast the REAL seqs add_output just allocated, via the
+                            // shared range broadcaster - this used to re-send the raw text
+                            // with `seq: 0, end_seq: None` and `from_server: false` for what
+                            // is genuine world text, so the client never recorded those seqs
+                            // as delivered (a permanent gap for the Phase C ack audit) and
+                            // mis-attributed the lines as client-generated.
+                            let output_before = app.worlds[world_idx].output_lines.len();
                             app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
-                            // Broadcast to WebSocket clients (only non-gagged)
-                            app.ws_broadcast(WsMessage::ServerData {
-                                world_index: world_idx,
-                                data,
-                                is_viewed: is_current,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false,
-                            });
+                            let output_after = app.worlds[world_idx].output_lines.len();
+                            app.broadcast_output_range(world_idx, output_before, output_after.saturating_sub(output_before), is_current, true, false);
                         }
 
                         // Mark output for redraw if this is the current world
@@ -18557,7 +18716,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         }),
                     }
                 }
@@ -18571,7 +18730,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     }
                 }

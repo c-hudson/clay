@@ -5,7 +5,7 @@ communication between a Clay server (single-user master instance, `-D`
 headless daemon, or `--multiuser` server) and its clients (the web UI, the
 webview GUI, the Rust `--console`/`--grep` remote clients, and Android).
 
-It reflects the protocol as of PROTOCOL-ROADMAP.md Phase D (2026-08-08).
+It reflects the protocol as of PROTOCOL-ROADMAP.md Phase E (2026-08-08).
 For field-level ground truth, always prefer `src/websocket.rs`'s `WsMessage`
 enum over this document — this file is prose describing that enum, not a
 replacement for it, and it has gone stale before.
@@ -271,6 +271,15 @@ skip_serializing_if = "Option::is_none")]`), `flush: bool`
 (`#[serde(default, skip_serializing_if = "is_false")]`), `gagged: bool`
 (`#[serde(default, skip_serializing_if = "is_false")]`).
 
+`highlight_colors: Vec<Option<String>>` (`#[serde(default, skip_serializing_if =
+"Vec::is_empty")]`) is parallel to the newline-separated lines in `data` and
+carries per-line `/hilite` colours. It is omitted entirely unless at least one
+line in the batch is highlighted, so the hot path pays nothing. Before it
+existed, `highlight_color` was applied to the server-side buffer but never
+transmitted live, so a highlighted line arrived and rendered plain on web/Android
+until some resync re-hydrated it from `InitialState`/`ScrollbackLines` (both of
+which do carry it per line).
+
 Four of these fields are omitted from the wire entirely when they hold their
 common-case value (bandwidth — `ServerData` is by far the highest-volume
 message type, so trimming a few bytes per line adds up): `from_server`
@@ -401,6 +410,15 @@ full `InitialState`). Note `RequestState` re-sends the *whole* `InitialState`
 snapshot — it does not by itself replay any live-output gap; a client that
 actually lost `ServerData` lines should rely on the `resume`/`acked`/
 `ResyncRequired` contract below, not `RequestState`, to recover them.
+
+**A client MUST NOT treat a `RequestState`-driven `InitialState` as if it were
+answering an `AuthRequest.resume`.** They are indistinguishable in the message
+itself, so the client has to track which one it asked for: any per-connection
+record of "worlds I asked the server to resume" must be consumed by the single
+`InitialState` that follows the `AuthRequest`, not held until the socket closes.
+Getting this wrong makes every resync look like a reconnect, so the client both
+skips its own catch-up fetch *and* waits forever for a replay the server will
+never send. See PROTOCOL-ROADMAP.md Phase E, Cause 1.
 
 `WorldStateResponse` carries **`deliverable_high_seq`** (PROTOCOL-ROADMAP.md
 Phase C): the highest seq that world currently owes a caught-up client, i.e.

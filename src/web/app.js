@@ -156,6 +156,15 @@
         return false;
     }
 
+    // Whether we hold ANY delivered seq for this world. Distinct from `contiguousFrontier()
+    // > 0` and from `_max_seq` truthiness: seq 0 is a real, legitimate value (World::next_seq
+    // starts at 0), so a world whose only delivered line is seq 0 has genuine data even
+    // though both of those read as falsy. Guarding on truthiness made such a world skip the
+    // newer-lines gap-fill entirely and fetch only older history.
+    function hasDeliveredSeqs(world) {
+        return !!(world && world._seenRanges && world._seenRanges.length > 0);
+    }
+
     // --- Resume/ack contract (PROTOCOL-ROADMAP.md Step 5) ----------------------------
     // The reconnect and keepalive-ack contract needs the highest seq such that EVERY seq up
     // to and including it has actually been received - not the highest seq SEEN, which can
@@ -672,7 +681,7 @@
     // old server, or a request this client didn't itself register) falls back to the
     // legacy world._gapFillPending heuristic.
     let nextScrollbackRequestId = 1;
-    const pendingScrollbackRequests = new Map(); // id -> { kind: 'gapfill'|'backfill', worldIndex, timer }
+    const pendingScrollbackRequests = new Map(); // id -> { kind: 'gapfill'|'backfill'|'initial-fill', worldIndex, timer }
     const SCROLLBACK_REQUEST_TIMEOUT_MS = 15000;
 
     // Registers a new outstanding scrollback request and returns its id. `kind` is
@@ -696,6 +705,33 @@
         }, SCROLLBACK_REQUEST_TIMEOUT_MS);
         pendingScrollbackRequests.set(id, { kind: kind, worldIndex: worldIndex, timer: timer });
         return id;
+    }
+
+    // Watchdog for the server's UNPROMPTED resume replay (`request_id: 0`). That reply is
+    // never registered in pendingScrollbackRequests - the client didn't ask for it, so
+    // there's no id to register - which means it has no timeout of its own. Without this,
+    // a _gapFillPending set from _resumedFromServer stays true forever if the replay never
+    // arrives, and a stuck _gapFillPending excludes the world from BOTH backfill queues
+    // (see startBackfill). Belt-and-braces alongside the resumeSentThisConnection lifetime
+    // fix in the InitialState handler: that stops the flag being set wrongly, this stops it
+    // being stuck if the replay is genuinely lost.
+    const unpromptedReplayTimers = {};   // world index -> timer id
+    function armUnpromptedReplayWatchdog(worldIndex) {
+        if (unpromptedReplayTimers[worldIndex]) clearTimeout(unpromptedReplayTimers[worldIndex]);
+        unpromptedReplayTimers[worldIndex] = setTimeout(function() {
+            delete unpromptedReplayTimers[worldIndex];
+            const world = worlds[worldIndex];
+            if (!world || !world._gapFillPending) return;
+            console.warn('Unprompted resume replay never arrived; clearing _gapFillPending and catching up', { worldIndex });
+            world._gapFillPending = false;
+            requestGapFill(worldIndex);
+        }, SCROLLBACK_REQUEST_TIMEOUT_MS);
+    }
+    function clearUnpromptedReplayWatchdog(worldIndex) {
+        if (unpromptedReplayTimers[worldIndex]) {
+            clearTimeout(unpromptedReplayTimers[worldIndex]);
+            delete unpromptedReplayTimers[worldIndex];
+        }
     }
 
     // Clears the bookkeeping for a request once its reply has arrived (or the request is
@@ -2644,6 +2680,13 @@
                     // from re-queuing a world that has nothing left to give.
                     world._backfill_exhausted = false;
                     world._gapFillPending = world._resumedFromServer;
+                    // Arm/clear the watchdog for the unprompted replay this flag is waiting
+                    // on - it carries request_id 0 and so has no registered timeout.
+                    if (world._resumedFromServer) {
+                        armUnpromptedReplayWatchdog(idx);
+                    } else {
+                        clearUnpromptedReplayWatchdog(idx);
+                    }
                     // The recompute loop below and rebuildSeenRanges() both exclude lines
                     // explicitly marked
                     // _has_real_seq: false - an ephemeral ServerData message that never
@@ -2906,6 +2949,28 @@
                 }
                 // Schedule lazy backfill of remaining scrollback history
                 startBackfill();
+                // The resume list is consumed by EXACTLY ONE InitialState - the one the
+                // server sends in reply to the AuthRequest that carried it. Clear it here,
+                // now that startBackfill() has read it, rather than waiting for the socket
+                // to close.
+                //
+                // This is the fix for "Android is missing output at the bottom after
+                // waking". A RequestState resync arrives on a still-open, already-
+                // authenticated socket: no close, no AuthRequest, no resume list, and the
+                // server sends NO unprompted replay for it (only AuthRequest.resume
+                // triggers one). But this map used to survive until close, so that resync's
+                // InitialState still found entries in it and set _resumedFromServer = true
+                // for every world - which skips requestGapFill() AND sets _gapFillPending,
+                // excluding the world from both backfill queues. The client then fetched
+                // nothing newer and sat at whatever it had before the wake, with
+                // _gapFillPending stuck true forever. RequestState is the dominant Android
+                // post-wake path, so it recurred on every wake until the socket dropped.
+                //
+                // Keying on this map (rather than the older `priorWorld &&
+                // contiguousFrontier(priorWorld) > 0` heuristic) was already meant to fix
+                // exactly this - but a map that outlives its one use behaves identically to
+                // that heuristic. The lifetime is the fix, not the key.
+                resumeSentThisConnection = new Map();
                 // Lock to specific world if URL parameter specified
                 if (lockedWorldName && !lockedWorld) {
                     for (var i = 0; i < worlds.length; i++) {
@@ -3117,7 +3182,12 @@
                             if (hasRealSeq && hasSeenSeq(world, lineSeq)) {
                                 return;
                             }
-                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false };
+                            // highlight_colors is parallel to the PRE-filter split, so index
+                            // by rawIdx (same reasoning as lineSeq above). Absent/empty means
+                            // nothing in this batch was highlighted.
+                            const lineHighlight = (Array.isArray(msg.highlight_colors) && msg.highlight_colors.length > rawIdx)
+                                ? msg.highlight_colors[rawIdx] : null;
+                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false, highlight_color: lineHighlight };
 
                             if (isGapFill) {
                                 // This batch fills a historical hole, not the tail — collect it
@@ -3760,6 +3830,15 @@
                 if (msg.world_index === currentWorldIndex && msg.count > 0) {
                     doReleasePending(msg.count);
                 }
+                // A gap-fill can come back short because the server clamped it against this
+                // world's pending backlog - more was owed, just not deliverable yet. The
+                // server reports that as backfill_complete: false so _gapFillPending stays
+                // armed; now that the backlog has released, re-drive it.
+                if (msg.world_index !== undefined && worlds[msg.world_index]
+                    && worlds[msg.world_index]._gapFillPending) {
+                    worlds[msg.world_index]._gapFillPending = false;
+                    requestGapFill(msg.world_index);
+                }
                 break;
 
             case 'ExecuteLocalCommand':
@@ -3991,6 +4070,9 @@
                 let kind;
                 if (msg.request_id === 0) {
                     kind = 'gapfill';
+                    // The unprompted replay we were waiting on has arrived - disarm its
+                    // watchdog so it can't fire later and issue a redundant gap-fill.
+                    clearUnpromptedReplayWatchdog(msg.world_index);
                 } else if (msg.request_id !== undefined && pendingScrollbackRequests.has(msg.request_id)) {
                     const entry = resolveScrollbackRequest(msg.request_id);
                     if (entry.worldIndex !== msg.world_index) {
@@ -4065,23 +4147,46 @@
                         requestGapFill(msg.world_index);
                     }
                 } else {
-                    // Response to RequestScrollback - prepend lines to output.
+                    // Response to RequestScrollback. Two shapes land here:
+                    //  - 'backfill'     : a before_seq request, i.e. OLDER history -> prepend
+                    //  - 'initial-fill' : a before_seq:null request, which the server answers
+                    //                     with the NEWEST N visible lines -> insert in seq
+                    //                     order and mark as delivered
                     if (msg.lines && msg.lines.length > 0) {
                         const wasBottom = isAtBottom();
                         const container = elements.outputContainer;
                         const oldScrollHeight = container.scrollHeight;
 
-                        // Prepend received lines (they are older than what we have)
-                        world.output_lines = msg.lines.concat(world.output_lines);
+                        if (kind === 'initial-fill') {
+                            // Newest lines, not older history. Prepending them would bury the
+                            // freshest output above whatever the world already holds (splash
+                            // text, system lines, a stale cached tail) so it never appears at
+                            // the bottom - one of the "missing output at the bottom" causes.
+                            // Skip anything already delivered, then place each line where its
+                            // seq says it belongs.
+                            for (const line of msg.lines) {
+                                if (line.seq !== undefined && hasSeenSeq(world, line.seq)) continue;
+                                if (line.seq === undefined || line.seq > maxSeenSeq(world)) {
+                                    world.output_lines.push(line);
+                                } else {
+                                    insertLinesBySeq(world, [line]);
+                                }
+                                if (line.seq !== undefined) markSeqRangeSeen(world, line.seq, line.seq);
+                            }
+                            world._max_seq = maxSeenSeq(world);
+                        } else {
+                            // Prepend received lines (they are older than what we have)
+                            world.output_lines = msg.lines.concat(world.output_lines);
 
-                        // Deliberately NOT marked into _seenRanges. This branch is the
-                        // downward-growing deep-history region (a before_seq request); the
-                        // resume/ack contract only ever covers the forward stream, and
-                        // folding a not-yet-adjacent older chunk in here would make
-                        // ranges[0] that chunk and drag contiguousFrontier() backwards.
-                        // Pre-Phase-C code excluded backfill from _max_seq/_seqGaps for the
-                        // same reason. Harmless for dedup: a gap-fill only ever asks for
-                        // seqs above the frontier, so it can't re-deliver these.
+                            // Deliberately NOT marked into _seenRanges. This branch is the
+                            // downward-growing deep-history region (a before_seq request); the
+                            // resume/ack contract only ever covers the forward stream, and
+                            // folding a not-yet-adjacent older chunk in here would make
+                            // ranges[0] that chunk and drag contiguousFrontier() backwards.
+                            // Pre-Phase-C code excluded backfill from _max_seq/_seqGaps for the
+                            // same reason. Harmless for dedup: a gap-fill only ever asks for
+                            // seqs above the frontier, so it can't re-deliver these.
+                        }
 
                         // Update oldest seq for next backfill request
                         let minSeq = Infinity;
@@ -4091,7 +4196,14 @@
                         if (minSeq !== Infinity) world._oldest_seq = minSeq;
 
                         if (msg.world_index === currentWorldIndex) {
-                            if (!wasBottom || grepRegex) {
+                            if (kind === 'initial-fill') {
+                                // Content was added at the BOTTOM, not above, so the
+                                // scrollTop correction below (which compensates for height
+                                // inserted above the viewport) must not run - it would scroll
+                                // away from the very lines we just added. Just repaint; if the
+                                // user was at the bottom, renderOutput keeps them there.
+                                renderOutput();
+                            } else if (!wasBottom || grepRegex) {
                                 // Scrolled up into history, or grep mode: the user needs to
                                 // see the new content immediately, so render synchronously
                                 // and correct scrollTop for the height added above.
@@ -4314,7 +4426,11 @@
         // range. Only the cache-hydrated case (no resume coverage possible - see
         // _resumedFromServer's comment above) still needs this client-driven request.
         worlds.forEach((world, idx) => {
-            if (world._hydratedFromLocal && world._max_seq && !world._resumedFromServer) {
+            // hasDeliveredSeqs(), not `world._max_seq` truthiness: seq 0 is a legitimate
+            // real value (World::next_seq starts at 0), so a world whose only delivered line
+            // is seq 0 used to fail this guard, skip the gap-fill, and fall through to the
+            // older-history queues only - never fetching anything newer.
+            if (world._hydratedFromLocal && hasDeliveredSeqs(world) && !world._resumedFromServer) {
                 requestGapFill(idx);
             }
         });
@@ -4470,10 +4586,20 @@
         const count = backfillPhase === 1
             ? Math.max(1, backfillPhase1Target - received)
             : Math.max(1, Math.min(BACKFILL_PHASE2_CHUNK_SIZE, backfillTotalTarget - received));
-        // before_seq may legitimately be null here (a world that received zero
-        // lines in InitialState despite having real history) - the daemon handles
-        // that as "send the last N lines", so send it through rather than skipping.
-        const requestId = registerScrollbackRequest(worldIndex, 'backfill');
+        // before_seq may legitimately be null here (a world that received zero lines in
+        // InitialState despite having real history) - the server handles that as "send the
+        // last N VISIBLE lines" (handle_request_scrollback's third branch), i.e. it returns
+        // the NEWEST lines, not older history.
+        //
+        // That difference matters for how the reply is applied, so tag the kind HERE rather
+        // than re-deriving it from _oldest_seq when the reply lands (by then it may have
+        // changed). A newest-lines reply must be inserted in seq order and marked into
+        // _seenRanges; blind-prepending it - which is correct for a genuine before_seq
+        // request - buries the newest output above whatever the world already holds and
+        // leaves it unmarked. That was a second, independent cause of "missing output at
+        // the bottom".
+        const isInitialFill = world._oldest_seq === null || world._oldest_seq === undefined;
+        const requestId = registerScrollbackRequest(worldIndex, isInitialFill ? 'initial-fill' : 'backfill');
         send({
             type: 'RequestScrollback',
             world_index: worldIndex,
@@ -4683,7 +4809,10 @@
         // the damage itself. An explicit fromSeq (the ResyncRequired path, where the server
         // names the range it owes us) still wins.
         const seq = hasExplicitFromSeq ? fromSeq : contiguousFrontier(world);
-        if (!hasExplicitFromSeq && !seq) {
+        // `!seq` would also reject a legitimate frontier of 0 and silently downgrade to an
+        // older-history-only backfill. Fall back only when we genuinely hold no delivered
+        // seqs for this world.
+        if (!hasExplicitFromSeq && !hasDeliveredSeqs(world)) {
             queueNormalBackfill(worldIndex);
             return;
         }

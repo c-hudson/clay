@@ -1474,3 +1474,120 @@ ignoring `is_current` on arrival.
 - **No on-device / two-instance run.** The scenario in the report — master TUI on A, a second
   instance on B, plus the "client 2 switching in must not disturb client 1's markers" case and
   the Android background/foreground cycle — has not been exercised against real processes.
+
+---
+
+# Phase E — three independent "missing output at the bottom" causes
+
+Reported: the Android client attached to a remote Clay is missing lines at the **bottom**
+(newest end) of a world compared to the TUI, frequently, and ambiguously "new input or
+existing output". Three unrelated mechanisms each produce exactly that.
+
+## Cause 1 (primary) — after a resync the client fetched nothing newer
+
+`resumeSentThisConnection` was cleared **only on socket close**
+(`app.js` `handleSessionDisconnect`), but `_resumedFromServer` is re-derived from it on
+**every** `InitialState`.
+
+A `RequestState` resync runs on a still-open, already-authenticated socket: no close, no
+`AuthRequest`, no resume list — and the server sends **no** unprompted replay for it (only
+`AuthRequest.resume` triggers one). But the map from that connection's original `AuthRequest`
+was still populated, so the resync's `InitialState` set `_resumedFromServer = true`, which
+skips `requestGapFill()` *and* sets `_gapFillPending`, which excludes the world from **both**
+the phase-1 and phase-2 backfill queues. Net: nothing newer was ever fetched, and
+`_gapFillPending` stuck true forever (the `request_id: 0` replay is never registered, so no
+watchdog existed). `RequestState` is the dominant Android post-wake path, so this recurred on
+every wake until the socket actually closed.
+
+Phase B had already tried to fix this class of bug by keying on `resumeSentThisConnection`
+instead of the older `priorWorld && contiguousFrontier(priorWorld) > 0` heuristic — but a map
+that outlives its one use behaves *identically* to that heuristic. **The lifetime was the bug,
+not the key.**
+
+**Fix:** consume the map at the end of the `InitialState` handler (it applies to exactly one
+`InitialState`), plus a standalone watchdog so `_gapFillPending` can never stay true with
+nothing in flight.
+
+## Cause 2 — server-side lines that were never broadcast at all
+
+The TUI rendered them; no client ever heard about them, and each burned a `seq`, leaving a
+permanent hole in every client's delivered-range tracking.
+
+| Site | Line |
+|---|---|
+| `handle_disconnected` | the world's final prompt (the `"Disconnected."` line right below it *was* broadcast, which is what made this easy to miss) |
+| `handle_prompt` | disconnected-world prompt-as-output — set `needs_output_redraw`, returned, broadcast nothing |
+| WONT-ECHO prompt timeout ×2 | raw `output_lines.push` inside `for world in &mut app.worlds`, so no `app` to broadcast from; also bypassed `push_line_respecting_pending`, violating the sorted-by-seq invariant. The connected branch also set `world.prompt` without ever sending `PromptUpdate`. |
+| TLS-proxy-death notice ×3 | including the **daemon** copy, which is what Android attaches to; also never sent `WorldDisconnected`, so clients kept showing the world as connected |
+
+**Fix:** a shared `App::push_and_broadcast_line` (push + broadcast iff it landed in
+`output_lines`, always with `end_seq: Some(seq)`), and restructuring the two loop-bound sites
+to collect and emit after the borrow ends. The duplication across the console/headless/daemon
+loops is why these drifted apart, so they now route through one helper.
+
+## Cause 3 — a `before_seq: null` reply carries the NEWEST lines but was prepended
+
+`requestBackfillChunk` sends `before_seq: world._oldest_seq`, which is `null` for a world with
+no real seqs — and the server answers that with the **newest** N visible lines. The reply was
+registered `kind: 'backfill'`, so the handler blind-`concat`ed it *above* existing content and
+deliberately left it out of `_seenRanges`. New output landed hundreds of lines up.
+
+**Fix:** tag the kind at request time (`'initial-fill'` vs `'backfill'`) rather than
+re-deriving it on the reply, and place an initial-fill in seq order, marked into `_seenRanges`.
+The scroll compensation is skipped for it too — that correction assumes content was inserted
+*above* the viewport.
+
+## Also fixed
+
+- **Inverted seq span on the more-mode-off drain.** `World::add_output` appended drained
+  `pending_lines` (higher seqs) *after* the loop's newly-allocated lines, so
+  `broadcast_output_range` derived `end_seq < first_seq`; the client read that as a mid-buffer
+  gap-fill and spliced the batch far from the tail. The drain now runs **before** the append
+  loop, which keeps `output_lines` sorted and — as a bonus — puts those released lines inside
+  the range every caller already broadcasts, so they reach clients at all for the first time.
+  `broadcast_output_range` additionally derives its span from the slice min/max, so a future
+  invariant violation degrades to a harmlessly wide forward span instead of misplacing text.
+- **`highlight_color` on the live path.** Applied to the buffer but never transmitted, so
+  highlighted lines rendered plain until a resync. `ServerData` gains
+  `highlight_colors: Vec<Option<String>>`, parallel to the lines in `data` and omitted entirely
+  when nothing in the batch is highlighted (zero cost on the hot path).
+- **Two `requestGapFill` degradations.** `_max_seq` truthiness and `contiguousFrontier() === 0`
+  both treated a legitimate seq 0 as "no data" (`World::next_seq` starts at 0), silently
+  downgrading to older-history-only. Now keyed on `hasDeliveredSeqs()`.
+- **Pending-clamped gap-fill stalled the pump.** A result truncated by `pending_floor_seq()`
+  reported `backfill_complete`, clearing `_gapFillPending` while the client was still behind.
+  It now reports incomplete, and `PendingReleased` re-drives it.
+- **`seq: 0` broadcasts that stored a real seq** (`SystemMessage`, both Slack/Discord
+  non-gagged paths): the line arrived but its seq was never recorded, leaving a permanent gap
+  for the Phase C ack audit. They now carry the real seqs via `broadcast_output_range`.
+
+## Deliberately out of scope
+
+- **~200 `App::add_output(...)` call sites target the console's `current_world_index`**
+  regardless of which world the action/trigger fired on. They *do* broadcast — the data is
+  mis-filed into the wrong client-side buffer, not lost. Threading a world index through every
+  command handler is a large, separate refactor.
+- **~9 reload/crash-recovery messages** are not broadcast, but clients get `ServerReloading`
+  and fully re-bootstrap immediately after, so broadcasting them would be redundant.
+- **TF hook output is discarded entirely** (`bridge.rs`'s `messages`/`errors` dropped at all
+  four call sites). Real, but invisible on *both* TUI and client — a different bug.
+
+## Status
+
+732/732 `cargo test` (726 baseline + 6 new), clean `cargo clippy` on both the musl and
+`webview-gui,native-audio` feature sets, clean musl build. Five mutations each fail a specific
+test: un-broadcasting the disconnect prompt, moving the drain back after the append loop,
+reverting the span to first/last, reporting a clamped gap-fill complete, and dropping
+`highlight_colors`.
+
+## Verification gaps
+
+- **No JS runtime in the sandbox** — `app.js` was not executed. The two decision points changed
+  here (the `_resumedFromServer` derivation and the reply-kind routing) were transliterated to
+  Python and exercised, including asserting that the *old* behaviour reproduces the bug
+  (fetches nothing after a resync, leaves `_gapFillPending` stuck); the surrounding handler
+  edits are reviewed and brace-balance-checked only. This is the fourth consecutive change to
+  carry this gap.
+- **No two-instance or on-device run.** The reported scenario — background the phone past the
+  heartbeat, resume (forcing the `RequestState` path), compare each world's bottom against the
+  TUI — has not been performed against real processes.

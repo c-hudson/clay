@@ -386,7 +386,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             }),
                         }
                     }
@@ -400,7 +400,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         }
                     }
@@ -495,16 +495,30 @@ pub async fn run_daemon_server() -> io::Result<()> {
 
                 // Check proxy health
                 #[cfg(all(unix, not(target_os = "android")))]
-                for world in &mut app.worlds {
-                    if world.connected {
-                        if let Some(proxy_pid) = world.proxy_pid {
-                            if !crate::platform::is_process_alive(proxy_pid) {
-                                world.clear_connection_state(false, false);
-                                let seq = world.next_seq;
-                                world.next_seq += 1;
-                                world.output_lines.push(OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq));
+                {
+                    // Collect first, emit after: the notice goes out through `app`
+                    // (push_and_broadcast_line + WorldDisconnected), which can't run while
+                    // `app.worlds` is mutably borrowed here. This is the daemon copy - the
+                    // one Android attaches to - and it previously broadcast nothing at all,
+                    // so the client kept showing the world connected after the proxy died.
+                    let mut proxy_died: Vec<usize> = Vec::new();
+                    for (world_idx, world) in app.worlds.iter_mut().enumerate() {
+                        if world.connected {
+                            if let Some(proxy_pid) = world.proxy_pid {
+                                if !crate::platform::is_process_alive(proxy_pid) {
+                                    world.clear_connection_state(false, false);
+                                    proxy_died.push(world_idx);
+                                }
                             }
                         }
+                    }
+                    let more_mode = app.settings.more_mode_enabled;
+                    for world_idx in proxy_died {
+                        let seq = app.worlds[world_idx].next_seq;
+                        app.worlds[world_idx].next_seq += 1;
+                        let line = OutputLine::new_client("TLS proxy terminated. Connection lost.".to_string(), seq);
+                        app.push_and_broadcast_line(world_idx, line, more_mode);
+                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                     }
                 }
             }
@@ -623,7 +637,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         } else {
                             let mut sent_to_server = false;
@@ -708,7 +722,7 @@ pub async fn handle_daemon_ws_message(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    flush: false, gagged: false,
+                                    flush: false, gagged: false, highlight_colors: Vec::new(),
                                 });
                             }
                         }
@@ -824,7 +838,7 @@ pub async fn handle_daemon_ws_message(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    flush: false, gagged: false,
+                                    flush: false, gagged: false, highlight_colors: Vec::new(),
                                 });
                             }
                         } else {
@@ -836,7 +850,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         }
                     } else if world_index < app.worlds.len() {
@@ -876,7 +890,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                     } else {
@@ -887,7 +901,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     }
                 }
@@ -949,7 +963,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     } else {
                         let mut output = String::new();
@@ -971,7 +985,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     }
                     app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -986,7 +1000,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                         app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
                         app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
@@ -998,7 +1012,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0, end_seq: None,
-                            flush: false, gagged: false,
+                            flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                         app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                     }
@@ -1017,7 +1031,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 }
                 Command::Notify { message } => {
@@ -1060,7 +1074,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         }
                         Err(e) => {
@@ -1071,7 +1085,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         }
                     }
@@ -1091,7 +1105,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 }
                 Command::Import { .. } => {
@@ -1105,7 +1119,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 }
                 // Commands that execute locally on the client
@@ -1129,7 +1143,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 }
                 // AddWorld - add or update world definition
@@ -1224,7 +1238,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
 
                             app.worlds[world_index].connection_id += 1;
@@ -1262,7 +1276,7 @@ pub async fn handle_daemon_ws_message(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0, end_seq: None,
-                                    flush: false, gagged: false,
+                                    flush: false, gagged: false, highlight_colors: Vec::new(),
                                 });
                             }
                         } else {
@@ -1273,7 +1287,7 @@ pub async fn handle_daemon_ws_message(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0, end_seq: None,
-                                flush: false, gagged: false,
+                                flush: false, gagged: false, highlight_colors: Vec::new(),
                             });
                         }
                     }
@@ -1374,7 +1388,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                     return;
                 }
@@ -1387,7 +1401,7 @@ pub async fn handle_daemon_ws_message(
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false,
+                    flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
 
                 // Attempt connection
@@ -1427,7 +1441,7 @@ pub async fn handle_daemon_ws_message(
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0, end_seq: None,
-                        flush: false, gagged: false,
+                        flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 }
             }
@@ -1455,7 +1469,7 @@ pub async fn handle_daemon_ws_message(
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0, end_seq: None,
-                    flush: false, gagged: false,
+                    flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
                 if !app.worlds[world_index].connected {
                     let settings = app.worlds[world_index].settings.clone();
@@ -2129,7 +2143,7 @@ keep_alive_type=Generic
                                         ts: current_timestamp_secs(),
                                         from_server: false,
                                         seq: 0, end_seq: None,
-                                        flush: false, gagged: false,
+                                        flush: false, gagged: false, highlight_colors: Vec::new(),
                                     }, Some(&requesting_username));
                                 }
                             // Create per-user connection
@@ -2164,7 +2178,7 @@ keep_alive_type=Generic
                                         ts: current_timestamp_secs(),
                                         from_server: false,
                                         seq: 0, end_seq: None,
-                                        flush: false, gagged: false,
+                                        flush: false, gagged: false, highlight_colors: Vec::new(),
                                     }, Some(&requesting_username));
                                 }
                             }
@@ -2200,7 +2214,7 @@ keep_alive_type=Generic
                                     ts: current_timestamp_secs(),
                                     from_server: true,
                                     seq: 0, end_seq: None,
-                                    flush: false, gagged: false,
+                                    flush: false, gagged: false, highlight_colors: Vec::new(),
                                 }, Some(&username));
                             }
                         }
@@ -3243,7 +3257,7 @@ fn broadcast_owner_scoped_released_lines(ws: &WebSocketServer, world_index: usiz
                 ts,
                 from_server: batch_from_server,
                 seq: 0, end_seq: None,
-                flush: false, gagged: batch_gagged,
+                flush: false, gagged: batch_gagged, highlight_colors: Vec::new(),
             }, owner);
             batch.clear();
             batch_from_server = line.from_server;
@@ -3260,7 +3274,7 @@ fn broadcast_owner_scoped_released_lines(ws: &WebSocketServer, world_index: usiz
             ts,
             from_server: batch_from_server,
             seq: 0, end_seq: None,
-            flush: false, gagged: batch_gagged,
+            flush: false, gagged: batch_gagged, highlight_colors: Vec::new(),
         }, owner);
     }
 }

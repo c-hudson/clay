@@ -6405,7 +6405,7 @@ if you're more curious.\"";
             seq,
             end_seq: None,
             flush: false,
-            gagged: false,
+            gagged: false, highlight_colors: Vec::new(),
         };
 
         // Fill the channel past its capacity of 4 - the 5th broadcast must overflow it.
@@ -6477,6 +6477,7 @@ if you're more curious.\"";
             end_seq: None,
             flush: false,
             gagged: false,
+            highlight_colors: Vec::new(),
         }
     }
 
@@ -7192,7 +7193,7 @@ if you're more curious.\"";
             // case, same skip_serializing_if treatment as flush/gagged.
             end_seq: None,
             flush: false,
-            gagged: false,
+            gagged: false, highlight_colors: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("from_server"), "from_server should be omitted when true: {}", json);
@@ -7202,7 +7203,7 @@ if you're more curious.\"";
 
         let round_tripped: WsMessage = serde_json::from_str(&json).unwrap();
         match round_tripped {
-            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, end_seq, flush, gagged } => {
+            WsMessage::ServerData { world_index, data, is_viewed, ts, from_server, seq, end_seq, flush, gagged, .. } => {
                 assert_eq!(world_index, 0);
                 assert_eq!(data, "hello\n");
                 assert!(is_viewed);
@@ -7232,7 +7233,7 @@ if you're more curious.\"";
             seq: 0,
             end_seq: Some(5),
             flush: false,
-            gagged: false,
+            gagged: false, highlight_colors: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"from_server\":false"), "from_server:false must be present on the wire: {}", json);
@@ -7636,6 +7637,233 @@ if you're more curious.\"";
         assert!(!log.iter().any(|m| matches!(m,
             WsMessage::ClaimedNew { .. } | WsMessage::ReleasedNew { .. })),
             "arrival must not broadcast any ownership change. Log: {:?}", log);
+    }
+
+    // ========================================================================
+    // Output that used to reach the TUI but never any client
+    // ========================================================================
+
+    /// Drains every `WsMessage` the fake client received, decoding BOTH outbound forms.
+    ///
+    /// A broadcast is `Outbound::Shared` (serialized once, shared by `Arc<str>` across every
+    /// recipient); only single-recipient sends are `Outbound::Message`. A drain that matches
+    /// just the latter silently sees nothing from any broadcast path.
+    fn drain_ws_messages(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>)
+        -> Vec<crate::websocket::WsMessage>
+    {
+        use crate::websocket::Outbound;
+        let mut out = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            match item {
+                Outbound::Message(msg) => out.push(*msg),
+                Outbound::Shared(json) => {
+                    if let Ok(msg) = serde_json::from_str::<crate::websocket::WsMessage>(&json) {
+                        out.push(msg);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every ServerData the fake client received, as (seq, end_seq, text).
+    fn drain_server_data(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>)
+        -> Vec<(u64, Option<u64>, String)>
+    {
+        use crate::websocket::WsMessage;
+        drain_ws_messages(rx).into_iter().filter_map(|m| {
+            if let WsMessage::ServerData { seq, end_seq, data, .. } = m {
+                Some((seq, end_seq, data))
+            } else { None }
+        }).collect()
+    }
+
+    /// `handle_disconnected` pushes the world's final prompt into `output_lines` and used to
+    /// broadcast nothing for it — the TUI showed a line at the bottom that no client ever
+    /// received, and the consumed seq left a permanent hole in every client's delivered-range
+    /// tracking. The `"Disconnected."` line immediately below it was always broadcast, which
+    /// is what made the omission so easy to miss.
+    #[test]
+    fn test_disconnect_broadcasts_the_final_prompt_line() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = true;
+        w.prompt = "HP:100> ".to_string();
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.handle_disconnected(0);
+
+        let sent = drain_server_data(&mut rx);
+        assert!(sent.iter().any(|(_, _, d)| d.contains("HP:100>")),
+            "the final prompt must be broadcast, not just rendered locally. Got: {sent:?}");
+        assert!(sent.iter().any(|(_, _, d)| d.contains("Disconnected.")),
+            "precondition: the Disconnected. line was always broadcast. Got: {sent:?}");
+
+        // ...and it must carry the line's REAL seq, so the client can account for it.
+        let prompt_line = app.worlds[0].output_lines.iter()
+            .find(|l| l.text.contains("HP:100>")).expect("prompt line in output_lines");
+        let (seq, end_seq, _) = sent.iter().find(|(_, _, d)| d.contains("HP:100>")).unwrap();
+        assert_eq!(*seq, prompt_line.seq, "must broadcast the stored seq, not 0");
+        assert_eq!(*end_seq, Some(prompt_line.seq),
+            "end_seq present is what marks the seq as real - seq 0 is a legitimate value");
+    }
+
+    /// `handle_prompt` on a disconnected world renders the prompt as an output line and used
+    /// to `return` without broadcasting anything at all.
+    #[test]
+    fn test_disconnected_world_prompt_as_output_is_broadcast() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = false;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.handle_prompt(0, b"login: ");
+
+        let sent = drain_server_data(&mut rx);
+        assert!(sent.iter().any(|(_, _, d)| d.contains("login:")),
+            "a prompt shown as output on a disconnected world must reach clients too. Got: {sent:?}");
+    }
+
+    /// A batch must never carry `end_seq < first_seq`. That happened when more-mode was
+    /// toggled off while a world was paused: the drained pending lines (higher seqs) were
+    /// appended AFTER the loop's newly-allocated lines, leaving `output_lines` unsorted. The
+    /// client read the inverted span as a mid-buffer gap-fill and spliced the batch far from
+    /// the tail — "the TUI shows it, the phone doesn't".
+    #[test]
+    fn test_more_mode_off_drain_keeps_output_sorted_and_span_forward() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        // A paused world holding a backlog.
+        w.paused = true;
+        for seq in 0..3u64 {
+            w.pending_lines.push(OutputLine::new(format!("held {seq}"), seq));
+        }
+        w.next_seq = 3;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = false;
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+
+        push_server_line(&mut app, 0, "fresh line");
+
+        let seqs: Vec<u64> = app.worlds[0].output_lines.iter().map(|l| l.seq).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted,
+            "output_lines must stay sorted by seq across the drain (CLAUDE.md invariant): {seqs:?}");
+
+        for (seq, end_seq, data) in drain_server_data(&mut rx) {
+            if let Some(end) = end_seq {
+                assert!(end >= seq,
+                    "broadcast span must never be inverted: seq={seq} end_seq={end} data={data:?}");
+            }
+        }
+    }
+
+    /// `broadcast_output_range` must derive its span from the min/max of the slice, so that
+    /// even a buffer that somehow ends up unsorted produces a forward span rather than one
+    /// the client mistakes for a mid-buffer gap-fill.
+    #[test]
+    fn test_broadcast_span_is_forward_even_for_an_unsorted_slice() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        // Deliberately out of order - the invariant is defended elsewhere; this asserts the
+        // broadcaster degrades to a wide-but-forward span instead of an inverted one.
+        w.output_lines.push(OutputLine::new("high".to_string(), 9));
+        w.output_lines.push(OutputLine::new("low".to_string(), 2));
+        w.next_seq = 10;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.broadcast_output_range(0, 0, 2, true, true, false);
+
+        let sent = drain_server_data(&mut rx);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let (seq, end_seq, _) = &sent[0];
+        assert_eq!(*seq, 2, "first_seq must be the slice minimum");
+        assert_eq!(*end_seq, Some(9), "end_seq must be the slice maximum");
+    }
+
+    /// `/hilite` colours are applied to the server-side buffer but used to be dropped on the
+    /// live path entirely, so a highlighted line arrived and rendered plain until a resync.
+    /// The array is omitted (empty) when nothing in the batch is highlighted, so the common
+    /// path stays free.
+    #[test]
+    fn test_highlight_colors_ride_the_live_broadcast() {
+        use crate::websocket::WsMessage;
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.output_lines.push(OutputLine::new("plain".to_string(), 0));
+        let mut hot = OutputLine::new("hot".to_string(), 1);
+        hot.highlight_color = Some("red".to_string());
+        w.output_lines.push(hot);
+        w.next_seq = 2;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.broadcast_output_range(0, 0, 2, true, true, false);
+
+        let mut colors = None;
+        for m in drain_ws_messages(&mut rx) {
+            if let WsMessage::ServerData { highlight_colors, .. } = m {
+                colors = Some(highlight_colors);
+            }
+        }
+        assert_eq!(colors, Some(vec![None, Some("red".to_string())]),
+            "highlight colours must be parallel to the lines in `data`");
+
+        // Nothing highlighted -> omitted entirely.
+        app.worlds[0].output_lines[1].highlight_color = None;
+        app.broadcast_output_range(0, 0, 2, true, true, false);
+        let mut colors2: Option<Vec<Option<String>>> = None;
+        for m in drain_ws_messages(&mut rx) {
+            if let WsMessage::ServerData { highlight_colors, .. } = m {
+                colors2 = Some(highlight_colors);
+            }
+        }
+        assert_eq!(colors2, Some(Vec::new()),
+            "an unhighlighted batch must carry no colour array at all (zero wire cost)");
+    }
+
+    /// A gap-fill truncated by the pending clamp must NOT report `backfill_complete` — more
+    /// is owed, it just isn't deliverable yet. Reporting completion cleared the client's
+    /// _gapFillPending and stopped its pump while it was still behind.
+    #[test]
+    fn test_pending_clamped_gap_fill_is_not_reported_complete() {
+        use crate::websocket::WsMessage;
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        // Deliverable: seq 1. Withheld behind the pending floor: seq 5 (invariant-violating
+        // shape the clamp exists for).
+        w.output_lines.push(OutputLine::new("deliverable".to_string(), 1));
+        w.output_lines.push(OutputLine::new("above the floor".to_string(), 5));
+        w.pending_lines.push(OutputLine::new("queued".to_string(), 4));
+        w.next_seq = 6;
+        app.worlds.push(w);
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.handle_request_scrollback(client_id, 0, 500, None, Some(0), Some(1));
+
+        let mut complete = None;
+        for m in drain_ws_messages(&mut rx) {
+            if let WsMessage::ScrollbackLines { backfill_complete, .. } = m {
+                complete = Some(backfill_complete);
+            }
+        }
+        assert_eq!(complete, Some(false),
+            "a clamped result must stay incomplete so the client keeps its gap-fill armed");
     }
 
     // ========================================================================
