@@ -7339,6 +7339,7 @@ if you're more curious.\"";
             visible_columns: 80,
             dimensions: None,
             paused: false,
+            visible: true,
             disconnected_at: None,
         });
 
@@ -7381,6 +7382,7 @@ if you're more curious.\"";
             visible_columns: 80,
             dimensions: None,
             paused: false,
+            visible: true,
             disconnected_at: Some(std::time::Instant::now()), // just disconnected
         });
         assert!(app.ws_client_viewing(0),
@@ -7402,6 +7404,7 @@ if you're more curious.\"";
             visible_columns: 80,
             dimensions: None,
             paused: false,
+            visible: true,
             disconnected_at: Some(long_ago),
         });
         assert!(!app.ws_client_viewing(0),
@@ -7416,13 +7419,13 @@ if you're more curious.\"";
         // Actively connected client with the larger viewport.
         app.ws_client_worlds.insert(1, ClientViewState {
             world_index: 0, visible_lines: 40, visible_columns: 100,
-            dimensions: None, paused: false, disconnected_at: None,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
         // Disconnected (but within grace) client with a smaller viewport - must not
         // constrain more-mode pagination for the still-present viewer above.
         app.ws_client_worlds.insert(2, ClientViewState {
             world_index: 0, visible_lines: 10, visible_columns: 40,
-            dimensions: None, paused: false, disconnected_at: Some(std::time::Instant::now()),
+            dimensions: None, paused: false, visible: true, disconnected_at: Some(std::time::Instant::now()),
         });
         assert_eq!(app.min_viewer_lines(0), Some(40),
             "the disconnected client's smaller viewport must be excluded from the min");
@@ -7439,15 +7442,15 @@ if you're more curious.\"";
             .expect("test host must have > 16 minutes of monotonic clock uptime");
         app.ws_client_worlds.insert(1, ClientViewState { // still connected: keep
             world_index: 0, visible_lines: 24, visible_columns: 80,
-            dimensions: None, paused: false, disconnected_at: None,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
         app.ws_client_worlds.insert(2, ClientViewState { // disconnected, within grace: keep
             world_index: 0, visible_lines: 24, visible_columns: 80,
-            dimensions: None, paused: false, disconnected_at: Some(std::time::Instant::now()),
+            dimensions: None, paused: false, visible: true, disconnected_at: Some(std::time::Instant::now()),
         });
         app.ws_client_worlds.insert(3, ClientViewState { // disconnected, expired: reap
             world_index: 0, visible_lines: 24, visible_columns: 80,
-            dimensions: None, paused: false, disconnected_at: Some(long_ago),
+            dimensions: None, paused: false, visible: true, disconnected_at: Some(long_ago),
         });
 
         app.reap_stale_ws_client_worlds();
@@ -8004,6 +8007,7 @@ if you're more curious.\"";
             visible_columns: 80,
             dimensions: None,
             paused: false,
+            visible: true,
             disconnected_at: None,
         });
         assert!(app.ws_client_viewing(1), "precondition: B counts as viewed");
@@ -8036,7 +8040,7 @@ if you're more curious.\"";
         push_server_line(&mut app, 0, "arrived before we looked");
         app.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: 0, visible_lines: 24, visible_columns: 80,
-            dimensions: None, paused: false, disconnected_at: None,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
         });
 
         let owner = app.display_owner_id(client_id);
@@ -8058,6 +8062,78 @@ if you're more curious.\"";
         app.handle_client_visibility(client_id, true);
         assert_eq!(app.worlds[0].output_lines.last().unwrap().display_id, Some(owner),
             "text that arrived while backgrounded must become ▶ on return");
+    }
+
+    /// Backgrounding must never be mistaken for an operator pause. `ClientViewState::paused`
+    /// is user-visible state (`/remote --pause`) that `handle_request_state` reports back as
+    /// the client's PAUSED badge; backgrounding writes `visible` instead. Folding the two
+    /// together made a resync landing inside the background window light that badge up, with
+    /// nothing to clear it on return.
+    #[test]
+    fn test_backgrounding_does_not_look_like_an_operator_pause() {
+        use crate::websocket::WsMessage;
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+        app.current_world_index = 0;
+
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 0, visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        });
+
+        app.handle_client_visibility(client_id, false);
+
+        let st = app.ws_client_worlds.get(&client_id).unwrap();
+        assert!(!st.visible, "backgrounding must clear `visible`");
+        assert!(!st.paused, "backgrounding must NOT touch `paused` - that's operator state");
+        assert!(!app.ws_client_viewing(0), "a hidden client must not count as a viewer");
+
+        // A resync arriving while backgrounded must not report a pause.
+        while rx.try_recv().is_ok() {}
+        app.handle_request_state(client_id);
+        let paused_msgs: Vec<_> = drain_ws_messages(&mut rx).into_iter()
+            .filter(|m| matches!(m, WsMessage::PausedState { .. })).collect();
+        assert!(paused_msgs.is_empty(),
+            "a resync while backgrounded must not send PausedState - it would light the \
+             PAUSED badge as though an operator had paused the session. Got: {paused_msgs:?}");
+
+        // Returning restores viewer status.
+        app.handle_client_visibility(client_id, true);
+        assert!(app.ws_client_viewing(0), "a visible client counts as a viewer again");
+    }
+
+    /// The converse: an operator pause DOES set `paused`, keeps the client out of the viewer
+    /// set, and is still re-asserted on resync so the badge survives a reconnect.
+    #[test]
+    fn test_operator_pause_still_sets_paused_and_is_reasserted_on_resync() {
+        use crate::websocket::WsMessage;
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+        app.current_world_index = 9999; // console is elsewhere, so only the client can view
+
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 0, visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        });
+        assert!(app.ws_client_viewing(0), "precondition");
+
+        let toggled = app.ws_toggle_client_paused(client_id);
+        assert!(toggled.is_some(), "toggle should find the client");
+        let st = app.ws_client_worlds.get(&client_id).unwrap();
+        assert!(st.paused, "an operator pause sets `paused`");
+        assert!(st.visible, "...and must NOT clear `visible` - the app is still on screen");
+        assert!(!app.ws_client_viewing(0), "a paused session doesn't count as a viewer either");
+
+        while rx.try_recv().is_ok() {}
+        app.handle_request_state(client_id);
+        let reasserted = drain_ws_messages(&mut rx).into_iter().any(|m|
+            matches!(m, WsMessage::PausedState { paused: true }));
+        assert!(reasserted,
+            "an operator pause must be re-asserted on resync so the PAUSED badge survives");
     }
 
     /// A stable client_uid keeps ▶ ownership across a reconnect, which is what makes a brief

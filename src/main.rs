@@ -1952,8 +1952,23 @@ pub struct ClientViewState {
     pub visible_columns: usize,
     /// Client's output area dimensions (width, height) for NAWS
     pub dimensions: Option<(u16, u16)>,
-    /// Mirrors WsClientInfo.paused — cached here for lock-free reads in output path
+    /// Mirrors WsClientInfo.paused — cached here for lock-free reads in output path.
+    /// Means ONLY "an operator ran `/remote --pause` on this session" — it is surfaced to
+    /// the user as the `PAUSED` badge and re-asserted on `RequestState`
+    /// (`handle_request_state`), so nothing else may borrow it. See `visible` below.
     pub paused: bool,
+    /// Whether the client is currently on screen. False while a mobile client is
+    /// backgrounded — which is NOT a disconnect (Android keeps its socket open behind
+    /// `MainActivity.onPause`), so it is signalled explicitly via
+    /// `WsMessage::ClientVisibility` and handled in `App::handle_client_visibility`.
+    ///
+    /// Deliberately a separate field from `paused` rather than reusing it. They have the
+    /// same effect on `ws_client_viewing` — neither counts as watching — but only `paused`
+    /// is user-visible state that `handle_request_state` reports back as `PausedState`.
+    /// Folding backgrounding into `paused` made a resync that landed while the app was in
+    /// the background light up the `PAUSED` badge as though an operator had paused the
+    /// session, with nothing to clear it on return.
+    pub visible: bool,
     /// When this client's WebSocket disconnected, if it currently has no live connection.
     /// `None` means "actively connected" (the normal case). Kept (rather than removing the
     /// entry outright) for a grace window after disconnect so a client's own current world
@@ -5974,12 +5989,14 @@ impl App {
         let visible_columns = prev.map(|s| s.visible_columns).unwrap_or(0);
         let dimensions = prev.and_then(|s| s.dimensions);
         let paused = prev.map(|s| s.paused).unwrap_or(false);
+        let visible = prev.map(|s| s.visible).unwrap_or(true);
         self.ws_client_worlds.insert(client_id, ClientViewState {
             world_index: idx,
             visible_lines,
             visible_columns,
             dimensions,
             paused,
+            visible,
             disconnected_at: None,
         });
         // Update client's world in WebSocket server (async state)
@@ -6304,7 +6321,8 @@ impl App {
         let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
         let dimensions = prev.and_then(|s| s.dimensions);
         let paused = prev.map(|v| v.paused).unwrap_or(false);
-        self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
+        let visible = prev.map(|v| v.visible).unwrap_or(true);
+        self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
         // Update client's world in WebSocket server (async state)
         self.ws_set_client_world(client_id, Some(world_index));
         // This client is now displaying the new world - claim whatever accumulated unviewed
@@ -8072,6 +8090,7 @@ impl App {
                 visible_columns: 0,
                 dimensions: None,
                 paused: new_paused,
+                visible: true,
                 disconnected_at: None,
             });
         }
@@ -8136,15 +8155,22 @@ impl App {
     /// A brief transport drop on a still-visible client is the opposite case and is covered
     /// by `WS_VIEWER_GRACE` (10s), which deliberately keeps the markers intact.
     ///
-    /// Implemented by reusing `ClientViewState::paused`, the existing "doesn't count as a
-    /// viewer" flag (`ws_client_viewing` already excludes it) — a hidden client and a
-    /// `--More--`-paused one want exactly the same treatment here.
+    /// Tracked in its own `ClientViewState::visible` field. `ws_client_viewing` excludes
+    /// both it and `paused`, since neither counts as watching — but they are NOT
+    /// interchangeable: `paused` is operator state (`/remote --pause`) that
+    /// `handle_request_state` reports back as the client's `PAUSED` badge, whereas
+    /// backgrounding is invisible to the user and must never light that badge.
     fn handle_client_visibility(&mut self, client_id: u64, visible: bool) {
         let Some(state) = self.ws_client_worlds.get_mut(&client_id) else { return };
-        if state.paused != visible {
+        if state.visible == visible {
             return; // already in this state - nothing to release or claim
         }
-        state.paused = !visible;
+        // `visible`, NOT `paused`. `paused` means only "an operator ran /remote --pause" and
+        // is reported back to the client as the PAUSED badge by handle_request_state; writing
+        // backgrounding into it made a resync that landed while the app was in the background
+        // light that badge up as though an operator had paused the session, with nothing to
+        // clear it on return.
+        state.visible = visible;
         let world_idx = state.world_index;
         let owner = self.display_owner_id(client_id);
         if visible {
@@ -8187,7 +8213,7 @@ impl App {
     }
 
     pub(crate) fn ws_client_viewing(&self, world_index: usize) -> bool {
-        self.ws_client_worlds.values().any(|v| v.world_index == world_index && !v.paused
+        self.ws_client_worlds.values().any(|v| v.world_index == world_index && !v.paused && v.visible
             && v.disconnected_at.map(|t| t.elapsed() < WS_VIEWER_GRACE).unwrap_or(true))
     }
 
@@ -9262,6 +9288,7 @@ impl App {
                     visible_columns: 0,
                     dimensions: None,
                     paused: false,
+                    visible: true,
                     disconnected_at: None,
                 });
                 // Signal event loop to trigger web reconnects
@@ -9375,6 +9402,7 @@ impl App {
             visible_columns: 0,
             dimensions: None,
             paused: false,
+            visible: true,
             disconnected_at: None,
         });
         // Broadcast activity count to new client
@@ -10165,7 +10193,8 @@ impl App {
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
+                    let visible = prev.map(|v| v.visible).unwrap_or(true);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(idx));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                     // Also send ExecuteLocalCommand so web clients can switch their local view
@@ -10460,7 +10489,8 @@ impl App {
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
+                    let visible = prev.map(|v| v.visible).unwrap_or(true);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(world_index));
                 }
 
@@ -10474,7 +10504,8 @@ impl App {
                     let visible_lines = prev.map(|v| v.visible_lines).unwrap_or(0);
                     let visible_columns = prev.map(|v| v.visible_columns).unwrap_or(0);
                     let paused = prev.map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, disconnected_at: None });
+                    let visible = prev.map(|v| v.visible).unwrap_or(true);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns, dimensions, paused, visible, disconnected_at: None });
                     self.ws_set_client_world(client_id, Some(world_index));
                     self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                     // Send active media for the new world
@@ -10540,7 +10571,8 @@ impl App {
                     let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
                     let vc = visible_columns.unwrap_or_else(|| self.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
                     let paused = self.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
-                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, disconnected_at: None });
+                    let visible = self.ws_client_worlds.get(&client_id).map(|v| v.visible).unwrap_or(true);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
                     // Update client's world in WebSocket server so broadcast_to_world_viewers works
                     self.ws_set_client_world(client_id, Some(world_index));
                 }

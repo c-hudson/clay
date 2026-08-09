@@ -1771,7 +1771,8 @@ pub async fn handle_daemon_ws_message(
                 let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
                 let vc = visible_columns.unwrap_or_else(|| app.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
                 let paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
-                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, disconnected_at: None });
+                let visible = app.ws_client_worlds.get(&client_id).map(|v| v.visible).unwrap_or(true);
+                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
             }
         }
         // Was entirely absent from this handler (T40) - a daemon-attached client reporting its

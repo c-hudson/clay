@@ -1449,12 +1449,24 @@ drawing ▶. An owner id is precisely that fix.
   drop keeps a client's markers even though it gets a fresh connection id. Empty uid falls back
   to the connection id (one-shot Rust clients, older peers). `CONSOLE_DISPLAY_ID = u64::MAX` is
   the local TUI's reserved id.
-- **Visibility**: `ClientVisibility { visible }`, driven from `app.js`'s `visibilitychange` and
+- **Visibility**: `ClientVisibility { visible }`, tracked in its own `ClientViewState::visible`
+  field, driven from `app.js`'s `visibilitychange` and
   Android's `MainActivity.onPause`/`onResume`. Backgrounding is **not** a disconnect (the socket
   stays open), so it must be signalled: a hidden client stops counting as a viewer and releases
   its markers, so text arriving meanwhile is unviewed and becomes ▶ on return.
   `WS_VIEWER_GRACE` therefore drops from 5 min to **10s** — it now only has to outlast a
   transport blip, not absorb backgrounding.
+- **Follow-up (found while answering a question about the status bar, fixed after v1.5.16):**
+  visibility originally *reused* `ClientViewState::paused` as its "doesn't count as a viewer"
+  flag. Both do keep a client out of `ws_client_viewing`, but they are not interchangeable:
+  `paused` means only `/remote --pause`, and `handle_request_state` reports it back to the
+  client as the user-visible `PAUSED` badge. So a resync landing while an Android client was
+  backgrounded — the 2-missed-heartbeat `triggerResync()` path runs in the background — would
+  light `PAUSED` as though an operator had paused the session, and
+  `handle_client_visibility` sent no `PausedState` on return to clear it. Split into a
+  separate `visible` field, carried over (not reset) at every `ClientViewState` reinsertion
+  site so a world switch or view-state update can't silently mark a backgrounded client
+  visible again.
 - **Persistence**: `viewed` rides in the `[output:N]` section as a `v` flag; `display_id` is
   deliberately not persisted (a reload has no live clients, so markers restore unowned). The
   old save-time watermark widening is gone — a displayed line already carries `viewed: true`.

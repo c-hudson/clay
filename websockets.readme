@@ -367,7 +367,10 @@ rendering changes:
   picks them up. This is what makes one instance's clear invisible to another,
   which the previous per-world watermark model could not do.
 
-**`ClientVisibility { visible }`** (client → server) exists because
+**`ClientVisibility { visible }`** (client → server) is tracked separately from the
+operator-pause state behind `/remote --pause` — both keep a client out of the
+viewer set, but only the latter is reported back as `PausedState` and shown as
+the client's `PAUSED` badge. It exists because
 backgrounding is *not* a disconnect — Android keeps its socket open behind
 `MainActivity.onPause` — so the server cannot infer it. A hidden client stops
 counting as a viewer and releases its markers, so text arriving meanwhile is
