@@ -2782,6 +2782,40 @@ pub struct World {
     naws_enabled: bool,          // True if NAWS telnet option was negotiated
     naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
     pub next_seq: u64,               // Next sequence number for output lines (for debugging)
+    /// Every seq this server has actually put on the wire for this world, as sorted,
+    /// coalesced, inclusive ranges — the server-side mirror of app.js's `_seenRanges`
+    /// (PROTOCOL-ROADMAP.md Phase F).
+    ///
+    /// This exists because "the TUI shows a line that no remote client ever received" has now
+    /// recurred through six independent code paths, and every fix so far has been a repair of
+    /// the one path that happened to get noticed. Each of those bugs has the same signature:
+    /// a line lands in `output_lines`, consumes a real seq, and no `ServerData` ever carries
+    /// that seq. A client cannot detect this on its own — the seq is simply absent from a
+    /// stream it has no independent record of — so the hole is permanent and silent.
+    ///
+    /// With the ledger the check is a one-line invariant the server can evaluate against
+    /// itself: every seq in `output_lines` below `pending_floor_seq()` must be covered here.
+    /// `App::audit_broadcast_ledger` runs that comparison on the keepalive tick, logs any
+    /// violation to `~/.clay/remote.log` as `SEQ-LEDGER` (with the line's text, so the
+    /// offending path is identifiable from a user's log alone), and re-broadcasts the missing
+    /// lines so the bug self-heals instead of costing the user their output.
+    ///
+    /// Wrapped in a `Mutex` because the broadcast helpers that feed it (`ws_broadcast*`) take
+    /// `&self` — several of their callers are already inside an iteration over `self.worlds`.
+    /// A `RefCell` would be the cheaper fit for that alone, but it costs `World` its `Sync`
+    /// bound, and the `webview-gui` build holds a `&World` iterator across an `.await` inside
+    /// a `tokio::spawn` (`webview_gui.rs` -> `daemon.rs`), which requires the future to be
+    /// `Send`. Lock traffic here is one uncontended acquire per broadcast.
+    ///
+    /// Bounded by coalescing: normally exactly one range. `LEDGER_MAX_RANGES` is a backstop
+    /// for a pathological stream; on overflow the two oldest ranges merge, which only ever
+    /// *widens* claimed coverage and so can never manufacture a false hole.
+    pub(crate) broadcast_ledger: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// Highest seq `audit_broadcast_ledger` has already examined for this world. The audit is
+    /// forward-only: a hole can only be created at broadcast time, so a seq that passed once
+    /// never needs re-checking, and this keeps the per-tick cost proportional to new output
+    /// rather than to buffer size.
+    pub(crate) ledger_audited_upto: Option<u64>,
     /// Number of upcoming user-typed sends to skip capturing entirely (see
     /// `App::record_user_input`). Set to 6 whenever this world connects, so a manually-typed
     /// MUD login line (e.g. `connect Bob hunter2`) or a password/PIN prompt response in the
@@ -2890,6 +2924,8 @@ impl World {
             naws_enabled: false,
             naws_sent_size: None,
             next_seq: 0,
+            broadcast_ledger: std::sync::Mutex::new(Vec::new()),
+            ledger_audited_upto: None,
             login_capture_guard: 6,
             reader_name: None,
             gmcp_enabled: false,
@@ -3083,6 +3119,62 @@ impl World {
             .rev()
             .find(|l| floor.map_or(true, |f| l.seq < f))
             .map(|l| l.seq)
+    }
+
+    /// Record `[start, end]` (inclusive) as broadcast, coalescing with any adjacent or
+    /// overlapping range so `broadcast_ledger` stays sorted, minimal and non-overlapping.
+    /// Byte-for-byte the same algorithm as app.js's `markSeqRangeSeen` — deliberately, so the
+    /// two sides of the contract can't drift in what "delivered" means.
+    pub(crate) fn mark_broadcast(&self, start: u64, end: u64) {
+        let end = end.max(start);
+        let mut ranges = self.ledger_guard();
+        // First range that could touch or follow [start, end]. `r.1 + 1 >= start` rather than
+        // `r.1 >= start` so an exactly-adjacent range coalesces instead of staying split.
+        let mut i = 0;
+        while i < ranges.len() && ranges[i].1 + 1 < start {
+            i += 1;
+        }
+        let (mut new_start, mut new_end) = (start, end);
+        let mut remove = 0;
+        while i + remove < ranges.len() && ranges[i + remove].0 <= end.saturating_add(1) {
+            let r = ranges[i + remove];
+            new_start = new_start.min(r.0);
+            new_end = new_end.max(r.1);
+            remove += 1;
+        }
+        ranges.splice(i..i + remove, [(new_start, new_end)]);
+        // Backstop only — merging the two oldest ranges closes the oldest hole by fiat, which
+        // widens claimed coverage and therefore can only ever suppress a report, never invent
+        // one.
+        const LEDGER_MAX_RANGES: usize = 512;
+        while ranges.len() > LEDGER_MAX_RANGES {
+            ranges[1].0 = ranges[0].0;
+            ranges.remove(0);
+        }
+    }
+
+    /// Lock the ledger, recovering from a poisoned mutex instead of panicking. This is
+    /// diagnostic bookkeeping on a hot broadcast path: a panic elsewhere while the lock was
+    /// held must not then take down every subsequent broadcast, and the worst case for
+    /// reusing the data is a stale range, which the audit treats as "already sent" — it can
+    /// suppress a report, never manufacture one.
+    fn ledger_guard(&self) -> std::sync::MutexGuard<'_, Vec<(u64, u64)>> {
+        self.broadcast_ledger.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Has `seq` been broadcast? Exact membership, O(log n).
+    pub(crate) fn was_broadcast(&self, seq: u64) -> bool {
+        self.ledger_guard()
+            .binary_search_by(|r| {
+                if seq < r.0 {
+                    std::cmp::Ordering::Greater
+                } else if seq > r.1 {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
     }
 
     pub(crate) fn record_input_line(&mut self, text: &str, log_input: bool, viewed: bool) -> (u64, bool) {
@@ -3910,6 +4002,17 @@ enum WsAsyncAction {
     Disconnect { world_index: usize, prev_index: usize },
     /// Need to trigger hot reload (exec_reload).
     Reload,
+}
+
+/// One line found in `output_lines` whose seq was never broadcast — see
+/// `App::audit_broadcast_ledger`. Carries exactly what the repair broadcast needs: the real
+/// seq, the text, and the two flags a client applies per `ServerData` message rather than per
+/// line (which is why repair runs are grouped by them).
+struct LedgerHole {
+    seq: u64,
+    text: String,
+    gagged: bool,
+    from_server: bool,
 }
 
 impl App {
@@ -7458,7 +7561,12 @@ impl App {
                 is_viewed: is_current,
                 ts: current_timestamp_secs(),
                 from_server: false,
-                seq, end_seq: None,
+                // `end_seq: Some(seq)`, never None - see push_and_broadcast_line's doc
+                // comment. A bare `seq` with no end_seq reads as "not a real seq" on the
+                // client whenever it happens to be 0 (a world's very first line), so that
+                // line's seq never enters the client's delivered-range record and shows up
+                // as a permanent hole to the ack audit.
+                seq, end_seq: Some(seq),
                 flush: false,
                 gagged: true, // clients store it and skip rendering unless F2/show-tags
                 highlight_colors: Vec::new(),
@@ -7609,6 +7717,19 @@ impl App {
             writeln!(file, "showing_splash: {}", world.showing_splash)?;
             writeln!(file, "partial_line: {:?}", if world.partial_line.is_empty() { "".to_string() } else { format!("({} chars) {:?}", world.partial_line.len(), &world.partial_line[..world.partial_line.len().min(100)]) })?;
             writeln!(file, "partial_in_pending: {}", world.partial_in_pending)?;
+            // Broadcast ledger (PROTOCOL-ROADMAP.md Phase F). Normally exactly one range
+            // spanning 0..=next_seq-1; more than one means seqs were consumed by lines that
+            // never went out on the wire, which is the "the TUI shows it, the phone doesn't"
+            // signature. `ledger_audited_upto` shows how far the self-audit has swept.
+            {
+                let ledger = world.ledger_guard();
+                writeln!(file, "broadcast_ledger: {} range(s) {:?}{}",
+                    ledger.len(),
+                    ledger.iter().take(8).collect::<Vec<_>>(),
+                    if ledger.len() > 8 { " ..." } else { "" })?;
+            }
+            writeln!(file, "ledger_audited_upto: {:?}", world.ledger_audited_upto)?;
+            writeln!(file, "next_seq: {}", world.next_seq)?;
             if let Some(ps) = world.pending_since {
                 writeln!(file, "pending_since: {:?} ago", ps.elapsed())?;
             }
@@ -7881,7 +8002,32 @@ impl App {
     }
 
     /// Broadcast a message to all authenticated WebSocket clients and the embedded GUI (if any)
+    /// Record a fan-out `ServerData`'s real seq span into the target world's broadcast ledger
+    /// (PROTOCOL-ROADMAP.md Phase F). Called from the two helpers that actually fan a message
+    /// out to every client — `ws_broadcast` and `ws_broadcast_to_world`. Deliberately NOT
+    /// called from `ws_send_to_client`: a single-recipient send is not delivery to everyone,
+    /// and marking it as such would mask a real hole for every other client. (Every
+    /// `ws_send_to_client` `ServerData` today is an ephemeral `seq: 0, end_seq: None`
+    /// system/command reply, so nothing is lost by that exclusion.)
+    ///
+    /// `end_seq.is_some()` widens the real-seq test exactly as app.js's `hasRealSeq` does —
+    /// seq 0 is legitimate for a world's first line, so a present `end_seq` is what
+    /// distinguishes it from a defaulted 0.
+    fn note_broadcast(&self, msg: &WsMessage) {
+        let WsMessage::ServerData { world_index, seq, end_seq, flush, .. } = msg else { return };
+        let Some(world) = self.worlds.get(*world_index) else { return };
+        if *flush {
+            // The client wipes its own delivered-seq record on a flush, so ours must match or
+            // every pre-flush seq would look like an outstanding hole forever after.
+            world.ledger_guard().clear();
+        }
+        if *seq > 0 || end_seq.is_some() {
+            world.mark_broadcast(*seq, end_seq.unwrap_or(*seq));
+        }
+    }
+
     pub(crate) fn ws_broadcast(&self, msg: WsMessage) {
+        self.note_broadcast(&msg);
         #[cfg(test)]
         {
             if let Ok(mut log) = self.ws_broadcast_log.lock() {
@@ -8118,6 +8264,7 @@ impl App {
 
     /// Broadcast a message only to clients viewing a specific world
     fn ws_broadcast_to_world(&self, world_index: usize, msg: WsMessage) {
+        self.note_broadcast(&msg);
         #[cfg(test)]
         {
             if let Ok(mut log) = self.ws_broadcast_log.lock() {
@@ -8827,7 +8974,7 @@ impl App {
                 is_viewed: is_current,
                 ts: current_timestamp_secs(),
                 from_server: true,
-                seq, end_seq: None,
+                seq, end_seq: Some(seq),
                 flush: false,
                 gagged: true, highlight_colors: Vec::new(),
             });
@@ -8914,7 +9061,7 @@ impl App {
                 is_viewed: true,
                 ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                 from_server: false,
-                seq, end_seq: None,
+                seq, end_seq: Some(seq),
                 flush: false, gagged: false, highlight_colors: Vec::new(),
             });
         }
@@ -8939,7 +9086,7 @@ impl App {
                     is_viewed: true,
                     ts: msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                     from_server: false,
-                    seq, end_seq: None,
+                    seq, end_seq: Some(seq),
                     flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
             }
@@ -9453,6 +9600,135 @@ impl App {
     ///
     /// Not wired into multiuser: `daemon.rs` emits `seq: 0, end_seq: None` universally, so
     /// there are no real seqs there to audit.
+    /// Server-side self-audit (PROTOCOL-ROADMAP.md Phase F): find every line sitting in
+    /// `output_lines` whose seq this server never actually put on the wire, report it, and
+    /// send it.
+    ///
+    /// This is the detector for the whole "the TUI shows a line the phone never got" bug
+    /// class, rather than for any one path that produces it. The class has now been fixed six
+    /// times — a bare `output_lines.push` with no broadcast, a disconnect prompt, a
+    /// disconnected-world prompt, an inverted span, a broadcast arm that stopped matching, a
+    /// release batch sized by the wrong formula — and each fix only closed the path that
+    /// happened to be noticed. The invariant checked here is path-independent: whatever the
+    /// mechanism, the symptom is always a stored line with an unbroadcast seq, and the audit
+    /// sees it without needing to know which code path left it there.
+    ///
+    /// What is deliberately NOT a violation:
+    /// - lines at/above `pending_floor_seq()` — held in `pending_lines` on purpose, broadcast
+    ///   later by `broadcast_released_lines`;
+    /// - the newest line in the buffer — it may be mid-flight this very tick, and re-sending
+    ///   it a moment early would be a self-inflicted duplicate;
+    /// - an outstanding partial line — excluded from broadcasts by design until completed.
+    ///
+    /// Forward-only: `ledger_audited_upto` means each seq is examined at most once, so the
+    /// per-tick cost tracks new output rather than buffer size.
+    ///
+    /// Returns the number of holes found, for tests and `/dump`.
+    pub(crate) fn audit_broadcast_ledger(&mut self) -> usize {
+        let mut repairs: Vec<(usize, Vec<LedgerHole>)> = Vec::new();
+        for (idx, world) in self.worlds.iter_mut().enumerate() {
+            let Some(newest) = world.output_lines.last().map(|l| l.seq) else { continue };
+            // Never audit up to the newest line: a broadcast for it may be in flight right
+            // now (the ledger is written at fan-out time, but a caller can push first and
+            // broadcast a few statements later).
+            let ceiling = match world.pending_floor_seq() {
+                Some(floor) => floor.min(newest),
+                None => newest,
+            };
+            // An outstanding partial is the last VISIBLE line and is legitimately unsent.
+            let partial_seq = if !world.partial_line.is_empty() && !world.partial_in_pending {
+                world.output_lines.iter().rev().find(|l| !l.gagged).map(|l| l.seq)
+            } else {
+                None
+            };
+            let floor = world.ledger_audited_upto;
+            let mut holes: Vec<LedgerHole> = Vec::new();
+            let mut highest_examined = None;
+            // Start past everything a previous pass already cleared. `output_lines` is sorted
+            // by seq (CLAUDE.md invariant), so this is a binary search; the per-line `floor`
+            // guard below still runs, so a buffer that somehow violated the invariant would
+            // only make the audit skip lines, never invent a hole.
+            let start = match floor {
+                Some(f) => world.output_lines.partition_point(|l| l.seq <= f),
+                None => 0,
+            };
+            for line in world.output_lines.iter().skip(start) {
+                if line.seq >= ceiling {
+                    break; // output_lines is sorted by seq (CLAUDE.md invariant)
+                }
+                if floor.is_some_and(|f| line.seq <= f) || Some(line.seq) == partial_seq {
+                    continue;
+                }
+                highest_examined = Some(line.seq);
+                if !world.was_broadcast(line.seq) {
+                    holes.push(LedgerHole {
+                        seq: line.seq,
+                        text: line.text.replace('\r', ""),
+                        gagged: line.gagged,
+                        from_server: line.from_server,
+                    });
+                }
+            }
+            if let Some(high) = highest_examined {
+                world.ledger_audited_upto = Some(high);
+            }
+            if !holes.is_empty() {
+                repairs.push((idx, holes));
+            }
+        }
+
+        let mut total = 0;
+        for (world_idx, holes) in repairs {
+            total += holes.len();
+            let world_name = self.worlds[world_idx].name.clone();
+            for hole in &holes {
+                // `.chars().take(..)`, never a byte slice: MUD text is UTF-8 and a byte index
+                // lands mid-codepoint on any accented character or emoji, which would panic
+                // the daemon from inside its own diagnostic. Same form as the sibling
+                // Report* handlers.
+                crate::http::log_remote_event("SEQ-LEDGER", "server", &format!(
+                    "world={}:'{}' seq={} was stored but never broadcast (gagged={}, from_server={}) - resending: {:?}",
+                    world_idx, world_name, hole.seq, hole.gagged, hole.from_server,
+                    hole.text.chars().take(120).collect::<String>()));
+            }
+            // Repair. Grouped into runs sharing (gagged, from_server) AND contiguous seqs, so
+            // each emitted batch's `seq..=end_seq` span covers exactly the lines it carries -
+            // the same grouping rule as `broadcast_released_lines`, and for the same reason:
+            // a client derives each line's seq as `msg.seq + index`.
+            let mut run: Vec<LedgerHole> = Vec::new();
+            let flush_run = |app: &Self, run: &mut Vec<LedgerHole>| {
+                if run.is_empty() {
+                    return;
+                }
+                let data = run.iter().map(|h| h.text.clone()).collect::<Vec<_>>().join("\n") + "\n";
+                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                    world_index: world_idx,
+                    data,
+                    is_viewed: true,
+                    ts: current_timestamp_secs(),
+                    from_server: run[0].from_server,
+                    seq: run[0].seq,
+                    end_seq: Some(run[run.len() - 1].seq),
+                    flush: false,
+                    gagged: run[0].gagged,
+                    highlight_colors: Vec::new(),
+                });
+                run.clear();
+            };
+            for hole in holes {
+                let breaks = run.last().is_some_and(|last: &LedgerHole| {
+                    last.seq + 1 != hole.seq || last.gagged != hole.gagged || last.from_server != hole.from_server
+                });
+                if breaks {
+                    flush_run(self, &mut run);
+                }
+                run.push(hole);
+            }
+            flush_run(self, &mut run);
+        }
+        total
+    }
+
     pub(crate) fn audit_client_acks(&mut self, client_id: u64) {
         // Worlds with real seqs only. `next_seq == 0` means nothing has ever been assigned
         // (a brand-new world), so there is nothing to be behind on.
@@ -10867,6 +11143,16 @@ impl App {
                 crate::http::log_remote_event("OUT-OF-ORDER", &ip, &format!("[{}] in '{}': recovered {} line(s) starting at seq={} that had arrived out of order",
                     source, world_name, recovered_count, line_seq));
             }
+            WsMessage::ReportGap { world_index, hole_start, hole_end, attempts, source } => {
+                // Always-on, same reasoning as the sibling reports above: only fires when a
+                // client has genuinely given up on a range of output, which is exactly the
+                // event that has been invisible in the field (PROTOCOL-ROADMAP.md Phase F).
+                let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+                let ip = self.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+                crate::http::log_remote_event("SEQ-HOLE", &ip, &format!("[{}] in '{}': gave up on seq {}..={} ({} line(s)) after {} gap-fill attempt(s) returned nothing for it",
+                    source, world_name, hole_start, hole_end,
+                    hole_end.saturating_sub(hole_start).saturating_add(1), attempts));
+            }
             WsMessage::ClientTypeDeclaration { client_type } => {
                 // Update client type in WebSocket server
                 self.ws_set_client_type(client_id, client_type);
@@ -10930,6 +11216,13 @@ impl App {
                 // that has gone quiet is exactly the one worth auditing, and the audit reads
                 // the recorded state rather than this payload.
                 self.audit_client_acks(client_id);
+                // ...and check the server against ITSELF (PROTOCOL-ROADMAP.md Phase F). The
+                // ack audit only sees holes a client is aware of; this one catches lines that
+                // were never broadcast to anybody, which no client can report because it has
+                // no independent record of what it should have received. Idempotent and
+                // forward-only (`ledger_audited_upto`), so running it once per client
+                // keepalive costs nothing after the first.
+                self.audit_broadcast_ledger();
             }
             _ => {
                 // Other message types handled elsewhere or ignored
@@ -17652,7 +17945,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         is_viewed: is_current,
                                         ts: current_timestamp_secs(),
                                         from_server: true,
-                                        seq, end_seq: None,
+                                        seq, end_seq: Some(seq),
                                         flush: false, gagged: true, highlight_colors: Vec::new(),
                                     });
                                 }
@@ -18578,7 +18871,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 is_viewed: is_current,
                                 ts: current_timestamp_secs(),
                                 from_server: true,
-                                seq, end_seq: None,
+                                seq, end_seq: Some(seq),
                                 flush: false, gagged: true, highlight_colors: Vec::new(),
                             });
                             }

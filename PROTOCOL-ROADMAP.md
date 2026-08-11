@@ -1603,3 +1603,155 @@ reverting the span to first/last, reporting a clamped gap-fill complete, and dro
 - **No two-instance or on-device run.** The reported scenario — background the phone past the
   heartbeat, resume (forcing the `RequestState` path), compare each world's bottom against the
   TUI — has not been performed against real processes.
+
+---
+
+# Phase F — stop fixing this one path at a time
+
+## The report
+
+> The android app is still having sync issues for the world output. Recently I've had it
+> display a world and it seems to have gotten the last line but skipped the second-to-last
+> line and then had the third-to-last line. Sometimes it just misses the last lines.
+>
+> Consider any logging or testing that can be put in to help automate the detection of the
+> issue as claude has taken several stabs at getting this correct in the last week or two.
+
+That second paragraph is the actual brief. Phases B through E each found a real bug and fixed
+it, and each fix was specific to the path that happened to be noticed: a bare
+`output_lines.push` with no broadcast, a disconnect prompt, a disconnected-world prompt, an
+inverted `seq..=end_seq` span, a broadcast match arm that silently stopped matching, a release
+batch sized by the wrong formula. Six fixes, six paths, one recurring symptom. The pattern says
+the problem is not any individual path — it is that **nothing checks the invariant**, so the
+seventh path costs another round trip through a user report.
+
+## What this phase adds
+
+Three detectors, none of which depends on knowing which code path is at fault.
+
+### 1. Server-side broadcast ledger (`World::broadcast_ledger`, `App::audit_broadcast_ledger`)
+
+The server now records every seq it actually puts on the wire, as coalesced inclusive ranges —
+the exact mirror of `app.js`'s `_seenRanges`, using the same algorithm so the two sides cannot
+drift in what "delivered" means. On each keepalive it compares that ledger against
+`output_lines`:
+
+> **Every line in `output_lines` below `pending_floor_seq()` must have been broadcast.**
+
+Any line that fails is logged to `~/.clay/remote.log` as `SEQ-LEDGER` *with its text* — so the
+offending path is identifiable from a user's log alone — and then **re-broadcast**, grouped into
+runs sharing `(gagged, from_server)` and contiguous seqs so each repair batch's span covers
+exactly the lines it carries. The bug class now self-heals instead of costing the user output.
+
+Deliberately not violations: lines at/above the pending floor (held for more-mode on purpose),
+the newest line in the buffer (a broadcast for it may be in flight this instant), and an
+outstanding partial line. Forward-only via `ledger_audited_upto`, so per-tick cost tracks new
+output rather than buffer size.
+
+`/dump` prints the ledger per world. A healthy world shows exactly one range, `(0, next_seq-1)`.
+More than one range is the signature of this whole bug class.
+
+### 2. Client-side gap reporting (`ReportGap` → `SEQ-HOLE`)
+
+The ledger proves what the *server* sent. It cannot see a hole that opens in transit — a dropped
+frame, a full outbound channel, an Android socket blip. When the client gives up on a seq range
+(see below) it now reports the exact range, and the server logs `SEQ-HOLE`. Between the two,
+every hole is attributable to one side or the other rather than being a symptom without a
+location.
+
+### 3. A path-independent fuzz test (`test_fuzz_every_output_line_is_broadcast`)
+
+200 seeded runs, 40 random operations each, over the operations that mutate `output_lines`
+(server chunks with and without a trailing partial prompt, captured user input, client-generated
+text, `/recall` blocks, pending release, more-mode toggling). After every step it asserts three
+things against what actually came out of the broadcast channel:
+
+- every stored line's seq was broadcast;
+- every batch's declared `seq..=end_seq` span matches the number of lines it carries (a wider
+  span makes the client mark seqs as delivered that it never received — silent, permanent loss);
+- the `seq → text` map a Phase-C client would build (`lineSeq = msg.seq + rawIdx`) matches what
+  the server actually stored. **A misfiled seq is the reported symptom**: file line N+1 under
+  seq N, and the real seq N+1 is later dropped as an already-seen duplicate, leaving one line
+  missing with its neighbours present.
+
+It also runs the shipping `App::audit_broadcast_ledger` as a second, independent oracle and
+fails if the two disagree — so a blind spot in the safety net users rely on is itself a test
+failure.
+
+## Bugs found and fixed
+
+**1. Unbounded gap-fill request loop (client).** `requestGapFill()` anchors on
+`contiguousFrontier()`. A seq the server can no longer produce — Ctrl+L's selective flush and a
+splash clear both remove lines from `output_lines`, and the archive prepend caps it at 10k —
+freezes that anchor. Every reply then re-delivers only lines the client already holds, the
+frontier does not move, and because a full chunk came back `backfill_complete` is false, so the
+`ScrollbackLines` handler immediately re-requests the identical range. Forever, on a live
+socket, on the client most likely to be metered.
+
+Verified by transliterating the `_seenRanges` family and the handler's loop condition to Python:
+against a server whose `output_lines` is `0..999` with seq 500 removed, the old code issues
+requests without bound (cut off at 10,000); the new code terminates in 2 requests, identifies
+the lost seq exactly, and advances the frontier to 999. Fix: count consecutive no-progress
+replies, and at 2 declare the oldest hole lost (`closeOldestSeqHole`), report it via `ReportGap`,
+and move on.
+
+**2. Ack-audit suppression was permanent (server).** `evaluate_ack_audit` fired one
+`ResyncRequired` per (world, stall position) and then went silent forever. That is exactly wrong
+when the resync itself never arrived — and the likeliest cause of a stall is a full outbound
+channel, i.e. precisely the condition under which the `ResyncRequired` is also dropped. A client
+could sit permanently behind with the server having written it off. Now retries every
+`AUDIT_REFIRE_INTERVAL` (6) audits while still stalled: often enough to survive a lost message,
+rare enough that a genuinely unfillable hole costs one message per ~3 minutes rather than one
+per 30 seconds.
+
+**3. `end_seq: None` alongside a real seq (server, 6 sites).** `push_and_broadcast_line`'s
+contract is that `end_seq` is always `Some(seq)`, because a present `end_seq` is what marks the
+seq as real — seq 0 is legitimate for a world's first line. Six single-line broadcast sites
+(captured user input, the gagged-line path in `process_server_data`, both `handle_disconnected`
+messages, and the two Slack/Discord gagged paths) sent a bare `seq`. Whenever that seq was 0 the
+client filed the line under an array index instead of a seq and never recorded it as delivered —
+a permanent hole for the ack audit to chase.
+
+**4. `appendNewLine` dropped `highlight_color` (client).** `renderOutput()` applies a `/hilite`
+background; the incremental live-append path did not. A highlighted line rendered plain until
+something forced a full re-render, at which point it silently changed appearance. The colour now
+threads through `handleIncomingLine` and the local more-mode queue as well.
+
+## What was ruled out
+
+Worth recording so the next investigation doesn't re-walk it. The live single-user broadcast
+path is clean: the fuzz above finds nothing, and neither does an end-to-end run. `World::partial_line`
+is effectively dead in production — all four `World::add_output` callers force a trailing
+newline, and `process_server_data` holds its partial in `trigger_partial_line` instead — so the
+`had_partial_in_output` adjustments in `add_output`/`add_output_to_world`/`emit_client_lines`/
+`process_server_data` never fire. The client's ANSI-only-line filter matches the TUI's
+(`process_output_line` skips `is_ansi_only_line` too), so it is not a source of divergence.
+
+## Status
+
+738/738 `cargo test` (734 baseline + 4 new: the path-independent fuzz invariant and three
+ledger-audit tests, one of which guards the audit's own diagnostic against panicking on
+multi-byte MUD text), clean `cargo clippy`, clean musl build.
+
+**End-to-end verified against real processes.** A `-D` daemon, a scripted MUD emitting numbered
+lines interleaved with blank lines, ANSI-only lines and unterminated prompts, and a WebSocket
+client written for this purpose that speaks the real protocol (challenge-response auth,
+`InitialState`, `flush`, `PongCheck`). Result over 280 lines: 280 seqs delivered, **0 holes, 0
+span mismatches, 0 misfiled seqs**; `/dump` reports `broadcast_ledger: 1 range(s) [(0, 279)]`
+against `next_seq: 280`, and `ledger_audited_upto: Some(278)` confirms the self-audit ran on the
+real `PongCheck` path inside the daemon. `remote.log` contains no `SEQ-LEDGER` or `SEQ-HOLE`
+entries, which is the correct clean result.
+
+## Verification gaps
+
+- **Still no JS runtime in the sandbox.** `app.js` was not executed. The gap-fill loop and the
+  `_seenRanges` operations it depends on were transliterated to Python and exercised (including
+  asserting the old code livelocks); the rest of the edit is reviewed and checked with a
+  string/regex/template-aware brace balancer, validated against the pre-change file. Fifth
+  consecutive change carrying this gap — a headless JS runtime in the dev environment would
+  retire it.
+- **No on-device Android run**, and no two-instance comparison of a world's tail against the TUI.
+- **The detector has not been observed firing in a live process** — only in unit tests. Producing
+  a real hole requires injecting a bug into a running binary.
+- **Multiuser is out of scope**, as in Phase C: `daemon.rs`'s multiuser path emits
+  `seq: 0, end_seq: None` universally, so there are no real seqs there to audit.

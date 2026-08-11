@@ -1761,6 +1761,11 @@ pub async fn handle_daemon_ws_message(
             // audit the master-WS PongCheck handler runs, since `-D` serves the same
             // single-user clients over the same protocol.
             app.audit_client_acks(client_id);
+            // ...and the server's audit of itself (PROTOCOL-ROADMAP.md Phase F). Must be
+            // here as well as in the master-WS handler: `-D` is what Android's local-server
+            // mode runs, so leaving it out would blind the detector on the platform this
+            // whole bug class keeps showing up on.
+            app.audit_broadcast_ledger();
         }
         WsMessage::Ping => {
             app.ws_send_to_client(client_id, WsMessage::Pong);
@@ -1818,6 +1823,16 @@ pub async fn handle_daemon_ws_message(
             let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
             crate::http::log_remote_event("OUT-OF-ORDER", &ip, &format!("[{}] in '{}': recovered {} line(s) starting at seq={} that had arrived out of order",
                 source, world_name, recovered_count, line_seq));
+        }
+        WsMessage::ReportGap { world_index, hole_start, hole_end, attempts, source } => {
+            // Always-on, same reasoning as the sibling reports above: only fires when a
+            // client has genuinely given up on a range of output, which is exactly the
+            // event that has been invisible in the field (PROTOCOL-ROADMAP.md Phase F).
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("SEQ-HOLE", &ip, &format!("[{}] in '{}': gave up on seq {}..={} ({} line(s)) after {} gap-fill attempt(s) returned nothing for it",
+                source, world_name, hole_start, hole_end,
+                hole_end.saturating_sub(hole_start).saturating_add(1), attempts));
         }
         WsMessage::ClientTypeDeclaration { client_type } => {
             // Update client type in WebSocket server
@@ -3727,6 +3742,16 @@ pub async fn handle_multiuser_ws_message(
             crate::http::log_remote_event("OUT-OF-ORDER", &ip, &format!("[{}] in '{}': recovered {} line(s) starting at seq={} that had arrived out of order",
                 source, world_name, recovered_count, line_seq));
         }
+        WsMessage::ReportGap { world_index, hole_start, hole_end, attempts, source } => {
+            // Always-on, same reasoning as the sibling reports above: only fires when a
+            // client has genuinely given up on a range of output, which is exactly the
+            // event that has been invisible in the field (PROTOCOL-ROADMAP.md Phase F).
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?").to_string();
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("SEQ-HOLE", &ip, &format!("[{}] in '{}': gave up on seq {}..={} ({} line(s)) after {} gap-fill attempt(s) returned nothing for it",
+                source, world_name, hole_start, hole_end,
+                hole_end.saturating_sub(hole_start).saturating_add(1), attempts));
+        }
         WsMessage::ToggleWorldGmcp { world_index } => {
             if world_index < app.worlds.len() {
                 app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
@@ -3790,6 +3815,7 @@ mod change_password_tests {
             acked_seq: std::collections::HashMap::new(),
             audit_prev_acked: std::collections::HashMap::new(),
             audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
             needs_resync: std::collections::HashSet::new(),
         });
         rx
@@ -3949,6 +3975,7 @@ mod resume_owner_scoping_tests {
             acked_seq: std::collections::HashMap::new(),
             audit_prev_acked: std::collections::HashMap::new(),
             audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
             needs_resync: std::collections::HashSet::new(),
         });
         rx

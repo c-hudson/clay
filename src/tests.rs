@@ -5506,6 +5506,7 @@ if you're more curious.\"";
                 viewport_height: 24, ip_address: "127.0.0.1".to_string(),
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
                 paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5563,6 +5564,7 @@ if you're more curious.\"";
                 viewport_height: 24, ip_address: "127.0.0.1".to_string(),
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
                 paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5813,6 +5815,7 @@ if you're more curious.\"";
                 last_activity: std::time::Instant::now(),
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5886,6 +5889,7 @@ if you're more curious.\"";
                 acked_seq: std::collections::HashMap::new(),
                 audit_prev_acked: std::collections::HashMap::new(),
                 audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5980,6 +5984,21 @@ if you're more curious.\"";
         app.audit_client_acks(client_id);
         assert!(phase_c_drain_resyncs(&mut rx).is_empty(),
             "re-firing at the same stall point must be suppressed");
+
+        // ...but only for AUDIT_REFIRE_INTERVAL audits, not forever (Phase F). Permanent
+        // suppression made a lost or undelivered ResyncRequired - the likeliest outcome
+        // precisely when the client's outbound channel is the thing that overflowed - a
+        // permanent write-off, with the server having decided the client was beyond help.
+        let refire = crate::websocket::AUDIT_REFIRE_INTERVAL;
+        for i in 0..refire.saturating_sub(2) {
+            app.audit_client_acks(client_id);
+            assert!(phase_c_drain_resyncs(&mut rx).is_empty(),
+                "still inside the suppression window at tick {i}");
+        }
+        app.audit_client_acks(client_id);
+        assert_eq!(phase_c_drain_resyncs(&mut rx), vec![(0, 4)],
+            "after AUDIT_REFIRE_INTERVAL audits still stalled at the same seq, the resync \
+             must be retried rather than abandoned");
 
         // It recovers to 8 (still behind), then stalls there: a NEW stall point, so the
         // suppression must not carry over.
@@ -6219,6 +6238,7 @@ if you're more curious.\"";
                 last_activity: std::time::Instant::now(),
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6278,6 +6298,7 @@ if you're more curious.\"";
                 last_activity: std::time::Instant::now(),
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6340,6 +6361,7 @@ if you're more curious.\"";
                 last_activity: std::time::Instant::now(),
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6392,6 +6414,7 @@ if you're more curious.\"";
                 last_activity: std::time::Instant::now(),
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -8309,6 +8332,7 @@ if you're more curious.\"";
                 viewport_height: 24, ip_address: "127.0.0.1".to_string(),
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
                 paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -8355,6 +8379,7 @@ if you're more curious.\"";
                 viewport_height: 24, ip_address: "127.0.0.1".to_string(),
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
                 paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -8395,3 +8420,329 @@ if you're more curious.\"";
         assert!(app.worlds[0].pending_lines.is_empty());
     }
 
+
+    // ==========================================================================
+    // Broadcast-coverage invariant (PROTOCOL-ROADMAP.md Phase F)
+    // ==========================================================================
+
+    /// Accumulates every `ServerData` span the server has emitted for one world and answers
+    /// "was this seq ever sent?". Mirrors app.js's `_seenRanges`, but server-side and used as
+    /// a test oracle: any line sitting in `output_lines` whose seq was never broadcast is a
+    /// permanent hole on every remote client.
+    #[derive(Default)]
+    struct BroadcastLedger {
+        covered: std::collections::HashSet<u64>,
+        texts: Vec<String>,
+        /// What a Phase-C client actually ends up believing: `seq -> text`, built exactly the
+        /// way app.js builds it (`lineSeq = msg.seq + rawIdx`, first writer wins because a
+        /// later arrival at a seq it already holds is dropped by `hasSeenSeq`).
+        client_model: std::collections::BTreeMap<u64, String>,
+        /// Batches whose declared span doesn't match the number of lines they carry - the
+        /// client silently marks the surplus seqs as delivered, so those lines can never be
+        /// re-requested and are lost permanently.
+        span_mismatches: Vec<String>,
+    }
+
+    impl BroadcastLedger {
+        fn absorb(&mut self, rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) {
+            use crate::websocket::WsMessage;
+            for m in drain_ws_messages(rx) {
+                if let WsMessage::ServerData { seq, end_seq, data, flush, .. } = m {
+                    if flush {
+                        self.covered.clear();
+                        self.texts.clear();
+                        self.client_model.clear();
+                    }
+                    let end = end_seq.unwrap_or(seq).max(seq);
+                    let has_real_seq = seq > 0 || end_seq.is_some();
+                    let lines: Vec<&str> = data.strip_suffix('\n').unwrap_or(&data).split('\n').collect();
+                    if has_real_seq {
+                        let span = (end - seq + 1) as usize;
+                        if span != lines.len() {
+                            self.span_mismatches.push(format!(
+                                "batch seq={seq} end_seq={end} declares {span} seqs but carries {} lines: {data:?}",
+                                lines.len()));
+                        }
+                        for (i, l) in lines.iter().enumerate() {
+                            let line_seq = seq + i as u64;
+                            self.client_model.entry(line_seq).or_insert_with(|| l.to_string());
+                        }
+                    }
+                    for s in seq..=end {
+                        self.covered.insert(s);
+                    }
+                    self.texts.push(data);
+                }
+            }
+        }
+
+        fn saw_text(&self, text: &str) -> bool {
+            let needle = text.replace('\r', "");
+            self.texts.iter().any(|d| d.contains(&needle))
+        }
+    }
+
+    /// The invariant: every line in `output_lines` must have been broadcast, except the one
+    /// line that is currently an outstanding partial (deliberately held back until completed).
+    /// Returns a list of human-readable violations rather than panicking, so a fuzz driver can
+    /// report every distinct failure mode in one run.
+    fn broadcast_coverage_violations(app: &App, world_idx: usize, ledger: &BroadcastLedger) -> Vec<String> {
+        let world = &app.worlds[world_idx];
+        // A partial line is legitimately unbroadcast until it is completed. It is the LAST
+        // non-gagged line in output_lines (see World::last_visible_output_idx).
+        let partial_idx = if !world.partial_line.is_empty() && !world.partial_in_pending {
+            world.output_lines.iter().rposition(|l| !l.gagged)
+        } else {
+            None
+        };
+        let mut out = Vec::new();
+        out.extend(ledger.span_mismatches.iter().cloned());
+        for (i, line) in world.output_lines.iter().enumerate() {
+            if Some(i) == partial_idx {
+                continue;
+            }
+            if !ledger.covered.contains(&line.seq) {
+                out.push(format!(
+                    "seq {} never broadcast (idx {}, gagged={}, input={}, text={:?})",
+                    line.seq, i, line.gagged, line.is_input, line.text));
+            } else if !line.text.is_empty() && !ledger.saw_text(&line.text) {
+                out.push(format!(
+                    "seq {} span was claimed but its TEXT was never sent (idx {}, text={:?})",
+                    line.seq, i, line.text));
+            }
+            // The client keys its buffer by seq. If the text it filed under this seq isn't
+            // the text the server stored there, the next batch carrying the real line is
+            // dropped as an already-seen duplicate - one line missing with its neighbours
+            // present, which is the field symptom this whole check exists to catch.
+            if let Some(client_text) = ledger.client_model.get(&line.seq) {
+                if client_text != &line.text.replace('\r', "") {
+                    out.push(format!(
+                        "seq {} MISFILED on the client: server has {:?}, client model has {:?}",
+                        line.seq, line.text, client_text));
+                }
+            }
+        }
+        out
+    }
+
+    /// Deterministic xorshift so a failing seed is reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    /// Fuzzes the operations that mutate `output_lines` against the broadcast-coverage
+    /// invariant. This exists because the "TUI shows a line the phone never got" bug class has
+    /// recurred through five different code paths; a per-path regression test only ever closes
+    /// the path that was already found. The invariant is path-independent.
+    #[test]
+    fn test_fuzz_every_output_line_is_broadcast() {
+        let mut failures: Vec<String> = Vec::new();
+        for seed in 1..=200u64 {
+            if let Some(msg) = fuzz_one_broadcast_coverage_run(seed) {
+                failures.push(msg);
+            }
+        }
+        assert!(failures.is_empty(),
+            "{} of 200 fuzz runs left un-broadcast lines in output_lines:\n{}",
+            failures.len(),
+            failures.iter().take(8).cloned().collect::<Vec<_>>().join("\n\n"));
+    }
+
+    fn fuzz_one_broadcast_coverage_run(seed: u64) -> Option<String> {
+        let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = true;
+        w.login_capture_guard = 0;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        app.output_height = 10;
+        app.output_width = 80;
+        app.settings.more_mode_enabled = true;
+        let (_cid, mut rx) = phase_c_register_client(&mut app);
+
+        let mut ledger = BroadcastLedger::default();
+        let mut history: Vec<String> = Vec::new();
+        let mut counter = 0u32;
+
+        for step in 0..40 {
+            let op = rng.below(10);
+            let desc = match op {
+                0..=3 => {
+                    // A chunk of complete lines from the MUD.
+                    let n = 1 + rng.below(4);
+                    let mut data = String::new();
+                    for _ in 0..n {
+                        counter += 1;
+                        data.push_str(&format!("srv{counter}\r\n"));
+                    }
+                    app.process_server_data(0, data.as_bytes(), 10, 80, false);
+                    format!("server_data({n} lines)")
+                }
+                4 => {
+                    // A chunk ending mid-line: the MUD prompt case.
+                    counter += 1;
+                    let data = format!("srv{counter}\r\nprompt{counter}> ");
+                    app.process_server_data(0, data.as_bytes(), 10, 80, false);
+                    format!("server_data(+trailing partial prompt{counter})")
+                }
+                5 => {
+                    counter += 1;
+                    app.record_user_input(0, &format!("cmd{counter}"));
+                    format!("user_input(cmd{counter})")
+                }
+                6 => {
+                    counter += 1;
+                    app.add_output_to_world(0, &format!("client{counter}"));
+                    format!("add_output_to_world(client{counter})")
+                }
+                7 => {
+                    app.release_pending_screenful();
+                    "release_pending_screenful".to_string()
+                }
+                8 => {
+                    counter += 1;
+                    app.emit_client_lines(0, &[format!("recallA{counter}"), format!("recallB{counter}")], false);
+                    format!("emit_client_lines({counter})")
+                }
+                _ => {
+                    let on = app.settings.more_mode_enabled;
+                    app.settings.more_mode_enabled = !on;
+                    format!("more_mode={}", !on)
+                }
+            };
+            history.push(desc);
+            ledger.absorb(&mut rx);
+            let mut violations = broadcast_coverage_violations(&app, 0, &ledger);
+            // Second, independent oracle: the SHIPPING self-audit (App::audit_broadcast_ledger)
+            // must reach the same verdict as the test-side ledger built from what actually
+            // came out of the socket. A disagreement means the safety net users rely on has a
+            // blind spot the test harness doesn't - which is worth failing over even when the
+            // product itself is behaving.
+            let audited = app.audit_broadcast_ledger();
+            if audited != 0 {
+                violations.push(format!(
+                    "App::audit_broadcast_ledger reported {audited} unbroadcast line(s) here"));
+            }
+            ledger.absorb(&mut rx); // absorb any repair the audit just emitted
+            if !violations.is_empty() {
+                return Some(format!(
+                    "seed {seed} step {step}:\n  history: {}\n  violations:\n    {}",
+                    history.join(" -> "),
+                    violations.join("\n    ")));
+            }
+        }
+        None
+    }
+
+    /// The Phase F self-audit: a line pushed into `output_lines` with no broadcast is found,
+    /// reported, and re-sent. This is the safety net for the whole "the TUI shows a line the
+    /// phone never got" class - the simulated bug below (a bare push) is exactly the shape of
+    /// the six real ones already fixed one at a time.
+    #[test]
+    fn test_broadcast_ledger_audit_finds_and_repairs_an_unbroadcast_line() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("w"));
+        app.current_world_index = 0;
+        let (_cid, mut rx) = phase_c_register_client(&mut app);
+
+        // Two normal lines, correctly broadcast.
+        push_and_broadcast(&mut app, 0, "first");
+        // The bug: a raw push with no broadcast at all.
+        let orphan_seq = app.worlds[0].next_seq;
+        app.worlds[0].next_seq += 1;
+        app.worlds[0].output_lines.push(OutputLine::new("orphaned line".to_string(), orphan_seq));
+        // A later line, correctly broadcast - the orphan is now mid-buffer, which is what
+        // makes it invisible to any tail-based check.
+        push_and_broadcast(&mut app, 0, "third");
+
+        let before = drain_server_data(&mut rx);
+        assert!(!before.iter().any(|(_, _, d)| d.contains("orphaned line")),
+            "precondition: the orphan must not have been broadcast yet");
+
+        let holes = app.audit_broadcast_ledger();
+        assert_eq!(holes, 1, "the audit must find exactly the one unbroadcast line");
+
+        let repair = drain_server_data(&mut rx);
+        let sent = repair.iter().find(|(_, _, d)| d.contains("orphaned line"))
+            .unwrap_or_else(|| panic!("the audit must re-send the missing line. Got: {repair:?}"));
+        assert_eq!(sent.0, orphan_seq, "the repair must carry the line's REAL seq");
+        assert_eq!(sent.1, Some(orphan_seq), "end_seq present is what marks the seq as real");
+
+        // Forward-only: a second pass must not re-report or re-send the same line.
+        assert_eq!(app.audit_broadcast_ledger(), 0, "the audit must not re-fire for a seq it already repaired");
+        assert!(drain_server_data(&mut rx).is_empty(), "no second repair broadcast");
+    }
+
+    /// The three legitimate reasons a stored line has no broadcast yet - it must not be
+    /// reported as a hole in any of them, or the audit becomes a duplicate generator.
+    #[test]
+    fn test_broadcast_ledger_audit_ignores_pending_and_newest_lines() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("w"));
+        app.current_world_index = 0;
+        app.settings.more_mode_enabled = true;
+        let (_cid, mut rx) = phase_c_register_client(&mut app);
+
+        push_and_broadcast(&mut app, 0, "delivered");
+        // The newest line, pushed but not yet broadcast (the in-flight case).
+        let newest_seq = app.worlds[0].next_seq;
+        app.worlds[0].next_seq += 1;
+        app.worlds[0].output_lines.push(OutputLine::new("in flight".to_string(), newest_seq));
+        // A backlog held on purpose: pending seqs are never owed to a client yet.
+        app.worlds[0].paused = true;
+        for _ in 0..3 {
+            let seq = app.worlds[0].next_seq;
+            app.worlds[0].next_seq += 1;
+            app.worlds[0].pending_lines.push(OutputLine::new("held".to_string(), seq));
+        }
+        let _ = drain_server_data(&mut rx);
+
+        assert_eq!(app.audit_broadcast_ledger(), 0,
+            "neither the newest line nor a held backlog is a hole");
+        assert!(drain_server_data(&mut rx).is_empty(), "nothing should be re-sent");
+    }
+
+    fn push_and_broadcast(app: &mut App, world_idx: usize, text: &str) {
+        let seq = app.worlds[world_idx].next_seq;
+        app.worlds[world_idx].next_seq += 1;
+        let more_mode = app.settings.more_mode_enabled;
+        app.push_and_broadcast_line(world_idx, OutputLine::new(text.to_string(), seq), more_mode);
+    }
+
+    /// The audit's own diagnostic must not be able to crash the daemon. MUD output is UTF-8;
+    /// truncating the reported text by byte index lands mid-codepoint on any accented
+    /// character or emoji.
+    #[test]
+    fn test_broadcast_ledger_audit_survives_multibyte_text() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("w"));
+        app.current_world_index = 0;
+        let (_cid, mut rx) = phase_c_register_client(&mut app);
+
+        push_and_broadcast(&mut app, 0, "first");
+        // 200 emoji: every candidate truncation offset is mid-codepoint.
+        let orphan_seq = app.worlds[0].next_seq;
+        app.worlds[0].next_seq += 1;
+        let text = "🐉".repeat(200);
+        app.worlds[0].output_lines.push(OutputLine::new(text.clone(), orphan_seq));
+        push_and_broadcast(&mut app, 0, "third");
+
+        assert_eq!(app.audit_broadcast_ledger(), 1);
+        let sent = drain_server_data(&mut rx);
+        assert!(sent.iter().any(|(_, _, d)| d.contains(&text)),
+            "the repair must carry the full line, not a truncated one");
+    }

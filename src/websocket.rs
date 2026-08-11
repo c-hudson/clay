@@ -617,6 +617,27 @@ pub enum WsMessage {
         source: String,  // "web", "gui", "android", "console"
     },
 
+    /// Report a hole in the delivered-seq stream that repeated gap-fill requests failed to
+    /// close (client -> server, PROTOCOL-ROADMAP.md Phase F). `[hole_start, hole_end]` is the
+    /// run of seqs the client has never received and the server did not return when asked
+    /// for them; the client gives up on that run at this point and advances its
+    /// `contiguousFrontier` past it, so the pair is a permanent-loss record, not a retry
+    /// request.
+    ///
+    /// This is the one failure mode neither existing audit can see. The server-side ack audit
+    /// only knows the client is behind, not which seqs are unfillable, and the server-side
+    /// broadcast ledger only proves the server *sent* them — a hole that opens in transit
+    /// (a dropped frame, a full outbound channel, a socket blip on Android) is invisible to
+    /// both. Logged as `SEQ-HOLE` in `~/.clay/remote.log` so a user's log alone shows how
+    /// often output is genuinely being lost and where.
+    ReportGap {
+        world_index: usize,
+        hole_start: u64,
+        hole_end: u64,
+        attempts: u32,
+        source: String,  // "web", "gui", "android", "console"
+    },
+
     // Remote instance handling (client -> server)
     /// Client declares its type on connection (affects output delivery)
     ClientTypeDeclaration { client_type: RemoteClientType },
@@ -1097,7 +1118,22 @@ pub struct WsClientInfo {
     /// or consumed by a line that never reached a broadcast) would otherwise produce one
     /// pointless resync per keepalive forever. Cleared for a world once its ack moves.
     pub audit_fired_at: std::collections::HashMap<usize, u64>,
+    /// Audits observed since the last `ResyncRequired` for a world still stalled at
+    /// `audit_fired_at`'s position. Suppression used to be permanent: one fire per (world,
+    /// seq), then silence forever. That is wrong whenever the resync itself failed to arrive
+    /// or failed to repair — a dropped `ResyncRequired` (the outbound channel was full, which
+    /// is the very condition that produces most stalls), a reply lost to a network blip, or a
+    /// client that hadn't finished hydrating. The client then sat permanently behind with the
+    /// server having decided it was a lost cause, which is the opposite of what a safety net
+    /// should do. Retry on a slow cadence instead: often enough to recover from a lost
+    /// message, rare enough that a genuinely unfillable hole costs one message every
+    /// `AUDIT_REFIRE_INTERVAL` keepalives rather than one per keepalive.
+    pub audit_stall_ticks: std::collections::HashMap<usize, u32>,
 }
+
+/// Keepalive audits to wait before re-sending a `ResyncRequired` to a client still stalled at
+/// the same seq — see `WsClientInfo::audit_stall_ticks`.
+pub(crate) const AUDIT_REFIRE_INTERVAL: u32 = 6;
 
 /// User credential for multiuser authentication
 #[derive(Clone, Debug)]
@@ -1492,6 +1528,7 @@ impl WebSocketServer {
                 // still allowed to fire. Whether this is merely "fine" or an actual recovery
                 // depends on whether we had previously fired at this world.
                 let had_fired = client.audit_fired_at.remove(&world_index).is_some();
+                client.audit_stall_ticks.remove(&world_index);
                 out.push((world_index, acked, deliverable,
                     if had_fired { AckAuditOutcome::Recovered } else { AckAuditOutcome::CaughtUp }));
                 continue;
@@ -1504,9 +1541,21 @@ impl WebSocketServer {
             let outcome = if !stalled {
                 AckAuditOutcome::Lagging
             } else if already_fired_here {
-                AckAuditOutcome::StillStalled
+                // Still stuck at the seq we already fired at. Count the tick and re-fire
+                // every AUDIT_REFIRE_INTERVAL audits rather than staying silent forever —
+                // see `audit_stall_ticks`. The counter resets on the re-fire so the cadence
+                // stays even.
+                let ticks = client.audit_stall_ticks.entry(world_index).or_insert(0);
+                *ticks += 1;
+                if *ticks >= AUDIT_REFIRE_INTERVAL {
+                    *ticks = 0;
+                    AckAuditOutcome::Fired
+                } else {
+                    AckAuditOutcome::StillStalled
+                }
             } else {
                 client.audit_fired_at.insert(world_index, acked);
+                client.audit_stall_ticks.insert(world_index, 0);
                 AckAuditOutcome::Fired
             };
             out.push((world_index, acked, deliverable, outcome));
@@ -2208,6 +2257,7 @@ where
             acked_seq: std::collections::HashMap::new(),
             audit_prev_acked: std::collections::HashMap::new(),
             audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
             needs_resync: std::collections::HashSet::new(),
         });
     }

@@ -156,6 +156,39 @@
         return false;
     }
 
+    // The oldest hole in this world's delivered-seq record, as [start, end] inclusive, or
+    // null when there is none. Holes are simply the spaces between ranges, so this is
+    // ranges[0].end + 1 .. ranges[1].start - 1.
+    function oldestSeqHole(world) {
+        const r = world && world._seenRanges;
+        if (!r || r.length < 2) return null;
+        return { start: r[0].end + 1, end: r[1].start - 1 };
+    }
+
+    // Declare the oldest hole permanently absent by merging the first two ranges, which
+    // advances contiguousFrontier() past it. Same operation as the MAX_SEEN_SEQ_RANGES
+    // backstop, invoked deliberately instead of on overflow.
+    //
+    // This exists because a hole the server cannot fill is otherwise unrecoverable AND
+    // self-perpetuating. requestGapFill() anchors on contiguousFrontier(), so an unfillable
+    // seq freezes that anchor: every reply then re-delivers only lines we already hold, the
+    // frontier doesn't move, and - because the reply is a full chunk, so backfill_complete is
+    // false - the ScrollbackLines handler immediately requests the same range again. That is
+    // an unbounded request loop on a live socket, on the client most likely to be on a
+    // metered connection. A seq can genuinely become unfillable: Ctrl+L's selective flush and
+    // a splash clear both remove lines from the server's output_lines, and the archive
+    // prepend caps output_lines at 10k lines - after any of those the line behind that seq no
+    // longer exists to be re-sent. Giving up on the run is the only terminating outcome; the
+    // loss is reported (ReportGap -> SEQ-HOLE) rather than silently absorbed.
+    function closeOldestSeqHole(world) {
+        const r = world && world._seenRanges;
+        if (!r || r.length < 2) return false;
+        r[1].start = r[0].start;
+        r.shift();
+        world._max_seq = maxSeenSeq(world);
+        return true;
+    }
+
     // Whether we hold ANY delivered seq for this world. Distinct from `contiguousFrontier()
     // > 0` and from `_max_seq` truthiness: seq 0 is a real, legitimate value (World::next_seq
     // starts at 0), so a world whose only delivered line is seq 0 has genuine data even
@@ -3230,9 +3263,9 @@
                                 } else if (!hasRealSeq && isFromServer) {
                                     // Released pending lines (seq=0, from_server=true) bypass local
                                     // more-mode to avoid flickering the More indicator
-                                    appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer);
+                                    appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight);
                                 } else {
-                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer);
+                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight);
                                 }
                             }
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
@@ -4128,6 +4161,41 @@
                         });
                     }
 
+                    // Termination guard (PROTOCOL-ROADMAP.md Phase F). A reply that delivered
+                    // nothing new means the seqs we are actually missing were not in it - the
+                    // server has no line for them. Since requestGapFill() re-anchors on the
+                    // (unmoved) contiguousFrontier(), retrying asks the identical question and
+                    // gets the identical answer, forever. Count consecutive no-progress
+                    // replies and, at the limit, declare the oldest hole lost so the frontier
+                    // can move; see closeOldestSeqHole().
+                    const GAPFILL_MAX_NO_PROGRESS = 2;
+                    world._gapFillNoProgress = appended ? 0 : (world._gapFillNoProgress || 0) + 1;
+                    if (world._gapFillNoProgress >= GAPFILL_MAX_NO_PROGRESS) {
+                        const hole = oldestSeqHole(world);
+                        world._gapFillNoProgress = 0;
+                        if (hole && closeOldestSeqHole(world)) {
+                            console.warn('Gap-fill could not recover a seq range - giving up on it', {
+                                world_index: msg.world_index, hole: hole
+                            });
+                            send({
+                                type: 'ReportGap',
+                                world_index: msg.world_index,
+                                hole_start: hole.start,
+                                hole_end: hole.end,
+                                attempts: GAPFILL_MAX_NO_PROGRESS,
+                                source: window.Android ? 'android' : 'web'
+                            });
+                        } else {
+                            // No hole to close (the frontier is already at our high-water
+                            // mark) - there is nothing left to ask for, so stop the pump
+                            // rather than re-requesting into the void.
+                            world._gapFillPending = false;
+                            updateScrollbackProgress();
+                            setTimeout(function() { backfillNextWorld(); }, BACKFILL_DELAY_MS);
+                            break;
+                        }
+                    }
+
                     if (appended && msg.world_index === currentWorldIndex) {
                         if (!wasBottom || grepRegex) {
                             renderOutput();
@@ -4265,7 +4333,7 @@
     }
 
     // Handle incoming line with more-mode logic
-    function handleIncomingLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true) {
+    function handleIncomingLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null) {
         if (text === undefined || text === null) return;
 
         const visibleLines = getVisibleLineCount();
@@ -4273,19 +4341,19 @@
 
         if (paused) {
             // Already paused, queue the line info
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor });
             updateStatusBar();
         } else if (moreModeEnabled && linesSincePause >= threshold) {
             // Trigger pause
             paused = true;
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor });
             // Scroll to bottom to show what we have so far
             scrollToBottom();
             updateStatusBar();
         } else {
             // Normal display - append the line
             linesSincePause++;
-            appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer);
+            appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer, highlightColor);
         }
     }
 
@@ -4342,7 +4410,7 @@
         const released = pendingLines.splice(0, toRelease);
 
         released.forEach(item => {
-            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew, item.fromServer);
+            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew, item.fromServer, item.highlightColor);
         });
 
         if (pendingLines.length === 0) {
@@ -6638,7 +6706,12 @@
     }
 
     // Append a new line to current world's output (already visible)
-    function appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true) {
+    // `highlightColor` must be threaded through here, not just applied in renderOutput():
+    // this is the path a line takes when it arrives live, and a /hilite'd line used to render
+    // plain until something forced a full re-render (a world switch, a resync) - at which
+    // point the same line suddenly gained its background. renderOutput() below is the
+    // reference for what a line should look like; keep the two in step.
+    function appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null) {
         // Strip newlines/carriage returns
         const cleanText = String(text).replace(/[\r\n]+/g, '');
 
@@ -6651,7 +6724,10 @@
         // Skip Discord emoji conversion when showTags is enabled so users can see original text
         const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
         const newLinePrefix = (newLineIndicator && markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
-        const html = tsPrefix + newLinePrefix + (showTags ? processed : convertDiscordEmojis(processed));
+        let html = tsPrefix + newLinePrefix + (showTags ? processed : convertDiscordEmojis(processed));
+        if (highlightColor !== null && highlightColor !== undefined) {
+            html = `<span style="background-color: ${colorNameToCss(highlightColor)}; display: block;">${html}</span>`;
+        }
 
         // "line" is a block-level element (see style.css) so it auto-stacks below the
         // previous one — no <br> separator needed (also what makes the wrapspace
