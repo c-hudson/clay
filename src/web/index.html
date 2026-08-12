@@ -147,8 +147,14 @@
                 <span class="font-slider-val" id="nav-font-slider-val" title="Increase font size">14</span>
             </div>
             <div class="nav-spacer"></div>
-            <button class="nav-btn" id="nav-up-btn" title="Previous World">&#9650;</button>
-            <button class="nav-btn" id="nav-down-btn" title="Next World">&#9660;</button>
+            <!-- Up = NEXT world, down = PREVIOUS world. Matches the console's world-switch
+                 keybindings (Ctrl-Up/Shift-Up -> world_next, Ctrl-Down/Shift-Down ->
+                 world_prev, see keybindings.rs) and this client's own keyboard path, which
+                 routes those same actions through requestNextWorld/requestPrevWorld. These
+                 two buttons used to be the other way round, so Ctrl-Up and tapping the up
+                 arrow moved in opposite directions in the same UI. -->
+            <button class="nav-btn" id="nav-up-btn" title="Next World">&#9650;</button>
+            <button class="nav-btn" id="nav-down-btn" title="Previous World">&#9660;</button>
         </div>
 
         <!-- Input area -->

@@ -10759,7 +10759,14 @@
         let downBtnTimer = null;
         let downBtnLongPressed = false;
 
-        // Up button - short press: prev world, long press (1s): prev history
+        // Up button - short press: NEXT world, long press (1s): prev history.
+        //
+        // The two directions are deliberately not symmetrical. Short press follows the
+        // console's world-switch keys (Ctrl-Up/Shift-Up -> world_next, keybindings.rs), which
+        // this client already honours on its own keyboard path; long press follows the input
+        // area's plain Up = older command, which is both the console's behaviour and the
+        // universal terminal convention. Short press used to call requestPrevWorld(), so the
+        // button and Ctrl-Up disagreed about which way "up" goes.
         function upBtnStart(e) {
             e.preventDefault();
             elements.input.focus();
@@ -10785,7 +10792,7 @@
                 upBtnTimer = null;
             }
             if (!upBtnLongPressed) {
-                requestPrevWorld();
+                requestNextWorld();
             }
             elements.input.focus();
         }
@@ -10796,7 +10803,9 @@
             elements.navUpBtn.addEventListener('touchend', upBtnEnd, { passive: false });
         }
 
-        // Down button - short press: next world, long press (1s): next history
+        // Down button - short press: PREVIOUS world, long press (1s): next history.
+        // Mirror of the up button above; see there for why the two press durations follow
+        // different conventions.
         function downBtnStart(e) {
             e.preventDefault();
             elements.input.focus();
@@ -10823,7 +10832,7 @@
                 downBtnTimer = null;
             }
             if (!downBtnLongPressed) {
-                requestNextWorld();
+                requestPrevWorld();
             }
             elements.input.focus();
         }
