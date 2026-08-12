@@ -277,8 +277,14 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
 }
 
 /// Create the help popup definition (main help, no topic)
+///
+/// Titled "Help for Clay vX.Y.Z" so the build is visible without running `/version` — matching
+/// the web/GUI/Android `#help-modal`, which is the only place those clients surface their own
+/// version at all (see `openHelpPopup` in app.js). The per-topic popup below deliberately
+/// keeps the plain "Help" title: it's contextual help for one setting, not the app's own help,
+/// and its content already names its subject.
 pub fn create_help_popup() -> PopupDefinition {
-    PopupDefinition::new(PopupId("help"), "Help")
+    PopupDefinition::new(PopupId("help"), format!("Help for Clay v{}", crate::VERSION))
         .with_field(Field::new(
             HELP_FIELD_CONTENT,
             "",
@@ -336,7 +342,10 @@ mod tests {
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("help"));
-        assert_eq!(state.definition.title, "Help");
+        // The title carries the running build so a user can identify it without /version.
+        assert_eq!(state.definition.title, format!("Help for Clay v{}", crate::VERSION));
+        assert!(state.definition.title.contains(crate::VERSION),
+            "the version must be the real one, not a hardcoded copy that can go stale");
         assert!(!state.definition.buttons.is_empty());
     }
 

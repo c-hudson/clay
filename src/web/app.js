@@ -558,6 +558,7 @@
         searchCloseBtn: document.getElementById('search-close-btn'),
         // Help popup (/help)
         helpModal: document.getElementById('help-modal'),
+        helpTitle: document.getElementById('help-title'),
         helpContent: document.getElementById('help-content'),
         helpCloseBtn: document.getElementById('help-close-btn'),
         helpOkBtn: document.getElementById('help-ok-btn'),
@@ -2982,16 +2983,16 @@
                 sendViewStateIfChanged();
                 // Warn once per session if this client's bundled version differs from the
                 // server's (only GUI-remote/Android can genuinely drift - see plan doc).
-                // Defense-in-depth: also treat a value still containing "{{" (an
-                // unreplaced template placeholder, e.g. from a future regression like the
-                // one already found/fixed for {{CLIENT_VERSION}}) as absent, not a real
-                // mismatch. Wrapped in its own try/catch so a malformed/missing field
-                // can never break InitialState processing.
+                // The local side goes through clientVersion(), which already treats an
+                // unreplaced "{{...}}" template placeholder as absent rather than as a real
+                // version (that has escaped once before); the same guard is applied inline to
+                // the server-supplied value. Wrapped in its own try/catch so a
+                // malformed/missing field can never break InitialState processing.
                 try {
-                    var localVersion = window.CLIENT_VERSION;
+                    var localVersion = clientVersion();
                     var remoteVersion = msg.server_version;
                     if (!versionMismatchShown && localVersion && remoteVersion &&
-                        localVersion.indexOf('{{') === -1 && remoteVersion.indexOf('{{') === -1 &&
+                        remoteVersion.indexOf('{{') === -1 &&
                         localVersion !== remoteVersion) {
                         appendClientLine(
                             `Version mismatch: ${localVersion} (local) ≠ ${remoteVersion} (remote).`,
@@ -6141,9 +6142,32 @@
         return html;
     }
 
+    // This client's own bundled version, or null when it genuinely isn't known.
+    //
+    // `window.CLIENT_VERSION` is injected three different ways: substituted into index.html
+    // server-side for the browser (http.rs) and the desktop WebView (webview_gui.rs), but set
+    // at runtime on Android (MainActivity.buildVarInjectionScript, from the APK's versionName)
+    // because the page is loaded straight off `file:///android_asset/` where nothing rewrites
+    // the template. So the raw `{{CLIENT_VERSION}}` placeholder is a real possible value here
+    // - it is what the bundled asset literally contains before Android's onPageFinished
+    // injection runs, and it has escaped once before (see the InitialState version-mismatch
+    // check, which reuses this). Callers get null and show something sensible rather than
+    // printing braces at the user.
+    function clientVersion() {
+        const v = window.CLIENT_VERSION;
+        if (typeof v !== 'string' || v.length === 0 || v.indexOf('{{') !== -1) return null;
+        return v;
+    }
+
     function openHelpPopup() {
         helpPopupOpen = true;
         const baseUrl = getBaseUrl();
+        // Name the build in the title bar - on web/GUI/Android this is the only place the
+        // client's own version is visible (the console has /version and its startup banner).
+        if (elements.helpTitle) {
+            const v = clientVersion();
+            elements.helpTitle.textContent = v ? 'Help for Clay v' + v : 'Help';
+        }
 
         let html = '<div class="help-quickstart">';
         for (const card of buildHelpQuickStartCards(baseUrl)) {

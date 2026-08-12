@@ -262,7 +262,11 @@
         <div id="help-modal" class="modal">
             <div class="modal-content help-modal-content">
                 <div class="popup-header">
-                    <span class="popup-title">Help</span>
+                    <!-- Filled in by openHelpPopup() as "Help for Clay vX.Y.Z" so a web/GUI/
+                         Android user can tell which client build they're on. Left as plain
+                         "Help" here so the fallback (version genuinely unknown) needs no
+                         special case. -->
+                    <span class="popup-title" id="help-title">Help</span>
                     <button id="help-close-btn" class="popup-close">&#10005;</button>
                 </div>
                 <div id="help-content" class="help-content"></div>
