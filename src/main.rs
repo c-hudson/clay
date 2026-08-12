@@ -7333,32 +7333,18 @@ impl App {
     /// `selective_flush`'s caller can pass a non-contiguous subset (only lines matching some
     /// filter), so a seq gap also starts a new batch even when `from_server`/`gagged` don't
     /// change - otherwise a batch's `seq..=end_seq` span would claim to cover lines it doesn't
-    /// actually contain. The ▶ new-text watermark is no longer part of this grouping: it's a
-    /// single per-world value (`World::new_from_seq`) broadcast separately via `NewWatermark`
-    /// whenever it moves, not a per-line flag riding along with the content - see
-    /// `World::new_from_seq`'s doc comment. Callers are responsible for calling
-    /// `App::broadcast_watermark_if_changed` themselves around whatever advanced it (typically
-    /// nothing here, since released pending lines already arrived not-new by rule 1).
-    pub(crate) fn broadcast_released_lines(&mut self, world_idx: usize, released: &[OutputLine]) {
+    /// actually contain. The ▶ new-text indicator is not part of this grouping either: it is
+    /// per-line ownership (`OutputLine::display_id`, PROTOCOL-ROADMAP.md Phase D) assigned by
+    /// the claim at the END of this function, not a flag riding along with the content.
+    ///
+    /// `releaser` is the CONNECTION id of the WebSocket client that asked for this release
+    /// (`release_pending_lines`), or `None` when the release wasn't client-driven — a console
+    /// key, `selective_flush`, or an orphaned-backlog drain. It decides who gets the ▶ markers
+    /// on whatever these lines turn out to have been the first display of; see the claim block
+    /// at the bottom for why the caller's answer beats re-deriving one here.
+    pub(crate) fn broadcast_released_lines(&mut self, world_idx: usize, released: &[OutputLine], releaser: Option<u64>) {
         if released.is_empty() {
             return;
-        }
-        // A release is a display event: the lines just moved from the server-held backlog
-        // onto somebody's screen. Anything among them that arrived while nobody was watching
-        // is still unviewed, so claim it now - without this, pending lines that accumulated
-        // on an unwatched world would move into output_lines and silently never become ▶,
-        // because the only other claim point is switching INTO a world and the releaser is
-        // already there. `claim_unviewed` is first-wins, so whichever viewer is looking gets
-        // them and a second viewer changes nothing.
-        let claimant = if world_idx == self.current_world_index {
-            Some(CONSOLE_DISPLAY_ID)
-        } else {
-            self.ws_client_worlds.iter()
-                .find(|(_, v)| v.world_index == world_idx && !v.paused && v.disconnected_at.is_none())
-                .map(|(&cid, _)| self.display_owner_id(cid))
-        };
-        if let Some(claimant) = claimant {
-            let _ = self.worlds[world_idx].claim_unviewed(claimant);
         }
         let ts = current_timestamp_secs();
         let mut batch: Vec<String> = Vec::new();
@@ -7403,6 +7389,48 @@ impl App {
                 flush: false, gagged: batch_gagged, highlight_colors: Vec::new(),
             });
         }
+
+        // A release is a display event: the lines just moved from the server-held backlog onto
+        // somebody's screen. Anything among them that arrived while nobody was watching is
+        // still unviewed, so claim it now — without this, pending lines that accumulated on an
+        // unwatched world move into output_lines and silently never become ▶, because the only
+        // other claim point is switching INTO a world and the releaser is already there.
+        //
+        // Two things here are load-bearing:
+        //
+        // 1. This runs AFTER every ServerData batch above, not before. The claim reaches a
+        //    remote client as `ClaimedNew`, whose handler stamps `display_id` by matching seqs
+        //    against the lines already in its `world.output_lines` — lines that only exist
+        //    there once the ServerData carrying them has been applied. Claiming first is a
+        //    silent no-op on the client (the console doesn't care, since it renders straight
+        //    off `output_lines`), which is exactly the bug this ordering fixes: released
+        //    backlogs showed ▶ on the TUI and nowhere else. `Outbound::Shared` (the broadcasts
+        //    above) and `Outbound::Message` (the ClaimedNew below) share one bounded channel
+        //    per client and are documented FIFO, so "after" is stable, not a race we won.
+        //
+        // 2. It goes through `claim_world_for`, the single place ▶ ownership is handed out.
+        //    This site used to call `World::claim_unviewed` directly and discard the returned
+        //    seq list with `let _`, so the server stamped ownership it never told anyone about.
+        //
+        // `releaser` is the CONNECTION id of the client that asked for the release, when there
+        // was one. Preferring it over the fallback scan matters with two clients on the same
+        // world: the scan is a `HashMap` `find()` and could hand the marker to whichever
+        // client it happened to reach first, i.e. not the one that pressed Tab.
+        let claimant = releaser
+            .filter(|cid| self.ws_client_worlds.contains_key(cid))
+            .map(|cid| (self.display_owner_id(cid), Some(cid)))
+            .or_else(|| {
+                if world_idx == self.current_world_index {
+                    Some((CONSOLE_DISPLAY_ID, None))
+                } else {
+                    self.ws_client_worlds.iter()
+                        .find(|(_, v)| v.world_index == world_idx && !v.paused && v.disconnected_at.is_none())
+                        .map(|(&cid, _)| (self.display_owner_id(cid), Some(cid)))
+                }
+            });
+        if let Some((owner_id, notify)) = claimant {
+            self.claim_world_for(world_idx, owner_id, notify);
+        }
     }
 
     /// `WsMessage::ReleasePending` handling — shared by master-WS and daemon (T38).
@@ -7439,7 +7467,9 @@ impl App {
 
         let released = self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator, self.settings.wrapspace as usize);
         let to_release = released.len();
-        self.broadcast_released_lines(world_index, &released);
+        // The requesting client claims the ▶ markers on whatever these lines are the first
+        // display of - it is the one that pressed Tab/PgDn, so it is the one looking at them.
+        self.broadcast_released_lines(world_index, &released, Some(client_id));
 
         // Broadcast release event and updated pending count
         self.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
@@ -7483,7 +7513,9 @@ impl App {
         // `(marked_new, from_server)` and currently sends `seq: 0` like every other release
         // site (Step 6 of the seq-drift fix makes this real once `output_lines` is guaranteed
         // seq-sorted through a pause).
-        self.broadcast_released_lines(world_index, &kept);
+        // No releaser: /flush is not tied to a viewer the way a Tab release is, so fall
+        // back to the console-or-any-viewer scan.
+        self.broadcast_released_lines(world_index, &kept, None);
         self.worlds[world_index].paused = false;
         self.worlds[world_index].lines_since_pause = 0;
         self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
@@ -12127,7 +12159,7 @@ impl App {
         let wrapspace = self.settings.wrapspace as usize;
         let released_lines = self.current_world_mut().release_pending(visual_budget, output_width, nli_enabled, wrapspace);
         let released = released_lines.len();
-        self.broadcast_released_lines(world_idx, &released_lines);
+        self.broadcast_released_lines(world_idx, &released_lines, None); // console Tab
 
         // Mark output for redraw so released lines are rendered
         self.needs_output_redraw = true;
@@ -12167,7 +12199,7 @@ impl App {
         // this site previously moved pending_lines to output_lines purely locally, so WS
         // clients (e.g. a remote Android session on this exact world) never received the
         // content and never learned pending_count dropped to 0.
-        self.broadcast_released_lines(world_idx, &released_lines);
+        self.broadcast_released_lines(world_idx, &released_lines, None); // server-side drain
         self.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released_lines.len() });
         self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
         self.broadcast_activity();

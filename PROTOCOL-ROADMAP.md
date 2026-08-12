@@ -1841,3 +1841,109 @@ since `src/web/*` is embedded via `include_str!`.
 - **The precise 3-5s was not measured on the user's device.** It depends on their Remote Lines
   setting, world count and link latency; the simulation shows the mechanism produces delays of
   that order, but the fix bounds staleness by construction rather than by matching a measurement.
+
+---
+
+# Phase H — released backlogs never got their ▶ on remote clients
+
+## The report
+
+> When 100 lines of new input arrives for a world that is not being displayed by any session
+> and the user switches, the output receives the expected new indicator on the first 20
+> (dependant upon screen size) or so lines of text. The more indicator is shown. User hits the
+> tab button or pgdn button and the remaining text does not have the new indicator. [...] When
+> the same thing is done on the main tui instance, the text gets the proper new indicator for
+> all new text even if it was pending.
+
+Correct, and the console/remote split is the tell.
+
+## Root cause
+
+`App::broadcast_released_lines` claimed the newly-shown lines and then threw the result away:
+
+```rust
+.map(|(&cid, _)| self.display_owner_id(cid))     // connection id available, discarded
+...
+let _ = self.worlds[world_idx].claim_unviewed(claimant);   // returned seq list discarded
+```
+
+`World::claim_unviewed` returns the seqs it stamped. The only place that ever sends
+`WsMessage::ClaimedNew` is `App::claim_world_for`, whose own doc comment calls itself "the only
+place ▶ ownership is ever handed out" — an invariant this site silently violated by reaching
+past it into `claim_unviewed`.
+
+That asymmetry is exactly why the TUI was right and every remote client was wrong:
+
+- **Console** renders from `output_lines` through `line_is_new_for(line, CONSOLE_DISPLAY_ID)`, so
+  the server-side `display_id` stamp *is* the rendering input.
+- **Remote** renders through `lineIsNew()` = `lineObj.display_id === myDisplayId`. Its line
+  objects come from `ServerData`, which carries no `display_id` (correct — arrival assigns no
+  owner). Ownership only ever reaches a client via `ClaimedNew`. None was sent.
+
+The switch-into-world path was unaffected (`handle_mark_world_seen` → `claim_world_for(...,
+Some(client_id))`), which is why the first screenful was always right and only the released
+backlog was wrong.
+
+## The fix, and the non-obvious half of it
+
+1. **Route the claim through `claim_world_for`** so the client is actually told.
+2. **Emit it AFTER the content**, not before. `ClaimedNew` names seqs that the client resolves
+   against lines already in its `world.output_lines`; those lines only exist there once the
+   `ServerData` carrying them has been applied. A claim sent first is a silent no-op on the
+   client — the console wouldn't notice, so wiring up the notification *in place* would have
+   looked correct and fixed nothing. `Outbound::Shared` and `Outbound::Message` share one
+   bounded channel per client and are documented FIFO, so "after" is stable rather than a race.
+3. **`releaser: Option<u64>`** threaded from `release_pending_lines`, which already had the
+   `client_id`. The old fallback was a `HashMap` `find()`: with two clients on one world it
+   could hand the markers to whichever it reached first, i.e. not the one that pressed Tab.
+   Console/`selective_flush`/orphan-drain sites pass `None` and keep that fallback.
+
+## Why the existing tests passed against it
+
+`test_pending_lines_marked_new_when_not_current` asserts through `AssertMarkedNew`, which counts
+server-side lines — and the server-side state was always correct. Nothing asserted the wire. The
+four new tests assert the drained client channel instead, and were mutation-checked:
+
+| mutation | caught by |
+|---|---|
+| notification removed (`let _ = claim_unviewed`) | 3 of 4 tests |
+| claim moved back *before* the content broadcast | **only** the ordering test |
+
+The second row is the point: the ordering assertion is not decoration, it is the only thing
+standing between this fix and a version of it that reintroduces the bug while looking right.
+
+## Status
+
+742/742 `cargo test` (738 + 4), clean `cargo clippy --all-targets` on both the musl and
+`webview-gui,native-audio` feature sets.
+
+**Verified live**, against a real `-D` daemon and a real WebSocket client driving the exact
+reported scenario — 100 lines onto a world the client was not viewing, switch in, Tab:
+
+```
+--- SWITCH ---
+ClaimedNew     19 seqs: 0..18          <- the head, which always worked
+--- TAB ---
+ServerData     seq 19..99              <- the released backlog
+ClaimedNew     81 seqs: 19..99         <- ...claimed, and AFTER its content
+flood world: 100 lines held, 100 carry OUR marker, 0 do not
+```
+
+Before the fix that final `ClaimedNew` did not exist, leaving 81 of 100 lines unmarked.
+
+## Verification gaps
+
+- **No on-device Android run**; verified with a scripted WS client that speaks the real
+  protocol, not a real phone.
+- **`/dump` does not print per-line `display_id`**, so the planned console cross-check there
+  wasn't possible. Console behaviour is covered by
+  `test_console_release_claims_for_console_without_notifying` instead, which asserts the
+  released lines carry `CONSOLE_DISPLAY_ID` and that no `ClaimedNew` is fabricated for a
+  socket-less viewer.
+
+## Consequence worth knowing
+
+A line has exactly one ▶ owner (Phase D). With two clients viewing the same world when a backlog
+is released, the releaser gets the markers and the other client does not. That is the existing
+model, not something this change introduced — but it is easier to reach now that releases claim
+correctly.

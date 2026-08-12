@@ -1670,7 +1670,7 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                     // a /recall that overflowed a screenful while paused), and forcing
                     // from_server: true mismarked the latter, losing its "✨ " client-line
                     // marker on the receiving end.
-                    app.broadcast_released_lines(world_idx, &lines);
+                    app.broadcast_released_lines(world_idx, &lines, None); // console key
                     if app.worlds[world_idx].pending_lines.is_empty() {
                         app.worlds[world_idx].paused = false;
                         app.worlds[world_idx].lines_since_pause = 0;
@@ -1693,7 +1693,7 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                 // diverge from what was actually released - see that helper's doc comment.
                 let released_lines = app.current_world_mut().release_all_pending();
                 let released = released_lines.len();
-                app.broadcast_released_lines(world_idx, &released_lines);
+                app.broadcast_released_lines(world_idx, &released_lines, None); // console key
                 app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
                 app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
                 app.broadcast_activity();
@@ -1719,7 +1719,7 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                 // instead of a local per-line loop that sent each line's original `seq` - a
                 // value that can be <= the client's _max_seq, causing kept lines to be
                 // silently dropped as false duplicates instead of shown.
-                app.broadcast_released_lines(world_idx, &kept);
+                app.broadcast_released_lines(world_idx, &kept, None); // console Ctrl+L
                 app.worlds[world_idx].paused = false;
                 app.worlds[world_idx].lines_since_pause = 0;
                 app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });

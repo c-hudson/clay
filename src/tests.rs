@@ -2634,7 +2634,7 @@
             line
         }).collect();
 
-        app.broadcast_released_lines(0, &released);
+        app.broadcast_released_lines(0, &released, None);
 
         let log = app.ws_broadcast_log.lock().unwrap();
         let server_data: Vec<(u64, Option<u64>, bool)> = log.iter().filter_map(|m| {
@@ -8745,4 +8745,181 @@ if you're more curious.\"";
         let sent = drain_server_data(&mut rx);
         assert!(sent.iter().any(|(_, _, d)| d.contains(&text)),
             "the repair must carry the full line, not a truncated one");
+    }
+
+    // ==========================================================================
+    // ▶ ownership on released pending lines (PROTOCOL-ROADMAP.md Phase H)
+    // ==========================================================================
+
+    /// Build a world holding `head` already-displayed-able lines plus `backlog` pending lines,
+    /// all of which arrived while NOBODY was viewing (so they are unviewed and unowned).
+    fn world_with_unviewed_backlog(app: &mut App, head: usize, backlog: usize) {
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = true;
+        for i in 0..head {
+            let mut l = OutputLine::new(format!("head {i}"), w.next_seq);
+            l.viewed = false; // arrived while unwatched
+            w.next_seq += 1;
+            w.output_lines.push(l);
+        }
+        w.paused = true;
+        for i in 0..backlog {
+            let mut l = OutputLine::new(format!("backlog {i}"), w.next_seq);
+            l.viewed = false;
+            w.next_seq += 1;
+            w.pending_lines.push(l);
+        }
+        app.worlds.push(w);
+        // The console is looking at some OTHER world - this backlog is unwatched by everyone,
+        // which is the whole premise (a line arriving while anyone views is born viewed).
+        app.worlds.push(World::new("elsewhere"));
+        app.current_world_index = 1;
+    }
+
+    fn claimed_new_seqs(msgs: &[crate::websocket::WsMessage]) -> Vec<Vec<u64>> {
+        use crate::websocket::WsMessage;
+        msgs.iter().filter_map(|m| match m {
+            WsMessage::ClaimedNew { seqs, .. } => Some(seqs.clone()),
+            _ => None,
+        }).collect()
+    }
+
+    /// The reported bug: 100 lines arrive on a world nobody is watching, a remote client
+    /// switches to it (head gets ▶ correctly), then hits Tab - and the released backlog came
+    /// out with no ▶ at all, while the console TUI marked the same lines correctly.
+    ///
+    /// The server was stamping `display_id` the whole time; it just never told the client,
+    /// because `broadcast_released_lines` called `World::claim_unviewed` directly and dropped
+    /// the returned seq list. Asserting server-side state would therefore have PASSED against
+    /// the bug - which is exactly what the pre-existing coverage did. This asserts the wire.
+    #[test]
+    fn test_released_backlog_claims_new_markers_for_the_releasing_client() {
+        let mut app = App::new();
+        world_with_unviewed_backlog(&mut app, 3, 5);
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        // Client switches to world 0: claims the head, which already worked.
+        app.handle_mark_world_seen(client_id, 0, None);
+        let head_claims = claimed_new_seqs(&drain_ws_messages(&mut rx));
+        assert_eq!(head_claims, vec![vec![0, 1, 2]],
+            "precondition: switching in claims the visible head");
+
+        // Client hits Tab -> release the whole backlog.
+        app.release_pending_lines(client_id, 0, 0);
+
+        let msgs = drain_ws_messages(&mut rx);
+        let claims = claimed_new_seqs(&msgs);
+        assert_eq!(claims, vec![vec![3, 4, 5, 6, 7]],
+            "the released backlog must be claimed FOR THIS CLIENT and named on the wire, \
+             not just stamped server-side. Got: {msgs:#?}");
+
+        // ...and the server's own copy agrees, so the console renders them identically.
+        let owner = app.display_owner_id(client_id);
+        for line in &app.worlds[0].output_lines {
+            assert_eq!(line.display_id, Some(owner),
+                "seq {} should be owned by the releasing client", line.seq);
+        }
+    }
+
+    /// Ordering is the load-bearing half of the fix. `ClaimedNew` names seqs that the client
+    /// resolves against lines already in its buffer, so a claim sent BEFORE the `ServerData`
+    /// carrying those lines is a silent no-op - the exact failure being fixed. This asserts
+    /// the claim trails the content, which is what the old code got wrong.
+    #[test]
+    fn test_released_backlog_claim_arrives_after_the_content() {
+        use crate::websocket::WsMessage;
+        let mut app = App::new();
+        world_with_unviewed_backlog(&mut app, 1, 4);
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        app.handle_mark_world_seen(client_id, 0, None);
+        let _ = drain_ws_messages(&mut rx);
+
+        app.release_pending_lines(client_id, 0, 0);
+
+        let msgs = drain_ws_messages(&mut rx);
+        let last_data = msgs.iter().rposition(|m| matches!(m, WsMessage::ServerData { .. }))
+            .expect("the released content must be broadcast");
+        let claim = msgs.iter().position(|m| matches!(m, WsMessage::ClaimedNew { .. }))
+            .expect("the released content must be claimed");
+        assert!(claim > last_data,
+            "ClaimedNew (idx {claim}) must follow the ServerData carrying those lines \
+             (last at idx {last_data}) - a claim for lines the client doesn't hold yet is \
+             silently dropped. Order was: {:?}",
+            msgs.iter().map(|m| format!("{m:?}").split_whitespace().next().unwrap_or("?").to_string()).collect::<Vec<_>>());
+    }
+
+    /// A console-driven release (Tab in the TUI) must still claim for the console and must not
+    /// invent a `ClaimedNew` for anybody - the console has no socket.
+    #[test]
+    fn test_console_release_claims_for_console_without_notifying() {
+        let mut app = App::new();
+        world_with_unviewed_backlog(&mut app, 1, 3);
+        app.current_world_index = 0; // console is now looking at the backlog world
+        app.output_height = 24;
+        app.output_width = 80;
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.release_pending_screenful();
+
+        assert!(claimed_new_seqs(&drain_ws_messages(&mut rx)).is_empty(),
+            "a console release has no client to notify");
+        let released: Vec<_> = app.worlds[0].output_lines.iter()
+            .filter(|l| l.text.starts_with("backlog")).collect();
+        assert!(!released.is_empty(), "precondition: something was released");
+        for line in released {
+            assert_eq!(line.display_id, Some(crate::CONSOLE_DISPLAY_ID),
+                "console-released lines belong to the console");
+        }
+    }
+
+    /// With two clients on the same world, the one that asked for the release gets the
+    /// markers. The pre-fix fallback was a `HashMap` `find()`, so it could hand them to
+    /// whichever client it reached first - i.e. not the one that pressed Tab.
+    #[test]
+    fn test_releasing_client_wins_over_another_viewer() {
+        use crate::websocket::{WsClientInfo, RemoteClientType};
+        let mut app = App::new();
+        world_with_unviewed_backlog(&mut app, 1, 3);
+        let (client_a, mut rx_a) = phase_c_register_client(&mut app);
+
+        // Register a second client, B, also viewing world 0.
+        let client_b = 2u64;
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel::<crate::websocket::Outbound>(
+            crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        {
+            let server = app.ws_server.as_ref().unwrap();
+            let mut clients = server.clients.write().unwrap();
+            let viewport = clients.get(&client_a).unwrap().viewport_height;
+            clients.insert(client_b, WsClientInfo {
+                authenticated: true,
+                tx: tx_b,
+                current_world: Some(0),
+                username: None,
+                received_initial_state: true,
+                client_type: RemoteClientType::Web,
+                viewport_height: viewport,
+                ip_address: "127.0.0.2".to_string(),
+                connected_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                paused: false,
+                acked_seq: std::collections::HashMap::new(),
+                audit_prev_acked: std::collections::HashMap::new(),
+                audit_fired_at: std::collections::HashMap::new(),
+                audit_stall_ticks: std::collections::HashMap::new(),
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.handle_mark_world_seen(client_a, 0, None);
+        app.handle_mark_world_seen(client_b, 0, None);
+        let _ = drain_ws_messages(&mut rx_a);
+        let _ = drain_ws_messages(&mut rx_b);
+
+        // B releases.
+        app.release_pending_lines(client_b, 0, 0);
+
+        assert!(claimed_new_seqs(&drain_ws_messages(&mut rx_a)).is_empty(),
+            "the client that did NOT release must not be handed the markers");
+        assert_eq!(claimed_new_seqs(&drain_ws_messages(&mut rx_b)), vec![vec![1, 2, 3]],
+            "the releasing client gets them");
     }
