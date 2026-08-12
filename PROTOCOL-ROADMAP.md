@@ -1755,3 +1755,89 @@ entries, which is the correct clean result.
   a real hole requires injecting a bug into a running binary.
 - **Multiuser is out of scope**, as in Phase C: `daemon.rs`'s multiuser path emits
   `seq: 0, end_seq: None` universally, so there are no real seqs there to audit.
+
+---
+
+# Phase G — the client had the data and wasn't painting it
+
+## The report
+
+> The android client is connecting to the remote tui, i see the scroll back buffer download
+> complete but the current world's output stays the same. Maybe 3-5 seconds later it refreshes
+> the screen and the output is updated [...] i wonder if the issue is that the android/web
+> client is just not calling for a refresh of the screen right away after it has the data.
+
+Correct diagnosis. Unlike Phases B–F, no line was ever lost or misdelivered — the lines were in
+`world.output_lines` the whole time. Only the DOM was behind.
+
+## Cause 1 — the repaint scheduler could be starved indefinitely
+
+`scheduleCurrentWorldRepaint()` was a pure trailing-edge debounce: every call did `clearTimeout`
+and armed a fresh 120ms timer. Any reply stream arriving faster than that window resets the
+timer on every chunk, so the current world repaints **zero** times until the stream stops. That
+is not a pathological case — the backfill pump re-arms every `BACKFILL_DELAY_MS` (30ms) and the
+gap-fill loop re-requests synchronously. The stale window's length was therefore set by however
+long catch-up took, with no upper bound at all.
+
+Fixed with a max-wait ceiling (`CURRENT_WORLD_REPAINT_MAX_WAIT_MS`, 300ms): the burst's start is
+stamped, and once a pending repaint has been deferred past the ceiling it paints instead of
+extending the window again. The 120ms coalescing is kept — its purpose (collapsing a chunk burst
+into one DOM rebuild, not restarting CSS animations) is still valid.
+
+Both schedulers were transliterated to Python and driven with simulated arrival streams:
+
+| chunk spacing | old | new |
+|---|---|---|
+| 80ms over 4s | **1 paint at 4040ms** | 10 paints, worst staleness 320ms |
+| 30ms over 1.5s | **1 paint at 1590ms** | 5 paints, worst staleness 300ms |
+| 200ms over 4s | 20 paints, 120ms | 20 paints, 120ms (unchanged) |
+
+The 4040ms figure lands squarely in the reported "3-5 seconds", and the 200ms row shows the
+ceiling costs nothing once the stream is already slower than the debounce.
+
+## Cause 2 — gap-fill borrowed reasoning that only holds for backfill
+
+The gap-fill branch deferred its repaint using the backfill branch's "at the bottom => old
+content above the fold, no rush" rationale. That is true for a **prepend**. A gap-fill
+**appends the newest lines at the tail** — exactly what an at-the-bottom viewer is looking at.
+It now calls `renderOutput()` directly (which ends in `scrollToBottom()`, so the viewer stays
+pinned), matching its own `!wasBottom` sibling.
+
+## Cause 3 — the scrollback badge was measuring the wrong thing
+
+`updateScrollbackProgress()` hid as soon as the depth ratio
+(`visibleLineCount` vs `min(backfillTotalTarget, totalVisibleLines)`) was satisfied. A gap-fill
+is in neither backfill queue and contributes nothing to that ratio, and with
+`remote_initial_lines` defaulting to 100 a hydrated Android cache satisfies the goal on the
+*first* tick. So the badge reported "complete" while the catch-up that actually mattered was
+still streaming — the false signal that made a stale screen look like a rendering bug rather
+than data still in flight. `scrollbackCatchUpPending()` (any outstanding
+`pendingScrollbackRequests` entry, or any world with `_gapFillPending`) now keeps the badge up
+and clamps the displayed percentage to 90, preserving the existing "100% only at true
+completion" property.
+
+## Not a bug here
+
+The console is unaffected: `handle_remote_ws_message`'s `ScrollbackLines` arms
+`needs_output_redraw = true` in both branches and redraws on the next event-loop tick. This was
+web/GUI/Android-only, and the console was the correct reference behaviour throughout.
+
+## Status
+
+738/738 `cargo test` (no Rust changed), clean musl build. The rebuilt binary was confirmed to
+actually serve the new asset over HTTP — grepping the *served* bytes, not the file on disk,
+since `src/web/*` is embedded via `include_str!`.
+
+## Verification gaps
+
+- **Still no JS runtime in the sandbox.** The scheduler logic was transliterated to Python and
+  exercised (table above); the rest of the edit is reviewed and brace-balance-checked with a
+  string/regex/template-aware checker that was validated both against the pre-change file *and*
+  against a deliberately-broken control, so a pass is not vacuous. Sixth consecutive change
+  carrying this gap.
+- **Not verified on-device.** The reported scenario — reconnect Android to the remote TUI after
+  being away, and check the current world's tail is right as soon as the badge clears — has not
+  been performed against a real phone.
+- **The precise 3-5s was not measured on the user's device.** It depends on their Remote Lines
+  setting, world count and link latency; the simulation shows the mechanism produces delays of
+  that order, but the fix bounds staleness by construction rather than by matching a measurement.

@@ -808,14 +808,36 @@
     // backfill (see the ScrollbackLines handler). A fast backfill can deliver many
     // chunks within a few hundred ms; debouncing collapses a burst into a single
     // renderOutput() once it quiets down instead of rebuilding the DOM per chunk.
-    let currentWorldRepaintTimer = null;
+    //
+    // The MAX_WAIT ceiling is what makes that safe. Without it this is a pure trailing
+    // edge, and a reply stream arriving faster than the debounce window resets the timer
+    // on every chunk, so the current world repaints ZERO times until the stream stops.
+    // The backfill pump re-arms every BACKFILL_DELAY_MS (30ms) and the gap-fill loop
+    // re-requests synchronously, so that is the normal case, not a pathological one: the
+    // lines sat in world.output_lines while the DOM stayed minutes-old-looking, and the
+    // screen only snapped up to date once catch-up finished. Staleness must be bounded by
+    // construction rather than by however long the server takes to finish sending.
     const CURRENT_WORLD_REPAINT_DEBOUNCE_MS = 120;
+    const CURRENT_WORLD_REPAINT_MAX_WAIT_MS = 300;
+    let currentWorldRepaintTimer = null;
+    let currentWorldRepaintBurstStart = 0;   // 0 = no burst in progress
+    function runCurrentWorldRepaint() {
+        currentWorldRepaintTimer = null;
+        currentWorldRepaintBurstStart = 0;   // next call starts a fresh ceiling window
+        requestAnimationFrame(renderOutput);
+    }
     function scheduleCurrentWorldRepaint() {
+        const now = Date.now();
+        if (currentWorldRepaintBurstStart === 0) {
+            currentWorldRepaintBurstStart = now;
+        } else if (now - currentWorldRepaintBurstStart >= CURRENT_WORLD_REPAINT_MAX_WAIT_MS) {
+            // Deferred long enough - paint now instead of extending the window again.
+            if (currentWorldRepaintTimer !== null) clearTimeout(currentWorldRepaintTimer);
+            runCurrentWorldRepaint();
+            return;
+        }
         if (currentWorldRepaintTimer !== null) clearTimeout(currentWorldRepaintTimer);
-        currentWorldRepaintTimer = setTimeout(function() {
-            currentWorldRepaintTimer = null;
-            requestAnimationFrame(renderOutput);
-        }, CURRENT_WORLD_REPAINT_DEBOUNCE_MS);
+        currentWorldRepaintTimer = setTimeout(runCurrentWorldRepaint, CURRENT_WORLD_REPAINT_DEBOUNCE_MS);
     }
 
     // Cached rendered output per world (array of DOM elements)
@@ -4202,7 +4224,18 @@
                             const newScrollHeight = container.scrollHeight;
                             container.scrollTop += (newScrollHeight - oldScrollHeight);
                         } else {
-                            scheduleCurrentWorldRepaint();
+                            // Render NOW, not via scheduleCurrentWorldRepaint(). A gap-fill
+                            // APPENDS the newest lines at the tail - the exact thing an
+                            // at-the-bottom viewer is looking at - so there is nothing to
+                            // defer. This branch used to borrow the backfill branch's
+                            // "at the bottom => old content above the fold, no rush"
+                            // reasoning below, which is only true for a PREPEND. Combined
+                            // with the debounce having had no ceiling, that is what left
+                            // the phone showing stale output for seconds after reconnect
+                            // while the data was already in world.output_lines.
+                            // renderOutput() ends in scrollToBottom(), so the viewer stays
+                            // pinned - same end state as the debounced path, just at once.
+                            renderOutput();
                         }
                     }
                     if (appended) scheduleWorldCacheSave(msg.world_index);
@@ -4614,9 +4647,28 @@
     // noticeable right after a reconnect where a world is already fully
     // hydrated from memory/cache: the ratio reads 100% immediately, so it must
     // hide immediately too.
+    //
+    // ...but that ratio measures scrollback DEPTH, and depth alone is not completion. A
+    // gap-fill (the reconnect/resync catch-up that fetches what arrived while we were
+    // away) is not part of either backfill queue and contributes nothing to the ratio, so
+    // a world hydrated from cache satisfies the depth goal on the very first tick and the
+    // badge hid while the catch-up that actually matters was still streaming. That false
+    // "download complete" is what made a stale screen look like a rendering bug rather
+    // than data still being in flight. scrollbackCatchUpPending() below keeps the badge
+    // honest about it.
+    //
+    // Is the client still owed catch-up it hasn't applied? Deliberately not derived from
+    // backfillInProgress, which only tracks the older-history queues - a gap-fill runs
+    // outside them entirely and can be outstanding while that flag is false (e.g. a
+    // mid-session ResyncRequired).
+    function scrollbackCatchUpPending() {
+        if (pendingScrollbackRequests.size > 0) return true;
+        return worlds.some(w => w && w._gapFillPending);
+    }
     function updateScrollbackProgress() {
         if (!elements.statusScrollback) return;
-        if (!backfillInProgress) {
+        const catchingUp = scrollbackCatchUpPending();
+        if (!backfillInProgress && !catchingUp) {
             elements.statusScrollback.style.display = 'none';
             return;
         }
@@ -4628,11 +4680,14 @@
             totalGoal += goal;
             totalReceived += Math.min(received, goal);
         });
-        if (totalGoal <= 0 || totalReceived >= totalGoal) {
+        if (!catchingUp && (totalGoal <= 0 || totalReceived >= totalGoal)) {
             elements.statusScrollback.style.display = 'none';
             return;
         }
-        const pct = Math.floor((totalReceived / totalGoal) * 100 / 10) * 10;
+        let pct = totalGoal > 0 ? Math.floor((totalReceived / totalGoal) * 100 / 10) * 10 : 0;
+        // Preserve the "100% is only ever shown at true completion" property above: the
+        // depth ratio can already be at 100 while a gap-fill is still outstanding.
+        if (catchingUp) pct = Math.min(pct, 90);
         elements.statusScrollback.style.display = '';
         elements.statusScrollbackPct.textContent = pct + '%';
     }
