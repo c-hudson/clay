@@ -1947,3 +1947,88 @@ A line has exactly one ▶ owner (Phase D). With two clients viewing the same wo
 is released, the releaser gets the markers and the other client does not. That is the existing
 model, not something this change introduced — but it is easier to reach now that releases claim
 correctly.
+
+---
+
+# Phase I — the Scrollback badge stuck at 90%
+
+## The report
+
+> The android app seem to, as of a few versions ago, be slow at finishing up the download of the
+> scrollback buffer. It shows a 90% status that hangs a long way too long. I believe the issue
+> is that the scrollback is being downloaded timely but it is not updating the indicator [...]
+> I could be wrong, so don't limit the search to this perspective.
+
+Right diagnosis, and it was a regression from Phase G (`8d31e01`). 90% is a literal constant
+introduced there.
+
+## What actually went wrong
+
+Phase G made the badge keep reporting while a reconnect gap-fill was outstanding, because it had
+been claiming "complete" while the screen was still stale. The predicate it used —
+`scrollbackCatchUpPending()` — was far broader than that case:
+
+1. `pendingScrollbackRequests.size > 0` counts ordinary `'backfill'`/`'initial-fill'` chunk
+   requests, not just `'gapfill'`.
+2. Any world with `_gapFillPending`, which `handle_request_scrollback` **deliberately keeps
+   armed** while that world holds an unreleased more-mode backlog ("more IS owed, it just isn't
+   deliverable until the backlog releases").
+3. An actual gap-fill in flight — the only intended case.
+
+The first reading of the symptom was wrong and is worth recording, because the correction is the
+whole story. The clamp `Math.min(pct, 90)` does **not** pin the badge throughout the download:
+`pct` is floored to tens, so the clamp can only bite on the single step that would read 100. The
+download-phase display was identical before and after Phase G. The regression is purely the
+*ending* — completion normally hides the badge, `catchingUp` suppressed that hide, and the
+clamped 100 became a permanent-looking 90%. Case (2) is what stretched it from "a moment" to
+"until the user pages through that backlog", i.e. potentially never.
+
+## Fix
+
+Restore `updateScrollbackProgress()` to its pre-Phase-G form and delete
+`scrollbackCatchUpPending()`. The badge reports one thing again: scrollback depth, `0/10/…/90`,
+hidden the moment the ratio is met.
+
+Phase G's justification no longer applies — it was compensating for a stale reconnect screen,
+and **that was fixed in the same commit** (gap-fill renders on arrival; the repaint debounce
+gained `CURRENT_WORLD_REPAINT_MAX_WAIT_MS`). Both of those are deliberately kept. Only the badge
+carve-out is withdrawn.
+
+## Status
+
+Simulated by transliterating the **shipped** function straight out of the edited source (not a
+hand copy) and driving it with the reporter's real setting, Remote Lines = 5000, 3 worlds,
+500-line phase-2 chunks:
+
+```
+0% x2 -> 10% x3 -> 20% x3 -> ... -> 80% x3 -> 90% x3 -> (hidden)
+download complete with a paused world's backlog outstanding:  (hidden)
+```
+
+The pre-fix code produced the same climb but ended `90% x5 -> …`, and `90%` indefinitely in the
+backlog case. Structural assertions run against the shipped text (no `catchingUp`, no
+`Math.min(pct, 90)`, the floor-to-10 expression present) so the simulation can't drift from what
+was actually written.
+
+Confirmed the rebuilt binary **serves** it — `src/web/*` is `include_str!`'d, so the file on disk
+is not proof: fetched `/app.js` over HTTP from a live `-D` daemon and asserted the served bytes
+contain zero occurrences of `scrollbackCatchUpPending`/`Math.min(pct, 90)`/`catchingUp`.
+
+742/742 `cargo test`, clean `cargo clippy --all-targets` on the musl and
+`webview-gui,native-audio` feature sets (no Rust changed; run as a guard).
+
+## Verification gaps
+
+- **No JS runtime in this sandbox**, so `app.js` was not executed. Brace-balance checked with a
+  checker validated against both the pre-change file and a deliberately-broken control.
+- **Not confirmed on device.** The badge counting up and disappearing on a real Android reconnect
+  has not been observed here.
+
+## Open, deliberately not bundled
+
+Phase F's gap-fill no-progress guard clears `world._gapFillPending` after two replies that
+deliver nothing new — exactly what the server's pending-clamp reply produces — and the
+`PendingReleased` re-drive is gated on that flag. So the client no longer stays armed the way
+`handle_request_scrollback`'s comment claims. Impact is low (released lines arrive as
+`ServerData` regardless; the re-drive was belt-and-braces), but the code and the comment
+disagree and one of them should move.

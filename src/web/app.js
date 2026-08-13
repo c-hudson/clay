@@ -4191,8 +4191,15 @@
                     // gets the identical answer, forever. Count consecutive no-progress
                     // replies and, at the limit, declare the oldest hole lost so the frontier
                     // can move; see closeOldestSeqHole().
+                    //
+                    // A reply the server clamped against this world's pending backlog is NOT
+                    // evidence of an unfillable hole: it delivered nothing because nothing was
+                    // deliverable YET. Counting it tripped this guard, which clears
+                    // _gapFillPending - the exact flag the PendingReleased re-drive is gated
+                    // on - so the catch-up the clamp exists to defer never resumed.
                     const GAPFILL_MAX_NO_PROGRESS = 2;
-                    world._gapFillNoProgress = appended ? 0 : (world._gapFillNoProgress || 0) + 1;
+                    world._gapFillNoProgress = (appended || msg.clamped_by_pending)
+                        ? 0 : (world._gapFillNoProgress || 0) + 1;
                     if (world._gapFillNoProgress >= GAPFILL_MAX_NO_PROGRESS) {
                         const hole = oldestSeqHole(world);
                         world._gapFillNoProgress = 0;
@@ -4243,6 +4250,15 @@
 
                     if (msg.backfill_complete) {
                         world._gapFillPending = false;
+                    } else if (msg.clamped_by_pending) {
+                        // The server withheld the rest behind this world's unreleased
+                        // more-mode backlog. Asking again returns the identical answer until
+                        // that backlog releases, so stop the loop - but stay ARMED
+                        // (_gapFillPending left true) so the PendingReleased handler re-drives
+                        // it, which is the contract handle_request_scrollback documents.
+                        // Safe to hold indefinitely now that the scrollback badge no longer
+                        // keys off this flag (it pinned the badge at 90% until the user
+                        // happened to page through the backlog).
                     } else {
                         // Gap is bigger than one chunk - keep pulling from the new
                         // high-water mark until the daemon says we're caught up.
@@ -4649,27 +4665,22 @@
     // hydrated from memory/cache: the ratio reads 100% immediately, so it must
     // hide immediately too.
     //
-    // ...but that ratio measures scrollback DEPTH, and depth alone is not completion. A
-    // gap-fill (the reconnect/resync catch-up that fetches what arrived while we were
-    // away) is not part of either backfill queue and contributes nothing to the ratio, so
-    // a world hydrated from cache satisfies the depth goal on the very first tick and the
-    // badge hid while the catch-up that actually matters was still streaming. That false
-    // "download complete" is what made a stale screen look like a rendering bug rather
-    // than data still being in flight. scrollbackCatchUpPending() below keeps the badge
-    // honest about it.
+    // This badge tracks the scrollback-DEPTH download and nothing else. It briefly also
+    // stayed up while a reconnect gap-fill was outstanding, on the reasoning that depth
+    // alone isn't completion - but that predicate was far too broad. It counted every entry
+    // in pendingScrollbackRequests, which holds ordinary 'backfill'/'initial-fill' chunks
+    // and not just 'gapfill', so it was true for essentially the whole download. The
+    // visible result: the ratio-met hide was suppressed and the badge sat on its last
+    // drawable number - 90% - after the download had genuinely finished.
     //
-    // Is the client still owed catch-up it hasn't applied? Deliberately not derived from
-    // backfillInProgress, which only tracks the older-history queues - a gap-fill runs
-    // outside them entirely and can be outstanding while that flag is false (e.g. a
-    // mid-session ResyncRequired).
-    function scrollbackCatchUpPending() {
-        if (pendingScrollbackRequests.size > 0) return true;
-        return worlds.some(w => w && w._gapFillPending);
-    }
+    // The reason it was made to linger is also gone: it was compensating for a reconnect
+    // showing stale output, and that was fixed directly in the same change (gap-fill now
+    // renders on arrival, and the repaint debounce has a max-wait ceiling). So the badge
+    // is back to reporting exactly one thing, honestly: 0/10/.../90 while the depth
+    // download runs, hidden the moment it completes.
     function updateScrollbackProgress() {
         if (!elements.statusScrollback) return;
-        const catchingUp = scrollbackCatchUpPending();
-        if (!backfillInProgress && !catchingUp) {
+        if (!backfillInProgress) {
             elements.statusScrollback.style.display = 'none';
             return;
         }
@@ -4681,14 +4692,11 @@
             totalGoal += goal;
             totalReceived += Math.min(received, goal);
         });
-        if (!catchingUp && (totalGoal <= 0 || totalReceived >= totalGoal)) {
+        if (totalGoal <= 0 || totalReceived >= totalGoal) {
             elements.statusScrollback.style.display = 'none';
             return;
         }
-        let pct = totalGoal > 0 ? Math.floor((totalReceived / totalGoal) * 100 / 10) * 10 : 0;
-        // Preserve the "100% is only ever shown at true completion" property above: the
-        // depth ratio can already be at 100 while a gap-fill is still outstanding.
-        if (catchingUp) pct = Math.min(pct, 90);
+        const pct = Math.floor((totalReceived / totalGoal) * 100 / 10) * 10;
         elements.statusScrollback.style.display = '';
         elements.statusScrollbackPct.textContent = pct + '%';
     }
