@@ -5830,7 +5830,7 @@ if you're more curious.\"";
         // (PROTOCOL-ROADMAP.md Step 8).
         while let Ok(item) = rx.try_recv() {
             if let Outbound::Message(msg) = item {
-                if let WsMessage::ScrollbackLines { world_index, lines, backfill_complete, request_id } = *msg {
+                if let WsMessage::ScrollbackLines { world_index, lines, backfill_complete, request_id, .. } = *msg {
                     assert_eq!(world_index, 0);
                     assert!(backfill_complete,
                         "the whole gap fits in one reply, so backfill should be reported complete");
@@ -6575,6 +6575,7 @@ if you're more curious.\"";
             world_index: 0,
             lines: gap_lines,
             backfill_complete: true,
+            clamped_by_pending: false,
             request_id: None,
         });
 
@@ -6639,6 +6640,7 @@ if you're more curious.\"";
             world_index: 0,
             lines: older_lines,
             backfill_complete: true,
+            clamped_by_pending: false,
             request_id: Some(backfill_id),
         });
 
@@ -8922,4 +8924,111 @@ if you're more curious.\"";
             "the client that did NOT release must not be handed the markers");
         assert_eq!(claimed_new_seqs(&drain_ws_messages(&mut rx_b)), vec![vec![1, 2, 3]],
             "the releasing client gets them");
+    }
+
+    /// Drains one `ScrollbackLines` reply and reports `(backfill_complete, clamped_by_pending)`.
+    fn drain_scrollback_flags(rx: &mut tokio::sync::mpsc::Receiver<crate::websocket::Outbound>) -> (bool, bool) {
+        let mut result = None;
+        while let Ok(item) = rx.try_recv() {
+            if let crate::websocket::Outbound::Message(msg) = item {
+                if let WsMessage::ScrollbackLines { backfill_complete, clamped_by_pending, .. } = *msg {
+                    assert!(result.is_none(), "expected exactly one ScrollbackLines reply");
+                    result = Some((backfill_complete, clamped_by_pending));
+                }
+            }
+        }
+        result.expect("expected a ScrollbackLines reply")
+    }
+
+    /// `backfill_complete: false` conflates two situations a client must handle in opposite
+    /// ways: "more history is available right now, ask again" and "more is owed but withheld,
+    /// asking again returns the identical answer". `clamped_by_pending` separates them.
+    ///
+    /// Note what actually triggers the clamp: it scans `output_lines` for entries at or above
+    /// `pending_floor_seq()`. Under the documented invariant (pending seqs always exceed
+    /// `output_lines` seqs) nothing ever qualifies, so an ordinary paused world with a backlog
+    /// is NOT clamped — it reports `backfill_complete: true` normally. The clamp is a defensive
+    /// detector for a *violated* invariant, which is the shape this test builds. Getting that
+    /// wrong is easy: a paused world looks like it should clamp and doesn't.
+    #[test]
+    fn test_scrollback_reply_reports_when_it_was_clamped_by_a_pending_backlog() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("w");
+        // Contrived invariant violation, matching
+        // test_handle_request_scrollback_after_seq_excludes_lines_past_pending_floor: a seq 5
+        // line sits in output_lines while seq 3/4 are still queued in pending_lines.
+        world.output_lines.push(OutputLine::new("seq 1".to_string(), 1));
+        world.output_lines.push(OutputLine::new("seq 5 (violates invariant)".to_string(), 5));
+        world.pending_lines.push(OutputLine::new("pending floor at seq 3".to_string(), 3));
+        world.pending_lines.push(OutputLine::new("pending seq 4".to_string(), 4));
+        world.next_seq = 6;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.handle_request_scrollback(client_id, 0, 100, None, Some(0), None);
+        let (complete, clamped) = drain_scrollback_flags(&mut rx);
+        assert!(clamped, "seq 5 was withheld by the pending floor - the reply must say so");
+        assert!(!complete, "and must not claim completion: more IS owed");
+
+        // Release the backlog. Nothing is withheld now, so the same request is genuinely done.
+        let released = app.worlds[0].release_all_pending();
+        assert_eq!(released.len(), 2, "precondition: the backlog released");
+        let _ = drain_ws_messages(&mut rx);
+
+        app.handle_request_scrollback(client_id, 0, 100, None, Some(0), None);
+        let (complete, clamped) = drain_scrollback_flags(&mut rx);
+        assert!(!clamped, "nothing is held back any more");
+        assert!(complete, "and the request is now genuinely exhausted");
+    }
+
+    /// The common case, asserted explicitly because it is the one that is easy to assume wrong:
+    /// an ordinary paused world with a backlog is NOT clamped. Its pending lines simply are not
+    /// history the gap-fill owes - they reach the client via broadcast_released_lines on
+    /// release - so the reply is a normal, complete one.
+    #[test]
+    fn test_ordinary_paused_backlog_is_not_reported_as_clamped() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("w");
+        for seq in 0..=2u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        world.paused = true;
+        for seq in 3..=9u64 {
+            world.pending_lines.push(OutputLine::new(format!("held {seq}"), seq));
+        }
+        world.next_seq = 10;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.handle_request_scrollback(client_id, 0, 100, None, Some(0), None);
+        let (complete, clamped) = drain_scrollback_flags(&mut rx);
+        assert!(!clamped, "a well-formed paused world does not trip the clamp");
+        assert!(complete, "the deliverable history really is exhausted");
+    }
+
+    /// A `before_seq` request (deep-history backfill) can never be clamped — the clamp only
+    /// applies to the forward `after_seq` catch-up — so it must never set the flag even on a
+    /// world sitting on a backlog. Guards against a future refactor hoisting the clamp.
+    #[test]
+    fn test_before_seq_backfill_is_never_reported_as_clamped() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("w");
+        for seq in 0..=5u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        world.paused = true;
+        world.pending_lines.push(OutputLine::new("held".to_string(), 6));
+        world.next_seq = 7;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.handle_request_scrollback(client_id, 0, 100, Some(4), None, None);
+        let (_, clamped) = drain_scrollback_flags(&mut rx);
+        assert!(!clamped, "before_seq history is unaffected by the pending clamp");
     }

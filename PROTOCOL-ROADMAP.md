@@ -1969,19 +1969,27 @@ been claiming "complete" while the screen was still stale. The predicate it used
 `scrollbackCatchUpPending()` — was far broader than that case:
 
 1. `pendingScrollbackRequests.size > 0` counts ordinary `'backfill'`/`'initial-fill'` chunk
-   requests, not just `'gapfill'`.
-2. Any world with `_gapFillPending`, which `handle_request_scrollback` **deliberately keeps
-   armed** while that world holds an unreleased more-mode backlog ("more IS owed, it just isn't
-   deliverable until the backlog releases").
+   requests, not just `'gapfill'` — so it is true for essentially the entire download.
+2. Any world with `_gapFillPending`.
 3. An actual gap-fill in flight — the only intended case.
 
-The first reading of the symptom was wrong and is worth recording, because the correction is the
-whole story. The clamp `Math.min(pct, 90)` does **not** pin the badge throughout the download:
-`pct` is floored to tens, so the clamp can only bite on the single step that would read 100. The
+Two readings of this were wrong on the way to the fix, and both are worth recording.
+
+**First**, the clamp `Math.min(pct, 90)` does *not* pin the badge throughout the download. `pct`
+is floored to tens, so it can only bite on the single step that would read 100; the
 download-phase display was identical before and after Phase G. The regression is purely the
 *ending* — completion normally hides the badge, `catchingUp` suppressed that hide, and the
-clamped 100 became a permanent-looking 90%. Case (2) is what stretched it from "a moment" to
-"until the user pages through that backlog", i.e. potentially never.
+clamped 100 became a stuck-looking 90%.
+
+**Second**, (2) was claimed to pin the badge "until the user pages through that backlog,
+potentially never", on the strength of `handle_request_scrollback`'s comment about keeping
+`_gapFillPending` armed. That is wrong, and a test written to demonstrate it failed instead:
+the clamp scans `output_lines` for entries at or above `pending_floor_seq()`, and under the
+documented invariant (pending seqs always exceed `output_lines` seqs) nothing ever qualifies. An
+ordinary paused world with a backlog reports `backfill_complete: true` and the client clears the
+flag immediately. The clamp is a *defensive detector for a violated invariant*, not a
+normal-operation signal. (1) is the real cause; `test_ordinary_paused_backlog_is_not_reported_as_clamped`
+now pins that down so the same wrong assumption isn't made a third time.
 
 ## Fix
 
@@ -2002,11 +2010,10 @@ hand copy) and driving it with the reporter's real setting, Remote Lines = 5000,
 
 ```
 0% x2 -> 10% x3 -> 20% x3 -> ... -> 80% x3 -> 90% x3 -> (hidden)
-download complete with a paused world's backlog outstanding:  (hidden)
 ```
 
-The pre-fix code produced the same climb but ended `90% x5 -> …`, and `90%` indefinitely in the
-backlog case. Structural assertions run against the shipped text (no `catchingUp`, no
+The pre-fix code produced the same climb but ended `90% x5 -> …` instead of hiding. Structural
+assertions run against the shipped text (no `catchingUp`, no
 `Math.min(pct, 90)`, the floor-to-10 expression present) so the simulation can't drift from what
 was actually written.
 
@@ -2024,11 +2031,21 @@ contain zero occurrences of `scrollbackCatchUpPending`/`Math.min(pct, 90)`/`catc
 - **Not confirmed on device.** The badge counting up and disappearing on a real Android reconnect
   has not been observed here.
 
-## Open, deliberately not bundled
+## Follow-on, fixed in the same round
 
-Phase F's gap-fill no-progress guard clears `world._gapFillPending` after two replies that
-deliver nothing new — exactly what the server's pending-clamp reply produces — and the
-`PendingReleased` re-drive is gated on that flag. So the client no longer stays armed the way
-`handle_request_scrollback`'s comment claims. Impact is low (released lines arrive as
-`ServerData` regardless; the re-drive was belt-and-braces), but the code and the comment
-disagree and one of them should move.
+Phase F's gap-fill no-progress guard cleared `world._gapFillPending` after two replies that
+deliver nothing new — which is what a pending-clamped reply looks like — and the
+`PendingReleased` re-drive is gated on that flag, so the client stopped staying armed the way
+`handle_request_scrollback`'s comment claims. The root problem was that `backfill_complete:
+false` conflated two situations a client must handle in *opposite* ways: "more history is
+available right now, ask again" and "more is owed but withheld, asking again returns the
+identical answer". A client cannot act correctly on the union — it either livelocks or gives up.
+
+`ScrollbackLines` now carries `clamped_by_pending` (`#[serde(default)]`; `backfill_complete` is
+deliberately unchanged when clamped, so an older client behaves exactly as before). The client
+treats a clamped reply as neither progress nor evidence of an unfillable hole: it stops asking
+but stays armed, which is what makes the `PendingReleased` re-drive work as documented. Holding
+the flag indefinitely is only safe *because* the badge above no longer keys off it.
+
+Scope note: as established above, this path is reached only when the seq-ordering invariant is
+violated. It is a defensive repair, not a fix for something users hit routinely.

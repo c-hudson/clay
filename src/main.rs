@@ -5338,7 +5338,7 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
-            WsMessage::ScrollbackLines { world_index, lines, backfill_complete: _, request_id } => {
+            WsMessage::ScrollbackLines { world_index, lines, backfill_complete: _, clamped_by_pending: _, request_id } => {
                 // Resolve which outstanding request this reply answers (PROTOCOL-ROADMAP.md's
                 // seq-drift fix, Step 12b) instead of routing purely on World::pending_gap,
                 // which stays ambiguous whenever a gap-fill and an ordinary backfill chunk
@@ -6298,11 +6298,18 @@ impl App {
         // ...but never report "complete" when the after_seq slice was cut short by the
         // pending clamp: more IS owed, it just isn't deliverable until the backlog releases.
         // The client keeps _gapFillPending armed and re-drives it on PendingReleased.
+        //
+        // `clamped_by_pending` is reported alongside so the client can tell that case apart
+        // from "there is more history available right now". Both used to arrive as a bare
+        // `backfill_complete: false`, and a client cannot act correctly on the union: asking
+        // again is right for the first and a livelock for the second. See the field's doc
+        // comment in websocket.rs.
         let backfill_complete = visible_count < count && !clamped_by_pending;
         self.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
             world_index,
             lines,
             backfill_complete,
+            clamped_by_pending,
             request_id,
         });
     }

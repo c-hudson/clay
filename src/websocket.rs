@@ -676,7 +676,21 @@ pub enum WsMessage {
     /// `AuthRequest.resume` path, `App::handle_ws_auth_initial_state`) - see that path's
     /// callers. `None` means either an old server that predates this field, or (defensively)
     /// a reply the server couldn't correlate to any specific request.
-    ScrollbackLines { world_index: usize, lines: Vec<TimestampedLine>, #[serde(default)] backfill_complete: bool, #[serde(default)] request_id: Option<u64> },
+    /// `clamped_by_pending` disambiguates the two very different reasons an `after_seq`
+    /// gap-fill can come back short, which `backfill_complete: false` alone conflates:
+    ///
+    /// - **more history is available right now** — the client should immediately ask again;
+    /// - **more is owed but withheld** behind this world's unreleased more-mode backlog
+    ///   (`handle_request_scrollback`'s pending clamp) — asking again returns the identical
+    ///   answer until the backlog releases.
+    ///
+    /// Without the distinction a client can only pick one wrong behaviour: re-request in a
+    /// tight loop (a livelock the client-side no-progress guard then has to break, which
+    /// clears `_gapFillPending` and so loses the `PendingReleased` re-drive the clamp
+    /// depends on), or stop and never resume. With it, a clamped reply means "stop asking,
+    /// stay armed". `backfill_complete` is deliberately left as-is when clamped (still
+    /// `false`) so an older client's behaviour is unchanged by this field's arrival.
+    ScrollbackLines { world_index: usize, lines: Vec<TimestampedLine>, #[serde(default)] backfill_complete: bool, #[serde(default)] clamped_by_pending: bool, #[serde(default)] request_id: Option<u64> },
     /// World switch result with appropriate initial data
     WorldSwitchResult {
         world_index: usize,
