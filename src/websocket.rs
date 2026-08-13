@@ -49,6 +49,14 @@ pub(crate) const WS_CLIENT_CHANNEL_CAPACITY: usize = 256;
 /// messages with no single world (control/global messages) return `None` and are simply
 /// logged as dropped with no resync target — losing e.g. an `ActivityUpdate` doesn't
 /// corrupt any world's `seq` stream the way losing a `ServerData` would.
+///
+/// **`ScrollbackBatch` is deliberately absent and must stay absent** (PROTOCOL-ROADMAP.md
+/// Phase J). It spans every world in one message, so there is no single index to return —
+/// but more importantly, a dropped batch must NOT trigger `ResyncRequired`. The push pump
+/// already handles `TrySendError::Full` correctly by leaving its cursors untouched and
+/// retrying the identical batch on the next tick; adding a resync on top would turn ordinary
+/// backpressure into a resync storm on exactly the slow client that provoked it. This looks
+/// like an oversight to anyone scanning the list — it isn't.
 pub(crate) fn message_world_index(msg: &WsMessage) -> Option<usize> {
     match msg {
         WsMessage::ServerData { world_index, .. }
@@ -309,6 +317,15 @@ pub enum WsMessage {
         /// than adopting somebody else's markers.
         #[serde(default)]
         your_display_id: u64,
+        /// Capability advertisement for the server-push scrollback download
+        /// (PROTOCOL-ROADMAP.md Phase J). `true` = this server understands
+        /// `ScrollbackSyncRequest`/`ScrollbackContinue` and will push `ScrollbackBatch`.
+        /// `serde(default)` = false against an older server, which is exactly the signal a
+        /// new client needs to fall back to the legacy `RequestScrollback` bulk fetch —
+        /// without it a new client would send a sync request into an old server's `_ => {}`
+        /// catch-all and wait forever for a batch that never comes.
+        #[serde(default)]
+        scrollback_push: bool,
     },
 
     // Real-time updates (server -> client)
@@ -790,6 +807,157 @@ pub enum WsMessage {
     /// should request via `RequestScrollback { after_seq: Some(from_seq), .. }` to
     /// resync. Not yet sent by anything — Step 1 is schema only.
     ResyncRequired { world_index: usize, from_seq: u64 },
+
+    // ---- Server-push scrollback download (PROTOCOL-ROADMAP.md Phase J) ----
+    //
+    // Replaces the client-pull backfill pump. The client reports, per world, the highest seq
+    // below which it has NO gaps; the server pushes history newest-first until it reaches
+    // that seq, spends the Remote Lines budget, or runs off the bottom of its buffer.
+    // Completeness becomes the server's job, which is the whole point: eight phases of
+    // patching the pull design failed because the client owned it and its bookkeeping kept
+    // getting corrupted.
+    //
+    // NOTE for `message_world_index`: none of these three carry a single `world_index` and
+    // none of them must ever appear there. See the comment at that function.
+    /// Client -> server. Sent once per connection, AFTER `InitialState` has been applied.
+    ///
+    /// Deliberately NOT folded into `AuthRequest.resume`, and deliberately keyed by world
+    /// NAME rather than array index. `AuthRequest` is sent *before* `InitialState`, so at
+    /// that point a cold-started client has an empty `worlds` array and reports nothing at
+    /// all (re-downloading history it already holds in its local cache), while a reconnecting
+    /// client reports indices taken from the *previous* `InitialState` — which silently land
+    /// on the wrong worlds if the world list changed meanwhile.
+    ///
+    /// `complete` is the explicit done-signal: `true` means "that is the entire list; for any
+    /// world absent from it, I hold nothing". A client with many worlds may send several with
+    /// `complete: false` and one final `complete: true`; the server accumulates.
+    ScrollbackSyncRequest {
+        worlds: Vec<ScrollbackClientWorld>,
+        complete: bool,
+        /// Client viewport height, for the screenful+10 first batch. Carried here rather
+        /// than read from `WsClientInfo.viewport_height` because `UpdateViewState` arrives
+        /// *after* `InitialState`, so the stored value is still the default 24 at the moment
+        /// the first batch is planned.
+        #[serde(default)]
+        viewport_lines: usize,
+        /// Client can decompress a zlib-deflated binary `ScrollbackBatch` frame. Set after
+        /// feature-detecting `DecompressionStream`; when false the server sends batches as
+        /// ordinary text frames.
+        #[serde(default)]
+        accepts_deflate: bool,
+        /// Protocol generation, 1 today.
+        #[serde(default)]
+        version: u32,
+    },
+    /// Client -> server. Acknowledges one delivered cycle and asks for the next. One
+    /// continue advances EVERY world, because a batch is a cycle across all worlds rather
+    /// than one world's chunk — with 20 worlds, per-world ack-gating would cost 20 round
+    /// trips per cycle instead of one.
+    ScrollbackContinue { batch_id: u64 },
+
+    /// Server -> client. One cycle's worth of history, covering every world still being
+    /// filled. The server waits for the matching `ScrollbackContinue` before sending the
+    /// next, and times send->continue on its own clock to decide whether to ramp up or back
+    /// off (a client-supplied timestamp would measure clock skew, not transfer duration).
+    ScrollbackBatch {
+        batch_id: u64,
+        worlds: Vec<ScrollbackWorldBatch>,
+        /// Worlds that finished during this cycle.
+        done: Vec<ScrollbackWorldDone>,
+        /// Every world is finished: the client hides its progress badge and sends no further
+        /// `ScrollbackContinue`.
+        complete: bool,
+    },
+}
+
+/// One world's entry in a client's `ScrollbackSyncRequest`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScrollbackClientWorld {
+    /// World name, not index — see `ScrollbackSyncRequest`'s doc comment.
+    pub name: String,
+    /// "Don't send me anything at or below this." `None` = the client holds nothing for this
+    /// world and wants a full download.
+    ///
+    /// This is a genuine "everything below here is gapless" claim, which the client can only
+    /// make because a completed download collapses its delivered-seq record to a single range
+    /// anchored at 0. A frontier derived from an un-collapsed record would be the *top of
+    /// whatever contiguous run it happens to hold* — on a cold start, the tail slice from
+    /// `InitialState` — and reporting that would make the server stop immediately and
+    /// download nothing.
+    #[serde(default)]
+    pub gapless_seq: Option<u64>,
+    /// Bottom/top of the contiguous run the client already holds above `gapless_seq`, so the
+    /// server can skip re-sending what `InitialState` (or the client's local cache) just
+    /// handed it. Both `None` degenerates to the plain `(world, gapless_seq)` behaviour.
+    #[serde(default)]
+    pub held_from: Option<u64>,
+    #[serde(default)]
+    pub held_to: Option<u64>,
+}
+
+/// One world's slice of a `ScrollbackBatch`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScrollbackWorldBatch {
+    /// Valid at send time; the client resolves by `world_name` and treats this as a hint,
+    /// since an index can be retargeted by a world being added or removed mid-download.
+    pub world_index: usize,
+    pub world_name: String,
+    /// ASCENDING by seq *within* a batch, so the client's existing seq-ordered insert works
+    /// unchanged. Successive batches walk DOWNWARD: every seq in batch N+1 is strictly below
+    /// every seq in batch N for the same world.
+    pub lines: Vec<TimestampedLine>,
+    /// Progress numerator/denominator, both server-computed. `planned_total` is the exact
+    /// number of lines the server intends to send for this world, fixed at plan time — not
+    /// `newest_seq - gapless_seq`, which overcounts, because seq ranges legitimately contain
+    /// holes (a selective flush discards pending lines whose seqs were already allocated) and
+    /// a badge built on it would stall short of 100% and never hide.
+    pub delivered: usize,
+    pub planned_total: usize,
+}
+
+/// Terminal marker for one world's download. The client raises its gapless seq ONLY on
+/// receiving this — never on "I stopped receiving lines", which is indistinguishable from a
+/// stalled or truncated download and is precisely how the historical frontier-poisoning bugs
+/// happened.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScrollbackWorldDone {
+    pub world_index: usize,
+    pub world_name: String,
+    pub reason: ScrollbackDoneReason,
+    /// Highest seq delivered during THIS download. The client collapses its delivered-seq
+    /// record to `[0, high_seq]`, which is what makes its next `gapless_seq` claim true by
+    /// declaration. `None` = nothing was delivered.
+    pub high_seq: Option<u64>,
+    /// Lowest seq delivered during this download.
+    pub low_seq: Option<u64>,
+    /// The oldest seq the server still holds in `output_lines` for this world. Without it, a
+    /// client whose `gapless_seq` is 500 against a server buffer starting at 3000 can never
+    /// advance its frontier past the unreachable 501..2999 hole, and re-requests that same
+    /// range on every reconnect forever. With it, the client closes the hole and moves on.
+    pub oldest_available_seq: Option<u64>,
+    /// The stop point chosen at plan time. If this is BELOW the client's reported
+    /// `gapless_seq`, the world's seq space was reset underneath it (a lost `settings.dat`,
+    /// a recreated world) and the client must drop its record rather than trust seqs from a
+    /// previous epoch.
+    pub plan_high_seq: u64,
+}
+
+/// Why a world's download stopped.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum ScrollbackDoneReason {
+    /// Reached the client's `gapless_seq` — it already has everything below.
+    ReachedClientSeq,
+    /// Spent the "Remote Lines" budget.
+    HitLineLimit,
+    /// Ran off the bottom of `output_lines`; see `oldest_available_seq`.
+    BufferExhausted,
+    /// Cancelled: continue timed out twice, the world was flushed or removed, or the client
+    /// went away. Nothing is corrupt — the client never raised its gapless seq.
+    Aborted,
+    /// This server mode can't serve a seq-driven download. Multiuser emits `seq: 0` on every
+    /// line, so there is nothing to walk; answering immediately stops the client's progress
+    /// badge hanging forever waiting on a batch that will never come.
+    Unsupported,
 }
 
 /// A line of output with timestamp
@@ -1143,11 +1311,123 @@ pub struct WsClientInfo {
     /// message, rare enough that a genuinely unfillable hole costs one message every
     /// `AUDIT_REFIRE_INTERVAL` keepalives rather than one per keepalive.
     pub audit_stall_ticks: std::collections::HashMap<usize, u32>,
+    /// In-flight server-push scrollback download for this client, if any
+    /// (PROTOCOL-ROADMAP.md Phase J). `None` before the client sends a
+    /// `ScrollbackSyncRequest`, and again once every world has finished.
+    ///
+    /// Lives here rather than in `App::ws_client_worlds`'s `ClientViewState` for three
+    /// reasons, in order of weight:
+    ///
+    /// 1. **Borrow checker.** Every `App` send helper takes `&self` (`ws_send_to_client`,
+    ///    `ws_broadcast`). With the state in `App`, driving the pump would need
+    ///    `&mut self.ws_client_worlds` while reading `&self.worlds` and calling a `&self`
+    ///    sender — a three-way conflict that forces a collect-plan-then-apply dance around
+    ///    every mutation. Behind `WebSocketServer::clients` the whole pump runs on `&self`:
+    ///    `take_push` under a short lock, drop the guard, plan against `&self.worlds`, send,
+    ///    `put_push`.
+    /// 2. **Lifetime.** `WsClientInfo` is removed when the socket drops. `ClientViewState`
+    ///    deliberately outlives it by `WS_VIEWER_GRACE` so a transport blip doesn't look
+    ///    like a world-switch. A download must die with its connection, not linger.
+    /// 3. **Precedent.** `acked_seq`, `needs_resync` and the `audit_*` maps are already
+    ///    per-client protocol bookkeeping in exactly this struct.
+    #[allow(dead_code)]
+    pub(crate) push: Option<Box<ScrollbackPush>>,
 }
 
 /// Keepalive audits to wait before re-sending a `ResyncRequired` to a client still stalled at
 /// the same seq — see `WsClientInfo::audit_stall_ticks`.
 pub(crate) const AUDIT_REFIRE_INTERVAL: u32 = 6;
+
+// The `#[allow(dead_code)]` on the download state below and on `WsClientInfo::push` and its
+// accessors is temporary scaffolding, not a permanent exemption. Phase J is built bottom-up:
+// steps 1-6 land the schema, the per-client state and the pure planner/builder, and nothing
+// outside the tests constructs any of it until `drive_scrollback_push` arrives in step 7.
+// REMOVE all nine of these then - anything still warning after step 7 is genuinely
+// unreachable and should be deleted rather than silenced.
+
+/// Which stage of the download a client is in (PROTOCOL-ROADMAP.md Phase J).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PushPhase {
+    /// First cycle: a screenful + `PUSH_INITIAL_EXTRA` lines per world, to fill the visible
+    /// output area before depth-filling starts.
+    Initial,
+    /// Steady state: `cycle_lines` per world per cycle, ramping.
+    Cycling,
+}
+
+/// A client's in-flight scrollback download (PROTOCOL-ROADMAP.md Phase J).
+///
+/// One batch covers every unfinished world and is answered by a single `ScrollbackContinue`,
+/// so this is per-client rather than per-(client, world): with 20 worlds, per-world
+/// ack-gating would cost 20 round trips per cycle instead of one.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct ScrollbackPush {
+    /// Per-world cursors, keyed by world NAME. An index would be retargeted onto a different
+    /// world by an add or remove mid-download; the name is re-resolved each cycle.
+    pub worlds: Vec<PushWorld>,
+    /// Lines per world in the next cycle: starts at `PUSH_CYCLE_START`, ramps by
+    /// `PUSH_CYCLE_STEP` up to `PUSH_CYCLE_MAX`.
+    pub cycle_lines: usize,
+    /// Set once a cycle came back slow, or a batch had to be trimmed to fit the size cap.
+    /// The rate never increases again after this — a deliberate asymmetry: a client that has
+    /// demonstrated it can't keep up shouldn't be probed repeatedly at a rate it already
+    /// failed.
+    pub ramp_locked: bool,
+    /// `(batch_id, sent_at)` for the cycle awaiting a continue. Timed on the SERVER clock:
+    /// a client-supplied timestamp compared against a server one measures clock skew plus
+    /// latency, not transfer duration, and on a phone with a drifting clock can come out
+    /// negative.
+    pub inflight: Option<(u64, std::time::Instant)>,
+    pub next_batch_id: u64,
+    /// Consecutive overdue continues. At `PUSH_MAX_STALLS` the download aborts.
+    pub stalls: u32,
+    /// Suspended: the client backgrounded, or a continue is overdue. Cursors are kept, so a
+    /// resume picks up exactly where it left off.
+    pub parked: bool,
+    pub phase: PushPhase,
+    /// Viewport height reported in `ScrollbackSyncRequest`, for the first cycle's size.
+    pub viewport_lines: usize,
+    /// Client can decode a zlib-deflated binary batch frame.
+    pub accepts_deflate: bool,
+    /// True once a cycle overlapped a park or a visibility change: that cycle's elapsed time
+    /// is meaningless as a throughput signal and must not drive the ramp either way.
+    /// Without this a single 3-second backgrounding hiccup would pin the rate at
+    /// `PUSH_CYCLE_START` for the rest of the download.
+    pub timing_invalid: bool,
+}
+
+/// One world's cursor within a `ScrollbackPush`.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct PushWorld {
+    pub name: String,
+    /// The client's reported gapless seq: nothing at or below this is sent. `None` = the
+    /// client holds nothing for this world.
+    pub floor_seq: Option<u64>,
+    /// Inclusive range the client already holds above `floor_seq`, skipped when encountered.
+    pub skip: Option<(u64, u64)>,
+    /// The next line delivered has `seq < cursor`. Walks downward as the download proceeds.
+    pub cursor: u64,
+    /// Stop point fixed when the download was planned. Fixing it (rather than chasing the
+    /// live tail) is what makes the download terminate on a busy world, and what makes the
+    /// push and live streams disjoint so neither needs to dedup against the other.
+    pub plan_high_seq: u64,
+    /// Oldest seq present in `output_lines` at plan time, reported in the done marker.
+    pub oldest_at_plan: Option<u64>,
+    /// Remaining "Remote Lines" budget, counted in VISIBLE lines.
+    pub budget_left: usize,
+    /// Exact number of lines this world's download intends to deliver, for the client's
+    /// progress denominator.
+    pub planned_total: usize,
+    pub delivered: usize,
+    /// Highest/lowest seq actually delivered, reported in the done marker. The client raises
+    /// its gapless seq to `high_seq` and collapses its record to `[0, high_seq]`.
+    pub high_seq: Option<u64>,
+    pub low_seq: Option<u64>,
+    pub done: bool,
+}
 
 /// User credential for multiuser authentication
 #[derive(Clone, Debug)]
@@ -1453,6 +1733,79 @@ impl WebSocketServer {
                 }
             }
         }
+    }
+
+    /// Remove a client's in-flight download state so the caller can drive it without holding
+    /// the clients lock (PROTOCOL-ROADMAP.md Phase J).
+    ///
+    /// Deliberately a `take` and not a clone. The lock must not be held across a send — a
+    /// send can block on the outbound channel's internals, and every other WS operation
+    /// needs this map — so the pump has to work on an owned copy. Taking guarantees that
+    /// while one caller is driving a client's pump, no second caller can obtain the same
+    /// state and drive it concurrently: the second `take_push` returns `None`. All dispatch
+    /// currently happens in a single `select!` per process so there is no real concurrency
+    /// today, but this makes the invariant structural rather than incidental.
+    ///
+    /// Callers MUST pair this with `put_push`, including on early returns, or the client
+    /// silently stops downloading.
+    #[allow(dead_code)]
+    pub(crate) fn take_push(&self, client_id: u64) -> Option<Box<ScrollbackPush>> {
+        let mut clients = self.clients.write().unwrap();
+        clients.get_mut(&client_id).and_then(|c| c.push.take())
+    }
+
+    /// Return a client's download state after driving it. Drops it on the floor if the
+    /// client disconnected in the meantime, which is the correct outcome — a download must
+    /// not outlive its connection.
+    #[allow(dead_code)]
+    pub(crate) fn put_push(&self, client_id: u64, state: Box<ScrollbackPush>) {
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.push = Some(state);
+        }
+    }
+
+    /// Clear a client's download state without driving it — used when the download aborts.
+    #[allow(dead_code)]
+    pub(crate) fn clear_push(&self, client_id: u64) {
+        let mut clients = self.clients.write().unwrap();
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.push = None;
+        }
+    }
+
+    /// `(client_id, when that client next needs attention)` for every client with an active
+    /// download. Feeds the shared pacing timer's re-arm so the event loops sleep until there
+    /// is genuinely something to do rather than polling.
+    ///
+    /// A client awaiting a continue is due at its timeout; one that is ready to send is due
+    /// immediately; a parked one is not due at all (it is woken by a visibility change, not
+    /// by the clock).
+    #[allow(dead_code)]
+    pub(crate) fn push_deadlines(&self, continue_timeout: std::time::Duration) -> Vec<(u64, std::time::Instant)> {
+        let clients = self.clients.read().unwrap();
+        clients
+            .iter()
+            .filter_map(|(&id, c)| {
+                let push = c.push.as_ref()?;
+                if push.parked {
+                    return None;
+                }
+                match push.inflight {
+                    Some((_, sent_at)) => Some((id, sent_at + continue_timeout)),
+                    None => Some((id, std::time::Instant::now())),
+                }
+            })
+            .collect()
+    }
+
+    /// Free slots in a client's outbound channel. The pump refuses to start a cycle below a
+    /// floor, which is the difference between a download that *competes* with live output
+    /// and one that *evicts* it: the channel is bounded and a full one discards messages.
+    #[allow(dead_code)]
+    pub(crate) fn client_channel_capacity(&self, client_id: u64) -> usize {
+        let clients = self.clients.read().unwrap();
+        clients.get(&client_id).map(|c| c.tx.capacity()).unwrap_or(0)
     }
 
 }
@@ -2272,6 +2625,7 @@ where
             audit_prev_acked: std::collections::HashMap::new(),
             audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
             needs_resync: std::collections::HashSet::new(),
         });
     }

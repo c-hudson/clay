@@ -3209,6 +3209,13 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         actions,
         splash_lines,
         server_version: crate::VERSION.to_string(),
+        // Multiuser stays on the legacy pull download permanently (PROTOCOL-ROADMAP.md
+        // Phase J). The push protocol is driven entirely by per-world sequence numbers and
+        // multiuser has none - it emits `seq: 0, end_seq: None` on every line and skips the
+        // ack audit outright - so there is nothing for a newest-first walk to walk. Reporting
+        // `false` keeps multiuser clients on `RequestScrollback`, which does work here, in
+        // preference to advertising the capability and then refusing every request.
+        scrollback_push: false,
     }
 }
 
@@ -3816,6 +3823,7 @@ mod change_password_tests {
             audit_prev_acked: std::collections::HashMap::new(),
             audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
             needs_resync: std::collections::HashSet::new(),
         });
         rx
@@ -3976,6 +3984,7 @@ mod resume_owner_scoping_tests {
             audit_prev_acked: std::collections::HashMap::new(),
             audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
             needs_resync: std::collections::HashSet::new(),
         });
         rx

@@ -5507,6 +5507,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
                 paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5565,6 +5566,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
                 paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5816,6 +5818,7 @@ if you're more curious.\"";
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -5890,6 +5893,7 @@ if you're more curious.\"";
                 audit_prev_acked: std::collections::HashMap::new(),
                 audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6239,6 +6243,7 @@ if you're more curious.\"";
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6299,6 +6304,7 @@ if you're more curious.\"";
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6362,6 +6368,7 @@ if you're more curious.\"";
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -6415,6 +6422,7 @@ if you're more curious.\"";
                 paused: false,
                 acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -8335,6 +8343,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
                 paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -8382,6 +8391,7 @@ if you're more curious.\"";
                 connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
                 paused: false, acked_seq: std::collections::HashMap::new(), audit_prev_acked: std::collections::HashMap::new(), audit_fired_at: std::collections::HashMap::new(),
             audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -8909,6 +8919,7 @@ if you're more curious.\"";
                 audit_prev_acked: std::collections::HashMap::new(),
                 audit_fired_at: std::collections::HashMap::new(),
                 audit_stall_ticks: std::collections::HashMap::new(),
+                push: None,
                 needs_resync: std::collections::HashSet::new(),
             });
         }
@@ -9031,4 +9042,700 @@ if you're more curious.\"";
         app.handle_request_scrollback(client_id, 0, 100, Some(4), None, None);
         let (_, clamped) = drain_scrollback_flags(&mut rx);
         assert!(!clamped, "before_seq history is unaffected by the pending clamp");
+    }
+
+    // ---- Phase J: server-push scrollback download, wire schema ----
+    //
+    // Step 1 is schema only: no senders, no handlers. These pin the parts of the encoding
+    // that later steps and the JS client depend on, so a rename or a dropped
+    // `#[serde(default)]` fails here rather than silently changing the wire format.
+
+    #[test]
+    fn test_scrollback_sync_request_round_trip() {
+        let msg = WsMessage::ScrollbackSyncRequest {
+            worlds: vec![
+                ScrollbackClientWorld {
+                    name: "Alpha".to_string(),
+                    gapless_seq: Some(500),
+                    held_from: Some(900),
+                    held_to: Some(1000),
+                },
+                ScrollbackClientWorld {
+                    name: "Beta".to_string(),
+                    gapless_seq: None,
+                    held_from: None,
+                    held_to: None,
+                },
+            ],
+            complete: true,
+            viewport_lines: 42,
+            accepts_deflate: true,
+            version: 1,
+        };
+        let json = serde_json::to_string(&msg).expect("serializes");
+        match serde_json::from_str::<WsMessage>(&json).expect("round-trips") {
+            WsMessage::ScrollbackSyncRequest { worlds, complete, viewport_lines, accepts_deflate, version } => {
+                assert_eq!(worlds.len(), 2);
+                assert_eq!(worlds[0].name, "Alpha");
+                assert_eq!(worlds[0].gapless_seq, Some(500));
+                assert_eq!(worlds[0].held_from, Some(900));
+                assert_eq!(worlds[0].held_to, Some(1000));
+                // A world the client holds nothing for: the server must read this as
+                // "download everything", not as "gapless seq 0".
+                assert_eq!(worlds[1].gapless_seq, None);
+                assert!(complete);
+                assert_eq!(viewport_lines, 42);
+                assert!(accepts_deflate);
+                assert_eq!(version, 1);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scrollback_sync_request_defaults_for_older_client() {
+        // Every added field must be omittable, or a client built against an earlier
+        // generation of this message fails to parse at the server instead of degrading.
+        let json = r#"{"type":"ScrollbackSyncRequest","worlds":[{"name":"Alpha"}],"complete":false}"#;
+        match serde_json::from_str::<WsMessage>(json).expect("parses without optional fields") {
+            WsMessage::ScrollbackSyncRequest { worlds, complete, viewport_lines, accepts_deflate, version } => {
+                assert_eq!(worlds.len(), 1);
+                assert_eq!(worlds[0].gapless_seq, None);
+                assert_eq!(worlds[0].held_from, None);
+                assert!(!complete);
+                assert_eq!(viewport_lines, 0);
+                // Defaulting to false is what keeps a client that can't decompress from
+                // being sent a binary frame it will silently fail to decode.
+                assert!(!accepts_deflate);
+                assert_eq!(version, 0);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scrollback_continue_round_trip() {
+        let json = serde_json::to_string(&WsMessage::ScrollbackContinue { batch_id: 7 }).unwrap();
+        match serde_json::from_str::<WsMessage>(&json).unwrap() {
+            WsMessage::ScrollbackContinue { batch_id } => assert_eq!(batch_id, 7),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scrollback_batch_round_trip() {
+        let line = TimestampedLine {
+            text: "hello".to_string(),
+            ts: 1234,
+            gagged: false,
+            from_server: true,
+            seq: 900,
+            highlight_color: None,
+            from_archive: false,
+            viewed: true,
+            display_id: None,
+        };
+        let msg = WsMessage::ScrollbackBatch {
+            batch_id: 3,
+            worlds: vec![ScrollbackWorldBatch {
+                world_index: 0,
+                world_name: "Alpha".to_string(),
+                lines: vec![line],
+                delivered: 25,
+                planned_total: 500,
+            }],
+            done: vec![ScrollbackWorldDone {
+                world_index: 1,
+                world_name: "Beta".to_string(),
+                reason: ScrollbackDoneReason::BufferExhausted,
+                high_seq: Some(1000),
+                low_seq: Some(3000),
+                oldest_available_seq: Some(3000),
+                plan_high_seq: 4000,
+            }],
+            complete: false,
+        };
+        let json = serde_json::to_string(&msg).expect("serializes");
+        match serde_json::from_str::<WsMessage>(&json).expect("round-trips") {
+            WsMessage::ScrollbackBatch { batch_id, worlds, done, complete } => {
+                assert_eq!(batch_id, 3);
+                assert_eq!(worlds.len(), 1);
+                assert_eq!(worlds[0].world_name, "Alpha");
+                assert_eq!(worlds[0].lines.len(), 1);
+                assert_eq!(worlds[0].lines[0].seq, 900);
+                assert_eq!(worlds[0].delivered, 25);
+                assert_eq!(worlds[0].planned_total, 500);
+                assert_eq!(done.len(), 1);
+                assert_eq!(done[0].reason, ScrollbackDoneReason::BufferExhausted);
+                // The field that terminates the re-request-forever loop when the server's
+                // buffer no longer reaches down to the client's frontier.
+                assert_eq!(done[0].oldest_available_seq, Some(3000));
+                assert_eq!(done[0].plan_high_seq, 4000);
+                assert!(!complete);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scrollback_done_reason_encodes_by_name() {
+        // The JS client switches on these strings; renaming a variant is a wire break.
+        for (reason, expected) in [
+            (ScrollbackDoneReason::ReachedClientSeq, "\"ReachedClientSeq\""),
+            (ScrollbackDoneReason::HitLineLimit, "\"HitLineLimit\""),
+            (ScrollbackDoneReason::BufferExhausted, "\"BufferExhausted\""),
+            (ScrollbackDoneReason::Aborted, "\"Aborted\""),
+            (ScrollbackDoneReason::Unsupported, "\"Unsupported\""),
+        ] {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_scrollback_batch_never_maps_to_a_world_index() {
+        // A dropped batch must not fire ResyncRequired: the push pump already handles a full
+        // channel by leaving its cursors alone and resending the identical batch, so a
+        // resync on top would turn ordinary backpressure into a storm aimed at the slow
+        // client that caused it. Guards the deliberate omission in message_world_index().
+        let batch = WsMessage::ScrollbackBatch {
+            batch_id: 1,
+            worlds: vec![ScrollbackWorldBatch {
+                world_index: 4,
+                world_name: "Alpha".to_string(),
+                lines: Vec::new(),
+                delivered: 0,
+                planned_total: 0,
+            }],
+            done: Vec::new(),
+            complete: false,
+        };
+        assert_eq!(crate::websocket::message_world_index(&batch), None,
+            "ScrollbackBatch must never resolve to a world_index - see message_world_index's doc comment");
+        assert_eq!(crate::websocket::message_world_index(&WsMessage::ScrollbackContinue { batch_id: 1 }), None);
+    }
+
+    #[test]
+    fn test_initial_state_scrollback_push_defaults_false() {
+        // Absent flag => old server => the client must stay on the legacy pull path rather
+        // than send a sync request into a `_ => {}` catch-all and wait forever.
+        //
+        // Built from a real build_initial_state() rather than a hand-written stub, so this
+        // exercises the message the server actually emits; the flag is then stripped to
+        // simulate an older server that predates it.
+        let mut app = App::new();
+        let state = app.build_initial_state(0);
+        let mut encoded = serde_json::to_value(&state).expect("serializes");
+
+        match &state {
+            WsMessage::InitialState { scrollback_push, .. } => assert!(
+                !scrollback_push,
+                "the flag must stay false until the ScrollbackSyncRequest handler exists (step 9)"
+            ),
+            other => panic!("wrong variant: {:?}", other),
+        }
+
+        assert!(encoded.get("scrollback_push").is_some(), "flag is present on the wire");
+        encoded.as_object_mut().unwrap().remove("scrollback_push");
+
+        match serde_json::from_value::<WsMessage>(encoded).expect("parses without the flag") {
+            WsMessage::InitialState { scrollback_push, .. } => assert!(!scrollback_push),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    // ---- Phase J: per-client download state and its accessors ----
+
+    /// Minimal `ScrollbackPush` for accessor tests — the planner (step 4) builds the real one.
+    fn push_fixture() -> Box<crate::websocket::ScrollbackPush> {
+        use crate::websocket::{ScrollbackPush, PushWorld, PushPhase};
+        Box::new(ScrollbackPush {
+            worlds: vec![PushWorld {
+                name: "Alpha".to_string(),
+                floor_seq: Some(500),
+                skip: None,
+                cursor: 1000,
+                plan_high_seq: 1000,
+                oldest_at_plan: Some(0),
+                budget_left: 100,
+                planned_total: 100,
+                delivered: 0,
+                high_seq: None,
+                low_seq: None,
+                done: false,
+            }],
+            cycle_lines: 25,
+            ramp_locked: false,
+            inflight: None,
+            next_batch_id: 1,
+            stalls: 0,
+            parked: false,
+            phase: PushPhase::Initial,
+            viewport_lines: 40,
+            accepts_deflate: true,
+            timing_invalid: false,
+        })
+    }
+
+    #[test]
+    fn test_push_state_take_and_put_round_trip() {
+        let mut app = App::new();
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        let server = app.ws_server.as_ref().unwrap();
+
+        assert!(server.take_push(client_id).is_none(), "no download before a sync request");
+
+        server.put_push(client_id, push_fixture());
+        let taken = server.take_push(client_id).expect("state comes back");
+        assert_eq!(taken.worlds.len(), 1);
+        assert_eq!(taken.worlds[0].name, "Alpha");
+        assert_eq!(taken.cycle_lines, 25);
+        assert_eq!(taken.phase, crate::websocket::PushPhase::Initial);
+    }
+
+    #[test]
+    fn test_push_state_take_is_exclusive() {
+        // take_push is a `take`, not a clone, precisely so two callers can never be driving
+        // the same client's pump against two divergent copies of its cursors. The second
+        // caller gets None and does nothing rather than double-sending a cycle.
+        let mut app = App::new();
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        let server = app.ws_server.as_ref().unwrap();
+
+        server.put_push(client_id, push_fixture());
+        assert!(server.take_push(client_id).is_some(), "first take wins");
+        assert!(server.take_push(client_id).is_none(), "second take must not see the state");
+    }
+
+    #[test]
+    fn test_push_state_is_dropped_when_the_client_is_gone() {
+        // A download must not outlive its connection. put_push for a departed client is a
+        // no-op rather than resurrecting an entry keyed by a dead id.
+        let mut app = App::new();
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        let server = app.ws_server.as_ref().unwrap();
+
+        server.clients.write().unwrap().remove(&client_id);
+        server.put_push(client_id, push_fixture());
+
+        assert!(server.clients.read().unwrap().get(&client_id).is_none());
+        assert!(server.take_push(client_id).is_none());
+    }
+
+    #[test]
+    fn test_clear_push_discards_the_download() {
+        let mut app = App::new();
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        let server = app.ws_server.as_ref().unwrap();
+
+        server.put_push(client_id, push_fixture());
+        server.clear_push(client_id);
+        assert!(server.take_push(client_id).is_none());
+    }
+
+    #[test]
+    fn test_push_deadlines_reflect_what_each_client_is_waiting_on() {
+        use std::time::{Duration, Instant};
+        let timeout = Duration::from_secs(30);
+        let mut app = App::new();
+        let (client_id, _rx) = phase_c_register_client(&mut app);
+        let server = app.ws_server.as_ref().unwrap();
+
+        // No download at all: nothing due.
+        assert!(server.push_deadlines(timeout).is_empty());
+
+        // Ready to send: due immediately, so the timer fires on the next tick.
+        server.put_push(client_id, push_fixture());
+        let due = server.push_deadlines(timeout);
+        assert_eq!(due.len(), 1);
+        assert!(due[0].1 <= Instant::now(), "a client with no batch in flight is due now");
+
+        // Awaiting a continue: due at the timeout, not before. This is what lets the event
+        // loops sleep instead of polling.
+        let sent_at = Instant::now();
+        let mut state = server.take_push(client_id).unwrap();
+        state.inflight = Some((7, sent_at));
+        server.put_push(client_id, state);
+        let due = server.push_deadlines(timeout);
+        assert_eq!(due.len(), 1);
+        assert!(due[0].1 >= sent_at + timeout, "an in-flight batch is due at its timeout");
+
+        // Parked: not due at all. A backgrounded client is woken by a visibility change,
+        // never by the clock, so it must not accrue timeouts while away.
+        let mut state = server.take_push(client_id).unwrap();
+        state.parked = true;
+        server.put_push(client_id, state);
+        assert!(server.push_deadlines(timeout).is_empty(), "a parked client is not due");
+    }
+
+    #[test]
+    fn test_client_channel_capacity_tracks_backlog() {
+        // The pump refuses to start a cycle when this drops below a floor: the channel is
+        // bounded and a full one DISCARDS messages, so an unthrottled download would evict
+        // live output rather than merely compete with it.
+        let mut app = App::new();
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        let server = app.ws_server.as_ref().unwrap();
+
+        let full = server.client_channel_capacity(client_id);
+        assert_eq!(full, crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+
+        let tx = server.clients.read().unwrap().get(&client_id).unwrap().tx.clone();
+        for _ in 0..10 {
+            tx.try_send(crate::websocket::Outbound::Shared(std::sync::Arc::from("{}"))).unwrap();
+        }
+        assert_eq!(server.client_channel_capacity(client_id), full - 10,
+            "capacity must reflect undrained backlog, not nominal size");
+
+        rx.close();
+        while rx.try_recv().is_ok() {}
+
+        // An unknown client reports zero, so the pump treats it as "no room" and skips it
+        // rather than sending into a channel that no longer exists.
+        assert_eq!(server.client_channel_capacity(9999), 0);
+    }
+
+    // ---- Phase J: splash lines must not collide with real output seqs ----
+
+    #[test]
+    fn test_splash_lines_do_not_reuse_seqs_for_real_output() {
+        // Splash used to be hardcoded to seqs 0-11 while next_seq stayed at 0, so the first
+        // twelve real lines re-used those seqs and output_lines held two different texts
+        // under one number. A newest-first download walk would deliver both and the client
+        // would drop one at random.
+        let mut world = World::new_with_splash("Splashy", true);
+        assert!(!world.output_lines.is_empty(), "fixture needs a splash");
+
+        let splash_seqs: Vec<u64> = world.output_lines.iter().map(|l| l.seq).collect();
+        assert_eq!(world.next_seq, splash_seqs.len() as u64,
+            "next_seq must sit above the splash, not at 0");
+
+        // Real output arriving on top of a still-displayed splash must get fresh seqs.
+        for i in 0..5 {
+            let seq = world.next_seq;
+            world.next_seq += 1;
+            world.output_lines.push(OutputLine::new(format!("real line {}", i), seq));
+        }
+
+        let all: Vec<u64> = world.output_lines.iter().map(|l| l.seq).collect();
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "duplicate seq in output_lines: {:?}", all);
+        assert!(all.windows(2).all(|w| w[0] < w[1]), "output_lines must stay ascending by seq");
+    }
+
+    #[test]
+    fn test_splash_reinstall_allocates_above_existing_seqs() {
+        // ensure_has_world reinstalls a splash into an EMPTY buffer - but empty does not mean
+        // "no seqs issued": /flush empties output_lines and deliberately leaves next_seq
+        // alone. Allocating from 0 there would re-issue seqs a connected client already holds.
+        let mut world = World::new("Reused");
+        world.next_seq = 8000;
+
+        let splash = World::generate_splash_lines(world.next_seq);
+        assert_eq!(splash.first().map(|l| l.seq), Some(8000),
+            "a reinstalled splash starts at next_seq, not 0");
+        assert_eq!(splash.last().map(|l| l.seq), Some(8000 + splash.len() as u64 - 1));
+    }
+
+    #[test]
+    fn test_world_without_splash_still_starts_at_seq_zero() {
+        // Guard against the fix silently costing every ordinary world its first 12 seqs.
+        let world = World::new("Plain");
+        assert!(world.output_lines.is_empty());
+        assert_eq!(world.next_seq, 0);
+    }
+
+    // ========================================================================
+    // Phase J: the scrollback push planner
+    //
+    // Pure decisions only - no clock, no sends. Everything here answers "what should this
+    // client receive", which is exactly the part that eight phases of the pull design kept
+    // getting wrong.
+    // ========================================================================
+
+    /// A world named `name` holding seqs `0..count`, every `gag_every`-th line gagged
+    /// (0 = none). `next_seq` is left just past the last line, as the live path maintains it.
+    fn push_world(name: &str, count: u64, gag_every: u64) -> World {
+        let mut world = World::new(name);
+        for seq in 0..count {
+            let mut line = OutputLine::new(format!("{} line {}", name, seq), seq);
+            if gag_every > 0 && seq % gag_every == 0 {
+                line.gagged = true;
+            }
+            world.output_lines.push(line);
+        }
+        world.next_seq = count;
+        world
+    }
+
+    fn claim(name: &str, gapless: Option<u64>) -> crate::websocket::ScrollbackClientWorld {
+        crate::websocket::ScrollbackClientWorld {
+            name: name.to_string(),
+            gapless_seq: gapless,
+            held_from: None,
+            held_to: None,
+        }
+    }
+
+    /// Everything the plan will deliver for `name`, newest-first, as seqs. Mirrors what the
+    /// cycle builder (step 5) will walk, so planner tests can assert on content rather than
+    /// only on counts.
+    fn planned_seqs(app: &App, plan: &crate::websocket::ScrollbackPush, name: &str) -> Vec<u64> {
+        let pw = plan.worlds.iter().find(|w| w.name == name).expect("world planned");
+        let world = app.worlds.iter().find(|w| w.name == name).unwrap();
+        let mut visible_spent = 0usize;
+        let mut out = Vec::new();
+        for line in world.output_lines.iter().rev() {
+            if line.seq > pw.plan_high_seq || line.from_archive {
+                continue;
+            }
+            if pw.floor_seq.is_some_and(|f| line.seq <= f) {
+                break;
+            }
+            if pw.skip.is_some_and(|(a, b)| line.seq >= a && line.seq <= b) {
+                continue;
+            }
+            if !line.gagged {
+                if visible_spent >= pw.budget_left {
+                    break;
+                }
+                visible_spent += 1;
+            }
+            out.push(line.seq);
+        }
+        out
+    }
+
+    #[test]
+    fn test_plan_stops_at_the_clients_gapless_seq() {
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        app.worlds = vec![push_world("Alpha", 1000, 0)];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", Some(900))], 40, false);
+        let seqs = planned_seqs(&app, &plan, "Alpha");
+
+        assert_eq!(seqs.first(), Some(&999), "newest first");
+        assert_eq!(seqs.last(), Some(&901), "stops just above the client's frontier");
+        assert!(!seqs.contains(&900), "must not resend the frontier line itself");
+        assert_eq!(plan.worlds[0].planned_total, 99);
+    }
+
+    #[test]
+    fn test_plan_downloads_everything_for_an_unmentioned_world() {
+        // The explicit contract of ScrollbackSyncRequest.complete: a world absent from the
+        // list means the client holds nothing for it.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        app.worlds = vec![push_world("Alpha", 50, 0), push_world("Beta", 50, 0)];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", Some(40))], 40, false);
+        let beta = plan.worlds.iter().find(|w| w.name == "Beta").expect("Beta planned");
+        assert_eq!(beta.floor_seq, None);
+        assert_eq!(beta.planned_total, 50, "unmentioned world downloads in full");
+    }
+
+    #[test]
+    fn test_plan_respects_the_remote_lines_budget() {
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 100;
+        app.worlds = vec![push_world("Alpha", 1000, 0)];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", None)], 40, false);
+        assert_eq!(plan.worlds[0].planned_total, 100, "budget caps the download");
+
+        let seqs = planned_seqs(&app, &plan, "Alpha");
+        assert_eq!(seqs.first(), Some(&999));
+        assert_eq!(seqs.last(), Some(&900), "budget is spent on the NEWEST lines");
+    }
+
+    #[test]
+    fn test_plan_budget_counts_visible_lines_only() {
+        // Gagged lines are invisible without F2, so they must not eat a client's allowance -
+        // but they ARE sent, so they count toward planned_total. Same rule as
+        // take_visible_range and the rest of the Remote Lines accounting.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 10;
+        app.worlds = vec![push_world("Alpha", 100, 2)]; // every 2nd line gagged
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", None)], 40, false);
+        let seqs = planned_seqs(&app, &plan, "Alpha");
+
+        let world = &app.worlds[0];
+        let visible = seqs.iter()
+            .filter(|s| !world.output_lines[**s as usize].gagged)
+            .count();
+        assert_eq!(visible, 10, "exactly the budget in VISIBLE lines");
+        assert!(seqs.len() > 10, "gagged lines ride along free");
+        assert_eq!(plan.worlds[0].planned_total, seqs.len(),
+            "planned_total counts every line actually sent, gagged included");
+    }
+
+    #[test]
+    fn test_plan_skips_the_range_the_client_already_holds() {
+        // held_from/held_to is what stops the download re-sending the slice InitialState
+        // just handed the client.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        app.worlds = vec![push_world("Alpha", 1000, 0)];
+
+        let mut c = claim("Alpha", Some(500));
+        c.held_from = Some(900);
+        c.held_to = Some(999);
+        let plan = app.plan_scrollback_push(&[c], 40, false);
+        let seqs = planned_seqs(&app, &plan, "Alpha");
+
+        assert!(seqs.iter().all(|s| !(900..=999).contains(s)), "held range is skipped");
+        assert_eq!(seqs.first(), Some(&899), "delivery resumes below the held range");
+        assert_eq!(seqs.last(), Some(&501));
+        assert_eq!(plan.worlds[0].planned_total, 399);
+    }
+
+    #[test]
+    fn test_plan_reports_oldest_available_when_history_was_trimmed() {
+        // The field that terminates the re-request-forever loop: the client's frontier is
+        // 100 but the server's buffer starts at 3000, so 101..2999 can never be delivered.
+        // Without oldest_available_seq the client asks again on every reconnect, forever.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 10000;
+        let mut world = World::new("Alpha");
+        for seq in 3000..3500u64 {
+            world.output_lines.push(OutputLine::new(format!("line {}", seq), seq));
+        }
+        world.next_seq = 3500;
+        app.worlds = vec![world];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", Some(100))], 40, false);
+        assert_eq!(plan.worlds[0].oldest_at_plan, Some(3000));
+        assert_eq!(plan.worlds[0].planned_total, 500, "only what actually exists");
+    }
+
+    #[test]
+    fn test_plan_ignores_a_client_frontier_from_a_previous_seq_epoch() {
+        // next_seq is persisted, but a lost settings.dat or a recreated world resets it. The
+        // client then reports a frontier above anything we hold; trusting it would download
+        // nothing and leave the client showing stale text forever.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        app.worlds = vec![push_world("Alpha", 50, 0)];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", Some(9000))], 40, false);
+        assert_eq!(plan.worlds[0].floor_seq, None, "impossible frontier is discarded");
+        assert_eq!(plan.worlds[0].planned_total, 50, "full download instead");
+        assert_eq!(plan.worlds[0].plan_high_seq, 49,
+            "and the done marker reports a plan_high below the client's claim, so it drops its record");
+    }
+
+    #[test]
+    fn test_plan_excludes_pending_held_lines() {
+        // Lines in the more-mode backlog have real seqs but were deliberately not broadcast.
+        // Delivering them here would put them on the wire ahead of the release path.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        let mut world = push_world("Alpha", 100, 0);
+        for seq in 100..120u64 {
+            world.pending_lines.push(OutputLine::new(format!("pending {}", seq), seq));
+        }
+        world.next_seq = 120;
+        app.worlds = vec![world];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", None)], 40, false);
+        assert_eq!(plan.worlds[0].plan_high_seq, 99, "stop point clamps below the backlog");
+        let seqs = planned_seqs(&app, &plan, "Alpha");
+        assert!(seqs.iter().all(|s| *s < 100), "no pending line is ever pushed");
+    }
+
+    #[test]
+    fn test_plan_excludes_archive_lines() {
+        // try_load_archive_lines fabricates seqs by counting backwards with a saturating_sub,
+        // so on a low-seq world they DUPLICATE real ones. Sending them would put two
+        // different texts on the wire under one seq.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        let mut world = push_world("Alpha", 20, 0);
+        let mut archived = OutputLine::new("archived text".to_string(), 5);
+        archived.from_archive = true;
+        world.output_lines.insert(0, archived);
+        app.worlds = vec![world];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", None)], 40, false);
+        assert_eq!(plan.worlds[0].planned_total, 20, "the archive line is not counted");
+
+        let seqs = planned_seqs(&app, &plan, "Alpha");
+        assert_eq!(seqs.iter().filter(|s| **s == 5).count(), 1,
+            "seq 5 appears once - the real line, not the archive duplicate");
+    }
+
+    #[test]
+    fn test_plan_high_seq_is_fixed_so_a_busy_world_terminates() {
+        // The stop point is chosen once. If it chased the live tail, a world receiving output
+        // faster than the download drains would never finish - and the push and live streams
+        // would overlap, so each would have to dedup against the other.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        app.worlds = vec![push_world("Alpha", 100, 0)];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", None)], 40, false);
+        assert_eq!(plan.worlds[0].plan_high_seq, 99);
+
+        for seq in 100..200u64 {
+            app.worlds[0].output_lines.push(OutputLine::new(format!("live {}", seq), seq));
+        }
+        app.worlds[0].next_seq = 200;
+
+        assert_eq!(plan.worlds[0].plan_high_seq, 99, "live arrivals do not move the stop point");
+        let seqs = planned_seqs(&app, &plan, "Alpha");
+        assert!(seqs.iter().all(|s| *s <= 99), "live lines are the broadcast path's job");
+    }
+
+    #[test]
+    fn test_plan_omits_worlds_with_nothing_to_send() {
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        app.worlds = vec![
+            push_world("Empty", 0, 0),
+            push_world("CaughtUp", 50, 0),
+            push_world("Needs", 50, 0),
+        ];
+
+        let plan = app.plan_scrollback_push(
+            &[claim("CaughtUp", Some(49)), claim("Needs", Some(10))], 40, false);
+
+        let names: Vec<&str> = plan.worlds.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["Needs"],
+            "an empty world and a fully caught-up one carry no cursor");
+    }
+
+    #[test]
+    fn test_plan_carries_client_negotiated_settings() {
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 100;
+        app.worlds = vec![push_world("Alpha", 50, 0)];
+
+        let plan = app.plan_scrollback_push(&[claim("Alpha", None)], 37, true);
+        assert_eq!(plan.viewport_lines, 37);
+        assert!(plan.accepts_deflate);
+        assert_eq!(plan.cycle_lines, crate::PUSH_CYCLE_START);
+        assert_eq!(plan.phase, crate::websocket::PushPhase::Initial);
+        assert!(!plan.ramp_locked);
+        assert!(plan.inflight.is_none());
+    }
+
+    #[test]
+    fn test_plan_matches_worlds_by_name_not_index() {
+        // An index would be silently retargeted by a world being added or removed between
+        // connections - the failure AuthRequest.resume's index-keyed list still has.
+        let mut app = App::new();
+        app.settings.remote_initial_lines = 1000;
+        app.worlds = vec![push_world("Alpha", 100, 0), push_world("Beta", 100, 0)];
+
+        // Client reports its frontiers in the opposite order to the server's world array.
+        let plan = app.plan_scrollback_push(
+            &[claim("Beta", Some(90)), claim("Alpha", Some(10))], 40, false);
+
+        let alpha = plan.worlds.iter().find(|w| w.name == "Alpha").unwrap();
+        let beta = plan.worlds.iter().find(|w| w.name == "Beta").unwrap();
+        assert_eq!(alpha.floor_seq, Some(10), "Alpha's frontier stayed with Alpha");
+        assert_eq!(beta.floor_seq, Some(90), "Beta's frontier stayed with Beta");
     }

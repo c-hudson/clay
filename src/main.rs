@@ -130,6 +130,7 @@ pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
+    ScrollbackClientWorld, ScrollbackWorldBatch, ScrollbackWorldDone, ScrollbackDoneReason,
     hash_password, hash_with_challenge, is_ip_in_allow_list,
 };
 pub use actions::{
@@ -1941,6 +1942,49 @@ impl User {
 /// suppressing its world's arrivals (`ws_client_viewing`) after nobody is looking.
 const WS_VIEWER_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+// ---- Server-push scrollback download pacing (PROTOCOL-ROADMAP.md Phase J) ----
+
+/// Extra lines beyond the client's viewport in the first cycle, so the visible output area is
+/// filled with a little margin before depth-filling begins.
+#[allow(dead_code)]
+pub(crate) const PUSH_INITIAL_EXTRA: usize = 10;
+/// Lines per world in the first cycling batch, and the floor the rate never drops below.
+#[allow(dead_code)]
+pub(crate) const PUSH_CYCLE_START: usize = 25;
+/// Ramp increment per successful cycle, and the decrement applied after a slow one.
+#[allow(dead_code)]
+pub(crate) const PUSH_CYCLE_STEP: usize = 25;
+/// Ceiling on lines per world per cycle.
+#[allow(dead_code)]
+pub(crate) const PUSH_CYCLE_MAX: usize = 500;
+/// A cycle slower than this cuts the rate. Measured on the SERVER clock, from sending a batch
+/// to receiving its `ScrollbackContinue`; comparing a server timestamp against a client one
+/// would measure clock skew rather than transfer time, and can come out negative on a phone.
+#[allow(dead_code)]
+pub(crate) const PUSH_SLOW_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long to wait for a `ScrollbackContinue` before parking the download.
+#[allow(dead_code)]
+pub(crate) const PUSH_CONTINUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Consecutive overdue continues before the download aborts. Aborting is safe at any point:
+/// the client only raises its gapless frontier on an explicit done marker, so an abandoned
+/// download costs re-fetching, never correctness.
+#[allow(dead_code)]
+pub(crate) const PUSH_MAX_STALLS: u32 = 2;
+/// Self-imposed ceiling on one serialized (and, when negotiated, compressed) cycle.
+///
+/// NOT a protocol limit: tungstenite 0.24 applies `max_message_size`/`max_frame_size` on the
+/// READ path only (`read_frame`, `Message::extend`), so nothing bounds what this server sends
+/// — the comment in websocket.rs claiming otherwise is wrong for this version. The real
+/// constraint is the peer's own read cap, and browsers are effectively unbounded. This exists
+/// to keep one batch off the latency and memory critical path, not to satisfy a peer.
+#[allow(dead_code)]
+pub(crate) const PUSH_MAX_CYCLE_BYTES: usize = 192 * 1024;
+/// Free slots required in a client's outbound channel before a cycle may start. The channel
+/// is bounded and a full one DISCARDS messages, so without a floor the download would evict
+/// live output rather than merely compete with it.
+#[allow(dead_code)]
+pub(crate) const PUSH_MIN_CHANNEL_SLOTS: usize = 8;
+
 /// Tracks a WebSocket client's view state for synchronized more-mode
 #[derive(Clone, Debug)]
 pub struct ClientViewState {
@@ -2871,11 +2915,17 @@ impl World {
 
     pub fn new_with_splash(name: &str, show_splash: bool) -> Self {
         let output_lines = if show_splash {
-            Self::generate_splash_lines()
+            Self::generate_splash_lines(0)
         } else {
             Vec::new()
         };
         let scroll_offset = output_lines.len().saturating_sub(1);
+        // Start real output ABOVE the splash rather than reusing its seqs. Not reset when the
+        // splash is later cleared: a client that connected during the splash was already sent
+        // those lines, so recycling the seqs would hand it two different texts under one
+        // number. The resulting unused range at the bottom is reported honestly by the
+        // download's `oldest_available_seq` and costs nothing.
+        let next_seq = output_lines.len() as u64;
         Self {
             name: name.to_string(),
             output_lines,
@@ -2923,7 +2973,7 @@ impl World {
             proxy_socket_path: None,
             naws_enabled: false,
             naws_sent_size: None,
-            next_seq: 0,
+            next_seq,
             broadcast_ledger: std::sync::Mutex::new(Vec::new()),
             ledger_audited_upto: None,
             login_capture_guard: 6,
@@ -3791,7 +3841,16 @@ impl World {
         }
     }
 
-    fn generate_splash_lines() -> Vec<OutputLine> {
+    /// Splash lines, allocated from `start_seq` upward.
+    ///
+    /// These used to be hardcoded to seqs 0-11 while the world's `next_seq` stayed at 0, so
+    /// the first twelve lines of real MUD output re-used seqs 0-11 and `output_lines` briefly
+    /// held two different texts under one seq. Harmless while nothing walked the buffer by
+    /// seq; fatal to the server-push download (PROTOCOL-ROADMAP.md Phase J), whose
+    /// newest-first walk would deliver both and let the client drop one at random. Callers
+    /// must advance `next_seq` past what this returns — the remote-console path at
+    /// `handle_initial_state` has always done so, and is the pattern this follows.
+    fn generate_splash_lines(start_seq: u64) -> Vec<OutputLine> {
         // Splash content without centering - will be centered at render time
         // Dog art:
         //           (\/\__o
@@ -3802,18 +3861,18 @@ impl World {
         let now = SystemTime::now();
         // Splash lines use seq 0-11 (will be cleared when real MUD data arrives)
         vec![
-            OutputLine::new_with_timestamp("".to_string(), now, 0),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m          (\\/\\__o     \x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗\x1b[0m".to_string(), now, 1),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m  __      `-/ `_/     \x1b[38;5;208m██╔════╝██║     ██╔══██╗╚██╗ ██╔╝\x1b[0m".to_string(), now, 2),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m `--\\______/  |       \x1b[38;5;215m██║     ██║     ███████║ ╚████╔╝ \x1b[0m".to_string(), now, 3),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m    /        /        \x1b[38;5;216m██║     ██║     ██╔══██║  ╚██╔╝  \x1b[0m".to_string(), now, 4),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m -`/_------'\\_.       \x1b[38;5;217m╚██████╗███████╗██║  ██║   ██║   \x1b[0m".to_string(), now, 5),
-            OutputLine::new_with_timestamp("\x1b[38;5;218m                       ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   \x1b[0m".to_string(), now, 6),
-            OutputLine::new_with_timestamp("".to_string(), now, 7),
-            OutputLine::new_with_timestamp("\x1b[38;5;213m✨ A 90dies mud client written today ✨\x1b[0m".to_string(), now, 8),
-            OutputLine::new_with_timestamp("".to_string(), now, 9),
-            OutputLine::new_with_timestamp("\x1b[38;5;244m/help for how to use clay\x1b[0m".to_string(), now, 10),
-            OutputLine::new_with_timestamp("".to_string(), now, 11),
+            OutputLine::new_with_timestamp("".to_string(), now, start_seq),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m          (\\/\\__o     \x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗\x1b[0m".to_string(), now, start_seq + 1),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m  __      `-/ `_/     \x1b[38;5;208m██╔════╝██║     ██╔══██╗╚██╗ ██╔╝\x1b[0m".to_string(), now, start_seq + 2),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m `--\\______/  |       \x1b[38;5;215m██║     ██║     ███████║ ╚████╔╝ \x1b[0m".to_string(), now, start_seq + 3),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m    /        /        \x1b[38;5;216m██║     ██║     ██╔══██║  ╚██╔╝  \x1b[0m".to_string(), now, start_seq + 4),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m -`/_------'\\_.       \x1b[38;5;217m╚██████╗███████╗██║  ██║   ██║   \x1b[0m".to_string(), now, start_seq + 5),
+            OutputLine::new_with_timestamp("\x1b[38;5;218m                       ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   \x1b[0m".to_string(), now, start_seq + 6),
+            OutputLine::new_with_timestamp("".to_string(), now, start_seq + 7),
+            OutputLine::new_with_timestamp("\x1b[38;5;213m✨ A 90dies mud client written today ✨\x1b[0m".to_string(), now, start_seq + 8),
+            OutputLine::new_with_timestamp("".to_string(), now, start_seq + 9),
+            OutputLine::new_with_timestamp("\x1b[38;5;244m/help for how to use clay\x1b[0m".to_string(), now, start_seq + 10),
+            OutputLine::new_with_timestamp("".to_string(), now, start_seq + 11),
         ]
     }
 }
@@ -4288,7 +4347,10 @@ impl App {
             // Add splash to current world if it has no output yet
             let current = &mut self.worlds[self.current_world_index];
             if current.output_lines.is_empty() && !current.connected {
-                current.output_lines = World::generate_splash_lines();
+                // Allocate from next_seq, not 0 - the buffer being empty does not mean no
+                // seqs have been handed out (a /flush empties it and leaves next_seq alone).
+                current.output_lines = World::generate_splash_lines(current.next_seq);
+                current.next_seq += current.output_lines.len() as u64;
                 current.showing_splash = true;
                 current.scroll_offset = current.output_lines.len().saturating_sub(1);
             }
@@ -6173,6 +6235,158 @@ impl App {
             self.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
             self.broadcast_activity();
         }
+    }
+
+    /// Plan a client's server-push scrollback download (PROTOCOL-ROADMAP.md Phase J).
+    ///
+    /// Pure: reads `self.worlds` and the request, returns state. No sends, no mutation, no
+    /// clock, no I/O — everything time-dependent lives in the pump (step 7), so the whole of
+    /// the "what should this client receive" decision is testable without a runtime.
+    ///
+    /// The key decision made here and nowhere else is `plan_high_seq`: each world's stop
+    /// point is FIXED at plan time to `deliverable_high_seq()`. Two consequences that the
+    /// rest of the design leans on:
+    ///
+    /// - the download terminates on a busy world, instead of chasing a tail that keeps moving;
+    /// - the push stream and the live broadcast stream are disjoint by construction (live
+    ///   lines are all above `plan_high_seq`), so neither has to dedup against the other.
+    ///
+    /// Worlds are matched by NAME. An index would be silently retargeted onto a different
+    /// world by an add or remove between connections, which is the failure the client-side
+    /// `AuthRequest.resume` list still has.
+    #[allow(dead_code)]
+    pub(crate) fn plan_scrollback_push(
+        &self,
+        req_worlds: &[crate::websocket::ScrollbackClientWorld],
+        viewport_lines: usize,
+        accepts_deflate: bool,
+    ) -> crate::websocket::ScrollbackPush {
+        use crate::websocket::{ScrollbackPush, PushWorld, PushPhase};
+
+        let budget = self.settings.remote_initial_lines as usize;
+        let mut worlds = Vec::new();
+
+        for world in self.worlds.iter() {
+            // A world the client didn't mention holds nothing on its side: full download.
+            // This is the explicit contract of ScrollbackSyncRequest.complete, and it is why
+            // the client sends the list AFTER InitialState - before it, a cold-started client
+            // has no world list and would silently claim to hold nothing for everything.
+            let claim = req_worlds.iter().find(|w| w.name == world.name);
+            let floor_seq = claim.and_then(|c| c.gapless_seq);
+            let skip = claim.and_then(|c| match (c.held_from, c.held_to) {
+                (Some(from), Some(to)) if from <= to => Some((from, to)),
+                _ => None,
+            });
+
+            // Nothing deliverable at all (empty world, or everything is held in the more-mode
+            // backlog): finish it immediately rather than carrying a cursor that can't move.
+            let Some(plan_high_seq) = world.deliverable_high_seq() else {
+                continue;
+            };
+
+            // The client's seq space and ours disagree - it reports a frontier above anything
+            // we hold. That means this world's seqs were reset underneath it (a lost
+            // settings.dat, a recreated world), so its cached lines are from a previous epoch.
+            // Plan the full download; the done marker's plan_high_seq tells it to drop its
+            // record rather than trust the old numbers.
+            let epoch_reset = floor_seq.is_some_and(|f| f > plan_high_seq);
+            let floor_seq = if epoch_reset { None } else { floor_seq };
+
+            let oldest_at_plan = Self::push_deliverable_lines(world, plan_high_seq)
+                .first()
+                .map(|l| l.seq);
+
+            let planned_total = Self::push_planned_total(world, plan_high_seq, floor_seq, skip, budget);
+            if planned_total == 0 {
+                continue;
+            }
+
+            worlds.push(PushWorld {
+                name: world.name.clone(),
+                floor_seq,
+                skip,
+                // Exclusive upper bound: the first line sent has seq < cursor.
+                cursor: plan_high_seq.saturating_add(1),
+                plan_high_seq,
+                oldest_at_plan,
+                budget_left: budget,
+                planned_total,
+                delivered: 0,
+                high_seq: None,
+                low_seq: None,
+                done: false,
+            });
+        }
+
+        ScrollbackPush {
+            worlds,
+            cycle_lines: PUSH_CYCLE_START,
+            ramp_locked: false,
+            inflight: None,
+            next_batch_id: 1,
+            stalls: 0,
+            parked: false,
+            phase: PushPhase::Initial,
+            viewport_lines,
+            accepts_deflate,
+            timing_invalid: false,
+        }
+    }
+
+    /// The slice of a world's `output_lines` this download may draw from: at or below
+    /// `plan_high_seq`, and never an archive line.
+    ///
+    /// Archive lines are excluded because `try_load_archive_lines` fabricates their seqs by
+    /// counting backwards from the buffer's oldest with a `saturating_sub`, so on a low-seq
+    /// world they collide with real ones. Sending them would put two different texts on the
+    /// wire under one seq. The archive is out of scope for this phase; when it comes in, it
+    /// needs a real seq scheme first.
+    #[allow(dead_code)]
+    fn push_deliverable_lines(world: &World, plan_high_seq: u64) -> Vec<&OutputLine> {
+        world
+            .output_lines
+            .iter()
+            .filter(|l| l.seq <= plan_high_seq && !l.from_archive)
+            .collect()
+    }
+
+    /// Exactly how many lines this world's download will deliver, computed at plan time.
+    ///
+    /// This is the client's progress denominator, and it is computed rather than estimated
+    /// on purpose. `plan_high_seq - gapless_seq` looks equivalent and is not: seq ranges
+    /// legitimately contain holes (a selective flush discards pending lines whose seqs were
+    /// already allocated; a partial-line completion removes a stored line mid-buffer), so a
+    /// badge built on the arithmetic would stall short of 100% and never hide.
+    ///
+    /// Counts every line that will actually be SENT, gagged ones included, because those are
+    /// what the client receives and counts against. The `budget` is spent on visible lines
+    /// only, matching `take_visible_range` and the rest of the Remote Lines accounting.
+    #[allow(dead_code)]
+    fn push_planned_total(
+        world: &World,
+        plan_high_seq: u64,
+        floor_seq: Option<u64>,
+        skip: Option<(u64, u64)>,
+        budget: usize,
+    ) -> usize {
+        let mut visible_spent = 0usize;
+        let mut total = 0usize;
+        for line in Self::push_deliverable_lines(world, plan_high_seq).iter().rev() {
+            if floor_seq.is_some_and(|f| line.seq <= f) {
+                break;
+            }
+            if skip.is_some_and(|(from, to)| line.seq >= from && line.seq <= to) {
+                continue;
+            }
+            if !line.gagged {
+                if visible_spent >= budget {
+                    break;
+                }
+                visible_spent += 1;
+            }
+            total += 1;
+        }
+        total
     }
 
     /// `WsMessage::RequestScrollback` handling — shared by master-WS and daemon (T40).
@@ -11553,6 +11767,11 @@ impl App {
             actions: self.settings.actions.clone(),
             splash_lines: generate_splash_strings(),
             server_version: crate::VERSION.to_string(),
+            // Stays false until the ScrollbackSyncRequest handler actually exists
+            // (PROTOCOL-ROADMAP.md Phase J, step 9). Advertising the capability before we
+            // can answer it would strand a new client waiting on a batch that never comes,
+            // so every intermediate build honestly reports "use the legacy path".
+            scrollback_push: false,
         }
     }
 
