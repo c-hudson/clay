@@ -9943,3 +9943,111 @@ if you're more curious.\"";
         assert!(!world.output_lines.iter().any(|l| l.seq == next),
             "the next live line would be issued seq {}, which is already in the buffer", next);
     }
+
+    #[test]
+    fn test_ensure_next_seq_above_buffer_repairs_the_reported_cave_shape() {
+        // Reproduces world 12 [cave] exactly as /dump reported it on 1.5.25: 1648 lines in
+        // the buffer against next_seq 145. Three 500-line archive blocks (whose seqs are
+        // fabricated and saturate at 0) plus ~142 live lines, and a counter that never moved.
+        //
+        // This state SURVIVED the fix for new archive loads, because a hot reload restores
+        // output_lines and next_seq independently - and a hot reload is exactly how a
+        // long-running instance picks up a new build. The repair has to happen on restore or
+        // the poisoned world never recovers.
+        let mut world = World::new("cave");
+        for _ in 0..3 {
+            let oldest = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
+            let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
+                .map(|i| crate::scrollback::ScrollbackLine {
+                    ts_ms: 1_000 + i as i64,
+                    world: "cave".to_string(),
+                    text: format!("archived {}", i),
+                })
+                .collect();
+            // Splice WITHOUT the counter advance, i.e. the state a pre-1.5.25 instance built.
+            let prepend = App::build_archive_prepend(archived, oldest);
+            world.output_lines.splice(0..0, prepend);
+        }
+        for seq in 0..142u64 {
+            world.output_lines.push(OutputLine::new(format!("live {}", seq), seq));
+        }
+        world.next_seq = 145;
+
+        let highest = world.output_lines.iter().map(|l| l.seq).max().unwrap();
+        assert!(world.next_seq <= highest, "fixture must reproduce the broken state");
+
+        world.ensure_next_seq_above_buffer();
+
+        assert!(world.next_seq > highest,
+            "after repair next_seq is {} but the buffer still contains seq {}",
+            world.next_seq, highest);
+        let next = world.next_seq;
+        assert!(!world.output_lines.iter().any(|l| l.seq == next),
+            "the next live line would reuse seq {}, already present in the buffer", next);
+    }
+
+    #[test]
+    fn test_ensure_next_seq_above_buffer_accounts_for_pending_lines() {
+        // Pending lines hold allocated seqs and get appended later, so they count.
+        let mut world = World::new("w");
+        world.output_lines.push(OutputLine::new("a".to_string(), 10));
+        world.pending_lines.push(OutputLine::new("held".to_string(), 99));
+        world.next_seq = 11;
+
+        world.ensure_next_seq_above_buffer();
+        assert_eq!(world.next_seq, 100, "must clear the highest pending seq too");
+    }
+
+    #[test]
+    fn test_ensure_next_seq_above_buffer_leaves_a_healthy_world_alone() {
+        // 44 of the 45 worlds in the reported dump were consistent; the repair must be a
+        // no-op for them rather than inflating their counters.
+        let mut world = World::new("healthy");
+        for seq in 0..477u64 {
+            world.output_lines.push(OutputLine::new(format!("l {}", seq), seq));
+        }
+        world.next_seq = 477;
+
+        world.ensure_next_seq_above_buffer();
+        assert_eq!(world.next_seq, 477, "a dense, consistent world must not be touched");
+
+        let mut empty = World::new("empty");
+        empty.ensure_next_seq_above_buffer();
+        assert_eq!(empty.next_seq, 0, "an empty world stays at 0");
+    }
+
+    #[test]
+    fn test_ledger_audit_self_repairs_a_poisoned_seq_counter() {
+        // Covers the WIRING, not just the helper: a world already holding more lines than
+        // seqs ever issued must recover on its own from the periodic audit, without a reload
+        // and without operator action. This is what rescues an instance that upgraded via a
+        // hot reload, which carries the broken pair across intact.
+        let mut app = App::new();
+        app.worlds = vec![World::new("cave")];
+        let (_client_id, _rx) = phase_c_register_client(&mut app);
+
+        // The reported shape: buffer full of archive-fabricated seqs, counter left behind.
+        for _ in 0..3 {
+            let oldest = app.worlds[0].output_lines.first().map(|l| l.seq).unwrap_or(0);
+            let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
+                .map(|i| crate::scrollback::ScrollbackLine {
+                    ts_ms: 1_000 + i as i64,
+                    world: "cave".to_string(),
+                    text: format!("archived {}", i),
+                })
+                .collect();
+            let prepend = App::build_archive_prepend(archived, oldest);
+            app.worlds[0].output_lines.splice(0..0, prepend);
+        }
+        app.worlds[0].next_seq = 145;
+
+        let highest = app.worlds[0].output_lines.iter().map(|l| l.seq).max().unwrap();
+        assert!(app.worlds[0].next_seq <= highest, "fixture must start broken");
+
+        app.audit_broadcast_ledger();
+
+        assert!(app.worlds[0].next_seq > highest,
+            "the periodic audit left next_seq at {} with seq {} still in the buffer - a \
+             poisoned world must recover without a reload",
+            app.worlds[0].next_seq, highest);
+    }

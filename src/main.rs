@@ -3190,6 +3190,29 @@ impl World {
     /// Holding the counter above the buffer makes seq reuse impossible, and repairs an
     /// already-poisoned client with no action on its side: later output simply arrives above
     /// anything that client ever recorded.
+    /// Force `next_seq` above every seq currently stored in this world, so a live line can
+    /// never be issued a number the buffer already contains.
+    ///
+    /// The counter and the buffer are restored independently by a hot reload, and archived
+    /// scrollback fabricates seqs that can exceed the counter, so the two can and do drift
+    /// apart. When they do, real MUD output reuses numbers a client already recorded as
+    /// delivered and the client drops it as a duplicate — that world goes silent on every
+    /// remote while the TUI, which renders by buffer position rather than by seq, looks
+    /// perfectly healthy.
+    ///
+    /// Checks `pending_lines` too: those carry allocated seqs and will be appended later.
+    pub(crate) fn ensure_next_seq_above_buffer(&mut self) {
+        let highest = self.output_lines.iter()
+            .chain(self.pending_lines.iter())
+            .map(|l| l.seq)
+            .max();
+        if let Some(h) = highest {
+            if h >= self.next_seq {
+                self.next_seq = h.saturating_add(1);
+            }
+        }
+    }
+
     pub(crate) fn install_archive_block(&mut self, prepend: Vec<OutputLine>) {
         let highest_fabricated = prepend.iter().map(|l| l.seq).max().unwrap_or(0);
         let inserted = prepend.len();
@@ -9927,6 +9950,22 @@ impl App {
     pub(crate) fn audit_broadcast_ledger(&mut self) -> usize {
         let mut repairs: Vec<(usize, Vec<LedgerHole>)> = Vec::new();
         for (idx, world) in self.worlds.iter_mut().enumerate() {
+            // Self-repair the seq counter before auditing anything else.
+            //
+            // "next_seq is above everything stored" is the invariant that keeps a live line
+            // from reusing a number a client already recorded — and it has now been broken by
+            // two separate routes: an archive load fabricating seqs without advancing the
+            // counter, and a hot reload restoring `output_lines` and `next_seq` independently
+            // so an already-broken pair carries straight across the upgrade meant to fix it.
+            //
+            // Both are fixed at their source, but a violation that already exists in a live
+            // buffer needs somewhere to be noticed. This audit already runs on every
+            // `PongCheck` (~30s) and already walks every world, so it is the natural place:
+            // a poisoned world recovers on its own within one keepalive, with no reload and
+            // nothing for the operator to know about. Cheap too — a `max()` over a buffer
+            // this loop is about to scan anyway.
+            world.ensure_next_seq_above_buffer();
+
             let Some(newest) = world.output_lines.last().map(|l| l.seq) else { continue };
             // Never audit up to the newest line: a broadcast for it may be in flight right
             // now (the ledger is written at fan-out time, but a caller can push first and

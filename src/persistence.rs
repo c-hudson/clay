@@ -2664,6 +2664,21 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
         world.next_seq = tw.next_seq;
+        // A reload restores `output_lines` and `next_seq` independently, so a buffer that
+        // already violated "next_seq is above everything stored" carries that violation
+        // straight across — and a hot reload is exactly how a long-lived instance picks up a
+        // new build, so the bad state outlives the fix meant to prevent it.
+        //
+        // Observed: a world holding 1648 lines (three 500-line archive blocks whose seqs are
+        // fabricated, plus ~142 live lines) with `next_seq` still at 145. Every subsequent
+        // line of real output reuses a number already in the buffer, and any client holding
+        // those numbers drops it as a duplicate — the world goes silent there while the TUI,
+        // which renders by position rather than seq, looks healthy.
+        //
+        // Repairing on restore is what makes the invariant self-healing rather than merely
+        // preventing new damage: an operator who reloads picks up the repair automatically,
+        // with no need to know their buffer was poisoned.
+        world.ensure_next_seq_above_buffer();
         // ▶ state is per-line now and rides in with the lines themselves (the 'v' flag, see
         // parse_timestamped_line). `display_id` is deliberately not persisted at all - a
         // reload has no live clients, so every marker restores unowned and an unviewed line
