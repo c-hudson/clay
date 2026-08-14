@@ -8673,20 +8673,26 @@ impl App {
     /// backgrounding is invisible to the user and must never light that badge.
     fn handle_client_visibility(&mut self, client_id: u64, visible: bool) {
         let Some(state) = self.ws_client_worlds.get_mut(&client_id) else { return };
-        if state.visible == visible {
-            return; // already in this state - nothing to release or claim
-        }
         // `visible`, NOT `paused`. `paused` means only "an operator ran /remote --pause" and
         // is reported back to the client as the PAUSED badge by handle_request_state; writing
         // backgrounding into it made a resync that landed while the app was in the background
         // light that badge up as though an operator had paused the session, with nothing to
         // clear it on return.
+        let was_visible = state.visible;
         state.visible = visible;
         let world_idx = state.world_index;
         let owner = self.display_owner_id(client_id);
         if visible {
+            // Always claim AND answer, even when this client already counted as visible.
+            // The claim is a no-op in that case (everything is already viewed), but the
+            // ClaimedNew it sends is not: the client claims optimistically the instant it
+            // returns to the foreground, and an unanswered guess sits outstanding until some
+            // unrelated later ClaimedNew revokes it — the "▶ appears, then vanishes a moment
+            // later" bug. This *always* looked like a repeat on the first resume after a load
+            // or reconnect, because the client's own visible-state mirror starts unknown
+            // while ClientViewState::visible defaults to true.
             self.claim_world_for(world_idx, owner, Some(client_id));
-        } else {
+        } else if was_visible {
             // The socket is still open when backgrounding, so the client can and should drop
             // its markers immediately rather than discovering it on the next render.
             self.release_world_for(world_idx, owner, Some(client_id));

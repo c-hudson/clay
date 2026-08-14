@@ -2905,6 +2905,43 @@
         );
     }
 
+    /// The drag-to-reveal gesture in the web/GUI/Android client asks for pending output one
+    /// row at a time (`ReleasePending { count: 1 }`), so a budget of 1 must release exactly one
+    /// logical line and leave the rest pending — including when that line wraps to several
+    /// rows, where a naive "stop once the budget is spent" loop would release nothing and the
+    /// gesture would stall forever.
+    #[test]
+    fn test_release_pending_one_row_budget_releases_exactly_one_line() {
+        let settings = Settings::default();
+        let width = 80usize;
+
+        let mut world = World::new("test");
+        // A first pending line far taller than the 1-row budget, then ordinary lines.
+        world.pending_lines.push(make_output_line(&"w ".repeat(200), false));
+        for i in 0..5 {
+            world.pending_lines.push(make_output_line(&format!("pending {}", i), false));
+        }
+        world.paused = true;
+
+        let metrics = test_metrics(&settings, width);
+        assert!(metrics.rows(&world.pending_lines[0]) > 1,
+            "precondition: the head line must wrap, or this doesn't test the overflow case");
+
+        let released = world.release_pending(1, &metrics);
+        assert_eq!(released.len(), 1, "a budget of 1 row must still release exactly one line");
+        assert_eq!(world.pending_lines.len(), 5, "the rest must stay pending");
+        assert_eq!(world.output_lines.len(), 1);
+        assert!(world.paused, "still paused with a backlog outstanding");
+
+        // And it keeps making progress one line per call.
+        for expect_left in (0..5).rev() {
+            let batch = world.release_pending(1, &metrics);
+            assert_eq!(batch.len(), 1, "each call must move exactly one line");
+            assert_eq!(world.pending_lines.len(), expect_left);
+        }
+        assert!(!world.paused, "pause clears once the backlog is drained");
+    }
+
     /// The "More NNNN" count must measure the held-back line the way the renderer draws it.
     /// It used to measure the raw text at the plain terminal width, so every prefix the
     /// renderer adds - the "✨ " client-line marker, the 🛢️ archive marker, the F2 timestamp -
@@ -8612,6 +8649,53 @@ if you're more curious.\"";
         app.handle_client_visibility(client_id, true);
         assert_eq!(app.worlds[0].output_lines.last().unwrap().display_id, Some(owner),
             "text that arrived while backgrounded must become ▶ on return");
+    }
+
+    /// A `ClientVisibility { visible: true }` must always be answered with a `ClaimedNew`,
+    /// even when the server already considered the client visible.
+    ///
+    /// The client claims optimistically the instant it returns to the foreground so ▶ paints
+    /// in the same frame as the text. That guess is reconciled by the ClaimedNew this triggers
+    /// — and it always *looked* like a repeat here on the first resume after a page load or
+    /// reconnect, because the client's own visible-state mirror starts unknown while
+    /// `ClientViewState::visible` defaults to true. Early-returning then left the guess
+    /// outstanding until some unrelated later ClaimedNew revoked it: ▶ appeared, then vanished
+    /// a moment later.
+    #[test]
+    fn test_visible_true_always_answers_even_when_already_visible() {
+        use crate::websocket::WsMessage;
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("A"));
+        app.current_world_index = 0;
+
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 0, visible_lines: 24, visible_columns: 80,
+            dimensions: None, paused: false, visible: true, disconnected_at: None,
+        });
+
+        // Nothing unviewed: the claim itself is a no-op, but the answer still has to come.
+        while rx.try_recv().is_ok() {}
+        app.handle_client_visibility(client_id, true);
+        assert_eq!(claimed_new_seqs(&drain_ws_messages(&mut rx)), vec![Vec::<u64>::new()],
+            "a redundant visible=true must still answer, or an optimistic claim is stranded");
+
+        // And with something genuinely unviewed it answers with the real list.
+        push_server_line(&mut app, 0, "missed while nobody looked");
+        app.worlds[0].output_lines.last_mut().unwrap().viewed = false;
+        let seq = app.worlds[0].output_lines.last().unwrap().seq;
+        while rx.try_recv().is_ok() {}
+        app.handle_client_visibility(client_id, true);
+        assert_eq!(claimed_new_seqs(&drain_ws_messages(&mut rx)), vec![vec![seq]]);
+
+        // Backgrounding is still a one-shot: a repeated hidden must not re-release.
+        app.handle_client_visibility(client_id, false);
+        while rx.try_recv().is_ok() {}
+        app.handle_client_visibility(client_id, false);
+        let msgs = drain_ws_messages(&mut rx);
+        assert!(!msgs.iter().any(|m| matches!(m, WsMessage::ReleasedNew { .. })),
+            "a repeated visible=false must not re-send ReleasedNew. Got: {msgs:?}");
     }
 
     /// Backgrounding must never be mistaken for an operator pause. `ClientViewState::paused`

@@ -973,6 +973,10 @@
     }
 
     // --- ▶ new-text ownership (PROTOCOL-ROADMAP.md, per-line display_id model) -----------
+    // How long an unanswered optimistic claim stays revocable. Far longer than any round
+    // trip, far shorter than the gap to an unrelated later ClaimedNew.
+    const OPTIMISTIC_CLAIM_TTL_MS = 5000;
+
     // Our server-assigned ownership id, from InitialState.your_display_id. A line renders ▶
     // iff its display_id equals this. 0/null means "we have no id" (an older server), in
     // which case we simply never paint ▶ rather than adopting somebody else's markers.
@@ -1739,11 +1743,17 @@
         debugLog('clearAuthKey: cleared');
     }
 
+    // Height of one output row in CSS pixels: font-size * the 1.2 line-height in style.css.
+    // Single definition because three separate things now convert between pixels and rows -
+    // the visible-line count, the "History NNN" distance-from-bottom, and the drag-to-release
+    // gesture - and a disagreement between them shows up as the wrong number of lines.
+    function lineHeightPx() {
+        return (currentFontSize || 14) * 1.2;
+    }
+
     // Get visible line count in output area
     function getVisibleLineCount() {
-        const fontSize = currentFontSize || 14;
-        const lineHeight = fontSize * 1.2; // font-size * line-height
-        return Math.floor(elements.outputContainer.clientHeight / lineHeight);
+        return Math.floor(elements.outputContainer.clientHeight / lineHeightPx());
     }
 
     // Get visible column count in output area (approximate from container width and font size)
@@ -3967,8 +3977,15 @@
                 if (msg.world_index !== undefined && worlds[msg.world_index] && Array.isArray(msg.seqs)) {
                     const cWorld = worlds[msg.world_index];
                     const granted = new Set(msg.seqs);
-                    const guessed = cWorld._optimisticClaim;
+                    const guess = cWorld._optimisticClaim;
                     cWorld._optimisticClaim = null;
+                    // Only a *fresh* guess may be revoked. Every path that claims optimistically
+                    // is answered promptly (MarkWorldSeen and ClientVisibility both always reply,
+                    // the latter even when the server already considered us visible), so a guess
+                    // older than one round trip means nothing answered it and this ClaimedNew is
+                    // about something else entirely.
+                    const guessed = (guess && (Date.now() - guess.at) < OPTIMISTIC_CLAIM_TTL_MS)
+                        ? guess.seqs : null;
                     let changed = false;
                     for (const line of (cWorld.output_lines || [])) {
                         if (granted.has(line.seq)) {
@@ -4579,15 +4596,22 @@
         }
     }
 
-    // Release one screenful of pending lines
-    function releaseScreenful() {
+    // How many lines are held back for the current world, local queue plus the server's.
+    function pendingTotal() {
+        const world = worlds[currentWorldIndex];
+        return pendingLines.length + (world ? (world.pending_count || 0) : 0);
+    }
+
+    // Release `count` lines of pending output. `count` is a VISUAL ROW budget on the wire
+    // (WsMessage::ReleasePending, see World::release_pending) - a line wrapping to three rows
+    // costs three - which is what makes it the right unit for the drag gesture, whose input is
+    // also measured in screen rows. `count: 0` means "everything"; use releaseAll() for that.
+    function releaseLines(count) {
         const world = worlds[currentWorldIndex];
         const serverPending = world ? (world.pending_count || 0) : 0;
 
         // Check if there's anything to release (local or server)
         if (pendingLines.length === 0 && serverPending === 0) return;
-
-        const count = Math.max(1, getVisibleLineCount() - 2);
 
         // Release local pending lines
         if (pendingLines.length > 0) {
@@ -4603,6 +4627,11 @@
             updateStatusBar();
             send({ type: 'ReleasePending', world_index: currentWorldIndex, count: count });
         }
+    }
+
+    // Release one screenful of pending lines
+    function releaseScreenful() {
+        releaseLines(Math.max(1, getVisibleLineCount() - 2));
     }
 
     // Release all pending lines
@@ -6833,8 +6862,11 @@
             }
         }
         // Remembered so the reconciling ClaimedNew can tell "we guessed this" apart from
-        // "we already owned this", and only revoke the former.
-        w._optimisticClaim = guessed.size ? guessed : null;
+        // "we already owned this", and only revoke the former. Timestamped because a guess is
+        // only meaningful until the reply that answers it: an outstanding guess that is never
+        // answered must not survive to be revoked by some unrelated later ClaimedNew, which is
+        // exactly how ▶ used to appear and then vanish a moment later.
+        w._optimisticClaim = guessed.size ? { seqs: guessed, at: Date.now() } : null;
     }
 
     function renderOutput(opts) {
@@ -8081,6 +8113,77 @@
         }
     }
 
+    // --- Drag/wheel to reveal pending output ------------------------------------------
+    //
+    // In more-mode the newest output is held back and the only way through it used to be a
+    // whole screenful at a time (PgDn/Tab). Scrolling could not reach it at all: when a line
+    // is held back the client scrolls to the bottom, so the container has no scroll distance
+    // left, a further downward drag moves nothing, and no `scroll` event is ever emitted.
+    //
+    // These handlers watch the gesture itself instead of the scroll position, so dragging past
+    // the bottom feeds pending lines in one at a time, tracking the finger.
+    //
+    // Accumulated overscroll distance in CSS pixels, and how many rows of it have already
+    // been spent. Both are running totals for the current gesture (see scheduleReveal).
+    let revealAccumPx = 0;
+    let revealConsumedRows = 0;
+    let revealRafPending = false;
+    let lastTouchY = null;
+
+    function resetRevealAccum() {
+        revealAccumPx = 0;
+        revealConsumedRows = 0;
+    }
+
+    // Is a downward overscroll gesture meaningful right now? Only at the very bottom with
+    // something actually held back - anywhere else the browser's own scrolling must be left
+    // completely alone.
+    function canRevealPending() {
+        return isAtBottom() && pendingTotal() > 0;
+    }
+
+    // Turn accumulated drag distance into a release, at most one request per animation frame.
+    //
+    // Coalescing is what keeps this from being one WebSocket round-trip per line: a fast drag
+    // covering five rows within a frame sends a single ReleasePending{count:5}, a slow drag
+    // sends count:1 per row.
+    //
+    // Rows owed are recomputed from the running total each frame rather than subtracting the
+    // consumed height as we go. Subtracting compounds floating-point error across frames and
+    // silently swallows a row over a long drag (20 drags of 0.7 rows released 13 lines, not
+    // 14); the epsilon then absorbs the representation error in the sum itself.
+    function scheduleReveal() {
+        if (revealRafPending) return;
+        revealRafPending = true;
+        requestAnimationFrame(() => {
+            revealRafPending = false;
+            const rowPx = lineHeightPx();
+            if (rowPx <= 0) { resetRevealAccum(); return; }
+            const wantRows = Math.floor(revealAccumPx / rowPx + 1e-9);
+            let lines = wantRows - revealConsumedRows;
+            if (lines <= 0) return;
+            // Never ask for more than is actually held back, however hard the flick.
+            const available = pendingTotal();
+            if (lines >= available) {
+                // Backlog exhausted: spend the whole gesture rather than banking credit that
+                // would dump a burst the moment new output arrives.
+                lines = available;
+                resetRevealAccum();
+            } else {
+                revealConsumedRows = wantRows;
+            }
+            if (lines > 0) releaseLines(lines);
+        });
+    }
+
+    // Wheel deltas are not always pixels. Firefox commonly reports DOM_DELTA_LINE, and treating
+    // that raw value as pixels would make a single notch release a whole page.
+    function wheelDeltaToPx(e) {
+        if (e.deltaMode === 1) return e.deltaY * lineHeightPx();          // DOM_DELTA_LINE
+        if (e.deltaMode === 2) return e.deltaY * elements.outputContainer.clientHeight; // DOM_DELTA_PAGE
+        return e.deltaY;                                                  // DOM_DELTA_PIXEL
+    }
+
     // Format count for status indicator (right-justified, 4 chars)
     function formatCount(n) {
         if (n >= 1000000) return 'Alot';
@@ -8123,12 +8226,10 @@
 
         // More/Hist badge
         const serverPending = world ? (world.pending_count || 0) : 0;
-        const totalPending = pendingLines.length + serverPending;
+        const totalPending = pendingTotal();
         if (!isAtBottom() && !scrollRafPending) {
             const container = elements.outputContainer;
-            const fontSize = currentFontSize || 14;
-            const lineHeight = fontSize * 1.2;
-            const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeight);
+            const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeightPx());
             elements.moreLabel.textContent = 'History';
             elements.moreCount.textContent = formatCount(linesFromBottom);
             elements.statusMore.style.display = '';
@@ -10258,9 +10359,7 @@
                 const pgLH = (currentFontSize || 14) * 1.2;
                 elements.outputContainer.scrollBy(0, pgH - pgLH);
                 if (isAtBottom()) {
-                    const world = worlds[currentWorldIndex];
-                    const serverPending = world ? (world.pending_count || 0) : 0;
-                    if (pendingLines.length === 0 && serverPending === 0) {
+                    if (pendingTotal() === 0) {
                         paused = false;
                         linesSincePause = 0;
                         updateStatusBar();
@@ -10271,9 +10370,7 @@
                 return true;
             }
             case 'scroll_half_page': {
-                const world = worlds[currentWorldIndex];
-                const serverPending = world ? (world.pending_count || 0) : 0;
-                if (pendingLines.length > 0 || serverPending > 0) {
+                if (pendingTotal() > 0) {
                     releaseScreenful();
                 } else {
                     const halfPage = Math.floor(elements.outputContainer.clientHeight / 2);
@@ -10301,9 +10398,7 @@
                         return true;
                     }
                 }
-                const world = worlds[currentWorldIndex];
-                const serverPending = world ? (world.pending_count || 0) : 0;
-                if (pendingLines.length > 0 || serverPending > 0) {
+                if (pendingTotal() > 0) {
                     releaseScreenful();
                 } else {
                     elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
@@ -11149,9 +11244,7 @@
         }
         function handlePgDn() {
             const container = elements.outputContainer;
-            const world = worlds[currentWorldIndex];
-            const serverPending = world ? (world.pending_count || 0) : 0;
-            if (pendingLines.length > 0 || serverPending > 0) {
+            if (pendingTotal() > 0) {
                 releaseScreenful();
             } else {
                 const pageHeight = container.clientHeight * 0.9;
@@ -11261,6 +11354,47 @@
         elements.outputContainer.addEventListener('scroll', function() {
             wasAtBottomBeforeResize = isAtBottom();
         }, { passive: true });
+
+        // Drag past the bottom to reveal pending output (see scheduleReveal above).
+        //
+        // Every handler is a no-op unless canRevealPending() holds, and preventDefault() is
+        // only ever called in that same case - ordinary scrolling anywhere in the buffer must
+        // stay fully native. touchmove/wheel are registered non-passive *because* of that
+        // conditional preventDefault; the browser has to be told we might cancel.
+        elements.outputContainer.addEventListener('touchstart', function(e) {
+            lastTouchY = e.touches.length ? e.touches[0].clientY : null;
+            resetRevealAccum();
+        }, { passive: true });
+
+        elements.outputContainer.addEventListener('touchmove', function(e) {
+            if (!e.touches.length) return;
+            const y = e.touches[0].clientY;
+            if (lastTouchY === null) { lastTouchY = y; return; }
+            // Finger moving UP drags the content up and pulls newer text in from below -
+            // the same direction that scrolls toward the newest output.
+            const dy = lastTouchY - y;
+            lastTouchY = y;
+            if (dy <= 0 || !canRevealPending()) return;
+            revealAccumPx += dy;
+            // Suppress the overscroll glow / rubber-band while we're consuming the gesture.
+            e.preventDefault();
+            scheduleReveal();
+        }, { passive: false });
+
+        function endRevealTouch() {
+            lastTouchY = null;
+            resetRevealAccum();
+        }
+        elements.outputContainer.addEventListener('touchend', endRevealTouch, { passive: true });
+        elements.outputContainer.addEventListener('touchcancel', endRevealTouch, { passive: true });
+
+        elements.outputContainer.addEventListener('wheel', function(e) {
+            const dy = wheelDeltaToPx(e);
+            if (dy <= 0 || !canRevealPending()) return;
+            revealAccumPx += dy;
+            e.preventDefault();
+            scheduleReveal();
+        }, { passive: false });
 
         // Strip zero-width spaces from copied text (inserted by insertWordBreaks for wrapping)
         document.addEventListener('copy', function(e) {
@@ -11448,16 +11582,16 @@
             }
             // If user scrolls to bottom, check pending state
             if (isAtBottom()) {
-                const world = worlds[currentWorldIndex];
-                const serverPending = world ? (world.pending_count || 0) : 0;
-                if (pendingLines.length === 0 && serverPending === 0) {
+                if (pendingTotal() === 0) {
                     paused = false;
                     linesSincePause = 0;
                     updateStatusBar();
-                } else if (paused) {
-                    // At bottom but have pending - release them
-                    releaseAll();
                 }
+                // With pending held back we simply park here. This used to call releaseAll(),
+                // so merely scrolling back down from history dumped the entire backlog at once
+                // with no way to ask for less. Reaching the bottom is not a request for
+                // anything; dragging further (see the touchmove/wheel handlers) feeds lines in
+                // one at a time, and PgDn/Tab still take a screenful.
             }
             scheduleRenderWindowCheck();
         };
