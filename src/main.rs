@@ -9909,9 +9909,17 @@ impl App {
             // by seq (CLAUDE.md invariant), so this is a binary search; the per-line `floor`
             // guard below still runs, so a buffer that somehow violated the invariant would
             // only make the audit skip lines, never invent a hole.
+            // `partition_point` is a binary search and needs a sorted buffer. An archive
+            // prepend can break that: it fabricates seqs by counting backwards from the
+            // oldest and saturates at 0, so on a young world the block lands at the FRONT
+            // carrying seqs that overlap the live range. On an unsorted buffer the search
+            // returns an unspecified index, and a too-high one would silently skip real lines
+            // — i.e. miss exactly the holes this audit exists to catch. Archive lines only
+            // ever sit at the front, so their presence there is the cheap test.
+            let archive_prefix = world.output_lines.first().is_some_and(|l| l.from_archive);
             let start = match floor {
-                Some(f) => world.output_lines.partition_point(|l| l.seq <= f),
-                None => 0,
+                Some(f) if !archive_prefix => world.output_lines.partition_point(|l| l.seq <= f),
+                _ => 0,
             };
             for line in world.output_lines.iter().skip(start) {
                 // Archived scrollback is outside the seq contract entirely and must be

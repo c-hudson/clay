@@ -247,6 +247,59 @@
         world._max_seq = maxSeenSeq(world);
     }
 
+    // Detect a scrollback buffer poisoned by the pre-1.5.23 archive bug.
+    //
+    // Servers before 1.5.23 could put archived scrollback (loaded from scrollback.db when the
+    // operator scrolled to the top in the TUI) onto the wire as ordinary ServerData. Those
+    // lines carry FABRICATED seqs, counted backwards from the buffer's oldest and saturating
+    // at 0, so they can overlap the live range. insertLinesBySeq then orders them by seq
+    // rather than arrival, which interleaves them into the middle of real history - the
+    // reported symptom was a world showing 8/13 text ABOVE 7/02 and 8/5 text, with nothing
+    // new ever appearing at the bottom because the frontier had been dragged up to the
+    // archive's highest fabricated seq.
+    //
+    // A fixed server never sends these, so their presence is proof the buffer predates the
+    // fix. Out-of-order real seqs are the same damage seen from the other side, and catch a
+    // buffer whose archive lines have since been trimmed out of the cache cap.
+    //
+    // Discarding is the safe direction: the worst case is one extra download of history the
+    // server still has, versus a world that stays permanently frozen.
+    // Backwards timestamp jump (seconds) treated as proof of a scrambled buffer. Generous on
+    // purpose: live output is timestamped on arrival and only ever moves forward, and lines
+    // recovered out of order are re-inserted in seq order, so they stay monotonic too. A jump
+    // this large mid-buffer means content from a different era was interleaved.
+    const CORRUPT_TS_REGRESSION_SECS = 3600;
+
+    function bufferIsCorrupted(lines) {
+        if (!Array.isArray(lines) || lines.length === 0) return false;
+        let prevSeq = null;
+        let prevTs = null;
+        for (const line of lines) {
+            if (!line) continue;
+            // Direct evidence: the server marked this line as archived. Only a pre-1.5.23
+            // server ever put one on the wire.
+            if (line.from_archive) return true;
+            // Indirect evidence, and the only signal available when the lines arrived via the
+            // broadcast-ledger repair path - that resent them as ServerData, which carries no
+            // per-line from_archive flag at all. This is the reported shape: current text
+            // sitting ABOVE text from weeks earlier, because the archived lines were handed
+            // seqs above the live range and insertLinesBySeq ordered them last.
+            if (typeof line.ts === 'number' && line.ts > 0) {
+                if (prevTs !== null && line.ts < prevTs - CORRUPT_TS_REGRESSION_SECS) return true;
+                prevTs = Math.max(prevTs === null ? line.ts : prevTs, line.ts);
+            }
+            // Lines tagged _has_real_seq === false carry an array index, not a seq (the
+            // seq: 0 ephemeral-broadcast fallback) - they say nothing about ordering.
+            if (line._has_real_seq === false || typeof line.seq !== 'number') continue;
+            // A strict inversion, or a repeat of a non-zero seq. Plain seq 0 is excluded
+            // from the duplicate test: the OutputLines handler coerces a missing seq to 0
+            // (`line.seq || 0`), so two of those in a row are not evidence of damage.
+            if (prevSeq !== null && (line.seq < prevSeq || (line.seq === prevSeq && line.seq !== 0))) return true;
+            prevSeq = line.seq;
+        }
+        return false;
+    }
+
     // Convert a legacy cache entry ({maxSeq, seqGaps}) into ranges, so upgrading doesn't
     // discard anyone's persisted scrollback (no IndexedDB version bump - same reasoning as
     // the CLIENT_LINE_PREFIX migration in the InitialState handler). The old record was
@@ -2645,8 +2698,36 @@
                             clearWorldCacheEntry(world.name);
                         }
                     }
-                    const priorWorld = priorWorldStale ? null : rawPriorWorld;
-                    const cachedWorld = cachedWorldStale ? null : rawCachedWorld;
+
+                    // Second, independent reason to throw a buffer away: it was poisoned by
+                    // the pre-1.5.23 archive bug (see bufferIsCorrupted). The restart test
+                    // above cannot catch this - on an established world the fabricated
+                    // archive seqs sit BELOW the live range, so maxSeq stays under next_seq
+                    // and the entry reads as perfectly current.
+                    //
+                    // It has to be caught here or a damaged client stays damaged forever: a
+                    // fixed server stops sending archive lines, but rebuildSeenRanges unions
+                    // the carried ranges straight back in on every reconnect, so the poisoned
+                    // frontier survives reconnects, resyncs and app updates alike. Wiping app
+                    // storage by hand was the only cure, which is not something a user should
+                    // have to know.
+                    const priorWorldCorrupt = !priorWorldStale && !!rawPriorWorld &&
+                        bufferIsCorrupted(rawPriorWorld.output_lines);
+                    const cachedWorldCorrupt = !cachedWorldStale && !!rawCachedWorld &&
+                        bufferIsCorrupted(rawCachedWorld.lines);
+                    if (priorWorldCorrupt || cachedWorldCorrupt) {
+                        console.warn('Clay: discarding corrupted scrollback for world "' +
+                            (world.name || ('#' + idx)) + '" (' +
+                            (priorWorldCorrupt ? 'in-memory' : 'cached') +
+                            ') - archived lines or out-of-order seqs from the pre-1.5.23 ' +
+                            'archive bug; re-downloading from the server');
+                        if (cachedWorldCorrupt && world.name) {
+                            clearWorldCacheEntry(world.name);
+                        }
+                    }
+
+                    const priorWorld = (priorWorldStale || priorWorldCorrupt) ? null : rawPriorWorld;
+                    const cachedWorld = (cachedWorldStale || cachedWorldCorrupt) ? null : rawCachedWorld;
                     // Whether this world was seeded from a local buffer (in-memory
                     // reconnect or persistent cache) rather than the server's
                     // freshly-sent slice - startBackfill() uses this to gap-fill
