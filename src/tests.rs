@@ -9739,3 +9739,163 @@ if you're more curious.\"";
         assert_eq!(alpha.floor_seq, Some(10), "Alpha's frontier stayed with Alpha");
         assert_eq!(beta.floor_seq, Some(90), "Beta's frontier stayed with Beta");
     }
+
+    // ========================================================================
+    // Archive lines vs the broadcast-ledger audit (reported v1.5.22)
+    //
+    // Symptom: one world showed OLD text on a freshly-installed Android client and then
+    // stopped showing NEW output entirely, while the TUI was fine. Other worlds were
+    // unaffected. A resync fixed it. A full uninstall/reinstall did not - which rules the
+    // client's cache out and puts it on the server.
+    // ========================================================================
+
+    /// Splice an archive block onto a world exactly as a TUI scroll-to-top does, using the
+    /// REAL production builder (`App::build_archive_prepend`) rather than a copy of it — so
+    /// these tests exercise the actual seq math and the actual `from_archive` marking,
+    /// including on the separator line.
+    fn splice_archive_lines(world: &mut World, count: usize) {
+        let archived: Vec<crate::scrollback::ScrollbackLine> = (0..count)
+            .map(|i| crate::scrollback::ScrollbackLine {
+                ts_ms: 1_000 + i as i64,
+                world: world.name.clone(),
+                text: format!("archived line {}", i),
+            })
+            .collect();
+        let oldest_seq = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
+        let prepend = App::build_archive_prepend(archived, oldest_seq);
+        world.output_lines.splice(0..0, prepend);
+    }
+
+    #[test]
+    fn test_every_line_of_an_archive_block_is_marked_including_the_separator() {
+        // The from_archive marker is the ONLY thing keeping this block out of the sequence
+        // contract. One unmarked line is enough to reintroduce the bug: it carries a
+        // fabricated seq, is never broadcast, and slips past every filter - producing a
+        // permanent ledger hole and a duplicate seq. The separator is built with
+        // `new_client`, which does not set the marker, so it is the line that gets missed.
+        let archived: Vec<crate::scrollback::ScrollbackLine> = (0..5)
+            .map(|i| crate::scrollback::ScrollbackLine {
+                ts_ms: 1_000 + i,
+                world: "W".to_string(),
+                text: format!("old {}", i),
+            })
+            .collect();
+
+        let block = App::build_archive_prepend(archived, 100);
+
+        assert_eq!(block.len(), 6, "separator plus five archived lines");
+        for (i, line) in block.iter().enumerate() {
+            assert!(line.from_archive,
+                "line {} of the archive block is not marked from_archive: {:?}",
+                i, line.text);
+        }
+    }
+
+    #[test]
+    fn test_archive_lines_are_not_resent_as_live_output_by_the_ledger_audit() {
+        // try_load_archive_lines splices archived history into output_lines and deliberately
+        // never broadcasts it - it is local TUI scrollback, not new MUD output. But
+        // audit_broadcast_ledger enforces "every line in output_lines below the pending floor
+        // must have been broadcast" with NO from_archive exemption, so it sees several hundred
+        // stored-but-unsent lines and re-broadcasts them as ServerData.
+        //
+        // To a connected client that is old text arriving as if it were new.
+        let mut app = App::new();
+        app.worlds = vec![World::new("Archived")];
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        // An established world: seqs well above the archive chunk size, so the archived lines
+        // land cleanly BELOW the live ones. This isolates the re-broadcast bug from the
+        // separate duplicate-seq bug the sibling test covers.
+        for seq in 5000..5060u64 {
+            app.worlds[0].output_lines.push(OutputLine::new(format!("real {}", seq), seq));
+            app.worlds[0].next_seq = seq + 1;
+            app.worlds[0].mark_broadcast(seq, seq);
+        }
+        while rx.try_recv().is_ok() {}
+
+        // The user scrolls to the top of this world in the TUI. This happens BEFORE the first
+        // ledger audit, which is the case that matters: the audit only ever runs on a
+        // PongCheck from a connected client, so on a freshly-restarted server (exactly what
+        // installing a new build does) `ledger_audited_upto` is still None and the first pass
+        // examines the buffer from index 0 - including everything the archive just prepended.
+        splice_archive_lines(&mut app.worlds[0], 500);
+
+        let resent = app.audit_broadcast_ledger();
+        let _ = client_id;
+
+        assert_eq!(resent, 0,
+            "the ledger audit re-broadcast {} archived lines as if they were new output - \
+             archived history is deliberately never broadcast, so it must be exempt from the \
+             every-stored-line-was-broadcast rule rather than treated as {} holes to repair",
+            resent, resent);
+    }
+
+    #[test]
+    fn test_archive_lines_never_reach_a_client_in_initial_state() {
+        // The fix's core contract: archived scrollback is display-only local history and is
+        // outside the sequence-number contract entirely.
+        //
+        // Its seqs are fabricated by counting backwards from the buffer's oldest with a
+        // saturating_sub, so on a world whose buffer starts below the archive chunk size they
+        // land ON TOP of live seqs. Sending them made a client record those numbers as
+        // delivered; real MUD output later reused them and the client dropped every line as a
+        // duplicate. The world went silent on the remote while the TUI kept updating - the
+        // exact asymmetry in the report.
+        let mut world = World::new("Young");
+        for seq in 0..60u64 {
+            world.output_lines.push(OutputLine::new(format!("real {}", seq), seq));
+        }
+        world.next_seq = 60;
+        splice_archive_lines(&mut world, 500);
+
+        let (sent, _visible) = App::build_initial_output_lines(&world.output_lines, false, 10_000);
+
+        assert!(sent.iter().all(|l| !l.from_archive),
+            "InitialState carried archived lines to a client");
+
+        // Nothing a client was told about may collide with a seq real output will later use.
+        let highest_sent = sent.iter().map(|l| l.seq).max().unwrap_or(0);
+        assert!(world.next_seq > highest_sent,
+            "next_seq is {} but the client was told about seqs up to {} - the next lines of \
+             real output would reuse numbers the client has already recorded as delivered",
+            world.next_seq, highest_sent);
+
+        let seqs: Vec<u64> = sent.iter().map(|l| l.seq).collect();
+        let mut uniq = seqs.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), seqs.len(), "a client was sent duplicate seqs: {:?}", seqs);
+    }
+
+    #[test]
+    fn test_archive_lines_never_reach_a_client_via_request_scrollback() {
+        // Same contract on the pull path - all three branches of handle_request_scrollback.
+        let mut app = App::new();
+        app.worlds = vec![World::new("Young")];
+        for seq in 0..60u64 {
+            app.worlds[0].output_lines.push(OutputLine::new(format!("real {}", seq), seq));
+        }
+        app.worlds[0].next_seq = 60;
+        splice_archive_lines(&mut app.worlds[0], 500);
+
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        for (label, before, after) in [
+            ("last-N", None, None),
+            ("before_seq", Some(59u64), None),
+            ("after_seq", None, Some(0u64)),
+        ] {
+            while rx.try_recv().is_ok() {}
+            app.handle_request_scrollback(client_id, 0, 1000, before, after, None);
+            let mut saw_archive = false;
+            while let Ok(out) = rx.try_recv() {
+                if let crate::websocket::Outbound::Message(msg) = out {
+                    if let WsMessage::ScrollbackLines { lines, .. } = *msg {
+                        saw_archive |= lines.iter().any(|l| l.from_archive);
+                    }
+                }
+            }
+            assert!(!saw_archive, "{} branch sent archived lines to a client", label);
+        }
+    }

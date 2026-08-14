@@ -6186,7 +6186,14 @@ impl App {
         // Send initial output lines based on client type
         let client_type = self.ws_get_client_type(client_id);
         let world = &self.worlds[idx];
-        let total_lines = world.output_lines.len();
+        // Archived scrollback excluded — display-only local history whose fabricated seqs
+        // must never reach a client (reported against v1.5.22). This is the world-switch
+        // delivery path, so without the filter every switch to a world the operator had
+        // scrolled back through re-seeded the client with archive seqs.
+        let live_lines: Vec<&OutputLine> = world.output_lines.iter()
+            .filter(|l| !l.from_archive)
+            .collect();
+        let total_lines = live_lines.len();
 
         let lines_to_send = match client_type {
             Some(websocket::RemoteClientType::RemoteConsole) => {
@@ -6201,7 +6208,7 @@ impl App {
 
         if lines_to_send > 0 {
             let start = total_lines.saturating_sub(lines_to_send);
-            let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
+            let lines: Vec<TimestampedLine> = live_lines[start..].iter()
                 .map(|line| {
                     let ts = line.timestamp
                         .duration_since(std::time::UNIX_EPOCH)
@@ -6408,7 +6415,7 @@ impl App {
         let (lines, visible_count): (Vec<TimestampedLine>, usize) = if let Some(seq) = before_seq {
             // Send lines with seq < before_seq (older than what client has)
             let eligible: Vec<_> = world.output_lines.iter()
-                .filter(|l| l.seq < seq)
+                .filter(|l| l.seq < seq && !l.from_archive)
                 .collect();
             let (range, visible_count) = Self::take_visible_range(&eligible, count, true, |l| l.gagged);
             let lines = eligible[range].iter()
@@ -6448,7 +6455,7 @@ impl App {
             // seq-drift-fix notes and CLAUDE.md's output_lines-sorted-by-seq invariant.
             let pending_floor = world.pending_floor_seq();
             let eligible: Vec<_> = world.output_lines.iter()
-                .filter(|l| l.seq > seq && pending_floor.map_or(true, |floor| l.seq < floor))
+                .filter(|l| l.seq > seq && pending_floor.map_or(true, |floor| l.seq < floor) && !l.from_archive)
                 .collect();
             // Was the result cut short by the clamp rather than by genuine exhaustion? If so
             // the client is NOT caught up - there is more it is owed, just not deliverable
@@ -6482,8 +6489,9 @@ impl App {
             (lines, visible_count)
         } else {
             // No before_seq/after_seq - send last N visible lines (backwards compatible)
-            let (range, visible_count) = Self::take_visible_range(&world.output_lines, count, true, |l| l.gagged);
-            let lines = world.output_lines[range].iter()
+            let eligible: Vec<_> = world.output_lines.iter().filter(|l| !l.from_archive).collect();
+            let (range, visible_count) = Self::take_visible_range(&eligible, count, true, |l| l.gagged);
+            let lines = eligible[range].iter()
                 .map(|line| {
                     let ts = line.timestamp
                         .duration_since(std::time::UNIX_EPOCH)
@@ -9906,6 +9914,25 @@ impl App {
                 None => 0,
             };
             for line in world.output_lines.iter().skip(start) {
+                // Archived scrollback is outside the seq contract entirely and must be
+                // skipped BEFORE any seq reasoning below (PROTOCOL-ROADMAP.md Phase J
+                // follow-up; reported against v1.5.22).
+                //
+                // `try_load_archive_lines` splices history out of scrollback.db onto the
+                // front of this buffer for the local TUI to scroll through. It is not MUD
+                // output, no client is owed it, and it is deliberately never broadcast — so
+                // this audit used to classify every one of those lines as a hole and RESEND
+                // them, dumping hundreds of lines of old text at every connected client as if
+                // they had just arrived. That is what the report described as "one world
+                // showing old data".
+                //
+                // Skipping before the `ceiling` check matters too: archive seqs are
+                // fabricated by counting backwards from the buffer's oldest and can collide
+                // with live ones, so a `break` here would abandon the audit early and hide
+                // genuine holes further up.
+                if line.from_archive {
+                    continue;
+                }
                 if line.seq >= ceiling {
                     break; // output_lines is sorted by seq (CLAUDE.md invariant)
                 }
@@ -11635,6 +11662,16 @@ impl App {
     /// decrement its aggregate budget by the true visible cost instead of the raw slice
     /// length (which would double-count gagged lines against the budget).
     pub(crate) fn build_initial_output_lines(lines: &[OutputLine], has_trailing_partial: bool, max_initial_lines: usize) -> (Vec<TimestampedLine>, usize) {
+        // Archived scrollback never goes to a client (reported against v1.5.22). Its seqs are
+        // fabricated by counting backwards from the buffer's oldest and can collide with live
+        // ones, so sending it made a client record seqs that real MUD output would later reuse
+        // — and the client then dropped that real output as a duplicate. A world could go
+        // permanently silent on the remote while the TUI kept updating normally.
+        //
+        // Filtering here rather than at the call site because every caller wants the same
+        // thing, and because `take_visible_range`'s budget must be spent on lines a client
+        // actually receives.
+        let lines: Vec<&OutputLine> = lines.iter().filter(|l| !l.from_archive).collect();
         let total_lines = if has_trailing_partial {
             lines.len().saturating_sub(1)
         } else {
@@ -12104,6 +12141,53 @@ impl App {
         misspelled
     }
 
+    /// Build the display block `try_load_archive_lines` splices onto the front of a world's
+    /// buffer: an "archive" separator followed by the archived lines, oldest first.
+    ///
+    /// Extracted so it is testable - `try_load_archive_lines` itself reads a fixed
+    /// `~/.clay/scrollback.db`, which a unit test must not touch. Every line this returns is
+    /// marked `from_archive`, **including the separator**: that marker is what keeps the whole
+    /// block out of the sequence-number contract (never broadcast, never in `InitialState`,
+    /// never in a `RequestScrollback` reply, exempt from the broadcast-ledger audit).
+    ///
+    /// The seqs here are fabricated by counting backwards from the buffer's oldest and
+    /// saturate at 0, so on a young world they collide with live ones. That is tolerable only
+    /// because the marker keeps them local; if a caller ever puts one of these lines on the
+    /// wire, a client records a seq that real output later reuses and then drops that real
+    /// output as a duplicate - the v1.5.22 "one world went silent" report.
+    pub(crate) fn build_archive_prepend(
+        archive_lines: Vec<scrollback::ScrollbackLine>,
+        oldest_seq: u64,
+    ) -> Vec<OutputLine> {
+        let count = archive_lines.len();
+        let seq_start = oldest_seq.saturating_sub(count as u64);
+
+        // Build separator then archive OutputLines (oldest first)
+        let mut prepend: Vec<OutputLine> = Vec::with_capacity(count + 1);
+        let sep_seq = seq_start.saturating_sub(1);
+        let mut separator = OutputLine::new_client(
+            format!("\x1b[2m{}\x1b[0m", "─".repeat(30) + " archive " + &"─".repeat(30)),
+            sep_seq,
+        );
+        // The separator is part of the archive block and must carry the same marker as the
+        // lines it introduces. `new_client` leaves `from_archive` false, so without this it
+        // is the one line of the block that still looks like real output: it holds a
+        // fabricated seq (which collides with a live one whenever seq_start saturates at 0),
+        // is never broadcast, and slips past every from_archive filter — leaving exactly one
+        // permanent ledger hole and one duplicate seq. Both surfaced as test failures while
+        // fixing the v1.5.22 report.
+        separator.from_archive = true;
+        prepend.push(separator);
+        for (i, al) in archive_lines.into_iter().enumerate() {
+            let ts = std::time::UNIX_EPOCH + std::time::Duration::from_millis(al.ts_ms as u64);
+            let mut line = OutputLine::new_with_timestamp(al.text, ts, seq_start + i as u64);
+            line.from_server = true;
+            line.from_archive = true;
+            prepend.push(line);
+        }
+        prepend
+    }
+
     /// Load older lines from the archive and prepend them to the world's output buffer.
     /// Returns the number of lines prepended (0 if nothing loaded or archive disabled).
     fn try_load_archive_lines(&mut self, world_idx: usize) -> usize {
@@ -12134,26 +12218,11 @@ impl App {
             return 0;
         }
 
+        // Captured before the Vec is moved; this is the return value (archived lines loaded,
+        // not counting the separator the block adds).
         let count = archive_lines.len();
-        let seq_start = {
-            let world = &self.worlds[world_idx];
-            world.output_lines.first().map(|l| l.seq).unwrap_or(0).saturating_sub(count as u64)
-        };
-
-        // Build separator then archive OutputLines (oldest first)
-        let mut prepend: Vec<OutputLine> = Vec::with_capacity(count + 1);
-        let sep_seq = seq_start.saturating_sub(1);
-        prepend.push(OutputLine::new_client(
-            format!("\x1b[2m{}\x1b[0m", "─".repeat(30) + " archive " + &"─".repeat(30)),
-            sep_seq,
-        ));
-        for (i, al) in archive_lines.into_iter().enumerate() {
-            let ts = std::time::UNIX_EPOCH + std::time::Duration::from_millis(al.ts_ms as u64);
-            let mut line = OutputLine::new_with_timestamp(al.text, ts, seq_start + i as u64);
-            line.from_server = true;
-            line.from_archive = true;
-            prepend.push(line);
-        }
+        let oldest_seq = self.worlds[world_idx].output_lines.first().map(|l| l.seq).unwrap_or(0);
+        let prepend = Self::build_archive_prepend(archive_lines, oldest_seq);
 
         // Prepend to world buffer and adjust scroll_offset
         {
