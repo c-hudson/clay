@@ -1647,13 +1647,14 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
                 let mut released = 0;
                 let mut visual_used = 0;
                 let pending_len = app.worlds[world_idx].pending_lines.len();
+                // Row budget measured the way the renderer draws. This used to divide the
+                // line's *byte* length by the width, which over-counts multi-byte text,
+                // under-counts word-wrap ragged edges, and ignores the ▶/🛢️/timestamp
+                // prefixes entirely.
+                let metrics = crate::rendering::RowMetrics::new(&app.settings, app.show_tags, output_width.max(1));
                 for i in 0..pending_len {
                     let line = &app.worlds[world_idx].pending_lines[i];
-                    let line_visual = if output_width > 0 {
-                        (line.text.len() / output_width) + 1
-                    } else {
-                        1
-                    };
+                    let line_visual = metrics.rows(line).max(1);
                     if visual_used + line_visual > visual_budget && released > 0 {
                         break;
                     }

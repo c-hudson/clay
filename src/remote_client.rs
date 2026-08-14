@@ -2194,11 +2194,12 @@ pub(crate) fn dispatch_remote_action(
 
         // Scrollback
         "scroll_page_up" => {
-            let scroll_amount = app.output_height.saturating_sub(2) as usize;
-            let current_offset = app.current_world().scroll_offset;
-            let new_offset = current_offset.saturating_sub(scroll_amount.max(1));
-            app.current_world_mut().scroll_offset = new_offset;
-            if new_offset == 0 {
+            // Row-exact, measured the way render_output_crossterm actually wraps (this client
+            // shares that renderer). The old logical-index subtraction ignored wrapping
+            // entirely, so a single wrapped paragraph could swallow a whole page.
+            let scroll_amount = (app.output_height as usize).saturating_sub(2).max(1);
+            app.move_viewport_up(scroll_amount);
+            if app.viewport_at_top() {
                 let before_seq = app.current_world().output_lines.first().map(|l| l.seq);
                 // Registered as Backfill (PROTOCOL-ROADMAP.md's seq-drift fix, Step 12b): a
                 // scroll-triggered request must never be misrouted into the gap-fill splice
@@ -2207,7 +2208,7 @@ pub(crate) fn dispatch_remote_action(
                 let request_id = app.register_scrollback_request(app.current_world_index, crate::ScrollbackRequestKind::Backfill);
                 let _ = ws_tx.send(WsMessage::RequestScrollback {
                     world_index: app.current_world_index,
-                    count: scroll_amount.max(1),
+                    count: scroll_amount,
                     before_seq,
                     after_seq: None,
                     request_id: Some(request_id),
@@ -2216,10 +2217,8 @@ pub(crate) fn dispatch_remote_action(
             app.needs_output_redraw = true;
         }
         "scroll_page_down" => {
-            let scroll_amount = app.output_height.saturating_sub(2) as usize;
-            let max_offset = app.current_world().output_lines.len().saturating_sub(1);
-            app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
-            app.needs_output_redraw = true;
+            let scroll_amount = (app.output_height as usize).saturating_sub(2).max(1);
+            app.move_viewport_down(scroll_amount);
         }
         "scroll_half_page" => {
             let half = (app.output_height as usize).saturating_sub(2) / 2;
@@ -2230,11 +2229,7 @@ pub(crate) fn dispatch_remote_action(
                     count: half.max(1),
                 });
             } else {
-                let scroll_amount = half.max(1);
-                let current_offset = app.current_world().scroll_offset;
-                let new_offset = current_offset.saturating_sub(scroll_amount);
-                app.current_world_mut().scroll_offset = new_offset;
-                app.needs_output_redraw = true;
+                app.move_viewport_up(half.max(1));
             }
         }
         "flush_output" => {

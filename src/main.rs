@@ -126,7 +126,7 @@ pub use telnet::{
 };
 pub use spell::{SpellChecker, SpellState};
 pub use input::{InputArea, display_width, display_width_chars, chars_for_display_width};
-pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps, local_time_from_epoch, local_time_now, color_name_to_ansi_bg, nli_visual_rows, nli_wrap_width};
+pub use util::{get_binary_name, strip_ansi_codes, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps, local_time_from_epoch, local_time_now, color_name_to_ansi_bg};
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
@@ -2638,20 +2638,6 @@ pub const INPUT_LINE_PREFIX: &str = "\u{00BB} "; // "» "
 /// collide with a real client.
 pub const CONSOLE_DISPLAY_ID: u64 = u64::MAX;
 
-/// Whether `line` should render with the ▶ new-text indicator for the viewer identified by
-/// `viewer_id` (a WebSocket client id, or `CONSOLE_DISPLAY_ID` for the local TUI). Ownership
-/// is recorded on the line itself, so this is a plain equality test — every rule about *when*
-/// a line becomes new lives in `World::claim_unviewed`/`World::release_claims`, not here.
-///
-/// Replaces `line_is_new_at(line, new_from_seq, viewed_from_seq)`, which evaluated each line
-/// against a pair of per-WORLD watermarks. A single shared pair cannot express "new for you
-/// but not for me": with two instances on different worlds it suppressed ▶ for everyone when
-/// any one client viewed a world, and one client leaving a world wiped another client's
-/// markers. See `OutputLine::display_id`'s doc comment.
-fn line_is_new_for(line: &OutputLine, viewer_id: u64) -> bool {
-    line.display_id == Some(viewer_id)
-}
-
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
 const MAX_LINE_LENGTH: usize = 10_000;
 
@@ -3365,7 +3351,12 @@ impl World {
         output_width: u16,
         clear_splash: bool,
         from_server: bool,
+        show_tags: bool,
     ) {
+        // One measuring context for the whole call: every row budget below must agree with
+        // what render_output_crossterm draws, which depends on show_tags (the F2 timestamp
+        // prefix) as much as it does on width and the ▶/🛢️ prefixes.
+        let metrics = rendering::RowMetrics::new(settings, show_tags, (output_width as usize).max(1));
 
         // Handle splash mode transitions
         if self.showing_splash && clear_splash {
@@ -3382,11 +3373,9 @@ impl World {
         // Without this, lines_since_pause carries over from when the user was viewing
         // the world, causing immediate pause when new output arrives.
         if !is_current && !self.paused && self.lines_since_pause >= max_lines && max_lines > 0 {
-            let width = (output_width as usize).max(1);
-            let nli = settings.new_line_indicator;
             let mut visible = 0;
             for line in self.output_lines.iter().rev() {
-                let vl = nli_visual_rows(&line.text, width, line_is_new_for(line, CONSOLE_DISPLAY_ID), nli, settings.wrapspace as usize);
+                let vl = metrics.rows(line);
                 if visible + vl > max_lines {
                     break;
                 }
@@ -3431,9 +3420,6 @@ impl World {
             // pending_lines, which is never counted). Track its old visual-row
             // cost so we can correct the delta below instead of silently
             // over/under-counting the budget.
-            let width = (output_width as usize).max(1);
-            let nli = settings.new_line_indicator;
-            let wrapspace = settings.wrapspace as usize;
             // Walk back past any invisible (gagged/input) lines appended after the partial
             // arrived - the partial itself is always the last VISIBLE line, not necessarily
             // output_lines.last()/pending_lines.last() (see last_visible_output_idx's doc
@@ -3443,8 +3429,7 @@ impl World {
             let old_visual = if partial_was_in_pending {
                 0
             } else if let Some(i) = self.last_visible_output_idx() {
-                let is_new = line_is_new_for(&self.output_lines[i], CONSOLE_DISPLAY_ID);
-                nli_visual_rows(&self.output_lines[i].text, width, is_new, nli, wrapspace)
+                metrics.rows(&self.output_lines[i])
             } else {
                 0
             };
@@ -3469,8 +3454,7 @@ impl World {
                     }
                 } else if let Some(i) = self.last_visible_output_idx() {
                     self.output_lines[i].text = completed_line.to_string();
-                    let last_is_new = line_is_new_for(&self.output_lines[i], CONSOLE_DISPLAY_ID);
-                    let new_visual = nli_visual_rows(&self.output_lines[i].text, width, last_is_new, nli, wrapspace);
+                    let new_visual = metrics.rows(&self.output_lines[i]);
                     // Re-count at the completed line's final wrapped height. Does
                     // NOT retroactively trigger a pause even if this pushes over
                     // budget — the very next line will pause correctly, and
@@ -3550,19 +3534,9 @@ impl World {
             // now is still not new, because rule 1 only cares whether anyone was watching
             // when it arrived, not whether it's been paged into view yet (contrast the old
             // model, which flagged every pending line unconditionally). Must be computed
-            // before nli_visual_rows below so the reserved-NLI-prefix-width budgeting
+            // before the row measurement below so the reserved-NLI-prefix-width budgeting
             // matches the marked_new value actually used.
             let will_be_marked_new = from_server && !is_current;
-            // Use nli_visual_rows for accurate visual line count — it uses wrap_ansi_line
-            // with the same effective width the renderer uses (reduced by NLI_PREFIX_WIDTH
-            // when the NLI setting is on and the line is marked_new), so that
-            // pause/partial-display budgeting stays in sync with what's drawn.
-            let visual_lines = nli_visual_rows(line, (output_width as usize).max(1), will_be_marked_new, settings.new_line_indicator, settings.wrapspace as usize);
-
-            // Use projected line count (current + this line's visual lines) for pause trigger
-            let triggers_pause = !goes_to_pending
-                && settings.more_mode_enabled
-                && (self.lines_since_pause + visual_lines) > max_lines;
 
             // Create OutputLine with appropriate from_server flag
             let seq = self.next_seq;
@@ -3577,6 +3551,18 @@ impl World {
             // OutputLine::viewed). `is_current` is the existing console-or-any-WS-client
             // predicate, unchanged - it still drives more-mode budgeting above too.
             new_line.viewed = is_current;
+
+            // Built before measuring, so the budget can be taken off the real OutputLine
+            // through the same path the renderer wraps with (`RowMetrics`) rather than off the
+            // raw &str. `rows_as` supplies `will_be_marked_new` because nobody owns this line
+            // yet: `display_id` is still None, but whoever looks at this world next will claim
+            // it and the ▶ prefix will then steal two columns.
+            let visual_lines = metrics.rows_as(&new_line, will_be_marked_new);
+
+            // Use projected line count (current + this line's visual lines) for pause trigger
+            let triggers_pause = !goes_to_pending
+                && settings.more_mode_enabled
+                && (self.lines_since_pause + visual_lines) > max_lines;
 
             if goes_to_pending {
                 // Track when pending output first appeared
@@ -3674,7 +3660,7 @@ impl World {
     /// from the display. 0 when no truncation is active.
     /// Mirrors the partial-line lookup in release_pending_screenful (walk back
     /// past gagged lines from scroll_offset).
-    pub fn hidden_visual_rows(&self, output_width: usize, nli_enabled: bool, wrapspace: usize) -> usize {
+    pub(crate) fn hidden_visual_rows(&self, metrics: &rendering::RowMetrics) -> usize {
         if self.visual_line_offset == 0 || self.output_lines.is_empty() {
             return 0;
         }
@@ -3682,8 +3668,11 @@ impl World {
         while idx > 0 && self.output_lines[idx].gagged {
             idx -= 1;
         }
-        let line = &self.output_lines[idx];
-        let total = nli_visual_rows(&line.text, output_width.max(1), line_is_new_for(line, CONSOLE_DISPLAY_ID), nli_enabled, wrapspace);
+        // Measured with the renderer's own wrapping, so the "More NNNN" count can't disagree
+        // with how many rows are actually held back. Measuring the raw text used to miss the
+        // F2 timestamp prefix, the "✨ " client-line prefix and the 🛢️ archive prefix, each of
+        // which can push a line onto another row and so under-report the hidden remainder.
+        let total = metrics.rows(&self.output_lines[idx]);
         total.saturating_sub(self.visual_line_offset)
     }
 
@@ -3814,7 +3803,7 @@ impl World {
     /// (`release_pending_screenful` sizing its broadcast with `visual_line_count` while this
     /// function released fewer lines per `nli_visual_rows`) let surplus lines be broadcast
     /// while remaining in `pending_lines`, so they were broadcast AGAIN on the next release.
-    pub fn release_pending(&mut self, visual_budget: usize, output_width: usize, nli_enabled: bool, wrapspace: usize) -> Vec<OutputLine> {
+    pub(crate) fn release_pending(&mut self, visual_budget: usize, metrics: &rendering::RowMetrics) -> Vec<OutputLine> {
         // Reset visual_line_offset so truncated wrapped lines from the pause trigger
         // are fully visible after releasing.
         self.visual_line_offset = 0;
@@ -3823,7 +3812,6 @@ impl World {
             self.lines_since_pause = 0;
             return Vec::new();
         }
-        let width = output_width.max(1);
         let mut visual_total = 0;
         let mut logical_count = 0;
 
@@ -3838,7 +3826,7 @@ impl World {
                 logical_count += 1;
                 continue;
             }
-            let vl = nli_visual_rows(&line.text, width, line_is_new_for(line, CONSOLE_DISPLAY_ID), nli_enabled, wrapspace);
+            let vl = metrics.rows(line);
             // If adding this line would exceed budget AND we already have at least one,
             // stop before adding it. Always release at least 1 line.
             if visual_total > 0 && visual_total + vl > visual_budget {
@@ -3924,7 +3912,12 @@ impl World {
         }
     }
 
-    fn is_at_bottom(&self) -> bool {
+    /// True when the last logical line of the buffer is the viewport's bottom anchor, i.e.
+    /// the user is following live output rather than reading scrollback.
+    ///
+    /// Deliberately ignores `visual_line_offset`: more-mode's partial reveal holds the anchor
+    /// on the last line with rows still hidden below, and that still counts as following.
+    pub(crate) fn is_at_bottom(&self) -> bool {
         self.scroll_offset >= self.output_lines.len().saturating_sub(1)
     }
 
@@ -6932,8 +6925,9 @@ impl App {
         let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
             && !self.worlds[world_idx].partial_in_pending;
 
+        let show_tags = self.show_tags;
         self.current_world_mut()
-            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
+            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false, show_tags);
 
         let output_after = self.worlds[world_idx].output_lines.len();
         let pending_after = self.worlds[world_idx].pending_lines.len();
@@ -7047,8 +7041,9 @@ impl App {
         let output_before = self.worlds[world_idx].output_lines.len();
         let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
             && !self.worlds[world_idx].partial_in_pending;
+        let show_tags = self.show_tags;
         self.worlds[world_idx]
-            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
+            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false, show_tags);
         // No ▶ broadcast needed on arrival any more: an arriving line carries its own state
         // (`OutputLine::viewed`, set from is_current) and is never owned by anyone yet, so no
         // client's markers change here. Ownership is only ever assigned by a claim, which
@@ -7217,8 +7212,9 @@ impl App {
         // unlike process_server_data, there's no has_partial_in_output
         // exclusion needed on the way out.
         let text = lines.join("\n") + "\n";
+        let show_tags = self.show_tags;
         self.worlds[world_idx]
-            .add_output(&text, is_current, &settings, output_height, output_width, false, false);
+            .add_output(&text, is_current, &settings, output_height, output_width, false, false, show_tags);
 
         let output_after = self.worlds[world_idx].output_lines.len();
         let pending_after = self.worlds[world_idx].pending_lines.len();
@@ -7800,7 +7796,8 @@ impl App {
         // count == 0 means release all; otherwise treat count as visual budget
         let visual_budget = if count == 0 { usize::MAX } else { count };
 
-        let released = self.worlds[world_index].release_pending(visual_budget, client_width, self.settings.new_line_indicator, self.settings.wrapspace as usize);
+        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, client_width.max(1));
+        let released = self.worlds[world_index].release_pending(visual_budget, &metrics);
         let to_release = released.len();
         // The requesting client claims the ▶ markers on whatever these lines are the first
         // display of - it is the one that pressed Tab/PgDn, so it is the one looking at them.
@@ -8753,11 +8750,18 @@ impl App {
             return;
         }
         let claimed = self.worlds[world_idx].claim_unviewed(owner_id);
-        if claimed.is_empty() {
-            return;
-        }
+        let nothing_claimed = claimed.is_empty();
         if let Some(client_id) = notify {
+            // Sent even when the list is empty. A remote client claims optimistically the
+            // instant it starts displaying a world — predicting this exact call — so that ▶
+            // paints in the same frame as the text instead of a network round-trip later.
+            // An empty list is how it learns a guess was wrong (another viewer got there
+            // first and the lines were already viewed), so skipping the message would leave
+            // a marker on screen that the server never granted.
             self.ws_send_to_client(client_id, WsMessage::ClaimedNew { world_index: world_idx, seqs: claimed });
+        }
+        if nothing_claimed {
+            return;
         }
         self.needs_output_redraw = true;
     }
@@ -9152,7 +9156,7 @@ impl App {
             let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
                 && !self.worlds[world_idx].partial_in_pending;
 
-            self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
+            self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true, self.show_tags);
 
             // Check if splash was cleared (output_lines was reset)
             let splash_was_cleared = was_showing_splash && !self.worlds[world_idx].showing_splash;
@@ -12361,160 +12365,102 @@ impl App {
         count
     }
 
-    fn scroll_output_up(&mut self) {
+    /// The page-scroll step: a screenful minus the two rows deliberately kept as overlap, so
+    /// the top two rows of the outgoing screen become the bottom two rows of the new one.
+    fn page_step(&self) -> usize {
+        (self.output_height as usize).saturating_sub(2).max(1)
+    }
+
+
+    /// Move the viewport up by exactly `rows` drawn rows, pulling in archived scrollback when
+    /// the oldest row we hold is already on screen. Returns false when nothing moved.
+    ///
+    /// Row-exact by way of `World::visual_line_offset`, so a paragraph taller than the screen
+    /// is paged through a screenful at a time instead of being jumped over wholesale. The old
+    /// implementation budgeted with a `div_ceil` estimate at full terminal width while the
+    /// renderer word-wraps at a prefix-reduced width, so it consistently under-counted long
+    /// lines and scrolled past rows that were on screen.
+    fn scroll_output_up_rows(&mut self, rows: usize) -> bool {
         let more_mode = self.settings.more_mode_enabled;
-        let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
-        let visible_height = (self.output_height as usize).max(1);
-        let width = (self.output_width as usize).max(1);
-        let show_tags = self.show_tags;
-        let wrapspace = self.settings.wrapspace as usize;
         let world_idx = self.current_world_index;
 
-        self.worlds[world_idx].visual_line_offset = 0;
+        if self.worlds[world_idx].output_lines.is_empty() {
+            return false;
+        }
 
-        let calc_min_offset = |output_lines: &[OutputLine]| -> usize {
-            let mut min = 0usize;
-            let mut vlines = 0usize;
-            for (idx, line) in output_lines.iter().enumerate() {
-                if show_tags || !line.gagged {
-                    vlines += visual_line_count(&line.text, width, wrapspace);
-                }
-                if vlines >= visible_height {
-                    min = idx;
-                    break;
-                }
-                min = idx;
-            }
-            min
-        };
-
-        let min_offset = calc_min_offset(&self.worlds[world_idx].output_lines);
-
-        if self.worlds[world_idx].scroll_offset <= min_offset {
-            // At the top — try loading older lines from the archive
-            let loaded = self.try_load_archive_lines(world_idx);
-            if loaded == 0 {
+        if self.viewport_at_top() {
+            // Oldest row we have is already on screen — try the scrollback archive.
+            if self.try_load_archive_lines(world_idx) == 0 {
                 if more_mode && !self.worlds[world_idx].paused {
                     self.worlds[world_idx].paused = true;
                 }
-                return;
+                return false;
             }
-            // Archive lines were prepended; recalculate min_offset for new buffer
+            // Archive lines were prepended; the anchor is re-read below against the new buffer.
         }
 
-        let min_offset = calc_min_offset(&self.worlds[world_idx].output_lines);
-        let world = &mut self.worlds[world_idx];
-
-        let mut visual_lines_moved = 0;
-        let mut new_offset = world.scroll_offset;
-
-        while visual_lines_moved < target_visual_lines {
-            if show_tags || !world.output_lines[new_offset].gagged {
-                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width, wrapspace);
-            }
-            if new_offset == 0 {
-                break;
-            }
-            new_offset -= 1;
-        }
-
-        world.scroll_offset = new_offset.max(min_offset);
-        if more_mode && !world.paused {
-            world.paused = true;
+        let moved = self.move_viewport_up(rows);
+        if more_mode && !self.worlds[world_idx].paused {
+            self.worlds[world_idx].paused = true;
         }
         self.needs_output_redraw = true;
+        moved
+    }
+
+    /// Move the current world's viewport up by exactly `rows` drawn rows, clamped at the
+    /// oldest row held in memory. No archive loading, no more-mode side effects — those
+    /// belong to the caller, because the remote console fetches its scrollback over the
+    /// WebSocket and mirrors `paused` from the daemon rather than owning either.
+    ///
+    /// Returns true if the anchor actually moved.
+    pub(crate) fn move_viewport_up(&mut self, rows: usize) -> bool {
+        let visible_height = (self.output_height as usize).max(1);
+        let world_idx = self.current_world_index;
+        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1));
+        let world = &mut self.worlds[world_idx];
+        let Some(anchor) = metrics.anchor_of(world) else { return false };
+        let Some(top) = metrics.top_anchor(world, visible_height) else { return false };
+        let target = metrics.back(world, anchor, rows).max(top);
+        metrics.apply_anchor(world, target);
+        self.needs_output_redraw = true;
+        target != anchor
+    }
+
+    /// True when the oldest row held in memory is already on screen, so scrolling up further
+    /// needs older lines from somewhere else (the local archive, or the daemon).
+    pub(crate) fn viewport_at_top(&self) -> bool {
+        let visible_height = (self.output_height as usize).max(1);
+        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1));
+        let world = &self.worlds[self.current_world_index];
+        match metrics.anchor_of(world) {
+            Some(anchor) => metrics.at_top(world, anchor, visible_height),
+            None => true,
+        }
+    }
+
+    fn scroll_output_up(&mut self) {
+        self.scroll_output_up_rows(self.page_step());
     }
 
     fn scroll_output_up_by(&mut self, lines: usize) {
-        let more_mode = self.settings.more_mode_enabled;
-        let visible_height = (self.output_height as usize).max(1);
-        let width = (self.output_width as usize).max(1);
-        let show_tags = self.show_tags;
-        let wrapspace = self.settings.wrapspace as usize;
+        self.scroll_output_up_rows(lines.max(1));
+    }
+
+    /// Move the current world's viewport down by exactly `rows` drawn rows, clamped at the
+    /// newest row.
+    pub(crate) fn move_viewport_down(&mut self, rows: usize) {
         let world_idx = self.current_world_index;
-
-        self.worlds[world_idx].visual_line_offset = 0;
-
-        let calc_min_offset = |output_lines: &[OutputLine]| -> usize {
-            let mut min = 0usize;
-            let mut vlines = 0usize;
-            for (idx, line) in output_lines.iter().enumerate() {
-                if show_tags || !line.gagged {
-                    vlines += visual_line_count(&line.text, width, wrapspace);
-                }
-                if vlines >= visible_height {
-                    min = idx;
-                    break;
-                }
-                min = idx;
-            }
-            min
-        };
-
-        let min_offset = calc_min_offset(&self.worlds[world_idx].output_lines);
-
-        if self.worlds[world_idx].scroll_offset <= min_offset {
-            let loaded = self.try_load_archive_lines(world_idx);
-            if loaded == 0 {
-                if more_mode && !self.worlds[world_idx].paused {
-                    self.worlds[world_idx].paused = true;
-                }
-                return;
-            }
-        }
-
-        let min_offset = calc_min_offset(&self.worlds[world_idx].output_lines);
+        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, (self.output_width as usize).max(1));
         let world = &mut self.worlds[world_idx];
-
-        let mut visual_lines_moved = 0;
-        let mut new_offset = world.scroll_offset;
-        while visual_lines_moved < lines {
-            if show_tags || !world.output_lines[new_offset].gagged {
-                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width, wrapspace);
-            }
-            if new_offset == 0 {
-                break;
-            }
-            new_offset -= 1;
-        }
-
-        world.scroll_offset = new_offset.max(min_offset);
-        if more_mode && !world.paused {
-            world.paused = true;
-        }
+        let Some(anchor) = metrics.anchor_of(world) else { return };
+        let Some(bottom) = metrics.bottom_anchor(world) else { return };
+        let target = metrics.forward(world, anchor, rows).min(bottom);
+        metrics.apply_anchor(world, target);
         self.needs_output_redraw = true;
     }
 
     fn scroll_output_down(&mut self) {
-        let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
-        let width = (self.output_width as usize).max(1);
-        let show_tags = self.show_tags;
-        let wrapspace = self.settings.wrapspace as usize;
-        let world = self.current_world_mut();
-        world.visual_line_offset = 0;
-        let max_scroll = world.output_lines.len().saturating_sub(1);
-
-        if world.scroll_offset >= max_scroll {
-            return; // Already at bottom
-        }
-
-        // Count lines being scrolled in (from scroll_offset+1 going forwards)
-        // These are the lines that will appear at the bottom
-        let mut visual_lines_moved = 0;
-        let mut new_offset = world.scroll_offset + 1;
-
-        while new_offset <= max_scroll && visual_lines_moved < target_visual_lines {
-            if show_tags || !world.output_lines[new_offset].gagged {
-                visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width, wrapspace);
-            }
-            new_offset += 1;
-        }
-
-        // new_offset is one past the last line counted, so subtract 1
-        world.scroll_offset = (new_offset - 1).min(max_scroll);
-
-        // Mark output for redraw
-        self.needs_output_redraw = true;
+        self.move_viewport_down(self.page_step());
     }
 
     /// Release one screenful of pending lines and broadcast to WebSocket clients.
@@ -12535,9 +12481,12 @@ impl App {
                 partial_idx -= 1;
             }
             if partial_idx < self.worlds[world_idx].output_lines.len() {
-                let partial_line = &self.worlds[world_idx].output_lines[partial_idx];
-                let partial_is_new = line_is_new_for(partial_line, CONSOLE_DISPLAY_ID);
-                let total_vl = nli_visual_rows(&partial_line.text, width, partial_is_new, self.settings.new_line_indicator, self.settings.wrapspace as usize);
+                // Measured with display_rows, not an estimate: this height is compared
+                // directly against visual_line_offset, which is also the viewport's
+                // row-exact bottom anchor. A disagreement here between the budget and what
+                // the renderer draws shows up as a skipped or repeated row.
+                let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, width);
+                let total_vl = metrics.rows(&self.worlds[world_idx].output_lines[partial_idx]);
                 let remaining = total_vl.saturating_sub(self.worlds[world_idx].visual_line_offset);
                 if remaining > visual_budget {
                     // More of this line than fits on screen — advance offset, done
@@ -12566,9 +12515,9 @@ impl App {
         // released, the surplus stayed in `pending_lines`, and got broadcast AGAIN on the next
         // Tab/PgDn with no way for any client to detect the duplicate (release batches use
         // `seq: 0`). Taking the actual return value makes that divergence impossible.
-        let nli_enabled = self.settings.new_line_indicator;
-        let wrapspace = self.settings.wrapspace as usize;
-        let released_lines = self.current_world_mut().release_pending(visual_budget, output_width, nli_enabled, wrapspace);
+        let metrics = rendering::RowMetrics::new(&self.settings, self.show_tags, output_width.max(1));
+        let world_idx_rp = self.current_world_index;
+        let released_lines = self.worlds[world_idx_rp].release_pending(visual_budget, &metrics);
         let released = released_lines.len();
         self.broadcast_released_lines(world_idx, &released_lines, None); // console Tab
 
@@ -18421,7 +18370,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let pending_before = app.worlds[world_idx].pending_lines.len();
                                 let output_before = app.worlds[world_idx].output_lines.len();
 
-                                app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
+                                app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true, app.show_tags);
 
                                 // Calculate what went where
                                 let pending_after = app.worlds[world_idx].pending_lines.len();
@@ -19338,7 +19287,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // as delivered (a permanent gap for the Phase C ack audit) and
                             // mis-attributed the lines as client-generated.
                             let output_before = app.worlds[world_idx].output_lines.len();
-                            app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
+                            app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true, app.show_tags);
                             let output_after = app.worlds[world_idx].output_lines.len();
                             app.broadcast_output_range(world_idx, output_before, output_after.saturating_sub(output_before), is_current, true, false);
                         }

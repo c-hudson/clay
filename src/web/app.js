@@ -949,10 +949,25 @@
     // Report this client's visibility to the server (WsMessage::ClientVisibility). Guarded
     // on an open, authenticated socket: before auth the server has no ClientViewState for us
     // to act on, and the InitialState that follows reports the correct state anyway.
+    // Mirrors the server's own ClientViewState.visible so we can tell a real transition from
+    // a repeat. handle_client_visibility early-returns on a repeat and sends no ClaimedNew,
+    // so the optimistic claim below must fire only when the server will actually act.
+    let lastSentVisibility = null;
     function sendClientVisibility(visible) {
         try {
             if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
-                ws.send(JSON.stringify({ type: 'ClientVisibility', visible: !!visible }));
+                const next = !!visible;
+                const transition = lastSentVisibility !== next;
+                ws.send(JSON.stringify({ type: 'ClientVisibility', visible: next }));
+                lastSentVisibility = next;
+                // Coming back to the foreground re-claims whatever arrived while we were away
+                // (backgrounding drops our markers but leaves the lines viewed, so only truly
+                // new text is in play). Claim it before the resume repaint for the same reason
+                // as a world switch: the ClaimedNew is a round-trip away.
+                if (next && transition) {
+                    claimUnviewedLocally(currentWorldIndex);
+                    renderOutput();
+                }
             }
         } catch (e) { /* non-fatal: the next InitialState re-establishes our state */ }
     }
@@ -3371,7 +3386,13 @@
                             // nothing in this batch was highlighted.
                             const lineHighlight = (Array.isArray(msg.highlight_colors) && msg.highlight_colors.length > rawIdx)
                                 ? msg.highlight_colors[rawIdx] : null;
-                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false, highlight_color: lineHighlight };
+                            // `viewed` mirrors OutputLine::viewed, which add_output sets to
+                            // "was anybody watching this world when this arrived". Carrying it
+                            // is what lets claimUnviewedLocally() predict the server's claim
+                            // instead of guessing every line is unviewed - without it, lines
+                            // that arrived while the console (or another client) was watching
+                            // would be optimistically marked ▶ and then taken back.
+                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false, highlight_color: lineHighlight, viewed: !!msg.is_viewed };
 
                             if (isGapFill) {
                                 // This batch fills a historical hole, not the tail — collect it
@@ -3936,13 +3957,30 @@
                 // started displaying that world). Sent to this client only - a claim never
                 // changes any other client's rendering. An explicit seq list, not a range:
                 // unviewed lines are not a contiguous tail (see WsMessage::ClaimedNew).
+                //
+                // Also the reconciliation point for claimUnviewedLocally()'s optimistic
+                // claim: the server's list is authoritative, so a seq we guessed at but that
+                // is missing from it gets its marker taken back. Sent even when the list is
+                // empty (see App::claim_world_for) precisely so a wrong guess is always
+                // corrected. The re-render is skipped when nothing actually changed, which is
+                // the common case now - that skipped repaint is the ▶ "flash" going away.
                 if (msg.world_index !== undefined && worlds[msg.world_index] && Array.isArray(msg.seqs)) {
                     const cWorld = worlds[msg.world_index];
-                    const wanted = new Set(msg.seqs);
+                    const granted = new Set(msg.seqs);
+                    const guessed = cWorld._optimisticClaim;
+                    cWorld._optimisticClaim = null;
+                    let changed = false;
                     for (const line of (cWorld.output_lines || [])) {
-                        if (wanted.has(line.seq)) line.display_id = myDisplayId;
+                        if (granted.has(line.seq)) {
+                            if (line.display_id !== myDisplayId) changed = true;
+                            line.display_id = myDisplayId;
+                            line.viewed = true;
+                        } else if (guessed && guessed.has(line.seq) && line.display_id === myDisplayId) {
+                            line.display_id = null;
+                            changed = true;
+                        }
                     }
-                    if (msg.world_index === currentWorldIndex) {
+                    if (changed && msg.world_index === currentWorldIndex) {
                         renderOutput();
                     }
                 }
@@ -3953,6 +3991,9 @@
                 // backgrounded). Other clients' markers live on their own lines' display_id
                 // and are unaffected - that is the whole point of per-line ownership.
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    // Drops any outstanding optimistic guess too: the server has just told us
+                    // we own nothing here, which supersedes whatever we predicted.
+                    worlds[msg.world_index]._optimisticClaim = null;
                     for (const line of (worlds[msg.world_index].output_lines || [])) {
                         if (line.display_id === myDisplayId) line.display_id = null;
                     }
@@ -4177,6 +4218,9 @@
                         worlds[msg.world_index].paused = msg.paused || false;
                     }
                     updateStatusBar();
+                    // Same reason as in switchWorldLocal: claim before the paint so ▶ is
+                    // there on the first frame rather than after MarkWorldSeen round-trips.
+                    claimUnviewedLocally(msg.world_index);
                     renderOutput();
                     // Send MarkWorldSeen since we're now viewing this world; tell the server
                     // which world we left so it can clear that world's indicators even across
@@ -5896,6 +5940,10 @@
             paused = false;
             pendingLines = [];
             linesSincePause = 0;
+            // Take ▶ ownership before the first paint, not after the MarkWorldSeen below
+            // round-trips - otherwise this render shows the text bare and the markers appear
+            // a moment later. The ClaimedNew that MarkWorldSeen triggers reconciles it.
+            claimUnviewedLocally(index);
             renderOutput();
             updateStatusBar();
             // Update prompt to show new world's prompt
@@ -6756,6 +6804,37 @@
         if (!lineObj) return false;
         if (!myDisplayId) return false; // no id yet, or an older server: never claim a marker
         return lineObj.display_id === myDisplayId;
+    }
+
+    // Take ▶ ownership of this world's unviewed lines locally, ahead of the server saying so.
+    //
+    // Ownership is server-authoritative, but the server can only tell us after a round trip -
+    // we render the world the instant the user switches to it, then MarkWorldSeen goes out,
+    // then ClaimedNew comes back. That is one full network round-trip during which the text is
+    // already on screen *without* its ▶ markers, so they visibly pop in a moment later. On a
+    // phone over mobile data it reads as the app redrawing itself.
+    //
+    // So predict it. This mirrors World::claim_unviewed exactly - same three conditions, same
+    // order - and the ClaimedNew that follows reconciles any difference (see its handler).
+    // A wrong guess is possible only when our `viewed` copy is stale, which needs a second
+    // remote client to have claimed the same world since our last update; it self-corrects on
+    // the next message rather than persisting.
+    function claimUnviewedLocally(worldIndex) {
+        const w = worlds[worldIndex];
+        if (!w || !myDisplayId || !Array.isArray(w.output_lines)) return;
+        const guessed = new Set();
+        for (const line of w.output_lines) {
+            if (line.viewed) continue;
+            line.viewed = true;
+            // from_server defaults true on the wire; archive lines never take a marker.
+            if (line.from_server !== false && !line.from_archive) {
+                line.display_id = myDisplayId;
+                guessed.add(line.seq);
+            }
+        }
+        // Remembered so the reconciling ClaimedNew can tell "we guessed this" apart from
+        // "we already owned this", and only revoke the former.
+        w._optimisticClaim = guessed.size ? guessed : null;
     }
 
     function renderOutput(opts) {

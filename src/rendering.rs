@@ -1,6 +1,8 @@
 // Rendering/UI functions extracted from main.rs
 // Handles terminal output rendering, ratatui frame composition, and popup rendering.
 
+use std::ops::Range;
+
 use crossterm::cursor;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -434,6 +436,370 @@ pub(crate) fn process_output_line(line: &OutputLine, show_tags: bool, temp_conve
     Some(processed.replace('\t', "        "))
 }
 
+/// Exact wrap width the console output renderer uses for one line.
+///
+/// The `▶ ` (new-line-indicator) and `🛢️ ` (archive) prefixes are printed by the draw loop
+/// rather than baked into the wrapped text, so their columns must be reserved here.
+///
+/// Every row-counting caller must go through this. A counter that wraps at a different width
+/// than the renderer draws is exactly what let Page Up walk past rows that were on screen.
+pub(crate) fn display_wrap_width(
+    term_width: usize,
+    marked_new: bool,
+    from_archive: bool,
+    nli_enabled: bool,
+) -> usize {
+    let mut width = term_width;
+    if nli_enabled && marked_new {
+        width = width.saturating_sub(NLI_PREFIX_WIDTH);
+    }
+    if from_archive {
+        width = width.saturating_sub(ARCHIVE_PREFIX_WIDTH);
+    }
+    width
+}
+
+/// The text the console renderer actually wraps: `process_output_line` plus OSC 8 URL
+/// wrapping and Discord-emoji links.
+///
+/// `None` means the line is not drawn at all (gagged without F2, or ANSI-only garbage).
+/// `Some("")` means it draws as a single blank row.
+pub(crate) fn expand_for_display(
+    line: &OutputLine,
+    show_tags: bool,
+    settings: &Settings,
+    cached_now: &CachedNow,
+) -> Option<String> {
+    let expanded = process_output_line(
+        line,
+        show_tags,
+        settings.temp_convert_enabled,
+        settings.zwj_enabled,
+        cached_now,
+    )?;
+    if expanded.is_empty() {
+        return Some(String::new());
+    }
+    // Wrap URLs with OSC 8 hyperlink sequences for terminal clickability.
+    let with_links = wrap_urls_with_osc8(&expanded);
+    // Convert Discord custom emojis to clickable :name: links (after URL wrapping to avoid
+    // conflicts). Skipped when show_tags is on so users can see the original text.
+    Some(if show_tags {
+        with_links
+    } else {
+        convert_discord_emojis_with_links(&with_links)
+    })
+}
+
+/// The wrapped rows of one line, exactly as the console renderer will draw them.
+/// Empty vec when the line is not drawn.
+pub(crate) fn display_wrapped(
+    line: &OutputLine,
+    term_width: usize,
+    show_tags: bool,
+    settings: &Settings,
+    cached_now: &CachedNow,
+) -> Vec<String> {
+    display_wrapped_as(line, term_width, line_is_new(line), show_tags, settings, cached_now)
+}
+
+/// As `display_wrapped`, but with the ▶-ownership answer supplied rather than read off the
+/// line.
+///
+/// Only more-mode's arrival budgeting needs this: when output lands on a world nobody is
+/// watching, the line is not owned by anyone *yet* but will be claimed by whoever looks next,
+/// so the budget has to reserve the indicator's columns for a marker that does not exist on
+/// the line at this instant. Everything that measures what is on screen right now uses
+/// `display_wrapped`.
+pub(crate) fn display_wrapped_as(
+    line: &OutputLine,
+    term_width: usize,
+    marked_new: bool,
+    show_tags: bool,
+    settings: &Settings,
+    cached_now: &CachedNow,
+) -> Vec<String> {
+    let text = match expand_for_display(line, show_tags, settings, cached_now) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let width = display_wrap_width(
+        term_width,
+        marked_new,
+        line.from_archive,
+        settings.new_line_indicator,
+    );
+    wrap_ansi_line(&text, width, settings.wrapspace as usize)
+}
+
+/// Number of screen rows `line` occupies. 0 when the line is not drawn at all.
+///
+/// This is the single source of truth for row budgeting (page scrolling, more-mode pause
+/// and release accounting). It calls the same functions the renderer calls, so it cannot
+/// drift from what is actually on screen — unlike the `div_ceil` estimate it replaced,
+/// which ignored word-wrap ragged edges, the `show_tags` timestamp, the `✨ ` client
+/// prefix, and the `▶ `/`🛢️ ` prefix widths, and so under-counted every long line.
+///
+/// Returning 0 for gagged lines also retires the ad-hoc `show_tags || !line.gagged` guards
+/// the row-walking loops used to carry.
+pub(crate) fn display_rows(
+    line: &OutputLine,
+    term_width: usize,
+    show_tags: bool,
+    settings: &Settings,
+    cached_now: &CachedNow,
+) -> usize {
+    display_wrapped(line, term_width, show_tags, settings, cached_now).len()
+}
+
+/// The bottom anchor of the console viewport, in exact rows: the display ends after row
+/// `rows` (1-based) of logical line `line`.
+///
+/// This is the row-resolution form of the `(World::scroll_offset, World::visual_line_offset)`
+/// pair — `visual_line_offset == 0` denormalizes to "all rows of that line". Ordering is row
+/// order, so anchors can be compared and clamped directly.
+///
+/// Scrolling has to be expressed in rows rather than logical lines: a single wrapped
+/// paragraph can be taller than the screen, so a line-granular anchor cannot honor "keep the
+/// top two rows on a Page Up" and will skip content outright at the page boundary.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct Anchor {
+    pub line: usize,
+    pub rows: usize,
+}
+
+/// Everything needed to measure how tall a line renders, bundled so the walking helpers below
+/// don't take six arguments each. Borrows only `Settings`, so callers can still hold a
+/// `&mut World` from a disjoint field of `App` at the same time.
+pub(crate) struct RowMetrics<'a> {
+    settings: &'a Settings,
+    show_tags: bool,
+    width: usize,
+    now: CachedNow,
+}
+
+impl<'a> RowMetrics<'a> {
+    pub(crate) fn new(settings: &'a Settings, show_tags: bool, width: usize) -> Self {
+        RowMetrics { settings, show_tags, width: width.max(1), now: CachedNow::new() }
+    }
+
+    /// Rows this line occupies on screen; 0 if it isn't drawn at all.
+    pub(crate) fn rows(&self, line: &OutputLine) -> usize {
+        display_rows(line, self.width, self.show_tags, self.settings, &self.now)
+    }
+
+    /// Rows this line will occupy once `marked_new` is decided, for budgeting output that has
+    /// not been claimed yet. See `display_wrapped_as`.
+    pub(crate) fn rows_as(&self, line: &OutputLine, marked_new: bool) -> usize {
+        display_wrapped_as(line, self.width, marked_new, self.show_tags, self.settings, &self.now).len()
+    }
+
+    fn prev_drawn(&self, lines: &[OutputLine], idx: usize) -> Option<usize> {
+        (0..idx).rev().find(|&i| self.rows(&lines[i]) > 0)
+    }
+
+    fn next_drawn(&self, lines: &[OutputLine], idx: usize) -> Option<usize> {
+        (idx + 1..lines.len()).find(|&i| self.rows(&lines[i]) > 0)
+    }
+
+    fn last_drawn(&self, lines: &[OutputLine]) -> Option<usize> {
+        (0..lines.len()).rev().find(|&i| self.rows(&lines[i]) > 0)
+    }
+
+    /// Read the world's current viewport anchor. `None` when nothing is drawable.
+    pub(crate) fn anchor_of(&self, world: &World) -> Option<Anchor> {
+        let lines = &world.output_lines;
+        if lines.is_empty() {
+            return None;
+        }
+        let start = world.scroll_offset.min(lines.len() - 1);
+        // scroll_offset can sit on a gagged line (gagged lines are appended, not removed);
+        // the renderer draws the nearest drawn line at or below it.
+        let line = if self.rows(&lines[start]) > 0 {
+            start
+        } else {
+            self.prev_drawn(lines, start).or_else(|| self.next_drawn(lines, start))?
+        };
+        let total = self.rows(&lines[line]);
+        // A visual_line_offset at or beyond the line's height is not a truncation — the
+        // renderer's `wrapped.len() > visual_line_offset` guard declines it.
+        let rows = if world.visual_line_offset > 0 && world.visual_line_offset < total {
+            world.visual_line_offset
+        } else {
+            total
+        };
+        Some(Anchor { line, rows })
+    }
+
+    /// Write an anchor back to the world, normalizing "all rows shown" to
+    /// `visual_line_offset == 0`.
+    ///
+    /// Setting `visual_line_offset` equal to the line's full height would be a silent
+    /// mis-render: the renderer's truncation guard is `wrapped.len() > visual_line_offset`,
+    /// so on equality it declines and truncates some *earlier* line instead.
+    pub(crate) fn apply_anchor(&self, world: &mut World, anchor: Anchor) {
+        let total = world
+            .output_lines
+            .get(anchor.line)
+            .map(|l| self.rows(l))
+            .unwrap_or(0);
+        let full = anchor.rows >= total;
+        world.visual_line_offset = if full { 0 } else { anchor.rows };
+        // When fully showing the last drawn line, park scroll_offset on the true end of the
+        // buffer so `is_at_bottom()` (and every "is the user following output" check built on
+        // it) still reports true even if trailing lines are gagged.
+        world.scroll_offset = if full && self.next_drawn(&world.output_lines, anchor.line).is_none() {
+            world.output_lines.len().saturating_sub(1)
+        } else {
+            anchor.line
+        };
+    }
+
+    /// Move the anchor back by exactly `n` drawn rows. Saturates at the first drawn row of
+    /// the buffer.
+    pub(crate) fn back(&self, world: &World, anchor: Anchor, mut n: usize) -> Anchor {
+        let lines = &world.output_lines;
+        let mut cur = anchor;
+        loop {
+            if n < cur.rows {
+                cur.rows -= n;
+                return cur;
+            }
+            n -= cur.rows;
+            match self.prev_drawn(lines, cur.line) {
+                Some(prev) => cur = Anchor { line: prev, rows: self.rows(&lines[prev]) },
+                // Out of buffer: stay on the first row we can still show.
+                None => return Anchor { line: cur.line, rows: 1 },
+            }
+            if n == 0 {
+                return cur;
+            }
+        }
+    }
+
+    /// Move the anchor forward by exactly `n` drawn rows. Saturates at the last drawn row.
+    pub(crate) fn forward(&self, world: &World, anchor: Anchor, mut n: usize) -> Anchor {
+        let lines = &world.output_lines;
+        let mut cur = anchor;
+        loop {
+            let total = self.rows(&lines[cur.line]);
+            let room = total.saturating_sub(cur.rows);
+            if n <= room {
+                cur.rows += n;
+                return cur;
+            }
+            n -= room;
+            match self.next_drawn(lines, cur.line) {
+                Some(next) => {
+                    // Stepping onto the next line's first row costs one of the n rows.
+                    cur = Anchor { line: next, rows: 1 };
+                    n -= 1;
+                }
+                None => return Anchor { line: cur.line, rows: total },
+            }
+            if n == 0 {
+                return cur;
+            }
+        }
+    }
+
+    /// The highest anchor that can still fill the screen — i.e. the anchor whose viewport
+    /// begins at the first drawn row of the buffer. Scrolling up past this only redraws the
+    /// same screen, so it is the clamp for Page Up.
+    pub(crate) fn top_anchor(&self, world: &World, visible_height: usize) -> Option<Anchor> {
+        let lines = &world.output_lines;
+        let mut acc = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            let rows = self.rows(line);
+            if rows == 0 {
+                continue;
+            }
+            if acc + rows >= visible_height {
+                return Some(Anchor { line: idx, rows: visible_height - acc });
+            }
+            acc += rows;
+        }
+        // Whole buffer is shorter than the screen: the bottom is also the top.
+        let last = self.last_drawn(lines)?;
+        Some(Anchor { line: last, rows: self.rows(&lines[last]) })
+    }
+
+    /// The lowest anchor: the last drawn row in the buffer.
+    pub(crate) fn bottom_anchor(&self, world: &World) -> Option<Anchor> {
+        let last = self.last_drawn(&world.output_lines)?;
+        Some(Anchor { line: last, rows: self.rows(&world.output_lines[last]) })
+    }
+
+    /// True when nothing is drawable above the viewport's top row.
+    pub(crate) fn at_top(&self, world: &World, anchor: Anchor, visible_height: usize) -> bool {
+        match self.top_anchor(world, visible_height) {
+            Some(top) => anchor <= top,
+            None => true,
+        }
+    }
+}
+
+/// Which collected rows are actually shown, given a bottom-anchored viewport of
+/// `visible_height` rows. Returned as ranges into the collected row vector so no row data is
+/// copied. A `None` tail means one contiguous slice — the normal case, and the only case that
+/// can ever be correct when the user is reading scrollback.
+///
+/// The two-range form is the new-line-indicator "old context" composition: when new (▶) text
+/// fills the screen, `min_old_context` old rows stay pinned at the top so the new block has
+/// something to sit under, and rows are dropped out of the *middle* to make room.
+///
+/// That splice is only legitimate when it actually has old context to preserve and new rows to
+/// preserve it for. Without those guards it fired on an all-old buffer purely because the row
+/// total happened to land in `(visible_height, visible_height + min_old_context]`, silently
+/// discarding 1-2 rows out of the middle of the screen — the "Page Up skipped lines and a
+/// paragraph starts mid-sentence" bug, which also made rows blink in and out at the *top* of
+/// the window on resize as the total slid in and out of that two-wide band. Pass
+/// `min_old_context == 0` to disable it outright (done whenever the user is scrolled back,
+/// where every row is old by definition).
+///
+/// `old_prefix` is the number of leading rows that are *not* new-marked.
+pub(crate) fn visible_row_ranges(
+    row_count: usize,
+    visible_height: usize,
+    min_old_context: usize,
+    old_prefix: usize,
+) -> (Range<usize>, Option<Range<usize>>) {
+    if row_count <= visible_height {
+        return (0..row_count, None);
+    }
+    let anchor_start = row_count - visible_height;
+
+    // How much old context a plain bottom anchor would already leave on screen.
+    let context_if_anchored = old_prefix.saturating_sub(anchor_start);
+    // Never let the pinned context crowd out the whole viewport.
+    let context = old_prefix
+        .min(min_old_context)
+        .min(visible_height.saturating_sub(1));
+
+    if min_old_context > 0
+        && row_count <= visible_height + min_old_context
+        && context > 0
+        // There must be new rows for the context to sit under...
+        && old_prefix < row_count
+        // ...and a plain bottom anchor must not already keep enough of them.
+        && context_if_anchored < min_old_context
+    {
+        let newest_count = visible_height - context;
+        let tail_start = row_count - newest_count;
+        return (0..context, Some(tail_start..row_count));
+    }
+
+    (anchor_start..row_count, None)
+}
+
+/// Number of leading rows that are not new-marked, given a per-row "is new" probe.
+fn old_row_prefix<T>(rows: &[T], is_new: impl Fn(&T) -> bool) -> usize {
+    rows.iter().take_while(|r| !is_new(r)).count()
+}
+
 /// A single visual line as it would appear in the output display.
 /// Used by `build_display_lines()` for testable display logic.
 #[derive(Debug, Clone)]
@@ -446,6 +812,8 @@ pub struct DisplayLine {
     pub highlight_f8: bool,
     /// Optional highlight color from /highlight action
     pub highlight_color: Option<String>,
+    /// True if this line was loaded from the scrollback archive (draws the 🛢️ prefix)
+    pub from_archive: bool,
 }
 
 /// Build the list of visual lines that would be displayed in the output area.
@@ -459,37 +827,26 @@ pub fn build_display_lines(
     term_width: usize,
     show_tags: bool,
 ) -> Vec<DisplayLine> {
-    let temp_convert_enabled = settings.temp_convert_enabled;
-    let zwj_enabled = settings.zwj_enabled;
     let new_line_indicator = settings.new_line_indicator;
-    let nli_prefix_width: usize = NLI_PREFIX_WIDTH;
-    let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
     let cached_now = CachedNow::new();
 
-    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool)> {
-        let expanded = match process_output_line(line, show_tags, temp_convert_enabled, zwj_enabled, cached_now) {
-            Some(text) if text.is_empty() => return vec![("".to_string(), false, None, false)],
-            Some(text) => text,
-            None => return Vec::new(),
-        };
-        let with_links = wrap_urls_with_osc8(&expanded);
-        let with_emoji_links = if show_tags {
-            with_links
-        } else {
-            convert_discord_emojis_with_links(&with_links)
-        };
+    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool, bool)> {
+        let rows = display_wrapped(line, term_width, show_tags, settings, cached_now);
+        if rows.len() == 1 && rows[0].is_empty() {
+            // Blank line: drawn as one empty row with no ▶/🛢️ prefix, matching the draw loop.
+            return vec![(String::new(), false, None, false, false)];
+        }
         let hl_color = line.highlight_color.clone();
         let mn = line_is_new(line);
-        let wrap_width = if new_line_indicator && mn {
-            term_width.saturating_sub(nli_prefix_width)
-        } else {
-            term_width
-        };
-        wrap_ansi_line(&with_emoji_links, wrap_width, settings.wrapspace as usize)
-            .into_iter()
-            .map(|s| (s, highlight_f8, hl_color.clone(), mn))
+        let fa = line.from_archive;
+        rows.into_iter()
+            .map(|s| (s, highlight_f8, hl_color.clone(), mn, fa))
             .collect()
     };
+
+    // Old-context composition only makes sense while following live output; during
+    // scrollback every row is old and splicing would discard rows out of the middle.
+    let min_old_context: usize = if new_line_indicator && world.is_at_bottom() { 2 } else { 0 };
 
     if world.output_lines.is_empty() {
         return Vec::new();
@@ -498,7 +855,7 @@ pub fn build_display_lines(
     // Normal unfiltered rendering
     let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
 
-    let mut rev_lines: Vec<(String, bool, Option<String>, bool)> = Vec::with_capacity(visible_height + 8);
+    let mut rev_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::with_capacity(visible_height + 8);
     let mut first_line_idx = end_line;
     let mut old_visual_count: usize = 0;
     let mut applied_vlo = false;
@@ -523,9 +880,10 @@ pub fn build_display_lines(
             old_visual_count += 1;
         }
 
-        if rev_lines.len() >= visible_height
-            && (!new_line_indicator || old_visual_count >= min_old_context)
-        {
+        // Keep collecting past a screenful only when the old-context composition is live and
+        // still needs old rows to pin at the top; min_old_context is 0 otherwise, so
+        // scrollback stops at exactly one screenful.
+        if rev_lines.len() >= visible_height && old_visual_count >= min_old_context {
             break;
         }
         if rev_lines.len() >= visible_height * 2 {
@@ -535,7 +893,11 @@ pub fn build_display_lines(
     rev_lines.reverse();
     let mut visual_lines = rev_lines;
 
-    if visual_lines.len() < visible_height && first_line_idx == 0 {
+    // Pad from below only when the buffer above genuinely ran out. Never when the anchor is
+    // deliberately hiding the rest of its line (`visual_line_offset`): those hidden rows, and
+    // everything after them, are either held back by more-mode or simply below the viewport,
+    // and pulling them up would both defeat the pause and punch a gap into the screen.
+    if visual_lines.len() < visible_height && first_line_idx == 0 && !applied_vlo {
         for line_idx in (end_line + 1)..world.output_lines.len() {
             let line = &world.output_lines[line_idx];
             let highlight = false;
@@ -551,33 +913,17 @@ pub fn build_display_lines(
         }
     }
 
-    // Build the final display slice (NLI composition logic)
-    let final_lines: Vec<(String, bool, Option<String>, bool)> = if visual_lines.len() <= visible_height {
-        visual_lines
-    } else if new_line_indicator && visual_lines.len() <= visible_height + min_old_context {
-        let mut old_prefix = 0;
-        for (_,_,_,mn) in &visual_lines {
-            if !mn { old_prefix += 1; } else { break; }
-        }
-        let context = old_prefix.min(min_old_context);
-        if context > 0 {
-            let newest_count = visible_height - context;
-            let mut composed = Vec::new();
-            composed.extend_from_slice(&visual_lines[..context]);
-            let tail_start = visual_lines.len().saturating_sub(newest_count);
-            composed.extend_from_slice(&visual_lines[tail_start..]);
-            composed
-        } else {
-            let start = visual_lines.len().saturating_sub(visible_height);
-            visual_lines[start..].to_vec()
-        }
-    } else {
-        let start = visual_lines.len().saturating_sub(visible_height);
-        visual_lines[start..].to_vec()
-    };
+    // Build the final display slice (see visible_row_ranges for the NLI composition rules)
+    let old_prefix = old_row_prefix(&visual_lines, |(_, _, _, mn, _)| *mn);
+    let (head, tail) = visible_row_ranges(visual_lines.len(), visible_height, min_old_context, old_prefix);
+    let mut final_lines: Vec<(String, bool, Option<String>, bool, bool)> =
+        visual_lines[head].to_vec();
+    if let Some(tail) = tail {
+        final_lines.extend_from_slice(&visual_lines[tail]);
+    }
 
-    final_lines.into_iter().map(|(text, highlight_f8, highlight_color, marked_new)| {
-        DisplayLine { text, marked_new, highlight_f8, highlight_color }
+    final_lines.into_iter().map(|(text, highlight_f8, highlight_color, marked_new, from_archive)| {
+        DisplayLine { text, marked_new, highlight_f8, highlight_color, from_archive }
     }).collect()
 }
 
@@ -667,8 +1013,6 @@ pub(crate) fn render_output_crossterm(app: &App) {
     let mut first_line_idx: usize = 0;
 
     let show_tags = app.show_tags;
-    let temp_convert_enabled = app.settings.temp_convert_enabled;
-    let zwj_enabled = app.settings.zwj_enabled;
     let highlight_actions = app.highlight_actions;
     let world_name = &world.name;
     // Pre-compile action patterns once (not per-line)
@@ -682,43 +1026,22 @@ pub(crate) fn render_output_crossterm(app: &App) {
     let cached_now = CachedNow::new();
 
     let new_line_indicator = app.settings.new_line_indicator;
-    // "▶ " prefix width — kept in sync via NLI_PREFIX_WIDTH const in util.rs
-    let nli_prefix_width: usize = NLI_PREFIX_WIDTH;
-    // Minimum old (non-new) context lines to show at top when switching worlds
-    let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
+    // Minimum old (non-new) context rows to pin at the top when new text has arrived.
+    // Zero while the user is scrolled back: there is no new text to give context to, and
+    // composing would discard rows out of the middle of the screen (see visible_row_ranges).
+    let min_old_context: usize = if new_line_indicator && world.is_at_bottom() { 2 } else { 0 };
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool, bool)> {
-        let expanded = match process_output_line(line, show_tags, temp_convert_enabled, zwj_enabled, cached_now) {
-            Some(text) if text.is_empty() => return vec![("".to_string(), false, None, false, false)],
-            Some(text) => text,
-            None => return Vec::new(),
-        };
-        // Wrap URLs with OSC 8 hyperlink sequences for terminal clickability
-        let with_links = wrap_urls_with_osc8(&expanded);
-        // Convert Discord custom emojis to clickable :name: links (after URL wrapping to avoid conflicts)
-        // Skip conversion when show_tags is enabled so users can see original text
-        let with_emoji_links = if show_tags {
-            with_links
-        } else {
-            convert_discord_emojis_with_links(&with_links)
-        };
+        // display_wrapped applies the same prefix-width reservations the draw loop below
+        // relies on (▶ and 🛢️ are printed separately, not baked into the wrapped text).
+        let rows = display_wrapped(line, term_width, show_tags, &app.settings, cached_now);
+        if rows.len() == 1 && rows[0].is_empty() {
+            // Blank line: one empty row, drawn without any prefix.
+            return vec![(String::new(), false, None, false, false)];
+        }
         let hl_color = line.highlight_color.clone();
         let mn = line_is_new(line);
         let fa = line.from_archive;
-        // Reduce wrap width to reserve space for any prefixes printed separately in the draw loop.
-        // The NLI "▶ " and the archive "🛢️ " prefixes are printed by the draw loop, NOT baked into
-        // the wrapped text, so we subtract their widths here.
-        // Note: ARCHIVE_PREFIX_WIDTH is hardcoded (not computed via unicode_width) because the VS16
-        // variation-selector emoji "🛢️" is measured as 1 col by unicode_width but rendered as 2 cells
-        // by terminals — baking the emoji into the text causes stray characters due to this mismatch.
-        let mut wrap_width = term_width;
-        if new_line_indicator && mn {
-            wrap_width = wrap_width.saturating_sub(nli_prefix_width);
-        }
-        if fa {
-            wrap_width = wrap_width.saturating_sub(ARCHIVE_PREFIX_WIDTH);
-        }
-        wrap_ansi_line(&with_emoji_links, wrap_width, app.settings.wrapspace as usize)
-            .into_iter()
+        rows.into_iter()
             .map(|s| (s, highlight_f8, hl_color.clone(), mn, fa))
             .collect()
     };
@@ -809,12 +1132,11 @@ pub(crate) fn render_output_crossterm(app: &App) {
                 old_visual_count += 1;
             }
 
-            // Collect enough to fill screen. When NLI is enabled, keep going
-            // past visible_height until we have min_old_context non-new lines,
-            // so the display window can include them at the top.
-            if rev_lines.len() >= visible_height
-                && (!new_line_indicator || old_visual_count >= min_old_context)
-            {
+            // Collect enough to fill screen. When the old-context composition is live, keep
+            // going past visible_height until we have min_old_context non-new lines, so the
+            // display window can include them at the top. min_old_context is 0 during
+            // scrollback, so that case stops at exactly one screenful.
+            if rev_lines.len() >= visible_height && old_visual_count >= min_old_context {
                 break;
             }
             // Safety limit: don't collect more than 2x screen height
@@ -825,7 +1147,9 @@ pub(crate) fn render_output_crossterm(app: &App) {
         rev_lines.reverse();
         visual_lines = rev_lines;
 
-        if visual_lines.len() < visible_height && first_line_idx == 0 {
+        // Pad from below only when the buffer above genuinely ran out - never when the anchor
+        // is deliberately hiding the rest of its line (see build_display_lines).
+        if visual_lines.len() < visible_height && first_line_idx == 0 && !applied_vlo {
             for line_idx in (end_line + 1)..world.output_lines.len() {
                 let line = &world.output_lines[line_idx];
                 let highlight = should_highlight(line);
@@ -875,35 +1199,17 @@ pub(crate) fn render_output_crossterm(app: &App) {
         }
     }
 
-    // Build the final display slice. When NLI is enabled and the world is paused
-    // (has pending lines), compose: old context at top + newest lines at bottom,
-    // dropping middle lines so total fits in visible_height. Once pending is fully
-    // released, just show the bottom visible_height lines normally.
-    let mut composed_lines: Vec<(String, bool, Option<String>, bool, bool)> = Vec::new();
-    let lines_to_show: &[(String, bool, Option<String>, bool, bool)] = if visual_lines.len() <= visible_height {
-        &visual_lines[..visual_lines.len()]
-    } else if new_line_indicator && visual_lines.len() <= visible_height + min_old_context {
-        // Old context lines are close to the bottom (within one screen + context).
-        // Compose: old context at top + newest lines at bottom.
-        let mut old_prefix = 0;
-        for (_,_,_,mn,_) in &visual_lines {
-            if !mn { old_prefix += 1; } else { break; }
-        }
-        let context = old_prefix.min(min_old_context);
-        if context > 0 {
-            let newest_count = visible_height - context;
-            composed_lines.extend_from_slice(&visual_lines[..context]);
-            let tail_start = visual_lines.len().saturating_sub(newest_count);
-            composed_lines.extend_from_slice(&visual_lines[tail_start..]);
-            &composed_lines
-        } else {
-            let start = visual_lines.len().saturating_sub(visible_height);
-            &visual_lines[start..]
-        }
-    } else {
-        let start = visual_lines.len().saturating_sub(visible_height);
-        &visual_lines[start..]
-    };
+    // Build the final display slice. Normally a contiguous bottom anchor; the NLI
+    // old-context composition (top context + newest tail, middle dropped) applies only
+    // under the guards in visible_row_ranges. Collected as references so neither form
+    // copies row data.
+    let old_prefix = old_row_prefix(&visual_lines, |(_, _, _, mn, _)| *mn);
+    let (head, tail) = visible_row_ranges(visual_lines.len(), visible_height, min_old_context, old_prefix);
+    let mut lines_to_show: Vec<&(String, bool, Option<String>, bool, bool)> =
+        visual_lines[head].iter().collect();
+    if let Some(tail) = tail {
+        lines_to_show.extend(visual_lines[tail].iter());
+    }
 
     for (row_idx, (wrapped, highlight_f8, hl_color, marked_new, from_archive)) in lines_to_show.iter().enumerate() {
         let row_y = row_idx as u16;
@@ -1256,65 +1562,32 @@ pub(crate) fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     // Fill the entire output area with background first
     f.render_widget(ratatui::widgets::Clear, area);
 
-    // Build visual lines (wrapped ANSI strings) by working backwards from scroll_offset
-    let mut wrapped_lines: Vec<String> = Vec::new();
+    // Share the same viewport core as the crossterm renderer rather than keeping a third
+    // hand-rolled copy of the collect-backwards-and-wrap loop. The copy this replaces
+    // ignored visual_line_offset entirely and reserved prefix widths on its own, so the
+    // screen could shift the moment a popup or the split editor opened.
+    //
+    // Note `area.width`, not `app.output_width`: the split editor halves this area, and the
+    // wrap must follow the area actually being drawn into.
+    //
+    // Still crossterm-only, deliberately unchanged here: F8 highlight-action matching and
+    // /highlight background painting, which this path has never drawn.
     let new_line_indicator = app.settings.new_line_indicator;
-    let nli_prefix_width: usize = NLI_PREFIX_WIDTH; // "▶ " = 2 columns
-
-    if !world.output_lines.is_empty() {
-        let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
-
-        // Cache "now" for timestamp formatting
-        let cached_now = CachedNow::new();
-
-        for line_idx in (0..=end_line).rev() {
-            let line = &world.output_lines[line_idx];
-            let is_new = new_line_indicator && line_is_new(line);
-            let is_archive = line.from_archive;
-
-            let expanded = match process_output_line(line, app.show_tags, app.settings.temp_convert_enabled, app.settings.zwj_enabled, &cached_now) {
-                Some(text) if text.is_empty() => {
-                    let prefix = if is_new { "\x1b[32m▶\x1b[0m ".to_string() } else { String::new() };
-                    let prefix = if is_archive { format!("{}🛢️ ", prefix) } else { prefix };
-                    wrapped_lines.insert(0, prefix);
-                    if wrapped_lines.len() >= visible_height {
-                        break;
-                    }
-                    continue;
-                }
-                Some(text) => text,
-                None => continue,
-            };
-
-            // Wrap the line to fit the output area width (narrower if NLI or archive prefix)
-            // ARCHIVE_PREFIX_WIDTH is hardcoded (not computed via unicode_width) because the
-            // VS16 emoji "🛢️" measures as 1 col but renders as 2 cells in terminals.
-            let mut wrap_width = area_width;
-            if is_new { wrap_width = wrap_width.saturating_sub(nli_prefix_width); }
-            if is_archive { wrap_width = wrap_width.saturating_sub(ARCHIVE_PREFIX_WIDTH); }
-            let wrapped = wrap_ansi_line(&expanded, wrap_width, app.settings.wrapspace as usize);
-
-            for w in wrapped.into_iter().rev() {
-                let prefixed = match (is_new, is_archive) {
-                    (true, true)   => format!("\x1b[32m▶\x1b[0m 🛢️ {}", w),
-                    (true, false)  => format!("\x1b[32m▶\x1b[0m {}", w),
-                    (false, true)  => format!("🛢️ {}", w),
-                    (false, false) => w,
-                };
-                wrapped_lines.insert(0, prefixed);
+    let display = build_display_lines(world, &app.settings, visible_height, area_width, app.show_tags);
+    let wrapped_lines: Vec<String> = display
+        .into_iter()
+        .map(|d| {
+            // The ▶ and 🛢️ prefixes are added here, matching the width reserved for them by
+            // display_wrap_width. ARCHIVE_PREFIX_WIDTH is hardcoded rather than measured
+            // because the VS16 emoji "🛢️" reports 1 col but renders as 2 cells.
+            match (new_line_indicator && d.marked_new, d.from_archive) {
+                (true, true) => format!("\x1b[32m▶\x1b[0m 🛢️ {}", d.text),
+                (true, false) => format!("\x1b[32m▶\x1b[0m {}", d.text),
+                (false, true) => format!("🛢️ {}", d.text),
+                (false, false) => d.text,
             }
-
-            if wrapped_lines.len() >= visible_height {
-                break;
-            }
-        }
-    }
-
-    // Trim to visible_height from the bottom (keep the most recent lines)
-    if wrapped_lines.len() > visible_height {
-        let excess = wrapped_lines.len() - visible_height;
-        wrapped_lines.drain(0..excess);
-    }
+        })
+        .collect();
 
     // Write each line directly to the ratatui buffer with ANSI-parsed styles
     let buf = f.buffer_mut();
@@ -1561,16 +1834,14 @@ pub(crate) fn render_splash_centered<'a>(world: &World, visible_height: usize, a
 /// so truncated output is never silently invisible.
 pub(crate) fn more_indicator_count(
     world: &World,
-    output_width: usize,
-    nli_enabled: bool,
-    wrapspace: usize,
+    metrics: &RowMetrics,
 ) -> Option<usize> {
     let pending = if !world.pending_lines.is_empty() {
         world.pending_lines.len()
     } else {
         world.pending_count
     };
-    let hidden = world.hidden_visual_rows(output_width, nli_enabled, wrapspace);
+    let hidden = world.hidden_visual_rows(metrics);
     let total = if world.paused { pending + hidden } else { hidden };
     if total > 0 { Some(total) } else { None }
 }
@@ -1604,9 +1875,7 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         (format!("Hist {}", format_more_count(lines_back)), true)
     } else if let Some(count) = more_indicator_count(
         world,
-        app.output_width as usize,
-        app.settings.new_line_indicator,
-        app.settings.wrapspace as usize,
+        &RowMetrics::new(&app.settings, app.show_tags, (app.output_width as usize).max(1)),
     ) {
         // Show More indicator when paused with pending lines, or when
         // visual_line_offset truncation is hiding rows of the current world

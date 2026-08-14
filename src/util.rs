@@ -1,5 +1,3 @@
-use ansi_to_tui::IntoText;
-use unicode_width::UnicodeWidthStr;
 
 // ============================================================================
 // Security helpers: constant-time comparison, owner-only file permissions
@@ -211,64 +209,12 @@ pub const NLI_PREFIX_WIDTH: usize = 2;
 /// Must stay in sync with the literal string "🛢️ " printed in rendering.rs.
 pub const ARCHIVE_PREFIX_WIDTH: usize = 3;
 
-/// Effective wrap width for a line, accounting for the new-line-indicator prefix.
-/// When `nli_enabled` is true and the line is `marked_new`, the prefix steals
-/// `NLI_PREFIX_WIDTH` columns; otherwise the full `output_width` is available.
-pub fn nli_wrap_width(output_width: usize, marked_new: bool, nli_enabled: bool) -> usize {
-    if nli_enabled && marked_new {
-        output_width.saturating_sub(NLI_PREFIX_WIDTH)
-    } else {
-        output_width
-    }
-}
-
-/// Visual row count for a line, using the indicator-aware wrap width.
-/// This must match the wrap width used in `render_output_crossterm` so that
-/// row-budget accounting (pause trigger, visual_line_offset, release_pending)
-/// agrees with what the renderer actually draws. `indent` is the `wrapspace` setting —
-/// threaded through so this count matches `wrap_ansi_line`'s actual row count exactly
-/// (it calls the same function, so the internal effective-indent clamp there keeps this
-/// automatically consistent even at pathological indent/width combinations).
-pub fn nli_visual_rows(text: &str, output_width: usize, marked_new: bool, nli_enabled: bool, indent: usize) -> usize {
-    use crate::rendering::wrap_ansi_line;
-    wrap_ansi_line(text, nli_wrap_width(output_width, marked_new, nli_enabled), indent)
-        .len()
-        .max(1)
-}
-
-/// Calculate the number of visual lines a string takes when wrapped to width. `indent` is
-/// the `wrapspace` setting: the first row holds `width` columns, every continuation row
-/// holds `width - indent` (clamped so at least 1 column remains, mirroring
-/// `wrap_ansi_line`'s internal clamp — this function doesn't call `wrap_ansi_line` itself,
-/// it's a cheaper div_ceil-based approximation, so the clamp needs to be duplicated here to
-/// stay consistent with it).
-pub fn visual_line_count(line: &str, width: usize, indent: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-    let eff_indent = indent.min(width.saturating_sub(1));
-    let cont_width = width - eff_indent;
-    let rows_for = |line_width: usize| -> usize {
-        // line_width == 0 falls into this arm too (0 <= width always holds since the
-        // width == 0 case already returned above) — same "1 row" result either way.
-        if line_width <= width {
-            1
-        } else {
-            1 + (line_width - width).div_ceil(cont_width)
-        }
-    };
-    match line.as_bytes().into_text() {
-        Ok(text) => {
-            let mut total = 0;
-            for l in text.lines {
-                let line_width: usize = l.spans.iter().map(|s| s.content.width()).sum();
-                total += rows_for(line_width);
-            }
-            total.max(1)
-        }
-        Err(_) => rows_for(line.width()),
-    }
-}
+// Note: the wrap-width and row-count helpers that used to live here (`nli_wrap_width`,
+// `nli_visual_rows`) are gone. Row measurement now has exactly one home,
+// `rendering::display_wrap_width` / `display_rows`, which measures the *processed* line the
+// renderer actually wraps - including the F2 timestamp prefix, the "✨ " client-line prefix
+// and the 🛢️ archive prefix - rather than the raw text at a partly-reserved width. Two
+// measuring functions is how the counts drifted from the screen in the first place.
 
 // ============================================================================
 // Cross-Platform Local Time
@@ -1196,36 +1142,66 @@ mod tests {
         assert!(color_name_to_ansi_bg("notacolor").contains("48;5;23"));
     }
 
-    // --- visual_line_count ---
+    // --- wrap row counting ---
+    // Row counting lives in `rendering::wrap_ansi_line` (via `display_rows`). These cover the
+    // cases the old `visual_line_count` div_ceil estimate did; that estimate is gone because
+    // it disagreed with the real wrapper on any text with spaces, which is what let Page Up
+    // scroll past rows that were on screen. The unbroken digit runs below hard-wrap, so both
+    // formulas agree on them and the expected values are unchanged.
+
+    fn rows(text: &str, width: usize, indent: usize) -> usize {
+        crate::rendering::wrap_ansi_line(text, width, indent).len().max(1)
+    }
 
     #[test]
     fn test_visual_lines_short() {
-        assert_eq!(visual_line_count("hello", 80, 0), 1);
+        assert_eq!(rows("hello", 80, 0), 1);
     }
 
     #[test]
     fn test_visual_lines_wrapping() {
-        assert_eq!(visual_line_count("12345678901234567890", 10, 0), 2);
+        assert_eq!(rows("12345678901234567890", 10, 0), 2);
     }
 
     #[test]
     fn test_visual_lines_empty() {
-        assert_eq!(visual_line_count("", 80, 0), 1);
+        assert_eq!(rows("", 80, 0), 1);
     }
 
     #[test]
     fn test_visual_lines_zero_width() {
-        assert_eq!(visual_line_count("hello", 0, 0), 1);
+        assert_eq!(rows("hello", 0, 0), 1);
     }
 
     #[test]
     fn test_visual_lines_with_indent() {
         // 20 columns of content at width 10: first row holds 10, remaining 10 needs
         // ceil(10 / (10-2)) = 2 continuation rows with indent 2 => 3 total.
-        assert_eq!(visual_line_count("12345678901234567890", 10, 2), 3);
+        assert_eq!(rows("12345678901234567890", 10, 2), 3);
         // indent >= width clamps to width-1 (=9 here), leaving 1 content column per
         // continuation row: first row holds 10, remaining 10 needs ceil(10/1) = 10 rows.
-        assert_eq!(visual_line_count("12345678901234567890", 10, 15), 11);
+        assert_eq!(rows("12345678901234567890", 10, 15), 11);
+    }
+
+    /// Word wrap is not the div_ceil estimate the scroll math used to rely on. Text with
+    /// spaces breaks at word boundaries, leaving ragged rows, so the real height exceeds
+    /// `ceil(width_in_columns / width)`. This is the divergence the whole row-accounting
+    /// rework exists to close, so pin it down rather than leaving it implicit.
+    #[test]
+    fn test_word_wrap_exceeds_div_ceil_estimate() {
+        // Three 6-column words at width 10. div_ceil sees 20 columns and says 2 rows; word
+        // wrap fits only one word per row (6 + 1 + 6 = 13 > 10), so it really needs 3.
+        let text = "aaaaaa bbbbbb cccccc";
+        let div_ceil_estimate = text.chars().count().div_ceil(10);
+        let real = rows(text, 10, 0);
+        assert_eq!(div_ceil_estimate, 2);
+        assert_eq!(real, 3);
+        assert!(
+            real > div_ceil_estimate,
+            "word wrap should need more rows than the div_ceil estimate: {} vs {}",
+            real,
+            div_ceil_estimate
+        );
     }
 
     // --- truncate_str ---

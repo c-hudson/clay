@@ -1,5 +1,12 @@
     use super::*;
 
+    /// Row-measuring context for tests: the console's own settings at `width`, F2 off.
+    /// The measurement helpers all take one now so a budget can never be computed with
+    /// different wrapping rules than the renderer draws with.
+    fn test_metrics(settings: &Settings, width: usize) -> crate::rendering::RowMetrics<'_> {
+        crate::rendering::RowMetrics::new(settings, false, width.max(1))
+    }
+
     #[test]
     fn test_insert_char_ascii() {
         let mut input = InputArea::new(3);
@@ -1641,7 +1648,7 @@
 
         // 100 short lines, each fits in one visual line
         let data: String = (1..=100).map(|i| format!("fffff{}\n", i)).collect();
-        world.add_output(&data, true, &settings, 24, 80, false, true);
+        world.add_output(&data, true, &settings, 24, 80, false, true, false);
 
         // max_lines = 24 - 2 = 22
         // After 22 visual lines, pause triggers on the 23rd line.
@@ -1702,7 +1709,7 @@
         let data: String = (1..=50).map(|i| {
             format!("{}LINE{:03}\n", "x".repeat(100), i)
         }).collect();
-        world.add_output(&data, true, &settings, 24, 80, false, true);
+        world.add_output(&data, true, &settings, 24, 80, false, true, false);
 
         // max_lines = 22. Each line is 107 chars → wraps to ceil(107/80)=2 visual lines.
         // Line 1: lines_since_pause(0) + 2 = 2, not > 22
@@ -1729,14 +1736,14 @@
         let max_lines = (output_height as usize) - 2; // 19
 
         // 2 short lines (1 visual line each)
-        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true);
-        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true, false);
+        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true, false);
         assert!(!world.paused, "Should not be paused after 2 short lines");
         assert_eq!(world.lines_since_pause, 2);
 
         // 1 huge line: 25 visual lines at width 80 (80*25 = 2000 visible chars)
         let huge_line = "A".repeat(80 * 25);
-        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true);
+        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true, false);
 
         // Should be paused
         assert!(world.paused, "Should be paused after huge line");
@@ -1760,12 +1767,12 @@
         let output_width: u16 = 80;
 
         // 2 short lines + 1 huge line (25 vl) + 5 pending lines
-        world.add_output("short one\n", true, &settings, output_height, output_width, false, true);
-        world.add_output("short two\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short one\n", true, &settings, output_height, output_width, false, true, false);
+        world.add_output("short two\n", true, &settings, output_height, output_width, false, true, false);
         let huge_line = "B".repeat(80 * 25);
         // The huge line + 5 more lines in one batch
         let batch = format!("{}\npending1\npending2\npending3\npending4\npending5\n", huge_line);
-        world.add_output(&batch, true, &settings, output_height, output_width, false, true);
+        world.add_output(&batch, true, &settings, output_height, output_width, false, true, false);
 
         assert!(world.paused);
         assert_eq!(world.output_lines.len(), 3, "3 lines in output (2 short + 1 huge)");
@@ -1775,7 +1782,7 @@
         // Simulate Tab: release_pending reveals more of the huge line first
         // Remaining vl of huge line: 25 - 17 = 8. Budget is 19.
         // 8 < 19, so partial clears and budget becomes 19 - 8 = 11 for pending.
-        world.release_pending(19 - 8, output_width as usize, false, 0);
+        world.release_pending(19 - 8, &test_metrics(&settings, output_width as usize));
         // visual_line_offset should be cleared by release_pending's scroll_to_bottom
         // (the App-level release_pending_screenful handles the VLO logic, but
         // at the World level, after release_pending, scroll_to_bottom clears it)
@@ -1790,10 +1797,10 @@
         let output_width: u16 = 80;
 
         // Set up a paused state with visual_line_offset
-        world.add_output("short\n", true, &settings, output_height, output_width, false, true);
-        world.add_output("short\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short\n", true, &settings, output_height, output_width, false, true, false);
+        world.add_output("short\n", true, &settings, output_height, output_width, false, true, false);
         let huge_line = "C".repeat(80 * 25);
-        world.add_output(&format!("{}\nextra\n", huge_line), true, &settings, output_height, output_width, false, true);
+        world.add_output(&format!("{}\nextra\n", huge_line), true, &settings, output_height, output_width, false, true, false);
 
         assert!(world.visual_line_offset > 0, "Should have visual_line_offset set");
 
@@ -1988,7 +1995,7 @@
         let settings = Settings::default();
 
         app.record_user_input(0, "north");
-        app.worlds[0].add_output("You go north.\n", true, &settings, 24, 80, false, true);
+        app.worlds[0].add_output("You go north.\n", true, &settings, 24, 80, false, true, false);
 
         let seqs: Vec<u64> = app.worlds[0].output_lines.iter().map(|l| l.seq).collect();
         for pair in seqs.windows(2) {
@@ -2015,14 +2022,14 @@
         let settings = Settings::default();
 
         // MUD prompt with no trailing newline.
-        app.worlds[0].add_output("prompt> ", true, &settings, 24, 80, false, true);
+        app.worlds[0].add_output("prompt> ", true, &settings, 24, 80, false, true, false);
         assert!(!app.worlds[0].partial_line.is_empty());
 
         // The player types a command while the prompt is still outstanding.
         app.record_user_input(0, "north");
 
         // The rest of the line (with a newline) arrives, completing the prompt.
-        app.worlds[0].add_output("rest of line\n", true, &settings, 24, 80, false, true);
+        app.worlds[0].add_output("rest of line\n", true, &settings, 24, 80, false, true, false);
 
         // The captured input line must still exist, untouched.
         let input_lines: Vec<&OutputLine> = app.worlds[0].output_lines.iter().filter(|l| l.is_input).collect();
@@ -2176,20 +2183,21 @@
         let settings = Settings { more_mode_enabled: true, ..Settings::default() };
 
         // Outstanding unterminated prompt: counted once as 1 visual row.
-        world.add_output("prompt> ", true, &settings, 24, 80, false, true);
+        world.add_output("prompt> ", true, &settings, 24, 80, false, true, false);
         assert_eq!(world.output_lines.len(), 1);
         assert_eq!(world.lines_since_pause, 1);
 
         // Complete it with enough text to wrap to multiple visual rows.
         let long = "x".repeat(400);
-        world.add_output(&format!("{}\n", long), true, &settings, 24, 80, false, true);
+        world.add_output(&format!("{}\n", long), true, &settings, 24, 80, false, true, false);
 
-        let expected = nli_visual_rows(
-            &format!("prompt> {}", long),
+        // Measured through the renderer's own path, the same one add_output now budgets with.
+        let expected = crate::rendering::display_rows(
+            &make_output_line(&format!("prompt> {}", long), false),
             80,
             false,
-            settings.new_line_indicator,
-            settings.wrapspace as usize,
+            &settings,
+            &CachedNow::new(),
         );
         assert!(expected > 1, "test line must actually wrap to be meaningful");
         assert_eq!(world.output_lines.len(), 1, "partial should complete in place, not append");
@@ -2205,13 +2213,13 @@
         let settings = Settings { more_mode_enabled: true, ..Settings::default() };
 
         // A whitespace-only partial is still counted as 1 visual row when added...
-        world.add_output("   ", true, &settings, 24, 80, false, true);
+        world.add_output("   ", true, &settings, 24, 80, false, true, false);
         assert_eq!(world.lines_since_pause, 1);
         let before = world.lines_since_pause;
 
         // ...but when completed it's visually empty and gets popped (filtered),
         // so the budget must be uncounted, not left stale.
-        world.add_output("\n", true, &settings, 24, 80, false, true);
+        world.add_output("\n", true, &settings, 24, 80, false, true, false);
         assert!(world.output_lines.is_empty(), "filtered line should be removed, not kept");
         assert_eq!(world.lines_since_pause, before - 1);
     }
@@ -2842,10 +2850,10 @@
         let output_height: u16 = 21;
         let output_width: u16 = 80;
 
-        world.add_output("short\n", true, &settings, output_height, output_width, false, true);
-        world.add_output("short\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short\n", true, &settings, output_height, output_width, false, true, false);
+        world.add_output("short\n", true, &settings, output_height, output_width, false, true, false);
         let huge_line = "D".repeat(80 * 25);
-        world.add_output(&format!("{}\nextra\n", huge_line), true, &settings, output_height, output_width, false, true);
+        world.add_output(&format!("{}\nextra\n", huge_line), true, &settings, output_height, output_width, false, true, false);
 
         let saved_vlo = world.visual_line_offset;
         assert!(saved_vlo > 0, "Should have visual_line_offset set");
@@ -2876,10 +2884,10 @@
         let output_width: u16 = 80;
         let max_lines = (output_height as usize) - 2; // 19
 
-        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true);
-        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true, false);
+        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true, false);
         let huge_line = "A".repeat(80 * 25); // 25 visual rows at width 80
-        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true);
+        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true, false);
 
         assert!(world.paused, "Should be paused after huge line");
         assert!(world.pending_lines.is_empty(), "Huge line goes to output, not pending");
@@ -2889,11 +2897,76 @@
         assert_eq!(world.visual_line_offset, max_lines - 2);
         let expected_hidden = 25 - world.visual_line_offset; // 8
 
-        assert_eq!(world.hidden_visual_rows(80, false, 0), expected_hidden);
+        assert_eq!(world.hidden_visual_rows(&test_metrics(&settings, 80)), expected_hidden);
         assert_eq!(
-            crate::rendering::more_indicator_count(&world, 80, false, 0),
+            crate::rendering::more_indicator_count(&world, &test_metrics(&Settings::default(), 80)),
             Some(expected_hidden),
             "More indicator must fire for VLO-only truncation even with no pending lines"
+        );
+    }
+
+    /// The "More NNNN" count must measure the held-back line the way the renderer draws it.
+    /// It used to measure the raw text at the plain terminal width, so every prefix the
+    /// renderer adds - the "✨ " client-line marker, the 🛢️ archive marker, the F2 timestamp -
+    /// was invisible to it. A line that those prefixes push onto an extra row then had that
+    /// row hidden with nothing in the count to say so.
+    #[test]
+    fn test_more_indicator_counts_prefix_widened_rows() {
+        let settings = Settings::default();
+        let width = 80usize;
+
+        // Exactly one full row of content at width 80. With the 3-column "✨ " prefix the
+        // renderer adds for a client-generated line, it needs two.
+        let text = "c".repeat(width);
+        let mut client_line = make_output_line(&text, false);
+        client_line.from_server = false;
+
+        let plain_rows = crate::rendering::display_rows(
+            &make_output_line(&text, false), width, false, &settings, &CachedNow::new());
+        let client_rows = crate::rendering::display_rows(
+            &client_line, width, false, &settings, &CachedNow::new());
+        assert_eq!(plain_rows, 1);
+        assert_eq!(client_rows, 2, "the ✨ prefix must push this line onto a second row");
+
+        let mut world = World::new("test");
+        world.output_lines.push(client_line);
+        world.scroll_offset = 0;
+        world.visual_line_offset = 1; // showing only the first row
+        world.paused = true;
+
+        assert_eq!(
+            world.hidden_visual_rows(&test_metrics(&settings, width)),
+            1,
+            "the row hidden by the ✨ prefix must be counted"
+        );
+        assert_eq!(
+            crate::rendering::more_indicator_count(&world, &test_metrics(&settings, width)),
+            Some(1),
+            "More must report the hidden prefix-widened row"
+        );
+    }
+
+    /// Same gap, via F2: showing tags prepends a timestamp, which can also push a line onto
+    /// another row. The count has to follow the toggle.
+    #[test]
+    fn test_more_indicator_follows_show_tags() {
+        let settings = Settings::default();
+        let width = 80usize;
+        let text = "t".repeat(width);
+
+        let mut world = World::new("test");
+        world.output_lines.push(make_output_line(&text, false));
+        world.scroll_offset = 0;
+        world.visual_line_offset = 1;
+        world.paused = true;
+
+        let tags_off = crate::rendering::RowMetrics::new(&settings, false, width);
+        let tags_on = crate::rendering::RowMetrics::new(&settings, true, width);
+
+        assert_eq!(world.hidden_visual_rows(&tags_off), 0, "one row, nothing hidden");
+        assert!(
+            world.hidden_visual_rows(&tags_on) > 0,
+            "with F2 on the timestamp prefix wraps this line, so a row is hidden"
         );
     }
 
@@ -2906,19 +2979,19 @@
         let output_height: u16 = 21;
         let output_width: u16 = 80;
 
-        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true);
-        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true, false);
+        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true, false);
         let huge_line = "A".repeat(80 * 25);
-        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true);
-        let hidden = world.hidden_visual_rows(80, false, 0);
+        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true, false);
+        let hidden = world.hidden_visual_rows(&test_metrics(&settings, 80));
 
         // Five more short (one-row) lines while paused with empty pending -> goes_to_pending.
         let more = "extra1\nextra2\nextra3\nextra4\nextra5\n";
-        world.add_output(more, true, &settings, output_height, output_width, false, true);
+        world.add_output(more, true, &settings, output_height, output_width, false, true, false);
 
         assert_eq!(world.pending_lines.len(), 5);
         assert_eq!(
-            crate::rendering::more_indicator_count(&world, 80, false, 0),
+            crate::rendering::more_indicator_count(&world, &test_metrics(&Settings::default(), 80)),
             Some(5 + hidden)
         );
 
@@ -2934,6 +3007,7 @@
             output_width,
             false,
             true,
+            false,
         );
         plain_world.paused = true;
         plain_world.pending_lines.clear();
@@ -2942,7 +3016,7 @@
         }
         assert_eq!(plain_world.visual_line_offset, 0);
         assert_eq!(
-            crate::rendering::more_indicator_count(&plain_world, 80, false, 0),
+            crate::rendering::more_indicator_count(&plain_world, &test_metrics(&plain_settings, 80)),
             Some(plain_world.pending_lines.len())
         );
     }
@@ -2955,10 +3029,10 @@
         let output_height: u16 = 21;
         let output_width: u16 = 80;
 
-        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true);
-        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true);
+        world.add_output("short line one\n", true, &settings, output_height, output_width, false, true, false);
+        world.add_output("short line two\n", true, &settings, output_height, output_width, false, true, false);
         let huge_line = "A".repeat(80 * 25);
-        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true);
+        world.add_output(&format!("{}\n", huge_line), true, &settings, output_height, output_width, false, true, false);
 
         assert!(world.paused);
         assert!(world.pending_lines.is_empty());
@@ -2978,7 +3052,7 @@
         assert!(!world.paused, "Stale pause should be cleared with nothing held back");
         assert_eq!(world.lines_since_pause, 0, "lines_since_pause should be reset with paused");
         assert_eq!(
-            crate::rendering::more_indicator_count(&world, 80, false, 0),
+            crate::rendering::more_indicator_count(&world, &test_metrics(&Settings::default(), 80)),
             None,
             "No indicator should remain once fully unpaused with nothing hidden/pending"
         );
@@ -2998,7 +3072,7 @@
         assert_eq!(world.visual_line_offset, 0, "VLO should still be reset");
         assert!(world.paused, "Should remain paused while pending_lines is non-empty");
         assert_eq!(
-            crate::rendering::more_indicator_count(&world, 80, false, 0),
+            crate::rendering::more_indicator_count(&world, &test_metrics(&Settings::default(), 80)),
             Some(world.pending_lines.len()),
             "Indicator should report the pending backlog"
         );
@@ -3118,15 +3192,15 @@
         assert!(chunk3.ends_with('\n'), "chunk3 should end with newline");
 
         // Process each chunk separately (simulating TCP reads)
-        world.add_output(chunk1, true, &settings, 48, 80, false, true);
+        world.add_output(chunk1, true, &settings, 48, 80, false, true, false);
         assert_eq!(world.output_lines.len(), 1, "Chunk 1: should have 1 output line (partial)");
         assert!(!world.partial_line.is_empty(), "Chunk 1: partial_line should be set");
 
-        world.add_output(chunk2, true, &settings, 48, 80, false, true);
+        world.add_output(chunk2, true, &settings, 48, 80, false, true, false);
         assert_eq!(world.output_lines.len(), 1, "Chunk 2: should STILL have 1 output line (updated partial)");
         assert!(!world.partial_line.is_empty(), "Chunk 2: partial_line should STILL be set (not lost)");
 
-        world.add_output(chunk3, true, &settings, 48, 80, false, true);
+        world.add_output(chunk3, true, &settings, 48, 80, false, true, false);
         assert_eq!(world.output_lines.len(), 1, "Chunk 3: should STILL have 1 output line (completed)");
         assert!(world.partial_line.is_empty(), "Chunk 3: partial_line should be empty (line complete)");
         assert_eq!(world.pending_lines.len(), 0, "Should have 0 pending lines (just 1 logical line)");
@@ -3153,7 +3227,7 @@
             let start = i * chunk_size;
             let end = if i == 19 { bytes.len() } else { (i + 1) * chunk_size };
             let chunk = std::str::from_utf8(&bytes[start..end]).unwrap();
-            world.add_output(chunk, true, &settings, 48, 80, false, true);
+            world.add_output(chunk, true, &settings, 48, 80, false, true, false);
         }
 
         // Should be exactly 1 logical line, not 10+ fragmented lines
@@ -3176,7 +3250,7 @@
             let data: String = (1..=100).map(|i| {
                 format!("fffff{}\n", chunk * 100 + i)
             }).collect();
-            world.add_output(&data, true, &settings, 48, 80, false, true);
+            world.add_output(&data, true, &settings, 48, 80, false, true, false);
         }
 
         // max_lines = 46. After 46+1=47 lines, pause triggers.
@@ -3200,7 +3274,7 @@
         let data: String = (1..=1000).map(|i| {
             format!("fffff{}\n", i)
         }).collect();
-        world.add_output(&data, true, &settings, 48, 80, false, true);
+        world.add_output(&data, true, &settings, 48, 80, false, true, false);
 
         assert!(world.paused, "Should be paused after 1000 lines");
         assert_eq!(world.output_lines.len(), 47,
@@ -3224,7 +3298,7 @@
         // Chunk 1: lines 0-22 (23 lines). Line 22 triggers pause (lsp=22, 22+1=23>22).
         // This is the LAST line of the chunk, so pending is empty after the trigger.
         let chunk1: String = all_lines[0..23].concat();
-        world.add_output(&chunk1, true, &settings, 24, 80, false, true);
+        world.add_output(&chunk1, true, &settings, 24, 80, false, true, false);
 
         // After chunk 1: should have 23 output lines and be paused.
         // The key assertion: paused must remain true even though pending is empty.
@@ -3233,7 +3307,7 @@
 
         // Chunk 2: lines 23-99 (77 lines). Already paused, all should go to pending.
         let chunk2: String = all_lines[23..100].concat();
-        world.add_output(&chunk2, true, &settings, 24, 80, false, true);
+        world.add_output(&chunk2, true, &settings, 24, 80, false, true, false);
 
         assert!(world.paused, "Should still be paused after chunk 2");
         assert_eq!(world.output_lines.len(), 23,
@@ -3243,7 +3317,7 @@
 
         // Chunk 3: lines 100-199 (100 lines). Still paused, all go to pending.
         let chunk3: String = all_lines[100..200].concat();
-        world.add_output(&chunk3, true, &settings, 24, 80, false, true);
+        world.add_output(&chunk3, true, &settings, 24, 80, false, true, false);
 
         assert!(world.paused, "Should still be paused after chunk 3");
         assert_eq!(world.output_lines.len(), 23,
@@ -3262,7 +3336,7 @@
         // Create 10 long lines, each ~500 chars (7 visual lines each at width 80)
         let long_word = "x".repeat(500);
         let data: String = (0..10).map(|_| format!("{}\n", long_word)).collect();
-        world.add_output(&data, true, &settings, 48, 80, false, true);
+        world.add_output(&data, true, &settings, 48, 80, false, true, false);
 
         // max_lines = 46. Each line = 7 visual lines.
         // Lines 1-6: 42 visual lines (< 46), go to output
@@ -3279,7 +3353,7 @@
         // Each pending line is 7 visual lines. Budget=46 fits 6 lines (42 visual) or 7 lines (49 visual).
         // Since 42+7=49 > 46, it should stop at 6 lines (the 7th would exceed budget).
         let pending_before = world.pending_lines.len();
-        world.release_pending(46, 80, false, 0);
+        world.release_pending(46, &test_metrics(&settings, 80));
         let released = pending_before - world.pending_lines.len();
 
         // Should release 6 lines (42 visual lines fits in 46 budget, 49 would exceed)
@@ -3299,7 +3373,7 @@
         // wrap_ansi_line produces ceil(10000/80) = 125 visual lines
         // The whole line goes to output_lines as one logical entry, and pause triggers
         let long_line = "x".repeat(10000) + "\n";
-        world.add_output(&long_line, true, &settings, 48, 80, false, true);
+        world.add_output(&long_line, true, &settings, 48, 80, false, true, false);
 
         // Should be paused - the line exceeds max_lines worth of visual lines
         assert!(world.paused, "Should be paused");
@@ -3317,11 +3391,11 @@
         // Add 3 short lines to trigger more-mode, then add long lines to pending
         // First fill output to near max_lines
         let short_data: String = (0..45).map(|i| format!("short line {}\n", i)).collect();
-        world.add_output(&short_data, true, &settings, 48, 80, false, true);
+        world.add_output(&short_data, true, &settings, 48, 80, false, true, false);
 
         // Now add mixed content: 1 short line, then 1 very long line, then 1 short line
         let mixed: String = format!("short\n{}\nafter\n", "x".repeat(500));
-        world.add_output(&mixed, true, &settings, 48, 80, false, true);
+        world.add_output(&mixed, true, &settings, 48, 80, false, true, false);
 
         assert!(world.paused, "Should be paused");
         let pending = world.pending_lines.len();
@@ -3332,7 +3406,7 @@
         // 500-char line = ceil(500/80) = 7 visual lines
         // "after" = 1 visual line
         // total = 9 visual lines < 46, so all should be released
-        world.release_pending(46, 80, false, 0);
+        world.release_pending(46, &test_metrics(&settings, 80));
         assert_eq!(world.pending_lines.len(), 0,
             "All {} pending lines should fit in visual budget of 46", pending);
     }
@@ -4944,6 +5018,449 @@
         // Last line should be "New 100"
         assert!(display.last().unwrap().text.contains("New 100"),
             "Last line should be 'New 100', got: {:?}", display.last().unwrap().text);
+    }
+
+    // ------------------------------------------------------------------
+    // Row accounting: contiguity and row-exact paging
+    //
+    // Two defects lived here. (1) The NLI "old context" splice pinned 2 rows at the top and
+    // jumped to the newest tail, discarding rows out of the *middle*, and fired on any buffer
+    // whose row total landed in (H, H+2] - including all-old buffers, where it had no new text
+    // to give context to. (2) Page Up budgeted rows with a div_ceil estimate at full terminal
+    // width while the renderer word-wraps at a prefix-reduced width, so it under-counted long
+    // lines and scrolled past rows that were on screen.
+    // ------------------------------------------------------------------
+
+    /// Every row the world would produce if nothing were clipped, in order. The displayed
+    /// rows must always be a contiguous run of this.
+    fn all_display_rows(world: &World, settings: &Settings, width: usize, show_tags: bool) -> Vec<String> {
+        let now = CachedNow::new();
+        world
+            .output_lines
+            .iter()
+            .flat_map(|l| {
+                let rows = crate::rendering::display_wrapped(l, width, show_tags, settings, &now);
+                if rows.len() == 1 && rows[0].is_empty() {
+                    vec![String::new()]
+                } else {
+                    rows
+                }
+            })
+            .collect()
+    }
+
+    fn displayed_text(world: &World, settings: &Settings, height: usize, width: usize) -> Vec<String> {
+        build_display_lines(world, settings, height, width, false)
+            .into_iter()
+            .map(|d| d.text)
+            .collect()
+    }
+
+    /// Index into `all` where the displayed window starts. Panics if `shown` is not an
+    /// unbroken run of `all` - i.e. if any row was dropped out of the middle of the screen.
+    fn window_start(shown: &[String], all: &[String], ctx: &str) -> usize {
+        assert!(!shown.is_empty(), "{ctx}: nothing displayed");
+        all.windows(shown.len())
+            .position(|w| w == shown)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{ctx}: displayed rows are not a contiguous run of the buffer.\nshown: {:#?}\nall: {:#?}",
+                    shown, all
+                )
+            })
+    }
+
+    fn assert_contiguous(shown: &[String], all: &[String], ctx: &str) {
+        window_start(shown, all, ctx);
+    }
+
+    /// The reported bug: reading an all-old buffer whose row total lands in the two-wide band
+    /// just above the screen height. The splice used to fire anyway - `old_prefix` covered the
+    /// whole vector, so `context` was 2 unconditionally - and silently ate the rows between
+    /// the pinned pair and the tail. On screen that read as "the first two lines are there,
+    /// then a couple are missing, and the next paragraph starts mid-sentence".
+    #[test]
+    fn test_build_display_all_old_buffer_is_contiguous_at_band_edges() {
+        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let height = 21usize;
+        let width = 80usize;
+
+        // A line that wraps to exactly 3 rows at width 80, so the backward walk can overshoot
+        // the screen height by 1 or 2 and land inside the band.
+        let tall = "T".repeat(200);
+
+        for filler_rows in [19usize, 20] {
+            let mut world = World::new("test");
+            for i in 0..10 {
+                world.output_lines.push(make_output_line(&format!("Context {}", i), false));
+            }
+            world.output_lines.push(make_output_line(&tall, false));
+            for i in 0..filler_rows {
+                world.output_lines.push(make_output_line(&format!("Line {}", i), false));
+            }
+            world.scroll_offset = world.output_lines.len() - 1;
+
+            let all = all_display_rows(&world, &settings, width, false);
+            let shown = displayed_text(&world, &settings, height, width);
+
+            assert_eq!(shown.len(), height, "filler_rows={filler_rows}: wrong row count");
+            assert_contiguous(&shown, &all, &format!("filler_rows={filler_rows}"));
+            // A bottom-anchored viewport ends on the newest row.
+            assert_eq!(shown.last(), all.last(), "filler_rows={filler_rows}: not bottom-anchored");
+        }
+    }
+
+    /// Scrollback is all-old by construction, so the splice must never engage there either -
+    /// including when the anchor sits mid-paragraph, which row-exact paging now produces.
+    #[test]
+    fn test_build_display_scrollback_is_contiguous() {
+        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let height = 21usize;
+        let width = 80usize;
+
+        let mut world = World::new("test");
+        for i in 0..15 {
+            world.output_lines.push(make_output_line(&format!("Before {}", i), false));
+        }
+        world.output_lines.push(make_output_line(&"P".repeat(600), false)); // ~8 rows
+        for i in 0..15 {
+            world.output_lines.push(make_output_line(&format!("After {}", i), false));
+        }
+
+        let all = all_display_rows(&world, &settings, width, false);
+        let para_idx = 15;
+
+        for vlo in 0..6 {
+            world.scroll_offset = para_idx;
+            world.visual_line_offset = vlo;
+            let shown = displayed_text(&world, &settings, height, width);
+            assert_contiguous(&shown, &all, &format!("scrollback vlo={vlo}"));
+        }
+    }
+
+    /// The composition itself still works where it was meant to: new text filling the screen
+    /// keeps two old rows pinned above it.
+    #[test]
+    fn test_build_display_composition_still_pins_old_context() {
+        let settings = Settings { new_line_indicator: true, ..Settings::default() };
+        let height = 21usize;
+
+        let mut world = World::new("test");
+        world.output_lines.push(make_output_line("Old 1", false));
+        world.output_lines.push(make_output_line("Old 2", false));
+        for i in 0..21 {
+            world.output_lines.push(make_output_line(&format!("New {}", i + 1), true));
+        }
+        world.scroll_offset = world.output_lines.len() - 1;
+
+        let display = build_display_lines(&world, &settings, height, 80, false);
+        assert_eq!(display.len(), height);
+        assert!(display[0].text.contains("Old 1"), "got {:?}", display[0].text);
+        assert!(display[1].text.contains("Old 2"), "got {:?}", display[1].text);
+        assert!(display[2].marked_new, "row 3 should be new text");
+        assert!(display.last().unwrap().text.contains("New 21"));
+    }
+
+    /// A buffer with no new-marked rows at all must never compose, whatever its row total.
+    #[test]
+    fn test_visible_row_ranges_never_splices_an_all_old_buffer() {
+        for row_count in 22..=23usize {
+            let (head, tail) = crate::rendering::visible_row_ranges(row_count, 21, 2, row_count);
+            assert!(tail.is_none(), "row_count={row_count}: spliced an all-old buffer");
+            assert_eq!(head, row_count - 21..row_count);
+        }
+    }
+
+    /// ...but it still composes when there is new text and bottom-anchoring would lose the
+    /// old context entirely.
+    #[test]
+    fn test_visible_row_ranges_composes_for_new_text() {
+        let (head, tail) = crate::rendering::visible_row_ranges(23, 21, 2, 2);
+        assert_eq!(head, 0..2);
+        assert_eq!(tail, Some(4..23));
+    }
+
+    // --- Row-exact Page Up / Page Down ---
+
+    fn app_with_lines(lines: Vec<OutputLine>, height: u16, width: u16, nli: bool, wrapspace: u8) -> App {
+        let mut app = App::new();
+        app.output_height = height;
+        app.output_width = width;
+        app.settings.new_line_indicator = nli;
+        app.settings.wrapspace = wrapspace;
+        app.settings.more_mode_enabled = false;
+        if app.worlds.is_empty() {
+            app.worlds.push(World::new("test"));
+        }
+        app.current_world_index = 0;
+        app.worlds[0].showing_splash = false;
+        app.worlds[0].output_lines = lines;
+        app.worlds[0].scroll_offset = app.worlds[0].output_lines.len().saturating_sub(1);
+        app.worlds[0].visual_line_offset = 0;
+        app
+    }
+
+    fn app_rows(app: &App) -> Vec<String> {
+        displayed_text(
+            &app.worlds[0],
+            &app.settings,
+            app.output_height as usize,
+            app.output_width as usize,
+        )
+    }
+
+    /// A buffer with a paragraph far taller than the screen, which is what broke paging:
+    /// a line-granular anchor has to jump the whole paragraph at once.
+    fn chatter_with_long_paragraph() -> Vec<OutputLine> {
+        let long = "<Public> Great Britain Jacobis says, \"It was evident in fact. The pressures \
+of the war had the most impact on their economies really, without significant opposition they \
+could have blitzed Europe and perhaps had some decades of a decreasingly functioning society \
+before the internal pressures tore it apart, much like we're seeing with Western societies now. \
+The EU was, after all, the Nazi plan for Europe merely implemented by the post-war European \
+powers. It has all the systemic issues of fascism, combined with a neoliberal belief in the \
+possibility of regulating away every societal ill, so lack of democratic accountability and a \
+proliferation of regulation which treats everything innovative as a worst-case maximal harm \
+producing phenomenon has meant that innovation and technological industrial growth in Europe is \
+stymied, corruption is rife, borders are uncontrolled, and who knows what's next.\"";
+
+        let mut lines = Vec::new();
+        // Deep enough that several full pages fit above the paragraph at every width the
+        // tests exercise, so the top-of-buffer clamp isn't what they end up measuring.
+        for i in 0..200 {
+            lines.push(make_output_line(&format!("<Public> Filler line number {}", i), false));
+        }
+        lines.push(make_output_line(
+            "<Public> ChatBot says, \"I agree the fascist regimes' internal issues stayed masked by their wartime loss.\"",
+            false,
+        ));
+        lines.push(make_output_line(long, false));
+        for i in 0..10 {
+            lines.push(make_output_line(&format!("<Public> Adrick says, \"reply {}\"", i), false));
+        }
+        lines
+    }
+
+    /// Page Up keeps exactly the top two rows of the outgoing screen, as the bottom two rows
+    /// of the new one - even when the boundary falls inside a paragraph taller than the
+    /// screen. The old line-granular anchor could not express that position at all.
+    #[test]
+    fn test_page_up_keeps_top_two_rows_as_new_bottom_two() {
+        for &(width, height) in &[(40u16, 24u16), (80, 24), (80, 12), (120, 30)] {
+            for &nli in &[false, true] {
+                for &wrapspace in &[0u8, 4] {
+                    let mut app = app_with_lines(
+                        chatter_with_long_paragraph(),
+                        height,
+                        width,
+                        nli,
+                        wrapspace,
+                    );
+                    let ctx = format!("w={width} h={height} nli={nli} ws={wrapspace}");
+                    let all = all_display_rows(&app.worlds[0], &app.settings, width as usize, false);
+                    let page = app.page_step();
+
+                    for step in 0..6 {
+                        let before = app_rows(&app);
+                        assert_eq!(before.len(), height as usize, "{ctx} step {step}: short screen");
+                        let pos_before = window_start(&before, &all, &format!("{ctx} step {step} before"));
+                        let top_two = before[..2].to_vec();
+
+                        if !app.scroll_output_up_rows(page) {
+                            break;
+                        }
+
+                        let after = app_rows(&app);
+                        assert_eq!(after.len(), height as usize, "{ctx} step {step}: short screen after");
+                        let pos_after = window_start(&after, &all, &format!("{ctx} step {step} after"));
+
+                        if pos_before - pos_after == page {
+                            // A full page: the outgoing top two rows are now the bottom two.
+                            assert_eq!(
+                                &after[after.len() - 2..],
+                                &top_two[..],
+                                "{ctx} step {step}: lost the two-row overlap"
+                            );
+                        } else {
+                            // A short move is only legitimate as the top-of-buffer clamp.
+                            assert_eq!(
+                                pos_after, 0,
+                                "{ctx} step {step}: moved {} rows instead of {page} without \
+                                 reaching the top of the buffer",
+                                pos_before - pos_after
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nothing is ever skipped: the screen after a Page Up is always a contiguous run of the
+    /// buffer's rows, and it always overlaps the screen before it.
+    #[test]
+    fn test_page_up_never_skips_rows() {
+        let mut app = app_with_lines(chatter_with_long_paragraph(), 24, 80, true, 0);
+        let all = all_display_rows(&app.worlds[0], &app.settings, 80, false);
+
+        for step in 0..8 {
+            let shown = app_rows(&app);
+            assert_contiguous(&shown, &all, &format!("page up step {step}"));
+            if !app.scroll_output_up_rows(app.page_step()) {
+                break;
+            }
+        }
+    }
+
+    /// Page Up then Page Down returns to exactly the screen you started on.
+    #[test]
+    fn test_page_up_down_round_trip() {
+        for &(width, height) in &[(40u16, 24u16), (80, 24), (120, 16)] {
+            let mut app = app_with_lines(chatter_with_long_paragraph(), height, width, true, 0);
+            let ctx = format!("w={width} h={height}");
+            let all = all_display_rows(&app.worlds[0], &app.settings, width as usize, false);
+            let page = app.page_step();
+
+            // Move off the bottom first so the round trip isn't trivially clamped.
+            app.scroll_output_up_rows(page);
+            let start = app_rows(&app);
+            let start_pos = window_start(&start, &all, &ctx);
+            let start_anchor = (app.worlds[0].scroll_offset, app.worlds[0].visual_line_offset);
+
+            app.scroll_output_up_rows(page);
+            let up = app_rows(&app);
+            let up_pos = window_start(&up, &all, &ctx);
+            assert_ne!(up, start, "{ctx}: page up did not move");
+            // Only a full, unclamped page can round-trip back to the same screen.
+            assert_eq!(start_pos - up_pos, page, "{ctx}: page up was clamped, widen the fixture");
+
+            app.move_viewport_down(page);
+            assert_eq!(app_rows(&app), start, "{ctx}: round trip changed the screen");
+            assert_eq!(
+                (app.worlds[0].scroll_offset, app.worlds[0].visual_line_offset),
+                start_anchor,
+                "{ctx}: round trip changed the anchor"
+            );
+        }
+    }
+
+    /// Paging down from anywhere lands back at the newest row, with the anchor normalized so
+    /// `is_at_bottom()` reports following-live-output again.
+    #[test]
+    fn test_page_down_reaches_and_normalizes_the_bottom() {
+        let mut app = app_with_lines(chatter_with_long_paragraph(), 24, 80, true, 0);
+        for _ in 0..5 {
+            app.scroll_output_up_rows(app.page_step());
+        }
+        assert!(!app.worlds[0].is_at_bottom() || app.worlds[0].visual_line_offset > 0);
+
+        for _ in 0..20 {
+            app.move_viewport_down(app.page_step());
+        }
+        assert!(app.worlds[0].is_at_bottom(), "did not reach the bottom");
+        assert_eq!(
+            app.worlds[0].visual_line_offset, 0,
+            "visual_line_offset must normalize to 0 at the bottom, or the renderer's \
+             `wrapped.len() > visual_line_offset` guard truncates some earlier line instead"
+        );
+
+        let all = all_display_rows(&app.worlds[0], &app.settings, 80, false);
+        let shown = app_rows(&app);
+        assert_eq!(shown.last(), all.last());
+    }
+
+    /// Scrolling up stops at the oldest row rather than running off the top.
+    #[test]
+    fn test_page_up_clamps_at_top_of_buffer() {
+        let mut app = app_with_lines(chatter_with_long_paragraph(), 24, 80, true, 0);
+        for _ in 0..200 {
+            if !app.scroll_output_up_rows(app.page_step()) {
+                break;
+            }
+        }
+        let all = all_display_rows(&app.worlds[0], &app.settings, 80, false);
+        let shown = app_rows(&app);
+        assert_eq!(shown.len(), 24);
+        assert_eq!(&shown[..], &all[..24], "top of buffer should be the first rows");
+        assert!(!app.scroll_output_up_rows(app.page_step()), "should be clamped");
+    }
+
+    /// The row counter used for budgeting and the rows the renderer emits must agree exactly -
+    /// including for archive lines (🛢️ prefix), ▶-marked lines, gagged lines, and F2 timestamps.
+    #[test]
+    fn test_display_rows_matches_rendered_rows() {
+        let now = CachedNow::new();
+        let long = "word ".repeat(60);
+
+        let mut archive = make_output_line(&long, false);
+        archive.from_archive = true;
+        let mut gagged = make_output_line("gagged text", false);
+        gagged.gagged = true;
+        let mut client = make_output_line(&long, false);
+        client.from_server = false;
+
+        let lines = vec![
+            make_output_line("short", false),
+            make_output_line(&long, false),
+            make_output_line(&long, true),
+            archive,
+            gagged,
+            client,
+            make_output_line("", false),
+        ];
+
+        for &show_tags in &[false, true] {
+            for &nli in &[false, true] {
+                for &width in &[20usize, 40, 80] {
+                    let settings = Settings {
+                        new_line_indicator: nli,
+                        wrapspace: 2,
+                        ..Settings::default()
+                    };
+                    for line in &lines {
+                        let rendered =
+                            crate::rendering::display_wrapped(line, width, show_tags, &settings, &now);
+                        let counted =
+                            crate::rendering::display_rows(line, width, show_tags, &settings, &now);
+                        assert_eq!(
+                            counted,
+                            rendered.len(),
+                            "w={width} tags={show_tags} nli={nli} text={:?}",
+                            &line.text[..line.text.len().min(30)]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scrolling up mid-paragraph in more-mode and then releasing a screenful must not skip or
+    /// repeat a row: `visual_line_offset` is both the scroll anchor and more-mode's
+    /// partial-reveal marker, so the release budget has to measure the same way.
+    #[test]
+    fn test_more_mode_release_after_mid_paragraph_scroll() {
+        let mut app = app_with_lines(chatter_with_long_paragraph(), 24, 80, true, 0);
+        app.settings.more_mode_enabled = true;
+        for i in 0..30 {
+            app.worlds[0]
+                .pending_lines
+                .push(make_output_line(&format!("<Public> pending {}", i), true));
+        }
+        app.worlds[0].paused = true;
+
+        // Land mid-paragraph.
+        app.scroll_output_up_rows(app.page_step());
+        app.scroll_output_up_rows(3);
+
+        let all = all_display_rows(&app.worlds[0], &app.settings, 80, false);
+        let shown = app_rows(&app);
+        assert_contiguous(&shown, &all, "after mid-paragraph scroll");
+
+        // Release a screenful; the viewport must still show a contiguous run.
+        app.release_pending_screenful();
+        let all_after = all_display_rows(&app.worlds[0], &app.settings, 80, false);
+        let shown_after = app_rows(&app);
+        assert_contiguous(&shown_after, &all_after, "after release_pending_screenful");
     }
 
     /// Test D: No NLI = simple bottom anchoring
@@ -7507,7 +8024,7 @@ if you're more curious.\"";
         let settings = Settings { more_mode_enabled: true, ..Settings::default() };
         world.paused = true; // already paused: new output goes straight to pending_lines
 
-        world.add_output("held back line\n", true /* is_current */, &settings, 24, 80, false, true);
+        world.add_output("held back line\n", true /* is_current */, &settings, 24, 80, false, true, false);
 
         assert_eq!(world.pending_lines.len(), 1);
         assert!(world.pending_lines[0].viewed,
@@ -7527,7 +8044,7 @@ if you're more curious.\"";
         let mut world = World::new("test");
         let settings = Settings { more_mode_enabled: true, ..Settings::default() };
 
-        world.add_output("visible line\n", true /* is_current */, &settings, 24, 80, false, true);
+        world.add_output("visible line\n", true /* is_current */, &settings, 24, 80, false, true, false);
 
         assert_eq!(world.output_lines.len(), 1);
         assert!(world.output_lines[0].viewed, "born viewed - somebody was watching");
@@ -7592,8 +8109,8 @@ if you're more curious.\"";
         let settings = Settings::default();
 
         // Backlog: arrived with nobody viewing -> claimable.
-        world.add_output("backlog 1\n", false, &settings, 24, 80, false, true);
-        world.add_output("backlog 2\n", false, &settings, 24, 80, false, true);
+        world.add_output("backlog 1\n", false, &settings, 24, 80, false, true, false);
+        world.add_output("backlog 2\n", false, &settings, 24, 80, false, true, false);
         assert!(world.output_lines.iter().all(|l| !l.viewed), "precondition: arrived unviewed");
 
         // The user switches in and displays the world: the backlog becomes theirs.
@@ -7601,8 +8118,8 @@ if you're more curious.\"";
         assert!(world.output_lines.iter().all(|l| l.display_id == Some(crate::CONSOLE_DISPLAY_ID)));
 
         // Now live output arrives while they are still sitting there. No display event.
-        world.add_output("live 1\n", true, &settings, 24, 80, false, true);
-        world.add_output("live 2\n", true, &settings, 24, 80, false, true);
+        world.add_output("live 1\n", true, &settings, 24, 80, false, true, false);
+        world.add_output("live 2\n", true, &settings, 24, 80, false, true, false);
 
         let flags: Vec<bool> = world.output_lines.iter()
             .map(|l| l.display_id == Some(crate::CONSOLE_DISPLAY_ID)).collect();
@@ -7625,8 +8142,8 @@ if you're more curious.\"";
         let mut world = World::new("test");
         let settings = Settings::default();
 
-        world.add_output("watched\n", true, &settings, 24, 80, false, true);
-        world.add_output("unwatched\n", false, &settings, 24, 80, false, true);
+        world.add_output("watched\n", true, &settings, 24, 80, false, true, false);
+        world.add_output("unwatched\n", false, &settings, 24, 80, false, true, false);
 
         world.claim_unviewed(crate::CONSOLE_DISPLAY_ID);
 
@@ -7643,9 +8160,9 @@ if you're more curious.\"";
         let mut world = World::new("test");
         let settings = Settings::default();
 
-        world.add_output("backlog\n", false, &settings, 24, 80, false, true);
-        world.add_output("watched\n", true, &settings, 24, 80, false, true);
-        world.add_output("client note\n", false, &settings, 24, 80, false, false /* from_server */);
+        world.add_output("backlog\n", false, &settings, 24, 80, false, true, false);
+        world.add_output("watched\n", true, &settings, 24, 80, false, true, false);
+        world.add_output("client note\n", false, &settings, 24, 80, false, false /* from_server */, false);
 
         world.claim_unviewed(crate::CONSOLE_DISPLAY_ID);
 
@@ -7913,7 +8430,7 @@ if you're more curious.\"";
     fn push_server_line(app: &mut App, world_idx: usize, text: &str) {
         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
         let settings = app.settings.clone();
-        app.worlds[world_idx].add_output(&format!("{text}\n"), is_current, &settings, 24, 80, false, true);
+        app.worlds[world_idx].add_output(&format!("{text}\n"), is_current, &settings, 24, 80, false, true, false);
     }
 
     /// The four arrival/claim rules, as a table.
@@ -7923,26 +8440,26 @@ if you're more curious.\"";
 
         // Row 1: arrives on a world nobody is viewing -> unviewed, unowned.
         let mut w = World::new("t");
-        w.add_output("a\n", false, &settings, 24, 80, false, true);
+        w.add_output("a\n", false, &settings, 24, 80, false, true, false);
         assert!(!w.output_lines[0].viewed);
         assert_eq!(w.output_lines[0].display_id, None);
 
         // Row 2: arrives on a world somebody IS viewing -> viewed, still unowned.
         let mut w = World::new("t");
-        w.add_output("a\n", true, &settings, 24, 80, false, true);
+        w.add_output("a\n", true, &settings, 24, 80, false, true, false);
         assert!(w.output_lines[0].viewed);
         assert_eq!(w.output_lines[0].display_id, None);
 
         // Row 3: a client displays an unviewed line -> viewed, owned by that client.
         let mut w = World::new("t");
-        w.add_output("a\n", false, &settings, 24, 80, false, true);
+        w.add_output("a\n", false, &settings, 24, 80, false, true, false);
         assert_eq!(w.claim_unviewed(42), vec![0]);
         assert!(w.output_lines[0].viewed);
         assert_eq!(w.output_lines[0].display_id, Some(42));
 
         // Row 4: a client displays an already-viewed line -> nothing happens.
         let mut w = World::new("t");
-        w.add_output("a\n", true, &settings, 24, 80, false, true);
+        w.add_output("a\n", true, &settings, 24, 80, false, true, false);
         assert!(w.claim_unviewed(42).is_empty());
         assert_eq!(w.output_lines[0].display_id, None,
             "a line that arrived while somebody was watching is permanently un-new");
@@ -7955,7 +8472,7 @@ if you're more curious.\"";
     fn test_second_viewer_neither_steals_nor_clears_the_first_viewers_marker() {
         let settings = Settings::default();
         let mut w = World::new("t");
-        w.add_output("backlog\n", false, &settings, 24, 80, false, true);
+        w.add_output("backlog\n", false, &settings, 24, 80, false, true, false);
 
         // Client 1 looks first and takes the marker.
         assert_eq!(w.claim_unviewed(1), vec![0]);
@@ -7986,9 +8503,9 @@ if you're more curious.\"";
     fn test_claim_sweeps_unviewed_lines_behind_a_viewed_one() {
         let settings = Settings::default();
         let mut w = World::new("t");
-        w.add_output("unwatched 1\n", false, &settings, 24, 80, false, true);
-        w.add_output("watched\n", true, &settings, 24, 80, false, true);
-        w.add_output("unwatched 2\n", false, &settings, 24, 80, false, true);
+        w.add_output("unwatched 1\n", false, &settings, 24, 80, false, true, false);
+        w.add_output("watched\n", true, &settings, 24, 80, false, true, false);
+        w.add_output("unwatched 2\n", false, &settings, 24, 80, false, true, false);
 
         let claimed = w.claim_unviewed(9);
         assert_eq!(claimed, vec![0, 2],
@@ -8795,6 +9312,34 @@ if you're more curious.\"";
             WsMessage::ClaimedNew { seqs, .. } => Some(seqs.clone()),
             _ => None,
         }).collect()
+    }
+
+    /// A client that starts displaying a world with nothing left to claim must still be told
+    /// so. The client claims optimistically the instant it switches (so ▶ paints in the same
+    /// frame as the text rather than a round-trip later), and an empty `ClaimedNew` is the
+    /// only signal that a guess was wrong - another viewer got there first. Skipping the
+    /// message, as the old `if claimed.is_empty() { return; }` did, would strand a marker the
+    /// server never granted.
+    #[test]
+    fn test_claim_always_answers_the_displaying_client() {
+        let mut app = App::new();
+        world_with_unviewed_backlog(&mut app, 3, 0);
+        let (client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.handle_mark_world_seen(client_id, 0, None);
+        assert_eq!(claimed_new_seqs(&drain_ws_messages(&mut rx)), vec![vec![0, 1, 2]],
+            "precondition: the first display claims the unviewed head");
+
+        // Switch away and back. Everything is viewed now, so there is nothing left to claim -
+        // but the client must still receive the (empty) answer.
+        app.handle_mark_world_seen(client_id, 1, Some(0));
+        let _ = drain_ws_messages(&mut rx);
+        app.handle_mark_world_seen(client_id, 0, Some(1));
+
+        let msgs = drain_ws_messages(&mut rx);
+        assert_eq!(claimed_new_seqs(&msgs), vec![Vec::<u64>::new()],
+            "an empty ClaimedNew must still be sent so the client can revoke an optimistic \
+             claim. Got: {msgs:#?}");
     }
 
     /// The reported bug: 100 lines arrive on a world nobody is watching, a remote client
