@@ -9899,3 +9899,47 @@ if you're more curious.\"";
             assert!(!saw_archive, "{} branch sent archived lines to a client", label);
         }
     }
+
+    #[test]
+    fn test_archive_load_keeps_next_seq_above_everything_in_the_buffer() {
+        // Reproduces the reported cave world: /dump showed output_lines.len 1648 against
+        // next_seq 145. The archive fabricates seqs and never advanced the counter, so the
+        // next ~1500 lines of real MUD output were stamped with numbers already sitting in
+        // the buffer. A client holding those numbers - from any session before archived lines
+        // were kept off the wire - drops every one as a duplicate, and the world goes silent
+        // there while the TUI, which renders by position rather than seq, looks fine.
+        //
+        // The invariant: next_seq is always above every seq present in output_lines, so a
+        // live line can never reuse one.
+        let mut world = World::new("cave");
+        for seq in 0..145u64 {
+            world.output_lines.push(OutputLine::new(format!("live {}", seq), seq));
+        }
+        world.next_seq = 145;
+
+        // Three scroll-to-top archive loads, as the reported buffer had. Goes through the
+        // REAL production path (build_archive_prepend + install_archive_block) rather than a
+        // copy of it, so removing the fix actually fails this test.
+        for _ in 0..3 {
+            let oldest = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
+            let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
+                .map(|i| crate::scrollback::ScrollbackLine {
+                    ts_ms: 1_000 + i as i64,
+                    world: "cave".to_string(),
+                    text: format!("archived {}", i),
+                })
+                .collect();
+            world.install_archive_block(App::build_archive_prepend(archived, oldest));
+        }
+
+        let highest_in_buffer = world.output_lines.iter().map(|l| l.seq).max().unwrap();
+        assert!(world.next_seq > highest_in_buffer,
+            "next_seq is {} but the buffer already contains seq {} - the next {} lines of real \
+             output would reuse numbers a client has already recorded as delivered",
+            world.next_seq, highest_in_buffer, highest_in_buffer + 1 - world.next_seq);
+
+        // And the very next live line must not collide with anything already stored.
+        let next = world.next_seq;
+        assert!(!world.output_lines.iter().any(|l| l.seq == next),
+            "the next live line would be issued seq {}, which is already in the buffer", next);
+    }

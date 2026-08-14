@@ -3171,6 +3171,45 @@ impl World {
             .map(|l| l.seq)
     }
 
+    /// Splice an archive block onto the front of this world's buffer, keeping `next_seq`
+    /// above everything the buffer now contains.
+    ///
+    /// **The `next_seq` advance is the point of this method.** `build_archive_prepend`
+    /// fabricates seqs by counting backwards from the buffer's oldest and SATURATES at 0, so
+    /// on a world whose oldest seq is below the chunk size the block does not land below the
+    /// live range — it lands on top of it and can extend past `next_seq`. Nothing used to
+    /// advance the counter, so the next lines of real MUD output were stamped with numbers
+    /// already sitting in the buffer.
+    ///
+    /// That is the defect behind the reported "one world stops updating": `/dump` showed the
+    /// affected world holding 1648 lines against a `next_seq` of 145. A client that recorded
+    /// those numbers — from any session before archived lines were kept off the wire — drops
+    /// every colliding line as a duplicate, so the world goes silent there while the TUI,
+    /// which renders by buffer position rather than by seq, looks perfectly healthy.
+    ///
+    /// Holding the counter above the buffer makes seq reuse impossible, and repairs an
+    /// already-poisoned client with no action on its side: later output simply arrives above
+    /// anything that client ever recorded.
+    pub(crate) fn install_archive_block(&mut self, prepend: Vec<OutputLine>) {
+        let highest_fabricated = prepend.iter().map(|l| l.seq).max().unwrap_or(0);
+        let inserted = prepend.len();
+        self.output_lines.splice(0..0, prepend);
+        self.scroll_offset += inserted;
+
+        if highest_fabricated >= self.next_seq {
+            self.next_seq = highest_fabricated.saturating_add(1);
+        }
+
+        // Cap buffer size: keep the newest 10_000 lines to avoid unbounded growth.
+        // output_lines is ordered oldest->newest, so drain from the FRONT (oldest).
+        const MAX_LINES: usize = 10_000;
+        if self.output_lines.len() > MAX_LINES {
+            let excess = self.output_lines.len() - MAX_LINES;
+            self.output_lines.drain(0..excess);
+            self.scroll_offset = self.scroll_offset.saturating_sub(excess);
+        }
+    }
+
     /// Record `[start, end]` (inclusive) as broadcast, coalescing with any adjacent or
     /// overlapping range so `broadcast_ledger` stays sorted, minimal and non-overlapping.
     /// Byte-for-byte the same algorithm as app.js's `markSeqRangeSeen` — deliberately, so the
@@ -12232,22 +12271,7 @@ impl App {
         let oldest_seq = self.worlds[world_idx].output_lines.first().map(|l| l.seq).unwrap_or(0);
         let prepend = Self::build_archive_prepend(archive_lines, oldest_seq);
 
-        // Prepend to world buffer and adjust scroll_offset
-        {
-            let world = &mut self.worlds[world_idx];
-            let inserted = prepend.len();
-            world.output_lines.splice(0..0, prepend);
-            world.scroll_offset += inserted;
-
-            // Cap buffer size: keep the newest 10_000 lines to avoid unbounded growth.
-            // output_lines is ordered oldest→newest, so drain from the FRONT (oldest).
-            const MAX_LINES: usize = 10_000;
-            if world.output_lines.len() > MAX_LINES {
-                let excess = world.output_lines.len() - MAX_LINES;
-                world.output_lines.drain(0..excess);
-                world.scroll_offset = world.scroll_offset.saturating_sub(excess);
-            }
-        }
+        self.worlds[world_idx].install_archive_block(prepend);
 
         self.needs_output_redraw = true;
         count
