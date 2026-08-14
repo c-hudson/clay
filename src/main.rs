@@ -2826,6 +2826,24 @@ pub struct World {
     naws_enabled: bool,          // True if NAWS telnet option was negotiated
     naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
     pub next_seq: u64,               // Next sequence number for output lines (for debugging)
+    /// Identifies this world's *sequence-number space*, so a client can tell whether the seqs
+    /// it cached still mean what they used to.
+    ///
+    /// `next_seq` restarts at 0 whenever a `World` is constructed fresh (a real process
+    /// start), while a client's persisted buffer outlives that by design. The old defence was
+    /// arithmetic — discard the cache when its max seq is at or above the server's `next_seq`
+    /// — and it is defeatable from both directions: the counter can be pushed back *above* a
+    /// stale cached value by ordinary output or by an archive load, at which point the
+    /// comparison goes quiet and a poisoned cache is trusted again. That is exactly what
+    /// happened in the v1.5.23-26 incident: the counter fix moved `next_seq` one past the
+    /// cached high-water mark and silently hid the detector from itself.
+    ///
+    /// A random id compared for equality has no such failure mode. It changes precisely when
+    /// the seq space restarts and never otherwise, so it survives the counter moving in either
+    /// direction. Persisted across a hot reload alongside `next_seq` and `output_lines` —
+    /// those three describe one seq space and must travel together or a reload invents a new
+    /// epoch for a buffer that never changed.
+    pub seq_epoch: u64,
     /// Every seq this server has actually put on the wire for this world, as sorted,
     /// coalesced, inclusive ranges — the server-side mirror of app.js's `_seenRanges`
     /// (PROTOCOL-ROADMAP.md Phase F).
@@ -2913,6 +2931,28 @@ impl World {
         Self::new_with_splash(name, false)
     }
 
+    /// Fresh id for a world's sequence-number space (see `World::seq_epoch`).
+    ///
+    /// Never returns 0: that value is reserved on the wire to mean "this peer doesn't speak
+    /// epochs" (an older server, or multiuser, which has no real seqs at all), and a client
+    /// must not read that as a concrete epoch to compare against.
+    ///
+    /// Falls back to a time/pid mix if the OS RNG is unavailable. Unlike an auth key this is
+    /// not a secret — it only has to differ between process lifetimes — so degrading is
+    /// correct here where failing closed would leave the world with no epoch at all.
+    fn new_seq_epoch() -> u64 {
+        let mut bytes = [0u8; 8];
+        if getrandom::getrandom(&mut bytes).is_err() {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            bytes = (nanos ^ ((std::process::id() as u64) << 32)).to_le_bytes();
+        }
+        let v = u64::from_le_bytes(bytes);
+        if v == 0 { 1 } else { v }
+    }
+
     pub fn new_with_splash(name: &str, show_splash: bool) -> Self {
         let output_lines = if show_splash {
             Self::generate_splash_lines(0)
@@ -2974,6 +3014,7 @@ impl World {
             naws_enabled: false,
             naws_sent_size: None,
             next_seq,
+            seq_epoch: Self::new_seq_epoch(),
             broadcast_ledger: std::sync::Mutex::new(Vec::new()),
             ledger_audited_upto: None,
             login_capture_guard: 6,
@@ -7298,6 +7339,9 @@ impl App {
             total_visible_lines: Some(0),
             pending_count: 0,
             next_seq: 0,
+            // Brand-new world: it has no lines yet, so there is nothing a client could be
+            // holding for it. Its real epoch reaches clients with the next InitialState.
+            seq_epoch: 0,
         };
         self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
         let _ = persistence::save_settings(self);
@@ -11877,6 +11921,7 @@ impl App {
                 total_visible_lines: Some(world.output_lines.iter().filter(|l| !l.gagged).count()),
                 pending_count: world.pending_lines.len(),
                 next_seq: world.next_seq,
+                seq_epoch: world.seq_epoch,
             }
         }).collect();
 

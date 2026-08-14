@@ -1048,6 +1048,21 @@ pub struct WorldStateMsg {
     /// elsewhere in this file, not trimmed via `skip_serializing_if`.
     #[serde(default)]
     pub next_seq: u64,
+    /// Identifies this world's sequence-number space (`World::seq_epoch`). A client caches
+    /// this alongside the buffer and discards that buffer whenever the value it stored does
+    /// not match the one here — its seqs then refer to a space that no longer exists.
+    ///
+    /// This supersedes the `next_seq` comparison above, which is arithmetic and therefore
+    /// defeatable: the counter can move back above a stale cached high-water mark (ordinary
+    /// output, or an archive load fabricating seqs) and the check falls silent while the
+    /// cache is still poisoned. Equality against a random id has no such hole.
+    ///
+    /// `0` means "this peer does not speak epochs" — an older server, or multiuser, whose
+    /// seqs are all hardcoded to 0 anyway. A client must treat 0 as "unknown" and fall back
+    /// to the older heuristic rather than comparing it as a real epoch. `serde(default)` gives
+    /// exactly that against a server predating this field.
+    #[serde(default)]
+    pub seq_epoch: u64,
 }
 
 /// World settings for WebSocket protocol

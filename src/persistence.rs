@@ -1655,6 +1655,14 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     // B2 (security remediation): reload state holds world passwords/tokens and the
     // encrypted auth key — create it owner-only (0600 on Unix), like settings.dat.
     let mut file = crate::util::secure_create_file(&path)?;
+    save_reload_state_to(app, &mut file)
+}
+
+/// Serializing half of `save_reload_state`, split from the file creation so the emitted
+/// format can be asserted in a test — the caller writes to a fixed `~/.clay` path that a
+/// unit test must not touch, and a format field silently going missing here is invisible to
+/// any test that supplies its own fixture text to the parser.
+pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Result<()> {
 
     // Save global state
     writeln!(file, "[reload]")?;
@@ -1771,6 +1779,10 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         }
         writeln!(file, "uses_wont_echo_prompt={}", world.uses_wont_echo_prompt)?;
         writeln!(file, "next_seq={}", world.next_seq)?;
+        // Travels with next_seq and output_lines: those three describe one sequence
+        // space. Omitting it would make a reload mint a fresh epoch for a buffer that
+        // never changed, invalidating every connected client's cache for no reason.
+        writeln!(file, "seq_epoch={}", world.seq_epoch)?;
         if !world.prompt.is_empty() {
             writeln!(file, "prompt={}", world.prompt.replace('=', "\\e"))?;
         }
@@ -1988,6 +2000,17 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
 
     debug_log(is_debug_enabled(), &format!("LOAD_STATE: Reading state file: {:?}", path));
     let content = std::fs::read_to_string(&path)?;
+    let loaded = load_reload_state_from_str(app, &content);
+    // Consume the file whether or not parsing succeeded: a state file that fails to parse
+    // would otherwise be retried on every start.
+    let _ = std::fs::remove_file(&path);
+    loaded
+}
+
+/// Parse half of `load_reload_state`, split out so the restore can be tested at all — the
+/// caller reads a fixed `~/.clay` path that a unit test must not touch. Everything that
+/// decides what a reloaded world looks like lives here; the caller only supplies bytes.
+pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bool> {
     let lines: Vec<&str> = content.lines().collect();
     debug_log(is_debug_enabled(), &format!("LOAD_STATE: State file has {} lines", lines.len()));
 
@@ -2028,6 +2051,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         prompt: String,
         settings: WorldSettings,
         next_seq: u64,
+        seq_epoch: u64,
         partial_line: String,
         partial_in_pending: bool,
         gmcp_enabled: bool,
@@ -2156,6 +2180,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         prompt: String::new(),
                         settings: WorldSettings::default(),
                         next_seq: 0,
+                        seq_epoch: 0,
                         partial_line: String::new(),
                         partial_in_pending: false,
                         gmcp_enabled: false,
@@ -2530,6 +2555,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
                             "proxy_socket_fd" => tw.proxy_socket_fd = value.parse().ok(),
                             "next_seq" => tw.next_seq = value.parse().unwrap_or(0),
+                            "seq_epoch" => tw.seq_epoch = value.parse().unwrap_or(0),
                             "partial_line" => tw.partial_line = unescape_string(value),
                             "partial_in_pending" => tw.partial_in_pending = value == "true",
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
@@ -2664,6 +2690,11 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
         world.next_seq = tw.next_seq;
+        // 0 means the state file predates this field; keep the epoch this World was
+        // constructed with rather than adopting a value that means "no epoch".
+        if tw.seq_epoch != 0 {
+            world.seq_epoch = tw.seq_epoch;
+        }
         // A reload restores `output_lines` and `next_seq` independently, so a buffer that
         // already violated "next_seq is above everything stored" carries that violation
         // straight across — and a hot reload is exactly how a long-lived instance picks up a
@@ -2737,8 +2768,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
 
     *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
 
-    // Clean up the reload state file and env var
-    let _ = std::fs::remove_file(&path);
+    // File cleanup belongs to the caller, which owns the path; this half is pure parsing so
+    // it can be tested without touching a real ~/.clay.
     std::env::remove_var("CLAY_RELOAD_PID");
 
     Ok(true)

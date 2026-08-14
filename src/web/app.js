@@ -2687,9 +2687,53 @@
                     // where World.next_seq is always sent as a hardcoded 0 - see its doc
                     // comment in daemon.rs's InitialState builder).
                     const serverNextSeq = world.next_seq || 0;
-                    const priorWorldStale = !!(rawPriorWorld && rawPriorWorld._max_seq > 0 && rawPriorWorld._max_seq >= serverNextSeq);
-                    const cachedWorldStale = !!(rawCachedWorld && rawCachedWorld.maxSeq > 0 && rawCachedWorld.maxSeq >= serverNextSeq);
-                    if (priorWorldStale || cachedWorldStale) {
+                    const serverEpoch = world.seq_epoch || 0;
+
+                    // Primary test: does this buffer's seq space still exist?
+                    //
+                    // `seq_epoch` is a random id the server mints when a world's sequence
+                    // space starts and keeps (across hot reloads) for as long as it lasts. A
+                    // buffer stamped with a different epoch holds seqs that refer to a space
+                    // that is gone, so every dedup decision made from it is meaningless.
+                    //
+                    // This replaces the arithmetic test below as the real defence. That test
+                    // compares a cached high-water mark against the server's current counter,
+                    // and BOTH sides move: ordinary output - or an archive load fabricating
+                    // seqs - can push `next_seq` back above a stale cached value, at which
+                    // point the comparison falls silent while the cache is still poisoned.
+                    // That is precisely how the v1.5.23-26 incident persisted: the server-side
+                    // counter fix moved `next_seq` one past the cached mark and hid the
+                    // detector from itself. Equality against a random id cannot do that.
+                    //
+                    // A cache with no epoch recorded predates this field. It is discarded
+                    // rather than trusted - that is a single extra download per world on
+                    // upgrade, and it is what finally clears a buffer poisoned by the older
+                    // versions without anyone having to wipe app storage by hand.
+                    const epochKnown = serverEpoch !== 0;
+                    const priorWorldWrongEpoch = !!(epochKnown && rawPriorWorld &&
+                        rawPriorWorld._seq_epoch !== serverEpoch);
+                    const cachedWorldWrongEpoch = !!(epochKnown && rawCachedWorld &&
+                        rawCachedWorld.seqEpoch !== serverEpoch);
+                    if (priorWorldWrongEpoch || cachedWorldWrongEpoch) {
+                        const had = priorWorldWrongEpoch ? rawPriorWorld._seq_epoch : rawCachedWorld.seqEpoch;
+                        console.warn('Clay: seq epoch changed for world "' + (world.name || ('#' + idx)) +
+                            '" - discarding ' + (priorWorldWrongEpoch ? 'in-memory' : 'cached') +
+                            ' scrollback (buffer epoch ' + (had === undefined ? 'absent' : had) +
+                            ', server epoch ' + serverEpoch + ')');
+                        if (cachedWorldWrongEpoch && world.name) {
+                            clearWorldCacheEntry(world.name);
+                        }
+                    }
+
+                    // Retained fallback for a server that does not send an epoch (older
+                    // build, or multiuser where every seq is a hardcoded 0). Redundant
+                    // whenever the epoch is known, and deliberately kept: it costs one
+                    // comparison and covers the peers the epoch cannot reach.
+                    const priorWorldStale = priorWorldWrongEpoch || !!(!epochKnown && rawPriorWorld &&
+                        rawPriorWorld._max_seq > 0 && rawPriorWorld._max_seq >= serverNextSeq);
+                    const cachedWorldStale = cachedWorldWrongEpoch || !!(!epochKnown && rawCachedWorld &&
+                        rawCachedWorld.maxSeq > 0 && rawCachedWorld.maxSeq >= serverNextSeq);
+                    if ((priorWorldStale && !priorWorldWrongEpoch) || (cachedWorldStale && !cachedWorldWrongEpoch)) {
                         const staleSeq = priorWorldStale ? rawPriorWorld._max_seq : rawCachedWorld.maxSeq;
                         console.warn('Clay: server session reset detected for world "' + (world.name || ('#' + idx)) +
                             '" - discarding stale ' + (priorWorldStale ? 'in-memory' : 'cached') +
@@ -2732,6 +2776,9 @@
                     // reconnect or persistent cache) rather than the server's
                     // freshly-sent slice - startBackfill() uses this to gap-fill
                     // instead of doing a full backfill for this world.
+                    // Stamp the live world so an in-memory reconnect (priorWorld) can be
+                    // epoch-checked the same way the persisted cache is.
+                    world._seq_epoch = serverEpoch;
                     world._hydratedFromLocal = !!(priorWorld || (cachedWorld && cachedWorld.lines && cachedWorld.lines.length > 0));
                     // Was this world covered by the AuthRequest.resume we just sent THIS
                     // connection (resumeSentThisConnection, recorded by
@@ -4994,11 +5041,14 @@
             // maxSeq is still written for the benefit of an older client reading this
             // entry after a downgrade, and is what the pre-Phase-C shape keyed on.
             const seenRanges = w._seenRanges || [];
+            // Stamped so the next hydration can tell whether these seqs still refer to
+            // a live sequence space - see the epoch check in the InitialState handler.
+            const seqEpoch = w._seq_epoch || 0;
             openWorldCacheDb().then((db) => {
                 if (!db) return;
                 try {
                     const tx = db.transaction(WORLD_CACHE_STORE, 'readwrite');
-                    tx.objectStore(WORLD_CACHE_STORE).put({ lines: lines, maxSeq: maxSeq, seenRanges: seenRanges }, worldCacheKey(worldCacheServerId, name));
+                    tx.objectStore(WORLD_CACHE_STORE).put({ lines: lines, maxSeq: maxSeq, seenRanges: seenRanges, seqEpoch: seqEpoch }, worldCacheKey(worldCacheServerId, name));
                 } catch (e) { /* ignore */ }
             });
         }, WORLD_CACHE_SAVE_DEBOUNCE_MS);

@@ -3176,6 +3176,10 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 // guard this field feeds only fires when the cache claims a real (> 0) seq, so
                 // a constant 0 here is inert, not a false "server restarted" trigger.
                 next_seq: 0,
+                // Multiuser emits seq: 0 on every line and has no real sequence space, so it
+                // has no epoch to report. 0 tells the client to fall back to the older
+                // heuristic rather than compare this as a concrete value.
+                seq_epoch: 0,
             }
         }).collect();
 

@@ -10051,3 +10051,115 @@ if you're more curious.\"";
              poisoned world must recover without a reload",
             app.worlds[0].next_seq, highest);
     }
+
+    // ---- Seq epoch: identifies a world's sequence-number space ----
+
+    #[test]
+    fn test_each_world_gets_a_distinct_nonzero_seq_epoch() {
+        // 0 is reserved on the wire for "this peer doesn't speak epochs" (older server, or
+        // multiuser), so a real world must never mint it - a client would read 0 as "unknown"
+        // and fall back to the heuristic this replaces.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..50 {
+            let w = World::new(&format!("w{}", i));
+            assert_ne!(w.seq_epoch, 0, "a real world must never get the reserved epoch 0");
+            assert!(seen.insert(w.seq_epoch), "duplicate epoch {}", w.seq_epoch);
+        }
+    }
+
+    #[test]
+    fn test_seq_epoch_survives_a_reload_round_trip() {
+        // The epoch describes the same sequence space as next_seq and output_lines, so it has
+        // to travel with them through a hot reload. If a reload minted a fresh epoch for an
+        // unchanged buffer, every connected client would throw away a good cache each reload.
+        //
+        // Drives the REAL parse path (load_reload_state_from_str), not a hand-rolled copy of
+        // it - a test that reimplements the restore cannot fail when the restore is broken.
+        let state = "[world_state:0]\nname=alpha\nnext_seq=500\nseq_epoch=987654321\n";
+        let mut app = App::new();
+        crate::persistence::load_reload_state_from_str(&mut app, state).expect("parses");
+
+        let w = app.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
+        assert_eq!(w.next_seq, 500);
+        assert_eq!(w.seq_epoch, 987_654_321,
+            "the epoch must be restored verbatim, or a reload invalidates every client cache");
+    }
+
+    #[test]
+    fn test_reload_without_a_seq_epoch_keeps_the_live_one() {
+        // A state file written by a build predating this field reports 0, which means "no
+        // epoch" - it must not clobber the epoch the World was constructed with, or every
+        // reload from an old state file would hand clients the reserved value.
+        let state = "[world_state:0]\nname=alpha\nnext_seq=500\n";
+        let mut app = App::new();
+        crate::persistence::load_reload_state_from_str(&mut app, state).expect("parses");
+
+        let w = app.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
+        assert_ne!(w.seq_epoch, 0,
+            "an absent epoch must leave the freshly-minted one in place, never the reserved 0 \
+             - a client would read 0 as \"server doesn't speak epochs\"");
+    }
+
+    #[test]
+    fn test_world_state_msg_carries_the_seq_epoch() {
+        // The client can only compare what reaches it.
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].output_lines.push(OutputLine::new("hi".to_string(), 0));
+        app.worlds[0].next_seq = 1;
+        let expected = app.worlds[0].seq_epoch;
+
+        let state = app.build_initial_state(0);
+        match state {
+            WsMessage::InitialState { worlds, .. } => {
+                let w = worlds.iter().find(|w| w.name == "alpha").expect("world present");
+                assert_eq!(w.seq_epoch, expected, "InitialState must report the world's epoch");
+                assert_ne!(w.seq_epoch, 0);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_seq_epoch_defaults_to_zero_against_an_older_server() {
+        // Absent field => 0 => the client treats the epoch as unknown and falls back to the
+        // older next_seq heuristic rather than comparing 0 as a concrete value.
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        let state = app.build_initial_state(0);
+        let mut encoded = serde_json::to_value(&state).unwrap();
+
+        let w0 = &mut encoded["worlds"][0];
+        assert!(w0.get("seq_epoch").is_some(), "epoch is present on the wire");
+        w0.as_object_mut().unwrap().remove("seq_epoch");
+
+        match serde_json::from_value::<WsMessage>(encoded).expect("parses without the field") {
+            WsMessage::InitialState { worlds, .. } => assert_eq!(worlds[0].seq_epoch, 0),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reload_state_write_emits_seq_epoch_and_round_trips() {
+        // Closes the gap a fixture-driven parser test cannot: if the WRITE side stops
+        // emitting seq_epoch, every reload hands clients a freshly-minted epoch for an
+        // unchanged buffer and they discard a perfectly good cache each time. Drives the real
+        // serializer and the real parser against each other.
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].next_seq = 500;
+        let epoch = app.worlds[0].seq_epoch;
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+
+        assert!(text.contains(&format!("seq_epoch={}", epoch)),
+            "the reload state must carry seq_epoch alongside next_seq");
+
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
+        let w = restored.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
+        assert_eq!(w.seq_epoch, epoch, "epoch must survive a full save/load round trip");
+        assert_eq!(w.next_seq, 500);
+    }
