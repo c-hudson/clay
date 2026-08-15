@@ -16,6 +16,37 @@
     window.addEventListener('error', function(e) {
         __clayShowError((e.message || 'error') + '\n@ ' + (e.filename || '?') + ':' + (e.lineno || '?') + ':' + (e.colno || '?') + (e.error && e.error.stack ? '\n' + e.error.stack : ''));
     });
+
+    // Render a caught error as text. Both halves are needed: V8 (Android WebView, Chrome)
+    // starts `stack` with "Name: message", but SpiderMonkey and JavaScriptCore (WebKitGTK,
+    // i.e. the desktop GUI and Termux) put *only* the frames there - reporting `stack` alone
+    // silently drops the single most useful line on those engines.
+    function __clayErrText(e) {
+        if (!e) return String(e);
+        var head = e.message ? ((e.name ? e.name + ': ' : '') + e.message) : String(e);
+        return e.stack ? head + '\n' + e.stack : head;
+    }
+
+    // Wrap an entry point so a throw inside it reports something usable.
+    //
+    // The global handler above is blind on Android: the app is loaded as
+    // file:///android_asset/web/index.html, and under a file:// (opaque) origin the WebView
+    // sanitizes uncaught errors from an external <script> to literally "Script error." with no
+    // filename, line, or stack. A try/catch *inside* this script is not subject to that - it
+    // receives the real Error - so guarding the entry points is what makes a failure
+    // diagnosable at all on the platform where it matters most.
+    //
+    // Swallows after reporting: a broken click handler should leave a banner, not an unhandled
+    // exception. Same pattern as the init() guard at the bottom of this file.
+    function guard(name, fn) {
+        return function() {
+            try {
+                return fn.apply(this, arguments);
+            } catch (e) {
+                __clayShowError(name + ' threw: ' + __clayErrText(e));
+            }
+        };
+    }
     window.addEventListener('unhandledrejection', function(e) {
         var r = e.reason;
         __clayShowError('unhandled rejection: ' + (r && r.message ? r.message : String(r)) + (r && r.stack ? '\n' + r.stack : ''));
@@ -949,6 +980,18 @@
     // Report this client's visibility to the server (WsMessage::ClientVisibility). Guarded
     // on an open, authenticated socket: before auth the server has no ClientViewState for us
     // to act on, and the InitialState that follows reports the correct state anyway.
+    // Drop the Android foreground service. Only call this when the session is genuinely over
+    // (the user disconnected, or reconnection has been abandoned) - never on a transient
+    // failure. The service is what stops Android reclaiming the process, so killing it during a
+    // retry loop is precisely backwards: the app most needs to survive while it is reconnecting.
+    function stopAndroidBackgroundService() {
+        try {
+            if (window.Android && window.Android.stopBackgroundService) {
+                window.Android.stopBackgroundService();
+            }
+        } catch (e) { /* non-fatal */ }
+    }
+
     // Mirrors the server's own ClientViewState.visible so we can tell a real transition from
     // a repeat. handle_client_visibility early-returns on a repeat and sends no ClaimedNew,
     // so the optimistic claim below must fire only when the server will actually act.
@@ -2047,11 +2090,13 @@
                 return;
             }
             connectionFailures++;
-            if (window.Android && window.Android.stopBackgroundService) {
-                window.Android.stopBackgroundService();
-            }
             const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
             if (connectionFailures >= maxFailures) {
+                // Only now, having given up, drop the Android foreground service. Tearing it
+                // down on every individual failure removed the process's protection at exactly
+                // the moment it was mid-reconnect and needed it most - the service is what keeps
+                // Android from reclaiming us while we retry.
+                stopAndroidBackgroundService();
                 showConnectionLog();
                 enableConnectionLogRetry();
             } else {
@@ -2089,9 +2134,6 @@
         }
 
         connectionFailures++;
-        if (window.Android && window.Android.stopBackgroundService) {
-            window.Android.stopBackgroundService();
-        }
 
         // If there is no usable credential and the auth modal is already open,
         // stop auto-reconnecting. The user will trigger a fresh connection by
@@ -2108,6 +2150,9 @@
 
         const maxFailures = window.WEBVIEW_MODE ? 5 : 2;
         if (connectionFailures >= maxFailures) {
+            // Reconnection abandoned - only now is it right to drop the foreground service
+            // (see stopAndroidBackgroundService). While still retrying above, it stays up.
+            stopAndroidBackgroundService();
             showConnectionLog();
             enableConnectionLogRetry();
         } else {
@@ -2124,25 +2169,43 @@
 
         window.onNativeWebSocketMessage = function(id, data) {
             if (id !== winnerAttemptId) return;
+            let msg;
             try {
-                const msg = JSON.parse(data);
-                handleMessage(msg);
+                msg = JSON.parse(data);
             } catch (e) {
                 console.error('Failed to parse message:', e);
+                return;
+            }
+            // This is the path Android actually uses (NativeWebSocket.java relays into it), so
+            // a handler throw here used to vanish into console.error on the one platform with
+            // no console. Reported separately from a parse failure - see the browser-socket
+            // onmessage below for the same split.
+            try {
+                handleMessage(msg);
+            } catch (e) {
+                __clayShowError('handleMessage(' + (msg && msg.type ? msg.type : '?') +
+                    ') threw: ' + __clayErrText(e));
             }
         };
 
         window.onNativeWebSocketMessageBase64 = function(id, base64Data) {
             if (id !== winnerAttemptId) return;
+            let msg;
             try {
                 const data = atob(base64Data);
                 const bytes = new Uint8Array(data.length);
                 for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i);
                 const decoded = new TextDecoder('utf-8').decode(bytes);
-                const msg = JSON.parse(decoded);
-                handleMessage(msg);
+                msg = JSON.parse(decoded);
             } catch (e) {
                 console.error('Failed to parse Base64 message:', e);
+                return;
+            }
+            try {
+                handleMessage(msg);
+            } catch (e) {
+                __clayShowError('handleMessage(' + (msg && msg.type ? msg.type : '?') +
+                    ') threw: ' + __clayErrText(e));
             }
         };
 
@@ -2283,11 +2346,22 @@
 
         socket.onmessage = function(event) {
             if (id !== winnerAttemptId) return;
+            let msg;
             try {
-                const msg = JSON.parse(event.data);
-                handleMessage(msg);
+                msg = JSON.parse(event.data);
             } catch (e) {
                 console.error('Failed to parse message:', e);
+                return;
+            }
+            // Deliberately separate from the parse failure above: a malformed frame and a bug
+            // in a message handler need completely different fixes, and the handler case used
+            // to be swallowed into console.error - invisible on Android, where there is no
+            // console. Reported by type so the banner says which message broke.
+            try {
+                handleMessage(msg);
+            } catch (e) {
+                __clayShowError('handleMessage(' + (msg && msg.type ? msg.type : '?') +
+                    ') threw: ' + __clayErrText(e));
             }
         };
     }
@@ -10226,7 +10300,19 @@
     }
 
     // Dispatch a keybinding action by ID. Returns true if handled.
+    // Guarded entry point. Keyboard actions and most buttons funnel through here, so a throw
+    // in any single action would otherwise be an unhandled exception with no usable report on
+    // Android (see guard()). The action id is included so the banner names what failed.
     function dispatchAction(actionId) {
+        try {
+            return dispatchActionImpl(actionId);
+        } catch (e) {
+            __clayShowError("action '" + actionId + "' threw: " + __clayErrText(e));
+            return false;
+        }
+    }
+
+    function dispatchActionImpl(actionId) {
         switch (actionId) {
             // Cursor
             case 'cursor_left': {
@@ -11189,10 +11275,10 @@
             elements.input.focus();
         }
         if (elements.navUpBtn) {
-            elements.navUpBtn.addEventListener('mousedown', upBtnStart);
-            elements.navUpBtn.addEventListener('mouseup', upBtnEnd);
-            elements.navUpBtn.addEventListener('touchstart', upBtnStart, { passive: false });
-            elements.navUpBtn.addEventListener('touchend', upBtnEnd, { passive: false });
+            elements.navUpBtn.addEventListener('mousedown', guard('navUp/start', upBtnStart));
+            elements.navUpBtn.addEventListener('mouseup', guard('navUp/end', upBtnEnd));
+            elements.navUpBtn.addEventListener('touchstart', guard('navUp/start', upBtnStart), { passive: false });
+            elements.navUpBtn.addEventListener('touchend', guard('navUp/end', upBtnEnd), { passive: false });
         }
 
         // Down button - short press: PREVIOUS world, long press (1s): next history.
@@ -11229,10 +11315,10 @@
             elements.input.focus();
         }
         if (elements.navDownBtn) {
-            elements.navDownBtn.addEventListener('mousedown', downBtnStart);
-            elements.navDownBtn.addEventListener('mouseup', downBtnEnd);
-            elements.navDownBtn.addEventListener('touchstart', downBtnStart, { passive: false });
-            elements.navDownBtn.addEventListener('touchend', downBtnEnd, { passive: false });
+            elements.navDownBtn.addEventListener('mousedown', guard('navDown/start', downBtnStart));
+            elements.navDownBtn.addEventListener('mouseup', guard('navDown/end', downBtnEnd));
+            elements.navDownBtn.addEventListener('touchstart', guard('navDown/start', downBtnStart), { passive: false });
+            elements.navDownBtn.addEventListener('touchend', guard('navDown/end', downBtnEnd), { passive: false });
         }
 
         // Page up/down buttons (nav bar)
@@ -11250,11 +11336,12 @@
                 const pageHeight = container.clientHeight * 0.9;
                 container.scrollTop += pageHeight;
             }
-            if (isAtBottom()) {
-                if (pendingLines.length === 0 && serverPending === 0) {
-                    paused = false;
-                    linesSincePause = 0;
-                }
+            // Landing at the bottom with nothing held back means we're following live output
+            // again. pendingTotal() covers both the local queue and the server's count - the
+            // same predicate every other site uses.
+            if (isAtBottom() && pendingTotal() === 0) {
+                paused = false;
+                linesSincePause = 0;
             }
             updateStatusBar();
         }
@@ -11263,37 +11350,37 @@
             elements.navPgUpBtn.addEventListener('touchstart', function(e) {
                 elements.input.focus();
             }, { passive: true });
-            elements.navPgUpBtn.addEventListener('touchend', function(e) {
+            elements.navPgUpBtn.addEventListener('touchend', guard('navPgUp', function(e) {
                 e.preventDefault();
                 handlePgUp();
-            }, { passive: false });
-            elements.navPgUpBtn.addEventListener('click', function(e) {
+            }), { passive: false });
+            elements.navPgUpBtn.addEventListener('click', guard('navPgUp', function(e) {
                 handlePgUp();
-            });
+            }));
         }
 
         if (elements.navPgDnBtn) {
             elements.navPgDnBtn.addEventListener('touchstart', function(e) {
                 elements.input.focus();
             }, { passive: true });
-            elements.navPgDnBtn.addEventListener('touchend', function(e) {
+            elements.navPgDnBtn.addEventListener('touchend', guard('navPgDn', function(e) {
                 e.preventDefault();
                 handlePgDn();
-            }, { passive: false });
-            elements.navPgDnBtn.addEventListener('click', function(e) {
+            }), { passive: false });
+            elements.navPgDnBtn.addEventListener('click', guard('navPgDn', function(e) {
                 handlePgDn();
-            });
+            }));
         }
 
         // Click on More/History indicator to release pending lines
-        elements.statusMore.addEventListener('click', function() {
+        elements.statusMore.addEventListener('click', guard('statusMore', function() {
             releaseScreenful();
-        });
+        }));
 
         // Click on Activity indicator to switch to world with activity
-        elements.activityIndicator.addEventListener('click', function() {
+        elements.activityIndicator.addEventListener('click', guard('activityIndicator', function() {
             requestNextWorld();
-        });
+        }));
 
         // Click on the note icon to open the current world's notes (same
         // editor as typing /note).
@@ -12999,5 +13086,5 @@
     };
 
     // Start the app
-    try { init(); } catch (e) { __clayShowError('init() threw: ' + (e && e.stack ? e.stack : e)); }
+    try { init(); } catch (e) { __clayShowError('init() threw: ' + __clayErrText(e)); }
 })();

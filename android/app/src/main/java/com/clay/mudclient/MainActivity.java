@@ -136,12 +136,16 @@ public class MainActivity extends AppCompatActivity {
     private Runnable pendingBatteryOptCallback = null;
     private boolean interfaceLoaded = false;
     private String loadedInterfaceUrl = null;
-    private LocalServerManager localServerManager;
-    private SshProxyManager sshProxyManager;
-    // Snapshot of the SSH settings last applied to a running sshProxyManager (null when SSH
-    // wasn't in use), so reloadInterfaceRespectingRunMode() can detect a credential/target
-    // change even when KEY_SSH_ENABLED itself didn't flip — see that method.
-    private String lastAppliedSshConfigSnapshot = null;
+    // The local server, the SSH tunnel, and the "what did we last apply" snapshots used to be
+    // Activity fields torn down in onDestroy(). They now live in ClaySession, scoped to the
+    // process rather than to the UI — see that class for why. These accessors keep the call
+    // sites below reading as they did.
+    // Counts Activity creations within one process. >1 means the Activity was recreated while
+    // the process survived (the case this bug was about); back to 1 after a real process death.
+    private static int activityCreateCount = 0;
+
+    private LocalServerManager localServerManager() { return ClaySession.localServer(); }
+    private SshProxyManager sshProxyManager() { return ClaySession.sshProxy(); }
     // Registered in onResume()/unregistered in onPause() (only while in SSH remote mode) so a
     // WiFi<->cellular handoff (or any other default-network change) triggers an unconditional
     // SSH tunnel restart - see restartSshTunnel(). Non-null only while registered.
@@ -694,7 +698,7 @@ public class MainActivity extends AppCompatActivity {
                 || !prefs.getBoolean(KEY_SSH_ENABLED, false)) {
                 return true; // not in SSH mode - nothing to gate
             }
-            if (sshProxyManager != null && sshProxyManager.isRunning()) {
+            if (ClaySession.isSshProxyRunning()) {
                 return true;
             }
             android.util.Log.i("Clay", "ensureSshTunnelReady: tunnel down, triggering restart");
@@ -776,6 +780,14 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        activityCreateCount++;
+        android.util.Log.i("Clay", "LIFECYCLE onCreate #" + activityCreateCount
+            + ": savedInstanceState=" + (savedInstanceState == null ? "null" : "present")
+            + " localServerRunning=" + ClaySession.isLocalServerRunning()
+            + " sshProxyRunning=" + ClaySession.isSshProxyRunning()
+            + (activityCreateCount > 1
+                ? "  <- Activity recreated, process survived"
+                : "  <- fresh process"));
         setContentView(R.layout.activity_main);
 
         // getNoBackupFilesDir() is never included in any backup (Auto Backup, ADB, OEM).
@@ -957,7 +969,6 @@ public class MainActivity extends AppCompatActivity {
     // startLocalServerThenLoadInterface() / loadInterfaceForRemoteMode(). Compared against the
     // live pref in onNewIntent() (see reloadIfRunModeChanged()) to detect a mode switch made from
     // Settings, since that path reuses this Activity instance rather than a fresh onCreate().
-    private String lastAppliedRunMode = null;
 
     private void proceedAfterPermissions() {
         if (runModeFlowStarted) {
@@ -997,12 +1008,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadInterfaceForRemoteMode() {
-        lastAppliedRunMode = RUN_MODE_REMOTE;
+        ClaySession.setLastAppliedRunMode(RUN_MODE_REMOTE);
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         if (prefs.getBoolean(KEY_SSH_ENABLED, false)) {
             startSshProxyThenLoadInterface();
         } else {
-            lastAppliedSshConfigSnapshot = null;
+            ClaySession.setLastAppliedSshConfigSnapshot(null);
             loadInterface();
         }
     }
@@ -1027,7 +1038,7 @@ public class MainActivity extends AppCompatActivity {
     // showSshFailedDialog() with a real error and Retry/Cancel actions.
     private void startSshProxyThenLoadInterface() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        lastAppliedSshConfigSnapshot = sshConfigSnapshot(prefs);
+        ClaySession.setLastAppliedSshConfigSnapshot(sshConfigSnapshot(prefs));
         final String sshUser = prefs.getString(KEY_SSH_USER, "");
         final String sshHost = prefs.getString(KEY_SERVER_HOST, "");
         final String sshRemoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
@@ -1050,11 +1061,11 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
             if (winner != null) {
-                sshProxyManager = winner;
+                ClaySession.setSshProxy(winner);
                 android.util.Log.i("Clay", "SSH proxy ready on port " + winner.getLocalPort());
                 runOnUiThread(this::loadInterface);
             } else {
-                sshProxyManager = null;
+                ClaySession.setSshProxy(null);
                 final String message = summarizeSshErrors(lastResult.errors);
                 runOnUiThread(() -> {
                     hideConnectingOverlay();
@@ -1087,10 +1098,10 @@ public class MainActivity extends AppCompatActivity {
         if (!hasSecondCandidate) {
             // No race needed - reuse the existing manager exactly as before this change (a
             // still-running instance with a matching target is a no-op inside start()).
-            if (sshProxyManager == null) {
-                sshProxyManager = new SshProxyManager(this);
+            if (sshProxyManager() == null) {
+                ClaySession.setSshProxy(new SshProxyManager(this));
             }
-            SshProxyManager manager = sshProxyManager;
+            SshProxyManager manager = sshProxyManager();
             boolean ok = manager.start(user, hostA, sshPort, clayPort, key, keyPass, password);
             if (ok) {
                 return new SshRaceResult(manager, null);
@@ -1275,10 +1286,10 @@ public class MainActivity extends AppCompatActivity {
             || !prefs.getBoolean(KEY_SSH_ENABLED, false)) {
             return; // not in SSH mode - nothing to watch/restart
         }
-        if (sshProxyManager == null) {
+        if (sshProxyManager() == null) {
             return; // never started (still on the first-connect flow) - nothing to restart
         }
-        if (!unconditional && sshProxyManager.isRunning()) {
+        if (!unconditional && sshProxyManager().isRunning()) {
             return; // still healthy
         }
         long now = System.currentTimeMillis();
@@ -1302,13 +1313,13 @@ public class MainActivity extends AppCompatActivity {
         // may still report isRunning()==true, and raceSshProxyStart()'s single-candidate path
         // would otherwise short-circuit via SshProxyManager.start()'s own "already running"
         // check and skip restarting entirely) and harmless/idempotent otherwise.
-        sshProxyManager.stop();
+        sshProxyManager().stop();
 
         new Thread(() -> {
             SshRaceResult result = raceSshProxyStart(sshUser, sshHost, sshRemoteHost, sshPort,
                 clayPort, privateKeyPem, keyPassphrase, password);
             if (result.winner != null) {
-                sshProxyManager = result.winner;
+                ClaySession.setSshProxy(result.winner);
                 final int newPort = result.winner.getLocalPort();
                 android.util.Log.i("Clay", "SSH tunnel watchdog: restarted OK on port " + newPort);
                 // No Toast here (removed - a background self-heal shouldn't interrupt the user
@@ -1354,16 +1365,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // Starts the bundled Clay server (spawn + readiness poll, both blocking) on a worker thread,
-    // then loads the WebView — buildVarInjectionScript() reads localServerManager's port/password
+    // then loads the WebView — buildVarInjectionScript() reads the local server's port/password
     // once it's running, so the WebView must not load (and race to connect) before this
     // completes. Proceeds to loadInterface() either way; if the server failed to start, app.js
     // will simply fail to connect, the same UX as an unreachable remote host.
     private void startLocalServerThenLoadInterface() {
-        lastAppliedRunMode = RUN_MODE_LOCAL;
-        if (localServerManager == null) {
-            localServerManager = new LocalServerManager(this);
+        ClaySession.setLastAppliedRunMode(RUN_MODE_LOCAL);
+        if (localServerManager() == null) {
+            ClaySession.setLocalServer(new LocalServerManager(this));
         }
-        final LocalServerManager manager = localServerManager;
+        final LocalServerManager manager = localServerManager();
         runOnUiThread(() -> showConnectingOverlay("Starting local server..."));
         new Thread(() -> {
             boolean ready = manager.start();
@@ -1527,8 +1538,8 @@ public class MainActivity extends AppCompatActivity {
                     // unmanaged for the whole backgrounded period - matches the "disconnecting
                     // to save power" intent above, and avoids a zombie tunnel that isRunning()
                     // would report as healthy on resume (see restartSshTunnel()'s doc comment).
-                    if (sshProxyManager != null) {
-                        sshProxyManager.stop();
+                    if (sshProxyManager() != null) {
+                        sshProxyManager().stop();
                     }
 
                     // Notify JavaScript that we disconnected due to timeout
@@ -1765,9 +1776,9 @@ public class MainActivity extends AppCompatActivity {
         if (appVersion == null) appVersion = "";
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         boolean isLocalMode = RUN_MODE_LOCAL.equals(prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE))
-            && localServerManager != null && localServerManager.isRunning();
+            && ClaySession.isLocalServerRunning();
         boolean isSshProxyMode = !isLocalMode && prefs.getBoolean(KEY_SSH_ENABLED, false)
-            && sshProxyManager != null && sshProxyManager.isRunning();
+            && ClaySession.isSshProxyRunning();
 
         String localHost;
         String remoteHost;
@@ -1778,9 +1789,9 @@ public class MainActivity extends AppCompatActivity {
         if (isLocalMode) {
             localHost = jsStr("127.0.0.1");
             remoteHost = jsStr("");  // no remote candidate to race against in local mode
-            port = localServerManager.getPort();
+            port = localServerManager().getPort();
             mode = jsStr("non_secure");  // plain ws only — local server is loopback, unencrypted
-            autoPasswordScript = "window.AUTO_PASSWORD=" + jsStr(localServerManager.getPasswordHash()) + ";";
+            autoPasswordScript = "window.AUTO_PASSWORD=" + jsStr(localServerManager().getPasswordHash()) + ";";
             // Leave window.WEB_PATH unset (not the possibly-stale value saved from a previous
             // remote server) — the local server always uses the default "clay" web_path, and
             // wsPathCandidates() already probes /clay/ws then /ws when WEB_PATH is unset.
@@ -1795,7 +1806,7 @@ public class MainActivity extends AppCompatActivity {
             // would for a direct remote connection.
             localHost = jsStr("127.0.0.1");
             remoteHost = jsStr("");
-            port = sshProxyManager.getLocalPort();
+            port = sshProxyManager().getLocalPort();
             mode = jsStr("non_secure");
             autoPasswordScript = "";
             webPathScript = "";
@@ -1881,12 +1892,51 @@ public class MainActivity extends AppCompatActivity {
         super.onNewIntent(intent);
         // Called when activity is brought to front via FLAG_ACTIVITY_CLEAR_TOP (e.g. a
         // notification tap), reusing this same instance rather than a fresh onCreate().
-        android.util.Log.i("Clay", "onNewIntent called, checking if interface needs loading");
-        if (interfaceLoaded) {
+        android.util.Log.i("Clay", "LIFECYCLE onNewIntent: interfaceLoaded=" + interfaceLoaded
+            + " localServerRunning=" + ClaySession.isLocalServerRunning()
+            + " sshProxyRunning=" + ClaySession.isSshProxyRunning());
+        if (!interfaceLoaded) {
+            checkAndLoadInterface();
+            return;
+        }
+        // The interface is already up. Coming back to a running app is a resume, not a reason to
+        // rebuild it: reloadInterfaceRespectingRunMode() clears interfaceLoaded and reloads the
+        // WebView, which is a full visible restart. Only do that when the run mode or SSH config
+        // has actually changed (or the tunnel died) - reloadInterfaceRespectingRunMode() already
+        // makes exactly that distinction, so ask it first and otherwise just resume the way an
+        // ordinary onResume does.
+        if (runModeOrSshConfigChanged()) {
             reloadInterfaceRespectingRunMode();
         } else {
+            android.util.Log.i("Clay", "onNewIntent: nothing changed, resuming without reload");
             checkAndLoadInterface();
         }
+    }
+
+    /**
+     * True when the saved run mode / SSH configuration no longer matches what the running local
+     * server or tunnel was started with, or when SSH is enabled but its tunnel has since died.
+     * Extracted so onNewIntent can ask the question without committing to a reload; the reload
+     * path itself re-derives the same answer.
+     */
+    private boolean runModeOrSshConfigChanged() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String currentMode = prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE);
+        String lastMode = ClaySession.lastAppliedRunMode();
+        if (lastMode != null && !currentMode.equals(lastMode)) {
+            return true;
+        }
+        boolean sshEnabledNow = RUN_MODE_REMOTE.equals(currentMode) && prefs.getBoolean(KEY_SSH_ENABLED, false);
+        String currentSshSnapshot = sshEnabledNow ? sshConfigSnapshot(prefs) : null;
+        String lastSshSnapshot = ClaySession.lastAppliedSshConfigSnapshot();
+        boolean sshChanged = lastSshSnapshot != null
+            ? !lastSshSnapshot.equals(currentSshSnapshot)
+            : currentSshSnapshot != null;
+        if (sshChanged) {
+            return true;
+        }
+        // SSH config unchanged, but the tunnel itself may have died while we were away.
+        return sshEnabledNow && !ClaySession.isSshProxyRunning();
     }
 
     // Reloads the WebView. If the run mode changed since it was last applied, or the SSH tunnel
@@ -1902,34 +1952,33 @@ public class MainActivity extends AppCompatActivity {
         loadedInterfaceUrl = null;
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String currentMode = prefs.getString(KEY_RUN_MODE, RUN_MODE_REMOTE);
-        boolean modeChanged = lastAppliedRunMode != null && !currentMode.equals(lastAppliedRunMode);
+        String lastMode = ClaySession.lastAppliedRunMode();
+        boolean modeChanged = lastMode != null && !currentMode.equals(lastMode);
 
         boolean sshEnabledNow = RUN_MODE_REMOTE.equals(currentMode) && prefs.getBoolean(KEY_SSH_ENABLED, false);
         String currentSshSnapshot = sshEnabledNow ? sshConfigSnapshot(prefs) : null;
-        boolean sshChanged = lastAppliedSshConfigSnapshot != null
-            ? !lastAppliedSshConfigSnapshot.equals(currentSshSnapshot)
+        String lastSshSnapshot = ClaySession.lastAppliedSshConfigSnapshot();
+        boolean sshChanged = lastSshSnapshot != null
+            ? !lastSshSnapshot.equals(currentSshSnapshot)
             : currentSshSnapshot != null;
 
         if (modeChanged || sshChanged) {
             android.util.Log.i("Clay", "Run mode or SSH config changed, reloading");
-            if (localServerManager != null) {
-                localServerManager.stop();
-            }
-            if (sshProxyManager != null) {
-                sshProxyManager.stop();
-            }
+            // A genuine mode/config change makes the running server or tunnel wrong, so this
+            // is one of the few places a real teardown is correct.
+            ClaySession.shutdown();
             runModeFlowStarted = false;
             proceedAfterPermissions();
         } else {
             // SSH config is unchanged, but the tunnel itself may have died since it was last
             // started (e.g. a background-idle drop) - buildVarInjectionScript() decides
-            // isSshProxyMode from sshProxyManager.isRunning() at page-load time, so calling
+            // isSshProxyMode from the SSH proxy's isRunning() at page-load time, so calling
             // loadInterface() straight through here would silently fall back to a direct
             // (non-SSH) connection instead of reconnecting the tunnel. Route through the same
             // 3x-retry startup flow a fresh launch uses instead, so resync repairs the tunnel
             // (with its existing "Retry" dialog on genuine failure) rather than abandoning it.
             boolean sshNeedsRestart = sshEnabledNow
-                && (sshProxyManager == null || !sshProxyManager.isRunning());
+                && !ClaySession.isSshProxyRunning();
             if (sshNeedsRestart) {
                 android.util.Log.i("Clay", "SSH enabled but tunnel not running, restarting before reload");
                 runModeFlowStarted = false;
@@ -1943,6 +1992,9 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        android.util.Log.i("Clay", "LIFECYCLE onResume: interfaceLoaded=" + interfaceLoaded
+            + " localServerRunning=" + ClaySession.isLocalServerRunning()
+            + " sshProxyRunning=" + ClaySession.isSshProxyRunning());
 
         // Cancel background shutdown timer since user is back
         cancelBackgroundShutdownTimer();
@@ -2067,25 +2119,36 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        android.util.Log.i("Clay", "LIFECYCLE onDestroy: isFinishing=" + isFinishing()
+            + " changingConfigurations=" + isChangingConfigurations()
+            + " localServerRunning=" + ClaySession.isLocalServerRunning()
+            + " sshProxyRunning=" + ClaySession.isSshProxyRunning());
         stopKeepalive();
         stopHeartbeat();
         cancelBackgroundShutdownTimer();
         unregisterSshNetworkCallback(); // normally already done in onPause(); safe/idempotent
-        if (localServerManager != null) {
-            localServerManager.stop();
-        }
-        if (sshProxyManager != null) {
-            sshProxyManager.stop();
-        }
+        // Deliberately does NOT stop the local server or the SSH tunnel. Android destroys and
+        // recreates Activities routinely - Back, a notification tap, or an OEM reclaiming a
+        // backgrounded Activity - and tearing the session down here meant every one of those
+        // killed the bundled server (losing all in-memory world state) and dropped the tunnel,
+        // so returning to the app had to rebuild both and looked like a cold start. They are
+        // owned by ClaySession now and are stopped only when the session genuinely ends: the
+        // notification's Disconnect action, stopBackgroundService(), the background-shutdown
+        // timeout, or a real run-mode/SSH-config change.
         super.onDestroy();
     }
 
     @Override
     public void onBackPressed() {
-        if (webView.canGoBack()) {
+        if (webView != null && webView.canGoBack()) {
             webView.goBack();
-        } else {
-            super.onBackPressed();
+            return;
         }
+        // Background the task rather than finishing the Activity. super.onBackPressed() would
+        // finish it, and Clay is a session app kept alive by a foreground service - Back means
+        // "put it away", not "end my session". Finishing also ran onDestroy(), which used to
+        // take the local server and SSH tunnel with it. Matches what Home already does, so both
+        // routes out of the app now behave identically.
+        moveTaskToBack(true);
     }
 }

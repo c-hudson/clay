@@ -72,6 +72,12 @@ public class ClayForegroundService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         // Check if this is a stop request
         if (intent != null && ACTION_STOP_SERVICE.equals(intent.getAction())) {
+            // The notification's "Disconnect" button is the user explicitly ending the session,
+            // so this is where the local server and SSH tunnel are torn down. MainActivity's
+            // onDestroy() deliberately no longer does it - an Activity going away says nothing
+            // about whether the user is finished - which would otherwise leave the bundled
+            // server running with nothing left to talk to it.
+            ClaySession.shutdown();
             releaseWakeLocks();
             stopForeground(true);
             stopSelf();
@@ -79,8 +85,14 @@ public class ClayForegroundService extends Service {
         }
 
         // Create intent to open app when notification is tapped
+        // SINGLE_TOP alongside CLEAR_TOP so tapping the notification resumes the existing
+        // Activity via onNewIntent instead of destroying and recreating it. With the Activity
+        // declared singleTask this is belt-and-braces, but CLEAR_TOP on its own is exactly what
+        // used to force a full teardown-and-reload on every notification tap.
         Intent notificationIntent = new Intent(this, MainActivity.class);
-        notificationIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        notificationIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+            | Intent.FLAG_ACTIVITY_CLEAR_TOP
+            | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         PendingIntent pendingIntent = PendingIntent.getActivity(
             this, 0, notificationIntent,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE

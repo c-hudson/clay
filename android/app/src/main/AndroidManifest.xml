@@ -24,9 +24,19 @@
         android:theme="@style/Theme.Clay"
         android:networkSecurityConfig="@xml/network_security_config">
 
+        <!-- singleTask: returning to the app (launcher icon, notification tap, recents) must
+             reuse the running instance and deliver onNewIntent, not build a fresh one. Under the
+             default "standard" mode the notification's FLAG_ACTIVITY_CLEAR_TOP destroyed and
+             recreated this Activity every time, which is what made a switch-back look like a
+             cold start.
+             configChanges: the app owns a live session and a WebView, so an environment change
+             must not recreate the Activity. orientation/screenSize/keyboard were already
+             handled; uiMode (dark-mode toggle), density, fontScale, screenLayout,
+             smallestScreenSize, locale, layoutDirection and navigation were not. -->
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|keyboard|keyboardHidden"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection"
             android:exported="true"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>

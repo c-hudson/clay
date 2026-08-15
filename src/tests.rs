@@ -9851,7 +9851,7 @@ if you're more curious.\"";
         // Built from a real build_initial_state() rather than a hand-written stub, so this
         // exercises the message the server actually emits; the flag is then stripped to
         // simulate an older server that predates it.
-        let mut app = App::new();
+        let app = App::new();
         let state = app.build_initial_state(0);
         let mut encoded = serde_json::to_value(&state).expect("serializes");
 
