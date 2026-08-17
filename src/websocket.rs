@@ -1030,6 +1030,46 @@ pub struct TimestampedLine {
     pub display_id: Option<u64>,
 }
 
+impl TimestampedLine {
+    /// The wire form of a stored line. **Use this rather than building the struct by hand.**
+    ///
+    /// Every field here has to match what the same line looks like when it arrives by any
+    /// other route, because a client dedups and reasons across all of them. Hand-built
+    /// copies did not: the five scrollback/world-state sites in `main.rs` passed
+    /// `viewed: false, display_id: None` (placeholders from when Phase D added the fields)
+    /// while `build_initial_output_lines` passed the real values, and only that one stripped
+    /// `\r`.
+    ///
+    /// The `viewed: false` was user-visible. A world switch backfills, the backfilled lines
+    /// claim to be unviewed, so `claimUnviewedLocally()` takes ▶ ownership of all of them and
+    /// the whole screenful lights up — then the server's authoritative `ClaimedNew` claims
+    /// nothing (it has them viewed) and the markers vanish a round trip later. Only on the
+    /// *first* switch to a world, because the optimistic claim sets `viewed = true` on the
+    /// client's own copies as it goes.
+    ///
+    /// `display_id: None` was the other half: a line this client genuinely owns arrives with
+    /// its marker stripped, so real ▶ markers go missing depending on how the line was
+    /// delivered.
+    pub(crate) fn from_output_line(line: &crate::OutputLine) -> Self {
+        TimestampedLine {
+            // Prefix-free, same as live ServerData broadcasts - the "✨ " client-line marker
+            // is added at display time only.
+            text: line.text.replace('\r', ""),
+            ts: line.timestamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            gagged: line.gagged,
+            from_server: line.from_server,
+            seq: line.seq,
+            highlight_color: line.highlight_color.clone(),
+            from_archive: line.from_archive,
+            viewed: line.viewed,
+            display_id: line.display_id,
+        }
+    }
+}
+
 /// World state for WebSocket protocol
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorldStateMsg {

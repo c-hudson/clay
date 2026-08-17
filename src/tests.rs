@@ -6089,6 +6089,64 @@ if you're more curious.\"";
         assert!(backfill_complete, "must report exhausted: only 10 visible lines exist despite 20 raw lines returned");
     }
 
+    /// A scrollback reply must carry each line's real `viewed`/`display_id`, not placeholders.
+    ///
+    /// With `viewed: false` hardcoded, a world switch backfilled lines that claimed to be
+    /// unviewed, so app.js's `claimUnviewedLocally()` took ▶ ownership of the whole screenful
+    /// and the server's authoritative ClaimedNew (which claims nothing - it has them viewed)
+    /// revoked them a round trip later. That is the "▶ shows then disappears, but only the
+    /// first time I switch to a world" report. `display_id: None` was the other half: a line
+    /// this client genuinely owns arrived with its marker stripped.
+    #[test]
+    fn test_scrollback_reply_carries_real_viewed_and_display_id() {
+        use crate::websocket::{WsClientInfo, WebSocketServer, RemoteClientType, Outbound};
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("world0");
+        for seq in 1..=10u64 {
+            let mut line = OutputLine::new(format!("line {seq}"), seq);
+            // What the server actually holds after another viewer has been watching: viewed,
+            // and owned by display id 77.
+            line.viewed = true;
+            line.display_id = if seq % 2 == 0 { Some(77) } else { None };
+            world.output_lines.push(line);
+        }
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        let server = WebSocketServer::new("", 0, "*", None, false, BanList::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let client_id = 1u64;
+        {
+            let mut clients = server.clients.write().unwrap();
+            clients.insert(client_id, WsClientInfo {
+                authenticated: true, tx, current_world: None, username: None,
+                received_initial_state: true, client_type: RemoteClientType::Web,
+                viewport_height: 24, ip_address: "127.0.0.1".to_string(),
+                connected_at: std::time::Instant::now(), last_activity: std::time::Instant::now(),
+                paused: false, acked_seq: std::collections::HashMap::new(),
+                audit_prev_acked: std::collections::HashMap::new(),
+                audit_fired_at: std::collections::HashMap::new(),
+                audit_stall_ticks: std::collections::HashMap::new(),
+                push: None,
+                needs_resync: std::collections::HashSet::new(),
+            });
+        }
+        app.ws_server = Some(server);
+
+        app.handle_request_scrollback(client_id, 0, 10, None, Some(0), None);
+        let (lines, _) = drain_one_scrollback_reply(&mut rx);
+        assert!(!lines.is_empty(), "expected a scrollback reply with lines");
+        for line in &lines {
+            assert!(line.viewed,
+                "seq {} came back unviewed; the client would optimistically claim it and then \
+                 have the marker revoked (the ▶ flash on first switch to a world)", line.seq);
+            let expected = if line.seq % 2 == 0 { Some(77) } else { None };
+            assert_eq!(line.display_id, expected,
+                "seq {} lost its ▶ owner in the scrollback reply", line.seq);
+        }
+    }
+
     /// Same as the `before_seq` test above, but for `after_seq`'s forward (oldest-first) walk
     /// - the reconnect gap-fill direction.
     #[test]

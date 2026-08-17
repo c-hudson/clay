@@ -6317,21 +6317,7 @@ impl App {
             let start = total_lines.saturating_sub(lines_to_send);
             let lines: Vec<TimestampedLine> = live_lines[start..].iter()
                 .map(|line| {
-                    let ts = line.timestamp
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    TimestampedLine {
-                        text: line.text.clone(),
-                        ts,
-                        gagged: line.gagged,
-                        from_server: line.from_server,
-                        seq: line.seq,
-                        highlight_color: line.highlight_color.clone(),
-                        from_archive: line.from_archive,
-                        viewed: false,
-                        display_id: None,
-                    }
+                    TimestampedLine::from_output_line(line)
                 })
                 .collect();
 
@@ -6527,21 +6513,7 @@ impl App {
             let (range, visible_count) = Self::take_visible_range(&eligible, count, true, |l| l.gagged);
             let lines = eligible[range].iter()
                 .map(|line| {
-                    let ts = line.timestamp
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    TimestampedLine {
-                        text: line.text.clone(),
-                        ts,
-                        gagged: line.gagged,
-                        from_server: line.from_server,
-                        seq: line.seq,
-                        highlight_color: line.highlight_color.clone(),
-                        from_archive: line.from_archive,
-                        viewed: false,
-                        display_id: None,
-                    }
+                    TimestampedLine::from_output_line(line)
                 })
                 .collect();
             (lines, visible_count)
@@ -6576,21 +6548,7 @@ impl App {
             let (range, visible_count) = Self::take_visible_range(&eligible, count, false, |l| l.gagged);
             let lines = eligible[range].iter()
                 .map(|line| {
-                    let ts = line.timestamp
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    TimestampedLine {
-                        text: line.text.clone(),
-                        ts,
-                        gagged: line.gagged,
-                        from_server: line.from_server,
-                        seq: line.seq,
-                        highlight_color: line.highlight_color.clone(),
-                        from_archive: line.from_archive,
-                        viewed: false,
-                        display_id: None,
-                    }
+                    TimestampedLine::from_output_line(line)
                 })
                 .collect();
             (lines, visible_count)
@@ -6600,21 +6558,7 @@ impl App {
             let (range, visible_count) = Self::take_visible_range(&eligible, count, true, |l| l.gagged);
             let lines = eligible[range].iter()
                 .map(|line| {
-                    let ts = line.timestamp
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    TimestampedLine {
-                        text: line.text.clone(),
-                        ts,
-                        gagged: line.gagged,
-                        from_server: line.from_server,
-                        seq: line.seq,
-                        highlight_color: line.highlight_color.clone(),
-                        from_archive: line.from_archive,
-                        viewed: false,
-                        display_id: None,
-                    }
+                    TimestampedLine::from_output_line(line)
                 })
                 .collect();
             (lines, visible_count)
@@ -6700,17 +6644,7 @@ impl App {
             .iter()
             .rev()
             .take(100)
-            .map(|line| TimestampedLine {
-                text: line.text.clone(),
-                ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                gagged: line.gagged,
-                from_server: line.from_server,
-                seq: line.seq,
-                highlight_color: line.highlight_color.clone(),
-                from_archive: line.from_archive,
-                viewed: false,
-                display_id: None,
-            })
+            .map(|line| TimestampedLine::from_output_line(line))
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -11847,19 +11781,7 @@ impl App {
         let ts_lines = lines[range]
             .iter()
             .map(|s| {
-                // Text stays prefix-free here, same as live ServerData broadcasts - the
-                // "✨ " client-line marker is added at display time only.
-                TimestampedLine {
-                    text: s.text.replace('\r', ""),
-                    ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                    gagged: s.gagged,
-                    from_server: s.from_server,
-                    seq: s.seq,
-                    highlight_color: s.highlight_color.clone(),
-                    from_archive: s.from_archive,
-                    viewed: s.viewed,
-                    display_id: s.display_id,
-                }
+                TimestampedLine::from_output_line(s)
             })
             .collect();
         (ts_lines, visible_count)
