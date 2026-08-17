@@ -2926,6 +2926,15 @@ impl World {
     /// Falls back to a time/pid mix if the OS RNG is unavailable. Unlike an auth key this is
     /// not a secret — it only has to differ between process lifetimes — so degrading is
     /// correct here where failing closed would leave the world with no epoch at all.
+    ///
+    /// **Kept below 2^53 so it survives a round trip through a JavaScript client.** JSON
+    /// numbers are IEEE doubles there, so a full-width u64 epoch comes back changed: a real
+    /// one observed on the wire, 12245391822682352775, reads in JS as 12245391822682354000.
+    /// The client's own epoch checks never noticed - they compare two values it rounded
+    /// identically - but anything that sends the epoch *back* for an exact comparison
+    /// (`AuthRequest.resume_epochs`) silently never matches. 53 bits is still ~9x10^15
+    /// values, so two live worlds colliding is not a practical concern, and the sole
+    /// requirement is that a new sequence space differ from the one it replaced.
     fn new_seq_epoch() -> u64 {
         let mut bytes = [0u8; 8];
         if getrandom::getrandom(&mut bytes).is_err() {
@@ -2935,7 +2944,9 @@ impl World {
                 .as_nanos() as u64;
             bytes = (nanos ^ ((std::process::id() as u64) << 32)).to_le_bytes();
         }
-        let v = u64::from_le_bytes(bytes);
+        // Mask, don't modulo: any bit pattern is equally good here, and masking keeps the
+        // distribution uniform without a bias correction.
+        let v = u64::from_le_bytes(bytes) & ((1u64 << 53) - 1);
         if v == 0 { 1 } else { v }
     }
 
@@ -9896,7 +9907,7 @@ impl App {
     /// each named world via the same path `RequestScrollback{ after_seq }` uses
     /// (`handle_request_scrollback`). Empty `resume` (old clients, or a client with no
     /// prior state) leaves behavior exactly as before this step.
-    fn handle_ws_auth_initial_state(&mut self, client_id: u64, current_world: Option<usize>, resume: Vec<(usize, u64)>) {
+    fn handle_ws_auth_initial_state(&mut self, client_id: u64, current_world: Option<usize>, resume: Vec<(usize, u64)>, resume_epochs: Vec<(usize, u64)>) {
         // Debug: log current world state for reload message diagnosis
         let cw = self.current_world_index;
         if cw < self.worlds.len() {
@@ -9914,7 +9925,9 @@ impl App {
                 ));
             }
         }
-        let initial_state = self.build_initial_state(self.display_owner_id(client_id));
+        let initial_state =
+            self.build_initial_state_with_resume(self.display_owner_id(client_id), &resume_epochs);
+        self.log_initial_state_resume_skip(&resume, &resume_epochs, &initial_state);
         self.ws_send_initial_state_and_mark(client_id, initial_state);
         let world_idx = current_world
             .filter(|&w| w < self.worlds.len())
@@ -11154,6 +11167,11 @@ impl App {
         } else {
             Vec::new()
         };
+        let auth_resume_epochs = if let WsMessage::AuthRequest { ref resume_epochs, .. } = msg {
+            resume_epochs.clone()
+        } else {
+            Vec::new()
+        };
         let auth_client_uid = if let WsMessage::AuthRequest { ref client_uid, .. } = msg {
             client_uid.clone()
         } else {
@@ -11164,7 +11182,7 @@ impl App {
                 // Record the stable ownership id BEFORE building InitialState, so the
                 // your_display_id it reports matches what any claim will stamp on lines.
                 self.set_display_owner_id(client_id, &auth_client_uid);
-                self.handle_ws_auth_initial_state(client_id, auth_current_world, auth_resume);
+                self.handle_ws_auth_initial_state(client_id, auth_current_world, auth_resume, auth_resume_epochs);
             }
             WsMessage::ClientVisibility { visible } => {
                 self.handle_client_visibility(client_id, visible);
@@ -11852,6 +11870,67 @@ impl App {
     /// well-defined; it lets the receiving client tell its own markers from another
     /// instance's on the very same lines.
     fn build_initial_state(&self, your_display_id: u64) -> WsMessage {
+        self.build_initial_state_with_resume(your_display_id, &[])
+    }
+
+    /// Debug-only record of how much of an `InitialState` the client's own buffer let us
+    /// skip. Shared by the master-WS path (`handle_ws_auth_initial_state`) and the `-D`
+    /// daemon's dispatcher, which have separate AuthRequest handlers - the whole point of
+    /// this line is to confirm the skip is happening in the field, so it must not be
+    /// present on only one of the two paths.
+    ///
+    /// `worlds_skipped=0` alongside a non-empty `resume` is the signature of an epoch
+    /// mismatch: the client asked to resume but its buffers name a different sequence
+    /// space, so the full history was sent (correctly).
+    pub(crate) fn log_initial_state_resume_skip(
+        &self,
+        resume: &[(usize, u64)],
+        resume_epochs: &[(usize, u64)],
+        initial_state: &WsMessage,
+    ) {
+        if !is_debug_enabled() {
+            return;
+        }
+        let skipped = self.worlds.iter().enumerate().filter(|(i, w)| {
+            w.seq_epoch != 0 && resume_epochs.iter().any(|&(ri, e)| ri == *i && e == w.seq_epoch)
+        }).count();
+        let lines: usize = if let WsMessage::InitialState { ref worlds, .. } = initial_state {
+            worlds.iter().map(|w| w.output_lines_ts.len()).sum()
+        } else {
+            0
+        };
+        debug_log(true, &format!(
+            "AUTH_INITIAL_STATE: resume={} resume_epochs={} worlds_skipped={}/{} lines_sent={}",
+            resume.len(), resume_epochs.len(), skipped, self.worlds.len(), lines));
+    }
+
+    /// `resume_epochs`: the `AuthRequest.resume_epochs` payload, i.e. per-world
+    /// `(world_index, seq_epoch)` for the buffers the client says it still holds.
+    ///
+    /// A world whose entry matches this server's `World::seq_epoch` gets **no** history
+    /// lines here. That is not an optimization gamble - it is what the client does with
+    /// them: app.js's InitialState handler hydrates a resumed world from its own
+    /// in-memory buffer (`world.output_lines = dedupBySeq(priorWorld.output_lines)`) and
+    /// never reads `output_lines_ts` for it. So the lines were being serialized, shipped
+    /// and parsed only to be dropped. With `remote_initial_lines` at its 5000 default,
+    /// that was the entire aggregate budget, on every reconnect - and Android reconnects
+    /// on every resume from background.
+    ///
+    /// Matching epochs is what makes the skip safe, in both directions:
+    /// - Wrong world at that index (worlds added/removed since the client recorded its
+    ///   frontier): epochs differ, so the history is sent.
+    /// - Client about to discard its own buffer: it does that *because* the epoch
+    ///   changed, which is the same condition, so the history is sent.
+    ///
+    /// Anything the client is genuinely missing still arrives - the resume replay in
+    /// `handle_ws_auth_initial_state` pushes everything after its frontier, and that path
+    /// is unchanged. An empty `resume_epochs` (older client, or multiuser where
+    /// `seq_epoch` is a hardcoded 0) skips nothing and behaves exactly as before.
+    fn build_initial_state_with_resume(
+        &self,
+        your_display_id: u64,
+        resume_epochs: &[(usize, u64)],
+    ) -> WsMessage {
         // Send only the most recent lines in InitialState for fast initial load.
         // Clients backfill remaining history via RequestScrollback after rendering.
         let per_world_cap = self.settings.remote_initial_lines.max(1) as usize;
@@ -11870,7 +11949,18 @@ impl App {
         let mut budget_remaining = total_line_budget;
 
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
-            let max_initial_lines = per_world_cap.min(budget_remaining);
+            // The client already holds this world's buffer and will keep it (see this
+            // method's doc comment) - send the metadata, skip the history. A 0 epoch is
+            // never a match: it is the "no epoch" value (multiuser, and any world whose
+            // sequence space predates the field), and treating it as one would let two
+            // unrelated worlds compare equal.
+            let client_holds_this_world = world.seq_epoch != 0
+                && resume_epochs.iter().any(|&(i, epoch)| i == idx && epoch == world.seq_epoch);
+            let max_initial_lines = if client_holds_this_world {
+                0
+            } else {
+                per_world_cap.min(budget_remaining)
+            };
             // Create timestamped versions (add sparkle prefix for client-generated messages)
             // Only include output_lines - pending_lines stay on the server and are
             // released via PgDn/Tab, then broadcast to clients normally.
@@ -16050,8 +16140,8 @@ pub async fn run_app_headless(
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
-                        if let WsMessage::AuthRequest { current_world, resume, .. } = &*msg {
-                            app.handle_ws_auth_initial_state(client_id, *current_world, resume.clone());
+                        if let WsMessage::AuthRequest { current_world, resume, resume_epochs, .. } = &*msg {
+                            app.handle_ws_auth_initial_state(client_id, *current_world, resume.clone(), resume_epochs.clone());
                             if app.web_reconnect_needed {
                                 app.web_reconnect_needed = false;
                                 if app.trigger_web_reconnects() {

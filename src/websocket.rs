@@ -249,6 +249,29 @@ pub enum WsMessage {
                                      // has, so the server can replay exactly the gap on reconnect.
                                      // See PROTOCOL-ROADMAP.md Step 2 (single-user) and Step 6a
                                      // (multiuser, owner-scoped).
+        /// Per-world `(world_index, seq_epoch)` for the buffers `resume` was built from -
+        /// the client's copy of `World::seq_epoch` as it last saw it.
+        ///
+        /// Exists so `build_initial_state` can skip re-sending history the client is
+        /// about to throw away. On an in-memory reconnect the client keeps its own buffer
+        /// (`world.output_lines = dedupBySeq(priorWorld.output_lines)` in app.js's
+        /// InitialState handler) and discards `output_lines_ts` entirely - so for a
+        /// resumed world those lines are pure waste, and with `remote_initial_lines`
+        /// at its 5000 default that is the whole budget being spent to be ignored.
+        ///
+        /// The epoch, not the index, is what makes the skip safe. It answers "is the world
+        /// at this index the same world instance the client is talking about?", which the
+        /// index alone cannot: worlds get added and removed, so index N may name a
+        /// different world than it did when the client recorded its frontier. It also
+        /// covers the case where the client discards its own buffer on arrival - it does
+        /// that precisely when the epoch differs, which is exactly when the server keeps
+        /// sending the history. Matching epochs means both sides agree the buffer stands.
+        ///
+        /// Empty from an older client (and always empty in multiuser, where `seq_epoch` is
+        /// a hardcoded 0), in which case nothing is skipped and the full history is sent
+        /// exactly as before.
+        #[serde(default)]
+        resume_epochs: Vec<(usize, u64)>,
         /// Stable, client-generated identity that survives reconnects (localStorage on
         /// web/Android, a per-process value on the Rust console). ▶ ownership
         /// (`OutputLine::display_id`) is keyed on this rather than the per-connection client
@@ -2682,7 +2705,7 @@ where
         };
         try_send_local(&clients, client_id, &tx, &client_ip, response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), client_uid: String::new() }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new() }))).await;
     }
 
     // Combined receive/send/keepalive loop.

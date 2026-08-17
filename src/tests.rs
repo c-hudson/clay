@@ -399,7 +399,7 @@
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), client_uid: String::new() };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new() };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
@@ -1168,7 +1168,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
         };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
@@ -1275,7 +1275,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
         };
         sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap())).await.unwrap();
         let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
@@ -1296,7 +1296,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
         };
         sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap())).await.unwrap();
         let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
@@ -1424,7 +1424,7 @@
             auth_key: Some("test_key".to_string()),
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
         };
         let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string(), "test_challenge".to_string());
 
@@ -1490,7 +1490,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
 
@@ -6159,6 +6159,163 @@ if you're more curious.\"";
         result.expect("expected a ScrollbackLines reply")
     }
 
+    /// A world's seq epoch must survive a round trip through a JavaScript client, which
+    /// parses JSON numbers as IEEE doubles. A full-width u64 does not: 12245391822682352775
+    /// (a real epoch seen on the wire) comes back as 12245391822682354000, so
+    /// `AuthRequest.resume_epochs` could never match and the InitialState skip silently
+    /// never fired. Caught only by running the real Android client against a real server.
+    #[test]
+    fn test_seq_epoch_is_representable_in_javascript() {
+        const MAX_SAFE: u64 = (1u64 << 53) - 1;
+        for _ in 0..2000 {
+            let epoch = World::new("w").seq_epoch;
+            assert_ne!(epoch, 0, "0 is the reserved 'no epoch' value");
+            assert!(epoch <= MAX_SAFE,
+                "epoch {epoch} exceeds JS's exact-integer range ({MAX_SAFE}) and would be \
+                 rounded by any browser/WebView client");
+            // The property that actually matters: f64 round-trip is lossless.
+            assert_eq!(epoch as f64 as u64, epoch, "epoch {epoch} does not survive an f64 round trip");
+        }
+    }
+
+    /// A reconnecting client that still holds a world's buffer must not be re-sent that
+    /// world's history. app.js hydrates a resumed world from its own in-memory buffer and
+    /// never reads `output_lines_ts` for it, so those lines were serialized, shipped and
+    /// parsed only to be dropped - the whole `remote_initial_lines` budget, on every
+    /// reconnect, and Android reconnects on every resume from background.
+    #[test]
+    fn test_initial_state_skips_history_for_worlds_the_client_still_holds() {
+        let mut app = App::new();
+        app.worlds.clear();
+
+        let mut world0 = World::new("held");
+        for seq in 0..300u64 {
+            world0.output_lines.push(OutputLine::new(format!("held {seq}"), seq));
+        }
+        let held_epoch = world0.seq_epoch;
+        assert_ne!(held_epoch, 0, "a live world must have a real seq epoch");
+        app.worlds.push(world0);
+
+        let mut world1 = World::new("fresh");
+        for seq in 0..300u64 {
+            world1.output_lines.push(OutputLine::new(format!("fresh {seq}"), seq));
+        }
+        app.worlds.push(world1);
+        app.current_world_index = 0;
+
+        // The client resumes world 0 only, and its epoch matches.
+        let state = app.build_initial_state_with_resume(0, &[(0, held_epoch)]);
+        let WsMessage::InitialState { worlds, .. } = state else {
+            panic!("expected InitialState");
+        };
+
+        assert!(worlds[0].output_lines_ts.is_empty(),
+            "world 0 is held by the client - its history must not be re-sent, got {} lines",
+            worlds[0].output_lines_ts.len());
+        assert!(!worlds[1].output_lines_ts.is_empty(),
+            "world 1 was not resumed - it must still get its history");
+
+        // The metadata a client needs is still present for the skipped world: the skip is
+        // about the line payload only.
+        assert_eq!(worlds[0].name, "held");
+        assert_eq!(worlds[0].total_output_lines, 300,
+            "a skipped world must still report how much history the server holds, or the \
+             client cannot tell there is anything to backfill");
+        assert_eq!(worlds[0].seq_epoch, held_epoch);
+    }
+
+    /// The skip is keyed on the epoch, not the index, because the index alone cannot answer
+    /// "is this the same world instance the client means?" - worlds get added and removed,
+    /// so index N may name a different world than when the client recorded its frontier.
+    /// Skipping on a stale index would leave that world empty on the client.
+    #[test]
+    fn test_initial_state_does_not_skip_when_the_epoch_does_not_match() {
+        let mut app = App::new();
+        app.worlds.clear();
+
+        let mut world0 = World::new("world0");
+        for seq in 0..300u64 {
+            world0.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        let real_epoch = world0.seq_epoch;
+        app.worlds.push(world0);
+        app.current_world_index = 0;
+
+        // Right index, wrong world: the client's buffer belongs to some other sequence space.
+        let state = app.build_initial_state_with_resume(0, &[(0, real_epoch.wrapping_add(1))]);
+        let WsMessage::InitialState { worlds, .. } = state else {
+            panic!("expected InitialState");
+        };
+        assert!(!worlds[0].output_lines_ts.is_empty(),
+            "a mismatched epoch means the client does not hold this world - history must be sent");
+
+        // 0 is the "no epoch" value (multiuser, pre-epoch worlds). It must never match, or
+        // two unrelated worlds would compare equal.
+        app.worlds[0].seq_epoch = 0;
+        let state = app.build_initial_state_with_resume(0, &[(0, 0)]);
+        let WsMessage::InitialState { worlds, .. } = state else {
+            panic!("expected InitialState");
+        };
+        assert!(!worlds[0].output_lines_ts.is_empty(),
+            "epoch 0 means 'unknown', not 'matches' - history must be sent");
+    }
+
+    /// A skipped world must not consume the aggregate cross-world budget - it spent nothing,
+    /// so the worlds that DO need history should get the full budget between them.
+    #[test]
+    fn test_skipped_world_does_not_consume_the_initial_state_budget() {
+        let mut app = App::new();
+        app.worlds.clear();
+
+        let per_world_cap = app.settings.remote_initial_lines.max(1) as usize;
+
+        let mut held = World::new("held");
+        for seq in 0..(per_world_cap as u64 * 2) {
+            held.output_lines.push(OutputLine::new(format!("held {seq}"), seq));
+        }
+        let held_epoch = held.seq_epoch;
+        app.worlds.push(held);
+
+        let mut fresh = World::new("fresh");
+        for seq in 0..(per_world_cap as u64 * 2) {
+            fresh.output_lines.push(OutputLine::new(format!("fresh {seq}"), seq));
+        }
+        app.worlds.push(fresh);
+        app.current_world_index = 0;
+
+        let state = app.build_initial_state_with_resume(0, &[(0, held_epoch)]);
+        let WsMessage::InitialState { worlds, .. } = state else {
+            panic!("expected InitialState");
+        };
+        assert!(worlds[0].output_lines_ts.is_empty());
+        assert_eq!(worlds[1].output_lines_ts.len(), per_world_cap,
+            "the un-held world must still get its full per-world cap - the skipped world \
+             consumed none of the shared budget");
+    }
+
+    /// Plain `build_initial_state` (RequestState, the console/GUI attach path, a first
+    /// connect) sends no resume list at all and must therefore be completely unaffected.
+    #[test]
+    fn test_initial_state_without_resume_is_unchanged() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world0 = World::new("world0");
+        for seq in 0..50u64 {
+            world0.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.worlds.push(world0);
+        app.current_world_index = 0;
+
+        let WsMessage::InitialState { worlds: with_empty, .. } =
+            app.build_initial_state_with_resume(0, &[]) else { panic!("expected InitialState") };
+        let WsMessage::InitialState { worlds: plain, .. } =
+            app.build_initial_state(0) else { panic!("expected InitialState") };
+
+        assert_eq!(with_empty[0].output_lines_ts.len(), 50);
+        assert_eq!(plain[0].output_lines_ts.len(), with_empty[0].output_lines_ts.len(),
+            "build_initial_state must stay exactly build_initial_state_with_resume(&[])");
+    }
+
     /// `build_initial_state`'s aggregate cross-world budget must be spent only on VISIBLE
     /// lines - a world heavy with gagged content (active /gag rules, watchdog spam
     /// suppression) must not starve OTHER worlds' share of the budget just because its own
@@ -6380,7 +6537,7 @@ if you're more curious.\"";
 
         // Reconnect: the client already has seq 1..=7 (last_contiguous_seq = 7), so
         // resume replay should send back exactly seq 8, 9, 10, oldest-first.
-        app.handle_ws_auth_initial_state(client_id, Some(0), vec![(0, 7)]);
+        app.handle_ws_auth_initial_state(client_id, Some(0), vec![(0, 7)], Vec::new());
 
         let mut scrollback_lines = None;
         // ScrollbackLines is a single-recipient send, so Outbound::Message
@@ -6803,7 +6960,7 @@ if you're more curious.\"";
         }
         app.ws_server = Some(server);
 
-        app.handle_ws_auth_initial_state(client_id, Some(0), Vec::new());
+        app.handle_ws_auth_initial_state(client_id, Some(0), Vec::new(), Vec::new());
 
         let mut saw_scrollback = false;
         let mut saw_initial_state = false;

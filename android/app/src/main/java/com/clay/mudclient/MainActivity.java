@@ -315,6 +315,22 @@ public class MainActivity extends AppCompatActivity {
         }
 
         /**
+         * Lets app.js record a lifecycle event of its own, into the same buffer the Java
+         * side uses (and therefore out to the server's remote.log as CLIENT-LIFECYCLE on
+         * the next flush). Exists for the resume path: whether a return from background
+         * reuses the live socket or throws it away and reconnects is a decision made
+         * entirely in JS, from state only JS can see, and on a phone with no adb attached
+         * the server log is the only place that answer can surface.
+         */
+        @JavascriptInterface
+        public void recordClientEvent(String event, String detail) {
+            if (event == null || event.isEmpty()) {
+                return;
+            }
+            recordLifecycle(event, detail == null ? "" : detail);
+        }
+
+        /**
          * Drain the buffered lifecycle events for reporting to the server. Returns them
          * newline-separated ("event\tdetail" per line), empty string when there are none.
          * Draining (rather than peeking) means each event is reported exactly once even

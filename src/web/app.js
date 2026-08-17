@@ -879,6 +879,31 @@
     // Builds the AuthRequest.resume list AND records it into resumeSentThisConnection -
     // used only at AuthRequest send sites. PongCheck.acked reuses buildResumeAckList()
     // directly without recording, since a periodic keepalive ack is not a resume request.
+    // Per-world seq_epoch for the same worlds buildResumeAckList() reports a frontier for,
+    // sent as AuthRequest.resume_epochs. The server uses it to skip re-sending history we
+    // already hold and are about to keep (see App::build_initial_state_with_resume): on an
+    // in-memory reconnect the InitialState handler hydrates a resumed world from
+    // priorWorld.output_lines and never reads its output_lines_ts, so those lines were
+    // being shipped only to be dropped.
+    //
+    // The `contiguousFrontier(world) > 0` test MUST stay identical to buildResumeAckList's.
+    // The server skips history for exactly the worlds named here, and the missing tail is
+    // covered by the resume replay, which fires for exactly the worlds named in `resume`.
+    // A world in this list but not in that one would be skipped with nothing replayed to
+    // cover it - i.e. an empty world. Same predicate, same set, no such world.
+    //
+    // A world with no recorded epoch is omitted rather than sent as 0: 0 is the server's
+    // "no epoch" value, and it must not compare equal to anything.
+    function buildResumeEpochList() {
+        const list = [];
+        worlds.forEach((world, idx) => {
+            if (contiguousFrontier(world) > 0 && world._seq_epoch) {
+                list.push([idx, world._seq_epoch]);
+            }
+        });
+        return list;
+    }
+
     function buildResumeAckListForAuthRequest() {
         const list = buildResumeAckList();
         resumeSentThisConnection = new Map();
@@ -1021,7 +1046,29 @@
     // a repeat. handle_client_visibility early-returns on a repeat and sends no ClaimedNew,
     // so the optimistic claim below must fire only when the server will actually act.
     let lastSentVisibility = null;
+
+    // When we last went to the background, so a resume can report how long it was away.
+    // Null until the first backgrounding, which reads as awayMs=-1 rather than a bogus age.
+    let lastHiddenAt = null;
+
+    // Record a client-side lifecycle event into Android's buffer, so it reaches the server's
+    // remote.log as CLIENT-LIFECYCLE on the next flush (see MainActivity.recordClientEvent).
+    // Buffered rather than sent directly because the events worth recording happen exactly
+    // when there is no usable socket to send them on. A no-op off Android, and on an older
+    // Android build whose bridge lacks the method.
+    function recordClientEvent(event, detail) {
+        try {
+            if (window.Android && typeof window.Android.recordClientEvent === 'function') {
+                window.Android.recordClientEvent(event, detail);
+            }
+        } catch (e) { /* diagnostics must never break the path they are reporting on */ }
+    }
+
     function sendClientVisibility(visible) {
+        // Stamped before the socket check on purpose: the case worth measuring is a resume
+        // that found no usable socket, and if this only ran when one was open, awayMs would
+        // be missing from exactly those reports.
+        if (!visible) lastHiddenAt = Date.now();
         try {
             if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
                 const next = !!visible;
@@ -1974,7 +2021,7 @@
         setTimeout(hideConnectionLog, 800);
 
         if (window.AUTO_PASSWORD) {
-            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), client_uid: clientUid }));
+            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_uid: clientUid }));
             return;
         }
 
@@ -5311,7 +5358,7 @@
             auth_key: keyValue,
             challenge_response: usesChallenge,
             request_key: false,
-            resume: buildResumeAckListForAuthRequest(),
+            resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(),
             client_uid: clientUid
         };
         if (currentWorldIndex !== undefined) {
@@ -5381,7 +5428,7 @@
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
             const challengeHash = serverChallenge ? await hashPassword(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), client_uid: clientUid };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_uid: clientUid };
             if (username) {
                 msg.username = username;
             }
@@ -5394,7 +5441,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             const challengeHash = serverChallenge ? sha256Fallback(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), client_uid: clientUid };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_uid: clientUid };
             if (username) {
                 msg.username = username;
             }
@@ -13085,6 +13132,17 @@
     // silent TCP death, etc.) and the visibilitychange event may not fire.
     window.checkConnectionOnResume = function() {
         debugLog('checkConnectionOnResume: ws=' + (ws ? ws.readyState : 'null') + ' auth=' + authenticated + ' wakeStateCleared=' + wakeStateCleared);
+        // Report what the socket looked like on return, and what we decided to do about it.
+        // A reconnect here is expensive and user-visible, and the two causes need different
+        // fixes: readyState 3 (CLOSED) means something outside the page killed the socket
+        // while we were away, whereas OPEN-and-authenticated followed by a `pongTimeout`
+        // event means the socket looked fine but the server never answered. On a phone with
+        // no adb attached this is the only way to tell them apart.
+        recordClientEvent('resumeCheck', 'ws=' + (ws ? ws.readyState : 'null')
+            + ' auth=' + authenticated
+            + ' wakeCheckInFlight=' + wakeStateCleared
+            + ' connectInProgress=' + connectInProgress
+            + ' awayMs=' + (lastHiddenAt ? (Date.now() - lastHiddenAt) : -1));
         // If visibilitychange (or an earlier checkConnectionOnResume call) already started
         // a wake check, defer — let it resolve. wakeStateCleared acts as the mutex.
         if (wakeStateCleared) {
@@ -13102,6 +13160,8 @@
         }
         if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
             // Connection is dead, reconnect
+            recordClientEvent('resumeReconnect', 'reason=socketClosed ws='
+                + (ws ? ws.readyState : 'null'));
             forceReconnect();
         } else if (ws.readyState === WebSocket.CONNECTING) {
             // Stale connecting attempt, kill and retry
@@ -13128,6 +13188,7 @@
                 wakePongTimeout = null;
                 wakeStateCleared = false;
                 // Pong never arrived — connection is stale; clear visual state then reconnect
+                recordClientEvent('resumeReconnect', 'reason=pongTimeout');
                 authenticated = false;
                 Object.keys(worlds).forEach(function(k) {
                     if (worlds[k]) worlds[k].connected = false;

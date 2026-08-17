@@ -60,6 +60,13 @@ pub async fn run_daemon_server() -> io::Result<()> {
         eprintln!("Warning: Could not load settings: {}", e);
     }
 
+    // Apply the loaded debug flag to the process-wide gate every is_debug_enabled() call
+    // reads. Without this, `debug_enabled=true` in settings.dat was honoured by every other
+    // mode but silently ignored in -D: the setting was loaded into app.settings, and every
+    // debug_log(is_debug_enabled(), ..) call site still saw the AtomicBool's `false`
+    // default, so a daemon could never be asked to produce a debug log at all.
+    crate::DEBUG_ENABLED.store(app.settings.debug_enabled, std::sync::atomic::Ordering::Relaxed);
+
     // Pre-compile action regexes after loading settings
     crate::compile_all_action_regexes(&mut app.settings.actions);
 
@@ -334,9 +341,13 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         // Check if this is an AuthRequest (client just authenticated)
-                        if let WsMessage::AuthRequest { ref resume, .. } = *msg {
-                            // Send initial state after successful authentication
-                            let initial_state = app.build_initial_state(app.display_owner_id(client_id));
+                        if let WsMessage::AuthRequest { ref resume, ref resume_epochs, .. } = *msg {
+                            // Send initial state after successful authentication. Skips the
+                            // history for worlds the client still holds - see
+                            // App::build_initial_state_with_resume.
+                            let initial_state = app.build_initial_state_with_resume(
+                                app.display_owner_id(client_id), resume_epochs);
+                            app.log_initial_state_resume_skip(resume, resume_epochs, &initial_state);
                             app.ws_send_initial_state_and_mark(client_id, initial_state);
                             // Resume-driven replay (PROTOCOL-ROADMAP.md Step 2): reuse the
                             // exact same gap-fill logic RequestScrollback{after_seq} already
@@ -4083,7 +4094,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(1, 0)], client_uid: String::new(),
+            resume: vec![(1, 0)], resume_epochs: Vec::new(), client_uid: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);
@@ -4139,7 +4150,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(0, 7)], client_uid: String::new(),
+            resume: vec![(0, 7)], resume_epochs: Vec::new(), client_uid: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);
