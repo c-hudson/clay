@@ -980,6 +980,31 @@
     // Report this client's visibility to the server (WsMessage::ClientVisibility). Guarded
     // on an open, authenticated socket: before auth the server has no ClientViewState for us
     // to act on, and the InitialState that follows reports the correct state anyway.
+    // Forward any buffered Android lifecycle events to the server, where they land in
+    // ~/.clay/remote.log as CLIENT-LIFECYCLE (WsMessage::ReportClientLifecycle).
+    //
+    // This is how "did the app resume or rebuild itself?" gets answered on a phone that is
+    // never going to be plugged into adb: the evidence arrives in the *desktop's* log. Java
+    // buffers the events because the most telling one (onCreate) happens long before there is
+    // a socket to send it on; draining here means each is reported exactly once.
+    function flushAndroidLifecycleEvents() {
+        try {
+            if (!window.Android || typeof window.Android.takeLifecycleEvents !== 'function') return;
+            const blob = window.Android.takeLifecycleEvents();
+            if (!blob) return;
+            for (const line of String(blob).split('\n')) {
+                if (!line) continue;
+                const tab = line.indexOf('\t');
+                send({
+                    type: 'ReportClientLifecycle',
+                    event: tab < 0 ? line : line.slice(0, tab),
+                    detail: tab < 0 ? '' : line.slice(tab + 1),
+                    source: 'android'
+                });
+            }
+        } catch (e) { /* diagnostics must never break the session */ }
+    }
+
     // Drop the Android foreground service. Only call this when the session is genuinely over
     // (the user disconnected, or reconnection has been abandoned) - never on a transient
     // failure. The service is what stops Android reclaiming the process, so killing it during a
@@ -1003,6 +1028,10 @@
                 const transition = lastSentVisibility !== next;
                 ws.send(JSON.stringify({ type: 'ClientVisibility', visible: next }));
                 lastSentVisibility = next;
+                // Android drives this from onPause/onResume (see MainActivity.notifyVisibility),
+                // so it is the natural moment to ship any lifecycle events recorded since the
+                // last flush - no separate timer or bridge call needed.
+                flushAndroidLifecycleEvents();
                 // Coming back to the foreground re-claims whatever arrived while we were away
                 // (backgrounding drops our markers but leaves the lines viewed, so only truly
                 // new text is in play). Claim it before the resume repaint for the same reason
@@ -2589,6 +2618,10 @@
                     if (window.Android && window.Android.startBackgroundService) {
                         window.Android.startBackgroundService();
                     }
+                    // Now that the socket is authenticated, report whatever lifecycle events
+                    // Java buffered while there was nothing to report them on - including the
+                    // onCreate that says whether this was a resume or a rebuild.
+                    flushAndroidLifecycleEvents();
                 } else {
                     // If this was a key-based auth failure, show password prompt with key visible
                     if (authKeyPending) {
@@ -8491,6 +8524,10 @@
         const clayServerTabBtn = document.getElementById('settings-clay-server-btn');
         if (clayServerTabBtn) clayServerTabBtn.style.display = isAndroid ? '' : 'none';
         // Open in Browser button is visible in all interfaces (not Android-only)
+        // Share Logs is an Android bridge (the logs are in app-private storage there); on web
+        // and the desktop GUI the same files are simply on the machine you are already using.
+        const shareLogsRow = document.getElementById('cs-share-logs-row');
+        if (shareLogsRow) shareLogsRow.style.display = isAndroid ? '' : 'none';
         // Show auth key Download button only in Android app (starts disabled until connected)
         const dlBtn = document.getElementById('cs-auth-key-download');
         if (dlBtn) {
@@ -12516,6 +12553,22 @@
         // Migrated from the now-deleted SettingsActivity.java's "Clear Pinned
         // Certificates" button - same CertPinning.clearAllPins() call, now reachable
         // from the clay-server settings tab instead of the dead native Settings screen.
+        var csShareLogsBtn = document.getElementById('cs-share-logs-btn');
+        if (csShareLogsBtn) {
+            csShareLogsBtn.onclick = function() {
+                var status = document.getElementById('cs-share-logs-status');
+                if (!window.Android || !window.Android.shareLogs) {
+                    if (status) { status.textContent = 'Only available in the Android app.'; status.style.display = ''; }
+                    return;
+                }
+                // shareLogs() reports what it found (or why it found nothing) synchronously and
+                // opens the share sheet on the UI thread - surface that rather than leaving a
+                // silent button when there are no logs to send.
+                var msg = window.Android.shareLogs();
+                if (status) { status.textContent = msg || ''; status.style.display = msg ? '' : 'none'; }
+            };
+        }
+
         var csClearPinsBtn = document.getElementById('cs-clear-pins-btn');
         if (csClearPinsBtn) {
             csClearPinsBtn.onclick = function() {

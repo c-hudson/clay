@@ -11573,6 +11573,14 @@ impl App {
                     source, world_name, hole_start, hole_end,
                     hole_end.saturating_sub(hole_start).saturating_add(1), attempts));
             }
+            WsMessage::ReportClientLifecycle { event, detail, source } => {
+                // Always-on, same reasoning as the sibling reports above: this only fires on an
+                // actual Android lifecycle transition, and it is the one signal that says
+                // whether the app resumed or rebuilt itself. Landing it in the server's
+                // remote.log is what makes that answerable without adb on the phone.
+                let ip = self.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+                crate::http::log_remote_event("CLIENT-LIFECYCLE", &ip, &format!("[{}] {}: {}", source, event, detail));
+            }
             WsMessage::ClientTypeDeclaration { client_type } => {
                 // Update client type in WebSocket server
                 self.ws_set_client_type(client_id, client_type);

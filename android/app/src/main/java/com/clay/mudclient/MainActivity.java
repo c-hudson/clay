@@ -144,6 +144,31 @@ public class MainActivity extends AppCompatActivity {
     // the process survived (the case this bug was about); back to 1 after a real process death.
     private static int activityCreateCount = 0;
 
+    // Lifecycle events waiting to be reported to the server (WsMessage::ReportClientLifecycle).
+    //
+    // Buffered rather than sent directly because the most diagnostic event of all - onCreate,
+    // i.e. "the Activity was rebuilt" - happens before the WebView exists, let alone an
+    // authenticated socket. JS drains this via takeLifecycleEvents() once connected. Static so
+    // it survives the Activity recreation it is there to report; bounded so a client that never
+    // connects cannot grow it without limit.
+    private static final int LIFECYCLE_BUFFER_MAX = 40;
+    private static final java.util.ArrayDeque<String> lifecycleEvents = new java.util.ArrayDeque<>();
+
+    /**
+     * Record a lifecycle transition: to logcat (for anyone who does have a cable) and to the
+     * buffer above, so it reaches the server's ~/.clay/remote.log as CLIENT-LIFECYCLE.
+     */
+    private static void recordLifecycle(String event, String detail) {
+        android.util.Log.i("Clay", "LIFECYCLE " + event + ": " + detail);
+        synchronized (lifecycleEvents) {
+            if (lifecycleEvents.size() >= LIFECYCLE_BUFFER_MAX) {
+                lifecycleEvents.pollFirst();
+            }
+            // Tab-separated: the JS side splits on it rather than needing a JSON parse.
+            lifecycleEvents.addLast(event + "\t" + detail);
+        }
+    }
+
     private LocalServerManager localServerManager() { return ClaySession.localServer(); }
     private SshProxyManager sshProxyManager() { return ClaySession.sshProxy(); }
     // Registered in onResume()/unregistered in onPause() (only while in SSH remote mode) so a
@@ -287,6 +312,99 @@ public class MainActivity extends AppCompatActivity {
                 Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                 stopService(serviceIntent);
             });
+        }
+
+        /**
+         * Drain the buffered lifecycle events for reporting to the server. Returns them
+         * newline-separated ("event\tdetail" per line), empty string when there are none.
+         * Draining (rather than peeking) means each event is reported exactly once even
+         * across a reconnect.
+         */
+        @JavascriptInterface
+        public String takeLifecycleEvents() {
+            StringBuilder sb = new StringBuilder();
+            synchronized (lifecycleEvents) {
+                String e;
+                while ((e = lifecycleEvents.pollFirst()) != null) {
+                    if (sb.length() > 0) sb.append('\n');
+                    sb.append(e);
+                }
+            }
+            return sb.toString();
+        }
+
+        /**
+         * Send the diagnostic logs out of the app via the system share sheet.
+         *
+         * They live in app-private internal storage (the bundled server runs with HOME set to
+         * getFilesDir(), so its ~/.clay is under files/.clay/), which no file manager can reach
+         * and which adb/root are otherwise the only ways into. Sharing is the one route off the
+         * device that needs no cable and no developer tooling.
+         *
+         * Returns a short status for the UI: how many files are being shared, or why none are.
+         */
+        @JavascriptInterface
+        public String shareLogs() {
+            final java.util.ArrayList<android.net.Uri> uris = new java.util.ArrayList<>();
+            final java.util.ArrayList<String> names = new java.util.ArrayList<>();
+            java.io.File clayDir = new java.io.File(getFilesDir(), ".clay");
+            java.io.File[] candidates = new java.io.File[] {
+                new java.io.File(clayDir, "remote.log"),
+                new java.io.File(clayDir, "debug.log"),
+                new java.io.File(clayDir, "output.debug.log"),
+                new java.io.File(getCacheDir(), "clay-local-server.log"),
+            };
+            for (java.io.File f : candidates) {
+                if (!f.isFile() || f.length() == 0) continue;
+                try {
+                    uris.add(androidx.core.content.FileProvider.getUriForFile(
+                        MainActivity.this, getPackageName() + ".fileprovider", f));
+                    names.add(f.getName() + " (" + (f.length() / 1024) + " KB)");
+                } catch (Exception e) {
+                    android.util.Log.e("Clay", "shareLogs: cannot expose " + f, e);
+                }
+            }
+            if (uris.isEmpty()) {
+                // Not a failure: in remote mode there is no on-device server, so there are no
+                // on-device logs - the lifecycle events went to the remote server's log instead.
+                return "No logs on this device yet. In Connect-to-a-Server mode the diagnostics "
+                     + "are written on the server you connect to, not here.";
+            }
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Intent send;
+                        if (uris.size() == 1) {
+                            send = new Intent(Intent.ACTION_SEND);
+                            send.putExtra(Intent.EXTRA_STREAM, uris.get(0));
+                        } else {
+                            send = new Intent(Intent.ACTION_SEND_MULTIPLE);
+                            send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+                        }
+                        send.setType("text/plain");
+                        send.putExtra(Intent.EXTRA_SUBJECT, "Clay diagnostic logs");
+                        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        // FLAG_GRANT_READ_URI_PERMISSION only reaches the app the user finally
+                        // picks. The share sheet itself is a separate process that reads the
+                        // URIs to build its preview, and without ClipData it is denied - Android
+                        // logs "Could not read ... stream types. If a preview is desired, call
+                        // Intent#setClipData()". Setting it grants the chooser the same access.
+                        android.content.ClipData clip = android.content.ClipData.newUri(
+                            getContentResolver(), "Clay logs", uris.get(0));
+                        for (int i = 1; i < uris.size(); i++) {
+                            clip.addItem(new android.content.ClipData.Item(uris.get(i)));
+                        }
+                        send.setClipData(clip);
+                        startActivity(Intent.createChooser(send, "Share Clay logs"));
+                    } catch (Exception e) {
+                        android.util.Log.e("Clay", "shareLogs: share failed", e);
+                        Toast.makeText(MainActivity.this, "Could not share logs: " + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                    }
+                }
+            });
+            return "Sharing " + android.text.TextUtils.join(", ", names);
         }
 
         @JavascriptInterface
@@ -781,13 +899,13 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         activityCreateCount++;
-        android.util.Log.i("Clay", "LIFECYCLE onCreate #" + activityCreateCount
-            + ": savedInstanceState=" + (savedInstanceState == null ? "null" : "present")
+        recordLifecycle("onCreate", "activityCreateCount=" + activityCreateCount
+            + " savedInstanceState=" + (savedInstanceState == null ? "null" : "present")
             + " localServerRunning=" + ClaySession.isLocalServerRunning()
             + " sshProxyRunning=" + ClaySession.isSshProxyRunning()
             + (activityCreateCount > 1
-                ? "  <- Activity recreated, process survived"
-                : "  <- fresh process"));
+                ? " (Activity recreated, process survived)"
+                : " (fresh process)"));
         setContentView(R.layout.activity_main);
 
         // getNoBackupFilesDir() is never included in any backup (Auto Backup, ADB, OEM).
@@ -1892,7 +2010,7 @@ public class MainActivity extends AppCompatActivity {
         super.onNewIntent(intent);
         // Called when activity is brought to front via FLAG_ACTIVITY_CLEAR_TOP (e.g. a
         // notification tap), reusing this same instance rather than a fresh onCreate().
-        android.util.Log.i("Clay", "LIFECYCLE onNewIntent: interfaceLoaded=" + interfaceLoaded
+        recordLifecycle("onNewIntent", "interfaceLoaded=" + interfaceLoaded
             + " localServerRunning=" + ClaySession.isLocalServerRunning()
             + " sshProxyRunning=" + ClaySession.isSshProxyRunning());
         if (!interfaceLoaded) {
@@ -1992,7 +2110,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        android.util.Log.i("Clay", "LIFECYCLE onResume: interfaceLoaded=" + interfaceLoaded
+        recordLifecycle("onResume", "interfaceLoaded=" + interfaceLoaded
             + " localServerRunning=" + ClaySession.isLocalServerRunning()
             + " sshProxyRunning=" + ClaySession.isSshProxyRunning());
 
@@ -2042,6 +2160,12 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        // Recorded before notifyVisibility() below, because that is what drives the JS flush -
+        // so this event ships with the same round trip rather than waiting for the next one.
+        // Gives the server log a clear "left the app" marker to pair each return against.
+        recordLifecycle("onPause", "interfaceLoaded=" + interfaceLoaded
+            + " localServerRunning=" + ClaySession.isLocalServerRunning()
+            + " sshProxyRunning=" + ClaySession.isSshProxyRunning());
         unregisterSshNetworkCallback();
         // Tell the server we're no longer on screen so it releases our ▶ new-text markers
         // and stops counting us as a viewer - text arriving while we're backgrounded is then
@@ -2119,7 +2243,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
-        android.util.Log.i("Clay", "LIFECYCLE onDestroy: isFinishing=" + isFinishing()
+        recordLifecycle("onDestroy", "isFinishing=" + isFinishing()
             + " changingConfigurations=" + isChangingConfigurations()
             + " localServerRunning=" + ClaySession.isLocalServerRunning()
             + " sshProxyRunning=" + ClaySession.isSshProxyRunning());

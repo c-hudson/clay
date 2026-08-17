@@ -45,6 +45,20 @@
             </intent-filter>
         </activity>
 
+        <!-- Grants temporary read access to the diagnostic logs so they can be shared out of
+             the app (MainActivity.shareLogs). They sit in app-private internal storage, which
+             nothing else can read and which cannot legally be handed over as a file:// URI on
+             API 24+; see res/xml/file_paths.xml for exactly what is exposed. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <!-- Foreground service for background connection -->
         <service
             android:name=".ClayForegroundService"

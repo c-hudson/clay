@@ -655,6 +655,26 @@ pub enum WsMessage {
         source: String,  // "web", "gui", "android", "console"
     },
 
+    /// A client reporting its own Android lifecycle transitions (onCreate / onNewIntent /
+    /// onResume / onDestroy), logged server-side as `CLIENT-LIFECYCLE` in `~/.clay/remote.log`.
+    ///
+    /// Exists because the question "did the app resume, or did it rebuild itself?" is only
+    /// answerable from the Android side, and the answer used to require `adb logcat` — which
+    /// means it could not be answered at all on a phone the user isn't willing to plug in.
+    /// Routing it over the WebSocket the client already holds puts the evidence in the
+    /// *desktop's* log instead, where it can just be read.
+    ///
+    /// `event` is the transition ("onCreate", "onResume", ...); `detail` carries the state
+    /// that distinguishes a resume from a restart — the Activity-creation count, and whether
+    /// the local server / SSH tunnel were still running at that moment. Buffered client-side
+    /// until the socket is up, because the most diagnostic event (onCreate, i.e. the Activity
+    /// was rebuilt) necessarily happens before there is any connection to report it on.
+    ReportClientLifecycle {
+        event: String,
+        detail: String,
+        source: String,  // "android", "web", "gui"
+    },
+
     // Remote instance handling (client -> server)
     /// Client declares its type on connection (affects output delivery)
     ClientTypeDeclaration { client_type: RemoteClientType },

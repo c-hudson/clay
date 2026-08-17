@@ -1834,6 +1834,12 @@ pub async fn handle_daemon_ws_message(
                 source, world_name, hole_start, hole_end,
                 hole_end.saturating_sub(hole_start).saturating_add(1), attempts));
         }
+        WsMessage::ReportClientLifecycle { event, detail, source } => {
+            // Same reasoning as the sibling reports above; see WsMessage::ReportClientLifecycle
+            // in websocket.rs for why an Android lifecycle transition is worth a server log line.
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("CLIENT-LIFECYCLE", &ip, &format!("[{}] {}: {}", source, event, detail));
+        }
         WsMessage::ClientTypeDeclaration { client_type } => {
             // Update client type in WebSocket server
             if let Some(ref server) = app.ws_server {
@@ -3762,6 +3768,12 @@ pub async fn handle_multiuser_ws_message(
             crate::http::log_remote_event("SEQ-HOLE", &ip, &format!("[{}] in '{}': gave up on seq {}..={} ({} line(s)) after {} gap-fill attempt(s) returned nothing for it",
                 source, world_name, hole_start, hole_end,
                 hole_end.saturating_sub(hole_start).saturating_add(1), attempts));
+        }
+        WsMessage::ReportClientLifecycle { event, detail, source } => {
+            // Same reasoning as the sibling reports above; see WsMessage::ReportClientLifecycle
+            // in websocket.rs for why an Android lifecycle transition is worth a server log line.
+            let ip = app.ws_server.as_ref().and_then(|s| s.get_client_ip(client_id)).unwrap_or_else(|| "?".to_string());
+            crate::http::log_remote_event("CLIENT-LIFECYCLE", &ip, &format!("[{}] {}: {}", source, event, detail));
         }
         WsMessage::ToggleWorldGmcp { world_index } => {
             if world_index < app.worlds.len() {

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Paths the FileProvider is allowed to hand out content:// URIs for, used by
+    MainActivity.shareLogs().
+
+    Clay's diagnostic logs live in app-private internal storage: the bundled server runs with
+    HOME set to getFilesDir() (see LocalServerManager), so its ~/.clay lands under files/.clay/,
+    and the server's own stdout goes to cache/clay-local-server.log. Nothing outside the app can
+    read those directly, and sharing them as file:// URIs would throw FileUriExposedException on
+    API 24+ - hence a FileProvider granting temporary read access to just these two directories.
+-->
+<paths>
+    <!-- ~/.clay for the on-device server: remote.log, debug.log, output.debug.log, dump.log -->
+    <files-path name="clay-config" path=".clay/" />
+    <!-- the local server's redirected stdout/stderr -->
+    <cache-path name="clay-cache" path="" />
+</paths>
