@@ -10768,6 +10768,61 @@ if you're more curious.\"";
         }
     }
 
+    /// A hot reload must not make the whole restored buffer look un-broadcast.
+    ///
+    /// `save_reload_state` persists `output_lines` but not `broadcast_ledger`, and the world is
+    /// rebuilt with `World::new()` - so without seeding, `audit_broadcast_ledger` sees every
+    /// restored line as "stored but never broadcast", logs a SEQ-LEDGER report for each, and
+    /// re-broadcasts the lot. Observed on a live server: 27,070 reports in one minute across 12
+    /// worlds with WS-CHANNEL-FULL in lockstep, i.e. every connected client had its entire
+    /// history pushed at it again. Nothing is owed after a reload - there are no live clients,
+    /// and a client reconnecting afterwards asks for what it actually missed via
+    /// AuthRequest.resume.
+    #[test]
+    fn test_reload_seeds_broadcast_ledger_so_the_audit_stays_quiet() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        for i in 0..50 {
+            let mut l = OutputLine::new(format!("restored line {i}"), app.worlds[0].next_seq);
+            l.viewed = true;
+            app.worlds[0].next_seq += 1;
+            app.worlds[0].output_lines.push(l);
+        }
+        // Pending lines carry higher seqs and genuinely have NOT been sent.
+        for i in 0..3 {
+            let l = OutputLine::new(format!("still pending {i}"), app.worlds[0].next_seq);
+            app.worlds[0].next_seq += 1;
+            app.worlds[0].pending_lines.push(l);
+        }
+        app.worlds[0].paused = true;
+        let highest_output = app.worlds[0].output_lines.last().unwrap().seq;
+        let first_pending = app.worlds[0].pending_lines.first().unwrap().seq;
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
+        let w = restored.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
+        assert_eq!(w.output_lines.len(), 50, "precondition: the buffer came back");
+
+        for line in &w.output_lines {
+            assert!(w.was_broadcast(line.seq),
+                "restored line seq={} must count as already delivered, or the audit re-sends \
+                 the entire buffer to every client on the next keepalive", line.seq);
+        }
+        assert!(!w.was_broadcast(first_pending),
+            "pending lines have NOT been sent - marking them delivered would suppress a real \
+             failure to deliver them after release");
+        assert!(w.was_broadcast(highest_output));
+
+        // The end-to-end consequence: the audit finds nothing to repair.
+        let repaired = restored.audit_broadcast_ledger();
+        assert_eq!(repaired, 0,
+            "a reload must not produce SEQ-LEDGER reports; got {repaired}");
+    }
+
     #[test]
     fn test_reload_state_write_emits_seq_epoch_and_round_trips() {
         // Closes the gap a fixture-driven parser test cannot: if the WRITE side stops

@@ -2710,6 +2710,28 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         // preventing new damage: an operator who reloads picks up the repair automatically,
         // with no need to know their buffer was poisoned.
         world.ensure_next_seq_above_buffer();
+        // Seed the broadcast ledger to cover everything just restored.
+        //
+        // `World::new()` starts with an empty ledger, but `output_lines` above came back full.
+        // `audit_broadcast_ledger` reads that as "every one of these was stored but never
+        // broadcast", logs a SEQ-LEDGER line for each and re-broadcasts the lot - so a single
+        // hot reload of a busy instance emits tens of thousands of bogus reports on the first
+        // keepalive and floods every client's outbound channel re-sending its entire history
+        // (observed on a live server: 27,070 SEQ-LEDGER lines in one minute across 12 worlds,
+        // seqs starting at 0, with WS-CHANNEL-FULL in lockstep).
+        //
+        // These lines are not owed to anybody: a reload has no live clients, and a client that
+        // reconnects afterwards asks for what it is actually missing via AuthRequest.resume /
+        // its own _seenRanges. Marking the restored span as delivered is therefore the honest
+        // state, and it is what makes `/dump` show the documented healthy shape of one range
+        // spanning (0, next_seq-1) rather than a buffer's worth of holes.
+        //
+        // Bounded to the highest seq in `output_lines`: `pending_lines` carry higher seqs and
+        // genuinely have not been sent, so they must stay outside the range or a real failure
+        // to deliver them after release would be suppressed.
+        if let Some(highest) = world.output_lines.iter().map(|l| l.seq).max() {
+            world.mark_broadcast(0, highest);
+        }
         // ▶ state is per-line now and rides in with the lines themselves (the 'v' flag, see
         // parse_timestamped_line). `display_id` is deliberately not persisted at all - a
         // reload has no live clients, so every marker restores unowned and an unviewed line
