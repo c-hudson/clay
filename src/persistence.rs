@@ -488,6 +488,9 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if action.gui_shortcut {
             writeln!(file, "gui_shortcut=true")?;
         }
+        if action.suppress_blanks {
+            writeln!(file, "suppress_blanks=true")?;
+        }
     }
 
     // Note: bans are in-memory only and not persisted
@@ -747,6 +750,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "enabled" => action.enabled = value != "false",
                         "startup" => action.startup = value == "true",
                         "gui_shortcut" => action.gui_shortcut = value == "true",
+                        "suppress_blanks" => action.suppress_blanks = value == "true",
                         _ if key.starts_with("pattern.") => {
                             let parts: Vec<&str> = key.splitn(3, '.').collect();
                             if parts.len() == 3 {
@@ -1375,6 +1379,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "enabled" => action.enabled = value != "false",
                         "startup" => action.startup = value == "true",
                         "gui_shortcut" => action.gui_shortcut = value == "true",
+                        "suppress_blanks" => action.suppress_blanks = value == "true",
                         _ if key.starts_with("pattern.") => {
                             // Multi-pattern keys: "pattern.N.text" (and legacy "pattern.N.type")
                             let parts: Vec<&str> = key.splitn(3, '.').collect();
@@ -1640,6 +1645,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             }
             if action.gui_shortcut {
                 writeln!(file, "gui_shortcut=true")?;
+            }
+            if action.suppress_blanks {
+                writeln!(file, "suppress_blanks=true")?;
             }
         }
     }
@@ -1962,6 +1970,9 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         }
         if action.gui_shortcut {
             writeln!(file, "gui_shortcut=true")?;
+        }
+        if action.suppress_blanks {
+            writeln!(file, "suppress_blanks=true")?;
         }
     }
 
@@ -2635,6 +2646,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "enabled" => action.enabled = value != "false",
                             "startup" => action.startup = value == "true",
                             "gui_shortcut" => action.gui_shortcut = value == "true",
+                        "suppress_blanks" => action.suppress_blanks = value == "true",
                             _ if key.starts_with("pattern.") => {
                                 // Multi-pattern keys: "pattern.N.text" (and legacy "pattern.N.type")
                                 let parts: Vec<&str> = key.splitn(3, '.').collect();
@@ -2855,6 +2867,7 @@ mod tests {
                     a.enabled = false;
                     a.startup = true;
                     a.gui_shortcut = true;
+                    a.suppress_blanks = true;
                     a
                 },
             ],
@@ -2955,6 +2968,7 @@ mod tests {
             assert_eq!(aa.enabled, bb.enabled, "{context}: action[{i}].enabled");
             assert_eq!(aa.startup, bb.startup, "{context}: action[{i}].startup");
             assert_eq!(aa.gui_shortcut, bb.gui_shortcut, "{context}: action[{i}].gui_shortcut");
+            assert_eq!(aa.suppress_blanks, bb.suppress_blanks, "{context}: action[{i}].suppress_blanks");
         }
         assert_eq!(a.tls_proxy_enabled, b.tls_proxy_enabled, "{context}: tls_proxy_enabled");
         assert_eq!(a.dictionary_path, b.dictionary_path, "{context}: dictionary_path");

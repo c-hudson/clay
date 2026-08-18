@@ -6089,6 +6089,243 @@ if you're more curious.\"";
         assert!(backfill_complete, "must report exhausted: only 10 visible lines exist despite 20 raw lines returned");
     }
 
+    /// Gagged and visible lines from the same packet must keep their arrival order.
+    ///
+    /// The output path used to partition a packet into visible and gagged lines and add all
+    /// the visible ones first, so a gagged line always got a HIGHER seq than a visible line
+    /// that actually arrived after it. `output_lines` stayed sorted by seq, so nothing broke
+    /// outright - but with F2 (show_tags) on, gagged lines rendered clustered at the end of
+    /// the packet instead of where they belong, which misrepresents what the server sent.
+    #[test]
+    fn test_gagged_and_visible_lines_keep_arrival_order() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        let mut action = crate::actions::Action {
+            name: "g".to_string(),
+            command: "/gag".to_string(),
+            ..Default::default()
+        };
+        action.patterns = vec![crate::actions::MatchPattern {
+            pattern: "^SPAM".to_string(),
+            compiled_regex: None,
+        }];
+        action.compile_regex();
+        app.settings.actions = vec![action];
+
+        // Interleaved on purpose: visible, gagged, visible, gagged, gagged, visible.
+        app.process_server_data(
+            0,
+            b"first
+SPAM a
+second
+SPAM b
+SPAM c
+third
+",
+            24, 80, false,
+        );
+
+        let got: Vec<(String, bool)> = app.worlds[0].output_lines.iter()
+            .map(|l| (l.text.clone(), l.gagged))
+            .collect();
+        let want: Vec<(String, bool)> = vec![
+            ("first".into(), false),
+            ("SPAM a".into(), true),
+            ("second".into(), false),
+            ("SPAM b".into(), true),
+            ("SPAM c".into(), true),
+            ("third".into(), false),
+        ];
+        assert_eq!(got, want, "lines must appear in the order the server sent them");
+
+        // And the seqs must ascend in that same order - the buffer is required to stay
+        // sorted by seq, so order and seq cannot disagree.
+        let seqs: Vec<u64> = app.worlds[0].output_lines.iter().map(|l| l.seq).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted, "seqs must ascend in arrival order: {seqs:?}");
+    }
+
+    /// A gagged line arriving before any visible line must survive the splash clear.
+    ///
+    /// Interleaving the runs introduced this: `add_output` clears `output_lines` on the
+    /// splash transition, so a gagged run added *before* the first visible run had its lines
+    /// wiped by that clear. The whole packet vanished except the visible tail. The splash is
+    /// now cleared once for the packet, ahead of every run. Caught only by running against a
+    /// real daemon - a world built with `World::new` shows no splash, so none of the existing
+    /// tests exercised it.
+    #[test]
+    fn test_gagged_line_before_first_visible_survives_splash_clear() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new_with_splash("test", true));
+        app.current_world_index = 0;
+        assert!(app.worlds[0].showing_splash, "precondition: the world starts on the splash");
+
+        let mut action = crate::actions::Action {
+            name: "g".to_string(),
+            command: "/gag".to_string(),
+            ..Default::default()
+        };
+        action.patterns = vec![crate::actions::MatchPattern {
+            pattern: "^SPAM".to_string(),
+            compiled_regex: None,
+        }];
+        action.compile_regex();
+        app.settings.actions = vec![action];
+
+        // Gagged FIRST, then visible - the order that used to lose the gagged line.
+        app.process_server_data(0, b"SPAM a\r\nvisible\r\n", 24, 80, false);
+
+        let got: Vec<(String, bool)> = app.worlds[0].output_lines.iter()
+            .map(|l| (l.text.clone(), l.gagged))
+            .collect();
+        assert_eq!(got, vec![("SPAM a".to_string(), true), ("visible".to_string(), false)],
+            "the gagged line must survive the splash clear and stay ahead of the visible one");
+        assert!(!app.worlds[0].showing_splash, "the splash must still be cleared by the packet");
+    }
+
+    /// `suppress_blanks` must survive a hot reload.
+    ///
+    /// The settings.dat round trip is already covered by persistence.rs's
+    /// `assert_settings_match`, but the reload state has its own independent serializer and
+    /// parser and no such guard. Missing that pair is the failure mode worth testing for: the
+    /// option would work until the user ran /reload and then silently switch itself off,
+    /// rather than failing in any visible way. Drives the real writer against the real parser.
+    #[test]
+    fn test_suppress_blanks_survives_a_reload() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.settings.actions = vec![crate::actions::Action {
+            name: "spam".to_string(),
+            command: "/gag".to_string(),
+            suppress_blanks: true,
+            ..Default::default()
+        }];
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+        assert!(text.contains("suppress_blanks=true"),
+            "the reload state must emit the flag; without this the option resets on every /reload");
+
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
+        let action = restored.settings.actions.iter().find(|a| a.name == "spam")
+            .expect("action restored");
+        assert!(action.suppress_blanks, "the flag must survive a full reload round trip");
+    }
+
+    /// Build an app with one world and one action that matches `pattern` and suppresses the
+    /// blank lines after it.
+    fn app_with_suppress_blanks_action(pattern: &str) -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        let mut action = crate::actions::Action {
+            name: "spam".to_string(),
+            command: "/gag".to_string(),
+            suppress_blanks: true,
+            ..Default::default()
+        };
+        action.patterns = vec![crate::actions::MatchPattern {
+            pattern: pattern.to_string(),
+            compiled_regex: None,
+        }];
+        action.compile_regex();
+        app.settings.actions = vec![action];
+        app
+    }
+
+    /// Which lines are visible (non-gagged), in order.
+    fn visible_texts(app: &App) -> Vec<String> {
+        app.worlds[0].output_lines.iter()
+            .filter(|l| !l.gagged)
+            .map(|l| l.text.clone())
+            .collect()
+    }
+
+    /// The blank run after a match is gagged, up to the cap.
+    ///
+    /// Gagged rather than dropped, so the lines stay in the buffer and F2 can reveal them -
+    /// that distinction is what keeps a mis-tuned action diagnosable.
+    #[test]
+    fn test_suppress_blanks_gags_the_run_after_a_match() {
+        let mut app = app_with_suppress_blanks_action("^spam");
+        app.process_server_data(0, b"spam here\r\n\r\n\r\nreal line\r\n", 24, 80, false);
+
+        assert_eq!(visible_texts(&app), vec!["real line".to_string()],
+            "the match and its two trailing blanks must all be hidden; got {:?}",
+            app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.gagged)).collect::<Vec<_>>());
+        assert_eq!(app.worlds[0].output_lines.len(), 4,
+            "suppressed lines must be GAGGED, not dropped - all four lines belong in the buffer");
+    }
+
+    /// A visible line ends the run even when fewer than the cap were consumed, so a later
+    /// unrelated blank is untouched.
+    #[test]
+    fn test_suppress_blanks_run_ends_at_the_first_visible_line() {
+        let mut app = app_with_suppress_blanks_action("^spam");
+        app.process_server_data(0, b"spam here\r\n\r\ntext\r\n\r\n", 24, 80, false);
+
+        assert_eq!(visible_texts(&app), vec!["text".to_string(), String::new()],
+            "only the blank directly after the match is suppressed; the blank after 'text' \
+             must stay visible; got {:?}",
+            app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.gagged)).collect::<Vec<_>>());
+    }
+
+    /// The cap bounds the run, so a mis-tuned action cannot swallow unbounded output.
+    #[test]
+    fn test_suppress_blanks_stops_at_the_cap() {
+        let mut app = app_with_suppress_blanks_action("^spam");
+        app.process_server_data(0, b"spam here\r\n\r\n\r\n\r\n\r\nafter\r\n", 24, 80, false);
+
+        // 4 blanks follow; SUPPRESS_BLANKS_MAX is 3, so the 4th survives.
+        assert_eq!(visible_texts(&app), vec![String::new(), "after".to_string()],
+            "the 4th blank exceeds the cap and must remain visible; got {:?}",
+            app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.gagged)).collect::<Vec<_>>());
+    }
+
+    /// The counter is per-world state carried across TCP reads, because the blanks that follow
+    /// a match routinely arrive in a later packet than the match itself.
+    #[test]
+    fn test_suppress_blanks_spans_tcp_reads() {
+        let mut app = app_with_suppress_blanks_action("^spam");
+        app.process_server_data(0, b"spam here\r\n", 24, 80, false);
+        app.process_server_data(0, b"\r\n", 24, 80, false);
+        app.process_server_data(0, b"real line\r\n", 24, 80, false);
+
+        assert_eq!(visible_texts(&app), vec!["real line".to_string()],
+            "a blank arriving in its own packet must still be suppressed; got {:?}",
+            app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.gagged)).collect::<Vec<_>>());
+    }
+
+    /// Without the flag, blank lines are untouched - the feature is opt-in.
+    #[test]
+    fn test_blanks_are_untouched_without_the_option() {
+        let mut app = app_with_suppress_blanks_action("^spam");
+        app.settings.actions[0].suppress_blanks = false;
+        app.process_server_data(0, b"spam here\r\n\r\n\r\nreal line\r\n", 24, 80, false);
+
+        assert_eq!(visible_texts(&app), vec![String::new(), String::new(), "real line".to_string()],
+            "with the option off the blanks must remain visible (only the /gag'd match hides)");
+    }
+
+    /// An ANSI-only line counts as blank: is_visually_empty() ignores escape sequences, which
+    /// is what "^\\s*$ after ANSI is stripped" means in practice for MUD output.
+    #[test]
+    fn test_suppress_blanks_treats_an_ansi_only_line_as_blank() {
+        let mut app = app_with_suppress_blanks_action("^spam");
+        app.process_server_data(0, b"spam here\r\n\x1b[0m\r\nreal line\r\n", 24, 80, false);
+
+        assert_eq!(visible_texts(&app), vec!["real line".to_string()],
+            "a colour-reset-only line must count as blank; got {:?}",
+            app.worlds[0].output_lines.iter().map(|l| (l.text.clone(), l.gagged)).collect::<Vec<_>>());
+    }
+
     /// A scrollback reply must carry each line's real `viewed`/`display_id`, not placeholders.
     ///
     /// With `viewed: false` hardcoded, a world switch backfilled lines that claimed to be

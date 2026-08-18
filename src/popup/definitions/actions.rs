@@ -35,6 +35,7 @@ pub const EDITOR_FIELD_COMMAND: FieldId = FieldId(14);
 pub const EDITOR_FIELD_ENABLED: FieldId = FieldId(15);
 pub const EDITOR_FIELD_STARTUP: FieldId = FieldId(16);
 pub const EDITOR_FIELD_GUI_SHORTCUT: FieldId = FieldId(17);
+pub const EDITOR_FIELD_SUPPRESS_BLANKS: FieldId = FieldId(18);
 
 // Button IDs - Editor view
 pub const EDITOR_BTN_SAVE: ButtonId = ButtonId(10);
@@ -185,6 +186,7 @@ pub struct ActionSettings {
     pub enabled: bool,
     pub startup: bool,
     pub gui_shortcut: bool,
+    pub suppress_blanks: bool,
 }
 
 /// Create the action editor popup definition (TUI — editable pattern list, max 4 visible)
@@ -241,6 +243,11 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
             EDITOR_FIELD_GUI_SHORTCUT,
             "GUI Shortcut",
             FieldKind::toggle(settings.gui_shortcut),
+        ))
+        .with_field(Field::new(
+            EDITOR_FIELD_SUPPRESS_BLANKS,
+            "Suppress Blanks",
+            FieldKind::toggle(settings.suppress_blanks),
         ))
         .with_button_if(!is_new, Button::new(EDITOR_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
         .with_button(Button::new(EDITOR_BTN_CANCEL, "Cancel").with_shortcut('C'))

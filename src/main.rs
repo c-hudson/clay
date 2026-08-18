@@ -40,6 +40,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static CUSTOM_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Global debug flag — set from settings, checked by debug_log and file writes
+/// Most blank lines an action with `suppress_blanks` will gag after its match.
+///
+/// A cap rather than "all of them" so a mis-tuned action can never swallow an unbounded run
+/// of output; a non-blank line ends the run before this in the normal case.
+pub(crate) const SUPPRESS_BLANKS_MAX: u8 = 3;
+
 pub(crate) static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Tracks whether the startup header has been written to ~/.clay/debug.log
@@ -993,6 +999,8 @@ fn apply_tf_attrs(text: &str, attrs: &str) -> String {
 struct TriggerProcessingResult {
     /// Whether the line should be gagged (suppressed from display)
     pub is_gagged: bool,
+    /// The matching action asked for the following blank lines to be gagged too.
+    pub suppress_blanks: bool,
     /// Commands to send to the MUD server
     pub send_commands: Vec<String>,
     /// Clay commands to execute (e.g. /connect, /worlds)
@@ -1068,6 +1076,7 @@ fn process_triggers(
 ) -> TriggerProcessingResult {
     let mut result = TriggerProcessingResult {
         is_gagged: false,
+        suppress_blanks: false,
         send_commands: Vec::new(),
         clay_commands: Vec::new(),
         messages: Vec::new(),
@@ -1078,6 +1087,7 @@ fn process_triggers(
     if let Some(action_result) = check_action_triggers(line, world_name, actions) {
         result.send_commands.extend(action_result.commands);
         result.is_gagged = action_result.should_gag;
+        result.suppress_blanks = action_result.suppress_blanks;
         result.highlight_color = action_result.highlight_color;
     }
 
@@ -2795,6 +2805,11 @@ pub struct World {
     pub partial_in_pending: bool,    // True if partial_line is in pending_lines (vs output_lines)
     trigger_partial_line: String, // Buffer for incomplete lines for action trigger checking
     just_filtered_idler: bool,   // True if we just filtered an idler message (for filtering trailing newline)
+    /// Blank lines still to be gagged after an action with `suppress_blanks` fired.
+    ///
+    /// Per-world and persistent across TCP reads for the same reason `just_filtered_idler`
+    /// is: the blanks that follow a match frequently arrive in a later packet than the match.
+    suppress_blanks_remaining: u8,
     wont_echo_time: Option<std::time::Instant>, // When WONT ECHO was seen (for timeout-based prompt detection)
     uses_wont_echo_prompt: bool, // True if this world uses WONT ECHO for prompts (auto-detected)
     pub is_initial_world: bool,      // True for the auto-created world before first connection
@@ -3017,6 +3032,7 @@ impl World {
             partial_in_pending: false,
             trigger_partial_line: String::new(),
             just_filtered_idler: false,
+            suppress_blanks_remaining: 0,
             wont_echo_time: None,
             uses_wont_echo_prompt: false,
             is_initial_world: false,
@@ -5059,6 +5075,7 @@ impl App {
                     enabled: action.enabled,
                     startup: action.startup,
                     gui_shortcut: action.gui_shortcut,
+                    suppress_blanks: action.suppress_blanks,
                 }
             } else {
                 ActionSettings::default()
@@ -8873,6 +8890,227 @@ impl App {
         (output_height, output_width)
     }
 
+    /// Add one run of consecutive non-gagged lines, then broadcast exactly that run.
+    ///
+    /// Split out of `process_server_data` so a packet can alternate between visible and
+    /// gagged runs and preserve arrival order; see the run loop there for why the two paths
+    /// cannot simply be merged. `append_newline` is false only for a final run whose packet
+    /// genuinely ended mid-line.
+    fn add_visible_run(
+        &mut self,
+        world_idx: usize,
+        run: &[(&str, Option<String>)],
+        is_current: bool,
+        console_height: u16,
+        console_width: u16,
+        is_daemon_mode: bool,
+        append_newline: bool,
+        // True on the first run of a packet that cleared the splash: the broadcast must tell
+        // clients to drop their splash buffer before appending.
+        flush: bool,
+    ) {
+        if run.is_empty() {
+            return;
+        }
+        // Highlight colours are matched back by line content after add_output has wrapped
+        // and stored the text, so the map only needs this run's lines.
+        let highlight_map: std::collections::HashMap<String, Option<String>> = run.iter()
+            .filter(|(_, hl)| hl.is_some())
+            .map(|(line, hl)| (line.to_string(), hl.clone()))
+            .collect();
+        let filtered_data = {
+            let lines_only: Vec<&str> = run.iter().map(|(line, _)| *line).collect();
+            let mut result = lines_only.join("\n");
+            if append_newline {
+                result.push('\n');
+            }
+            result
+        };
+
+        // Add non-gagged output to world
+        if !filtered_data.is_empty() {
+            let settings = self.settings.clone();
+
+            let (output_height, output_width) =
+                self.viewer_output_dims(world_idx, console_height, console_width, is_daemon_mode);
+
+            // Track pending count before add_output for synchronized more-mode
+            let pending_before = self.worlds[world_idx].pending_lines.len();
+            let output_before = self.worlds[world_idx].output_lines.len();
+            let was_showing_splash = self.worlds[world_idx].showing_splash;
+
+            // Track partial line state before add_output:
+            // If there's a partial line in output_lines, we shouldn't have broadcast it yet
+            // (we exclude partials from broadcasts). When it's completed, we'll include it.
+            let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
+                && !self.worlds[world_idx].partial_in_pending;
+
+            self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true, self.show_tags);
+
+            // Check if splash was cleared (output_lines was reset)
+            let splash_was_cleared = was_showing_splash && !self.worlds[world_idx].showing_splash;
+
+            // Check partial state after add_output
+            let has_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
+                && !self.worlds[world_idx].partial_in_pending;
+
+            // Calculate what went where
+            let pending_after = self.worlds[world_idx].pending_lines.len();
+            let output_after = self.worlds[world_idx].output_lines.len();
+
+
+            // Calculate broadcast boundaries, accounting for partial lines:
+            // - Partial lines are NOT broadcast (clients only get complete lines)
+            // - When a partial is completed (updated in-place), include it in the broadcast
+            // This fixes the bug where partial line updates were never sent to remote clients
+            let (lines_to_output, skip_count) = if splash_was_cleared {
+                // Broadcast all output lines since buffer was cleared
+                (output_after, 0)
+            } else {
+                let mut skip = output_before;
+                let mut count = output_after.saturating_sub(output_before);
+
+                // If we had a partial in output_lines before, it wasn't broadcast yet.
+                // Now that add_output may have completed it (or added new lines after it),
+                // include it in this broadcast by moving skip back one position.
+                if had_partial_in_output && skip > 0 {
+                    skip -= 1;
+                    count = output_after.saturating_sub(skip);
+                }
+
+                // If there's currently a partial line at the end of output_lines,
+                // exclude it from this broadcast (it'll be sent when completed)
+                if has_partial_in_output && count > 0 {
+                    count -= 1;
+                }
+
+                (count, skip)
+            };
+            let lines_to_pending = pending_after.saturating_sub(pending_before);
+
+            // Apply highlight colors to newly added lines
+            if !highlight_map.is_empty() {
+                // Apply to output_lines
+                for line in self.worlds[world_idx].output_lines.iter_mut().skip(output_before) {
+                    let plain_text = strip_ansi_codes(&line.text);
+                    if let Some(hl) = highlight_map.get(&plain_text) {
+                        line.highlight_color = hl.clone();
+                    }
+                }
+                // Apply to pending_lines
+                for line in self.worlds[world_idx].pending_lines.iter_mut().skip(pending_before) {
+                    let plain_text = strip_ansi_codes(&line.text);
+                    if let Some(hl) = highlight_map.get(&plain_text) {
+                        line.highlight_color = hl.clone();
+                    }
+                }
+            }
+
+            // Mark output for redraw whenever output changes
+            self.needs_output_redraw = true;
+
+            // For synchronized more-mode: only broadcast lines that went to output_lines
+            // Lines that went to pending_lines will be broadcast when released
+            // Only send to clients viewing this world (Phase 2 output routing).
+            // is_viewed: true unconditionally - clients viewing this world consider it
+            // "viewed". flush: splash_was_cleared, so the client clears its buffer
+            // atomically before appending new lines (avoids a race with a separate
+            // WorldFlushed message) - broadcast_output_range's count==0 branch still sends
+            // WorldFlushed on its own when there's nothing else to send alongside it.
+            self.broadcast_output_range(world_idx, skip_count, lines_to_output, true, true, splash_was_cleared || flush);
+
+            // Broadcast pending count update if it changed (for synchronized more-mode indicator)
+            // Use filtered broadcast to skip clients that received pending in InitialState
+            if lines_to_pending > 0 || pending_after != pending_before {
+                self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
+            }
+
+            // Broadcast updated unseen count so all clients stay in sync
+            let unseen_count = self.worlds[world_idx].unseen_lines;
+            if unseen_count > 0 {
+                self.ws_broadcast(WsMessage::UnseenUpdate {
+                    world_index: world_idx,
+                    count: unseen_count,
+                });
+            }
+
+            // Broadcast activity count to keep all clients in sync
+            self.broadcast_activity();
+        }
+    }
+
+    /// Add one run of consecutive gagged lines (F2-only) and broadcast each.
+    ///
+    /// Bypasses `add_output` entirely - it has no notion of a gagged line - so seq, `viewed`
+    /// and archiving are all set by hand here.
+    fn add_gagged_run(&mut self, world_idx: usize, run: &[(&str, Option<String>)], is_current: bool, flush: bool) {
+        if run.is_empty() {
+            return;
+        }
+        // Invariant: World::output_lines is always sorted by seq (see the doc comment on
+        // App::broadcast_released_lines, which real-seq release broadcasts depend on). Pushing
+        // a gagged line straight into output_lines unconditionally used to violate that: while
+        // paused with pending_lines holding earlier (lower-seq) lines that haven't been
+        // released yet, a gagged line pushed here gets a NEWER/higher seq but lands in
+        // output_lines immediately, ahead of those still-pending lower-seq lines - so when
+        // they're eventually released and appended after it, output_lines ends up with a seq
+        // dip in the middle. Route the gagged line into pending_lines instead in that case; it
+        // rides the same release batch (and its own broadcast) when the pause ends.
+        //
+        // Deliberately NOT gated on settings.more_mode_enabled: pending_lines can be
+        // non-empty even after more-mode is toggled off globally - add_output's "more-mode
+        // off => drain pending" branch only fires for a world actively receiving new
+        // non-gagged output at the moment of the toggle, so a paused background world that
+        // isn't currently receiving non-gagged output keeps its stale paused/pending_lines
+        // state regardless of the current setting value. The condition that actually matters
+        // is "is there an existing backlog this line would otherwise jump ahead of", which is
+        // exactly `paused && !pending_lines.is_empty()` on its own.
+        let hold_gagged_in_pending = self.worlds[world_idx].paused
+            && !self.worlds[world_idx].pending_lines.is_empty();
+        for (run_pos, (line, highlight)) in run.iter().cloned().enumerate() {
+            let seq_is_first = run_pos == 0;
+            let seq = self.worlds[world_idx].next_seq;
+            self.worlds[world_idx].next_seq += 1;
+            let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
+            output_line.highlight_color = highlight;
+            // Gagged or not, this is still text from the world: born viewed when someone's
+            // watching, same as add_output does for non-gagged lines. Bypasses add_output
+            // entirely so this must be set by hand.
+            output_line.viewed = is_current;
+            // Archive gagged server lines to long-term scrollback (with gagged=true) -
+            // unconditional on which buffer it lands in, since archiving is a timestamped
+            // log, not a seq-ordered live buffer other code indexes into.
+            if let Some(ref tx) = self.worlds[world_idx].scrollback_tx {
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let world_name = self.worlds[world_idx].name.clone();
+                let _ = tx.try_send((world_name, ts_ms, line.to_string(), true));
+            }
+            if hold_gagged_in_pending {
+                self.worlds[world_idx].pending_lines.push(output_line);
+                // Not broadcast here - it goes out with the pending release batch via
+                // App::broadcast_released_lines, same as every other pending line.
+                continue;
+            }
+            self.worlds[world_idx].output_lines.push(output_line);
+            // Broadcast gagged line to WebSocket clients
+            let ws_data = line.to_string().replace('\r', "") + "\n";
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data: ws_data,
+                is_viewed: is_current,
+                ts: current_timestamp_secs(),
+                from_server: true,
+                seq, end_seq: Some(seq),
+                // Only ever true for the first line of a packet that cleared the splash.
+                flush: flush && seq_is_first,
+                gagged: true, highlight_colors: Vec::new(),
+            });
+        }
+    }
+
     pub fn process_server_data(
         &mut self,
         world_idx: usize,
@@ -8969,6 +9207,7 @@ impl App {
         let mut has_partial = false;
         // Use persistent flag to track idler filtering across TCP packets
         let mut just_filtered_idler = self.worlds[world_idx].just_filtered_idler;
+        let mut suppress_blanks_remaining = self.worlds[world_idx].suppress_blanks_remaining;
 
 
         for (i, line) in lines.iter().enumerate() {
@@ -9003,6 +9242,19 @@ impl App {
                 self.worlds[world_idx].trigger_partial_line = line.to_string();
                 has_partial = true;
             } else {
+                // Gag the blank run that follows an action with "Suppress Blanks" set. Placed
+                // ahead of the trigger sweep deliberately: a suppressed line needs no pattern
+                // matching at all, so this is cheaper than the status quo rather than an
+                // addition to it. Gagged (not dropped) so the line stays in the buffer and F2
+                // reveals it, matching how /gag already behaves.
+                if suppress_blanks_remaining > 0 && is_visually_empty(line) {
+                    suppress_blanks_remaining -= 1;
+                    processed_lines.push((line, true, None));
+                    continue;
+                }
+                // Any visible line ends the run, even if fewer than the cap were consumed.
+                suppress_blanks_remaining = 0;
+
                 // Watchdog/watchname spam detection (before triggers)
                 let mut watchdog_gagged = false;
                 let stripped = strip_ansi_for_watchdog(line);
@@ -9044,6 +9296,9 @@ impl App {
                 commands_to_execute.extend(tr.send_commands);
                 tf_commands_to_execute.extend(tr.clay_commands);
                 tf_messages.extend(tr.messages);
+                if tr.suppress_blanks {
+                    suppress_blanks_remaining = SUPPRESS_BLANKS_MAX;
+                }
                 processed_lines.push((line, tr.is_gagged || watchdog_gagged, tr.highlight_color));
             }
         }
@@ -9076,6 +9331,7 @@ impl App {
 
         // Save the idler filter state for next packet
         self.worlds[world_idx].just_filtered_idler = just_filtered_idler;
+        self.worlds[world_idx].suppress_blanks_remaining = suppress_blanks_remaining;
 
         // If we have a partial line and world uses WONT ECHO prompts, start timeout
         if has_partial && self.worlds[world_idx].prompt.is_empty()
@@ -9083,145 +9339,73 @@ impl App {
             self.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
         }
 
-        // Separate gagged and non-gagged lines, tracking highlight colors
+        // Add the packet's lines in the order the server sent them.
+        //
+        // This used to partition into "all non-gagged, then all gagged", which made a gagged
+        // line always take a HIGHER seq than a visible line that actually arrived after it.
+        // `output_lines` stayed sorted by seq so nothing broke outright, but with F2
+        // (show_tags) on the gagged lines rendered clustered at the end of the packet rather
+        // than where they belong. The two paths genuinely cannot be merged - `add_output`
+        // owns wrapping, more-mode/pending and splash handling and has no gagged concept -
+        // so instead group the lines into consecutive runs of the same gagged-ness and
+        // alternate between the two paths, which preserves arrival order exactly.
+        let mut runs: Vec<(bool, Vec<(&str, Option<String>)>)> = Vec::new();
+        for (line, gagged, highlight) in &processed_lines {
+            match runs.last_mut() {
+                Some((run_gagged, items)) if *run_gagged == *gagged => {
+                    items.push((*line, highlight.clone()));
+                }
+                _ => runs.push((*gagged, vec![(*line, highlight.clone())])),
+            }
+        }
+
+        // Every non-gagged line in the packet, for the once-per-packet work below: TTS speaks
+        // a packet as a single utterance, so it must not be run per-run.
         let non_gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
             .filter(|(_, gagged, _)| !gagged)
             .map(|(line, _, highlight)| (*line, highlight.clone()))
             .collect();
-        let gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
-            .filter(|(_, gagged, _)| *gagged)
-            .map(|(line, _, highlight)| (*line, highlight.clone()))
-            .collect();
-        // Create a map of line content to highlight color for non-gagged lines
-        let highlight_map: std::collections::HashMap<String, Option<String>> = non_gagged_lines.iter()
-            .filter(|(_, hl)| hl.is_some())
-            .map(|(line, hl)| (line.to_string(), hl.clone()))
-            .collect();
 
-        // Rebuild data for non-gagged lines
-        // Add trailing newline if original ended with newline OR if we have a partial
-        // (because a partial means there was a newline before it that we need to preserve)
-        let filtered_data = if non_gagged_lines.is_empty() {
-            String::new()
-        } else {
-            let lines_only: Vec<&str> = non_gagged_lines.iter().map(|(line, _)| *line).collect();
-            let mut result = lines_only.join("\n");
-            if ends_with_newline || has_partial {
-                result.push('\n');
-            }
-            result
-        };
+        // Clear the splash once for the whole packet, rather than letting the first VISIBLE
+        // run do it from inside add_output. Now that runs are interleaved a GAGGED run can
+        // come first, and add_output's splash branch clears output_lines - which would wipe
+        // the gagged lines already added by that earlier run. The flush that tells clients to
+        // drop their own splash buffer is handed to the first run to broadcast, so it still
+        // goes out exactly once.
+        let mut pending_flush = false;
+        if !processed_lines.is_empty() && self.worlds[world_idx].showing_splash {
+            self.worlds[world_idx].showing_splash = false;
+            self.worlds[world_idx].needs_redraw = true;
+            self.worlds[world_idx].output_lines.clear();
+            self.worlds[world_idx].scroll_offset = 0;
+            pending_flush = true;
+        }
 
-        // Add non-gagged output to world
-        if !filtered_data.is_empty() {
-            let settings = self.settings.clone();
+        // Captured after the splash clear but before any insertion - "was the viewer at the
+        // bottom when this packet arrived?" - because the runs below move output_lines.len()
+        // underneath it.
+        let was_at_bottom = self.worlds[world_idx].is_at_bottom();
 
-            let (output_height, output_width) =
-                self.viewer_output_dims(world_idx, console_height, console_width, is_daemon_mode);
-
-            // Track pending count before add_output for synchronized more-mode
-            let pending_before = self.worlds[world_idx].pending_lines.len();
-            let output_before = self.worlds[world_idx].output_lines.len();
-            let was_showing_splash = self.worlds[world_idx].showing_splash;
-
-            // Track partial line state before add_output:
-            // If there's a partial line in output_lines, we shouldn't have broadcast it yet
-            // (we exclude partials from broadcasts). When it's completed, we'll include it.
-            let had_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
-                && !self.worlds[world_idx].partial_in_pending;
-
-            self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true, self.show_tags);
-
-            // Check if splash was cleared (output_lines was reset)
-            let splash_was_cleared = was_showing_splash && !self.worlds[world_idx].showing_splash;
-
-            // Check partial state after add_output
-            let has_partial_in_output = !self.worlds[world_idx].partial_line.is_empty()
-                && !self.worlds[world_idx].partial_in_pending;
-
-            // Calculate what went where
-            let pending_after = self.worlds[world_idx].pending_lines.len();
-            let output_after = self.worlds[world_idx].output_lines.len();
-
-
-            // Calculate broadcast boundaries, accounting for partial lines:
-            // - Partial lines are NOT broadcast (clients only get complete lines)
-            // - When a partial is completed (updated in-place), include it in the broadcast
-            // This fixes the bug where partial line updates were never sent to remote clients
-            let (lines_to_output, skip_count) = if splash_was_cleared {
-                // Broadcast all output lines since buffer was cleared
-                (output_after, 0)
+        let run_count = runs.len();
+        for (run_idx, (gagged, run)) in runs.iter().enumerate() {
+            let flush = std::mem::take(&mut pending_flush);
+            if *gagged {
+                self.add_gagged_run(world_idx, run, is_current, flush);
             } else {
-                let mut skip = output_before;
-                let mut count = output_after.saturating_sub(output_before);
-
-                // If we had a partial in output_lines before, it wasn't broadcast yet.
-                // Now that add_output may have completed it (or added new lines after it),
-                // include it in this broadcast by moving skip back one position.
-                if had_partial_in_output && skip > 0 {
-                    skip -= 1;
-                    count = output_after.saturating_sub(skip);
-                }
-
-                // If there's currently a partial line at the end of output_lines,
-                // exclude it from this broadcast (it'll be sent when completed)
-                if has_partial_in_output && count > 0 {
-                    count -= 1;
-                }
-
-                (count, skip)
-            };
-            let lines_to_pending = pending_after.saturating_sub(pending_before);
-
-            // Apply highlight colors to newly added lines
-            if !highlight_map.is_empty() {
-                // Apply to output_lines
-                for line in self.worlds[world_idx].output_lines.iter_mut().skip(output_before) {
-                    let plain_text = strip_ansi_codes(&line.text);
-                    if let Some(hl) = highlight_map.get(&plain_text) {
-                        line.highlight_color = hl.clone();
-                    }
-                }
-                // Apply to pending_lines
-                for line in self.worlds[world_idx].pending_lines.iter_mut().skip(pending_before) {
-                    let plain_text = strip_ansi_codes(&line.text);
-                    if let Some(hl) = highlight_map.get(&plain_text) {
-                        line.highlight_color = hl.clone();
-                    }
-                }
+                // Only a final run can end without a newline, and only when the packet did.
+                // A partial tail never reaches processed_lines (it is held for the next
+                // read), so in practice this is always true - kept explicit rather than
+                // assumed.
+                let append_newline =
+                    run_idx + 1 != run_count || ends_with_newline || has_partial;
+                self.add_visible_run(
+                    world_idx, run, is_current,
+                    console_height, console_width, is_daemon_mode, append_newline, flush,
+                );
             }
+        }
 
-            // Mark output for redraw whenever output changes
-            self.needs_output_redraw = true;
-
-            // For synchronized more-mode: only broadcast lines that went to output_lines
-            // Lines that went to pending_lines will be broadcast when released
-            // Only send to clients viewing this world (Phase 2 output routing).
-            // is_viewed: true unconditionally - clients viewing this world consider it
-            // "viewed". flush: splash_was_cleared, so the client clears its buffer
-            // atomically before appending new lines (avoids a race with a separate
-            // WorldFlushed message) - broadcast_output_range's count==0 branch still sends
-            // WorldFlushed on its own when there's nothing else to send alongside it.
-            self.broadcast_output_range(world_idx, skip_count, lines_to_output, true, true, splash_was_cleared);
-
-            // Broadcast pending count update if it changed (for synchronized more-mode indicator)
-            // Use filtered broadcast to skip clients that received pending in InitialState
-            if lines_to_pending > 0 || pending_after != pending_before {
-                self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
-            }
-
-            // Broadcast updated unseen count so all clients stay in sync
-            let unseen_count = self.worlds[world_idx].unseen_lines;
-            if unseen_count > 0 {
-                self.ws_broadcast(WsMessage::UnseenUpdate {
-                    world_index: world_idx,
-                    count: unseen_count,
-                });
-            }
-
-            // Broadcast activity count to keep all clients in sync
-            self.broadcast_activity();
-
+        if !non_gagged_lines.is_empty() {
             // Text-to-speech: speak non-gagged MUD output when TTS is enabled and not muted
             // Only speak output from the currently visible world
             if self.settings.tts_mode != tts::TtsMode::Off && !self.settings.tts_muted
@@ -9261,69 +9445,6 @@ impl App {
             }
         }
 
-        // Add gagged lines to output (they'll only show with F2)
-        // Also broadcast to WebSocket clients so F2 works on all interfaces
-        let was_at_bottom = self.worlds[world_idx].is_at_bottom();
-        // Invariant: World::output_lines is always sorted by seq (see the doc comment on
-        // App::broadcast_released_lines, which real-seq release broadcasts depend on). Pushing
-        // a gagged line straight into output_lines unconditionally used to violate that: while
-        // paused with pending_lines holding earlier (lower-seq) lines that haven't been
-        // released yet, a gagged line pushed here gets a NEWER/higher seq but lands in
-        // output_lines immediately, ahead of those still-pending lower-seq lines - so when
-        // they're eventually released and appended after it, output_lines ends up with a seq
-        // dip in the middle. Route the gagged line into pending_lines instead in that case; it
-        // rides the same release batch (and its own broadcast) when the pause ends.
-        //
-        // Deliberately NOT gated on settings.more_mode_enabled: pending_lines can be
-        // non-empty even after more-mode is toggled off globally - add_output's "more-mode
-        // off => drain pending" branch only fires for a world actively receiving new
-        // non-gagged output at the moment of the toggle, so a paused background world that
-        // isn't currently receiving non-gagged output keeps its stale paused/pending_lines
-        // state regardless of the current setting value. The condition that actually matters
-        // is "is there an existing backlog this line would otherwise jump ahead of", which is
-        // exactly `paused && !pending_lines.is_empty()` on its own.
-        let hold_gagged_in_pending = self.worlds[world_idx].paused
-            && !self.worlds[world_idx].pending_lines.is_empty();
-        for (line, highlight) in gagged_lines {
-            let seq = self.worlds[world_idx].next_seq;
-            self.worlds[world_idx].next_seq += 1;
-            let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
-            output_line.highlight_color = highlight;
-            // Gagged or not, this is still text from the world: born viewed when someone's
-            // watching, same as add_output does for non-gagged lines. Bypasses add_output
-            // entirely so this must be set by hand.
-            output_line.viewed = is_current;
-            // Archive gagged server lines to long-term scrollback (with gagged=true) -
-            // unconditional on which buffer it lands in, since archiving is a timestamped
-            // log, not a seq-ordered live buffer other code indexes into.
-            if let Some(ref tx) = self.worlds[world_idx].scrollback_tx {
-                let ts_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let world_name = self.worlds[world_idx].name.clone();
-                let _ = tx.try_send((world_name, ts_ms, line.to_string(), true));
-            }
-            if hold_gagged_in_pending {
-                self.worlds[world_idx].pending_lines.push(output_line);
-                // Not broadcast here - it goes out with the pending release batch via
-                // App::broadcast_released_lines, same as every other pending line.
-                continue;
-            }
-            self.worlds[world_idx].output_lines.push(output_line);
-            // Broadcast gagged line to WebSocket clients
-            let ws_data = line.to_string().replace('\r', "") + "\n";
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                world_index: world_idx,
-                data: ws_data,
-                is_viewed: is_current,
-                ts: current_timestamp_secs(),
-                from_server: true,
-                seq, end_seq: Some(seq),
-                flush: false,
-                gagged: true, highlight_colors: Vec::new(),
-            });
-        }
         // Keep scroll at bottom if we were already there, even when paused.
         // Without this, gagged lines shift output_lines.len() ahead of scroll_offset,
         // causing is_at_bottom() to return false and Tab to scroll instead of releasing.
@@ -13055,7 +13176,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         ACTIONS_BTN_ADD, ACTIONS_BTN_EDIT, ACTIONS_BTN_DELETE, ACTIONS_BTN_CANCEL,
         EDITOR_FIELD_NAME, EDITOR_FIELD_WORLD, EDITOR_FIELD_MATCH_TYPE,
         EDITOR_FIELD_PATTERNS, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED, EDITOR_FIELD_STARTUP,
-        EDITOR_FIELD_GUI_SHORTCUT,
+        EDITOR_FIELD_GUI_SHORTCUT, EDITOR_FIELD_SUPPRESS_BLANKS,
         EDITOR_BTN_SAVE, EDITOR_BTN_CANCEL, EDITOR_BTN_DELETE,
     };
     use popup::definitions::world_editor::{
@@ -14154,6 +14275,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             let enabled = state.get_bool(EDITOR_FIELD_ENABLED).unwrap_or(true);
                             let startup = state.get_bool(EDITOR_FIELD_STARTUP).unwrap_or(false);
                             let gui_shortcut = state.get_bool(EDITOR_FIELD_GUI_SHORTCUT).unwrap_or(false);
+                            let suppress_blanks = state.get_bool(EDITOR_FIELD_SUPPRESS_BLANKS).unwrap_or(false);
                             let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
 
                             // Read the action-level match type
@@ -14181,6 +14303,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 enabled,
                                 startup,
                                 gui_shortcut,
+                                suppress_blanks,
                                 ..Action::default()
                             };
 
@@ -14336,6 +14459,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             let enabled = state.get_bool(EDITOR_FIELD_ENABLED).unwrap_or(true);
                             let startup = state.get_bool(EDITOR_FIELD_STARTUP).unwrap_or(false);
                             let gui_shortcut = state.get_bool(EDITOR_FIELD_GUI_SHORTCUT).unwrap_or(false);
+                            let suppress_blanks = state.get_bool(EDITOR_FIELD_SUPPRESS_BLANKS).unwrap_or(false);
                             let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
 
                             let match_type_str = state.get_selected(EDITOR_FIELD_MATCH_TYPE).unwrap_or("regexp");
@@ -14361,6 +14485,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                                 enabled,
                                 startup,
                                 gui_shortcut,
+                                suppress_blanks,
                                 ..Action::default()
                             };
 

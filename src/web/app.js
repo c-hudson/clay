@@ -526,6 +526,7 @@
         actionEnabled: document.getElementById('action-enabled'),
         actionStartup: document.getElementById('action-startup'),
         actionGuiShortcut: document.getElementById('action-gui-shortcut'),
+        actionSuppressBlanks: document.getElementById('action-suppress-blanks'),
         actionError: document.getElementById('action-error'),
         actionSaveBtn: document.getElementById('action-save-btn'),
         actionEditorDeleteBtn: document.getElementById('action-editor-delete-btn'),
@@ -8975,6 +8976,7 @@
             elements.actionEnabled.value = (action.enabled !== false) ? 'yes' : 'no';
             elements.actionStartup.value = action.startup ? 'yes' : 'no';
             elements.actionGuiShortcut.value = action.gui_shortcut ? 'yes' : 'no';
+            elements.actionSuppressBlanks.value = action.suppress_blanks ? 'yes' : 'no';
         } else {
             // New action
             elements.actionEditorTitle.textContent = 'New Action';
@@ -9096,7 +9098,8 @@
             command: elements.actionCommand.value,
             enabled: elements.actionEnabled.value === 'yes',
             startup: elements.actionStartup.value === 'yes',
-            gui_shortcut: elements.actionGuiShortcut.value === 'yes'
+            gui_shortcut: elements.actionGuiShortcut.value === 'yes',
+            suppress_blanks: elements.actionSuppressBlanks.value === 'yes'
         };
 
         if (editingActionIndex < 0) {

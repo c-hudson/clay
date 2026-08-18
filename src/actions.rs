@@ -78,6 +78,17 @@ pub struct Action {
     pub startup: bool,          // If true, run commands on Clay startup
     #[serde(default)]
     pub gui_shortcut: bool,     // If true, show as a shortcut tile in the web/GUI icon bar
+    /// If true, gag up to `SUPPRESS_BLANKS_MAX` blank lines immediately following a match.
+    ///
+    /// MUD output routinely pads a line with blanks, so gagging the line alone still leaves
+    /// the vertical space behind. This cannot be expressed as a wider regex: lines are split
+    /// (`combined_data.lines()`) before `check_action_triggers` ever sees them, so a pattern
+    /// can never match a newline - and the split happens on TCP-packet boundaries, so even a
+    /// multi-line haystack would only match when the blanks happened to arrive in the same
+    /// read. The suppression is a counter on the world instead; see
+    /// `World::suppress_blanks_remaining`.
+    #[serde(default)]
+    pub suppress_blanks: bool,
 }
 
 impl Default for Action {
@@ -93,6 +104,7 @@ impl Default for Action {
             enabled: true,
             startup: false,
             gui_shortcut: false,
+            suppress_blanks: false,
         }
     }
 }
@@ -371,6 +383,10 @@ pub struct ActionTriggerResult {
     pub should_gag: bool,           // If true, suppress the line from output
     pub commands: Vec<String>,      // Commands to execute
     pub highlight_color: Option<String>, // If Some, highlight the line with this color
+    /// Mirrors `Action::suppress_blanks` on the action that fired: the caller should gag the
+    /// blank lines that follow. Independent of `should_gag` - an action may want the blanks
+    /// gone while keeping the line itself visible.
+    pub suppress_blanks: bool,
 }
 
 /// Convert a wildcard pattern (* and ?) to a regex pattern
@@ -671,6 +687,7 @@ pub fn check_action_triggers(
                         should_gag,
                         commands: filtered_commands,
                         highlight_color,
+                        suppress_blanks: action.suppress_blanks,
                     });
                 }
             }
@@ -1054,6 +1071,23 @@ mod tests {
         let actions = vec![make_action("test", "hello", "nod", MatchType::Regexp)];
         let result = check_action_triggers("HELLO WORLD", "", &actions);
         assert!(result.is_some());
+    }
+
+    /// `suppress_blanks` is independent of `/gag`: an action may want the padding blanks gone
+    /// while keeping the matched line itself visible.
+    #[test]
+    fn test_trigger_reports_suppress_blanks() {
+        let mut action = make_action("test", "spam", "say hi", MatchType::Regexp);
+        action.suppress_blanks = true;
+        let result = check_action_triggers("spam message", "", &[action]).unwrap();
+        assert!(result.suppress_blanks, "the flag must reach the caller so it can arm the counter");
+        assert!(!result.should_gag, "suppress_blanks must not imply gagging the matched line");
+
+        // Default off, and a non-matching line reports nothing at all.
+        let plain = make_action("test", "spam", "say hi", MatchType::Regexp);
+        assert!(!plain.suppress_blanks, "must default off");
+        let result = check_action_triggers("spam message", "", &[plain]).unwrap();
+        assert!(!result.suppress_blanks);
     }
 
     #[test]

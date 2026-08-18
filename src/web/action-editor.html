@@ -665,6 +665,7 @@ function renderDetail() {
   checkRow.appendChild(buildCheckbox('Enabled', a.enabled, v => { a.enabled = v; renderList(); markDirty(); }));
   checkRow.appendChild(buildCheckbox('Run at startup', a.startup, v => { a.startup = v; markDirty(); }));
   checkRow.appendChild(buildCheckbox('GUI Menu Shortcut', a.gui_shortcut, v => { a.gui_shortcut = v; markDirty(); }));
+  checkRow.appendChild(buildCheckbox('Suppress Blanks', a.suppress_blanks, v => { a.suppress_blanks = v; markDirty(); }));
   const checkWrap = document.createElement('div');
   checkWrap.className = 'field-row';
   checkWrap.appendChild(checkRow);
@@ -855,6 +856,7 @@ function addNewAction() {
       enabled: true,
       startup: false,
       gui_shortcut: false,
+      suppress_blanks: false,
     };
     actions.push(a);
     selActionName = name;
