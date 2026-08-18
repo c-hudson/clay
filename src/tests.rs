@@ -399,7 +399,7 @@
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new() };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new() };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
 
@@ -1168,7 +1168,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
         };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json)).await.unwrap();
@@ -1275,7 +1275,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
         };
         sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap())).await.unwrap();
         let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
@@ -1296,7 +1296,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
         };
         sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap())).await.unwrap();
         let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
@@ -1424,7 +1424,7 @@
             auth_key: Some("test_key".to_string()),
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
         };
         let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string(), "test_challenge".to_string());
 
@@ -1490,7 +1490,7 @@
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new(),
+            resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap())).await.unwrap();
 

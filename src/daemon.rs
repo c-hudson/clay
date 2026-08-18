@@ -4094,7 +4094,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(1, 0)], resume_epochs: Vec::new(), client_uid: String::new(),
+            resume: vec![(1, 0)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);
@@ -4150,7 +4150,7 @@ mod resume_owner_scoping_tests {
             auth_key: None,
             request_key: false,
             challenge_response: false,
-            resume: vec![(0, 7)], resume_epochs: Vec::new(), client_uid: String::new(),
+            resume: vec![(0, 7)], resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new(),
         }, &event_tx).await;
 
         let replies = drain_scrollback_replies(&mut alice_rx);

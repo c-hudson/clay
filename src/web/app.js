@@ -894,6 +894,19 @@
     //
     // A world with no recorded epoch is omitted rather than sent as 0: 0 is the server's
     // "no epoch" value, and it must not compare equal to anything.
+    // This build's version, sent as AuthRequest.client_version and logged server-side next to
+    // WS-AUTH. On Android the APK bundles its own copy of this file, so it can lag arbitrarily
+    // far behind the server it talks to - which is exactly the ambiguity this resolves. A web
+    // client is served by the server and so always matches it; empty is logged as "-".
+    function clientVersion() {
+        try {
+            if (window.Android && typeof window.Android.getAppVersion === 'function') {
+                return window.Android.getAppVersion() || '';
+            }
+        } catch (e) { /* fall through - reporting a version must never block auth */ }
+        return (typeof window.CLAY_VERSION === 'string') ? window.CLAY_VERSION : '';
+    }
+
     function buildResumeEpochList() {
         const list = [];
         worlds.forEach((world, idx) => {
@@ -2021,7 +2034,7 @@
         setTimeout(hideConnectionLog, 800);
 
         if (window.AUTO_PASSWORD) {
-            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_uid: clientUid }));
+            ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD, request_key: false, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid }));
             return;
         }
 
@@ -2443,8 +2456,37 @@
     }
 
     // Cleanly close all pending attempts and the winner, then reconnect.
+    // Every reconnect in the client funnels through here, so this is the one place worth
+    // instrumenting. Instrumenting call sites individually is what left the real cause
+    // invisible: `checkConnectionOnResume` was covered and reported a healthy socket every
+    // time, while the reconnect actually came from one of the other eighteen callers - most
+    // of which (the whole `visibilitychange` handler, including its own pong timeout) had no
+    // reporting at all.
+    //
+    // The caller is derived from a stack trace rather than a passed-in reason so it cannot go
+    // stale as callers are added, and so this needed no edit at nineteen sites.
+    function reconnectCallerHint() {
+        try {
+            var lines = String(new Error().stack || '').split('\n');
+            // 0 is this helper, 1 is forceReconnect itself; the first frame after those is the
+            // caller. Firefox/JavaScriptCore omit the V8-style header line, so scan rather than
+            // index blindly.
+            for (var i = 0; i < lines.length; i++) {
+                var f = lines[i].trim();
+                if (!f || f.indexOf('reconnectCallerHint') !== -1 || f.indexOf('forceReconnect') !== -1) continue;
+                if (f.indexOf('Error') === 0) continue;
+                return f.replace(/^at\s+/, '').slice(0, 90);
+            }
+        } catch (e) { /* diagnostics must never break the path they report on */ }
+        return '?';
+    }
+
     function forceReconnect() {
         var now = Date.now();
+        recordClientEvent('forceReconnect', 'ws=' + (ws ? ws.readyState : 'null')
+            + ' auth=' + authenticated
+            + ' sinceLastMs=' + (lastForceReconnectAt ? (now - lastForceReconnectAt) : -1)
+            + ' from=' + reconnectCallerHint());
         if (now - lastForceReconnectAt < 1000) {
             var remaining = 1000 - (now - lastForceReconnectAt);
             debugLog('forceReconnect: debounced (' + (now - lastForceReconnectAt) + 'ms since last), retry in ' + remaining + 'ms');
@@ -5358,7 +5400,7 @@
             auth_key: keyValue,
             challenge_response: usesChallenge,
             request_key: false,
-            resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(),
+            resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(),
             client_uid: clientUid
         };
         if (currentWorldIndex !== undefined) {
@@ -5428,7 +5470,7 @@
         hashPassword(password).then(async hash => {
             // Challenge-response: SHA256(SHA256(password) + challenge)
             const challengeHash = serverChallenge ? await hashPassword(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_uid: clientUid };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid };
             if (username) {
                 msg.username = username;
             }
@@ -5441,7 +5483,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             const challengeHash = serverChallenge ? sha256Fallback(hash + serverChallenge) : hash;
-            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_uid: clientUid };
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: false, challenge_response: !!serverChallenge, resume: buildResumeAckListForAuthRequest(), resume_epochs: buildResumeEpochList(), client_version: clientVersion(), client_uid: clientUid };
             if (username) {
                 msg.username = username;
             }

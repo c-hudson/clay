@@ -272,6 +272,20 @@ pub enum WsMessage {
         /// exactly as before.
         #[serde(default)]
         resume_epochs: Vec<(usize, u64)>,
+        /// The client build's version string, logged next to WS-AUTH so a single log pull
+        /// answers "what is this peer running?".
+        ///
+        /// Exists because that question was unanswerable exactly when it mattered: a fix had
+        /// shipped, the diagnostics it added produced nothing, and there was no way to tell
+        /// "the peer does not have the build yet" from "the build is installed and the thing
+        /// being measured did not happen". Those need opposite next steps. An Android APK is
+        /// the case that really needs it - it bundles its own assets, so unlike a web client
+        /// (served by the server, hence always the same version) it can lag arbitrarily far
+        /// behind the server it talks to.
+        ///
+        /// Empty from a client that predates this field, logged as "-".
+        #[serde(default)]
+        client_version: String,
         /// Stable, client-generated identity that survives reconnects (localStorage on
         /// web/Android, a per-process value on the Rust console). ▶ ownership
         /// (`OutputLine::display_id`) is keyed on this rather than the per-connection client
@@ -2745,7 +2759,7 @@ where
         };
         try_send_local(&clients, client_id, &tx, &client_ip, response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_uid: String::new() }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false, resume: Vec::new(), resume_epochs: Vec::new(), client_version: String::new(), client_uid: String::new() }))).await;
     }
 
     // Combined receive/send/keepalive loop.
@@ -2857,7 +2871,7 @@ where
             Some(Ok(WsRawMessage::Text(text))) => {
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match &ws_msg {
-                        WsMessage::AuthRequest { username, password_hash: client_hash, auth_key, request_key, challenge_response: uses_challenge, .. } => {
+                        WsMessage::AuthRequest { username, password_hash: client_hash, auth_key, request_key, challenge_response: uses_challenge, ref client_version, .. } => {
                             let has_key = auth_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
                             let has_pw = !client_hash.is_empty();
                             crate::http::log_remote_event("WS-AUTH", &client_ip,
@@ -2960,6 +2974,8 @@ where
                             if auth_success {
                                 // Log successful auth
                                 log_ws_auth(&client_ip, true, auth_username.as_deref());
+                                crate::http::log_remote_event("CLIENT-VERSION", &client_ip,
+                                    if client_version.is_empty() { "-" } else { client_version.as_str() });
                                 // Clear any accumulated violations so transient reconnect
                                 // failures don't result in a ban after a successful login
                                 ban_list.clear_violations(&client_ip);

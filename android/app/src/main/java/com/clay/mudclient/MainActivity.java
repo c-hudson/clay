@@ -324,6 +324,19 @@ public class MainActivity extends AppCompatActivity {
          * entirely in JS, from state only JS can see, and on a phone with no adb attached
          * the server log is the only place that answer can surface.
          */
+        /// The installed APK's version, reported to the server at auth (AuthRequest.client_version)
+        /// so a log pull can tell "the phone does not have this build yet" from "it has it and
+        /// the thing being measured did not happen". The APK bundles its own web assets, so this
+        /// is the version of both the app and the JS talking to the server.
+        @JavascriptInterface
+        public String getAppVersion() {
+            try {
+                return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
         @JavascriptInterface
         public void recordClientEvent(String event, String detail) {
             if (event == null || event.isEmpty()) {
