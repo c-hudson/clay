@@ -56,6 +56,9 @@ public class NativeWebSocket {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private WebSocketCallback callback;
     private boolean isConnected = false;
+    /// Set by close(): distinguishes "we asked for this" from a socket that died on its own.
+    /// Without it, every loser of the connect race would report as an unexplained death.
+    private volatile boolean closedLocally = false;
     private final Context appContext;
 
     public interface WebSocketCallback {
@@ -170,6 +173,10 @@ public class NativeWebSocket {
                 @Override
                 public void onClosed(WebSocket webSocket, int code, String reason) {
                     Log.d(TAG, "WebSocket closed: " + code + " " + reason);
+                    if (!closedLocally) {
+                        MainActivity.recordLifecycle("socketClosed",
+                            "code=" + code + " reason=" + (reason == null || reason.isEmpty() ? "-" : reason));
+                    }
                     isConnected = false;
                     mainHandler.post(() -> {
                         if (callback != null) {
@@ -223,6 +230,12 @@ public class NativeWebSocket {
                         errorMsg += ")";
                     }
                     Log.e(TAG, "WebSocket error: " + errorMsg, t);
+                    // Same rationale as the onClosed report above: a transport that dies on
+                    // its own is the reconnect cause that had no recorded explanation.
+                    if (!closedLocally) {
+                        MainActivity.recordLifecycle("socketFailed",
+                            t == null ? errorMsg : (t.getClass().getSimpleName() + ": " + t.getMessage()));
+                    }
                     isConnected = false;
                     final String finalError = errorMsg;
                     mainHandler.post(() -> {
@@ -281,6 +294,7 @@ public class NativeWebSocket {
 
     public void close() {
         Log.d(TAG, "Closing WebSocket connection");
+        closedLocally = true;
         isConnected = false;
         if (webSocket != null) {
             try {

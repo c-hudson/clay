@@ -2935,6 +2935,29 @@ impl World {
     /// (`AuthRequest.resume_epochs`) silently never matches. 53 bits is still ~9x10^15
     /// values, so two live worlds colliding is not a practical concern, and the sole
     /// requirement is that a new sequence space differ from the one it replaced.
+    /// Does `client_epoch` — a `seq_epoch` echoed back by a client — refer to this same
+    /// sequence space?
+    ///
+    /// Not `==`, because a JavaScript client **cannot** echo a large u64 unchanged. JSON
+    /// numbers are IEEE doubles there, so an epoch above 2^53 is rounded on arrival and the
+    /// client sends that rounded value back. `new_seq_epoch` mints below 2^53 so new epochs
+    /// round-trip exactly, but that only ever helped a sequence space created *after* the
+    /// upgrade: `seq_epoch` survives a hot reload verbatim, so a long-running server keeps
+    /// its original full-width epochs indefinitely. On the first real deployment this was
+    /// tried on, every world had a pre-fix epoch and so nothing ever matched
+    /// (`resume_epochs=14 worlds_skipped=0/45` in the debug log).
+    ///
+    /// Comparing the f64 projections asks the question that actually matters — "do these two
+    /// look the same to a JS peer?" — and needs no migration, no epoch change, and nothing
+    /// from the client. For a new (<2^53) epoch the projection is lossless, so this is exactly
+    /// `==`; for a legacy one it accepts precisely the value the client is able to send.
+    ///
+    /// A 0 on either side means "no epoch" (multiuser, or a peer that predates the field) and
+    /// never matches — two unrelated worlds must not compare equal.
+    pub(crate) fn seq_epoch_matches(server_epoch: u64, client_epoch: u64) -> bool {
+        server_epoch != 0 && client_epoch != 0 && (server_epoch as f64) == (client_epoch as f64)
+    }
+
     fn new_seq_epoch() -> u64 {
         let mut bytes = [0u8; 8];
         if getrandom::getrandom(&mut bytes).is_err() {
@@ -11814,7 +11837,7 @@ impl App {
             return;
         }
         let skipped = self.worlds.iter().enumerate().filter(|(i, w)| {
-            w.seq_epoch != 0 && resume_epochs.iter().any(|&(ri, e)| ri == *i && e == w.seq_epoch)
+            resume_epochs.iter().any(|&(ri, e)| ri == *i && World::seq_epoch_matches(w.seq_epoch, e))
         }).count();
         let lines: usize = if let WsMessage::InitialState { ref worlds, .. } = initial_state {
             worlds.iter().map(|w| w.output_lines_ts.len()).sum()
@@ -11876,8 +11899,8 @@ impl App {
             // never a match: it is the "no epoch" value (multiuser, and any world whose
             // sequence space predates the field), and treating it as one would let two
             // unrelated worlds compare equal.
-            let client_holds_this_world = world.seq_epoch != 0
-                && resume_epochs.iter().any(|&(i, epoch)| i == idx && epoch == world.seq_epoch);
+            let client_holds_this_world = resume_epochs.iter()
+                .any(|&(i, epoch)| i == idx && World::seq_epoch_matches(world.seq_epoch, epoch));
             let max_initial_lines = if client_holds_this_world {
                 0
             } else {

@@ -158,7 +158,9 @@ public class MainActivity extends AppCompatActivity {
      * Record a lifecycle transition: to logcat (for anyone who does have a cable) and to the
      * buffer above, so it reaches the server's ~/.clay/remote.log as CLIENT-LIFECYCLE.
      */
-    private static void recordLifecycle(String event, String detail) {
+    /// Package-visible so NativeWebSocket can report a socket dying on its own - that death
+    /// happens with no usable socket to send on, which is exactly what the buffer is for.
+    static void recordLifecycle(String event, String detail) {
         android.util.Log.i("Clay", "LIFECYCLE " + event + ": " + detail);
         synchronized (lifecycleEvents) {
             if (lifecycleEvents.size() >= LIFECYCLE_BUFFER_MAX) {

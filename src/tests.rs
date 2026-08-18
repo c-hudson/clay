@@ -6217,6 +6217,66 @@ if you're more curious.\"";
         result.expect("expected a ScrollbackLines reply")
     }
 
+    /// A world whose epoch was minted **before** the 53-bit fix must still match when a JS
+    /// client echoes it back — rounded, because that is the only form a JS client can send.
+    ///
+    /// This is the case the first fix missed and the field caught. `new_seq_epoch` masking to
+    /// 53 bits only helps a sequence space created after the upgrade; `seq_epoch` survives a
+    /// hot reload verbatim, so a server running since before the upgrade keeps full-width
+    /// epochs forever. On the real deployment every world was in that state, so the skip
+    /// never fired once: `resume_epochs=14 worlds_skipped=0/45`. Verifying against a freshly
+    /// started server could not have caught it — every epoch there is newly minted.
+    #[test]
+    fn test_legacy_oversized_epoch_still_matches_what_a_js_client_echoes() {
+        // A real pre-fix epoch observed on the wire, and what a JS client turns it into.
+        const LEGACY: u64 = 12245391822682352775;
+        let as_js_sees_it = LEGACY as f64 as u64;
+        assert_ne!(as_js_sees_it, LEGACY,
+            "this constant is only meaningful if JS actually rounds it");
+
+        assert!(World::seq_epoch_matches(LEGACY, as_js_sees_it),
+            "a legacy epoch must match the rounded value a JS client is able to echo back \
+             ({LEGACY} vs {as_js_sees_it}) - otherwise the InitialState skip never fires on \
+             any server that has been running since before the fix");
+
+        // Still exact for a new-style epoch: no behaviour change there.
+        let fresh = World::new("w").seq_epoch;
+        assert!(World::seq_epoch_matches(fresh, fresh));
+        assert!(!World::seq_epoch_matches(fresh, fresh + 1),
+            "a genuinely different epoch must not match");
+
+        // 0 is "no epoch" on either side and must never match.
+        assert!(!World::seq_epoch_matches(0, 0));
+        assert!(!World::seq_epoch_matches(LEGACY, 0));
+        assert!(!World::seq_epoch_matches(0, LEGACY));
+    }
+
+    /// The end-to-end version of the above, through the real builder: a world carrying a
+    /// pre-fix epoch, resumed by a client sending the rounded form, must have its history
+    /// skipped.
+    #[test]
+    fn test_initial_state_skips_for_a_client_resuming_a_legacy_epoch_world() {
+        const LEGACY: u64 = 12245391822682352775;
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("legacy");
+        world.seq_epoch = LEGACY; // as a pre-1.5.33 reload would have restored it
+        for seq in 0..200u64 {
+            world.output_lines.push(OutputLine::new(format!("line {seq}"), seq));
+        }
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        let echoed = LEGACY as f64 as u64;
+        let state = app.build_initial_state_with_resume(0, &[(0, echoed)]);
+        let WsMessage::InitialState { worlds, .. } = state else { panic!("expected InitialState") };
+        assert!(worlds[0].output_lines_ts.is_empty(),
+            "history must be skipped for a legacy-epoch world the client still holds; got {} lines",
+            worlds[0].output_lines_ts.len());
+        assert_eq!(worlds[0].total_output_lines, 200,
+            "the skipped world must still report what the server holds");
+    }
+
     /// A world's seq epoch must survive a round trip through a JavaScript client, which
     /// parses JSON numbers as IEEE doubles. A full-width u64 does not: 12245391822682352775
     /// (a real epoch seen on the wire) comes back as 12245391822682354000, so
