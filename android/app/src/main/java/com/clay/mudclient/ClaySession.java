@@ -33,6 +33,14 @@ final class ClaySession {
      * null on every Activity recreation that check reads "changed" and forces a needless restart
      * of a perfectly healthy server or tunnel.
      */
+    /// Handle of the default network the SSH tunnel was last built against, or 0 if unknown.
+    ///
+    /// Lives here rather than on the Activity because the network callback is registered in
+    /// onResume and unregistered in onPause, so an Activity-scoped field would be empty on
+    /// every single resume - which is exactly the state that made the registration echo
+    /// (see MainActivity's onAvailable) indistinguishable from a real network handoff.
+    private static long sshNetworkHandle;
+
     private static String lastAppliedRunMode;
     private static String lastAppliedSshConfigSnapshot;
 
@@ -52,6 +60,14 @@ final class ClaySession {
 
     static synchronized void setSshProxy(SshProxyManager m) {
         sshProxy = m;
+    }
+
+    static synchronized long sshNetworkHandle() {
+        return sshNetworkHandle;
+    }
+
+    static synchronized void setSshNetworkHandle(long handle) {
+        sshNetworkHandle = handle;
     }
 
     static synchronized String lastAppliedRunMode() {

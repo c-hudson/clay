@@ -1378,6 +1378,29 @@ public class MainActivity extends AppCompatActivity {
         sshNetworkCallback = new ConnectivityManager.NetworkCallback() {
             @Override
             public void onAvailable(Network network) {
+                // registerDefaultNetworkCallback() invokes this IMMEDIATELY with the network
+                // that is already current - it is not purely a change notification. Since the
+                // callback is registered in onResume and unregistered in onPause, every resume
+                // produced one of these, and treating it as a handoff tore down a perfectly
+                // good tunnel, moved it to a fresh random port, and forced a reconnect through
+                // updateSshTunnelPort(). That is the "Reconnecting..." flash on every return to
+                // the app, with the socket having been alive right up until this fired.
+                //
+                // So compare against the network the tunnel was actually built on, rather than
+                // trusting the callback to mean "changed".
+                long handle = network.getNetworkHandle();
+                long previous = ClaySession.sshNetworkHandle();
+                ClaySession.setSshNetworkHandle(handle);
+                if (previous == 0L) {
+                    // First sighting: the tunnel was just built for this network, so there is
+                    // nothing to heal - only record it.
+                    android.util.Log.i("Clay", "Default network recorded (" + handle + ")");
+                    return;
+                }
+                if (previous == handle) {
+                    android.util.Log.i("Clay", "Default network unchanged - keeping SSH tunnel");
+                    return;
+                }
                 android.util.Log.i("Clay", "Default network changed - restarting SSH tunnel");
                 restartSshTunnel(true);
             }
