@@ -388,17 +388,79 @@ impl WorldSwitchMode {
     }
 }
 
-/// URL shortening service selection
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
+/// URL shortening service selection.
+///
+/// Which of these `/url` actually uses, and in what order, is the hidden
+/// `url_shorteners=` key in settings.dat's `[global]` section (no UI - edit the file).
+/// See `default_order` for what a file without that key gets seeded with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum UrlShortener {
     #[default]
     IsGd,
     VGd,
     TinyUrl,
+    /// No longer in `default_order()`, but still parsed from `url_shorteners=` so a user
+    /// who wants it back only has to add `da.gd` to that list.
     DaGd,
 }
 
 impl UrlShortener {
+    /// Settings.dat name for this service - what `url_shorteners=` is written with and
+    /// parsed from.
+    pub fn name(&self) -> &'static str {
+        match self {
+            UrlShortener::IsGd => "is.gd",
+            UrlShortener::VGd => "v.gd",
+            UrlShortener::TinyUrl => "tinyurl",
+            UrlShortener::DaGd => "da.gd",
+        }
+    }
+
+    /// Inverse of `name`, tolerant of the obvious spellings. Returns None for anything
+    /// unrecognized so `parse_list` can skip it instead of failing the whole line.
+    pub fn from_name(s: &str) -> Option<UrlShortener> {
+        match s.trim().to_lowercase().as_str() {
+            "is.gd" | "isgd" => Some(UrlShortener::IsGd),
+            "v.gd" | "vgd" => Some(UrlShortener::VGd),
+            "tinyurl" | "tinyurl.com" => Some(UrlShortener::TinyUrl),
+            "da.gd" | "dagd" => Some(UrlShortener::DaGd),
+            _ => None,
+        }
+    }
+
+    /// The list seeded into a settings.dat that has no `url_shorteners=` key yet.
+    /// The **last** entry is the last-resort fallback: `shorten_url_fallback` tries it
+    /// only after every other entry failed, and never promotes it to the front however
+    /// well it worked last time. tinyurl sits there deliberately.
+    pub fn default_order() -> Vec<UrlShortener> {
+        vec![UrlShortener::IsGd, UrlShortener::VGd, UrlShortener::TinyUrl]
+    }
+
+    /// Parse the `url_shorteners=` CSV. Unknown names are skipped and duplicates
+    /// collapsed (first occurrence wins, since position is the whole point of the
+    /// setting); an empty or all-unrecognized value falls back to `default_order()` so
+    /// the setting can never be typo'd into leaving `/url` with nothing to call.
+    pub fn parse_list(csv: &str) -> Vec<UrlShortener> {
+        let mut list: Vec<UrlShortener> = Vec::new();
+        for part in csv.split(',') {
+            if let Some(s) = UrlShortener::from_name(part) {
+                if !list.contains(&s) {
+                    list.push(s);
+                }
+            }
+        }
+        if list.is_empty() {
+            UrlShortener::default_order()
+        } else {
+            list
+        }
+    }
+
+    /// Serialize a list back to the `url_shorteners=` CSV form.
+    pub fn list_to_string(list: &[UrlShortener]) -> String {
+        list.iter().map(|s| s.name()).collect::<Vec<_>>().join(",")
+    }
+
     /// Build the full API request URL for the given long URL.
     pub fn build_request_url(&self, long_url: &str) -> String {
         match self {
@@ -1233,6 +1295,54 @@ fn emoji_name_to_unicode(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_url_shortener_default_order_excludes_dagd() {
+        let order = UrlShortener::default_order();
+        assert_eq!(order, vec![UrlShortener::IsGd, UrlShortener::VGd, UrlShortener::TinyUrl]);
+        assert!(!order.contains(&UrlShortener::DaGd), "da.gd was dropped from the default list");
+        // tinyurl stays the last-resort entry — shorten_url_fallback never promotes it.
+        assert_eq!(order.last(), Some(&UrlShortener::TinyUrl));
+    }
+
+    #[test]
+    fn test_url_shortener_list_roundtrip() {
+        let list = vec![UrlShortener::TinyUrl, UrlShortener::DaGd, UrlShortener::VGd];
+        let csv = UrlShortener::list_to_string(&list);
+        assert_eq!(csv, "tinyurl,da.gd,v.gd");
+        assert_eq!(UrlShortener::parse_list(&csv), list);
+    }
+
+    #[test]
+    fn test_url_shortener_parse_list_order_is_preserved() {
+        assert_eq!(
+            UrlShortener::parse_list("v.gd, tinyurl ,is.gd"),
+            vec![UrlShortener::VGd, UrlShortener::TinyUrl, UrlShortener::IsGd]
+        );
+    }
+
+    #[test]
+    fn test_url_shortener_parse_list_skips_unknown_and_dupes() {
+        assert_eq!(
+            UrlShortener::parse_list("is.gd,bogus.example,IS.GD,tinyurl.com"),
+            vec![UrlShortener::IsGd, UrlShortener::TinyUrl]
+        );
+    }
+
+    #[test]
+    fn test_url_shortener_parse_list_falls_back_when_unusable() {
+        // A typo'd or emptied setting must not leave /url with nothing to call.
+        assert_eq!(UrlShortener::parse_list(""), UrlShortener::default_order());
+        assert_eq!(UrlShortener::parse_list("nope,,also-nope"), UrlShortener::default_order());
+    }
+
+    #[test]
+    fn test_url_shortener_request_urls() {
+        assert!(UrlShortener::IsGd.build_request_url("http://x/y").starts_with("https://is.gd/create.php?"));
+        assert!(UrlShortener::VGd.build_request_url("http://x/y").starts_with("https://v.gd/create.php?"));
+        assert!(UrlShortener::TinyUrl.build_request_url("http://x/y").starts_with("https://tinyurl.com/api-create.php?"));
+        assert!(UrlShortener::DaGd.build_request_url("http://x/y").starts_with("https://da.gd/s?"));
+    }
 
     #[test]
     fn test_from_iana_name_utf8() {

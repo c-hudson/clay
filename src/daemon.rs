@@ -763,7 +763,7 @@ pub async fn handle_daemon_ws_message(
                     app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
                 }
                 Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } | Command::TinyUrl { .. } => {
-                    spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
+                    spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed, app.settings.url_shorteners.clone());
                 }
                 Command::DictUsage => {
                     app.emit_usage(world_index, &[

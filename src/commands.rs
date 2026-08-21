@@ -914,35 +914,58 @@ pub fn normalize_language_code(lang: &str) -> String {
     }
 }
 
-/// Remembers which non-tinyurl service last succeeded, so `shorten_url_fallback`
-/// tries it first on the next call. In-memory only (not persisted) - resets on restart.
+/// Remembers which service last succeeded, so `shorten_url_fallback` tries it first on
+/// the next call. In-memory only (not persisted) - resets on restart. Never holds the
+/// last-resort service (see below), so the memo can't reorder the tail of the list.
 static LAST_WORKING_SHORTENER: std::sync::Mutex<Option<crate::encoding::UrlShortener>> =
     std::sync::Mutex::new(None);
 
-/// Shorten a URL, trying non-tinyurl services first and falling back to tinyurl
-/// last. Tries the non-tinyurl service that worked last time first (if any), then
-/// the remaining non-tinyurl services, and only tries tinyurl after all of them
-/// have failed - tinyurl is never tried first.
-pub async fn shorten_url_fallback(url: &str) -> Result<String, String> {
+/// The order `shorten_url_fallback` will actually try, given the configured list and the
+/// last-known-good service. Pure so the two rules that aren't plain iteration are testable
+/// without hitting the network: an empty list means the built-in default order, and the
+/// last-known-good service is moved to the front *unless* it is the final (last-resort)
+/// entry, which always stays last.
+fn resolve_shortener_order(
+    services: &[crate::encoding::UrlShortener],
+    last_working: Option<crate::encoding::UrlShortener>,
+) -> Vec<crate::encoding::UrlShortener> {
     use crate::encoding::UrlShortener;
 
-    let last = *LAST_WORKING_SHORTENER.lock().unwrap();
-    let mut order: Vec<UrlShortener> = Vec::new();
-    if let Some(s) = last {
-        order.push(s);
-    }
-    for s in [UrlShortener::IsGd, UrlShortener::VGd, UrlShortener::DaGd] {
-        if !order.contains(&s) {
-            order.push(s);
+    let mut order: Vec<UrlShortener> = if services.is_empty() {
+        UrlShortener::default_order()
+    } else {
+        services.to_vec()
+    };
+
+    if let Some(last) = last_working {
+        if let Some(pos) = order.iter().position(|s| *s == last) {
+            if pos > 0 && pos + 1 < order.len() {
+                let s = order.remove(pos);
+                order.insert(0, s);
+            }
         }
     }
-    order.push(UrlShortener::TinyUrl); // always last
+    order
+}
+
+/// Shorten a URL, trying `services` in order and falling back to the next one on any
+/// failure. `services` is the user's configured list (`Settings::url_shorteners`, from
+/// settings.dat's hidden `url_shorteners=` key); an empty list means "use the built-in
+/// default order" so a caller can't accidentally disable /url entirely.
+///
+/// Two rules on top of plain in-order iteration, both inherited from the fixed list this
+/// replaced: the service that worked last time is promoted to the front, and the **last**
+/// entry is exempt from that promotion - it's the designated last-resort fallback
+/// (tinyurl by default) and is only ever reached after everything ahead of it failed.
+pub async fn shorten_url_fallback(url: &str, services: &[crate::encoding::UrlShortener]) -> Result<String, String> {
+    let order = resolve_shortener_order(services, *LAST_WORKING_SHORTENER.lock().unwrap());
 
     let mut last_err = "no URL shortener available".to_string();
-    for service in order {
+    let total = order.len();
+    for (i, service) in order.into_iter().enumerate() {
         match lookup_tinyurl(url, service).await {
             Ok(short) => {
-                if service != UrlShortener::TinyUrl {
+                if i + 1 < total {
                     *LAST_WORKING_SHORTENER.lock().unwrap() = Some(service);
                 }
                 return Ok(short);
@@ -1093,6 +1116,9 @@ pub fn spawn_api_lookup(
     client_id: u64,
     world_index: usize,
     command: Command,
+    // Configured shortener list for /url (Settings::url_shorteners); ignored by the
+    // other commands, but taken here so the spawned task doesn't need App access.
+    url_shorteners: Vec<crate::encoding::UrlShortener>,
 ) {
     match command {
         Command::Dict { word } => {
@@ -1133,7 +1159,7 @@ pub fn spawn_api_lookup(
         }
         Command::TinyUrl { url } => {
             tokio::spawn(async move {
-                let result = match shorten_url_fallback(&url).await {
+                let result = match shorten_url_fallback(&url, &url_shorteners).await {
                     Ok(short) => Ok(short),
                     Err(e) => Err(format!("URL shortening failed: {}", e)),
                 };
@@ -2608,7 +2634,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             ], false);
         }
         Command::TinyUrl { url } => {
-            match shorten_url_fallback(&url).await {
+            let services = app.settings.url_shorteners.clone();
+            match shorten_url_fallback(&url, &services).await {
                 Ok(short) => {
                     app.input.buffer = short;
                     app.input.cursor_position = 0;
@@ -2962,3 +2989,55 @@ pub(crate) fn process_pending_tf_commands(app: &mut App) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::UrlShortener;
+
+    #[test]
+    fn test_shortener_order_uses_configured_list_verbatim() {
+        let cfg = vec![UrlShortener::VGd, UrlShortener::IsGd, UrlShortener::TinyUrl];
+        assert_eq!(resolve_shortener_order(&cfg, None), cfg);
+    }
+
+    #[test]
+    fn test_shortener_order_empty_list_falls_back_to_default() {
+        assert_eq!(resolve_shortener_order(&[], None), UrlShortener::default_order());
+    }
+
+    #[test]
+    fn test_shortener_order_promotes_last_known_good() {
+        let cfg = vec![UrlShortener::IsGd, UrlShortener::VGd, UrlShortener::TinyUrl];
+        assert_eq!(
+            resolve_shortener_order(&cfg, Some(UrlShortener::VGd)),
+            vec![UrlShortener::VGd, UrlShortener::IsGd, UrlShortener::TinyUrl]
+        );
+    }
+
+    #[test]
+    fn test_shortener_order_never_promotes_the_last_resort_entry() {
+        // tinyurl is last in the default list, so even a win doesn't move it up.
+        let cfg = vec![UrlShortener::IsGd, UrlShortener::VGd, UrlShortener::TinyUrl];
+        assert_eq!(resolve_shortener_order(&cfg, Some(UrlShortener::TinyUrl)), cfg);
+        // ...but that's positional, not tinyurl-specific: put it mid-list and it promotes.
+        let cfg2 = vec![UrlShortener::IsGd, UrlShortener::TinyUrl, UrlShortener::VGd];
+        assert_eq!(
+            resolve_shortener_order(&cfg2, Some(UrlShortener::TinyUrl)),
+            vec![UrlShortener::TinyUrl, UrlShortener::IsGd, UrlShortener::VGd]
+        );
+    }
+
+    #[test]
+    fn test_shortener_order_ignores_last_known_good_removed_from_list() {
+        // User dropped da.gd from url_shorteners= while the in-memory memo still held it.
+        let cfg = vec![UrlShortener::IsGd, UrlShortener::VGd, UrlShortener::TinyUrl];
+        assert_eq!(resolve_shortener_order(&cfg, Some(UrlShortener::DaGd)), cfg);
+    }
+
+    #[test]
+    fn test_shortener_order_single_entry_list() {
+        let cfg = vec![UrlShortener::IsGd];
+        assert_eq!(resolve_shortener_order(&cfg, Some(UrlShortener::IsGd)), cfg);
+    }
+}

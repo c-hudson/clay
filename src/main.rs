@@ -1721,6 +1721,12 @@ pub struct Settings {
     // to keep the IME up; when false, the OS decides. Always overridden off when
     // a hardware keyboard is attached, regardless of this setting.
     pub keyboard_always_visible: bool,
+    /// Hidden setting - no UI in any interface, edit `url_shorteners=` in settings.dat's
+    /// `[global]` section by hand. The services `/url` tries and the order it tries them
+    /// in; the last entry is the last-resort fallback (see `shorten_url_fallback`). A
+    /// settings.dat without the key is seeded with `UrlShortener::default_order()` on
+    /// load (see `persistence::load_settings`).
+    pub url_shorteners: Vec<encoding::UrlShortener>,
 }
 
 impl Default for Settings {
@@ -1775,6 +1781,7 @@ impl Default for Settings {
             log_input_enabled: false,
             remote_initial_lines: 100,
             keyboard_always_visible: true,
+            url_shorteners: encoding::UrlShortener::default_order(),
         }
     }
 }
@@ -7999,6 +8006,9 @@ impl App {
         writeln!(file, "more_mode_enabled: {}", self.settings.more_mode_enabled)?;
         writeln!(file, "show_tags: {}", self.show_tags)?;
         writeln!(file, "new_line_indicator: {}", self.settings.new_line_indicator)?;
+        // Hidden setting with no UI — /dump is the only way to see the list /url is
+        // actually using after a hand edit to settings.dat.
+        writeln!(file, "url_shorteners: {}", encoding::UrlShortener::list_to_string(&self.settings.url_shorteners))?;
         writeln!(file, "max_lines (output_height-2): {}", (self.output_height as usize).saturating_sub(2))?;
         writeln!(file)?;
 
@@ -11003,7 +11013,7 @@ impl App {
                 }
             }
             Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } | Command::TinyUrl { .. } => {
-                spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
+                spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed, self.settings.url_shorteners.clone());
             }
             Command::DictUsage => {
                 self.emit_usage(world_index, &[

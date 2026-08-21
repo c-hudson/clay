@@ -238,6 +238,76 @@ pub fn remove_pin(host_port: &str) {
     save_known_hosts_to(&known_hosts_path(), &map);
 }
 
+/// Fingerprint of settings.dat as of the last time *Clay itself* read or wrote it, carried
+/// across a hot reload in the reload-state file. `reapply_externally_edited_settings`
+/// compares it against the file on disk to tell a hand edit apart from an in-memory
+/// setting that was simply never saved. None = no baseline (fresh process that has not
+/// touched settings.dat yet, or a reload state written by a build predating the key).
+static SETTINGS_FILE_FINGERPRINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Content hash of settings.dat bytes. Length is prefixed only to make the value
+/// eyeball-comparable in a reload-state file; the hash is what actually decides.
+fn fingerprint_settings_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{}:{}", bytes.len(), hex::encode(hasher.finalize()))
+}
+
+/// Record settings.dat's current on-disk fingerprint as "what we last read or wrote".
+/// Only the canonical settings path counts - tests, `/import` exports and multiuser all
+/// route other paths through the same read/write helpers and must not move the baseline.
+fn record_settings_fingerprint(path: &std::path::Path) {
+    if path != get_settings_path().as_path() {
+        return;
+    }
+    let fp = std::fs::read(path).ok().map(|b| fingerprint_settings_bytes(&b));
+    *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = fp;
+}
+
+/// Re-apply `path` over `app`'s already-restored settings iff its content differs from
+/// `recorded`. Split out from `reapply_externally_edited_settings` so the decision can be
+/// tested against a temp file instead of the caller's real `~/.clay/settings.dat`.
+fn reapply_settings_from_path(app: &mut App, path: &std::path::Path, recorded: Option<&str>) -> bool {
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if fingerprint_settings_bytes(content.as_bytes()) == recorded {
+        return false;
+    }
+    load_settings_from_str(app, &content);
+    true
+}
+
+/// A hot reload restores settings from the reload state's snapshot of *memory* and never
+/// calls `load_settings` (see main.rs's `should_load_state` branch), so a hand edit to
+/// settings.dat made while Clay was running used to stay invisible until the next cold
+/// start. This re-applies the file after the reload state has been restored - but only
+/// when it actually changed on disk since Clay last read or wrote it. The guard matters:
+/// settings.dat is written on saves, not on every mutation, so unconditionally replaying
+/// it would let a stale on-disk copy revert live in-memory settings on every reload.
+///
+/// No baseline fingerprint (a reload state written by a build predating the key) means
+/// nothing is re-applied: without one, a hand edit and an unsaved in-memory change are
+/// indistinguishable, and clobbering the user's live settings is the worse failure. One
+/// cold start re-establishes the baseline.
+///
+/// The whole file is re-applied, not just `[global]` - `load_settings_from_str` merges by
+/// name and only ever writes `world.settings`, so restored runtime state (output buffers,
+/// connections, seq counters) is untouched and a hand-added world simply appears.
+pub fn reapply_externally_edited_settings(app: &mut App) -> bool {
+    let path = get_settings_path();
+    let recorded = SETTINGS_FILE_FINGERPRINT.lock().unwrap().clone();
+    let applied = reapply_settings_from_path(app, &path, recorded.as_deref());
+    if applied {
+        record_settings_fingerprint(&path);
+    }
+    applied
+}
+
 pub fn save_settings(app: &App) -> io::Result<()> {
     save_settings_with_source(app, "local")
 }
@@ -284,6 +354,10 @@ pub fn save_settings_to_path_with_source(app: &App, path: &std::path::Path, sour
         append_settings_audit_log(source, &old_global, &new_global);
     }
 
+    // Baseline for the hot-reload hand-edit check: what we just wrote is, by definition,
+    // not an external edit.
+    record_settings_fingerprint(path);
+
     Ok(())
 }
 
@@ -326,6 +400,10 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
     writeln!(file, "remote_initial_lines={}", app.settings.remote_initial_lines)?;
+    // Hidden setting (no UI anywhere): which services /url shortens through, in order.
+    // Written unconditionally so the list is visible and hand-editable in the file; a
+    // settings.dat predating the key gets it seeded on load (see load_settings).
+    writeln!(file, "url_shorteners={}", crate::encoding::UrlShortener::list_to_string(&app.settings.url_shorteners))?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
     writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
@@ -599,7 +677,18 @@ fn append_settings_audit_log_to_path(
 
 pub fn load_settings(app: &mut App) -> io::Result<()> {
     let path = get_settings_path();
-    load_settings_from_path(app, &path)
+    load_settings_from_path(app, &path)?;
+
+    // Seed the hidden url_shorteners= key into a settings.dat written before it existed,
+    // so the list /url uses is discoverable and editable in the file instead of being an
+    // invisible default. The rewrite is derived entirely from what was just loaded, so
+    // it's content-preserving; guarded on a parseable [global] section so a missing or
+    // corrupt file is never replaced with defaults.
+    let global = read_global_section(&path);
+    if !global.is_empty() && !global.contains_key("url_shorteners") {
+        let _ = save_settings(app);
+    }
+    Ok(())
 }
 
 /// Load settings from a specific path (used by tests)
@@ -609,6 +698,7 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
     }
     let content = std::fs::read_to_string(path)?;
     load_settings_from_str(app, &content);
+    record_settings_fingerprint(path);
     Ok(())
 }
 
@@ -891,6 +981,12 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         if let Ok(n) = value.parse::<u16>() {
                             app.settings.remote_initial_lines = n.clamp(10, 5000);
                         }
+                    }
+                    "url_shorteners" => {
+                        // Hidden setting: the services /url tries, in order. Unknown
+                        // names are skipped; an empty/all-garbage value falls back to
+                        // the built-in order rather than disabling /url.
+                        app.settings.url_shorteners = crate::encoding::UrlShortener::parse_list(value);
                     }
                     "web_secure" => {
                         app.settings.web_secure = value == "true";
@@ -1689,6 +1785,13 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "wrapspace={}", app.settings.wrapspace)?;
     writeln!(file, "remote_initial_lines={}", app.settings.remote_initial_lines)?;
+    writeln!(file, "url_shorteners={}", crate::encoding::UrlShortener::list_to_string(&app.settings.url_shorteners))?;
+    // Fingerprint of settings.dat as we last read/wrote it. The restore compares it
+    // against the file on disk so a hand edit made while Clay was running survives the
+    // reload - see reapply_externally_edited_settings.
+    if let Some(ref fp) = *SETTINGS_FILE_FINGERPRINT.lock().unwrap() {
+        writeln!(file, "settings_fingerprint={}", fp)?;
+    }
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
     writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
@@ -2015,6 +2118,13 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
     // Consume the file whether or not parsing succeeded: a state file that fails to parse
     // would otherwise be retried on every start.
     let _ = std::fs::remove_file(&path);
+
+    // The restore above rebuilt settings from the pre-exec snapshot of memory; settings.dat
+    // was never read. Fold in a hand edit made while the old process was running, if there
+    // was one (no-op otherwise) - see reapply_externally_edited_settings.
+    if matches!(loaded, Ok(true)) && reapply_externally_edited_settings(app) {
+        debug_log(true, "LOAD_STATE: settings.dat changed on disk since we last wrote it - re-applied over reload state");
+    }
     loaded
 }
 
@@ -2392,6 +2502,17 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         if let Ok(n) = value.parse::<u16>() {
                             app.settings.remote_initial_lines = n.clamp(10, 5000);
                         }
+                    }
+                    "url_shorteners" => {
+                        // Hidden setting: the services /url tries, in order. Unknown
+                        // names are skipped; an empty/all-garbage value falls back to
+                        // the built-in order rather than disabling /url.
+                        app.settings.url_shorteners = crate::encoding::UrlShortener::parse_list(value);
+                    }
+                    "settings_fingerprint" => {
+                        // What settings.dat looked like when we last read/wrote it, so
+                        // load_reload_state can spot a hand edit made while we ran.
+                        *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = Some(value.to_string());
                     }
                     "web_secure" => {
                         app.settings.web_secure = value == "true";
@@ -2830,6 +2951,12 @@ mod tests {
             color_offset_percent: 42,          // default: 0
             wrapspace: 7,                      // default: 0
             remote_initial_lines: 250,         // default: 100
+            // default: [IsGd, VGd, TinyUrl] — different services AND different order
+            url_shorteners: vec![
+                crate::encoding::UrlShortener::DaGd,
+                crate::encoding::UrlShortener::TinyUrl,
+                crate::encoding::UrlShortener::IsGd,
+            ],
             font_name: "TestFont".to_string(), // default: ""
             font_size: 18.0,                   // default: 14.0
             web_font_size_phone: 12.0,         // default: 10.0
@@ -2934,6 +3061,7 @@ mod tests {
         assert_eq!(a.color_offset_percent, b.color_offset_percent, "{context}: color_offset_percent");
         assert_eq!(a.wrapspace, b.wrapspace, "{context}: wrapspace");
         assert_eq!(a.remote_initial_lines, b.remote_initial_lines, "{context}: remote_initial_lines");
+        assert_eq!(a.url_shorteners, b.url_shorteners, "{context}: url_shorteners");
         assert_eq!(a.font_name, b.font_name, "{context}: font_name");
         assert_eq!(a.font_size, b.font_size, "{context}: font_size");
         assert_eq!(a.web_font_size_phone, b.web_font_size_phone, "{context}: web_font_size_phone");
@@ -3008,6 +3136,127 @@ mod tests {
         assert_eq!(a.gmcp_packages, b.gmcp_packages, "{context}: gmcp_packages");
         assert_eq!(a.auto_reconnect_secs, b.auto_reconnect_secs, "{context}: auto_reconnect_secs");
         assert_eq!(a.auto_reconnect_on_web, b.auto_reconnect_on_web, "{context}: auto_reconnect_on_web");
+    }
+
+    /// The hot-reload hand-edit check: settings.dat is only re-applied over the restored
+    /// reload state when it actually changed on disk since Clay last read or wrote it.
+    #[test]
+    fn test_reapply_settings_only_when_file_changed_on_disk() {
+        let tmp = std::env::temp_dir().join("clay_test_reapply_settings.dat");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut app = App::new();
+        app.settings.http_port = 9000;
+        save_settings_to_path(&app, &tmp).expect("save failed");
+        let baseline = fingerprint_settings_bytes(&std::fs::read(&tmp).unwrap());
+
+        // Unchanged file: a live in-memory change that was never saved must survive.
+        app.settings.http_port = 7777;
+        assert!(!reapply_settings_from_path(&mut app, &tmp, Some(&baseline)), "unchanged file must not be re-applied");
+        assert_eq!(app.settings.http_port, 7777, "unsaved in-memory setting was clobbered by its own stale on-disk copy");
+
+        // No baseline (reload state from a build predating the key): also a no-op.
+        assert!(!reapply_settings_from_path(&mut app, &tmp, None), "no baseline must mean no re-apply");
+        assert_eq!(app.settings.http_port, 7777);
+
+        // Hand edit while running: the file wins.
+        let edited = std::fs::read_to_string(&tmp).unwrap().replace("http_port=9000", "http_port=9123");
+        std::fs::write(&tmp, &edited).unwrap();
+        assert!(reapply_settings_from_path(&mut app, &tmp, Some(&baseline)), "externally edited file must be re-applied");
+        assert_eq!(app.settings.http_port, 9123, "hand edit did not reach the reloaded process");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A re-apply must fold in settings only — the runtime state the reload state just
+    /// restored (output buffers, seq counters, connection flags) has to survive it.
+    #[test]
+    fn test_reapply_settings_preserves_restored_runtime_state() {
+        let tmp = std::env::temp_dir().join("clay_test_reapply_runtime.dat");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("live");
+        world.settings.hostname = "old.example.com".to_string();
+        world.settings.port = "4000".to_string();
+        app.worlds.push(world);
+        save_settings_to_path(&app, &tmp).expect("save failed");
+        let baseline = fingerprint_settings_bytes(&std::fs::read(&tmp).unwrap());
+
+        // Runtime state as a reload restore would have rebuilt it.
+        app.worlds[0].connected = true;
+        app.worlds[0].next_seq = 4242;
+        app.worlds[0].output_lines.push(OutputLine::new("a line from before the reload".to_string(), 4241));
+
+        let edited = std::fs::read_to_string(&tmp).unwrap().replace("old.example.com", "new.example.com");
+        std::fs::write(&tmp, &edited).unwrap();
+        assert!(reapply_settings_from_path(&mut app, &tmp, Some(&baseline)));
+
+        assert_eq!(app.worlds.len(), 1, "re-apply must merge by name, not duplicate the world");
+        assert_eq!(app.worlds[0].settings.hostname, "new.example.com", "edited world setting not picked up");
+        assert!(app.worlds[0].connected, "restored connection flag was reset");
+        assert_eq!(app.worlds[0].next_seq, 4242, "restored seq counter was reset");
+        assert_eq!(app.worlds[0].output_lines.len(), 1, "restored output buffer was dropped");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The fingerprint has to ride across the exec in the reload-state file, or the new
+    /// process has no baseline to compare settings.dat against.
+    /// Sole test touching SETTINGS_FILE_FINGERPRINT — keep it that way (parallel tests).
+    #[test]
+    fn test_settings_fingerprint_survives_reload_state_roundtrip() {
+        let fp = fingerprint_settings_bytes(b"[global]\nhttp_port=9000\n");
+        *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = Some(fp.clone());
+
+        let app = App::new();
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).unwrap();
+        assert!(content.contains(&format!("settings_fingerprint={fp}")), "reload state must carry the fingerprint");
+
+        *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = None;
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load failed");
+        assert_eq!(
+            *SETTINGS_FILE_FINGERPRINT.lock().unwrap(), Some(fp),
+            "fingerprint must be restored on the far side of the exec"
+        );
+        *SETTINGS_FILE_FINGERPRINT.lock().unwrap() = None;
+    }
+
+    /// A hot reload never calls `load_settings` (see main.rs's `should_load_state` branch):
+    /// the reload-state file is the *only* source of settings across an exec, so anything
+    /// written to settings.dat but not to reload state silently reverts to its default on
+    /// every /reload. Guards the hidden `url_shorteners` key against exactly that.
+    #[test]
+    fn test_url_shorteners_survive_reload_state_roundtrip() {
+        let mut app = App::new();
+        app.settings.url_shorteners = vec![
+            crate::encoding::UrlShortener::DaGd,
+            crate::encoding::UrlShortener::TinyUrl,
+            crate::encoding::UrlShortener::VGd,
+        ];
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).expect("reload state is valid UTF-8");
+        assert!(
+            content.contains("url_shorteners=da.gd,tinyurl,v.gd"),
+            "reload state must carry url_shorteners, got:\n{content}"
+        );
+
+        let mut reloaded = App::new();
+        assert_ne!(
+            reloaded.settings.url_shorteners, app.settings.url_shorteners,
+            "test is meaningless unless the fresh App starts at the default list"
+        );
+        load_reload_state_from_str(&mut reloaded, &content).expect("load_reload_state_from_str failed");
+        assert_eq!(
+            reloaded.settings.url_shorteners, app.settings.url_shorteners,
+            "url_shorteners must survive a hot reload"
+        );
     }
 
     #[test]
@@ -3288,6 +3537,7 @@ pattern=foo
         assert_ne!(non_default.color_offset_percent, default.color_offset_percent, "color_offset_percent should differ");
         assert_ne!(non_default.wrapspace, default.wrapspace, "wrapspace should differ");
         assert_ne!(non_default.remote_initial_lines, default.remote_initial_lines, "remote_initial_lines should differ");
+        assert_ne!(non_default.url_shorteners, default.url_shorteners, "url_shorteners should differ");
         assert_ne!(non_default.font_name, default.font_name, "font_name should differ");
         assert_ne!(non_default.font_size, default.font_size, "font_size should differ");
         assert_ne!(non_default.web_font_size_phone, default.web_font_size_phone, "web_font_size_phone should differ");
