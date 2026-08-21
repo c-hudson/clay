@@ -6701,7 +6701,12 @@
             'Enabled: Whether this action is active.', '',
             'Startup: Run command when Clay starts/hot-reloads.', '',
             'GUI Menu Shortcut: Show this action as a one-click',
-            '  shortcut tile in the web/GUI icon bar.'
+            '  shortcut tile in the web/GUI icon bar.', '',
+            'Suppress Blanks: Also hide up to 3 blank lines that',
+            '  immediately follow a matched line, stopping at the',
+            '  first line with visible text. A line containing only',
+            '  colour codes counts as blank. Like /gag, the lines',
+            '  are hidden rather than discarded - F2 still shows them.'
         ],
         connections: [
             'Connected Worlds - Active Connections', '',

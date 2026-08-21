@@ -166,7 +166,12 @@ WebSocket (secure/non-secure), HTTP/HTTPS, TLS cert/key, allow list
 - Filter box with `F` or `/`
 
 ### Action Editor
-Fields: Name, World, Match Type (Regexp/Wildcard), Pattern, Command (multiline), Enabled, Startup
+Fields: Name, World, Match Type (Regexp/Wildcard), Pattern, Command (multiline), Enabled, Startup,
+GUI Menu Shortcut, Suppress Blanks
+
+- **Suppress Blanks**: hides up to 3 blank lines immediately following a matched line, stopping at
+  the first line with visible text. A line containing only ANSI colour codes counts as blank.
+  Hidden rather than discarded, like `/gag`, so F2 (show tags) still reveals them.
 
 ## ANSI Music
 

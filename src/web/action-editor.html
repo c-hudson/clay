@@ -665,7 +665,7 @@ function renderDetail() {
   checkRow.appendChild(buildCheckbox('Enabled', a.enabled, v => { a.enabled = v; renderList(); markDirty(); }));
   checkRow.appendChild(buildCheckbox('Run at startup', a.startup, v => { a.startup = v; markDirty(); }));
   checkRow.appendChild(buildCheckbox('GUI Menu Shortcut', a.gui_shortcut, v => { a.gui_shortcut = v; markDirty(); }));
-  checkRow.appendChild(buildCheckbox('Suppress Blanks', a.suppress_blanks, v => { a.suppress_blanks = v; markDirty(); }));
+  checkRow.appendChild(buildCheckbox('Suppress Blanks', a.suppress_blanks, v => { a.suppress_blanks = v; markDirty(); }, 'Also hide up to 3 blank lines immediately following a matched line'));
   const checkWrap = document.createElement('div');
   checkWrap.className = 'field-row';
   checkWrap.appendChild(checkRow);
@@ -825,7 +825,7 @@ function buildInput(type, value, onChange) {
   return el;
 }
 
-function buildCheckbox(label, checked, onChange) {
+function buildCheckbox(label, checked, onChange, title) {
   const lbl = document.createElement('label');
   lbl.className = 'checkbox-label';
   const cb = document.createElement('input');
@@ -834,6 +834,7 @@ function buildCheckbox(label, checked, onChange) {
   cb.addEventListener('change', () => onChange(cb.checked));
   lbl.appendChild(cb);
   lbl.appendChild(document.createTextNode(label));
+  if (title) lbl.title = title;
   return lbl;
 }
 

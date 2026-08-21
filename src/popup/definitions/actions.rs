@@ -305,6 +305,19 @@ fn action_editor_help_text() -> Vec<String> {
         "",
         "Startup: Run this action's command when Clay starts",
         "  or hot-reloads (useful for initialization scripts).",
+        "",
+        "GUI Shortcut: Show this action as a one-click shortcut",
+        "  tile in the web/GUI icon bar. No effect on the",
+        "  console.",
+        "",
+        "Suppress Blanks: Also hide up to 3 blank lines that",
+        "  immediately follow a matched line (MUD output often",
+        "  pads a line with blanks, so gagging the line alone",
+        "  leaves the empty space behind). The run stops at the",
+        "  first line with visible text. A line containing only",
+        "  colour codes counts as blank. Like /gag, the lines",
+        "  are hidden rather than discarded - F2 still shows",
+        "  them.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
