@@ -357,6 +357,43 @@ impl Theme {
     }
 }
 
+/// Rendering style for the console (TUI) separator bar.
+///
+/// `TinyFugue` is the historical look: every gap in the bar is filled with `_`
+/// and the bar sits on the terminal background. `Web` drops the underscores
+/// (they become plain spaces) and paints the bar with the active console
+/// theme's `status_bar.bg` — the same color the web/GUI status bar uses.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum SeparatorStyle {
+    #[default]
+    TinyFugue,
+    Web,
+}
+
+impl SeparatorStyle {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SeparatorStyle::TinyFugue => "tinyfugue",
+            SeparatorStyle::Web => "web",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "web" => SeparatorStyle::Web,
+            _ => SeparatorStyle::TinyFugue,
+        }
+    }
+
+    /// The character used to fill the gaps in the bar.
+    pub fn fill_char(&self) -> char {
+        match self {
+            SeparatorStyle::TinyFugue => '_',
+            SeparatorStyle::Web => ' ',
+        }
+    }
+}
+
 /// World switching mode for Up/Down arrow cycling
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum WorldSwitchMode {

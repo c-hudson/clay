@@ -1571,10 +1571,12 @@ pub async fn handle_daemon_ws_message(
             let themes_json = app.theme_file.to_json_all();
             let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
             let active_theme = app.settings.gui_theme.name().to_string();
+            let separator_style = app.settings.separator_style.name().to_string();
             app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                 themes_json,
                 theme_names,
                 active_theme,
+                separator_style,
             });
         }
         WsMessage::UpdateThemeColors { theme_name, colors_json } => {
@@ -1607,10 +1609,12 @@ pub async fn handle_daemon_ws_message(
             let themes_json = app.theme_file.to_json_all();
             let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
             let active_theme = app.settings.gui_theme.name().to_string();
+            let separator_style = app.settings.separator_style.name().to_string();
             app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                 themes_json,
                 theme_names,
                 active_theme,
+                separator_style,
             });
         }
         WsMessage::DeleteTheme { name } => {
@@ -1618,13 +1622,27 @@ pub async fn handle_daemon_ws_message(
             let themes_json = app.theme_file.to_json_all();
             let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
             let active_theme = app.settings.gui_theme.name().to_string();
+            let separator_style = app.settings.separator_style.name().to_string();
             app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                 themes_json,
                 theme_names,
                 active_theme,
+                separator_style,
+            });
+        }
+        WsMessage::UpdateSeparatorStyle { style } => {
+            app.settings.separator_style = crate::SeparatorStyle::from_name(&style);
+            app.needs_output_redraw = true;
+            let settings_msg = app.build_global_settings_msg();
+            app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                settings: settings_msg,
+                input_height: app.input_height,
             });
         }
         WsMessage::SaveThemeFile => {
+            // The separator style lives in settings.dat, not theme.dat, but the theme
+            // editor's single Save button owns both.
+            let _ = persistence::save_settings(app);
             let content = app.theme_file.generate_file_content();
             let path = clay_config_path("theme.dat");
             match std::fs::write(&path, &content) {

@@ -310,6 +310,60 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
   flex-shrink: 0;
 }
 
+.opt-item {
+  display: flex;
+  align-items: center;
+  padding: 4px 10px 4px 24px;
+  cursor: pointer;
+  gap: 8px;
+  border-left: 3px solid transparent;
+}
+
+.opt-item:hover { background: var(--editor-hover); }
+
+.opt-check {
+  width: 15px;
+  height: 15px;
+  border-radius: 3px;
+  border: 1px solid var(--editor-border);
+  background: var(--editor-bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  color: transparent;
+  flex-shrink: 0;
+}
+
+.opt-item.checked .opt-check {
+  background: var(--editor-accent);
+  border-color: var(--editor-accent);
+  color: var(--editor-bg);
+}
+
+.opt-item-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.opt-item-name {
+  font-size: 12px;
+  color: var(--editor-fg);
+  white-space: nowrap;
+}
+
+.opt-item-desc {
+  font-size: 11px;
+  color: var(--editor-fg2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Right panel */
 .right-panel {
   flex: 1;
@@ -458,16 +512,6 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
   position: relative;
 }
 
-.preview-toolbar {
-  display: flex;
-  align-items: center;
-  height: 24px;
-  padding: 0 8px;
-  gap: 8px;
-  flex-shrink: 0;
-  font-size: 11px;
-}
-
 .preview-toolbar-btn {
   display: flex;
   align-items: center;
@@ -531,12 +575,6 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
   font-variant-numeric: tabular-nums;
 }
 
-.preview-toolbar-title {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.3px;
-}
-
 .preview-toolbar-spacer { flex: 1; }
 
 .preview-output {
@@ -554,26 +592,15 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
 .preview-separator {
   display: flex;
   align-items: center;
-  padding: 0 4px;
-  height: 20px;
-  font-size: 12px;
-  flex-shrink: 0;
-}
-
-.preview-status-left {
-  padding: 0 4px;
-  font-weight: bold;
+  padding: 0 8px;
+  gap: 8px;
+  height: 24px;
   font-size: 11px;
+  flex-shrink: 0;
 }
 
 .preview-world-name {
   font-weight: bold;
-  padding: 0 6px;
-}
-
-.preview-separator-fill {
-  flex: 1;
-  overflow: hidden;
   white-space: nowrap;
 }
 
@@ -902,26 +929,21 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
       <div class="preview-container" id="previewContainer">
         <div class="preview-output" id="previewOutput"></div>
         <div class="preview-separator" id="previewSeparator">
-          <span class="preview-status-left" id="previewStatus"></span>
+          <div class="preview-toolbar-btn" id="previewSepHamburger">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect y="2" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="7.25" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="12.5" width="16" height="1.5" rx="0.75" fill="currentColor"/></svg>
+          </div>
           <span class="preview-world-name" id="previewWorldName"></span>
-          <span class="preview-separator-fill" id="previewFill"></span>
+          <div class="preview-toolbar-spacer"></div>
+          <div class="preview-font-slider-group" id="previewSepFontSliderGroup">
+            <span class="preview-font-slider-label" id="previewSepFontLabel">A</span>
+            <input type="range" class="preview-font-slider" id="previewSepFontSlider" min="9" max="20" value="14" tabindex="-1">
+            <span class="preview-font-slider-val" id="previewSepFontVal">14</span>
+          </div>
           <span class="preview-time" id="previewTime"></span>
         </div>
         <div class="preview-input" id="previewInput">
           <span class="preview-prompt-text" id="previewPrompt"></span>
           <span class="preview-cursor" id="previewCursor"></span>
-        </div>
-        <div class="preview-toolbar" id="previewToolbar">
-          <div class="preview-toolbar-btn" id="previewHamburger">
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect y="2" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="7.25" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="12.5" width="16" height="1.5" rx="0.75" fill="currentColor"/></svg>
-          </div>
-          <div class="preview-font-slider-group" id="previewFontSliderGroup">
-            <span class="preview-font-slider-label" id="previewFontLabel">A</span>
-            <input type="range" class="preview-font-slider" id="previewFontSlider" min="9" max="20" value="14" tabindex="-1">
-            <span class="preview-font-slider-val" id="previewFontVal">14</span>
-          </div>
-          <span class="preview-toolbar-title" id="previewToolbarTitle">Clay</span>
-          <div class="preview-toolbar-spacer"></div>
         </div>
         <div class="preview-popup-overlay">
           <div class="preview-popup" id="previewPopup"></div>
@@ -1062,6 +1084,13 @@ let ws = null;
 let isRemoteMode = false;
 let activeThemeName = 'dark';  // Which theme the server is currently using
 let updateDebounceTimer = null;
+// Console separator-bar style: 'tinyfugue' (underscore fill) or 'web' (flat
+// status-bar coloring). Lives in settings.dat rather than theme.dat, but the
+// Save button here owns both files. Unlike the color edits, a change here is
+// held locally and only sent on Save — leaving without saving discards it.
+// Remote mode only: a standalone editor has no settings.dat to write to.
+let separatorStyle = 'tinyfugue';
+let savedSeparatorStyle = 'tinyfugue';
 
 // ── WebSocket / Auth ──────────────────────────────────────────────────────
 
@@ -1153,6 +1182,10 @@ function handleWsMessage(msg) {
       if (msg.active_theme) {
         activeThemeName = msg.active_theme;
       }
+      if (msg.separator_style) {
+        separatorStyle = (msg.separator_style === 'web') ? 'web' : 'tinyfugue';
+      }
+      savedSeparatorStyle = separatorStyle;
       const names = Object.keys(themes).sort();
       currentTheme = names.includes(activeThemeName) ? activeThemeName : (names.includes('dark') ? 'dark' : names[0]);
       selectedVar = null;
@@ -1163,6 +1196,7 @@ function handleWsMessage(msg) {
     case 'ThemeFileSaved':
       if (msg.success) {
         savedSnapshot = JSON.stringify(themes);
+        savedSeparatorStyle = separatorStyle;
         updateUnsaved();
         showSaveStatus('Saved');
       } else {
@@ -1300,7 +1334,7 @@ function showSaveStatus(text) {
 // ── Unsaved tracking ──────────────────────────────────────────────────────
 
 function isModified() {
-  return JSON.stringify(themes) !== savedSnapshot;
+  return JSON.stringify(themes) !== savedSnapshot || separatorStyle !== savedSeparatorStyle;
 }
 
 function updateUnsaved() {
@@ -1422,6 +1456,64 @@ function buildColorList() {
     groupEl.appendChild(items);
     container.appendChild(groupEl);
   }
+
+  buildSeparatorGroup(container);
+}
+
+// ── Separator bar style (settings.dat, not theme.dat) ─────────────────────
+
+var SEPARATOR_STYLES = [
+  { key: 'tinyfugue', label: 'TinyFugue', desc: 'Underscore fill' },
+  { key: 'web', label: 'Web Coloring', desc: 'Flat status_bar.bg' }
+];
+
+function buildSeparatorGroup(container) {
+  // Only the running Clay instance has a settings.dat to write this to; a
+  // standalone (file://) editor edits theme colors alone.
+  if (!isRemoteMode) return;
+
+  const groupEl = document.createElement('div');
+  groupEl.className = 'color-group';
+
+  const header = document.createElement('div');
+  header.className = 'color-group-header';
+  header.innerHTML = '<span class="color-group-arrow">&#9660;</span><span class="color-group-title">Separator Bar</span>';
+
+  const items = document.createElement('div');
+  items.className = 'color-group-items';
+
+  header.addEventListener('click', function() {
+    var arrow = header.querySelector('.color-group-arrow');
+    arrow.classList.toggle('collapsed');
+    items.classList.toggle('collapsed');
+  });
+
+  for (const opt of SEPARATOR_STYLES) {
+    const item = document.createElement('div');
+    item.className = 'opt-item' + (separatorStyle === opt.key ? ' checked' : '');
+    item.dataset.sepStyle = opt.key;
+    item.innerHTML = '<div class="opt-check">&#10003;</div>' +
+      '<div class="opt-item-info">' +
+      '<span class="opt-item-name">' + escapeHtml(opt.label) + '</span>' +
+      '<span class="opt-item-desc">' + escapeHtml(opt.desc) + '</span></div>';
+    item.addEventListener('click', function() { setSeparatorStyle(opt.key); });
+    items.appendChild(item);
+  }
+
+  groupEl.appendChild(header);
+  groupEl.appendChild(items);
+  container.appendChild(groupEl);
+}
+
+function setSeparatorStyle(style) {
+  if (separatorStyle === style) return;
+  separatorStyle = style;
+  document.querySelectorAll('.opt-item[data-sep-style]').forEach(function(el) {
+    el.classList.toggle('checked', el.dataset.sepStyle === style);
+  });
+  // Deliberately NOT sent here: the running console keeps its current style until
+  // Save, and an unsaved change is simply discarded. remoteSave() sends it.
+  updateUnsaved();
 }
 
 function selectVar(key) {
@@ -1693,19 +1785,12 @@ function updatePreview() {
   output.style.background = t.bg;
   output.style.color = t.fg;
 
-  // Toolbar (hamburger, font slider, Clay title)
-  var toolbar = document.getElementById('previewToolbar');
-  toolbar.style.background = t['menu_bar.bg'] || t.bg_surface;
-  toolbar.style.borderTop = '1px solid ' + t.border_subtle;
+  // Separator bar widgets (hamburger, font slider) — colored like the real status bar
+  ['previewSepHamburger', 'previewSepFontLabel', 'previewSepFontVal'].forEach(function(id) {
+    document.getElementById(id).style.color = t.fg_muted;
+  });
 
-  var hamburger = document.getElementById('previewHamburger');
-  hamburger.style.color = t.fg_muted;
-
-  var fontLabel = document.getElementById('previewFontLabel');
-  fontLabel.style.color = t.fg_muted;
-
-  var fontSlider = document.getElementById('previewFontSlider');
-  fontSlider.style.background = t.border_medium;
+  document.getElementById('previewSepFontSlider').style.background = t.border_medium;
 
   // Update slider thumb color via dynamic style
   var thumbStyle = document.getElementById('previewSliderThumbStyle');
@@ -1716,12 +1801,6 @@ function updatePreview() {
   }
   thumbStyle.textContent = '.preview-font-slider::-webkit-slider-thumb{background:' + t.fg_muted + ';border:1.5px solid ' + t.border_medium + '}'
     + '.preview-font-slider::-moz-range-thumb{background:' + t.fg_muted + ';border:1.5px solid ' + t.border_medium + '}';
-
-  var fontVal = document.getElementById('previewFontVal');
-  fontVal.style.color = t.fg_muted;
-
-  var toolbarTitle = document.getElementById('previewToolbarTitle');
-  toolbarTitle.style.color = t.fg_secondary;
 
   var lines = [
     { text: 'Welcome to the Realm of Shadows!', color: t['ansi.11'], bold: true },
@@ -1759,24 +1838,13 @@ function updatePreview() {
   sep.style.background = t['status_bar.bg'];
   sep.style.color = t.fg;
 
-  var status = document.getElementById('previewStatus');
-  status.textContent = '__________';
-  status.style.background = 'transparent';
-  status.style.color = t.fg_dim;
-
   var worldName = document.getElementById('previewWorldName');
-  worldName.style.color = '#ffffff';
+  worldName.style.color = t.fg;
   worldName.innerHTML = '<span style="color:' + t.success + '">&#x25CF;</span> MudWorld';
 
-  var fill = document.getElementById('previewFill');
-  var underscores = '';
-  for (var j = 0; j < 60; j++) underscores += '_';
-  fill.style.color = t.fg_dim;
-  fill.textContent = underscores;
-
-  var time = document.getElementById('previewTime');
   var now = new Date();
-  time.style.color = t['ansi.6'];
+  var time = document.getElementById('previewTime');
+  time.style.color = t.fg;
   time.textContent = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
 
   input.style.background = t.bg_deep;
@@ -1891,15 +1959,20 @@ function updatePreview() {
   '</div>';
   popup.innerHTML = ph;
 
-  // Menu mockup - positioned bottom-left, above separator bar
+  // Menu mockup - positioned bottom-left, sitting directly on the separator bar
   var menu = document.getElementById('previewMenu');
   menu.style.background = t['menu_bar.bg'] || popupBg;
   menu.style.color = fgC;
-  // Position: left side, just above separator bar
+  // Real Clay opens this dropdown upward from the status bar with no gap, so the
+  // offset is everything below the separator's top edge — measured rather than
+  // hardcoded, since a hardcoded one silently leaves a gap when the preview stack
+  // changes. (Heights are only 0 while the editor is hidden, before auth.)
+  var stackBelow = document.getElementById('previewSeparator').offsetHeight
+    + document.getElementById('previewInput').offsetHeight;
   menu.style.top = '';
   menu.style.right = '';
   menu.style.left = '0px';
-  menu.style.bottom = '69px';
+  menu.style.bottom = (stackBelow > 0 ? stackBelow : 57) + 'px';
 
   var menuItems = ['Help', 'Settings', 'Web Settings', 'Actions', 'World Selector', 'Connected Worlds'];
   var selectedMenu = 1; // "Settings" selected
@@ -1918,6 +1991,11 @@ function updatePreview() {
 
 function remoteSave() {
   if (!isRemoteMode) return;
+  // Ordered ahead of SaveThemeFile: the server applies the style, then writes
+  // settings.dat from the state it just updated.
+  if (separatorStyle !== savedSeparatorStyle) {
+    wsSend({ type: 'UpdateSeparatorStyle', style: separatorStyle });
+  }
   wsSend({ type: 'SaveThemeFile' });
 }
 
@@ -2038,6 +2116,7 @@ function resetChanges() {
   if (!isModified()) return;
   if (!confirm('Revert all changes since last load/save?')) return;
   themes = JSON.parse(savedSnapshot);
+  separatorStyle = savedSeparatorStyle;
   var names = Object.keys(themes).sort();
   if (!themes[currentTheme]) currentTheme = names[0];
   selectedVar = null;

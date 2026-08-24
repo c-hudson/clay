@@ -395,6 +395,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "input_height={}", app.input_height)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
+    writeln!(file, "separator_style={}", app.settings.separator_style.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
@@ -894,6 +895,9 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                     }
                     "ansi_music_enabled" => {
                         app.settings.ansi_music_enabled = value == "true";
+                    }
+                    "separator_style" => {
+                        app.settings.separator_style = SeparatorStyle::from_name(value);
                     }
                     "input_height" => {
                         if let Ok(h) = value.parse::<u16>() {
@@ -1780,6 +1784,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "show_tags={}", app.show_tags)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
+    writeln!(file, "separator_style={}", app.settings.separator_style.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
@@ -2419,6 +2424,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "ansi_music_enabled" => {
                         app.settings.ansi_music_enabled = value == "true";
                     }
+                    "separator_style" => {
+                        app.settings.separator_style = SeparatorStyle::from_name(value);
+                    }
                     "show_tags" => {
                         app.show_tags = value == "true";
                     }
@@ -2946,6 +2954,7 @@ mod tests {
             debug_enabled: true,               // default: false
             ansi_music_enabled: false,         // default: true
             theme: Theme::Light,               // default: Dark
+            separator_style: SeparatorStyle::Web, // default: TinyFugue
             gui_theme: Theme::Light,           // default: Dark
             gui_transparency: 0.7,             // default: 1.0
             color_offset_percent: 42,          // default: 0
@@ -3056,6 +3065,7 @@ mod tests {
         assert_eq!(a.debug_enabled, b.debug_enabled, "{context}: debug_enabled");
         assert_eq!(a.ansi_music_enabled, b.ansi_music_enabled, "{context}: ansi_music_enabled");
         assert_eq!(a.theme.name(), b.theme.name(), "{context}: theme");
+        assert_eq!(a.separator_style.name(), b.separator_style.name(), "{context}: separator_style");
         assert_eq!(a.gui_theme.name(), b.gui_theme.name(), "{context}: gui_theme");
         assert_eq!(a.gui_transparency, b.gui_transparency, "{context}: gui_transparency");
         assert_eq!(a.color_offset_percent, b.color_offset_percent, "{context}: color_offset_percent");
@@ -3256,6 +3266,33 @@ mod tests {
         assert_eq!(
             reloaded.settings.url_shorteners, app.settings.url_shorteners,
             "url_shorteners must survive a hot reload"
+        );
+    }
+
+    #[test]
+    fn test_separator_style_survives_reload_state_roundtrip() {
+        let mut app = App::new();
+        app.settings.separator_style = SeparatorStyle::Web;
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).expect("reload state is valid UTF-8");
+        assert!(
+            content.contains("separator_style=web"),
+            "reload state must carry separator_style, got:\n{content}"
+        );
+
+        let mut reloaded = App::new();
+        assert_eq!(
+            reloaded.settings.separator_style,
+            SeparatorStyle::TinyFugue,
+            "test is meaningless unless a fresh App starts at the default style"
+        );
+        load_reload_state_from_str(&mut reloaded, &content).expect("load_reload_state_from_str failed");
+        assert_eq!(
+            reloaded.settings.separator_style,
+            SeparatorStyle::Web,
+            "separator_style must survive a hot reload"
         );
     }
 
@@ -3532,6 +3569,7 @@ pattern=foo
         assert_ne!(non_default.debug_enabled, default.debug_enabled, "debug_enabled should differ");
         assert_ne!(non_default.ansi_music_enabled, default.ansi_music_enabled, "ansi_music_enabled should differ");
         assert_ne!(non_default.theme.name(), default.theme.name(), "theme should differ");
+        assert_ne!(non_default.separator_style.name(), default.separator_style.name(), "separator_style should differ");
         assert_ne!(non_default.gui_theme.name(), default.gui_theme.name(), "gui_theme should differ");
         assert_ne!(non_default.gui_transparency, default.gui_transparency, "gui_transparency should differ");
         assert_ne!(non_default.color_offset_percent, default.color_offset_percent, "color_offset_percent should differ");

@@ -160,6 +160,21 @@ More mode, spell check, temp convert, world switching, show tags, input height, 
 ### Web Settings (`/web`)
 WebSocket (secure/non-secure), HTTP/HTTPS, TLS cert/key, allow list
 
+### Theme Editor (`/theme-editor` page)
+Browser page for editing the colour variables in `~/.clay/theme.dat` (background, foreground,
+semantic, UI elements, ANSI palette), with a live Clay mockup preview.
+
+- **Separator Bar**: chooses how the console (TUI) separator bar is drawn.
+  - **TinyFugue** (default): gaps filled with `_`, drawn on the terminal background —
+    `_________● zmc__________(Activity: 3)_________9:01`
+  - **Web Coloring**: same layout with the underscores replaced by spaces, drawn on the
+    `status_bar.bg` colour the web interface's status bar uses.
+
+  Unlike the colours (which live in `theme.dat`), this is stored in `settings.dat` as
+  `separator_style`. Both are written by the editor's single **Save** button, and unlike a
+  colour edit the new style is not applied to the running console until Save — leaving the
+  editor (or pressing Reset) without saving discards the change.
+
 ### Actions List (`/actions`)
 - List with enable status, name, world, pattern
 - `Space` toggles enable, `Enter` edits, `A` adds, `D` deletes

@@ -1862,6 +1862,16 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let world = app.current_world();
     let theme = app.settings.theme;
+    // TinyFugue style fills every gap with '_' over the terminal background; Web style
+    // uses plain spaces over the console theme's status_bar.bg (the web/GUI status bar
+    // color). Everything else about the bar is identical between the two.
+    let sep_style = app.settings.separator_style;
+    let fill = sep_style.fill_char();
+    let fill_str = |n: usize| -> String { fill.to_string().repeat(n) };
+    let bar_bg = match sep_style {
+        crate::SeparatorStyle::TinyFugue => theme.bg(),
+        crate::SeparatorStyle::Web => app.theme_colors().status_bar_bg.to_ratatui(),
+    };
 
     // Build bar components
     let time_str = get_current_time_12hr();
@@ -1881,8 +1891,8 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         // visual_line_offset truncation is hiding rows of the current world
         (format!("More {}", format_more_count(count)), true)
     } else {
-        // Fill with underscores when nothing to show
-        ("_".repeat(STATUS_INDICATOR_LEN), false)
+        // Fill when nothing to show
+        (fill_str(STATUS_INDICATOR_LEN), false)
     };
 
     // World name
@@ -1975,11 +1985,11 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         status_str.len()
     };
 
-    // Add underscores to reach position 24 (or as close as possible)
+    // Pad to reach position 24 (or as close as possible)
     if !activity_str.is_empty() && current_pos < ACTIVITY_POSITION {
         let padding = ACTIVITY_POSITION - current_pos;
         spans.push(Span::styled(
-            "_".repeat(padding),
+            fill_str(padding),
             Style::default().fg(theme.fg_dim()),
         ));
     }
@@ -1994,28 +2004,28 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    // Calculate underscore padding - fill between content and time
+    // Calculate padding - fill between content and time
     let used_len = if activity_str.is_empty() {
         current_pos
     } else {
         ACTIVITY_POSITION.max(current_pos) + activity_str.len()
     };
-    // Subtract 2 for the fixed underscores before time
-    let underscore_count = width.saturating_sub(used_len + time_display.len() + 2);
+    // Subtract 2 for the fixed gap before time
+    let fill_count = width.saturating_sub(used_len + time_display.len() + 2);
 
     spans.push(Span::styled(
-        "_".repeat(underscore_count),
+        fill_str(fill_count),
         Style::default().fg(theme.fg_dim()),
     ));
 
-    // Underscore separator before time (2 chars for extra spacing)
-    spans.push(Span::styled("__", Style::default().fg(theme.fg_dim())));
+    // Separator before time (2 chars for extra spacing)
+    spans.push(Span::styled(fill_str(2), Style::default().fg(theme.fg_dim())));
 
     // Time on the right (no spaces around it)
     spans.push(Span::styled(time_display, Style::default().fg(theme.fg())));
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.bg()));
+    let paragraph = Paragraph::new(line).style(Style::default().bg(bar_bg));
 
     f.render_widget(paragraph, area);
 }

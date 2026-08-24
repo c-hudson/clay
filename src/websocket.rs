@@ -798,9 +798,20 @@ pub enum WsMessage {
     AddTheme { name: String, copy_from: String },
     DeleteTheme { name: String },
     SaveThemeFile,
+    /// Console separator-bar style ("tinyfugue" | "web"). Applied to the running TUI
+    /// immediately; persisted to settings.dat by the SaveThemeFile that follows.
+    UpdateSeparatorStyle { style: String },
 
     // Theme editor (server -> client)
-    ThemeEditorState { themes_json: String, theme_names: Vec<String>, active_theme: String },
+    ThemeEditorState {
+        themes_json: String,
+        theme_names: Vec<String>,
+        active_theme: String,
+        /// Console separator-bar style ("tinyfugue" | "web"); lives in settings.dat,
+        /// not theme.dat, but is edited from the theme editor.
+        #[serde(default)]
+        separator_style: String,
+    },
     ThemeFileSaved { success: bool, error: Option<String> },
     ThemeCssVarsUpdated { css_vars: String, colors_json: String },
 
@@ -1203,6 +1214,9 @@ pub struct GlobalSettingsMsg {
     pub show_tags: bool,
     pub ansi_music_enabled: bool,
     pub console_theme: String,
+    /// Console separator-bar style ("tinyfugue" | "web") — see SeparatorStyle.
+    #[serde(default)]
+    pub separator_style: String,
     pub gui_theme: String,
     #[serde(default = "default_gui_transparency")]
     pub gui_transparency: f32,

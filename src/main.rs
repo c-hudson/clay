@@ -122,7 +122,7 @@ pub fn get_version_string() -> String {
 }
 
 // Re-export commonly used types from modules
-pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, convert_discord_emojis_with_links, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
+pub use encoding::{Encoding, SeparatorStyle, Theme, WorldSwitchMode, convert_discord_emojis, convert_discord_emojis_with_links, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point, build_naws_subnegotiation, build_ttype_response, TelnetResult,
@@ -1636,6 +1636,9 @@ pub struct Settings {
     debug_enabled: bool,    // Debug logging to ~/.clay/debug.log
     ansi_music_enabled: bool, // Enable ANSI music playback (web/GUI only)
     theme: Theme,           // Console theme
+    // How the console separator bar is drawn: TinyFugue underscores, or the
+    // web interface's flat status-bar coloring. Console/TUI only.
+    pub separator_style: SeparatorStyle,
     gui_theme: Theme,       // GUI theme (separate from console)
     gui_transparency: f32,  // GUI window transparency (0.0-1.0)
     // Color contrast adjustment for web/GUI (0 = disabled, 1-100 = adjustment percentage)
@@ -1739,6 +1742,7 @@ impl Default for Settings {
             debug_enabled: false,
             ansi_music_enabled: true,  // ANSI music enabled by default
             theme: Theme::Dark,
+            separator_style: SeparatorStyle::TinyFugue,
             gui_theme: Theme::Dark,
             gui_transparency: 1.0,
             color_offset_percent: 0,   // 0 = disabled, 1-100 = adjustment percentage
@@ -4356,6 +4360,7 @@ impl App {
             show_tags: self.show_tags,
             ansi_music_enabled: self.settings.ansi_music_enabled,
             console_theme: self.settings.theme.name().to_string(),
+            separator_style: self.settings.separator_style.name().to_string(),
             gui_theme: self.settings.gui_theme.name().to_string(),
             gui_transparency: self.settings.gui_transparency,
             color_offset_percent: self.settings.color_offset_percent,
@@ -4412,6 +4417,7 @@ impl App {
         DEBUG_ENABLED.store(settings.debug_enabled, Ordering::Relaxed);
         self.settings.ansi_music_enabled = settings.ansi_music_enabled;
         self.settings.theme = Theme::from_name(&settings.console_theme);
+        self.settings.separator_style = SeparatorStyle::from_name(&settings.separator_style);
         self.settings.gui_theme = Theme::from_name(&settings.gui_theme);
         self.settings.gui_transparency = settings.gui_transparency;
         self.settings.color_offset_percent = settings.color_offset_percent;
@@ -11477,10 +11483,12 @@ impl App {
                 let themes_json = self.theme_file.to_json_all();
                 let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
                 let active_theme = self.settings.gui_theme.name().to_string();
+                let separator_style = self.settings.separator_style.name().to_string();
                 self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                     themes_json,
                     theme_names,
                     active_theme,
+                    separator_style,
                 });
             }
             WsMessage::UpdateThemeColors { theme_name, colors_json } => {
@@ -11514,10 +11522,12 @@ impl App {
                 let themes_json = self.theme_file.to_json_all();
                 let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
                 let active_theme = self.settings.gui_theme.name().to_string();
+                let separator_style = self.settings.separator_style.name().to_string();
                 self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                     themes_json,
                     theme_names,
                     active_theme,
+                    separator_style,
                 });
             }
             WsMessage::DeleteTheme { name } => {
@@ -11526,13 +11536,29 @@ impl App {
                 let themes_json = self.theme_file.to_json_all();
                 let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
                 let active_theme = self.settings.gui_theme.name().to_string();
+                let separator_style = self.settings.separator_style.name().to_string();
                 self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
                     themes_json,
                     theme_names,
                     active_theme,
+                    separator_style,
+                });
+            }
+            WsMessage::UpdateSeparatorStyle { style } => {
+                self.settings.separator_style = SeparatorStyle::from_name(&style);
+                self.needs_output_redraw = true;
+                // Console-only setting, but GUI/web clients mirror it in their own
+                // settings views, so keep every client's copy in sync.
+                let settings_msg = self.build_global_settings_msg();
+                self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                    settings: settings_msg,
+                    input_height: self.input_height,
                 });
             }
             WsMessage::SaveThemeFile => {
+                // The separator style lives in settings.dat, not theme.dat, but the theme
+                // editor's single Save button owns both.
+                let _ = persistence::save_settings(self);
                 let content = self.theme_file.generate_file_content();
                 let path = clay_config_path("theme.dat");
                 match std::fs::write(&path, &content) {
