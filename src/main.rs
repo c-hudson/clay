@@ -1742,7 +1742,7 @@ impl Default for Settings {
             debug_enabled: false,
             ansi_music_enabled: true,  // ANSI music enabled by default
             theme: Theme::Dark,
-            separator_style: SeparatorStyle::TinyFugue,
+            separator_style: SeparatorStyle::Web,
             gui_theme: Theme::Dark,
             gui_transparency: 1.0,
             color_offset_percent: 0,   // 0 = disabled, 1-100 = adjustment percentage

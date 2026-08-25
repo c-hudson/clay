@@ -165,10 +165,14 @@ Browser page for editing the colour variables in `~/.clay/theme.dat` (background
 semantic, UI elements, ANSI palette), with a live Clay mockup preview.
 
 - **Separator Bar**: chooses how the console (TUI) separator bar is drawn.
-  - **TinyFugue** (default): gaps filled with `_`, drawn on the terminal background —
+  - **Web Coloring** (default): the bar's layout with the underscores replaced by spaces,
+    drawn on the `status_bar.bg` colour the web interface's status bar uses, so a fresh
+    install matches the web/GUI look.
+  - **TinyFugue**: gaps filled with `_`, drawn on the terminal background —
     `_________● zmc__________(Activity: 3)_________9:01`
-  - **Web Coloring**: same layout with the underscores replaced by spaces, drawn on the
-    `status_bar.bg` colour the web interface's status bar uses.
+
+  The default applies to a first invocation only. Once the setting has been saved to
+  settings.dat the stored value wins, so an existing install keeps whatever it has.
 
   Unlike the colours (which live in `theme.dat`), this is stored in `settings.dat` as
   `separator_style`. Both are written by the editor's single **Save** button, and unlike a

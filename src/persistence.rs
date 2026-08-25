@@ -2994,7 +2994,7 @@ mod tests {
             debug_enabled: true,               // default: false
             ansi_music_enabled: false,         // default: true
             theme: Theme::Light,               // default: Dark
-            separator_style: SeparatorStyle::Web, // default: TinyFugue
+            separator_style: SeparatorStyle::TinyFugue, // default: Web
             gui_theme: Theme::Light,           // default: Dark
             gui_transparency: 0.7,             // default: 1.0
             color_offset_percent: 42,          // default: 0
@@ -3392,26 +3392,26 @@ mod tests {
     #[test]
     fn test_separator_style_survives_reload_state_roundtrip() {
         let mut app = App::new();
-        app.settings.separator_style = SeparatorStyle::Web;
+        app.settings.separator_style = SeparatorStyle::TinyFugue;
 
         let mut buf: Vec<u8> = Vec::new();
         save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
         let content = String::from_utf8(buf).expect("reload state is valid UTF-8");
         assert!(
-            content.contains("separator_style=web"),
+            content.contains("separator_style=tinyfugue"),
             "reload state must carry separator_style, got:\n{content}"
         );
 
         let mut reloaded = App::new();
         assert_eq!(
             reloaded.settings.separator_style,
-            SeparatorStyle::TinyFugue,
-            "test is meaningless unless a fresh App starts at the default style"
+            SeparatorStyle::Web,
+            "test is meaningless unless a fresh App starts at the OTHER style"
         );
         load_reload_state_from_str(&mut reloaded, &content).expect("load_reload_state_from_str failed");
         assert_eq!(
             reloaded.settings.separator_style,
-            SeparatorStyle::Web,
+            SeparatorStyle::TinyFugue,
             "separator_style must survive a hot reload"
         );
     }

@@ -363,10 +363,15 @@ impl Theme {
 /// and the bar sits on the terminal background. `Web` drops the underscores
 /// (they become plain spaces) and paints the bar with the active console
 /// theme's `status_bar.bg` — the same color the web/GUI status bar uses.
+///
+/// `Web` is the default, so a fresh install matches the web/GUI interfaces out
+/// of the box. This only affects a first invocation: once `separator_style` has
+/// been written to settings.dat the stored value wins, so anyone already running
+/// Clay keeps whatever they have.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum SeparatorStyle {
-    #[default]
     TinyFugue,
+    #[default]
     Web,
 }
 
@@ -380,8 +385,11 @@ impl SeparatorStyle {
 
     pub fn from_name(name: &str) -> Self {
         match name {
+            "tinyfugue" => SeparatorStyle::TinyFugue,
             "web" => SeparatorStyle::Web,
-            _ => SeparatorStyle::TinyFugue,
+            // Unrecognised (a hand-edited settings.dat) falls back to the default
+            // rather than to whichever arm happened to be last.
+            _ => Self::default(),
         }
     }
 
