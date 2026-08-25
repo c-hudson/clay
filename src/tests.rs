@@ -1897,7 +1897,8 @@
             match_style: tf::RecallMatchStyle::Simple,
             ..tf::RecallOptions::default()
         };
-        let matches = app.recall_matches(&opts, 0).unwrap();
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
         assert_eq!(matches, vec!["\u{00BB} north".to_string()],
             "the RecallSource::Input arm used to be an unconditional `continue` - /recall -i always returned no matches");
     }
@@ -1919,7 +1920,8 @@
             match_style: tf::RecallMatchStyle::Simple,
             ..tf::RecallOptions::default() // default source: CurrentWorld
         };
-        let matches = app.recall_matches(&opts, 0).unwrap();
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
         assert_eq!(matches, vec!["You go north.".to_string()],
             "plain /recall (no source flag) must stay server-output-only, excluding captured input");
     }
@@ -1943,7 +1945,8 @@
             match_style: tf::RecallMatchStyle::Simple,
             ..tf::RecallOptions::default()
         };
-        let local_matches = app.recall_matches(&local_opts, 0).unwrap();
+        let local_matches: Vec<String> = app.recall_matches(&local_opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
         assert_eq!(local_matches, vec!["Disconnected.".to_string(), "\u{00BB} north".to_string()],
             "-l must include both client-generated notices AND captured input, but not server output");
 
@@ -1952,7 +1955,8 @@
             match_style: tf::RecallMatchStyle::Simple,
             ..tf::RecallOptions::default()
         };
-        let global_matches = app.recall_matches(&global_opts, 0).unwrap();
+        let global_matches: Vec<String> = app.recall_matches(&global_opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
         assert_eq!(global_matches, vec!["You go north.".to_string(), "Disconnected.".to_string(), "\u{00BB} north".to_string()],
             "-g must include server output + client notices + captured input, all together");
     }
@@ -2076,6 +2080,70 @@
 
         app.record_user_input(0, "look again");
         assert_eq!(app.worlds[0].output_lines.iter().filter(|l| l.is_input).count(), 2);
+    }
+
+    #[test]
+    fn test_a_packet_split_line_is_archived_exactly_once() {
+        // Before this fix, a line arriving in two TCP reads was completed in place
+        // and then SKIPPED by the loop that does the archiving (`start_idx = 1`),
+        // so it never reached the archive at all. Chatty MUDs split constantly, so
+        // the hole was large, silent and permanent.
+        let dir = std::env::temp_dir().join(format!("clay_test_split_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("scrollback.db");
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Zmc"));
+        let settings = app.settings.clone();
+
+        {
+            let sdb = crate::scrollback::ScrollbackDb::open(&db_path, &[]).expect("open archive");
+            app.worlds[0].scrollback_tx = Some(sdb.sender());
+            app.worlds[0].ensure_world_id();
+
+            // "hello world" arrives as "hello " then "world\n".
+            app.worlds[0].add_output("hello ", true, &settings, 24, 80, false, true, false);
+            app.worlds[0].add_output("world\n", true, &settings, 24, 80, false, true, false);
+            // And an ordinary unsplit line, as a control.
+            app.worlds[0].add_output("plain line\n", true, &settings, 24, 80, false, true, false);
+
+            app.worlds[0].scrollback_tx = None; // drop this world's sender
+            drop(sdb);
+        }
+
+        // Poll: the writer flushes on disconnect but is a detached thread.
+        let mut hits = Vec::new();
+        for _ in 0..100 {
+            hits = crate::scrollback::ScrollbackDb::search(
+                &db_path, Some("Zmc"), "*", None, None, 100, false,
+            );
+            if hits.len() >= 2 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let texts: Vec<&str> = hits.iter().map(|l| l.text.as_str()).collect();
+        assert!(
+            texts.contains(&"hello world"),
+            "the completed split line must be archived; got {texts:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|t| **t == "hello world").count(), 1,
+            "and exactly once, not once per fragment"
+        );
+        assert!(!texts.contains(&"hello "), "the partial fragment must not be archived");
+        assert!(texts.contains(&"plain line"));
+
+        // The live line carries the durable sequence the archive stored.
+        let line = app.worlds[0].output_lines.iter()
+            .find(|l| l.text == "hello world").expect("completed line in buffer");
+        assert!(
+            line.archive_seq.is_some(),
+            "a completed split line must carry its archive sequence, or /recall -D \
+             cannot tell that memory already covers it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4942,7 +5010,7 @@
     /// `world.new_from_seq = 1` to bring it above the watermark. Ownership is the console's,
     /// since `rendering::line_is_new` always draws for the local instance.
     fn make_output_line(text: &str, marked_new: bool) -> OutputLine {
-        OutputLine {
+        OutputLine { archive_seq: None, archive_sourced: false,
             text: text.to_string(),
             timestamp: std::time::SystemTime::now(),
             from_server: true,
@@ -7493,7 +7561,7 @@ third
             });
         }
 
-        let make_line = |seq: u64| WsMessage::ServerData {
+        let make_line = |seq: u64| WsMessage::ServerData { archive_sourced: false,
             world_index: 0,
             data: format!("line {seq}"),
             is_viewed: true,
@@ -7564,7 +7632,7 @@ third
     // `ResyncRequired`/`ScrollbackLines` round trip that recovers it.
 
     fn console_server_data(world_index: usize, seq: u64, lines: &[&str]) -> WsMessage {
-        WsMessage::ServerData {
+        WsMessage::ServerData { archive_sourced: false,
             world_index,
             data: lines.join("\n"),
             is_viewed: true,
@@ -7634,7 +7702,7 @@ third
 
         // The server replies with the missing lines (seq 6..=10), exactly as
         // `handle_request_scrollback`'s after_seq branch would produce.
-        let gap_lines: Vec<TimestampedLine> = (6..=10u64).map(|seq| TimestampedLine {
+        let gap_lines: Vec<TimestampedLine> = (6..=10u64).map(|seq| TimestampedLine { archive_sourced: false,
             text: format!("line{seq}"),
             ts: 0,
             gagged: false,
@@ -7698,7 +7766,7 @@ third
         // remote_client.rs) and receive its reply while pending_gap is STILL open - the
         // exact race this fix targets.
         let backfill_id = app.register_scrollback_request(0, ScrollbackRequestKind::Backfill);
-        let older_lines: Vec<TimestampedLine> = (90..=100u64).map(|seq| TimestampedLine {
+        let older_lines: Vec<TimestampedLine> = (90..=100u64).map(|seq| TimestampedLine { archive_sourced: false,
             text: format!("line{seq}"),
             ts: 0,
             gagged: false,
@@ -7967,7 +8035,7 @@ third
     // shared methods both master-WS and daemon now call.
 
     fn make_pending_line(text: &str, highlighted: bool) -> OutputLine {
-        OutputLine {
+        OutputLine { archive_seq: None, archive_sourced: false,
             text: text.to_string(),
             timestamp: std::time::SystemTime::now(),
             from_server: true,
@@ -8279,7 +8347,7 @@ third
     /// note on unknown-field tolerance.)
     #[test]
     fn test_server_data_common_case_omits_from_server() {
-        let msg = WsMessage::ServerData {
+        let msg = WsMessage::ServerData { archive_sourced: false,
             world_index: 0,
             data: "hello\n".to_string(),
             is_viewed: true,
@@ -8323,7 +8391,7 @@ third
     /// value must round-trip on the wire, not be trimmed - only None is omitted.
     #[test]
     fn test_server_data_non_default_from_server_is_serialized() {
-        let msg = WsMessage::ServerData {
+        let msg = WsMessage::ServerData { archive_sourced: false,
             world_index: 1,
             data: "system message".to_string(),
             is_viewed: false,
@@ -10265,7 +10333,7 @@ third
 
     #[test]
     fn test_scrollback_batch_round_trip() {
-        let line = TimestampedLine {
+        let line = TimestampedLine { archive_sourced: false,
             text: "hello".to_string(),
             ts: 1234,
             gagged: false,
@@ -10896,7 +10964,7 @@ third
     /// including on the separator line.
     fn splice_archive_lines(world: &mut World, count: usize) {
         let archived: Vec<crate::scrollback::ScrollbackLine> = (0..count)
-            .map(|i| crate::scrollback::ScrollbackLine {
+            .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
                 ts_ms: 1_000 + i as i64,
                 world: world.name.clone(),
                 text: format!("archived line {}", i),
@@ -10915,7 +10983,7 @@ third
         // permanent ledger hole and a duplicate seq. The separator is built with
         // `new_client`, which does not set the marker, so it is the line that gets missed.
         let archived: Vec<crate::scrollback::ScrollbackLine> = (0..5)
-            .map(|i| crate::scrollback::ScrollbackLine {
+            .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
                 ts_ms: 1_000 + i,
                 world: "W".to_string(),
                 text: format!("old {}", i),
@@ -11064,7 +11132,7 @@ third
         for _ in 0..3 {
             let oldest = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine {
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),
@@ -11099,7 +11167,7 @@ third
         for _ in 0..3 {
             let oldest = world.output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine {
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),
@@ -11171,7 +11239,7 @@ third
         for _ in 0..3 {
             let oldest = app.worlds[0].output_lines.first().map(|l| l.seq).unwrap_or(0);
             let archived: Vec<crate::scrollback::ScrollbackLine> = (0..500)
-                .map(|i| crate::scrollback::ScrollbackLine {
+                .map(|i| crate::scrollback::ScrollbackLine { wseq: None,
                     ts_ms: 1_000 + i as i64,
                     world: "cave".to_string(),
                     text: format!("archived {}", i),

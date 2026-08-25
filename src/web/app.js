@@ -3599,7 +3599,7 @@
                             // instead of guessing every line is unviewed - without it, lines
                             // that arrived while the console (or another client) was watching
                             // would be optimistically marked ▶ and then taken back.
-                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false, highlight_color: lineHighlight, viewed: !!msg.is_viewed };
+                            const lineObj = { text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, gagged: msg.gagged || false, highlight_color: lineHighlight, viewed: !!msg.is_viewed, archive_sourced: !!msg.archive_sourced };
 
                             if (isGapFill) {
                                 // This batch fills a historical hole, not the tail — collect it
@@ -3642,9 +3642,9 @@
                                 } else if (!hasRealSeq && isFromServer) {
                                     // Released pending lines (seq=0, from_server=true) bypass local
                                     // more-mode to avoid flickering the More indicator
-                                    appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight);
+                                    appendNewLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
                                 } else {
-                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight);
+                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex, lineMarkedNew, isFromServer, lineHighlight, !!msg.archive_sourced);
                                 }
                             }
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
@@ -4460,7 +4460,8 @@
                             from_server: line.from_server !== false,
                             seq: line.seq || 0,
                             highlight_color: line.highlight_color,
-                            from_archive: line.from_archive || false
+                            from_archive: line.from_archive || false,
+                            archive_sourced: line.archive_sourced || false
                         });
                     }
                     if (msg.world_index === currentWorldIndex) {
@@ -4769,7 +4770,7 @@
     }
 
     // Handle incoming line with more-mode logic
-    function handleIncomingLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null) {
+    function handleIncomingLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null, archiveSourced = false) {
         if (text === undefined || text === null) return;
 
         const visibleLines = getVisibleLineCount();
@@ -4777,19 +4778,19 @@
 
         if (paused) {
             // Already paused, queue the line info
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced });
             updateStatusBar();
         } else if (moreModeEnabled && linesSincePause >= threshold) {
             // Trigger pause
             paused = true;
-            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor });
+            pendingLines.push({ text, ts, worldIndex, lineIndex, markedNew: markedNew || false, fromServer, highlightColor, archiveSourced });
             // Scroll to bottom to show what we have so far
             scrollToBottom();
             updateStatusBar();
         } else {
             // Normal display - append the line
             linesSincePause++;
-            appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer, highlightColor);
+            appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer, highlightColor, archiveSourced);
         }
     }
 
@@ -4858,7 +4859,7 @@
         const released = pendingLines.splice(0, toRelease);
 
         released.forEach(item => {
-            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew, item.fromServer, item.highlightColor);
+            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex, item.markedNew, item.fromServer, item.highlightColor, item.archiveSourced);
         });
 
         if (pendingLines.length === 0) {
@@ -6965,8 +6966,12 @@
     // grep/filter matching, and the /quote backtick re-capture all stay
     // prefix-free, exactly as OutputLine.text does on the Rust side.
     const CLIENT_LINE_PREFIX = '✨ ';
-    function applyClientPrefix(text, fromServer) {
+    function applyClientPrefix(text, fromServer, archiveSourced) {
         if (fromServer !== false) return text; // default true, like the Rust flag
+        // /recall -D output is client-emitted but its text came out of scrollback.db, so it
+        // takes the 🛢️ archive prefix instead — matching Page Up scrollback, and matching
+        // process_output_line() on the Rust side.
+        if (archiveSourced) return text;
         if (!text || stripAnsiForFilter(text).trim() === '') return text; // is_visually_empty()
         return CLIENT_LINE_PREFIX + text;
     }
@@ -7132,6 +7137,9 @@
             const lineMarkedNew = typeof lineObj === 'object' ? lineIsNew(lineObj, world) : false;
             const lineFromArchive = typeof lineObj === 'object' ? lineObj.from_archive : false;
             const lineFromServer = typeof lineObj === 'object' ? lineObj.from_server : true;
+            // Mirrors OutputLine::shows_archive_prefix(): both flags mean "text from
+            // scrollback.db", only from_archive also means "fabricated seq, never delivered".
+            const lineArchiveSourced = typeof lineObj === 'object' ? !!lineObj.archive_sourced : false;
 
             // Skip gagged lines unless showTags is enabled (F2)
             if (lineGagged && !showTags) {
@@ -7162,13 +7170,16 @@
             // Format timestamp prefix if showTags is enabled
             const tsPrefix = showTags && lineTs ? `<span class="timestamp">${formatTimestamp(lineTs)}</span>` : '';
 
-            const prefixedLine = applyClientPrefix(cleanLine, lineFromServer);
-            const strippedText = showTags ? prefixedLine : stripMudTag(prefixedLine);
+            // Strip the MUD tag BEFORE the prefix, matching process_output_line() on the
+            // Rust side: stripMudTag only fires on a line starting with '[', so prefixing
+            // first silently suppresses it.
+            const taggedText = showTags ? cleanLine : stripMudTag(cleanLine);
+            const strippedText = applyClientPrefix(taggedText, lineFromServer, lineArchiveSourced);
             const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
             // Skip Discord emoji conversion when showTags is enabled so users can see original text
             const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
             const newLinePrefix = (newLineIndicator && lineMarkedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
-            const archivePrefix = lineFromArchive ? '🛢️ ' : '';
+            const archivePrefix = (lineFromArchive || lineArchiveSourced) ? '🛢️ ' : '';
             let html = tsPrefix + newLinePrefix + archivePrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
             // Apply /highlight color from action command (takes priority)
@@ -7242,20 +7253,24 @@
     // plain until something forced a full re-render (a world switch, a resync) - at which
     // point the same line suddenly gained its background. renderOutput() below is the
     // reference for what a line should look like; keep the two in step.
-    function appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null) {
+    function appendNewLine(text, ts, worldIndex, lineIndex, markedNew, fromServer = true, highlightColor = null, archiveSourced = false) {
         // Strip newlines/carriage returns
         const cleanText = String(text).replace(/[\r\n]+/g, '');
 
         // Format timestamp prefix if showTags is enabled
         const tsPrefix = showTags && ts ? `<span class="timestamp">${formatTimestamp(ts)}</span>` : '';
 
-        const prefixedText = applyClientPrefix(cleanText, fromServer);
-        const strippedText = showTags ? prefixedText : stripMudTag(prefixedText);
+        // Same ordering as renderOutput()/process_output_line(): strip, then prefix.
+        const taggedText = showTags ? cleanText : stripMudTag(cleanText);
+        const strippedText = applyClientPrefix(taggedText, fromServer, archiveSourced);
         const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
         // Skip Discord emoji conversion when showTags is enabled so users can see original text
         const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
         const newLinePrefix = (newLineIndicator && markedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
-        let html = tsPrefix + newLinePrefix + (showTags ? processed : convertDiscordEmojis(processed));
+        // Without this the line would render with ✨ on arrival and only become 🛢️ on the
+        // next full renderOutput() - the flash this path has produced before.
+        const archivePrefix = archiveSourced ? '🛢️ ' : '';
+        let html = tsPrefix + newLinePrefix + archivePrefix + (showTags ? processed : convertDiscordEmojis(processed));
         if (highlightColor !== null && highlightColor !== undefined) {
             html = `<span style="background-color: ${colorNameToCss(highlightColor)}; display: block;">${html}</span>`;
         }

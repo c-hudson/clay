@@ -1305,6 +1305,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.add_output("Font settings are available in the web and GUI interfaces.");
         }
         Command::Quit => {
+            // Drain the archive writer before tearing anything down, so the last
+            // batch of output reaches disk rather than dying with the process.
+            app.flush_scrollback();
             // Kill all TLS proxy processes before quitting
             for world in &app.worlds {
                 #[cfg(unix)]

@@ -379,6 +379,11 @@ pub enum WsMessage {
     /// knows the true count; the receiver may not, once it applies its own line filters
     /// (ANSI-only lines, idler markers, grep mode).
     ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true", skip_serializing_if = "is_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default, skip_serializing_if = "Option::is_none")] end_seq: Option<u64>, #[serde(default, skip_serializing_if = "is_false")] flush: bool, #[serde(default, skip_serializing_if = "is_false")] gagged: bool,
+        /// Whole batch is `/recall -D` output — archived text delivered as ordinary live
+        /// lines. Batch-level rather than per-line because `emit_recall` always emits a
+        /// homogeneous block (the archive rows, or a single client notice, never a mix).
+        /// Clients draw 🛢️ instead of ✨ for these. See `OutputLine::archive_sourced`.
+        #[serde(default, skip_serializing_if = "is_false")] archive_sourced: bool,
         /// Per-line `/hilite` colours, parallel to the newline-separated lines in `data`.
         /// Empty (and omitted from the wire) whenever no line in the batch is highlighted —
         /// the overwhelming common case, so this costs nothing on the hot path.
@@ -1043,6 +1048,13 @@ pub struct TimestampedLine {
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
     #[serde(default)]
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive
+    /// Mirrors `OutputLine::archive_sourced` — a `/recall -D` result: archived *text*
+    /// delivered as an ordinary live line. Display-only (draws 🛢️ instead of ✨).
+    /// Deliberately NOT folded into `from_archive` on the wire: app.js's
+    /// `bufferIsCorrupted()` treats any wire `from_archive` as proof of a pre-1.5.23
+    /// server and throws the client's whole buffer away.
+    #[serde(default)]
+    pub archive_sourced: bool,
     /// Mirrors `OutputLine::viewed` — see its doc comment in main.rs. Carried on the wire so a
     /// client hydrating from InitialState/ScrollbackLines knows which lines are still
     /// unclaimed. `serde(default)` = false, matching an older peer that doesn't send it.
@@ -1089,6 +1101,7 @@ impl TimestampedLine {
             seq: line.seq,
             highlight_color: line.highlight_color.clone(),
             from_archive: line.from_archive,
+            archive_sourced: line.archive_sourced,
             viewed: line.viewed,
             display_id: line.display_id,
         }

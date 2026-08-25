@@ -1643,6 +1643,12 @@ pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // Always log reload (not gated by debug flag) so we can trace issues
     debug_log(is_debug_enabled(), "RELOAD: Starting exec_reload");
 
+    // Drain the archive writer first. The reload path ends in `exec`/`exit` with
+    // every World (and therefore every archive sender) still alive, so the writer
+    // never sees a channel disconnect and would otherwise lose whatever is still
+    // batched.
+    app.flush_scrollback();
+
     // Save the current state
     debug_log(is_debug_enabled(), "RELOAD: Saving state...");
     persistence::save_reload_state(app)?;

@@ -416,8 +416,16 @@ pub(crate) fn process_output_line(line: &OutputLine, show_tags: bool, temp_conve
     }
     // Colorize square emoji (🟩🟨 etc.) with ANSI codes
     let text = colorize_square_emojis(&line.text, zwj_enabled);
-    // Add ✨ prefix for client-generated messages
-    let text = if !line.from_server {
+    // Strip the MUD tag BEFORE adding any prefix. strip_mud_tag only fires on a line that
+    // starts with '[', so prefixing first silently suppresses it — which is why /recall
+    // output used to keep tags that the same line shows stripped when it arrives live. It
+    // also has to be prefix-independent for /recall -D, where one result block holds the
+    // same MUD line from the archive (🛢️) and from the live buffer (✨).
+    let text = if show_tags { text } else { strip_mud_tag(&text) };
+    // Add ✨ prefix for client-generated messages. Archive-sourced lines (/recall -D
+    // results) are client-emitted but their text came out of scrollback.db, so they take
+    // the 🛢️ prefix the draw loop adds instead — same as Page Up scrollback.
+    let text = if !line.from_server && !line.archive_sourced {
         format!("✨ {}", text)
     } else {
         text
@@ -431,7 +439,7 @@ pub(crate) fn process_output_line(line: &OutputLine, show_tags: bool, temp_conve
         };
         format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp_with_now(cached_now), text_with_temps)
     } else {
-        strip_mud_tag(&text)
+        text
     };
     Some(processed.replace('\t', "        "))
 }
@@ -529,7 +537,7 @@ pub(crate) fn display_wrapped_as(
     let width = display_wrap_width(
         term_width,
         marked_new,
-        line.from_archive,
+        line.shows_archive_prefix(),
         settings.new_line_indicator,
     );
     wrap_ansi_line(&text, width, settings.wrapspace as usize)
@@ -838,7 +846,7 @@ pub fn build_display_lines(
         }
         let hl_color = line.highlight_color.clone();
         let mn = line_is_new(line);
-        let fa = line.from_archive;
+        let fa = line.shows_archive_prefix();
         rows.into_iter()
             .map(|s| (s, highlight_f8, hl_color.clone(), mn, fa))
             .collect()
@@ -1040,7 +1048,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
         }
         let hl_color = line.highlight_color.clone();
         let mn = line_is_new(line);
-        let fa = line.from_archive;
+        let fa = line.shows_archive_prefix();
         rows.into_iter()
             .map(|s| (s, highlight_f8, hl_color.clone(), mn, fa))
             .collect()

@@ -2620,6 +2620,23 @@ pub struct OutputLine {
     pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
     pub from_archive: bool, // true if line was loaded from the scrollback.db archive (not current session)
+    /// This line's *text* came out of scrollback.db (a `/recall -D` result), but the line
+    /// itself is an ordinary, seq-carrying, broadcast line — unlike `from_archive`, which
+    /// additionally means "fabricated seq, never deliver to a client" and is filtered out
+    /// of every delivery path. Purely a display distinction: draw the 🛢️ archive prefix
+    /// instead of the ✨ client-line prefix, so archived text reads the same in a `/recall
+    /// -D` as it does when you Page Up into it. Never set this on a line whose seq is
+    /// fabricated — use `from_archive` for those.
+    pub archive_sourced: bool,
+    /// Durable archive sequence for this line, when it was archived.
+    ///
+    /// NOT the protocol `seq` above: that restarts at 0 on every cold start
+    /// (`World::new`) and is therefore useless as a database key. This one is
+    /// allocated from the archive itself and survives restarts, which is what
+    /// lets `/recall -D` compute an exact memory/SQL boundary instead of
+    /// guessing with timestamps. `None` = never archived (client output, input,
+    /// a partial still being assembled) or the allocator was unreachable.
+    pub archive_seq: Option<i64>,
     /// Has this line been on somebody's screen yet? Set true either at arrival (the world was
     /// being viewed by someone, so it was never "missed") or the first time any client
     /// displays it. Once true it never goes back to false, and the line can never again be
@@ -2702,9 +2719,20 @@ impl OutputLine {
             seq,
             highlight_color: None,
             from_archive: false,
+            archive_sourced: false,
+            archive_seq: None,
             viewed: false,
             display_id: None,
         }
+    }
+
+    /// True when this line draws the 🛢️ archive prefix (and, for `archive_sourced`,
+    /// suppresses the ✨ client prefix it would otherwise get). Both flags mean
+    /// "this text came from scrollback.db"; only `from_archive` also means
+    /// "fabricated seq, never delivered". Display code must use this, never either
+    /// flag alone, or `/recall -D` and Page Up render archived text differently.
+    pub fn shows_archive_prefix(&self) -> bool {
+        self.from_archive || self.archive_sourced
     }
 
     pub fn new_client(text: String, seq: u64) -> Self {
@@ -2717,6 +2745,8 @@ impl OutputLine {
             seq,
             highlight_color: None,
             from_archive: false,
+            archive_sourced: false,
+            archive_seq: None,
             viewed: false,
             display_id: None,
         }
@@ -2732,13 +2762,15 @@ impl OutputLine {
             seq,
             highlight_color: None,
             from_archive: false,
+            archive_sourced: false,
+            archive_seq: None,
             viewed: false,
             display_id: None,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false, viewed: false, display_id: None }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, is_input: false, seq, highlight_color: None, from_archive: false, archive_sourced: false, archive_seq: None, viewed: false, display_id: None }
     }
 
     /// A user-typed command captured on its way to the MUD. `gagged: true` is what makes it
@@ -2754,6 +2786,8 @@ impl OutputLine {
             seq,
             highlight_color: None,
             from_archive: false,
+            archive_sourced: false,
+            archive_seq: None,
             viewed: false,
             display_id: None,
         }
@@ -2794,7 +2828,7 @@ pub struct World {
     pub settings: WorldSettings,
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
-    pub scrollback_tx: Option<std::sync::mpsc::SyncSender<scrollback::ArchiveEntry>>,
+    pub scrollback_tx: Option<scrollback::ArchiveSender>,
     #[cfg(unix)]
     socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only)
     #[cfg(not(unix))]
@@ -2901,6 +2935,18 @@ pub struct World {
     /// protects manually-typed input during that same window.
     pub(crate) login_capture_guard: u8,
     reader_name: Option<String>, // Name used by active reader task (for lookup after rename)
+    /// Stable identity for this world, independent of `name`.
+    ///
+    /// The scrollback archive keys rows by this rather than by name, because a
+    /// rename (`App::update_world_settings`) otherwise orphans every archived
+    /// line the world ever wrote. Lives on `World` rather than `WorldSettings`
+    /// precisely so it survives a rename — both rename sites assign `name` in
+    /// place and never rebuild the `World`.
+    ///
+    /// Empty means "not yet assigned"; `ensure_world_id` mints one on demand, so
+    /// throwaway worlds (tests, transient lookups) never burn an id. 32 lowercase
+    /// hex, no dashes.
+    pub world_id: String,
     pub gmcp_enabled: bool,          // True if GMCP was negotiated with the server
     pub msdp_enabled: bool,          // True if MSDP was negotiated with the server
     pub gmcp_supported_packages: Vec<String>, // GMCP packages we told the server we support
@@ -3066,6 +3112,7 @@ impl World {
             ledger_audited_upto: None,
             login_capture_guard: 6,
             reader_name: None,
+            world_id: String::new(),
             gmcp_enabled: false,
             msdp_enabled: false,
             gmcp_supported_packages: Vec::new(),
@@ -3289,6 +3336,46 @@ impl World {
     /// perfectly healthy.
     ///
     /// Checks `pending_lines` too: those carry allocated seqs and will be appended later.
+    /// Return this world's stable id, minting one if it has none yet.
+    ///
+    /// Called from `App::init_scrollback` (which owns `&mut self` — `save_settings`
+    /// only has `&App` and so cannot mint) and from the archive write path before
+    /// the first row is queued, so an id exists exactly when something durable
+    /// needs to reference it.
+    pub(crate) fn ensure_world_id(&mut self) -> &str {
+        if self.world_id.is_empty() {
+            self.world_id = uuid::Uuid::new_v4().simple().to_string();
+        }
+        &self.world_id
+    }
+
+    /// Queue `text` for the archive and return the durable sequence number it was
+    /// given, so the caller can stamp it onto the `OutputLine`.
+    ///
+    /// Returns `None` when there is no archive (disabled) or the allocator could
+    /// not be reached. In the latter case the line is STILL queued — the writer
+    /// assigns a number instead. Losing the number is acceptable; losing the line
+    /// is not.
+    pub(crate) fn archive_line(&mut self, text: &str, gagged: bool) -> Option<i64> {
+        self.scrollback_tx.as_ref()?;
+        // Mint before borrowing the sender: both borrow `self`.
+        let uuid = self.ensure_world_id().to_string();
+        let name = self.name.clone();
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let tx = self.scrollback_tx.as_ref()?;
+        let slot = tx.alloc_wseq(&uuid, &name);
+        let mut entry = scrollback::ArchiveEntry::new(name, ts_ms, text.to_string(), gagged);
+        if let Some((wid, wseq)) = slot {
+            entry.wid = Some(wid);
+            entry.wseq = Some(wseq);
+        }
+        tx.send(entry);
+        slot.map(|(_, wseq)| wseq)
+    }
+
     pub(crate) fn ensure_next_seq_above_buffer(&mut self) {
         let highest = self.output_lines.iter()
             .chain(self.pending_lines.iter())
@@ -3508,13 +3595,30 @@ impl World {
                     self.lines_since_pause = self.lines_since_pause.saturating_sub(old_visual);
                 }
             } else {
+                // The completed line is archived HERE, because the loop below skips
+                // it (`start_idx = 1`) and the archive send lives inside that loop.
+                // Without this, any line that happened to arrive split across two
+                // TCP reads was updated on screen and never written to the archive
+                // at all — a silent, permanent hole proportional to how chatty the
+                // MUD is. Only archive once the line is actually complete.
+                let completed_archive_seq = if ends_with_newline && from_server {
+                    self.archive_line(completed_line, false)
+                } else {
+                    None
+                };
                 // Update the partial line with combined content
                 if partial_was_in_pending {
                     if let Some(i) = self.last_visible_pending_idx() {
                         self.pending_lines[i].text = completed_line.to_string();
+                        if completed_archive_seq.is_some() {
+                            self.pending_lines[i].archive_seq = completed_archive_seq;
+                        }
                     }
                 } else if let Some(i) = self.last_visible_output_idx() {
                     self.output_lines[i].text = completed_line.to_string();
+                    if completed_archive_seq.is_some() {
+                        self.output_lines[i].archive_seq = completed_archive_seq;
+                    }
                     let new_visual = metrics.rows(&self.output_lines[i]);
                     // Re-count at the completed line's final wrapped height. Does
                     // NOT retroactively trigger a pause even if this pushes over
@@ -3562,6 +3666,10 @@ impl World {
         for (i, line) in lines.iter().enumerate().skip(start_idx) {
             let is_last = i == line_count - 1;
             let is_partial = is_last && !ends_with_newline;
+            // Durable archive sequence for this line, filled in below iff it is
+            // actually archived. Stamped onto the OutputLine so /recall -D can
+            // tell which archive rows the live buffer already covers.
+            let mut archive_seq: Option<i64> = None;
 
             // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
             let uses_idler_keepalive = matches!(
@@ -3577,13 +3685,9 @@ impl World {
                 self.write_log_line(line);
                 // Archive server lines to long-term scrollback
                 if from_server {
-                    if let Some(ref tx) = self.scrollback_tx {
-                        let ts_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
-                        let _ = tx.try_send((self.name.clone(), ts_ms, line.to_string(), false));
-                    }
+                    // Unbounded queue; a refusal is counted in ArchiveStats rather
+                    // than vanishing the way try_send's dropped Result did.
+                    archive_seq = self.archive_line(line, false);
                 }
             }
 
@@ -3612,6 +3716,7 @@ impl World {
             // OutputLine::viewed). `is_current` is the existing console-or-any-WS-client
             // predicate, unchanged - it still drives more-mode budgeting above too.
             new_line.viewed = is_current;
+            new_line.archive_seq = archive_seq;
 
             // Built before measuring, so the budget can be taken off the real OutputLine
             // through the same path the renderer wraps with (`RowMetrics`) rather than off the
@@ -4049,6 +4154,11 @@ pub(crate) enum ScrollbackRequestKind {
     Backfill,
 }
 
+/// One run of consecutive lines of the same gagged-ness, as grouped by
+/// `process_server_data`: `(gagged, [(text, highlight_color)])`. Named because
+/// the nested tuple is otherwise repeated at every boundary it crosses.
+type OutputRun<'a> = (bool, Vec<(&'a str, Option<String>)>);
+
 pub struct App {
     pub worlds: Vec<World>,
     pub current_world_index: usize,
@@ -4322,7 +4432,21 @@ impl App {
         if self.settings.scrollback_enabled {
             if self.scrollback.is_none() {
                 let path = clay_config_path("scrollback.db");
-                match scrollback::ScrollbackDb::open(&path) {
+                // Mint ids BEFORE opening: the migration attributes legacy rows
+                // (which recorded only a world name) to whichever live world
+                // currently answers to that name, so it needs the ids to exist.
+                for world in &mut self.worlds {
+                    world.ensure_world_id();
+                }
+                let refs: Vec<scrollback::WorldRef> = self
+                    .worlds
+                    .iter()
+                    .map(|w| scrollback::WorldRef {
+                        world_uuid: w.world_id.clone(),
+                        name: w.name.clone(),
+                    })
+                    .collect();
+                match scrollback::ScrollbackDb::open(&path, &refs) {
                     Ok(db) => self.scrollback = Some(db),
                     Err(e) => {
                         debug_log(true, &format!("scrollback: failed to open {:?}: {}", path, e));
@@ -4332,10 +4456,28 @@ impl App {
         } else {
             self.scrollback = None;
         }
-        // Push/clear sender on all worlds
+        // Push/clear sender on all worlds. Minting the stable world id here is
+        // what makes it exist exactly when archiving is on: `save_settings` takes
+        // `&App` and so cannot mint, and a world that never archives never needs
+        // one. The id then reaches settings.dat on the next save.
         let sender = self.scrollback.as_ref().map(|db| db.sender());
+        let archiving = sender.is_some();
         for world in &mut self.worlds {
             world.scrollback_tx = sender.clone();
+            if archiving {
+                world.ensure_world_id();
+            }
+        }
+    }
+
+    /// Flush every queued archive line and stop the writer thread.
+    ///
+    /// Must be called before any exit that does not drop every `World` — notably
+    /// the hot-reload `exec`, where `std::process::exit` leaves the senders alive
+    /// so the writer never sees a disconnect and never runs its final flush.
+    pub fn flush_scrollback(&mut self) {
+        if let Some(db) = self.scrollback.as_mut() {
+            db.flush_and_close();
         }
     }
 
@@ -5131,7 +5273,7 @@ impl App {
             // `end_seq: None`) ever reached this handler. Regression from 99fe3dc
             // (2026-08-04); this arm's body never actually needed `end_seq`'s value, only
             // `msg_seq`, so dropping the literal match is a complete fix.
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq, flush, gagged, highlight_colors, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, end_seq, flush, gagged, highlight_colors, archive_sourced, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Flush: clear output buffer before appending new lines
                     // (e.g., splash screen cleared — combined with data to avoid race condition)
@@ -5225,6 +5367,10 @@ impl App {
                                 OutputLine::new_client(line.to_string(), seq)
                             };
                             output_line.gagged = gagged;
+                            // Batch-level flag (see ServerData::archive_sourced): a /recall -D
+                            // block is uniformly archive-sourced, so it applies to every line
+                            // in this batch. Draws 🛢️ in place of the ✨ client prefix.
+                            output_line.archive_sourced = archive_sourced;
                             // Parallel to the PRE-filter split, so index by `i` - the same
                             // reasoning as the seq derivation above. Empty means nothing in
                             // this batch was highlighted.
@@ -5369,7 +5515,7 @@ impl App {
                         // local one here put non-server seqs into output_lines.
                         let seq = tl.seq;
                         world.next_seq = world.next_seq.max(seq + 1);
-                        world.output_lines.push(OutputLine {
+                        world.output_lines.push(OutputLine { archive_seq: None,
                             text: tl.text,
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                             from_server: tl.from_server,
@@ -5380,6 +5526,7 @@ impl App {
                             seq,
                             highlight_color: tl.highlight_color,
                             from_archive: false,
+                            archive_sourced: tl.archive_sourced,
                             viewed: false,
                             display_id: None,
                         });
@@ -5529,7 +5676,7 @@ impl App {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     let was_at_bottom = world.is_at_bottom();
                     for line in lines {
-                        let output_line = OutputLine {
+                        let output_line = OutputLine { archive_seq: None,
                             text: line.text,
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
                             from_server: line.from_server,
@@ -5538,6 +5685,7 @@ impl App {
                             seq: line.seq,
                             highlight_color: line.highlight_color,
                             from_archive: line.from_archive,
+                            archive_sourced: line.archive_sourced,
                             viewed: false,
                             display_id: None,
                         };
@@ -5613,7 +5761,7 @@ impl App {
                             // include lines we already have — drop those instead of duplicating.
                             let new_lines: Vec<OutputLine> = lines.into_iter()
                                 .filter(|l| l.seq > last_contiguous_seq)
-                                .map(|line| OutputLine {
+                                .map(|line| OutputLine { archive_seq: None,
                                     text: line.text,
                                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
                                     from_server: line.from_server,
@@ -5622,6 +5770,7 @@ impl App {
                                     seq: line.seq,
                                     highlight_color: line.highlight_color,
                                     from_archive: line.from_archive,
+                                    archive_sourced: line.archive_sourced,
                                     viewed: false,
                                     display_id: None,
                                 }).collect();
@@ -5646,7 +5795,7 @@ impl App {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Insert at the beginning of output_lines
                     let new_lines: Vec<OutputLine> = lines.into_iter().map(|line| {
-                        OutputLine {
+                        OutputLine { archive_seq: None,
                             text: line.text,
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
                             from_server: line.from_server,
@@ -5655,6 +5804,7 @@ impl App {
                             seq: line.seq,
                             highlight_color: line.highlight_color,
                             from_archive: line.from_archive,
+                            archive_sourced: line.archive_sourced,
                             viewed: false,
                             display_id: None,
                         }
@@ -5773,7 +5923,7 @@ impl App {
             world.proxy_pid = if w.is_proxy { Some(0) } else { None };
             let output_lines_count = w.output_lines_ts.len();
             world.output_lines = w.output_lines_ts.into_iter().map(|tl| {
-                OutputLine {
+                OutputLine { archive_seq: None,
                     text: tl.text,
                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                     from_server: tl.from_server,
@@ -5782,6 +5932,7 @@ impl App {
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
                     from_archive: tl.from_archive,
+                    archive_sourced: tl.archive_sourced,
                     viewed: false,
                     display_id: None,
                 }
@@ -5798,7 +5949,7 @@ impl App {
                 w.scroll_offset
             };
             world.pending_lines = w.pending_lines_ts.into_iter().map(|tl| {
-                OutputLine {
+                OutputLine { archive_seq: None,
                     text: tl.text,
                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                     from_server: tl.from_server,
@@ -5807,6 +5958,7 @@ impl App {
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
                     from_archive: tl.from_archive,
+                    archive_sourced: tl.archive_sourced,
                     viewed: false,
                     display_id: None,
                 }
@@ -5967,47 +6119,84 @@ impl App {
         opts: &tf::RecallOptions,
         fallback_idx: usize,
     ) -> Result<Vec<OutputLine>, String> {
+        // -D searches the archive AND the live buffer, oldest first. The archive holds
+        // everything that has scrolled out of memory; the live buffer holds what hasn't been
+        // written back yet plus this session's client-side output. Searching only one of them
+        // silently hides half the history the user is asking about.
         if opts.archive {
-            // Input isn't archived (see OutputLine::is_input's doc comment - captured input
-            // only lives in output_lines/pending_lines and the per-world file log, never
-            // scrollback.db), so -D -i would otherwise silently return "No matches" forever
-            // with no indication why. Archive rows are always reconstructed via
-            // OutputLine::new_with_timestamp below, which is always is_input: false.
-            if opts.source == tf::RecallSource::Input {
-                return Err("Input history isn't archived — use /recall -i without -D".to_string());
-            }
             if !self.settings.scrollback_enabled {
                 return Err("Archive is off — enable \"Archive Input/Output\" in Setup first".to_string());
             }
-            let world_name = match &opts.source {
-                tf::RecallSource::World(name) => Some(name.as_str()),
-                _ => {
-                    if fallback_idx < self.worlds.len() {
-                        Some(self.worlds[fallback_idx].name.as_str())
-                    } else {
-                        None
-                    }
-                }
+            let idx = match &opts.source {
+                tf::RecallSource::World(name) => self
+                    .find_world_index(name)
+                    .ok_or_else(|| format!("No world named '{}'", name))?,
+                _ => fallback_idx,
             };
+            let live: Vec<OutputLine> = self
+                .worlds
+                .get(idx)
+                .map(|w| w.output_lines.clone())
+                .unwrap_or_default();
+            let world_name = self.worlds.get(idx).map(|w| w.name.as_str());
             let db_path = clay_config_path("scrollback.db");
             if !db_path.exists() {
-                return Err("Archive database not found — connect to a world with archiving enabled first".to_string());
+                // The live half still works; only the archive half is missing.
+                return Ok(live);
             }
+            // Cut the archive at the oldest line the live buffer already holds, so the
+            // overlap (every live line was archived as it arrived) isn't listed twice.
+            //
+            // The cut is on the DURABLE archive sequence, not on a timestamp:
+            // timestamps collide, so equal ts_ms values straddled the old boundary in
+            // both directions — dropping some rows and duplicating others. With wseq
+            // the two halves are disjoint by construction, which is why nothing below
+            // needs to de-duplicate.
+            let before_wseq: Option<i64> = live.iter().filter_map(|l| l.archive_seq).min();
+            // Timestamp fallback for the first run after an upgrade, a world whose
+            // buffer predates archiving, or a degraded allocator. Reproduces the old
+            // semantics exactly rather than returning nothing.
+            let until_ms = if before_wseq.is_some() {
+                None
+            } else {
+                live.iter()
+                    .filter_map(|l| l.timestamp.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .min()
+                    .map(|oldest| oldest - 1)
+            };
             let pattern = opts.pattern.as_deref().unwrap_or("*");
-            let use_regex = matches!(opts.match_style, tf::RecallMatchStyle::Regexp);
-            let results = scrollback::ScrollbackDb::search(
-                &db_path,
-                world_name,
+            // Carry the REAL match style through. Passing a bare `use_regex` bool
+            // collapsed Simple into Glob, so `-D -msimple rc` asked the archive for
+            // an anchored match and got nothing — the rows never reached the
+            // substring filter that would have matched them.
+            let kind = match opts.match_style {
+                tf::RecallMatchStyle::Simple => scrollback::PatternKind::Simple,
+                tf::RecallMatchStyle::Glob => scrollback::PatternKind::Glob,
+                tf::RecallMatchStyle::Regexp => scrollback::PatternKind::Regex,
+            };
+            let results = scrollback::query(&db_path, &scrollback::ArchiveQuery {
+                world: world_name,
                 pattern,
-                None,
-                None,
-                10_000,
-                use_regex,
-            );
-            let lines: Vec<OutputLine> = results.into_iter().enumerate().map(|(i, sl)| {
+                kind,
+                before_wseq,
+                since_ms: None,
+                until_ms,
+                limit: 10_000,
+                // Take the most recent matches. The old ascending scan kept the
+                // OLDEST 10k, silently hiding recent history on a large archive.
+                newest_first: true,
+            });
+            // `archive_sourced` is what makes these render with 🛢️ instead of ✨ once
+            // emit_recall re-emits them; the live half keeps its own provenance.
+            let mut lines: Vec<OutputLine> = results.into_iter().enumerate().map(|(i, sl)| {
                 let ts = std::time::UNIX_EPOCH + std::time::Duration::from_millis(sl.ts_ms as u64);
-                OutputLine::new_with_timestamp(sl.text, ts, i as u64)
+                let mut line = OutputLine::new_with_timestamp(sl.text, ts, i as u64);
+                line.archive_sourced = true;
+                line.archive_seq = sl.wseq;
+                line
             }).collect();
+            lines.extend(live);
             return Ok(lines);
         }
 
@@ -6697,7 +6886,7 @@ impl App {
             .iter()
             .rev()
             .take(100)
-            .map(|line| TimestampedLine::from_output_line(line))
+            .map(TimestampedLine::from_output_line)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -7117,7 +7306,7 @@ impl App {
         let text = line.text.replace('\r', "");
         let displayed = self.worlds[world_idx].push_line_respecting_pending(line, more_mode);
         if displayed {
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                 world_index: world_idx,
                 data: format!("{}\n", text),
                 is_viewed: true,
@@ -7156,6 +7345,13 @@ impl App {
             .map(|line| line.text.replace('\r', ""))
             .collect::<Vec<_>>()
             .join("\n") + "\n";
+        // Batch-level, so only a wholly archive-sourced batch is flagged — `all` rather than
+        // `any`, since a mixed batch would otherwise put 🛢️ on ordinary client lines. In
+        // practice emit_recall always emits a homogeneous block.
+        let archive_sourced = world.output_lines.iter()
+            .skip(skip)
+            .take(count)
+            .all(|line| line.archive_sourced);
         // Parallel to the lines in `data`. Left empty (and omitted from the wire) unless at
         // least one line is highlighted, so the common path costs nothing - see
         // ServerData::highlight_colors.
@@ -7168,6 +7364,7 @@ impl App {
             if colors.iter().any(|c| c.is_some()) { colors } else { Vec::new() }
         };
         self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            archive_sourced,
             world_index: world_idx,
             data,
             is_viewed,
@@ -7182,6 +7379,20 @@ impl App {
     }
 
     pub(crate) fn emit_client_lines(&mut self, world_idx: usize, lines: &[String], is_daemon_mode: bool) {
+        self.emit_client_lines_marked(world_idx, lines, is_daemon_mode, false);
+    }
+
+    /// `emit_client_lines` plus the `archive_sourced` display flag (see
+    /// `OutputLine::archive_sourced`). `archive_sourced` applies to the whole block, which is
+    /// all `/recall -D` needs: `execute_recall` returns only matched rows, and the "No
+    /// matches"/error cases are emitted as an ordinary client block instead.
+    pub(crate) fn emit_client_lines_marked(
+        &mut self,
+        world_idx: usize,
+        lines: &[String],
+        is_daemon_mode: bool,
+        archive_sourced: bool,
+    ) {
         if world_idx >= self.worlds.len() || lines.is_empty() {
             return;
         }
@@ -7217,6 +7428,19 @@ impl App {
         let output_after = self.worlds[world_idx].output_lines.len();
         let pending_after = self.worlds[world_idx].pending_lines.len();
         let lines_to_pending = pending_after.saturating_sub(pending_before);
+
+        // Stamp before broadcasting: broadcast_output_range reads the flag off the lines.
+        // More-mode can route part (or all) of the block into pending_lines, so both tails
+        // are stamped — a line released from pending later must still draw 🛢️.
+        if archive_sourced {
+            let world = &mut self.worlds[world_idx];
+            for line in world.output_lines.iter_mut().skip(output_before) {
+                line.archive_sourced = true;
+            }
+            for line in world.pending_lines.iter_mut().skip(pending_before) {
+                line.archive_sourced = true;
+            }
+        }
 
         let mut skip_count = output_before;
         let mut lines_to_output = output_after.saturating_sub(output_before);
@@ -7686,7 +7910,7 @@ impl App {
             let seq_contiguous = prev_seq.map(|p| line.seq == p + 1).unwrap_or(true);
             if (line.from_server != batch_from_server || line.gagged != batch_gagged || !seq_contiguous) && !batch.is_empty() {
                 let ws_data = batch.join("\n") + "\n";
-                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                     world_index: world_idx,
                     data: ws_data,
                     is_viewed: true,
@@ -7707,7 +7931,7 @@ impl App {
         }
         if !batch.is_empty() {
             let ws_data = batch.join("\n") + "\n";
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                 world_index: world_idx,
                 data: ws_data,
                 is_viewed: true,
@@ -7917,7 +8141,7 @@ impl App {
                 continue; // held in pending_lines; rides the release batch via broadcast_released_lines
             }
             let ws_data = part.replace('\r', "") + "\n";
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                 world_index: world_idx,
                 data: ws_data,
                 is_viewed: is_current,
@@ -8159,9 +8383,9 @@ impl App {
         &self,
         opts: &tf::RecallOptions,
         world_idx: usize,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<(String, bool)>, String> {
         let lines = self.recall_source_lines(opts, world_idx)?;
-        Ok(execute_recall(opts, &lines, self.show_tags))
+        Ok(crate::actions::execute_recall_with_source(opts, &lines, self.show_tags))
     }
 
     /// Render a /recall (or the /N shorthand, which is rewritten to /recall
@@ -8170,18 +8394,36 @@ impl App {
     /// GUI). `world_idx` is both the default history source (overridden by
     /// -w/-g/-D inside `opts`) and the destination for the rendered output.
     pub(crate) fn emit_recall(&mut self, opts: &tf::RecallOptions, world_idx: usize, is_daemon_mode: bool) {
-        let block: Vec<String> = match self.recall_matches(opts, world_idx) {
+        // A -D result mixes archive rows with live-buffer rows, so provenance is per match,
+        // not per block. Matches come out in buffer order (recall_source_lines puts the whole
+        // archive half first), so the flags form contiguous runs — emit one homogeneous block
+        // per run instead of widening ServerData with a parallel per-line array.
+        let matches: Vec<(String, bool)> = match self.recall_matches(opts, world_idx) {
             Ok(matches) => {
                 if matches.is_empty() {
                     let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                    vec![format!("No matches for '{}'", pattern_str)]
+                    // Clay talking, not recalled text: keeps the ✨ client prefix.
+                    vec![(format!("No matches for '{}'", pattern_str), false)]
                 } else {
                     matches
                 }
             }
-            Err(e) => vec![e],
+            Err(e) => vec![(e, false)],
         };
-        self.emit_client_lines(world_idx, &block, is_daemon_mode);
+
+        let mut run: Vec<String> = Vec::new();
+        let mut run_archived = matches.first().map(|(_, a)| *a).unwrap_or(false);
+        for (text, archived) in matches {
+            if archived != run_archived && !run.is_empty() {
+                self.emit_client_lines_marked(world_idx, &run, is_daemon_mode, run_archived);
+                run.clear();
+            }
+            run_archived = archived;
+            run.push(text);
+        }
+        if !run.is_empty() {
+            self.emit_client_lines_marked(world_idx, &run, is_daemon_mode, run_archived);
+        }
     }
 
     /// Handle GMCP Client.Media.* messages (MCMP protocol)
@@ -8912,6 +9154,7 @@ impl App {
     /// gagged runs and preserve arrival order; see the run loop there for why the two paths
     /// cannot simply be merged. `append_newline` is false only for a final run whose packet
     /// genuinely ended mid-line.
+    #[allow(clippy::too_many_arguments)]
     fn add_visible_run(
         &mut self,
         world_idx: usize,
@@ -9096,14 +9339,7 @@ impl App {
             // Archive gagged server lines to long-term scrollback (with gagged=true) -
             // unconditional on which buffer it lands in, since archiving is a timestamped
             // log, not a seq-ordered live buffer other code indexes into.
-            if let Some(ref tx) = self.worlds[world_idx].scrollback_tx {
-                let ts_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let world_name = self.worlds[world_idx].name.clone();
-                let _ = tx.try_send((world_name, ts_ms, line.to_string(), true));
-            }
+            output_line.archive_seq = self.worlds[world_idx].archive_line(line, true);
             if hold_gagged_in_pending {
                 self.worlds[world_idx].pending_lines.push(output_line);
                 // Not broadcast here - it goes out with the pending release batch via
@@ -9113,7 +9349,7 @@ impl App {
             self.worlds[world_idx].output_lines.push(output_line);
             // Broadcast gagged line to WebSocket clients
             let ws_data = line.to_string().replace('\r', "") + "\n";
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                 world_index: world_idx,
                 data: ws_data,
                 is_viewed: is_current,
@@ -9365,7 +9601,7 @@ impl App {
         // owns wrapping, more-mode/pending and splash handling and has no gagged concept -
         // so instead group the lines into consecutive runs of the same gagged-ness and
         // alternate between the two paths, which preserves arrival order exactly.
-        let mut runs: Vec<(bool, Vec<(&str, Option<String>)>)> = Vec::new();
+        let mut runs: Vec<OutputRun> = Vec::new();
         for (line, gagged, highlight) in &processed_lines {
             match runs.last_mut() {
                 Some((run_gagged, items)) if *run_gagged == *gagged => {
@@ -9537,7 +9773,7 @@ impl App {
         // world's pending output after a disconnect/reconnect. Deferred messages ride along
         // with the rest of the backlog on release instead, same as every other pending line.
         if disconnect_msg_displayed {
-            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                 world_index: world_idx,
                 data: "Disconnected.\n".to_string(),
                 is_viewed: true,
@@ -9562,7 +9798,7 @@ impl App {
             // Same reasoning as the "Disconnected." broadcast above: only send this now if it
             // was actually displayed, not deferred into pending_lines behind older content.
             if reconnect_msg_displayed {
-                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                     world_index: world_idx,
                     data: format!("Reconnecting in {} seconds...\n", secs),
                     is_viewed: true,
@@ -10228,7 +10464,7 @@ impl App {
                     return;
                 }
                 let data = run.iter().map(|h| h.text.clone()).collect::<Vec<_>>().join("\n") + "\n";
-                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                     world_index: world_idx,
                     data,
                     is_viewed: true,
@@ -10499,7 +10735,7 @@ impl App {
                             self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts, strip_ansi);
                         }
                         _ => {
-                            self.ws_broadcast(WsMessage::ServerData {
+                            self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: format!("Unknown command: {}", name),
                                 is_viewed: false,
@@ -10528,7 +10764,7 @@ impl App {
                 // WS clients must collect the password/auth-key client-side and send a
                 // dedicated ImportSettings message instead (see plan) - a bounced /import
                 // typed on the command line can't carry secrets, so it's rejected here.
-                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                     world_index,
                     data: "Use the /import dialog (not the command line) so your password/auth-key aren't sent unprotected.".to_string(),
                     is_viewed: false,
@@ -10587,7 +10823,7 @@ impl App {
                                 world.last_send_time = Some(std::time::Instant::now());
                             }
                         } else {
-                            self.ws_broadcast(WsMessage::ServerData {
+                            self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: format!("World '{}' is not connected.", target),
                                 is_viewed: false,
@@ -10599,7 +10835,7 @@ impl App {
                         }
                     } else {
                         // Wording matches the console copy (commands.rs) exactly.
-                        self.ws_broadcast(WsMessage::ServerData {
+                        self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: format!("World '{}' not found.", target),
                             is_viewed: false,
@@ -10636,7 +10872,7 @@ impl App {
                         .unwrap_or(false);
 
                 if !is_local_gui_master {
-                    self.ws_send_to_client(client_id, WsMessage::ServerData {
+                    self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "/connect is only available from the local console or GUI.".to_string(),
                         is_viewed: false,
@@ -10673,7 +10909,7 @@ impl App {
                         crate::platform::kill_proxy_process(proxy_pid);
                     }
                     self.worlds[world_index].clear_connection_state(true, true);
-                    self.ws_broadcast(WsMessage::ServerData {
+                    self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "Disconnected.".to_string(),
                         is_viewed: false,
@@ -10684,7 +10920,7 @@ impl App {
                     });
                     self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                 } else {
-                    self.ws_broadcast(WsMessage::ServerData {
+                    self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "Not connected.".to_string(),
                         is_viewed: false,
@@ -10748,7 +10984,7 @@ impl App {
                 // Send current ban list
                 let bans = self.ban_list.get_ban_info();
                 if bans.is_empty() {
-                    self.ws_broadcast(WsMessage::ServerData {
+                    self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "No hosts are currently banned.".to_string(),
                         is_viewed: false,
@@ -10770,7 +11006,7 @@ impl App {
                     }
                     output.push_str(&"\u{2500}".repeat(70));
                     output.push_str("\nUse /unban <host> to remove a ban.");
-                    self.ws_broadcast(WsMessage::ServerData {
+                    self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: output,
                         is_viewed: false,
@@ -10786,7 +11022,7 @@ impl App {
                 if self.ban_list.remove_ban(&host) {
                     // Save settings to persist the change
                     let _ = persistence::save_settings(self);
-                    self.ws_broadcast(WsMessage::ServerData {
+                    self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: format!("Removed ban for: {}", host),
                         is_viewed: false,
@@ -10799,7 +11035,7 @@ impl App {
                     self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
                     self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
                 } else {
-                    self.ws_broadcast(WsMessage::ServerData {
+                    self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: format!("No ban found for: {}", host),
                         is_viewed: false,
@@ -10818,7 +11054,7 @@ impl App {
                     world_index,
                     notes: test_notes,
                 });
-                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                     world_index,
                     data: "Playing test music (Super Mario Bros)...".to_string(),
                     is_viewed: false,
@@ -10893,7 +11129,7 @@ impl App {
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
             }
             Command::Version => {
-                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                     world_index,
                     data: get_version_string(),
                     is_viewed: false,
@@ -10964,7 +11200,7 @@ impl App {
                         self.current_world_index = world_index;
                         return WsAsyncAction::Connect { world_index, prev_index, broadcast: false };
                     } else {
-                        self.ws_broadcast(WsMessage::ServerData {
+                        self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: "No connection settings configured for this world.".to_string(),
                             is_viewed: false,
@@ -11057,7 +11293,7 @@ impl App {
                 if let Some(lines) = get_topic_help(topic) {
                     let help_text = lines.join("\n");
                     for line in help_text.lines() {
-                        self.ws_send_to_client(client_id, WsMessage::ServerData {
+                        self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                             world_index, data: line.to_string(), is_viewed: false,
                             ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
                             flush: false, gagged: false, highlight_colors: Vec::new(),
@@ -11087,7 +11323,7 @@ impl App {
         // Trailing newline required - without it the client's line-parser would
         // treat this as an incomplete/partial line rather than a complete block.
         let data = if help_text.ends_with('\n') { help_text } else { format!("{}\n", help_text) };
-        self.ws_send_to_client(client_id, WsMessage::ServerData {
+        self.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
             world_index, data, is_viewed: false,
             ts: current_timestamp_secs(), from_server: false, seq: 0, end_seq: None,
             flush: false, gagged: false, highlight_colors: Vec::new(),
@@ -11122,8 +11358,10 @@ impl App {
             if world_index < self.worlds.len() {
                 match self.recall_matches(&opts, world_index) {
                     Ok(matches) => {
+                        // /quote feeds the recalled text to the MUD; provenance is a
+                        // display concern only, so it's dropped here.
                         lines = matches.iter()
-                            .map(|line| {
+                            .map(|(line, _archived)| {
                                 let raw = format!("{}{}", recall_prefix, line);
                                 if strip_ansi { strip_ansi_codes(&raw) } else { raw }
                             })
@@ -11325,7 +11563,7 @@ impl App {
                 if world_index < self.worlds.len() && !self.worlds[world_index].connected {
                     // Check if world has connection settings
                     if !self.worlds[world_index].settings.has_connection_settings() {
-                        self.ws_broadcast(WsMessage::ServerData {
+                        self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: "No connection settings configured for this world.".to_string(),
                             is_viewed: false,
@@ -12524,6 +12762,11 @@ impl App {
             let mut line = OutputLine::new_with_timestamp(al.text, ts, seq_start + i as u64);
             line.from_server = true;
             line.from_archive = true;
+            // Carry the REAL archive sequence (the protocol `seq` above stays
+            // fabricated, and `from_archive` still keeps these off the wire). This
+            // is what stops a Page Up followed by /recall -D from listing the same
+            // text twice: these lines now participate in the boundary.
+            line.archive_seq = al.wseq;
             prepend.push(line);
         }
         prepend
@@ -12536,8 +12779,11 @@ impl App {
             return 0;
         }
 
-        // Need oldest timestamp from this world's buffer
-        let (world_name, oldest_ts_ms) = {
+        // Prefer the durable sequence over the timestamp: it cuts on an exact key,
+        // so Page Up cannot re-show a line the buffer already holds (nor skip one
+        // whose timestamp ties). Falls back to the timestamp when the buffer's
+        // oldest line predates archiving or the archive has not been migrated.
+        let (world_name, oldest_ts_ms, oldest_wseq) = {
             let world = &self.worlds[world_idx];
             let ts = world.output_lines.first().map(|l| {
                 l.timestamp
@@ -12545,7 +12791,8 @@ impl App {
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0)
             }).unwrap_or(0);
-            (world.name.clone(), ts)
+            let wseq = world.output_lines.iter().filter_map(|l| l.archive_seq).min();
+            (world.name.clone(), ts, wseq)
         };
 
         let db_path = clay_config_path("scrollback.db");
@@ -12554,7 +12801,19 @@ impl App {
             return 0;
         }
 
-        let archive_lines = scrollback::load_before_path(&db_path, &world_name, oldest_ts_ms, 500);
+        let archive_lines = match oldest_wseq {
+            Some(w) => {
+                let by_seq = scrollback::load_before_wseq(&db_path, &world_name, w, 500);
+                if by_seq.is_empty() {
+                    // Pre-migration archive, or nothing older: the timestamp path
+                    // still answers.
+                    scrollback::load_before_path(&db_path, &world_name, oldest_ts_ms, 500)
+                } else {
+                    by_seq
+                }
+            }
+            None => scrollback::load_before_path(&db_path, &world_name, oldest_ts_ms, 500),
+        };
         if archive_lines.is_empty() {
             return 0;
         }
@@ -15210,15 +15469,25 @@ async fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         let pattern = grep_pattern.as_deref().unwrap_or("*");
-        let results = scrollback::ScrollbackDb::search(
-            &db_path,
-            grep_world_filter.as_deref(),
+        // Through `query` rather than the legacy `search`: on a v2 archive this
+        // uses the FTS index where the pattern allows and the (wid, wseq) index
+        // otherwise, instead of scanning every row. `query` falls back to the
+        // legacy path by itself if the file has not been migrated yet.
+        let results = scrollback::query(&db_path, &scrollback::ArchiveQuery {
+            world: grep_world_filter.as_deref(),
             pattern,
-            None,
-            None,
-            100_000,
-            grep_use_regex,
-        );
+            kind: if grep_use_regex {
+                scrollback::PatternKind::Regex
+            } else {
+                scrollback::PatternKind::Glob
+            },
+            before_wseq: None,
+            since_ms: None,
+            until_ms: None,
+            limit: 100_000,
+            // Oldest-first, matching what --grep-archive has always printed.
+            newest_first: false,
+        });
         if results.is_empty() {
             eprintln!("No matches found.");
         }
@@ -16389,7 +16658,7 @@ pub async fn run_app_headless(
                     AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                         match result {
                             Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
-                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
+                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: e,
                                 is_viewed: false,
@@ -16408,7 +16677,7 @@ pub async fn run_app_headless(
                             }
                         } else {
                             for line in &lines {
-                                app.ws_send_to_client(requesting_client_id, WsMessage::ServerData {
+                                app.ws_send_to_client(requesting_client_id, WsMessage::ServerData { archive_sourced: false,
                                     world_index,
                                     data: line.clone(),
                                     is_viewed: false,
@@ -18541,7 +18810,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Broadcast gagged line to WebSocket clients
                                     let is_current = world_idx == app.current_world_index;
                                     let ws_data = message.replace('\r', "") + "\n";
-                                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                                    app.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                                         world_index: world_idx,
                                         data: ws_data,
                                         is_viewed: is_current,
@@ -18783,7 +19052,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                         match result {
                             Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
-                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
+                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: e,
                                 is_viewed: false,
@@ -18802,7 +19071,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         } else {
                             for line in &lines {
-                                app.ws_send_to_client(requesting_client_id, WsMessage::ServerData {
+                                app.ws_send_to_client(requesting_client_id, WsMessage::ServerData { archive_sourced: false,
                                     world_index,
                                     data: line.clone(),
                                     is_viewed: false,
@@ -19467,7 +19736,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Broadcast gagged line to WebSocket clients
                             let is_current = world_idx == app.current_world_index;
                             let ws_data = message.replace('\r', "") + "\n";
-                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData { archive_sourced: false,
                                 world_index: world_idx,
                                 data: ws_data,
                                 is_viewed: is_current,
@@ -19636,7 +19905,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                     match result {
                         Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
-                        Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
+                        Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: e,
                             is_viewed: false,
@@ -19650,7 +19919,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
                     app.remote_ping_responses = None;
                     for line in &lines {
-                        app.ws_send_to_client(requesting_client_id, WsMessage::ServerData {
+                        app.ws_send_to_client(requesting_client_id, WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: line.clone(),
                             is_viewed: false,

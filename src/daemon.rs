@@ -390,7 +390,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                         match result {
                             Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text, cursor_start }),
-                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
+                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: e,
                                 is_viewed: false,
@@ -404,7 +404,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
                         app.remote_ping_responses = None;
                         for line in &lines {
-                            app.ws_send_to_client(requesting_client_id, WsMessage::ServerData {
+                            app.ws_send_to_client(requesting_client_id, WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: line.clone(),
                                 is_viewed: false,
@@ -641,7 +641,7 @@ pub async fn handle_daemon_ws_message(
                     // Execute action if it exists (respects the action's world field).
                     if let Some(action) = find_invocable_action(&app.settings.actions, &name, &world_name) {
                         if !action.enabled {
-                            app.ws_broadcast(WsMessage::ServerData {
+                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: format!("Action '{}' is disabled.", action.name),
                                 is_viewed: false,
@@ -726,7 +726,7 @@ pub async fn handle_daemon_ws_message(
                                 app.register_repeat_process(process);
                             }
                             _ => {
-                                app.ws_broadcast(WsMessage::ServerData {
+                                app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                     world_index,
                                     data: format!("Unknown command: {}", name),
                                     is_viewed: false,
@@ -842,7 +842,7 @@ pub async fn handle_daemon_ws_message(
                                     world.last_send_time = Some(std::time::Instant::now());
                                 }
                             } else {
-                                app.ws_broadcast(WsMessage::ServerData {
+                                app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                     world_index,
                                     data: format!("World '{}' is not connected.", target),
                                     is_viewed: false,
@@ -854,7 +854,7 @@ pub async fn handle_daemon_ws_message(
                             }
                         } else {
                             // Wording matches the console copy (commands.rs) exactly.
-                            app.ws_broadcast(WsMessage::ServerData {
+                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: format!("World '{}' not found.", target),
                                 is_viewed: false,
@@ -894,7 +894,7 @@ pub async fn handle_daemon_ws_message(
                         // fields), leaking stale state into the next connection attempt on
                         // this world in daemon mode.
                         app.worlds[world_index].clear_connection_state(true, true);
-                        app.ws_broadcast(WsMessage::ServerData {
+                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: "Disconnected.".to_string(),
                             is_viewed: false,
@@ -905,7 +905,7 @@ pub async fn handle_daemon_ws_message(
                         });
                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                     } else {
-                        app.ws_broadcast(WsMessage::ServerData {
+                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: "Not connected.".to_string(),
                             is_viewed: false,
@@ -967,7 +967,7 @@ pub async fn handle_daemon_ws_message(
                 Command::BanList => {
                     let bans = app.ban_list.get_ban_info();
                     if bans.is_empty() {
-                        app.ws_broadcast(WsMessage::ServerData {
+                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: "No hosts are currently banned.".to_string(),
                             is_viewed: false,
@@ -989,7 +989,7 @@ pub async fn handle_daemon_ws_message(
                         }
                         output.push_str(&"\u{2500}".repeat(70));
                         output.push_str("\nUse /unban <host> to remove a ban.");
-                        app.ws_broadcast(WsMessage::ServerData {
+                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: output,
                             is_viewed: false,
@@ -1004,7 +1004,7 @@ pub async fn handle_daemon_ws_message(
                 Command::Unban { host } => {
                     if app.ban_list.remove_ban(&host) {
                         let _ = persistence::save_settings(app);
-                        app.ws_broadcast(WsMessage::ServerData {
+                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: format!("Removed ban for: {}", host),
                             is_viewed: false,
@@ -1016,7 +1016,7 @@ pub async fn handle_daemon_ws_message(
                         app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
                         app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
                     } else {
-                        app.ws_broadcast(WsMessage::ServerData {
+                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                             world_index,
                             data: format!("No ban found for: {}", host),
                             is_viewed: false,
@@ -1035,7 +1035,7 @@ pub async fn handle_daemon_ws_message(
                         world_index,
                         notes: test_notes,
                     });
-                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "Playing test music (Super Mario Bros)...".to_string(),
                         is_viewed: false,
@@ -1078,7 +1078,7 @@ pub async fn handle_daemon_ws_message(
                         .sum();
                     match app.write_debug_dump("daemon") {
                         Ok(dump_path) => {
-                            app.ws_broadcast(WsMessage::ServerData {
+                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path.display()),
                                 is_viewed: false,
@@ -1089,7 +1089,7 @@ pub async fn handle_daemon_ws_message(
                             });
                         }
                         Err(e) => {
-                            app.ws_broadcast(WsMessage::ServerData {
+                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: format!("Failed to create dump file: {}", e),
                                 is_viewed: false,
@@ -1109,7 +1109,7 @@ pub async fn handle_daemon_ws_message(
                 Command::RemoteAttach { .. } => {
                     // A headless daemon (-D) has no local console/GUI to relaunch into —
                     // /connect only makes sense for an interactive master or client.
-                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "/connect is not available in daemon mode.".to_string(),
                         is_viewed: false,
@@ -1123,7 +1123,7 @@ pub async fn handle_daemon_ws_message(
                     // Same reasoning as the WS-bounced-command rejection in main.rs: the
                     // command line can't carry a password/auth-key, so a dedicated
                     // ImportSettings message is required (later plan step).
-                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "Use the /import dialog (not the command line) so your password/auth-key aren't sent unprotected.".to_string(),
                         is_viewed: false,
@@ -1147,7 +1147,7 @@ pub async fn handle_daemon_ws_message(
                     app.ws_send_to_client(client_id, WsMessage::OpenWindow { world });
                 }
                 Command::Version => {
-                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: get_version_string(),
                         is_viewed: false,
@@ -1178,7 +1178,12 @@ pub async fn handle_daemon_ws_message(
                             app.emit_client_text(world_index, "Error: World name cannot start with '('", true);
                             return;
                         }
-                        let new_world = World::new(&name);
+                        let mut new_world = World::new(&name);
+                        // Every other world-creation path wires this (see
+                        // App::find_or_create_world); without it a world added
+                        // through the daemon never archives a single line.
+                        new_world.scrollback_tx =
+                            app.scrollback.as_ref().map(|db| db.sender());
                         app.worlds.push(new_world);
                         app.worlds.len() - 1
                     };
@@ -1242,7 +1247,7 @@ pub async fn handle_daemon_ws_message(
                             let world_name = app.worlds[world_index].name.clone();
 
                             let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                            app.ws_broadcast(WsMessage::ServerData {
+                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: format!("Connecting to {}:{}{}...\n", settings.hostname, settings.port, ssl_msg),
                                 is_viewed: false,
@@ -1280,7 +1285,7 @@ pub async fn handle_daemon_ws_message(
                                 app.ws_broadcast(WsMessage::WorldConnected { world_index, name: world_name });
                             } else {
                                 app.worlds[world_index].skip_auto_login = false;
-                                app.ws_broadcast(WsMessage::ServerData {
+                                app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                     world_index,
                                     data: "Connection failed.\n".to_string(),
                                     is_viewed: false,
@@ -1291,7 +1296,7 @@ pub async fn handle_daemon_ws_message(
                                 });
                             }
                         } else {
-                            app.ws_broadcast(WsMessage::ServerData {
+                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                                 world_index,
                                 data: "No connection settings configured for this world.".to_string(),
                                 is_viewed: false,
@@ -1392,7 +1397,7 @@ pub async fn handle_daemon_ws_message(
 
                 // Check if world has connection settings
                 if !settings.has_connection_settings() {
-                    app.ws_broadcast(WsMessage::ServerData {
+                    app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "Configure host/port in world settings.\n".to_string(),
                         is_viewed: false,
@@ -1405,7 +1410,7 @@ pub async fn handle_daemon_ws_message(
                 }
 
                 let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                app.ws_broadcast(WsMessage::ServerData {
+                app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                     world_index,
                     data: format!("Connecting to {}:{}{}...\n", settings.hostname, settings.port, ssl_msg),
                     is_viewed: false,
@@ -1445,7 +1450,7 @@ pub async fn handle_daemon_ws_message(
                 } else {
                     // Connection failed
                     app.worlds[world_index].skip_auto_login = false;
-                    app.ws_broadcast(WsMessage::ServerData {
+                    app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                         world_index,
                         data: "Connection failed.\n".to_string(),
                         is_viewed: false,
@@ -1473,7 +1478,7 @@ pub async fn handle_daemon_ws_message(
         WsMessage::TrustCertificate { world_index, host, new_fingerprint } => {
             if world_index < app.worlds.len() {
                 persistence::replace_pin(&host, &new_fingerprint);
-                app.ws_broadcast(WsMessage::ServerData {
+                app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
                     world_index,
                     data: format!("Trusting new certificate for {}, reconnecting...\n", host),
                     is_viewed: false,
@@ -2187,7 +2192,7 @@ keep_alive_type=Generic
                             // Check if world has connection settings
                             if !settings.has_connection_settings() {
                                 if let Some(ws) = &app.ws_server {
-                                    ws.broadcast_to_owner(WsMessage::ServerData {
+                                    ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
                                         world_index,
                                         data: "No connection settings configured for this world.\n".to_string(),
                                         is_viewed: true,
@@ -2222,7 +2227,7 @@ keep_alive_type=Generic
                             } else {
                                 // Connection failed - send error to user
                                 if let Some(ws) = &app.ws_server {
-                                    ws.broadcast_to_owner(WsMessage::ServerData {
+                                    ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
                                         world_index,
                                         data: "Connection failed.\n".to_string(),
                                         is_viewed: true,
@@ -2258,7 +2263,7 @@ keep_alive_type=Generic
                             // too, or the client-line "✨ " marker would wrongly apply to
                             // every line of MUD text once clients key off this flag.
                             if let Some(ws) = &app.ws_server {
-                                ws.broadcast_to_owner(WsMessage::ServerData {
+                                ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
                                     world_index,
                                     data: decoded,
                                     is_viewed: true,
@@ -3312,7 +3317,7 @@ fn broadcast_owner_scoped_released_lines(ws: &WebSocketServer, world_index: usiz
     for line in released {
         if (line.from_server != batch_from_server || line.gagged != batch_gagged) && !batch.is_empty() {
             let ws_data = batch.join("\n") + "\n";
-            ws.broadcast_to_owner(WsMessage::ServerData {
+            ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
                 world_index,
                 data: ws_data,
                 is_viewed: true,
@@ -3329,7 +3334,7 @@ fn broadcast_owner_scoped_released_lines(ws: &WebSocketServer, world_index: usiz
     }
     if !batch.is_empty() {
         let ws_data = batch.join("\n") + "\n";
-        ws.broadcast_to_owner(WsMessage::ServerData {
+        ws.broadcast_to_owner(WsMessage::ServerData { archive_sourced: false,
             world_index,
             data: ws_data,
             is_viewed: true,

@@ -1695,8 +1695,15 @@ Options:
   #           Show line numbers
 
 Your typed input is captured invisibly - it never appears in normal output.
-Press F2 (show tags) to see it inline, or use /recall -i/-l/-g. Not archived,
-so -D can't be combined with -i.
+Press F2 (show tags) to see it inline, or use /recall -i/-l/-g. Typed input is
+never written to the archive (the "Log Input" setting writes it to the per-world
+log FILE only), so -D reaches it through the in-memory half below.
+
+-D searches the offline archive AND the in-memory buffer together, oldest
+first, cut so the overlap between them isn't listed twice. Rows that came out
+of the archive are marked with the same symbol Page Up scrollback uses; rows
+still in memory keep the client-output symbol, as does Clay's own text
+(e.g. "No matches").
 
 Range: N (last N), -N (Nth previous), N-M, N-
 

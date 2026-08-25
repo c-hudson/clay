@@ -165,7 +165,7 @@ fn load_known_hosts_from(path: &std::path::Path) -> std::collections::HashMap<St
                 continue;
             }
             if let Some((host, fp)) = line.split_once('=') {
-                map.insert(host.trim().to_string(), fp.trim().to_lowercase());
+                map.insert(normalize_pin_host(host), fp.trim().to_lowercase());
             }
         }
     }
@@ -205,19 +205,33 @@ fn save_known_hosts_to(path: &std::path::Path, map: &std::collections::HashMap<S
     }
 }
 
+/// Normalize a `host:port` pin key. Hostnames are case-insensitive, so `MyHost:9000`
+/// and `myhost:9000` must resolve to the same pin — otherwise the same server gets
+/// two independent pins depending on how the user typed the address, and a rotated
+/// certificate is only caught for whichever spelling was used first. The Android
+/// client already lowercases here (`CertPinning.hostPortFromSocket`), so normalizing
+/// in one place keeps the two implementations of this protocol in agreement.
+///
+/// Applied in `load_known_hosts_from` as well, which migrates any mixed-case entry
+/// already on disk instead of stranding it.
+fn normalize_pin_host(host_port: &str) -> String {
+    host_port.trim().to_lowercase()
+}
+
 /// Look up the pinned fingerprint for a `host:port`, if one has been recorded.
 pub fn get_pin(host_port: &str) -> Option<String> {
-    known_hosts().lock().ok()?.get(host_port).cloned()
+    known_hosts().lock().ok()?.get(&normalize_pin_host(host_port)).cloned()
 }
 
 /// Pin a fingerprint for `host_port` only if no pin exists yet (first-connect,
 /// silent). Returns `true` if a new pin was written.
 pub fn add_pin(host_port: &str, fingerprint: &str) -> bool {
     let Ok(mut map) = known_hosts().lock() else { return false };
-    if map.contains_key(host_port) {
+    let key = normalize_pin_host(host_port);
+    if map.contains_key(&key) {
         return false;
     }
-    map.insert(host_port.to_string(), fingerprint.to_lowercase());
+    map.insert(key, fingerprint.to_lowercase());
     save_known_hosts_to(&known_hosts_path(), &map);
     true
 }
@@ -226,7 +240,7 @@ pub fn add_pin(host_port: &str, fingerprint: &str) -> bool {
 /// certificate after a mismatch warning).
 pub fn replace_pin(host_port: &str, fingerprint: &str) {
     let Ok(mut map) = known_hosts().lock() else { return };
-    map.insert(host_port.to_string(), fingerprint.to_lowercase());
+    map.insert(normalize_pin_host(host_port), fingerprint.to_lowercase());
     save_known_hosts_to(&known_hosts_path(), &map);
 }
 
@@ -234,7 +248,7 @@ pub fn replace_pin(host_port: &str, fingerprint: &str) {
 #[cfg(test)]
 pub fn remove_pin(host_port: &str) {
     let Ok(mut map) = known_hosts().lock() else { return };
-    map.remove(host_port);
+    map.remove(&normalize_pin_host(host_port));
     save_known_hosts_to(&known_hosts_path(), &map);
 }
 
@@ -473,6 +487,11 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         }
         writeln!(file)?;
         writeln!(file, "[world:{}]", world.name)?;
+        // Stable archive identity; see World::world_id. Written only once assigned,
+        // so an untouched settings.dat is not churned by a read-only run.
+        if !world.world_id.is_empty() {
+            writeln!(file, "world_id={}", world.world_id)?;
+        }
         writeln!(file, "world_type={}", world.settings.world_type.name())?;
         // MUD settings
         writeln!(file, "hostname={}", world.settings.hostname)?;
@@ -1141,6 +1160,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                 // Find the world and update its settings
                 if let Some(world) = app.worlds.iter_mut().find(|w| &w.name == world_name) {
                     match key {
+                        "world_id" => world.world_id = value.to_string(),
                         "world_type" => world.settings.world_type = WorldType::from_name(value),
                         "hostname" => world.settings.hostname = value.to_string(),
                         "port" => world.settings.port = value.to_string(),
@@ -1510,6 +1530,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
             else if let Some(ref world_name) = current_world {
                 if let Some(world) = app.worlds.iter_mut().find(|w| &w.name == world_name) {
                     match key {
+                        "world_id" => world.world_id = value.to_string(),
                         "world_type" => world.settings.world_type = WorldType::from_name(value),
                         "hostname" => world.settings.hostname = value.to_string(),
                         "port" => world.settings.port = value.to_string(),
@@ -1653,6 +1674,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
                 .replace('=', "\\e")
                 .replace(':', "\\:");
             writeln!(file, "[world:{}:{}]", escaped_name, escaped_owner)?;
+            if !world.world_id.is_empty() {
+                writeln!(file, "world_id={}", world.world_id)?;
+            }
             writeln!(file, "world_type={}", world.settings.world_type.name())?;
             writeln!(file, "hostname={}", world.settings.hostname)?;
             writeln!(file, "port={}", world.settings.port)?;
@@ -1895,6 +1919,11 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         }
         writeln!(file, "uses_wont_echo_prompt={}", world.uses_wont_echo_prompt)?;
         writeln!(file, "next_seq={}", world.next_seq)?;
+        // The stable archive identity must survive a reload, or the rebuilt World
+        // mints a fresh one and stops matching its own archived history.
+        if !world.world_id.is_empty() {
+            writeln!(file, "world_id={}", world.world_id)?;
+        }
         // Travels with next_seq and output_lines: those three describe one sequence
         // space. Omitting it would make a reload mint a fresh epoch for a buffer that
         // never changed, invalidating every connected client's cache for no reason.
@@ -2150,6 +2179,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
     // Temporary storage for world data
     struct TempWorld {
         name: String,
+        world_id: String,
         output_lines: Vec<OutputLine>,
         scroll_offset: usize,
         connected: bool,
@@ -2208,7 +2238,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     let from_server = flags.contains('s');
                     let gagged = flags.contains('g');
                     let is_input = flags.contains('i');
-                    return OutputLine {
+                    return OutputLine { archive_seq: None,
                         text,
                         timestamp,
                         from_server,
@@ -2217,6 +2247,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         seq,
                         highlight_color: None,
                         from_archive: false,
+                        archive_sourced: false,
                         viewed: flags.contains('v'),
                         display_id: None,
                     };
@@ -2230,7 +2261,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     let from_server = flags.contains('s');
                     let gagged = flags.contains('g');
                     let is_input = flags.contains('i');
-                    return OutputLine {
+                    return OutputLine { archive_seq: None,
                         text,
                         timestamp,
                         from_server,
@@ -2239,6 +2270,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         seq: 0,
                         highlight_color: None,
                         from_archive: false,
+                        archive_sourced: false,
                         viewed: flags.contains('v'),
                         display_id: None,
                     };
@@ -2248,7 +2280,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     // this format predates seq numbering entirely, and treating ancient
                     // history as already-seen is right - the alternative would make every
                     // such line claimable and paint a full screen of ▶ on first display.
-                    return OutputLine {
+                    return OutputLine { archive_seq: None,
                         text: unescape_string(parts[1]),
                         timestamp,
                         from_server: true,
@@ -2257,6 +2289,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         seq: 0,
                         highlight_color: None,
                         from_archive: false,
+                        archive_sourced: false,
                         viewed: true,
                         display_id: None,
                     };
@@ -2285,6 +2318,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                 while temp_worlds.len() <= idx {
                     temp_worlds.push(TempWorld {
                         name: String::new(),
+                        world_id: String::new(),
                         output_lines: Vec::new(),
                         scroll_offset: 0,
                         connected: false,
@@ -2695,6 +2729,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
                             "proxy_socket_fd" => tw.proxy_socket_fd = value.parse().ok(),
                             "next_seq" => tw.next_seq = value.parse().unwrap_or(0),
+                            "world_id" => tw.world_id = value.to_string(),
                             "seq_epoch" => tw.seq_epoch = value.parse().unwrap_or(0),
                             "partial_line" => tw.partial_line = unescape_string(value),
                             "partial_in_pending" => tw.partial_in_pending = value == "true",
@@ -2831,6 +2866,11 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
         world.next_seq = tw.next_seq;
+        // Empty means the state file predates this field (or archiving was off);
+        // leave whatever the rebuilt World already has rather than clearing it.
+        if !tw.world_id.is_empty() {
+            world.world_id = tw.world_id;
+        }
         // 0 means the state file predates this field; keep the epoch this World was
         // constructed with rather than adopting a value that means "no epoch".
         if tw.seq_epoch != 0 {
@@ -3267,6 +3307,86 @@ mod tests {
             reloaded.settings.url_shorteners, app.settings.url_shorteners,
             "url_shorteners must survive a hot reload"
         );
+    }
+
+    #[test]
+    fn test_world_id_is_stable_across_rename_and_survives_persistence() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Zmc"));
+        app.worlds[0].settings.hostname = "mud.example.com".to_string();
+        app.worlds[0].settings.port = "4000".to_string();
+
+        let id = app.worlds[0].ensure_world_id().to_string();
+        assert_eq!(id.len(), 32, "32 lowercase hex, no dashes");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(
+            app.worlds[0].ensure_world_id(), id,
+            "ensure_world_id must be idempotent, not mint a new id per call"
+        );
+
+        // A rename assigns `name` in place; the identity must not move with it.
+        app.worlds[0].name = "Renamed".to_string();
+        assert_eq!(app.worlds[0].world_id, id, "a rename must not change world identity");
+
+        // settings.dat round trip.
+        let tmp = std::env::temp_dir().join(format!("clay_test_world_id_{}.dat", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        save_settings_to_path(&app, &tmp).expect("save");
+        let content = std::fs::read_to_string(&tmp).expect("read");
+        assert!(content.contains(&format!("world_id={id}")), "got:\n{content}");
+
+        let mut reloaded = App::new();
+        reloaded.worlds.clear();
+        load_settings_from_str(&mut reloaded, &content);
+        let w = reloaded.worlds.iter().find(|w| w.name == "Renamed").expect("world reloaded");
+        assert_eq!(w.world_id, id, "world_id must survive settings.dat");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_world_id_survives_reload_state_roundtrip() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Zmc"));
+        let id = app.worlds[0].ensure_world_id().to_string();
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).expect("reload state is valid UTF-8");
+        assert!(content.contains(&format!("world_id={id}")));
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load failed");
+        let w = reloaded.worlds.iter().find(|w| w.name == "Zmc").expect("world restored");
+        assert_eq!(w.world_id, id, "a hot reload must not mint a fresh identity");
+    }
+
+    #[test]
+    fn test_world_without_an_id_is_left_alone_by_persistence() {
+        // A world that has never archived should not gain an id just by being saved,
+        // and an older settings.dat with no world_id must load cleanly.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Zmc"));
+        app.worlds[0].settings.hostname = "mud.example.com".to_string();
+        app.worlds[0].settings.port = "4000".to_string();
+        assert!(app.worlds[0].world_id.is_empty());
+
+        let tmp = std::env::temp_dir()
+            .join(format!("clay_test_world_noid_{}.dat", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        save_settings_to_path(&app, &tmp).expect("save");
+        let content = std::fs::read_to_string(&tmp).expect("read");
+        assert!(!content.contains("world_id="), "no id written when none assigned");
+
+        let mut reloaded = App::new();
+        reloaded.worlds.clear();
+        load_settings_from_str(&mut reloaded, &content);
+        assert!(reloaded.worlds.iter().any(|w| w.name == "Zmc"));
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -3782,5 +3902,53 @@ pattern=foo
 
         remove_pin(host);
         assert_eq!(get_pin(host), None);
+    }
+
+    #[test]
+    fn test_pin_host_key_is_case_insensitive() {
+        // Hostnames are case-insensitive, so the same server typed two ways must
+        // resolve to one pin — otherwise a rotated certificate is only detected for
+        // whichever spelling was used first. The Android client (CertPinning.java)
+        // already lowercases its pin keys; this keeps the Rust side in agreement.
+        let mixed = "Clay-Test-Pin-Case.INVALID:9999";
+        let lower = "clay-test-pin-case.invalid:9999";
+        remove_pin(mixed);
+        assert_eq!(get_pin(lower), None, "stale pin left over from a prior run");
+
+        assert!(add_pin(mixed, "aaaa"));
+        assert_eq!(get_pin(lower), Some("aaaa".to_string()), "lookup must ignore case");
+        assert_eq!(get_pin(mixed), Some("aaaa".to_string()));
+
+        // Second spelling must be recognized as already pinned, not pinned afresh.
+        assert!(!add_pin(lower, "bbbb"));
+        assert_eq!(get_pin(mixed), Some("aaaa".to_string()));
+
+        // "Trust new certificate" through either spelling updates the one entry.
+        replace_pin(lower, "cccc");
+        assert_eq!(get_pin(mixed), Some("cccc".to_string()));
+
+        remove_pin(lower);
+        assert_eq!(get_pin(mixed), None);
+    }
+
+    #[test]
+    fn test_known_hosts_load_migrates_mixed_case_host_keys() {
+        // A pin written by an older build could carry a mixed-case host. Loading must
+        // fold it to the normalized key rather than stranding it under a spelling that
+        // get_pin will never look up again.
+        let tmp = std::env::temp_dir().join("clay_test_known_hosts_case.dat");
+        std::fs::write(&tmp, "# comment
+MyHost.Example:9000=AABBCC
+").expect("write");
+
+        let map = load_known_hosts_from(&tmp);
+        assert_eq!(
+            map.get("myhost.example:9000").map(String::as_str),
+            Some("aabbcc"),
+            "host key and fingerprint must both be normalized on load, got {map:?}"
+        );
+        assert!(!map.contains_key("MyHost.Example:9000"));
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

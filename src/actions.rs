@@ -441,6 +441,17 @@ pub fn wildcard_to_regex(pattern: &str) -> String {
 
 /// Execute recall command with options, returning the list of matching lines
 pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], show_tags: bool) -> Vec<String> {
+    execute_recall_with_source(opts, output_lines, show_tags)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// `execute_recall` plus, per match, whether the line it came from was archive-sourced
+/// (`OutputLine::archive_sourced`). `/recall -D` searches the archive and the live buffer
+/// together, so a single result block can contain both, and the caller needs to know which
+/// is which to pick the 🛢️ or ✨ prefix.
+pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[OutputLine], show_tags: bool) -> Vec<(String, bool)> {
     use tf::{RecallMatchStyle, RecallRange};
 
     // Build regex from pattern based on match style
@@ -510,7 +521,7 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], sho
     };
 
     // Collect matching lines
-    let mut matches: Vec<(usize, String)> = Vec::new();
+    let mut matches: Vec<(usize, String, bool)> = Vec::new();
     let lines_to_check = &output_lines[start_idx..end_idx];
 
     for (rel_idx, line) in lines_to_check.iter().enumerate() {
@@ -601,7 +612,11 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], sho
                 display_line = format!("{}: {}", abs_idx + 1, display_line);
             }
 
-            matches.push((abs_idx, display_line));
+            // shows_archive_prefix(), not archive_sourced alone: the live buffer can
+            // already hold archive text that Page Up prepended (from_archive), and it must
+            // report as archived here or the same line renders 🛢️ in the buffer and ✨ in
+            // the recall of it.
+            matches.push((abs_idx, display_line, line.shows_archive_prefix()));
         }
     }
 
@@ -613,7 +628,7 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine], sho
 
     // TODO: Handle context lines (-A, -B, -C) if needed
 
-    matches.into_iter().map(|(_, s)| s).collect()
+    matches.into_iter().map(|(_, s, archived)| (s, archived)).collect()
 }
 
 /// Check if a line matches any action triggers.
