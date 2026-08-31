@@ -1887,6 +1887,20 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         writeln!(file, "watchdog_override_{}={}|{}|{}|{}", i, escaped_world, status, cfg.n1, cfg.n2)?;
     }
 
+    // Save the half-typed input line so a reload doesn't throw away whatever the user
+    // was in the middle of composing. Escaped like history below: Alt-Enter puts real
+    // newlines in the buffer, and a bare '=' would be eaten by the key/value split.
+    // Written only when there is something to restore, so an idle reload doesn't grow
+    // the state file.
+    if !app.input.buffer.is_empty() {
+        let escaped = app.input.buffer
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('=', "\\e");
+        writeln!(file, "input_buffer={}", escaped)?;
+        writeln!(file, "input_cursor={}", app.input.cursor_position)?;
+    }
+
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
     for (i, hist) in app.input.history.iter().enumerate() {
@@ -2684,6 +2698,13 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "watchdog_n2" => {
                         if let Ok(n) = value.parse::<usize>() { app.tf_engine.watchdog_n2 = n; }
                     }
+                    "input_buffer" => {
+                        app.input.buffer = unescape_string(value);
+                    }
+                    "input_cursor" => {
+                        // Clamped below, once the buffer is definitely parsed.
+                        app.input.cursor_position = value.parse().unwrap_or(0);
+                    }
                     k if k.starts_with("history_") => {
                         app.input.history.push(unescape_string(value));
                     }
@@ -2970,6 +2991,20 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
     }
 
     *app.ws_auth_key_shared.write().unwrap() = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone());
+
+    // `cursor_position` is a BYTE index that several places slice `buffer` with
+    // (input.rs `&self.buffer[..self.cursor_position]`), so an out-of-range or
+    // mid-codepoint value from a truncated or hand-edited state file would panic on the
+    // first redraw. Clamp into range and snap back to a character boundary. Done after
+    // the parse loop so it cannot depend on which of the two keys was read first.
+    if app.input.cursor_position > app.input.buffer.len() {
+        app.input.cursor_position = app.input.buffer.len();
+    }
+    while app.input.cursor_position > 0 && !app.input.buffer.is_char_boundary(app.input.cursor_position) {
+        app.input.cursor_position -= 1;
+    }
+    // A restored multi-line buffer may leave the cursor below the visible area.
+    app.input.adjust_viewport();
 
     // File cleanup belongs to the caller, which owns the path; this half is pure parsing so
     // it can be tested without touching a real ~/.clay.
@@ -3387,6 +3422,81 @@ mod tests {
         assert!(reloaded.worlds.iter().any(|w| w.name == "Zmc"));
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_in_progress_input_survives_a_hot_reload() {
+        // A reload used to discard whatever was half-typed in the input area: the
+        // state file carried input HISTORY but never the live buffer.
+        let mut app = App::new();
+        app.input.buffer = "say hello there".to_string();
+        app.input.cursor_position = 4; // just after "say "
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save");
+        let content = String::from_utf8(buf).expect("utf8");
+        assert!(content.contains("input_buffer=say hello there"), "got:\n{content}");
+        assert!(content.contains("input_cursor=4"));
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load");
+        assert_eq!(reloaded.input.buffer, "say hello there");
+        assert_eq!(reloaded.input.cursor_position, 4, "the caret must land where it was");
+    }
+
+    #[test]
+    fn test_input_with_equals_newline_and_backslash_survives_a_hot_reload() {
+        // '=' would be eaten by the key/value split, '\n' would end the record, and a
+        // backslash would corrupt the unescape if not doubled. Alt-Enter really does put
+        // newlines in the buffer.
+        let mut app = App::new();
+        app.input.buffer = "@set me=foo\nsecond \\ line".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save");
+        let content = String::from_utf8(buf).expect("utf8");
+        assert!(!content.contains("@set me=foo\nsecond"), "the raw newline must not reach the file");
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load");
+        assert_eq!(reloaded.input.buffer, "@set me=foo\nsecond \\ line");
+        assert_eq!(reloaded.input.cursor_position, reloaded.input.buffer.len());
+    }
+
+    #[test]
+    fn test_an_empty_input_adds_nothing_to_the_reload_state() {
+        let app = App::new();
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save");
+        let content = String::from_utf8(buf).expect("utf8");
+        assert!(!content.contains("input_buffer="), "an idle reload must not grow the state file");
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load");
+        assert!(reloaded.input.buffer.is_empty());
+        assert_eq!(reloaded.input.cursor_position, 0);
+    }
+
+    #[test]
+    fn test_a_bad_restored_cursor_is_clamped_not_panicked_on() {
+        // cursor_position is a BYTE index used to slice the buffer, so a stale or
+        // hand-edited value must never reach the renderer as-is.
+        for (line, expect) in [
+            ("input_buffer=hi\ninput_cursor=9999\n", 2usize),   // past the end
+            ("input_buffer=café\ninput_cursor=4\n", 3),         // mid-codepoint (é is 2 bytes)
+            ("input_buffer=hi\ninput_cursor=notanumber\n", 0),  // garbage
+        ] {
+            let content = format!("[reload]\ncurrent_world_index=0\n{line}");
+            let mut app = App::new();
+            load_reload_state_from_str(&mut app, &content).expect("load");
+            assert_eq!(
+                app.input.cursor_position, expect,
+                "cursor must be clamped to a char boundary for {line:?}"
+            );
+            // Must not panic — this is the slice every redraw performs.
+            let _ = &app.input.buffer[..app.input.cursor_position];
+        }
     }
 
     #[test]

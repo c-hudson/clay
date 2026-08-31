@@ -1,6 +1,42 @@
 use ratatui::style::Color;
 use crate::util::strip_ansi_codes;
 
+/// A C1 control character (U+0080-U+009F) — never safe to write to a terminal.
+///
+/// A terminal in a UTF-8 locale decodes the two bytes `C2 9F` back into U+009F = APC,
+/// which opens an Application Program Command string and swallows everything that follows
+/// until a String Terminator arrives. What follows, in Clay's case, is the cursor
+/// positioning, scroll-region reset and separator-bar/input-area draw that
+/// `render_output_crossterm` queues after the line — so those get eaten and the bottom of
+/// the screen is left holding whatever was there before, including another world's output.
+/// U+009B (CSI) and U+0084 (IND, which scrolls) are destructive in their own ways, and
+/// tmux is stricter about all of them than a bare xterm.
+///
+/// It is invisible to Clay's own accounting as well: `unicode_width` reports `None` for a
+/// C1 char, which the renderer's `visible_width` treats as zero columns.
+///
+/// This is reachable from ordinary MUD text — a world set to an 8-bit encoding while the
+/// MUD actually sends UTF-8 turns every emoji into a run of C1 controls — so it is
+/// filtered at decode (below) and again at display time, for text replayed out of the
+/// archive that was stored before this guard existed.
+pub fn is_c1_control(c: char) -> bool {
+    ('\u{80}'..='\u{9f}').contains(&c)
+}
+
+/// Drop every C1 control from `s`, returning `s` untouched when there are none.
+///
+/// The prescan looks for 0xC2, the lead byte every C1 control has when UTF-8 encoded, so
+/// the overwhelmingly common all-ASCII line costs one linear scan and no allocation.
+pub fn strip_c1_controls(s: String) -> String {
+    if !s.bytes().any(|b| b == 0xC2) {
+        return s;
+    }
+    if !s.chars().any(is_c1_control) {
+        return s;
+    }
+    s.chars().filter(|&c| !is_c1_control(c)).collect()
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Encoding {
     #[default]
@@ -14,8 +50,52 @@ impl Encoding {
         let result = match self {
             Encoding::Utf8 => String::from_utf8_lossy(bytes).to_string(),
             Encoding::Latin1 => {
-                // ISO-8859-1: each byte maps directly to its Unicode codepoint
-                bytes.iter().map(|&b| b as char).collect()
+                // ISO-8859-1, except for 0x80-0x9F, which is decoded as Windows-1252.
+                //
+                // Strict ISO-8859-1 maps 0x80-0x9F to the C1 control characters, and a C1
+                // control that reaches the terminal wrecks the screen (see
+                // `is_c1_control`). No MUD has ever meant to send SS2 or APC as text, and
+                // `from_iana_name` already folds WINDOWS-1252/CP1252 into this variant, so
+                // the CP1252 glyphs are both what the sender meant and the only safe
+                // reading. This is what browsers do too: the WHATWG Encoding Standard
+                // decodes the label "iso-8859-1" with the windows-1252 table.
+                //
+                // The five bytes CP1252 leaves undefined (0x81, 0x8D, 0x8F, 0x90, 0x9D)
+                // stay C1 here and are dropped by the control filter at the end of this
+                // function.
+                bytes
+                    .iter()
+                    .map(|&b| match b {
+                        0x80 => '\u{20AC}', // €
+                        0x82 => '\u{201A}', // ‚
+                        0x83 => '\u{0192}', // ƒ
+                        0x84 => '\u{201E}', // „
+                        0x85 => '\u{2026}', // …
+                        0x86 => '\u{2020}', // †
+                        0x87 => '\u{2021}', // ‡
+                        0x88 => '\u{02C6}', // ˆ
+                        0x89 => '\u{2030}', // ‰
+                        0x8A => '\u{0160}', // Š
+                        0x8B => '\u{2039}', // ‹
+                        0x8C => '\u{0152}', // Œ
+                        0x8E => '\u{017D}', // Ž
+                        0x91 => '\u{2018}', // '
+                        0x92 => '\u{2019}', // '
+                        0x93 => '\u{201C}', // "
+                        0x94 => '\u{201D}', // "
+                        0x95 => '\u{2022}', // •
+                        0x96 => '\u{2013}', // –
+                        0x97 => '\u{2014}', // —
+                        0x98 => '\u{02DC}', // ˜
+                        0x99 => '\u{2122}', // ™
+                        0x9A => '\u{0161}', // š
+                        0x9B => '\u{203A}', // ›
+                        0x9C => '\u{0153}', // œ
+                        0x9E => '\u{017E}', // ž
+                        0x9F => '\u{0178}', // Ÿ
+                        _ => b as char,
+                    })
+                    .collect()
             }
             Encoding::Fansi => {
                 // FANSI: CP437 encoding used by many MUDs
@@ -172,10 +252,12 @@ impl Encoding {
         // Strip control characters that could cause rendering issues
         // Keep: \t (tab), \n (newline), \x1b (escape for ANSI sequences), \x07 (BEL for OSC termination)
         // Keep: \x0e (Ctrl-N, ANSI music terminator)
-        // Also strip DEL (0x7F) and other high control chars
+        // Also strip DEL (0x7F) and the C1 controls U+0080-U+009F (see `is_c1_control`);
+        // `c >= ' '` alone lets every one of those through, which is how a UTF-8 MUD read
+        // through an 8-bit encoding came to hand the terminal a raw APC.
         let filtered: String = result
             .chars()
-            .filter(|&c| (c >= ' ' && c != '\x7f') || c == '\t' || c == '\n' || c == '\x1b' || c == '\x07' || c == '\x0e')
+            .filter(|&c| (c >= ' ' && c != '\x7f' && !is_c1_control(c)) || c == '\t' || c == '\n' || c == '\x1b' || c == '\x07' || c == '\x0e')
             .collect();
 
         // Strip non-color ANSI sequences (cursor movement, erase, etc.)
@@ -184,7 +266,7 @@ impl Encoding {
 
         // Strip any remaining control characters (BEL, carriage returns, etc.)
         // Keep Ctrl-N for ANSI music terminator
-        result.chars().filter(|&c| (c >= ' ' && c != '\x7f') || c == '\t' || c == '\n' || c == '\x1b' || c == '\x0e').collect()
+        result.chars().filter(|&c| (c >= ' ' && c != '\x7f' && !is_c1_control(c)) || c == '\t' || c == '\n' || c == '\x1b' || c == '\x0e').collect()
     }
 
     pub fn name(&self) -> &'static str {
@@ -447,6 +529,15 @@ pub enum UrlShortener {
     /// No longer in `default_order()`, but still parsed from `url_shorteners=` so a user
     /// who wants it back only has to add `da.gd` to that list.
     DaGd,
+    /// Not in `default_order()` either. Added because is.gd and v.gd — which share an
+    /// operator and a backend, so they fail together — began returning
+    /// "Error, database insert failed" for every request, leaving tinyurl as the only
+    /// working default. ulvis.net answers in plain text and its links 301 straight to
+    /// the target rather than through an interstitial. It does refuse some domains
+    /// outright ("Error: Domain not allowed"); that body is surfaced as an error by
+    /// `lookup_tinyurl`'s must-start-with-http check, so the next service in the list
+    /// gets its turn.
+    Ulvis,
 }
 
 impl UrlShortener {
@@ -458,6 +549,7 @@ impl UrlShortener {
             UrlShortener::VGd => "v.gd",
             UrlShortener::TinyUrl => "tinyurl",
             UrlShortener::DaGd => "da.gd",
+            UrlShortener::Ulvis => "ulvis.net",
         }
     }
 
@@ -469,6 +561,7 @@ impl UrlShortener {
             "v.gd" | "vgd" => Some(UrlShortener::VGd),
             "tinyurl" | "tinyurl.com" => Some(UrlShortener::TinyUrl),
             "da.gd" | "dagd" => Some(UrlShortener::DaGd),
+            "ulvis.net" | "ulvis" => Some(UrlShortener::Ulvis),
             _ => None,
         }
     }
@@ -528,6 +621,14 @@ impl UrlShortener {
                     .append_pair("url", long_url)
                     .finish();
                 format!("https://da.gd/s?{}", encoded)
+            }
+            UrlShortener::Ulvis => {
+                // Plain-text response by default; `type=json` would need parsing that
+                // `lookup_tinyurl` does not do.
+                let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("url", long_url)
+                    .finish();
+                format!("https://ulvis.net/api.php?{}", encoded)
             }
         }
     }
@@ -1387,6 +1488,36 @@ mod tests {
         assert!(UrlShortener::VGd.build_request_url("http://x/y").starts_with("https://v.gd/create.php?"));
         assert!(UrlShortener::TinyUrl.build_request_url("http://x/y").starts_with("https://tinyurl.com/api-create.php?"));
         assert!(UrlShortener::DaGd.build_request_url("http://x/y").starts_with("https://da.gd/s?"));
+        assert!(UrlShortener::Ulvis.build_request_url("http://x/y").starts_with("https://ulvis.net/api.php?"));
+    }
+
+    #[test]
+    fn test_every_shortener_round_trips_through_the_settings_name() {
+        // Guards the four places a new service has to be wired: name(), from_name(),
+        // build_request_url() and the CSV round trip. A variant added to only some of
+        // them silently drops out of `url_shorteners=` on the next save.
+        for s in [
+            UrlShortener::IsGd,
+            UrlShortener::VGd,
+            UrlShortener::TinyUrl,
+            UrlShortener::DaGd,
+            UrlShortener::Ulvis,
+        ] {
+            let name = s.name();
+            assert_eq!(UrlShortener::from_name(name), Some(s), "{name} must parse back to itself");
+            assert_eq!(
+                UrlShortener::parse_list(name), vec![s],
+                "{name} must survive the url_shorteners= CSV"
+            );
+            let req = s.build_request_url("https://example.com/a?b=1&c=2");
+            assert!(req.starts_with("https://"), "{name} must build an https request, got {req}");
+            // The long URL has to be percent-encoded into the query, or a target
+            // containing & or = truncates the request.
+            assert!(
+                req.contains("https%3A%2F%2Fexample.com%2Fa%3Fb%3D1%26c%3D2"),
+                "{name} must percent-encode the target, got {req}"
+            );
+        }
     }
 
     #[test]
@@ -1396,6 +1527,71 @@ mod tests {
         assert_eq!(Encoding::from_iana_name("UTF8"), Some(Encoding::Utf8));
         assert_eq!(Encoding::from_iana_name("US-ASCII"), Some(Encoding::Utf8));
         assert_eq!(Encoding::from_iana_name("ascii"), Some(Encoding::Utf8));
+    }
+
+    #[test]
+    fn test_latin1_decode_never_emits_c1_controls() {
+        // Every byte, straight through the Latin-1 decoder. Not one of the 256 may come
+        // out as a C1 control: a single U+009F reaching the terminal opens an APC string
+        // that eats Clay's separator-bar and input-area draw for the rest of the frame.
+        let all: Vec<u8> = (0u8..=255).collect();
+        let decoded = Encoding::Latin1.decode(&all);
+        for c in decoded.chars() {
+            assert!(
+                !is_c1_control(c),
+                "byte decode produced C1 control U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn test_latin1_decode_of_utf8_emoji_is_visible_mojibake() {
+        // The reported bug: a world set to latin1 while the MUD actually speaks UTF-8.
+        // The emoji cannot survive - the encoding is simply wrong - but the result has to
+        // be harmless mojibake the user can see and diagnose, not terminal controls.
+        // "\u{1F384}\u{1F514}\u{26A1}" is F0 9F 8E 84 F0 9F 94 94 E2 9A A1; under strict
+        // ISO-8859-1 that is C1 APC/SS2/IND/CCH/SCI, which is what wedged the TUI.
+        let decoded = Encoding::Latin1.decode("\u{1F384}\u{1F514}\u{26A1}".as_bytes());
+        assert_eq!(decoded, "\u{F0}\u{178}\u{17D}\u{201E}\u{F0}\u{178}\u{201D}\u{201D}\u{E2}\u{161}\u{A1}");
+        assert!(!decoded.chars().any(is_c1_control));
+        // Nothing is dropped: 11 bytes in, 11 characters out.
+        assert_eq!(decoded.chars().count(), 11);
+    }
+
+    #[test]
+    fn test_latin1_decode_keeps_real_high_latin1_text() {
+        // The CP1252 remap must not disturb 0xA0-0xFF, which ISO-8859-1 and CP1252 agree on.
+        let decoded = Encoding::Latin1.decode(&[0xE9, 0xE8, 0xFC, 0xF1, 0xA9, 0xB0]);
+        assert_eq!(decoded, "\u{E9}\u{E8}\u{FC}\u{F1}\u{A9}\u{B0}");
+    }
+
+    #[test]
+    fn test_utf8_decode_strips_literal_c1_controls() {
+        // A MUD can also send a well-formed UTF-8 encoding of a C1 control (C2 9F). The
+        // Latin-1 remap does not cover that path, so the filter at the end of decode() has
+        // to catch it.
+        let decoded = Encoding::Utf8.decode("a\u{9f}b\u{9b}c\u{84}d".as_bytes());
+        assert_eq!(decoded, "abcd");
+    }
+
+    #[test]
+    fn test_fansi_decode_never_emits_c1_controls() {
+        let all: Vec<u8> = (0u8..=255).collect();
+        assert!(!Encoding::Fansi.decode(&all).chars().any(is_c1_control));
+    }
+
+    #[test]
+    fn test_strip_c1_controls_leaves_clean_text_alone() {
+        // The 0xC2 prescan must not corrupt the many non-C1 characters that share that
+        // lead byte (NBSP, degree sign, the Latin-1 punctuation block).
+        for s in ["plain ascii", "caf\u{e9} \u{b0}C \u{a9}2026", "\u{a0}nbsp\u{a0}", ""] {
+            assert_eq!(strip_c1_controls(s.to_string()), s);
+        }
+        assert_eq!(strip_c1_controls("a\u{9f}b".to_string()), "ab");
+        // Every C1, and nothing but C1, is removed.
+        let c1: String = (0x80u32..=0x9f).map(|c| char::from_u32(c).unwrap()).collect();
+        assert_eq!(strip_c1_controls(format!("x{c1}y")), "xy");
     }
 
     #[test]

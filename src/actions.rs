@@ -1030,6 +1030,75 @@ mod tests {
     }
 
     #[test]
+    fn test_comma_separated_world_list_fires_in_every_listed_world() {
+        // Regression guard: a `world=a,b` action must trigger in BOTH worlds, not
+        // just the first one listed. Exercises the real settings.dat loader so the
+        // `\e` unescaping and the `pattern.N.text` keys are covered too.
+        let conf = concat!(
+            "[action:brig_dump]\n",
+            "world=brig,haven\n",
+            "match_type=wildcard\n",
+            "pattern.0.text= -\\e> Starting Daily Backup*\n",
+            "pattern.1.text= -\\e> Validating all rooms\n",
+            "command=/gag\n",
+            "suppress_blanks=true\n",
+        );
+        let mut app = crate::App::new();
+        crate::persistence::load_settings_from_str(&mut app, conf);
+        crate::compile_all_action_regexes(&mut app.settings.actions);
+        let acts = &app.settings.actions;
+
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].world, "brig,haven", "the comma list must survive loading verbatim");
+        assert_eq!(acts[0].patterns.len(), 2);
+        // `\e` in settings.dat is an escaped '=' (see unescape_action_value), so the
+        // stored pattern is the MUD's literal " -=> " prefix.
+        assert_eq!(acts[0].patterns[0].pattern, " -=> Starting Daily Backup*");
+
+        for line in [" -=> Starting Daily Backup now", " -=> Validating all rooms"] {
+            for world in ["brig", "haven", "BRIG", "Haven"] {
+                let hit = check_action_triggers(line, world, acts);
+                assert!(hit.is_some(), "{line:?} must fire in world {world:?}");
+                assert!(hit.unwrap().should_gag, "/gag must be reported for {world:?}");
+            }
+            assert!(
+                check_action_triggers(line, "elsewhere", acts).is_none(),
+                "{line:?} must NOT fire in a world outside the list"
+            );
+        }
+    }
+
+    #[test]
+    fn test_only_the_first_matching_action_fires() {
+        // check_action_triggers returns on the first match in list order, so an
+        // earlier action that also matches shadows every later one for that line.
+        // This is what makes a multi-world action look like it "only works on one
+        // world" when a world-specific action happens to sit above it.
+        let mut first = Action::new();
+        first.name = "shadower".to_string();
+        first.world = "haven".to_string();
+        first.match_type = MatchType::Wildcard;
+        first.patterns = vec![MatchPattern { pattern: "*Daily Backup*".to_string(), compiled_regex: None }];
+        first.command = "/echo shadowed".to_string();
+
+        let mut second = Action::new();
+        second.name = "brig_dump".to_string();
+        second.world = "brig,haven".to_string();
+        second.match_type = MatchType::Wildcard;
+        second.patterns = vec![MatchPattern { pattern: "*Daily Backup*".to_string(), compiled_regex: None }];
+        second.command = "/gag".to_string();
+
+        let mut actions = vec![first, second];
+        compile_all_action_regexes(&mut actions);
+
+        let line = " -=> Starting Daily Backup now";
+        // In brig only the second is eligible, so it gags.
+        assert!(check_action_triggers(line, "brig", &actions).unwrap().should_gag);
+        // In haven the earlier action wins and nothing is gagged — the reported symptom.
+        assert!(!check_action_triggers(line, "haven", &actions).unwrap().should_gag);
+    }
+
+    #[test]
     fn test_compile_all_action_regexes() {
         let mut actions = vec![
             Action { pattern: "test1".to_string(), enabled: true, ..Action::default() },

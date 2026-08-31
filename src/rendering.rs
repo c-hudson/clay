@@ -492,11 +492,18 @@ pub(crate) fn expand_for_display(
     let with_links = wrap_urls_with_osc8(&expanded);
     // Convert Discord custom emojis to clickable :name: links (after URL wrapping to avoid
     // conflicts). Skipped when show_tags is on so users can see the original text.
-    Some(if show_tags {
+    let converted = if show_tags {
         with_links
     } else {
         convert_discord_emojis_with_links(&with_links)
-    })
+    };
+    // Last line of defence against C1 controls (see `encoding::is_c1_control`). `decode`
+    // already strips them from live MUD output, but this is also the path that draws text
+    // coming back out of scrollback.db — Page Up's prepend and `/recall -D` — and rows
+    // archived before that guard existed still carry them. Stripping here rather than at
+    // the `Print` sites keeps `visible_width`/`display_rows` measuring the same string the
+    // renderer emits.
+    Some(crate::encoding::strip_c1_controls(converted))
 }
 
 /// The wrapped rows of one line, exactly as the console renderer will draw them.

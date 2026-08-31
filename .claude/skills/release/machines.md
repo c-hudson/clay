@@ -16,6 +16,14 @@ shipped stale binaries. Always `git stash push -- Cargo.lock`, pull, and then as
 
 No SSH required — commands run directly.
 
+**Every local build shares one `target/` directory**, so they cannot overlap: cargo takes an
+exclusive lock on it and a second build waits on `Blocking waiting for file lock on build
+directory`. That includes the two Termux cross-builds and the Android APK, whose
+`buildNativeServer` Gradle task shells out to cargo. Run them one at a time and check each
+artifact's mtime afterwards — a backgrounded build that blocks on the lock can end without
+running its remaining steps while the shell still reports success (this shipped a stale
+aarch64 binary and APK into the v1.5.41 staging area; SKILL.md Step 5).
+
 ### Linux musl (x86_64)
 ```bash
 cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend,ssh-transport
@@ -50,8 +58,9 @@ cargo build --release --features webview-gui,native-audio
 ### Termux armv7 binary (cross-compiled, no GUI)
 
 Cross-compiled here on localhost via the Android NDK — there is no 32-bit device available, so
-unlike the aarch64 Termux binaries below (built natively on-device), this one targets
-`armv7-linux-androideabi` using the NDK's clang. No-GUI only (`rustls-backend`), so no
+this one targets `armv7-linux-androideabi` using the NDK's clang. (The aarch64 no-GUI binary
+below is now cross-compiled the same way; only the aarch64 *GUI* variant is still built
+on-device.) No-GUI only (`rustls-backend`), so no
 tao/wry/X11 patches or libraries are needed.
 
 **One-time setup:**
