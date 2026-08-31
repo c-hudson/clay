@@ -1070,6 +1070,16 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 visible_lines,
                                 visible_columns: Some(width as usize),
                             });
+                            // Mark the world we're displaying as seen. Only a world
+                            // *switch* ever sends MarkWorldSeen otherwise, so the world on
+                            // screen at connect would keep its server-side unseen_lines
+                            // and a stale first_unseen_at - which Unseen First cycling
+                            // later mistakes for the oldest activity and bounces back to.
+                            // Same fix as app.js's InitialState handler.
+                            let _ = ws_tx.send(WsMessage::MarkWorldSeen {
+                                world_index: current_world_index,
+                                previous_world_index: None,
+                            });
                             break;
                         }
                         _ => {}

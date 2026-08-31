@@ -8536,6 +8536,79 @@ third
              (those only clear when switching AWAY, or on Ctrl+L)");
     }
 
+    /// The reconnect-repeat bug (Android up/down cycling revisits a world with nothing
+    /// new): the world a client is displaying when it (re)connects never went through a
+    /// world *switch*, so nothing cleared its server-side unseen_lines - and its
+    /// first_unseen_at, stamped while the client was away, is typically the OLDEST of all
+    /// worlds. Unseen First cycling (calculate_next_world_from) would therefore bounce
+    /// back to it ahead of worlds with genuinely undisplayed output.
+    ///
+    /// The fix is client-side (app.js / remote_client.rs send MarkWorldSeen at the end of
+    /// InitialState processing); this test pins the server half of that contract: a
+    /// connect-time MarkWorldSeen for the world the client already views (no switch, no
+    /// previous_world_index) must fully clear it out of Unseen First's candidate ordering.
+    #[test]
+    fn test_connect_time_mark_world_seen_stops_cycle_repeat() {
+        let mut app = App::new();
+        app.worlds.clear();
+        assert_eq!(app.settings.world_switch_mode, crate::encoding::WorldSwitchMode::UnseenFirst,
+            "precondition: Unseen First is the default mode this scenario runs under");
+
+        // "alpha" is on the client's screen at reconnect: unseen accumulated while the
+        // phone slept, with the oldest first_unseen_at of the three.
+        let now = std::time::Instant::now();
+        let mut alpha = World::new("alpha");
+        alpha.connected = true;
+        alpha.unseen_lines = 10;
+        alpha.first_unseen_at = now.checked_sub(std::time::Duration::from_secs(3600));
+        let mut bravo = World::new("bravo");
+        bravo.connected = true;
+        bravo.unseen_lines = 3;
+        bravo.first_unseen_at = now.checked_sub(std::time::Duration::from_secs(600));
+        let mut charlie = World::new("charlie");
+        charlie.connected = true;
+        charlie.unseen_lines = 2;
+        charlie.first_unseen_at = now.checked_sub(std::time::Duration::from_secs(60));
+        app.worlds.push(alpha);
+        app.worlds.push(bravo);
+        app.worlds.push(charlie);
+
+        // Auth-time server state: the client reported current_world = 0 (alpha), which the
+        // auth handler records without clearing anything (main.rs handle_ws_auth_initial_state).
+        let client_id = 7;
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 0,
+            visible_lines: 24,
+            visible_columns: 80,
+            dimensions: None,
+            paused: false,
+            visible: true,
+            disconnected_at: None,
+        });
+
+        // Without the connect-time MarkWorldSeen, the second press bounced back to alpha:
+        // from bravo, alpha's stale hour-old first_unseen_at beat charlie's fresh activity.
+        assert_eq!(app.calculate_next_world_from(1), Some(0),
+            "scenario precondition: with alpha left unseen, cycling from bravo picks alpha \
+             (the bug this fix removes)");
+
+        // The fix: the client's InitialState handler now sends MarkWorldSeen for the world
+        // it resolved to, with no previous_world_index.
+        app.handle_mark_world_seen(client_id, 0, None);
+        assert_eq!(app.worlds[0].unseen_lines, 0);
+        assert!(app.worlds[0].first_unseen_at.is_none(),
+            "mark_seen must also drop first_unseen_at, or alpha still outranks fresher worlds");
+
+        // First press from alpha: bravo (oldest remaining unseen).
+        assert_eq!(app.calculate_next_world_from(0), Some(1));
+        app.handle_mark_world_seen(client_id, 1, Some(0));
+
+        // Second press from bravo: charlie - NOT back to already-displayed alpha.
+        assert_eq!(app.calculate_next_world_from(1), Some(2),
+            "cycling must move on to the world with real undisplayed output instead of \
+             repeating the world that was on screen at reconnect");
+    }
+
     // ========== Resume semantics: grace window for a briefly-disconnected WS client ==========
 
     #[test]

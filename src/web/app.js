@@ -3434,6 +3434,27 @@
                     elements.input.value = '';
                     elements.prompt.textContent = '';
                 }
+                // Mark the world this InitialState landed us on as seen. Nothing else
+                // does: switchWorldLocal only fires on an actual switch, so the world on
+                // screen at (re)connect/resync kept its server-side unseen_lines and a
+                // stale first_unseen_at from while we were away - and Unseen First
+                // cycling (CalculateNextWorld) would later bounce back to it, "switching
+                // to a world with nothing new", ahead of worlds with real activity.
+                // handle_mark_world_seen also records this client's real viewed world
+                // (previous_world_index omitted: the server's own per-client record is
+                // the right "world we left" here). Skipped when hidden - a resync landing
+                // while backgrounded must not mark anything seen (the user isn't
+                // looking) - and in note-editor windows, which don't display output.
+                // Guarded like the blocks above: this must never break InitialState
+                // processing, and in multiuser the server ownership-checks the index.
+                try {
+                    if (!noteMode && worlds[currentWorldIndex] &&
+                        document.visibilityState !== 'hidden') {
+                        send({ type: 'MarkWorldSeen', world_index: currentWorldIndex });
+                    }
+                } catch (e) {
+                    console.error('Clay: error sending connect-time MarkWorldSeen', e);
+                }
                 break;
 
             case 'ServerData':
