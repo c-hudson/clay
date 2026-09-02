@@ -1302,6 +1302,17 @@
     let keyboardAlwaysVisible = true;  // Will be synced from server settings
     let hardwareKeyboardPresent = false;  // Set by Java via window.onHardwareKeyboardChanged
 
+    // Last at-bottom verdict as of the most recent scroll event on the output container.
+    // This is the *user's* scroll state, immune to the window between a viewport shrink and
+    // the resize handler's re-pin: when the Android IME opens (adjustResize), clientHeight
+    // shrinks immediately, so a raw isAtBottom() reads false for a user who is really
+    // sitting at the bottom until the resize handler scrolls them back down. Any handler
+    // deciding "was the user at the bottom?" mid-stream (the ScrollbackLines branches, the
+    // resize handlers) must consult isAtBottom() || lastScrollAtBottom, not isAtBottom()
+    // alone — reading the raw value in that window is what let a resume-replay gap-fill
+    // treat an at-the-bottom user as scrolled-up and "preserve" a position they weren't at.
+    let lastScrollAtBottom = true;
+
     // MCMP (MUD Client Media Protocol) state
     let mcmpDefaultUrl = '';
     let mcmpMusicPlayer = null;    // { audio, key, name } - one music track at a time
@@ -4552,9 +4563,11 @@
                     // they're appended and deduped - handled entirely separately from the
                     // phase 1/2 backfill prepend logic below (a gap-fill is normally tiny and
                     // finishes in one or two requests).
-                    const wasBottom = isAtBottom();
-                    const container = elements.outputContainer;
-                    const oldScrollHeight = container.scrollHeight;
+                    // lastScrollAtBottom: see its declaration — a bare isAtBottom() here
+                    // reads false for a user really at the bottom whenever this reply lands
+                    // while the Android IME is opening (clientHeight already shrunk, re-pin
+                    // not yet run), which routed them into the preserve-position branch.
+                    const wasBottom = isAtBottom() || lastScrollAtBottom;
                     let appended = false;
                     let droppedCount = 0;
 
@@ -4636,9 +4649,22 @@
 
                     if (appended && msg.world_index === currentWorldIndex) {
                         if (!wasBottom || grepRegex) {
-                            renderOutput();
-                            const newScrollHeight = container.scrollHeight;
-                            container.scrollTop += (newScrollHeight - oldScrollHeight);
+                            // Scrolled up into history: rebuild without moving the view.
+                            // This used to be renderOutput() followed by a manual
+                            // scrollTop += (newScrollHeight - oldScrollHeight), which was
+                            // wrong twice over: renderOutput() ends in scrollToBottom(), so
+                            // the delta was applied on top of the bottom rather than the
+                            // user's position; and the delta itself went hugely negative
+                            // whenever the DOM had grown past _renderWindow (appendNewLine
+                            // never trims, so hundreds of lines accumulate between full
+                            // renders) because the rebuild clamps back to the window. Net
+                            // effect: the view landed hundreds of lines above the bottom,
+                            // and more-mode's pause-on-scroll-up then froze it there — the
+                            // "jumps way up when the keyboard opens" Android bug. Widen the
+                            // window to cover everything currently in the DOM first, so the
+                            // rebuild can't drop lines the user may be looking at.
+                            growRenderWindowToDom(world);
+                            renderOutput({ preserveScroll: true });
                         } else {
                             // Render NOW, not via scheduleCurrentWorldRepaint(). A gap-fill
                             // APPENDS the newest lines at the tail - the exact thing an
@@ -4679,9 +4705,9 @@
                     //                     with the NEWEST N visible lines -> insert in seq
                     //                     order and mark as delivered
                     if (msg.lines && msg.lines.length > 0) {
-                        const wasBottom = isAtBottom();
-                        const container = elements.outputContainer;
-                        const oldScrollHeight = container.scrollHeight;
+                        // isAtBottom() || lastScrollAtBottom, not isAtBottom() alone — see
+                        // the gap-fill branch above and lastScrollAtBottom's declaration.
+                        const wasBottom = isAtBottom() || lastScrollAtBottom;
 
                         if (kind === 'initial-fill') {
                             // Newest lines, not older history. Prepending them would bury the
@@ -4732,10 +4758,14 @@
                             } else if (!wasBottom || grepRegex) {
                                 // Scrolled up into history, or grep mode: the user needs to
                                 // see the new content immediately, so render synchronously
-                                // and correct scrollTop for the height added above.
-                                renderOutput();
-                                const newScrollHeight = container.scrollHeight;
-                                container.scrollTop += (newScrollHeight - oldScrollHeight);
+                                // without moving the view. Same fix as the gap-fill branch
+                                // above: the old renderOutput()-then-manual-delta pattern
+                                // applied the correction on top of renderOutput()'s own
+                                // scrollToBottom() and went badly negative when the rebuild
+                                // clamped an appendNewLine-inflated DOM back to
+                                // _renderWindow.
+                                growRenderWindowToDom(world);
+                                renderOutput({ preserveScroll: true });
                             } else {
                                 // At the bottom: the backfilled lines are old content added
                                 // above the fold, not currently visible, so there's no rush
@@ -7013,6 +7043,24 @@
     // How close to the top (px) triggers growing the window - large enough to grow before
     // the user actually hits the physical top and sees a hard stop.
     const RENDER_WINDOW_GROW_TRIGGER_PX = 300;
+
+    // Widen a world's render window to cover every line currently in the DOM. The DOM can
+    // hold more lines than _renderWindow says: appendNewLine() only ever appends (it never
+    // trims the top), and the at-the-bottom reset in scheduleRenderWindowCheck() shrinks
+    // _renderWindow without rebuilding. A preserve-position rebuild
+    // (renderOutput({preserveScroll:true})) must not clamp that surplus away — the dropped
+    // top lines may include exactly what a scrolled-up user is reading, and the height they
+    // take with them corrupts the scroll compensation. Call this immediately before any
+    // preserveScroll rebuild. Each DOM child of #output is one .line span, so
+    // childElementCount is the line count. Capped at RENDER_WINDOW_MAX like every other
+    // window adjustment.
+    function growRenderWindowToDom(world) {
+        const domLines = elements.output.childElementCount;
+        const current = world._renderWindow || RENDER_WINDOW_INITIAL;
+        if (domLines > current) {
+            world._renderWindow = Math.min(RENDER_WINDOW_MAX, domLines);
+        }
+    }
 
     // rAF-throttled: outputContainer.onscroll can fire many times per animation frame, but
     // growing the window triggers a full renderOutput() rebuild, which is not something to
@@ -11604,12 +11652,10 @@
             });
         }
 
-        // Track whether we're at the bottom (for resize handling)
-        let wasAtBottomBeforeResize = true;
-
-        // Update tracking on scroll
+        // Track whether we're at the bottom (for resize handling and the mid-resize
+        // at-bottom checks — see lastScrollAtBottom's declaration).
         elements.outputContainer.addEventListener('scroll', function() {
-            wasAtBottomBeforeResize = isAtBottom();
+            lastScrollAtBottom = isAtBottom();
         }, { passive: true });
 
         // Drag past the bottom to reveal pending output (see scheduleReveal above).
@@ -11666,7 +11712,7 @@
         // Window resize handler to update separator fill and maintain scroll position
         window.addEventListener('resize', function() {
             // If we were at the bottom before resize, stay at bottom
-            if (wasAtBottomBeforeResize) {
+            if (lastScrollAtBottom) {
                 scrollToBottom();
             }
             updateStatusBar();
@@ -11678,7 +11724,7 @@
         if (window.visualViewport) {
             window.visualViewport.addEventListener('resize', function() {
                 // If we were at bottom before keyboard appeared, stay at bottom
-                if (wasAtBottomBeforeResize) {
+                if (lastScrollAtBottom) {
                     scrollToBottom();
                 }
                 updateStatusBar();
