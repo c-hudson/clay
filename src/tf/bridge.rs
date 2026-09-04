@@ -9,6 +9,7 @@
 use super::{TfEngine, TfCommandResult, TfHookEvent, TfMatchMode};
 use super::macros;
 use super::hooks;
+use super::control_flow;
 
 /// Result of processing TF triggers against a line
 #[derive(Debug, Default)]
@@ -25,11 +26,17 @@ pub struct TfTriggerResult {
     pub errors: Vec<String>,
     /// Substituted text (replaces the original line)
     pub substitution: Option<(String, String)>,  // (text, attrs)
+    /// `fire_event` only: a non-quiet hook macro matched. Per `/help hooks`'
+    /// SEND rule ("If a SEND hook matches the text that would be sent, the text
+    /// is not sent (unless the hook was defined with /def -q)"), a SEND caller
+    /// uses this to decide whether to suppress sending the original text - see
+    /// `App::fire_tf_hook`.
+    pub matched_non_quiet: bool,
 }
 
 /// Process a line of MUD output against all TF triggers
 /// Returns the combined results of all matching triggers
-pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>) -> TfTriggerResult {
+pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>, world_type: Option<&str>) -> TfTriggerResult {
     let mut result = TfTriggerResult::default();
 
     // Strip ANSI codes and trailing whitespace for pattern matching (like Clay actions do)
@@ -37,7 +44,7 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>) -> T
     let plain_line = plain_line.trim_end();
 
     // Get trigger results from the macro system
-    let command_results = macros::process_triggers(engine, plain_line, world);
+    let command_results = macros::process_triggers(engine, plain_line, world, world_type);
 
     // Process each result
     for cmd_result in command_results {
@@ -51,7 +58,7 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>) -> T
             TfCommandResult::ClayCommand(cmd) => {
                 result.clay_commands.push(cmd);
             }
-            TfCommandResult::Error(e) if e != "__break__" => {
+            TfCommandResult::Error(e) if control_flow::parse_break_marker(&e).is_none() => {
                 result.errors.push(e);
             }
             _ => {}
@@ -82,6 +89,11 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>) -> T
             }
         }
 
+        // Check world-type restriction (-T)
+        if !macros::world_type_matches(macro_def, world_type) {
+            continue;
+        }
+
         result.should_gag = true;
         break;
     }
@@ -94,13 +106,16 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>) -> T
     result
 }
 
-/// Fire hooks for a specific event
-pub fn fire_event(engine: &mut TfEngine, event: TfHookEvent) -> TfTriggerResult {
+/// Fire hooks for a specific event with `arg` as its argument text (finding
+/// C.10 / plan step P1.9 - see `hooks::fire_hook`'s own doc comment for what
+/// `arg` means per event and how pattern/capture matching works).
+pub fn fire_event(engine: &mut TfEngine, event: TfHookEvent, arg: &str) -> TfTriggerResult {
     let mut result = TfTriggerResult::default();
 
-    let command_results = hooks::fire_hook(engine, event);
+    let outcome = hooks::fire_hook(engine, event, arg);
+    result.matched_non_quiet = outcome.matched_non_quiet;
 
-    for cmd_result in command_results {
+    for cmd_result in outcome.results {
         match cmd_result {
             TfCommandResult::Success(Some(msg)) => {
                 result.messages.push(msg);
@@ -184,7 +199,7 @@ pub fn get_stats(engine: &TfEngine) -> TfEngineStats {
         .filter(|m| m.trigger.as_ref().map(|t| !t.pattern.is_empty()).unwrap_or(false))
         .count();
 
-    let hook_count: usize = engine.hooks.values().map(|v| v.len()).sum();
+    let hook_count: usize = engine.macros.iter().filter(|m| m.hook.is_some()).count();
 
     TfEngineStats {
         variable_count: engine.global_vars.len(),
@@ -213,7 +228,7 @@ mod tests {
     #[test]
     fn test_process_line_no_triggers() {
         let mut engine = TfEngine::new();
-        let result = process_line(&mut engine, "Hello world", None);
+        let result = process_line(&mut engine, "Hello world", None, None);
         assert!(result.send_commands.is_empty());
         assert!(result.clay_commands.is_empty());
         assert!(!result.should_gag);
@@ -235,7 +250,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = process_line(&mut engine, "Hello world", None);
+        let result = process_line(&mut engine, "Hello world", None, None);
         assert!(result.send_commands.contains(&"say matched!".to_string()));
     }
 
@@ -269,6 +284,12 @@ mod tests {
     #[test]
     fn test_get_stats() {
         let mut engine = TfEngine::new();
+        // TfEngine::new() may itself seed TFLIBDIR/TFPATH globals (see
+        // "P1.3 library search path" - default_tflibdir()/$TFPATH), so the
+        // baseline var count depends on the machine (e.g. whether it has a
+        // system tf-lib). Compare against that baseline rather than
+        // asserting an absolute count.
+        let baseline_vars = engine.global_vars.len();
         engine.set_global("var1", super::super::TfValue::String("test".to_string()));
         engine.macros.push(TfMacro {
             name: "m1".to_string(),
@@ -277,7 +298,7 @@ mod tests {
         });
 
         let stats = get_stats(&engine);
-        assert_eq!(stats.variable_count, 1);
+        assert_eq!(stats.variable_count, baseline_vars + 1);
         assert_eq!(stats.macro_count, 1);
     }
 }

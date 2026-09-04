@@ -993,6 +993,21 @@
     let keybindings = {};  // key name -> action ID, received from server
     let killRing = [];     // killed text for yank (Ctrl+Y)
 
+    // TinyFugue-parity plan Job 22b (P2.7): canonical key names (crate::keynames grammar)
+    // this server currently answers via a `/bind`/`-b`/`-B` or `key_<name>` macro
+    // (GlobalSettingsMsg.tf_bound_keys_json - see App::tf_bound_keys_json's doc comment in
+    // main.rs). Checked BEFORE the local action table on every resolved keypress; a hit is
+    // sent to the server as WsMessage::RunKeyBinding instead of running a built-in action.
+    let tfBoundKeys = new Set();
+
+    // TF's numeric prefix (`%kbnum`, mirrors Rust InputArea.kbnum/kbnum_sign in src/input.rs)
+    // and the insert/overwrite toggle (`%insert`, InputArea.insert). Client-side only - never
+    // synced with the console's own kbnum/insert (each RunKeyBinding send carries this
+    // client's own pending value, consumed exactly once, exactly like the console does).
+    let kbnum = null;
+    let kbnumSign = 1;
+    let insertMode = true;
+
     // Actions state
     let actions = [];
     let actionsListPopupOpen = false;
@@ -1204,6 +1219,11 @@
     // Filter popup state (F4)
     let filterPopupOpen = false;
     let filterText = '';
+    // TF-parity plan Job 22b/P2.7 (Esc-L default): remembers the last non-empty filter
+    // text so toggle_limit can reapply it after a close - mirrors the console's own
+    // PendingLimitOp::Reapply against the last /limit pattern, purely client-side here
+    // since the web Find popup and the console's F4 filter are independent per finding 33.
+    let lastFilterText = '';
 
     // Search popup state (F5)
     let searchPopupOpen = false;
@@ -1418,15 +1438,33 @@
     // Command Definitions (single source of truth is Rust's parse_command)
     // ============================================================================
 
-    // Internal commands for tab completion (must match Rust parse_command match arms)
-    // This list is verified against parse_command()'s own source by
-    // test_command_parity_js_vs_rust in tests.rs
+    // Internal commands for tab completion (must match Rust parse_command match arms,
+    // plus a small set of TF-engine commands - tf/parser.rs's own dispatch, which never
+    // has a parse_command match arm - added purely for completion). This list is
+    // verified against parse_command()'s own source by test_command_parity_js_vs_rust in
+    // tests.rs, via a hand-maintained allowlist there for the TF-only entries; the array
+    // below must stay a flat comma-separated string literal list with NO comments inside
+    // the brackets - that test's own JS-side extraction is a naive split(',') over
+    // everything between the first '[' and the first ']' after this line, so an inline
+    // comment containing a comma is parsed as bogus extra "commands".
+    //
+    // TinyFugue-parity plan finding 30 (Job 22b/P2.7): 'log'/'unworld' are native
+    // Commands now (parse_command match arms) - both used to be temporarily exempted in
+    // test_command_parity_js_vs_rust until this job added them here. 'cd', 'pwd',
+    // 'runtime', 'ismacro', 'isvar', 'features', 'restrict', 'sys', 'xtitle', 'more',
+    // 'wrap', 'limit', 'unlimit', 'relimit', 'result', 'first', 'rest', 'last', 'nth',
+    // 'ver', 'man', 'nogag' are TF-engine commands from Phase 1's missing-builtins/stdlib
+    // work, listed in that test's tf_only_completion_commands allowlist.
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'import',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say',
+        'log', 'unworld',
+        'cd', 'pwd', 'runtime', 'ismacro', 'isvar', 'features', 'restrict', 'sys',
+        'xtitle', 'more', 'wrap', 'limit', 'unlimit', 'relimit', 'result',
+        'first', 'rest', 'last', 'nth', 'ver', 'man', 'nogag',
     ];
 
     function isInternalCommand(name) {
@@ -3329,6 +3367,13 @@
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
                     }
+                    // TF-parity plan Job 22b/P2.7: canonical key names this server
+                    // currently answers via /bind or a key_<name> macro - checked before
+                    // the action table on every resolved keypress (resolveKeyName).
+                    if (msg.settings.tf_bound_keys_json !== undefined) {
+                        try { tfBoundKeys = new Set(JSON.parse(msg.settings.tf_bound_keys_json)); }
+                        catch (e) { tfBoundKeys = new Set(); }
+                    }
                     settingsSynced = true;
                 }
                 } catch (e) {
@@ -4120,6 +4165,13 @@
                     applyAdvancedFontSettings();
                     if (msg.settings.keybindings_json) {
                         try { keybindings = JSON.parse(msg.settings.keybindings_json); } catch(e) {}
+                    }
+                    // TF-parity plan Job 22b/P2.7: canonical key names this server
+                    // currently answers via /bind or a key_<name> macro - checked before
+                    // the action table on every resolved keypress (resolveKeyName).
+                    if (msg.settings.tf_bound_keys_json !== undefined) {
+                        try { tfBoundKeys = new Set(JSON.parse(msg.settings.tf_bound_keys_json)); }
+                        catch (e) { tfBoundKeys = new Set(); }
                     }
                     settingsSynced = true;
                 }
@@ -5836,6 +5888,33 @@
         }
     }
 
+    // TF RECALLBEG/RECALLEND (TF-parity plan Job 22b/P2.7): jump directly to a specific
+    // history entry - mirrors InputArea::history_begin_n/history_end_n/history_goto.
+    function historyGotoIndex(idx) {
+        historyIndex = idx;
+        elements.input.value = commandHistory[idx];
+        elements.input.selectionStart = elements.input.selectionEnd = commandHistory[idx].length;
+    }
+
+    // n-th entry from the oldest end (n=1 is the very first command); negative n defers
+    // to historyEndN (mirrors InputArea::history_begin_n exactly).
+    function historyBeginN(n) {
+        if (commandHistory.length === 0) return;
+        if (n < 0) { historyEndN(-n); return; }
+        const last = commandHistory.length - 1;
+        const idx = Math.min(Math.max(n - 1, 0), last);
+        historyGotoIndex(idx);
+    }
+
+    // n-th entry from the newest end (mirrors InputArea::history_end_n exactly).
+    function historyEndN(n) {
+        if (commandHistory.length === 0) return;
+        if (n < 0) { historyBeginN(-n); return; }
+        const last = commandHistory.length - 1;
+        const idx = Math.min(Math.max(last - (n - 1), 0), last);
+        historyGotoIndex(idx);
+    }
+
     // Helper: check if character is a word character (A-Z, a-z, 0-9)
     function isWordChar(ch) {
         return /[A-Za-z0-9]/.test(ch);
@@ -6198,6 +6277,26 @@
     }
 
     // Switch world locally (does not affect console)
+    // TF SOCKETB/SOCKETF (TF-parity plan Job 22b/P2.7, finding 38): the target CONNECTED
+    // world `direction` steps away from currentWorldIndex, in world-list order - computed
+    // entirely from this client's own cached `worlds` array, mirroring
+    // App::cycle_connected_world exactly (including its "same as current -> null, meaning
+    // nothing to switch to" case). Caller switches locally via switchWorldLocal (this
+    // client's own equivalent of sending SwitchWorld - see switchWorldLocal's own
+    // MarkWorldSeen/RequestWorldState send, which achieves the same server-side effect).
+    function cycleConnectedWorldLocal(direction) {
+        const connected = [];
+        worlds.forEach((w, i) => { if (w.connected) connected.push(i); });
+        if (connected.length === 0) return null;
+        const len = connected.length;
+        const currentPos = connected.indexOf(currentWorldIndex);
+        const targetPos = currentPos !== -1
+            ? (((currentPos + direction) % len) + len) % len
+            : 0;
+        const target = connected[targetPos];
+        return target === currentWorldIndex ? null : target;
+    }
+
     function switchWorldLocal(index) {
         if (lockedWorld) return; // Don't switch worlds in locked windows
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
@@ -6264,6 +6363,7 @@
 
     function updateFilter() {
         filterText = elements.filterInput.value;
+        if (filterText) lastFilterText = filterText;
         renderOutput();
     }
 
@@ -8502,7 +8602,10 @@
         if (world && world.name && world.was_connected) {
             elements.statusDot.className = 'status-dot' + (world.connected ? '' : ' off');
             const gmcpInd = (world && world.gmcp_user_enabled) ? ' [g]' : '';
-            elements.worldName.textContent = world.name + gmcpInd;
+            // TF-parity plan Job 22b/P2.7: show a pending numeric prefix next to the
+            // world name, mirroring the console's own separator-bar "[N]" (rendering.rs).
+            const kbnumInd = (kbnum !== null) ? ' [' + kbnum + ']' : '';
+            elements.worldName.textContent = world.name + gmcpInd + kbnumInd;
             elements.statusDot.style.display = '';
             elements.worldName.style.display = '';
         } else {
@@ -10374,54 +10477,496 @@
         }
     }
 
-    // Escape+key sequence tracking (mirrors console's last_escape pattern)
-    let lastEscapeTime = 0;
+    // ============================================================================
+    // Key-name grammar (TinyFugue-parity plan Job 22b/P2.7 - JS port of src/keynames.rs)
+    // ============================================================================
+    //
+    // A canonical key name is a whitespace-free sequence of "tokens" written back to
+    // back (a chord like "^X^R" is just two tokens in a row). See keynames.rs's module
+    // doc comment for the full grammar; this port only needs to PRODUCE canonical names
+    // from a browser KeyboardEvent (never TF's raw byte spellings - a browser never
+    // hands us those) and to TOKENIZE an already-canonical string (to compare chord
+    // prefixes token-by-token rather than as raw text - see keynames::is_prefix_of_any's
+    // own doc comment for why a naive string prefix check is wrong, e.g. "F1" must never
+    // look like a prefix of the unrelated "F10").
 
-    function isRecentEscape() {
-        return (Date.now() - lastEscapeTime) < 500;
-    }
+    // Named-key words as they appear in canonical text, longest first so a greedy
+    // front-match never stops short (defensive - none of these actually collide as
+    // prefixes of one another, but keeping the invariant explicit costs nothing).
+    const NAMED_KEY_WORDS = ['PageDown', 'PageUp', 'Backspace', 'Escape', 'Insert',
+        'Delete', 'Enter', 'Space', 'Home', 'End', 'Tab', 'Up', 'Down', 'Left', 'Right']
+        .sort((a, b) => b.length - a.length);
 
-    // Convert a JS KeyboardEvent to canonical key name (matching Rust format)
-    // Returns null if the key should not be looked up in bindings
-    function keyEventToName(e) {
-        const key = e.key;
-        // Handle Escape+key sequences (Esc pressed within 500ms)
-        if (!e.ctrlKey && !e.altKey && !e.metaKey && isRecentEscape() && key !== 'Escape') {
-            if (key === 'Backspace') return 'Esc-Backspace';
-            if (key === ' ') return 'Esc-Space';
-            if (key.length === 1) return 'Esc-' + key;  // preserves case: Esc-j vs Esc-J
-            return null;
+    // Match a named-key word (or F1..F20) at the front of `s`. Returns the matched
+    // word/F-name, or null. Mirrors keynames::NamedKey::parse's word set, restricted to
+    // canonical (already-capitalized) spelling since this only ever tokenizes text this
+    // same module produced.
+    function matchNamedKeyWord(s) {
+        for (const w of NAMED_KEY_WORDS) {
+            if (s.startsWith(w)) return w;
         }
-        // Ctrl+letter
-        if (e.ctrlKey && !e.altKey && !e.metaKey && key.length === 1) {
-            return '^' + key.toUpperCase();
-        }
-        // Alt+letter (native Alt key, not escape sequence)
-        if (e.altKey && !e.ctrlKey && !e.metaKey && key.length === 1) {
-            return 'Esc-' + key;  // preserves case
-        }
-        // Alt+Backspace
-        if (e.altKey && !e.ctrlKey && !e.metaKey && key === 'Backspace') {
-            return 'Esc-Backspace';
-        }
-        // F-keys
-        if (/^F(\d+)$/.test(key)) return key;
-        // Special keys with modifiers
-        const specialMap = {
-            'ArrowUp': 'Up', 'ArrowDown': 'Down', 'ArrowLeft': 'Left', 'ArrowRight': 'Right',
-            'PageUp': 'PageUp', 'PageDown': 'PageDown',
-            'Home': 'Home', 'End': 'End', 'Insert': 'Insert', 'Delete': 'Delete',
-            'Backspace': 'Backspace', 'Tab': 'Tab', 'Enter': 'Enter', 'Escape': 'Escape'
-        };
-        const mapped = specialMap[key];
-        if (mapped) {
-            if (e.shiftKey && !e.ctrlKey && !e.altKey) return 'Shift-' + mapped;
-            if (e.ctrlKey && !e.shiftKey && !e.altKey) return 'Ctrl-' + mapped;
-            if (e.altKey && !e.shiftKey && !e.ctrlKey) return 'Alt-' + mapped;
-            if (!e.shiftKey && !e.ctrlKey && !e.altKey) return mapped;
+        const m = /^F([0-9]{1,2})/.exec(s);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (n >= 1 && n <= 20) return 'F' + n;
         }
         return null;
     }
+
+    // Parse exactly one token off the front of already-canonical text `s`. Mirrors
+    // keynames::parse_one_token, restricted to the canonical-text subset (no TF raw
+    // forms - "Ctrl-<letter>" never appears in canonical text, only "^<letter>"; a plain
+    // Ctrl-modified token is always rendered "^X", never "Ctrl-X").
+    function parseCanonicalToken(s) {
+        if (s.length === 0) return null;
+        if (s.startsWith('Esc-')) {
+            const inner = parseCanonicalToken(s.slice(4));
+            if (!inner) return null;
+            return { token: 'Esc-' + inner.token, rest: inner.rest };
+        }
+        for (const prefix of ['Ctrl-', 'Shift-', 'Alt-']) {
+            if (s.startsWith(prefix)) {
+                const rest = s.slice(prefix.length);
+                const named = matchNamedKeyWord(rest);
+                if (named) return { token: prefix + named, rest: rest.slice(named.length) };
+            }
+        }
+        if (s[0] === '^') {
+            const rest = s.slice(1);
+            const ch = Array.from(rest)[0] || '';
+            return { token: '^' + ch, rest: rest.slice(ch.length) };
+        }
+        const named = matchNamedKeyWord(s);
+        if (named) return { token: named, rest: s.slice(named.length) };
+        const ch = Array.from(s)[0];
+        return { token: ch, rest: s.slice(ch.length) };
+    }
+
+    // Tokenize an already-canonical key name into its individual tokens (each itself a
+    // canonical-text string), e.g. "^X^R" -> ["^X","^R"], "Esc-Left" -> ["Esc-Left"]
+    // (one compound token, not two).
+    function tokenizeCanonical(s) {
+        const tokens = [];
+        let rest = s;
+        let guard = 0;
+        while (rest.length > 0 && guard++ < 64) {
+            const r = parseCanonicalToken(rest);
+            if (!r) break;
+            tokens.push(r.token);
+            rest = r.rest;
+        }
+        return tokens;
+    }
+
+    // A named-key word for `named`, honoring a Shift/Ctrl/Alt modifier on `e` as a real
+    // "Modified-" token - mirrors keybindings::modified_or_named's Shift>Ctrl>Alt
+    // priority exactly, shared by every arrow direction and (finding 41 / Job 22c) the
+    // rest of the named keys below.
+    function namedWithModifier(named, e) {
+        if (e.shiftKey) return 'Shift-' + named;
+        if (e.ctrlKey) return 'Ctrl-' + named;
+        if (e.altKey) return 'Alt-' + named;
+        return named;
+    }
+
+    // The raw token for one physical, TOP-LEVEL keystroke (no chord in progress) as a
+    // canonical-text string, or null if it isn't a candidate key name at all (a plain
+    // unmodified character - ordinary typed input). Mirrors keybindings::key_event_to_token
+    // + KeySeq::canonical() exactly. Finding 41 / Job 22c: PageUp/PageDown/Home/End/Insert/
+    // Delete/Tab/Enter now honor Shift/Ctrl/Alt via namedWithModifier, same as arrows
+    // already did - previously all of these dropped every modifier, so e.g. Ctrl-Home
+    // (the new recall_begin default) could never be named from a live keypress here
+    // either, matching the identical gap the Rust side had.
+    function keyEventToToken(e) {
+        const key = e.key;
+        if (e.metaKey) return null;
+        if (e.ctrlKey && key.length === 1) {
+            return '^' + key.toUpperCase();
+        }
+        if (e.altKey && key.length === 1) {
+            return 'Esc-' + key; // preserves case: Esc-j vs Esc-J
+        }
+        const arrowMap = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right' };
+        if (arrowMap[key]) {
+            return namedWithModifier(arrowMap[key], e);
+        }
+        if (key === 'PageUp') return namedWithModifier('PageUp', e);
+        if (key === 'PageDown') return namedWithModifier('PageDown', e);
+        if (key === 'Home') return namedWithModifier('Home', e);
+        if (key === 'End') return namedWithModifier('End', e);
+        if (key === 'Insert') return namedWithModifier('Insert', e);
+        if (key === 'Delete') return namedWithModifier('Delete', e);
+        if (key === 'Backspace') return e.altKey ? 'Esc-Backspace' : 'Backspace';
+        if (key === 'Tab') return namedWithModifier('Tab', e);
+        if (key === 'Enter') return namedWithModifier('Enter', e);
+        if (key === 'Escape') return 'Escape';
+        const m = /^F([0-9]{1,2})$/.exec(key);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (n >= 1 && n <= 20) return key;
+        }
+        return null;
+    }
+
+    // Backward-compatible alias: the F-key/global-shortcut bypass (setupEventListeners)
+    // uses this name directly, chord-unaware (F-keys never participate in a chord).
+    function keyEventToName(e) {
+        return keyEventToToken(e);
+    }
+
+    // The raw INNER token for one physical keystroke arriving while a chord (bare Escape
+    // or a genuine multi-token prefix like "^X") is already buffered. Unlike
+    // keyEventToToken this deliberately handles plain characters too (preserving case -
+    // "Esc-j" != "Esc-J", finding A bug 1). Arrows never apply Shift/Alt here (Esc-Left is
+    // Escape-then-Left as two keystrokes, not one modified chord) - unchanged, out of
+    // finding 41's scope. Finding 41 / Job 22c: PageUp/PageDown/Home/End/Insert/Delete/Tab/
+    // Enter DO now honor a real modifier via namedWithModifier, same as the top-level
+    // keyEventToToken fix - the caller (chordPush) prepends "Esc-" to whatever this
+    // returns, so e.g. Escape then Ctrl-PageDown names "Esc-Ctrl-PageDown". TF has no raw
+    // "Esc-Ctrl-..." form of its own (only key_esc_ctrl_pgdn-style names via the
+    // key_<name> macro layer) - keeping the Esc- wrapper around the modified token is
+    // Clay's own simplest, most predictable choice, matching keybindings::escape_key_to_token.
+    function escapeKeyToToken(e) {
+        const key = e.key;
+        if (e.metaKey) return null;
+        if (e.ctrlKey && key.length === 1) {
+            return '^' + key.toUpperCase();
+        }
+        if (key === ' ') return 'Space';
+        if (key.length === 1) return key; // preserve case
+        if (key === 'Backspace') return 'Backspace';
+        if (key === 'Tab') return namedWithModifier('Tab', e);
+        if (key === 'Enter') return namedWithModifier('Enter', e);
+        if (key === 'Escape') return 'Escape';
+        if (key === 'ArrowUp') return 'Up';
+        if (key === 'ArrowDown') return 'Down';
+        if (key === 'ArrowLeft') return 'Left';
+        if (key === 'ArrowRight') return 'Right';
+        if (key === 'PageUp') return namedWithModifier('PageUp', e);
+        if (key === 'PageDown') return namedWithModifier('PageDown', e);
+        if (key === 'Home') return namedWithModifier('Home', e);
+        if (key === 'End') return namedWithModifier('End', e);
+        if (key === 'Insert') return namedWithModifier('Insert', e);
+        if (key === 'Delete') return namedWithModifier('Delete', e);
+        const m = /^F([0-9]{1,2})$/.exec(key);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (n >= 1 && n <= 20) return key;
+        }
+        return null;
+    }
+
+    // ============================================================================
+    // Chord state (TinyFugue-parity plan Job 22b/P2.7 - JS port of src/chords.rs)
+    // ============================================================================
+    // Replaces the old lastEscapeTime/isRecentEscape pair with TF's real chord model:
+    // ANY key can be the first half of a multi-keystroke binding as long as some longer
+    // binding starts with it, not just Escape. See chords.rs's module doc comment.
+
+    const CHORD_CANCEL_TOKEN = '^G';
+    const CHORD_WINDOW_MS = 500;
+    const chordState = { pending: [], armedAt: null };
+
+    function chordIsPending() {
+        return chordState.pending.length > 0;
+    }
+
+    function chordCancel() {
+        chordState.pending = [];
+        chordState.armedAt = null;
+    }
+
+    // True iff `candidateTokens` is a genuine, strictly shorter prefix of some bound
+    // key's own tokens - mirrors keynames::is_prefix_of_any (token-vector comparison,
+    // never a naive string prefix check).
+    function isPrefixOfAnyKeys(boundKeys, candidateTokens) {
+        for (const key of boundKeys) {
+            const toks = tokenizeCanonical(key);
+            if (toks.length <= candidateTokens.length) continue;
+            let match = true;
+            for (let i = 0; i < candidateTokens.length; i++) {
+                if (toks[i] !== candidateTokens[i]) { match = false; break; }
+            }
+            if (match) return true;
+        }
+        return false;
+    }
+
+    // The two binding tables a keystroke can be a (possibly ambiguous) prefix of: the
+    // local action map (`keybindings`) and the server's `tf_bound_keys_json` list -
+    // exactly the two chords::resolve_key_name consults.
+    function chordIsPrefix(candidateTokens) {
+        return isPrefixOfAnyKeys(Object.keys(keybindings), candidateTokens)
+            || isPrefixOfAnyKeys(tfBoundKeys, candidateTokens);
+    }
+
+    function chordHasBinding(candidateTokens) {
+        const name = candidateTokens.join('');
+        const action = keybindings[name];
+        if (action && action !== 'UNBOUND') return true;
+        return tfBoundKeys.has(name);
+    }
+
+    // Push one more keystroke's token onto the buffered prefix (or start a fresh one).
+    // Mirrors chords::ChordState::push exactly, including the "a still-bare Escape is
+    // ALWAYS open-ended" carve-out. Returns {type:'pending'} | {type:'complete', name} |
+    // {type:'abandon', prefix (array of tokens), replay (the token that broke it)}.
+    function chordPush(token, now) {
+        const hadPrefix = chordIsPending();
+
+        if (chordState.pending.length > 0 &&
+            chordState.pending[chordState.pending.length - 1] === 'Escape') {
+            chordState.pending.pop();
+            chordState.pending.push('Esc-' + token);
+        } else {
+            chordState.pending.push(token);
+        }
+
+        const candidate = chordState.pending.slice();
+
+        if (candidate[candidate.length - 1] === 'Escape') {
+            chordState.armedAt = now;
+            return { type: 'pending' };
+        }
+
+        if (chordIsPrefix(candidate)) {
+            chordState.armedAt = now;
+            return { type: 'pending' };
+        }
+
+        chordState.pending = [];
+        chordState.armedAt = null;
+
+        if (chordHasBinding(candidate)) {
+            return { type: 'complete', name: candidate.join('') };
+        }
+
+        if (hadPrefix) {
+            return { type: 'abandon', prefix: candidate.slice(0, candidate.length - 1), replay: token };
+        }
+        return { type: 'complete', name: candidate.join('') };
+    }
+
+    // If the buffered prefix has gone stale, drop it and return its own canonical name
+    // if it has a binding worth firing on timeout - null otherwise (including the
+    // hardcoded bare-Escape exception: a lone unfollowed Escape is always a silent
+    // no-op, matching the pre-Job-22b behavior exactly). Mirrors ChordState::expired.
+    function chordExpired(now, windowMs) {
+        if (chordState.armedAt === null) return null;
+        if (now - chordState.armedAt < windowMs) return null;
+        const seq = chordState.pending;
+        chordState.pending = [];
+        chordState.armedAt = null;
+        if (seq.length === 1 && seq[0] === 'Escape') return null;
+        return chordHasBinding(seq) ? seq.join('') : null;
+    }
+
+    // Resolve one physical keydown event against the buffered chord state. Mirrors
+    // chords::resolve_key_name exactly (its KeyResolution enum: Pending/Dispatch/NotAKey
+    // becomes {type:'pending'} / {type:'dispatch', name} / {type:'notakey'} here).
+    function resolveKeyName(e) {
+        const now = Date.now();
+
+        if (chordIsPending()) {
+            const fired = chordExpired(now, CHORD_WINDOW_MS);
+            if (fired !== null) {
+                return { type: 'dispatch', name: fired };
+            }
+        }
+
+        const midChord = chordIsPending();
+        const token = midChord ? escapeKeyToToken(e) : keyEventToToken(e);
+
+        if (token === null) {
+            if (midChord) chordCancel();
+            return { type: 'notakey' };
+        }
+
+        if (midChord && token === CHORD_CANCEL_TOKEN) {
+            chordCancel();
+            return { type: 'notakey' };
+        }
+
+        const result = chordPush(token, now);
+        if (result.type === 'pending') return { type: 'pending' };
+        if (result.type === 'complete') return { type: 'dispatch', name: result.name };
+
+        // Abandon: the prefix buffered before `token` matches no binding once `token`
+        // broke it out of every candidate chord.
+        if (chordHasBinding(result.prefix)) {
+            return { type: 'dispatch', name: result.prefix.join('') };
+        }
+        // The common case (e.g. "^X" then an unbound follow-up): re-resolve THIS exact
+        // keystroke as if no chord had been in progress (chordState is already empty -
+        // chordPush cleared it before returning 'abandon').
+        const token2 = keyEventToToken(e);
+        if (token2 === null) return { type: 'notakey' };
+        const result2 = chordPush(token2, now);
+        if (result2.type === 'pending') return { type: 'pending' };
+        if (result2.type === 'complete') return { type: 'dispatch', name: result2.name };
+        return { type: 'notakey' }; // unreachable: a fresh push on empty state can't abandon
+    }
+
+    // ============================================================================
+    // Numeric prefix / insert mode (TinyFugue-parity plan Job 22b/P2.7 - JS port of
+    // InputArea.kbnum/kbnum_sign/insert in src/input.rs)
+    // ============================================================================
+
+    const MAX_KBNUM_MAGNITUDE = 999; // TF's own documented default %max_kbnum
+
+    function kbnumDigit(d) {
+        const magnitude = (kbnum !== null)
+            ? Math.min(Math.abs(kbnum) * 10 + d, MAX_KBNUM_MAGNITUDE)
+            : d;
+        kbnum = kbnumSign * magnitude;
+    }
+
+    function kbnumNegativeStart() {
+        kbnum = null;
+        kbnumSign = -1;
+    }
+
+    function clearKbnum() {
+        kbnum = null;
+        kbnumSign = 1;
+    }
+
+    // n = kbnum, defaulting unset-or-zero to 1 (TF's `kbnum?:1` idiom) - for actions
+    // with a sense of direction (negative reverses).
+    function takeKbnum() {
+        const n = (kbnum !== null && kbnum !== 0) ? kbnum : 1;
+        clearKbnum();
+        return n;
+    }
+
+    // Like takeKbnum, but zero-or-negative both default to 1 (word-case actions have no
+    // sense of direction to reverse).
+    function takeKbnumPositive() {
+        const n = (kbnum !== null && kbnum > 0) ? kbnum : 1;
+        clearKbnum();
+        return n;
+    }
+
+    // ============================================================================
+    // Self-test (TinyFugue-parity plan Job 22b/P2.7 verification): table-driven check
+    // that this port produces exactly the canonical names src/keynames.rs's own Rust
+    // test suite pins. Exposed on `window` so an external harness (headless-browser
+    // driven, no server connection needed) can call it directly. Never called by the
+    // app itself - purely a verification hook.
+    // ============================================================================
+    function __clayKeyNameSelfTestImpl() {
+        const results = [];
+        function check(label, actual, expected) {
+            results.push({ label: label, actual: actual, expected: expected, pass: actual === expected });
+        }
+        function ev(key, opts) {
+            opts = opts || {};
+            return { key: key, ctrlKey: !!opts.ctrl, altKey: !!opts.alt, shiftKey: !!opts.shift, metaKey: !!opts.meta };
+        }
+
+        // ---- Single-keystroke, non-chord cases (keyEventToToken) ----
+        check('Ctrl-a -> ^A', keyEventToToken(ev('a', { ctrl: true })), '^A');
+        check('Ctrl-A -> ^A (case folds)', keyEventToToken(ev('A', { ctrl: true })), '^A');
+        check('F1 -> F1', keyEventToToken(ev('F1')), 'F1');
+        check('F12 -> F12', keyEventToToken(ev('F12')), 'F12');
+        check('plain Up -> Up', keyEventToToken(ev('ArrowUp')), 'Up');
+        check('Shift-Up -> Shift-Up', keyEventToToken(ev('ArrowUp', { shift: true })), 'Shift-Up');
+        check('Ctrl-Up -> Ctrl-Up', keyEventToToken(ev('ArrowUp', { ctrl: true })), 'Ctrl-Up');
+        check('Alt-Up -> Alt-Up (real terminal modifier)', keyEventToToken(ev('ArrowUp', { alt: true })), 'Alt-Up');
+        check('Shift+Ctrl-Up -> Shift-Up (Shift wins priority)', keyEventToToken(ev('ArrowUp', { shift: true, ctrl: true })), 'Shift-Up');
+        check('PageUp -> PageUp', keyEventToToken(ev('PageUp')), 'PageUp');
+        check('Backspace -> Backspace', keyEventToToken(ev('Backspace')), 'Backspace');
+        check('Alt-Backspace -> Esc-Backspace', keyEventToToken(ev('Backspace', { alt: true })), 'Esc-Backspace');
+        check('Tab -> Tab', keyEventToToken(ev('Tab')), 'Tab');
+        check('Escape -> Escape', keyEventToToken(ev('Escape')), 'Escape');
+        check('Alt-j -> Esc-j (case preserved)', keyEventToToken(ev('j', { alt: true })), 'Esc-j');
+        check('Alt-J -> Esc-J (case preserved)', keyEventToToken(ev('J', { alt: true })), 'Esc-J');
+        check('plain letter -> null (ordinary typed input)', keyEventToToken(ev('j')), null);
+
+        // ---- Finding 41 / Job 22c: modified named keys (PageUp/PageDown/Home/End/
+        // Insert/Delete/Tab/Enter) - these used to drop every modifier, so the new
+        // Ctrl-Home/Ctrl-End/Ctrl-PageDown defaults could never fire and Shift-Tab/
+        // Ctrl-Delete could never be bound at all.
+        check('Ctrl-Home -> Ctrl-Home', keyEventToToken(ev('Home', { ctrl: true })), 'Ctrl-Home');
+        check('Ctrl-End -> Ctrl-End', keyEventToToken(ev('End', { ctrl: true })), 'Ctrl-End');
+        check('Ctrl-PageDown -> Ctrl-PageDown', keyEventToToken(ev('PageDown', { ctrl: true })), 'Ctrl-PageDown');
+        check('Ctrl-Delete -> Ctrl-Delete', keyEventToToken(ev('Delete', { ctrl: true })), 'Ctrl-Delete');
+        check('Shift-Tab -> Shift-Tab', keyEventToToken(ev('Tab', { shift: true })), 'Shift-Tab');
+        check('Shift-Insert -> Shift-Insert', keyEventToToken(ev('Insert', { shift: true })), 'Shift-Insert');
+        check('Alt-PageUp -> Alt-PageUp', keyEventToToken(ev('PageUp', { alt: true })), 'Alt-PageUp');
+        check('plain Home (no modifier) unaffected -> Home', keyEventToToken(ev('Home')), 'Home');
+
+        // ---- tokenizeCanonical (chord-prefix tokenization, not naive string prefix) ----
+        check('tokenize ^X^R', JSON.stringify(tokenizeCanonical('^X^R')), JSON.stringify(['^X', '^R']));
+        check('tokenize Esc-Left is ONE token', JSON.stringify(tokenizeCanonical('Esc-Left')), JSON.stringify(['Esc-Left']));
+        check('F1 is not a prefix of F10 (token vector, not string)',
+            isPrefixOfAnyKeys(['F10'], tokenizeCanonical('F1')), false);
+        check('^X IS a genuine prefix of ^X^R',
+            isPrefixOfAnyKeys(['^X^R'], tokenizeCanonical('^X')), true);
+
+        // ---- Chord sequences (resolveKeyName) - seed a small fixture binding table
+        // representative of the real defaults so is_prefix/has_binding have something to
+        // recognize, exactly like a live server's keybindings_json/tf_bound_keys_json
+        // would; restored afterward so this never disturbs a real session.
+        const savedKeybindings = keybindings;
+        const savedTfBoundKeys = tfBoundKeys;
+        const savedChord = { pending: chordState.pending.slice(), armedAt: chordState.armedAt };
+        keybindings = {
+            'Esc-Left': 'world_socket_prev', 'Esc-Right': 'world_socket_next',
+            '^X^R': 'reload', 'Esc-^N': 'scroll_line_forward',
+            'Esc-j': 'flush_output', 'Esc-J': 'selective_flush',
+            'Ctrl-Up': 'history_prev',
+            'Esc-Ctrl-PageDown': 'flush_output',
+        };
+        tfBoundKeys = new Set();
+
+        function resolveSeq(events) {
+            chordCancel();
+            let last = null;
+            for (const e of events) last = resolveKeyName(e);
+            return last;
+        }
+
+        check('Esc,j -> Esc-j (lowercase)',
+            (resolveSeq([ev('Escape'), ev('j')]) || {}).name, 'Esc-j');
+        check('Esc,J -> Esc-J (uppercase, distinct from Esc-j)',
+            (resolveSeq([ev('Escape'), ev('J')]) || {}).name, 'Esc-J');
+        check('Esc,Left -> Esc-Left (named key, two sequential keystrokes)',
+            (resolveSeq([ev('Escape'), ev('ArrowLeft')]) || {}).name, 'Esc-Left');
+        check('Esc,Ctrl-n -> Esc-^N',
+            (resolveSeq([ev('Escape'), ev('n', { ctrl: true })]) || {}).name, 'Esc-^N');
+        check('Ctrl-x,Ctrl-r -> ^X^R (genuine two-token chord)',
+            (resolveSeq([ev('x', { ctrl: true }), ev('r', { ctrl: true })]) || {}).name, '^X^R');
+        check('Ctrl-Up (single keystroke, real modifier) -> Ctrl-Up, not a chord',
+            (resolveSeq([ev('ArrowUp', { ctrl: true })]) || {}).name, 'Ctrl-Up');
+        check('Alt-Up vs Esc-Up are distinct: Alt-Up resolves in one keystroke',
+            (resolveSeq([ev('ArrowUp', { alt: true })]) || {}).name, 'Alt-Up');
+        // Escape then Up (two SEPARATE keystrokes) folds into the compound "Esc-Up" -
+        // not directly bound in the fixture table above, so it abandons and replays Up
+        // plain; this asserts that distinction rather than a false "Esc-Up" positive.
+        check('Esc,Up (unbound Esc-Up) replays as plain Up, distinct from Alt-Up',
+            (resolveSeq([ev('Escape'), ev('ArrowUp')]) || {}).name, 'Up');
+        // Finding 41 / Job 22c: Esc- then a modified named key keeps the Esc- wrapper
+        // around the real Modified token (ruling: "Esc-" + modified token, since TF has
+        // no raw "Esc-Ctrl-..." form of its own) - and it fires as a genuine chord when
+        // something is actually bound to it.
+        check('Esc,Ctrl-PageDown -> Esc-Ctrl-PageDown (bound in the fixture table)',
+            (resolveSeq([ev('Escape'), ev('PageDown', { ctrl: true })]) || {}).name,
+            'Esc-Ctrl-PageDown');
+
+        const pending1 = resolveSeq([ev('x', { ctrl: true })]);
+        check('Ctrl-x alone (mid ^X^R) -> pending', pending1 && pending1.type, 'pending');
+
+        keybindings = savedKeybindings;
+        tfBoundKeys = savedTfBoundKeys;
+        chordState.pending = savedChord.pending;
+        chordState.armedAt = savedChord.armedAt;
+
+        const failed = results.filter(r => !r.pass);
+        return { pass: failed.length === 0, total: results.length, failed: failed.length, results: results };
+    }
+
+    window.__clayKeyNameSelfTest = __clayKeyNameSelfTestImpl;
 
     // Look up a key name in keybindings and return the action ID, or null
     function lookupBinding(keyName) {
@@ -10462,6 +11007,17 @@
         pushKillRing(killed);
         input.value = text.substring(0, start) + text.substring(pos);
         input.selectionStart = input.selectionEnd = start;
+    }
+
+    // Kill from start of line to cursor and push to kill ring (TF's real ^U -
+    // kb_backward_kill_line; mirrors InputArea::kill_to_start).
+    function killToStartKill() {
+        const input = elements.input;
+        const pos = input.selectionStart;
+        const killed = input.value.substring(0, pos);
+        pushKillRing(killed);
+        input.value = input.value.substring(pos);
+        input.selectionStart = input.selectionEnd = 0;
     }
 
     // Kill to end of line and push to kill ring
@@ -10517,52 +11073,112 @@
         input.selectionStart = input.selectionEnd = start;
     }
 
+    // TF-parity plan Job 22b/P2.7: the one exception to "every other action clears
+    // kbnum" - mirrors input_handler::is_kbnum_setting_action exactly.
+    const KBNUM_SETTING_ACTIONS = new Set([
+        'kbnum_0', 'kbnum_1', 'kbnum_2', 'kbnum_3', 'kbnum_4',
+        'kbnum_5', 'kbnum_6', 'kbnum_7', 'kbnum_8', 'kbnum_9', 'kbnum_negative',
+    ]);
+
     // Dispatch a keybinding action by ID. Returns true if handled.
     // Guarded entry point. Keyboard actions and most buttons funnel through here, so a throw
     // in any single action would otherwise be an unhandled exception with no usable report on
     // Android (see guard()). The action id is included so the banner names what failed.
+    //
+    // TF-parity plan Job 22b/P2.7: any action other than the numeric-prefix-building ones
+    // clears a pending kbnum, whether or not it actually consumed one (tf-help #kbnum) -
+    // mirrors input_handler::dispatch_action's own wrapper exactly, and is what makes
+    // bell/^G cancel a pending prefix without honoring it, with no special case in 'bell'.
     function dispatchAction(actionId) {
         try {
-            return dispatchActionImpl(actionId);
+            const result = dispatchActionImpl(actionId);
+            if (!KBNUM_SETTING_ACTIONS.has(actionId)) {
+                clearKbnum();
+            }
+            return result;
         } catch (e) {
             __clayShowError("action '" + actionId + "' threw: " + __clayErrText(e));
             return false;
         }
     }
 
+    // Tab completion, factored out of tab_key's own more-mode-priority handling so it can
+    // also be bound standalone (Esc-Tab default, TF-parity plan Job 22b/P2.7 - mirrors
+    // input_handler::perform_completion's own factoring, Job 19). Returns true if a
+    // completion was applied.
+    function performCompletion() {
+        const inputValue = elements.input.value;
+        if (!inputValue.startsWith('/')) return false;
+        const completed = completeCommand(inputValue);
+        if (completed === null) return false;
+        elements.input.value = completed;
+        const spacePos = completed.indexOf(' ');
+        const cursorPos = spacePos >= 0 ? spacePos : completed.length;
+        elements.input.setSelectionRange(cursorPos, cursorPos);
+        return true;
+    }
+
     function dispatchActionImpl(actionId) {
         switch (actionId) {
-            // Cursor
+            // Cursor - all four honor a pending numeric prefix (TF-parity plan Job 22b/
+            // P2.7, mirrors input_handler.rs's own cursor_left/right/word_left/word_right
+            // arms): n = kbnum.unwrap_or(1), negative n reverses direction.
             case 'cursor_left': {
                 const input = elements.input;
-                if (input.selectionStart > 0) {
-                    input.selectionStart = input.selectionEnd = input.selectionStart - 1;
+                const n = takeKbnum();
+                const dir = n >= 0 ? -1 : 1;
+                for (let i = 0; i < Math.abs(n); i++) {
+                    const pos = input.selectionStart + dir;
+                    if (pos >= 0 && pos <= input.value.length) input.selectionStart = input.selectionEnd = pos;
                 }
                 return true;
             }
             case 'cursor_right': {
                 const input = elements.input;
-                if (input.selectionStart < input.value.length) {
-                    input.selectionStart = input.selectionEnd = input.selectionStart + 1;
+                const n = takeKbnum();
+                const dir = n >= 0 ? 1 : -1;
+                for (let i = 0; i < Math.abs(n); i++) {
+                    const pos = input.selectionStart + dir;
+                    if (pos >= 0 && pos <= input.value.length) input.selectionStart = input.selectionEnd = pos;
                 }
                 return true;
             }
             case 'cursor_word_left': {
-                const input = elements.input;
-                let pos = input.selectionStart;
-                const text = input.value;
-                while (pos > 0 && text[pos - 1] === ' ') pos--;
-                while (pos > 0 && text[pos - 1] !== ' ') pos--;
-                input.selectionStart = input.selectionEnd = pos;
+                const n = takeKbnum();
+                const times = Math.abs(n);
+                const forward = n < 0;
+                for (let i = 0; i < times; i++) {
+                    const input = elements.input;
+                    let pos = input.selectionStart;
+                    const text = input.value;
+                    if (forward) {
+                        while (pos < text.length && text[pos] !== ' ') pos++;
+                        while (pos < text.length && text[pos] === ' ') pos++;
+                    } else {
+                        while (pos > 0 && text[pos - 1] === ' ') pos--;
+                        while (pos > 0 && text[pos - 1] !== ' ') pos--;
+                    }
+                    input.selectionStart = input.selectionEnd = pos;
+                }
                 return true;
             }
             case 'cursor_word_right': {
-                const input = elements.input;
-                let pos = input.selectionStart;
-                const text = input.value;
-                while (pos < text.length && text[pos] !== ' ') pos++;
-                while (pos < text.length && text[pos] === ' ') pos++;
-                input.selectionStart = input.selectionEnd = pos;
+                const n = takeKbnum();
+                const times = Math.abs(n);
+                const forward = n >= 0;
+                for (let i = 0; i < times; i++) {
+                    const input = elements.input;
+                    let pos = input.selectionStart;
+                    const text = input.value;
+                    if (forward) {
+                        while (pos < text.length && text[pos] !== ' ') pos++;
+                        while (pos < text.length && text[pos] === ' ') pos++;
+                    } else {
+                        while (pos > 0 && text[pos - 1] === ' ') pos--;
+                        while (pos > 0 && text[pos - 1] !== ' ') pos--;
+                    }
+                    input.selectionStart = input.selectionEnd = pos;
+                }
                 return true;
             }
             case 'cursor_home': {
@@ -10579,51 +11195,99 @@
                 // Multi-line cursor movement - let browser handle natively in textarea
                 return false;
 
-            // Editing
+            // Editing - deletion actions honor kbnum the same way (TF-parity plan Job
+            // 22b/P2.7).
             case 'delete_backward': {
-                // Let browser handle natively
-                return false;
-            }
-            case 'delete_forward': {
+                const n = takeKbnum();
+                if (n === 1) return false; // let the browser handle the common case natively
                 const input = elements.input;
-                const pos = input.selectionStart;
-                const text = input.value;
-                if (pos < text.length) {
-                    input.value = text.substring(0, pos) + text.substring(pos + 1);
-                    input.selectionStart = input.selectionEnd = pos;
+                const times = Math.abs(n);
+                const forward = n < 0;
+                for (let i = 0; i < times; i++) {
+                    const pos = input.selectionStart;
+                    const text = input.value;
+                    if (forward) {
+                        if (pos < text.length) { input.value = text.substring(0, pos) + text.substring(pos + 1); input.selectionStart = input.selectionEnd = pos; }
+                    } else if (pos > 0) {
+                        input.value = text.substring(0, pos - 1) + text.substring(pos);
+                        input.selectionStart = input.selectionEnd = pos - 1;
+                    }
                 }
                 return true;
             }
-            case 'delete_word_backward':
-                deleteWordBackwardKill();
+            case 'delete_forward': {
+                const n = takeKbnum();
+                const times = Math.abs(n);
+                const forward = n >= 0;
+                for (let i = 0; i < times; i++) {
+                    const input = elements.input;
+                    const pos = input.selectionStart;
+                    const text = input.value;
+                    if (forward) {
+                        if (pos < text.length) { input.value = text.substring(0, pos) + text.substring(pos + 1); input.selectionStart = input.selectionEnd = pos; }
+                    } else if (pos > 0) {
+                        input.value = text.substring(0, pos - 1) + text.substring(pos);
+                        input.selectionStart = input.selectionEnd = pos - 1;
+                    }
+                }
                 return true;
-            case 'delete_word_forward':
-                deleteWordForwardKill();
+            }
+            case 'delete_word_backward': {
+                const n = takeKbnum();
+                for (let i = 0; i < Math.abs(n); i++) {
+                    if (n >= 0) deleteWordBackwardKill(); else deleteWordForwardKill();
+                }
                 return true;
-            case 'delete_word_backward_punct':
-                backwardKillWordPunctuationKill();
+            }
+            case 'delete_word_forward': {
+                const n = takeKbnum();
+                for (let i = 0; i < Math.abs(n); i++) {
+                    if (n >= 0) deleteWordForwardKill(); else deleteWordBackwardKill();
+                }
                 return true;
+            }
+            case 'delete_word_backward_punct': {
+                const n = takeKbnum();
+                for (let i = 0; i < Math.abs(n); i++) {
+                    if (n >= 0) backwardKillWordPunctuationKill(); else deleteWordForwardKill();
+                }
+                return true;
+            }
             case 'kill_to_end':
                 killToEndKill();
                 return true;
             case 'clear_line':
                 clearLineKill();
                 return true;
-            case 'transpose_chars':
-                transposeChars();
+            // TF's real ^U (kb_backward_kill_line): kill from start of line to cursor,
+            // keeping the kill ring - Clay's own historical "clear whole line" is
+            // clear_line above (TF-parity plan Job 22b/P2.7).
+            case 'kill_to_start':
+                killToStartKill();
                 return true;
+            case 'transpose_chars': {
+                const n = takeKbnumPositive();
+                for (let i = 0; i < n; i++) transposeChars();
+                return true;
+            }
             case 'literal_next':
                 // Not meaningful in browser
                 return true;
-            case 'capitalize_word':
-                transformWordForward('capitalize');
+            case 'capitalize_word': {
+                const n = takeKbnumPositive();
+                for (let i = 0; i < n; i++) transformWordForward('capitalize');
                 return true;
-            case 'lowercase_word':
-                transformWordForward('lowercase');
+            }
+            case 'lowercase_word': {
+                const n = takeKbnumPositive();
+                for (let i = 0; i < n; i++) transformWordForward('lowercase');
                 return true;
-            case 'uppercase_word':
-                transformWordForward('uppercase');
+            }
+            case 'uppercase_word': {
+                const n = takeKbnumPositive();
+                for (let i = 0; i < n; i++) transformWordForward('uppercase');
                 return true;
+            }
             case 'collapse_spaces':
                 collapseSpaces();
                 return true;
@@ -10636,32 +11300,77 @@
             case 'yank':
                 killRingYank();
                 return true;
+            // TF Insert/Esc-v: `/@test insert := !insert` (TF-parity plan Job 22b/P2.7).
+            case 'toggle_insert':
+                insertMode = !insertMode;
+                updateStatusBar();
+                return true;
+            // Numeric prefix entry (TF-parity plan Job 22b/P2.7). See kbnumDigit/
+            // kbnumNegativeStart for the accumulation rule.
+            case 'kbnum_0': kbnumDigit(0); updateStatusBar(); return true;
+            case 'kbnum_1': kbnumDigit(1); updateStatusBar(); return true;
+            case 'kbnum_2': kbnumDigit(2); updateStatusBar(); return true;
+            case 'kbnum_3': kbnumDigit(3); updateStatusBar(); return true;
+            case 'kbnum_4': kbnumDigit(4); updateStatusBar(); return true;
+            case 'kbnum_5': kbnumDigit(5); updateStatusBar(); return true;
+            case 'kbnum_6': kbnumDigit(6); updateStatusBar(); return true;
+            case 'kbnum_7': kbnumDigit(7); updateStatusBar(); return true;
+            case 'kbnum_8': kbnumDigit(8); updateStatusBar(); return true;
+            case 'kbnum_9': kbnumDigit(9); updateStatusBar(); return true;
+            case 'kbnum_negative': kbnumNegativeStart(); updateStatusBar(); return true;
 
-            // History
-            case 'history_prev':
-                historyPrev();
+            // History - repeat n times in the given direction, negative n reversing
+            // (TF-parity plan Job 22b/P2.7).
+            case 'history_prev': {
+                const n = takeKbnum();
+                for (let i = 0; i < Math.abs(n); i++) { if (n >= 0) historyPrev(); else historyNext(); }
                 return true;
-            case 'history_next':
-                historyNext();
+            }
+            case 'history_next': {
+                const n = takeKbnum();
+                for (let i = 0; i < Math.abs(n); i++) { if (n >= 0) historyNext(); else historyPrev(); }
                 return true;
-            case 'history_search_backward':
-                historySearchBackward();
+            }
+            case 'history_search_backward': {
+                const n = takeKbnum();
+                for (let i = 0; i < Math.abs(n); i++) { if (n >= 0) historySearchBackward(); else historySearchForward(); }
                 return true;
-            case 'history_search_forward':
-                historySearchForward();
+            }
+            case 'history_search_forward': {
+                const n = takeKbnum();
+                for (let i = 0; i < Math.abs(n); i++) { if (n >= 0) historySearchForward(); else historySearchBackward(); }
                 return true;
+            }
+            // TF RECALLBEG/RECALLEND: jump straight to the oldest/newest history entry,
+            // kbnum-aware ("n-th entry from that end").
+            case 'recall_begin': {
+                const n = takeKbnum();
+                historyBeginN(n);
+                return true;
+            }
+            case 'recall_end': {
+                const n = takeKbnum();
+                historyEndN(n);
+                return true;
+            }
 
             // Scrollback
             case 'scroll_page_up': {
+                const n = takeKbnum();
                 const pgH = elements.outputContainer.clientHeight;
                 const pgLH = (currentFontSize || 14) * 1.2;
-                elements.outputContainer.scrollBy(0, -(pgH - pgLH));
+                const rows = Math.max(1, Math.abs(n));
+                const amount = (pgH - pgLH) * rows;
+                elements.outputContainer.scrollBy(0, n >= 0 ? -amount : amount);
                 return true;
             }
             case 'scroll_page_down': {
+                const n = takeKbnum();
                 const pgH = elements.outputContainer.clientHeight;
                 const pgLH = (currentFontSize || 14) * 1.2;
-                elements.outputContainer.scrollBy(0, pgH - pgLH);
+                const rows = Math.max(1, Math.abs(n));
+                const amount = (pgH - pgLH) * rows;
+                elements.outputContainer.scrollBy(0, n >= 0 ? amount : -amount);
                 if (isAtBottom()) {
                     if (pendingTotal() === 0) {
                         paused = false;
@@ -10673,13 +11382,44 @@
                 }
                 return true;
             }
+            // TF PAGEBACK: identical to scroll_page_up (full page backward) - a real
+            // alias so the two can never drift apart.
+            case 'scroll_page_back':
+                return dispatchActionImpl('scroll_page_up');
+            // TF HPAGE: half page FORWARD (kbfunc.tf: dokey_page/dokey_hpage both move
+            // toward the bottom by default) - release pending output if any, else scroll
+            // down. scroll_half_page_back (below) is the always-backward TF HPAGEBACK.
             case 'scroll_half_page': {
-                if (pendingTotal() > 0) {
-                    releaseScreenful();
+                const n = takeKbnum();
+                const halfPage = Math.floor(elements.outputContainer.clientHeight / 2) * Math.max(1, Math.abs(n));
+                if (n >= 0) {
+                    if (pendingTotal() > 0) {
+                        releaseScreenful();
+                    } else {
+                        elements.outputContainer.scrollBy(0, halfPage);
+                    }
                 } else {
-                    const halfPage = Math.floor(elements.outputContainer.clientHeight / 2);
                     elements.outputContainer.scrollBy(0, -halfPage);
                 }
+                return true;
+            }
+            case 'scroll_half_page_back': {
+                const n = takeKbnum();
+                const halfPage = Math.floor(elements.outputContainer.clientHeight / 2) * Math.max(1, Math.abs(n));
+                elements.outputContainer.scrollBy(0, n >= 0 ? -halfPage : halfPage);
+                return true;
+            }
+            // TF LINE/LINEBACK: scroll by exactly one output line, kbnum-aware.
+            case 'scroll_line_forward': {
+                const n = takeKbnum();
+                const amount = lineHeightPx() * Math.max(1, Math.abs(n));
+                elements.outputContainer.scrollBy(0, n >= 0 ? amount : -amount);
+                return true;
+            }
+            case 'scroll_line_back': {
+                const n = takeKbnum();
+                const amount = lineHeightPx() * Math.max(1, Math.abs(n));
+                elements.outputContainer.scrollBy(0, n >= 0 ? -amount : amount);
                 return true;
             }
             case 'flush_output':
@@ -10689,19 +11429,33 @@
             case 'selective_flush':
                 selectiveFlush();
                 return true;
+            // TF CLEAR: empty the view without dropping any lines - scrollback is
+            // untouched, so scrolling re-populates it (TF-parity plan Job 22b/P2.7).
+            case 'clear_screen':
+                elements.outputContainer.scrollTop = elements.outputContainer.scrollHeight;
+                renderOutput();
+                return true;
+            // TF PAUSE: pause the current world so new output queues as pending.
+            case 'pause_output':
+                paused = true;
+                updateStatusBar();
+                return true;
+            // TF kb_expand_line: substitute %var/$[]/$() in the current input line in
+            // place. The console does this via `substitute_commands(&mut app.tf_engine,
+            // ...)`, a pure local read against `app.tf_engine` - there is no equivalent
+            // for a web/GUI client: the only server-side path that touches an input
+            // buffer (`/grab`, `cmd_grab`) queues a `PendingKeyboardOp` against the
+            // CONSOLE's own local input area (see its doc comment in tf/parser.rs), not
+            // this client's; routing this client's line through it would silently rewrite
+            // the master console's command line instead. `/eval` executes rather than
+            // just substituting, so sending it as a command would send the (possibly
+            // half-typed) line to the MUD - actively harmful, not just unhelpful. No-op
+            // here rather than either of those; see this job's own report for detail.
+            case 'expand_line':
+                return true;
             case 'tab_key': {
                 // Try command completion first
-                const inputValue = elements.input.value;
-                if (inputValue.startsWith('/')) {
-                    const completed = completeCommand(inputValue);
-                    if (completed !== null) {
-                        elements.input.value = completed;
-                        const spacePos = completed.indexOf(' ');
-                        const cursorPos = spacePos >= 0 ? spacePos : completed.length;
-                        elements.input.setSelectionRange(cursorPos, cursorPos);
-                        return true;
-                    }
-                }
+                if (performCompletion()) return true;
                 if (pendingTotal() > 0) {
                     releaseScreenful();
                 } else {
@@ -10709,6 +11463,11 @@
                 }
                 return true;
             }
+            // Tab completion as a standalone action (Esc-Tab default), sharing
+            // performCompletion with Tab's own inline handling above.
+            case 'completion':
+                performCompletion();
+                return true;
 
             // World
             case 'world_next':
@@ -10732,10 +11491,55 @@
             case 'world_forward':
                 requestNextWorld();
                 return true;
+            // TF SOCKETB/SOCKETF (/fg -</fg ->): cycle CONNECTED worlds only, in
+            // world-list order - distinct from world_prev/world_next above, which cycle
+            // "active" worlds using the server's alphabetical/unseen-first rules
+            // (TF-parity plan Job 22b/P2.7; finding 38: computed from this client's own
+            // cached world list, switched to locally exactly like a tab click does).
+            case 'world_socket_prev': {
+                const n = takeKbnum();
+                const target = cycleConnectedWorldLocal(-n);
+                if (target !== null) switchWorldLocal(target);
+                return true;
+            }
+            case 'world_socket_next': {
+                const n = takeKbnum();
+                const target = cycleConnectedWorldLocal(n);
+                if (target !== null) switchWorldLocal(target);
+                return true;
+            }
+            // TF /bg (= /fg -n): background every world / no foreground - a no-op, same
+            // as the console (Clay always shows one world per client).
+            case 'bg_all_worlds':
+                return true;
 
             // System
             case 'help':
                 if (helpPopupOpen) closeHelpPopup(); else openHelpPopup();
+                return true;
+            // TF-parity plan Job 22b/P2.7 (Esc-L default): toggle the Find popup between
+            // "closed" and "the last filter text applied" - mirrors the console's
+            // toggle_limit against PendingLimitOp::Reapply/Clear (finding 33: the two
+            // filters are independent client-side state, so this only ever touches this
+            // client's own).
+            case 'toggle_limit': {
+                if (filterPopupOpen) {
+                    if (filterText) lastFilterText = filterText;
+                    closeFilterPopup();
+                } else if (lastFilterText) {
+                    filterPopupOpen = true;
+                    filterText = lastFilterText;
+                    elements.filterPopup.style.display = 'block';
+                    elements.filterInput.value = lastFilterText;
+                    renderOutput();
+                }
+                return true;
+            }
+            // TF-parity plan Job 22b/P2.7 (^X^V default): same text a typed /version
+            // prints - round-trips through SendCommand since the version banner is
+            // generated server-side.
+            case 'show_version':
+                send({ type: 'SendCommand', world_index: currentWorldIndex, command: '/version' });
                 return true;
             case 'redraw':
                 if (worlds[currentWorldIndex]) {
@@ -10753,6 +11557,17 @@
                 }
                 renderOutput();
                 return true;
+            // TF REFRESH: plain repaint, no filtering (TF-parity plan Job 22b/P2.7, ^L
+            // default) - unlike 'redraw' above, client-generated lines and ▶ markers are
+            // left untouched.
+            case 'refresh_line':
+                renderOutput();
+                return true;
+            // Clay's own historical ^L behavior (repaint AND drop client-generated
+            // lines) - unbound by default now, still bindable; a real alias of 'redraw'
+            // so the two can never drift apart.
+            case 'redraw_server_only':
+                return dispatchActionImpl('redraw');
             case 'reload':
                 // Local only — never restart the remote server
                 if (window.WEBVIEW_MODE) {
@@ -11969,9 +12784,19 @@
             }
 
             // Handle F-keys and shortcuts globally via keybinding system
-            // (before popup checks which have early returns)
+            // (before popup checks which have early returns). Not chord-aware (F-keys
+            // never participate in a chord) but does honor dispatch order (TF-parity plan
+            // Job 22b/P2.7): a server-side /bind on one of these keys wins over the
+            // built-in action, exactly like the main input-level handler below.
             {
                 const keyName = keyEventToName(e);
+                if (keyName && tfBoundKeys.has(keyName)) {
+                    const kb = kbnum; clearKbnum();
+                    e.preventDefault();
+                    e.stopPropagation();
+                    send({ type: 'RunKeyBinding', key: keyName, kbnum: kb });
+                    return;
+                }
                 const action = lookupBinding(keyName);
                 if (action === 'help' || action === 'toggle_tags' || action === 'filter_popup' ||
                     action === 'search_popup' ||
@@ -12225,44 +13050,122 @@
             }
 
             // Handle navigation keys at document level via keybinding system
-            // (skip when input is focused — the input-specific handler takes care of it)
+            // (skip when input is focused — the input-specific handler takes care of it).
+            // TF-parity plan Job 22b/P2.7: resolveKeyName owns chord state; dispatch order
+            // is tf_bound_keys_json (RunKeyBinding) first, then the local action table.
             if (document.activeElement !== elements.input &&
                 document.activeElement !== elements.filterInput) {
-                const keyName = keyEventToName(e);
-                const action = lookupBinding(keyName);
-                if (action) {
-                    // Clear escape time for Esc+key sequences that matched
-                    if (isRecentEscape() && e.key !== 'Escape') lastEscapeTime = 0;
+                const resolution = resolveKeyName(e);
+                if (resolution.type === 'pending') {
                     e.preventDefault();
                     e.stopPropagation();
-                    dispatchAction(action);
-                    elements.input.focus();
                     return;
+                }
+                if (resolution.type === 'dispatch') {
+                    const name = resolution.name;
+                    if (tfBoundKeys.has(name)) {
+                        const kb = kbnum; clearKbnum();
+                        e.preventDefault();
+                        e.stopPropagation();
+                        send({ type: 'RunKeyBinding', key: name, kbnum: kb });
+                        elements.input.focus();
+                        return;
+                    }
+                    const action = lookupBinding(name);
+                    if (action) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        dispatchAction(action);
+                        elements.input.focus();
+                        return;
+                    }
                 }
             }
 
-            // Escape handling: close popups or track for sequences
+            // Escape handling: close popups (chord state itself is entirely owned by
+            // resolveKeyName above/in the input-level handler now).
             if (e.key === 'Escape' && filterPopupOpen) {
                 e.preventDefault();
                 closeFilterPopup();
             } else if (e.key === 'Escape' && deviceModeModalOpen) {
                 e.preventDefault();
                 hideDeviceModeModal();
-            } else if (e.key === 'Escape') {
-                lastEscapeTime = Date.now();
             }
         };
 
-        // Keyboard controls (console-style) - input-specific
+        // Keyboard controls (console-style) - input-specific. TF-parity plan Job 22b/
+        // P2.7: mirrors input_handler::handle_key_event's exact structure - resolve the
+        // chord state first (1 call per physical keydown), then dispatch in order
+        // (tf_bound_keys_json/RunKeyBinding, built-in action table, the hardcoded Enter
+        // check keyed off the RAW key so e.g. an unbound "Esc-Enter" still submits,
+        // then plain character fallthrough).
         elements.input.addEventListener('keydown', function(e) {
-            // Clear history search state on non-search keys
-            const keyName = keyEventToName(e);
-            const action = lookupBinding(keyName);
-            if (e.key !== 'Escape' && action !== 'history_search_backward' && action !== 'history_search_forward') {
+            const resolution = resolveKeyName(e);
+
+            if (resolution.type === 'pending') {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+
+            const keyName = resolution.type === 'dispatch' ? resolution.name : null;
+
+            // Clear history search state on any non-search key - mirrors Rust exactly:
+            // keyed off the resolved chord name (only when there IS one), not the raw
+            // key, and only these three names are exempt.
+            if (keyName !== null && keyName !== 'Esc-p' && keyName !== 'Esc-n' && keyName !== 'Escape') {
                 clearHistorySearch();
             }
 
-            // Enter is always handled directly (not configurable)
+            // TF's %insert off (Insert/Esc-v toggle): overwrite the character under the
+            // cursor instead of inserting, for an ordinary single printable character
+            // that resolved to no candidate key name at all (mirrors InputArea::
+            // insert_char's overwrite branch). Runs before the action-table/Enter checks
+            // below so a plain unbound letter is intercepted here rather than falling
+            // through to the browser's native insert-at-cursor.
+            if (!insertMode && keyName === null && e.key.length === 1 &&
+                !e.ctrlKey && !e.altKey && !e.metaKey) {
+                const input = elements.input;
+                const pos = input.selectionStart;
+                const text = input.value;
+                const selEnd = input.selectionEnd > pos ? input.selectionEnd : Math.min(pos + 1, text.length);
+                input.value = text.substring(0, pos) + e.key + text.substring(selEnd);
+                input.selectionStart = input.selectionEnd = pos + e.key.length;
+                clearKbnum();
+                resetCompletion();
+                lastInputWasDelete = false;
+                checkTempConversion();
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+
+            // 1-2. tf_bound_keys_json (a server-side /bind or key_<name> macro) - highest
+            // priority, checked before the built-in action table.
+            if (keyName !== null && tfBoundKeys.has(keyName)) {
+                const kb = kbnum; clearKbnum();
+                e.preventDefault();
+                e.stopPropagation();
+                send({ type: 'RunKeyBinding', key: keyName, kbnum: kb });
+                return;
+            }
+
+            // 3. Built-in action table.
+            if (keyName !== null) {
+                const action = lookupBinding(keyName);
+                if (action) {
+                    const handled = dispatchAction(action);
+                    if (handled) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                    }
+                    return;
+                }
+            }
+
+            // 4. Enter (not bound by default via the action system - always active),
+            // checked via the raw physical key - fires even if the resolved chord name
+            // (e.g. "Esc-Enter") wasn't bound to anything, exactly like input_handler.rs.
             if (e.key === 'Enter') {
                 e.preventDefault();
                 e.stopPropagation();
@@ -12270,22 +13173,8 @@
                 return;
             }
 
-            // Binding-based dispatch
-            if (action) {
-                // Clear escape time for Esc+key sequences that matched
-                if (isRecentEscape() && e.key !== 'Escape') lastEscapeTime = 0;
-                const handled = dispatchAction(action);
-                if (handled) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-                return;
-            }
-
-            // Track bare Escape for Escape+key sequences
-            if (e.key === 'Escape') {
-                lastEscapeTime = Date.now();
-            }
+            // 5. Fall through to character input (unbound keys) - browser handles it
+            // natively; the 'input' listener below clears kbnum for a plain typed char.
         });
 
         // Reset command completion state when input changes (typing, not Tab)
@@ -12297,6 +13186,12 @@
             // anything else (typed character, paste, IME composition) does not.
             lastInputWasDelete = !!(e.inputType && e.inputType.indexOf('delete') === 0);
             checkTempConversion();
+            // TF-parity plan Job 22b/P2.7: any value change not already handled by
+            // dispatchAction's own wrapper (e.g. a plain typed/pasted character, or IME
+            // composition) cancels a pending numeric prefix - mirrors InputArea::
+            // insert_char/insert_str's own clear_kbnum() call. Harmless to call again
+            // when dispatchAction already cleared it.
+            clearKbnum();
         });
 
         // Auth submit

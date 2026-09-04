@@ -520,8 +520,20 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
         }
     };
 
-    // Collect matching lines
-    let mut matches: Vec<(usize, String, bool)> = Vec::new();
+    // Every line that passes the source/gag filters, in buffer order - the pool -An/-Bn/-Cn
+    // context is drawn from (real tf: context comes from the SAME history the match search
+    // itself covers, clipped to the requested <range>, not the whole unfiltered buffer -
+    // verified directly against real tf: -A/-B/-C never pulled a context line from outside
+    // an explicit x-y <range>'s own bounds). `is_match` is precomputed here too so it can
+    // drive both plain (no -A/-B/-C) and context-expanded selection below without
+    // rerunning the regex.
+    struct EligibleLine {
+        display: String,
+        archived: bool,
+        is_match: bool,
+    }
+
+    let mut eligible: Vec<EligibleLine> = Vec::new();
     let lines_to_check = &output_lines[start_idx..end_idx];
 
     for (rel_idx, line) in lines_to_check.iter().enumerate() {
@@ -580,55 +592,91 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
             None => true, // No pattern = match all
         };
 
-        if is_match {
-            let mut display_line = if show_tags {
-                line.text.clone()
-            } else {
-                strip_mud_tag(&line.text)
-            };
+        let mut display_line = if show_tags {
+            line.text.clone()
+        } else {
+            strip_mud_tag(&line.text)
+        };
 
-            // Mark captured user input so it's visually distinguishable from world output
-            // and client notices in mixed -l/-g results - applied at render time only,
-            // never baked into OutputLine.text (see INPUT_LINE_PREFIX's doc comment in
-            // main.rs). Before the -t/# prefixes below, so the result reads
-            // "12: [14:22:01] » north".
-            if line.is_input {
-                display_line = format!("{}{}", crate::INPUT_LINE_PREFIX, display_line);
-            }
-
-            // Add timestamp if requested, honoring the optional -t[format] (default %H:%M:%S)
-            if opts.show_timestamps {
-                let epoch_secs = line.timestamp.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0) as i64;
-                let lt = crate::util::local_time_from_epoch(epoch_secs);
-                let fmt = opts.timestamp_format.as_deref().unwrap_or("%H:%M:%S");
-                let ts_str = crate::util::format_local_time(&lt, fmt);
-                display_line = format!("[{}] {}", ts_str, display_line);
-            }
-
-            // Add line number if requested
-            if opts.show_line_numbers {
-                display_line = format!("{}: {}", abs_idx + 1, display_line);
-            }
-
-            // shows_archive_prefix(), not archive_sourced alone: the live buffer can
-            // already hold archive text that Page Up prepended (from_archive), and it must
-            // report as archived here or the same line renders 🛢️ in the buffer and ✨ in
-            // the recall of it.
-            matches.push((abs_idx, display_line, line.shows_archive_prefix()));
+        // Mark captured user input so it's visually distinguishable from world output
+        // and client notices in mixed -l/-g results - applied at render time only,
+        // never baked into OutputLine.text (see INPUT_LINE_PREFIX's doc comment in
+        // main.rs). Before the -t/# prefixes below, so the result reads
+        // "12: [14:22:01] » north".
+        if line.is_input {
+            display_line = format!("{}{}", crate::INPUT_LINE_PREFIX, display_line);
         }
+
+        // Add timestamp if requested, honoring the optional -t[format] (default %H:%M:%S)
+        if opts.show_timestamps {
+            let epoch_secs = line.timestamp.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0) as i64;
+            let lt = crate::util::local_time_from_epoch(epoch_secs);
+            let fmt = opts.timestamp_format.as_deref().unwrap_or("%H:%M:%S");
+            let ts_str = crate::util::format_local_time(&lt, fmt);
+            display_line = format!("[{}] {}", ts_str, display_line);
+        }
+
+        // Add line number if requested
+        if opts.show_line_numbers {
+            display_line = format!("{}: {}", abs_idx + 1, display_line);
+        }
+
+        // shows_archive_prefix(), not archive_sourced alone: the live buffer can
+        // already hold archive text that Page Up prepended (from_archive), and it must
+        // report as archived here or the same line renders 🛢️ in the buffer and ✨ in
+        // the recall of it.
+        eligible.push(EligibleLine { display: display_line, archived: line.shows_archive_prefix(), is_match });
     }
+
+    let mut match_positions: Vec<usize> = eligible.iter()
+        .enumerate()
+        .filter(|(_, l)| l.is_match)
+        .map(|(pos, _)| pos)
+        .collect();
 
     // Handle LastMatching - keep only last N matches
     if let RecallRange::LastMatching(n) = &opts.range {
-        let skip = matches.len().saturating_sub(*n);
-        matches = matches.into_iter().skip(skip).collect();
+        let skip = match_positions.len().saturating_sub(*n);
+        match_positions = match_positions.into_iter().skip(skip).collect();
     }
 
-    // TODO: Handle context lines (-A, -B, -C) if needed
+    if opts.context_before == 0 && opts.context_after == 0 {
+        return match_positions.into_iter()
+            .map(|pos| (eligible[pos].display.clone(), eligible[pos].archived))
+            .collect();
+    }
 
-    matches.into_iter().map(|(_, s, archived)| (s, archived)).collect()
+    // -An/-Bn/-Cn: expand each match into an inclusive [start, end] window within
+    // `eligible`, then merge overlapping/adjacent windows so a run of nearby matches
+    // becomes one contiguous block instead of repeating shared lines. Real tf: "groups of
+    // lines that are not adjacent in history will be separated by '--'."
+    let last_idx = eligible.len().saturating_sub(1);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for pos in match_positions {
+        let start = pos.saturating_sub(opts.context_before);
+        let end = (pos + opts.context_after).min(last_idx);
+        match ranges.last_mut() {
+            Some((_, prev_end)) if start <= *prev_end + 1 => {
+                *prev_end = (*prev_end).max(end);
+            }
+            _ => ranges.push((start, end)),
+        }
+    }
+
+    let mut result: Vec<(String, bool)> = Vec::new();
+    for (i, (start, end)) in ranges.into_iter().enumerate() {
+        if i > 0 {
+            // Separator between non-adjacent groups - Clay's own text, not a recalled
+            // line, so it is never archive-sourced (matches "No matches"'s own convention).
+            result.push(("--".to_string(), false));
+        }
+        for line in &eligible[start..=end] {
+            result.push((line.display.clone(), line.archived));
+        }
+    }
+    result
 }
 
 /// Check if a line matches any action triggers.

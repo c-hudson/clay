@@ -472,6 +472,18 @@ pub enum WsMessage {
     /// Send MSDP message to MUD server (client -> server)
     SendMsdp { world_index: usize, variable: String, value: String },
     SendCommand { world_index: usize, command: String },
+    /// Client -> server (TF-parity plan Job 22a/P2.7): the client pressed a key that
+    /// `GlobalSettingsMsg::tf_bound_keys_json` told it is bound by a `/bind`/`-b`/`-B` or
+    /// `key_<name>` macro on the server, so it should run there instead of the client's own
+    /// built-in action for that key. `key` is the canonical name (`crate::keynames`
+    /// grammar, e.g. `"Esc-x"`, `"^X^R"`); `kbnum` is the client's own pending numeric
+    /// prefix, if any, mirrored into the server's TF engine for the duration of the bound
+    /// command (tf-help #kbnum) and cleared afterward. The server resolves `key` the exact
+    /// same way the console does (`chords::resolve_bound_command`: a `/bind` macro, then a
+    /// `key_<name>` macro) and executes the result in this client's own context — output
+    /// comes back like any typed command. A `key` with no such binding (stale client-side
+    /// cache, race with an `/unbind`) is ignored silently, never an error.
+    RunKeyBinding { key: String, kbnum: Option<i64> },
     SwitchWorld { world_index: usize },
     ConnectWorld { world_index: usize },
     /// Server -> client: a MUD world's TLS certificate no longer matches the
@@ -1310,6 +1322,14 @@ pub struct GlobalSettingsMsg {
     /// Keyboard bindings (serialized as JSON object: key -> action)
     #[serde(default)]
     pub keybindings_json: String,
+    /// TF-parity plan Job 22a/P2.7: canonical key names currently answered by a `/bind`/
+    /// `-b`/`-B` or `key_<name>` macro (JSON array of strings, e.g. `["Esc-x","^X^R"]`) -
+    /// see `App::tf_bound_keys_json`'s doc comment. Tells a web/GUI client which keystrokes
+    /// to hand to the server via `WsMessage::RunKeyBinding` instead of running its own
+    /// built-in action for them, since TF customizations are engine state that otherwise
+    /// never reaches a client at all.
+    #[serde(default)]
+    pub tf_bound_keys_json: String,
     /// Auth key value for display in web settings (only sent to authenticated clients)
     #[serde(default)]
     pub auth_key: String,

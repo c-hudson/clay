@@ -210,7 +210,7 @@ CLAY_PASSWORD=pass ./clay --grep=hostname:port -f '*combat*'
 |---------|-------------|
 | `/dict <word>` | Look up word definition (Free Dictionary API) |
 | `/urban <word>` | Look up word definition (Urban Dictionary) |
-| `/translate <lang> <text>` | Translate text (also `/tr`) |
+| `/translate <lang> <text>` | Translate text (`/tr` is an alias on the web/GUI clients only — on the console, `/tr` is TinyFugue's own character-translate command, see "TinyFugue Commands") |
 | `/url <url>` | Shorten a URL (is.gd) |
 
 Lookup commands place the result in the input buffer with the cursor at the start, so you can type a prefix (e.g. `say`) before sending.
@@ -234,7 +234,8 @@ Lookup commands place the result in the input buffer with the cursor at the star
 
 ## TinyFugue Commands
 
-Clay includes a TinyFugue compatibility layer. All TF commands work with both `/` and `#` prefixes:
+Clay includes a TinyFugue compatibility layer — see `docs/markdown/06-tf-commands.md`
+for the full command set and `reference/tf-engine.md` for the engine reference.
 
 | Command | Description |
 |---------|-------------|
@@ -248,7 +249,9 @@ Clay includes a TinyFugue compatibility layer. All TF commands work with both `/
 | `/load filename` | Load a TF script file |
 | `/tfhelp [topic]` | Show TF help |
 
-The `#` prefix also works for backward compatibility. See `/tfhelp` for full command list.
+See `/tfhelp` or `/help commands` for the full command list. (A line starting
+with `;` or `#` is a comment, matching TinyFugue's own script convention —
+it is not a second command prefix; only `/` dispatches a command.)
 
 ### Importing TinyFugue Worlds
 
@@ -262,13 +265,24 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 
 ## Controls
 
-All keybindings are configurable via `~/.clay/keybindings.dat`. Defaults follow TinyFugue conventions. A browser-based keybind editor is available at `/keybind-editor`.
+All keybindings are configurable via `~/.clay/keybindings.dat` — see
+`docs/markdown/07-keyboard-shortcuts.md` for the complete table (every
+default, including chords, the numeric prefix, and popup shortcuts) and
+`TINYFUGUE-COMPAT.md` for which defaults changed and why. Any binding you've
+customized in `keybindings.dat` survives a Clay upgrade unchanged; only keys
+you never touched pick up a new default. A browser-based keybind editor is
+available at `/keybind-editor` when the HTTP server is enabled (`/web`).
+
+Defaults follow TinyFugue 5.0's own keymap, with a short list of deliberate
+exceptions (`^Q` stays spell suggestions, `^R` stays hot reload, plus a
+handful of Clay-only extras like the F-keys). A summary:
 
 **World Switching:**
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+Up/Down` | Switch between active worlds |
+| `Esc-Left/Right` | Cycle connected worlds |
+| `Esc-{`/`Esc-}` | Cycle active worlds (unseen output first) |
 | `Shift+Up/Down` | Cycle through all worlds |
 | `Escape w` | Switch to world with activity |
 
@@ -276,34 +290,22 @@ All keybindings are configurable via `~/.clay/keybindings.dat`. Defaults follow 
 
 | Key | Action |
 |-----|--------|
-| `Left/Right` | Move cursor one character |
-| `Ctrl+B/F` | Move cursor left/right one character |
-| `Escape b/f` | Move cursor one word left/right |
+| `Left/Right` or `Ctrl+B/F` | Move cursor one character |
+| `Escape b/f` or `Ctrl+Left/Right` | Move cursor one word left/right |
 | `Up/Down` | Move cursor up/down (multi-line input) |
-| `Ctrl+A` / `Home` | Jump to start of line |
-| `Ctrl+E` / `End` | Jump to end of line |
-| `Ctrl+U` | Clear line |
-| `Ctrl+W` | Delete word backward |
+| `Ctrl+A` / `Home`, `Ctrl+E` / `End` | Jump to start/end of line |
+| `Ctrl+U` | Kill to start of line (kill ring kept) |
 | `Ctrl+K` | Kill to end of line |
-| `Ctrl+D` | Delete character forward |
+| `Ctrl+W` | Delete word backward |
 | `Ctrl+Y` | Yank (paste from kill ring) |
 | `Ctrl+T` | Transpose two characters before cursor |
-| `Ctrl+V` | Insert next character literally (console only) |
-| `Ctrl+P/N` | Previous/next command history |
+| `Ctrl+P/N` or `Ctrl+Up/Down` | Previous/next command history |
+| `Ctrl+Home/End` | Jump to oldest/newest history entry |
+| `Insert` / `Escape v` | Toggle insert/overwrite mode |
+| `Escape 0-9` / `Escape -` | Build a numeric repeat-count prefix (TF `%kbnum`) |
 | `Ctrl+Q` | Spell suggestions |
-| `Ctrl+G` | Terminal bell |
-| `Tab` | Command completion (when input starts with `/`) |
-| `Escape Space` | Collapse multiple spaces to one |
-| `Escape -` | Jump to matching bracket `()[]{}` |
-| `Escape .` / `_` | Insert last word from previous history |
-| `Escape p` | Search history backward by prefix |
-| `Escape n` | Search history forward by prefix |
-| `Escape Backspace` | Delete word backward (punctuation-delimited) |
-| `Escape c/l/u` | Capitalize / lowercase / uppercase word |
-| `Escape d` | Delete word forward |
+| `Tab` / `Escape Tab` | Release pending output / command completion |
 | `Alt+Up/Down` | Resize input area (1-15 lines) |
-
-**Kill Ring:** `Ctrl+K`, `Ctrl+U`, `Ctrl+W`, `Escape d`, and `Escape Backspace` push deleted text to the kill ring. `Ctrl+Y` pastes the most recent entry.
 
 **Output & Scrollback:**
 
@@ -311,21 +313,20 @@ All keybindings are configurable via `~/.clay/keybindings.dat`. Defaults follow 
 |-----|--------|
 | `PageUp/PageDown` | Scroll output history |
 | `Tab` | Release one screenful (when paused) |
-| `Escape j` | Jump to end, release all pending |
-| `Escape J` | Selective flush: keep highlighted pending, discard rest |
+| `Escape j` / `Escape J` | Release all pending / selective flush (keep hilite) |
 | `Escape h` | Half-page scroll up or release half screenful |
-| `Ctrl+L` | Redraw screen (keep only server data) |
+| `Ctrl+L` | Refresh screen (plain repaint) |
+| `F4` | Filter/search output |
 
 **General:**
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+R` | Hot reload |
+| `Ctrl+R` / `Ctrl+X Ctrl+R` | Hot reload |
 | `F1` | Help |
 | `F2` | Toggle MUD tag display with timestamps |
-| `F4` | Filter/search output |
+| `F5` | Search command history |
 | `F8` | Toggle action highlighting |
-| `F5` | Search command history (web/GUI) |
 | `F9` | Toggle GMCP media audio |
 | `Ctrl+C` (x2) | Quit |
 

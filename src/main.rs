@@ -13,7 +13,9 @@ pub mod http;
 pub mod persistence;
 pub mod daemon;
 pub mod theme;
+pub mod keynames;
 pub mod keybindings;
+pub mod chords;
 pub mod input_handler;
 pub mod rendering;
 pub mod audio;
@@ -241,6 +243,17 @@ pub struct FilterPopup {
     cursor: usize,
     filtered_indices: Vec<usize>,  // Indices of matching lines in output_lines
     scroll_offset: usize,          // Scroll position within filtered results
+    /// Matching style (Job 15's `/limit -m<style>`). F4's own manual typing always uses
+    /// the default, `Glob` - see this type's own doc comment for why that's not a
+    /// behavior change from the old hardcoded "wildcards-if-present, else substring"
+    /// heuristic this field replaced.
+    style: tf::TfMatchMode,
+    /// `/limit -v` (Job 15): keep only lines that DON'T match, instead of ones that do.
+    /// Always `false` for F4's own manual typing.
+    invert: bool,
+    /// `/limit -a` (Job 15): keep only lines that have attributes (`line_has_attrs`),
+    /// in addition to matching the pattern. Always `false` for F4's own manual typing.
+    attrs_only: bool,
 }
 
 impl FilterPopup {
@@ -251,6 +264,9 @@ impl FilterPopup {
             cursor: 0,
             filtered_indices: Vec::new(),
             scroll_offset: 0,
+            style: tf::TfMatchMode::Glob,
+            invert: false,
+            attrs_only: false,
         }
     }
 
@@ -260,6 +276,9 @@ impl FilterPopup {
         self.cursor = 0;
         self.filtered_indices.clear();
         self.scroll_offset = 0;
+        self.style = tf::TfMatchMode::Glob;
+        self.invert = false;
+        self.attrs_only = false;
     }
 
     fn close(&mut self) {
@@ -269,46 +288,53 @@ impl FilterPopup {
         self.scroll_offset = 0;
     }
 
-    fn update_filter(&mut self, output_lines: &[OutputLine]) {
+    /// Matches a single line's plain (ANSI-stripped) text against `self.style` -
+    /// `TfMatchMode::Glob` (F4's own manual-typing default, and `/limit`'s default when
+    /// no `-m` is given) is a strict superset of the old hardcoded heuristic: a pattern
+    /// with no `*`/`?` compiles to a fully-escaped, unanchored regex, which is exactly
+    /// equivalent to a case-insensitive substring `.contains()` - so this is not a
+    /// behavior change for plain text, only an addition for `-msimple`/`-mregexp`.
+    fn pattern_matches(&self, plain: &str) -> bool {
         if self.filter_text.is_empty() {
-            self.filtered_indices = (0..output_lines.len()).collect();
-        } else {
-            // Check if pattern has wildcards
-            let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
-
-            if has_wildcards {
-                // Use wildcard matching with regex
-                if let Some(regex) = filter_wildcard_to_regex(&self.filter_text) {
-                    self.filtered_indices = output_lines
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, line)| {
-                            let plain = strip_ansi_codes(&line.text);
-                            regex.is_match(&plain)
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                } else {
-                    // Invalid regex, show no matches
-                    self.filtered_indices.clear();
-                }
-            } else {
-                // Simple substring matching (case-insensitive)
-                let filter_lower = self.filter_text.to_lowercase();
-                self.filtered_indices = output_lines
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, line)| {
-                        let plain = strip_ansi_codes(&line.text);
-                        plain.to_lowercase().contains(&filter_lower)
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-            }
+            return true;
         }
+        match self.style {
+            tf::TfMatchMode::Simple => plain.to_lowercase().contains(&self.filter_text.to_lowercase()),
+            tf::TfMatchMode::Glob => filter_wildcard_to_regex(&self.filter_text)
+                .map(|re| re.is_match(plain))
+                .unwrap_or(false),
+            tf::TfMatchMode::Regexp => regex::RegexBuilder::new(&self.filter_text)
+                .case_insensitive(true)
+                .build()
+                .map(|re| re.is_match(plain))
+                .unwrap_or(false),
+        }
+    }
+
+    fn update_filter(&mut self, output_lines: &[OutputLine]) {
+        self.filtered_indices = output_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let plain = strip_ansi_codes(&line.text);
+                let matched = self.pattern_matches(&plain);
+                let matched = if self.invert { !matched } else { matched };
+                matched && (!self.attrs_only || line_has_attrs(line))
+            })
+            .map(|(i, _)| i)
+            .collect();
         // Reset scroll to end (most recent matches)
         self.scroll_offset = self.filtered_indices.len().saturating_sub(1);
     }
+}
+
+/// `/limit -a` (Job 15): does this line "have attributes"? TF's own concept covers any
+/// SGR/color/bold/underline attribute a MUD sent, not just Clay's own `/highlight`
+/// action - approximated as "an explicit highlight color, OR the raw text still
+/// contains an ANSI escape sequence" (the latter catches ordinary MUD color/attribute
+/// codes that `/highlight` never touches).
+fn line_has_attrs(line: &OutputLine) -> bool {
+    line.highlight_color.is_some() || line.text.contains('\x1b')
 }
 
 /// Returns true if an output line should appear in F5 search results.
@@ -1071,6 +1097,7 @@ fn parse_bamf_portal(line: &str) -> Option<BamfPortal> {
 fn process_triggers(
     line: &str,
     world_name: &str,
+    world_type: &str,
     actions: &[actions::Action],
     tf_engine: &mut tf::TfEngine,
 ) -> TriggerProcessingResult {
@@ -1092,7 +1119,7 @@ fn process_triggers(
     }
 
     // Check TF triggers
-    let tf_result = tf::bridge::process_line(tf_engine, line, Some(world_name));
+    let tf_result = tf::bridge::process_line(tf_engine, line, Some(world_name), Some(world_type));
     result.send_commands.extend(tf_result.send_commands);
     result.clay_commands.extend(tf_result.clay_commands);
     result.messages.extend(tf_result.messages);
@@ -2048,6 +2075,22 @@ pub struct ClientViewState {
 // Shared Command Parsing
 // ============================================================================
 
+/// What `Command::Log` should do to its resolved target(s) - see `/help log`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogAction {
+    /// No OFF/ON/<file> argument and no -wilg selector at all: list every world currently
+    /// logging (real tf: "with no option, lists all open logs").
+    Status,
+    /// ON, or no OFF/ON/<file> argument but at least one -wilg selector was given (real tf:
+    /// "with an -ligw option, same as ON") - resume the target's normal, auto-computed log
+    /// file (`World::get_log_path`), same file a fresh `log_enabled = true` would use.
+    On,
+    /// OFF - stop logging the target.
+    Off,
+    /// <file> - start logging the target to this exact path instead of the auto-computed one.
+    File(String),
+}
+
 /// Parsed command representation - shared across console, GUI, and web interfaces
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::enum_variant_names)]
@@ -2082,6 +2125,14 @@ pub enum Command {
     WorldConnectBackground { name: String },
     /// /worlds <name> - switch to or connect to named world
     WorldSwitch { name: String },
+    /// /worlds <host> <port> (also /world) - TF's own host+port form: create-or-
+    /// reuse a temporary world named "<host>:<port>" and connect to it. Real TF
+    /// invents a name like "(unnamed3)"; Clay's stable name means repeating the
+    /// same "/world host port" reconnects the same temp world instead of piling
+    /// up "(unnamed4)", "(unnamed5)", ... - see `parse_world_command`.
+    /// `use_ssl` (from `-x`) is honored here (there's no pre-existing world
+    /// setting to fall back to, unlike the named-world form).
+    WorldConnectHostPort { host: String, port: String, use_ssl: bool, no_login: bool, background: bool },
     /// /connect [host port [ssl]] - connect to server (internal use by buttons/TF)
     Connect { host: Option<String>, port: Option<String>, ssl: bool },
     /// /connect host:port | host port | --close | --cancel - attach to/detach from a remote
@@ -2089,16 +2140,47 @@ pub enum Command {
     RemoteAttach { addr: String, close: bool, cancel: bool },
     /// /import host[:port] - download settings/theme/keybindings from another Clay instance
     Import { addr: String },
-    /// /disconnect or /dc - disconnect current world
-    Disconnect,
+    /// /disconnect or /dc [<world>|-ALL] - disconnect a world: the current one
+    /// (`None`), every connected world (`Some("-ALL")`, case-insensitive, real
+    /// TF spelling), or one named world (`Some(name)`).
+    Disconnect { world: Option<String> },
     /// /flush - clear output buffer for current world
     Flush,
     /// /menu - show menu popup to select windows/popups
     Menu,
     /// /font - show font settings popup (web/GUI only)
     Font,
-    /// /send [-W] [-w<world>] [-n] <text> - send text
-    Send { text: String, all_worlds: bool, target_world: Option<String>, no_newline: bool },
+    /// /send [-W] [-T<type>] [-w[<world>]] [-n] [-h] <text> - send text
+    Send {
+        text: String,
+        all_worlds: bool,
+        target_world: Option<String>,
+        /// -T<type>: send to every connected world whose type (`/help worlds`'s MUD/Slack/
+        /// Discord distinction) glob-matches this pattern - see `execute_send_command`.
+        world_type: Option<String>,
+        no_newline: bool,
+        /// -h: fire the SEND hook per target world first (finding: real TF's own default is
+        /// "does not execute SEND hooks" - see /help send).
+        run_hook: bool,
+    },
+    /// /log [-w[<world>]] [-i] [-l] [-g] [OFF|ON|<file>] - per-world output logging.
+    /// See `commands::execute_log_command`'s doc comment for what maps onto Clay's simpler
+    /// one-log-per-world model (`WorldSettings::log_enabled`) and what's accepted but not
+    /// distinct.
+    Log {
+        /// -w<world> (`Some("<world>")`), bare -w (`Some(String::new())`, meaning "the
+        /// current world, explicitly"), or omitted entirely (`None`).
+        world: Option<String>,
+        /// -i: also toggle the global `log_input_enabled` setting (the one real Clay
+        /// analog to TF's separate "keyboard input" log stream).
+        log_input: bool,
+        /// -l: accepted, not distinct - Clay's per-world log already includes local
+        /// (client-generated) output alongside server output in the same file.
+        log_local: bool,
+        /// -g: accepted, not distinct - Clay logs per-world, not one combined stream.
+        log_global: bool,
+        action: LogAction,
+    },
     /// /remote - list remotely connected clients
     Remote,
     /// /remote --kill <id> - disconnect a remote client
@@ -2123,7 +2205,30 @@ pub enum Command {
         user: Option<String>,
         password: Option<String>,
         use_ssl: bool,
+        /// `[<file>]` - per-world script loaded on connect (finding 31 / plan
+        /// Job 14b). Kept in the TF engine's own memory only
+        /// (`TfEngine::world_files`), never persisted to settings.dat - see
+        /// `commands::execute_add_world_command`.
+        file: Option<String>,
     },
+    /// /addworld [-T<type>] DEFAULT [<char> <pass> [<file>]] - set the fallback
+    /// character/password/file used by any world that has none of its own
+    /// (`${world_character}`, `${world_password}`, `world_info(name, "file")`).
+    /// Stored as TF engine globals rather than a real world entry, so it never
+    /// shows up in /listworlds - see finding 31 / plan Job 14b.
+    AddWorldDefault {
+        character: Option<String>,
+        password: Option<String>,
+        file: Option<String>,
+    },
+    /// /unworld <name>... - remove the definition of each named world
+    /// (`/help unworld`, plan Job 14c / finding 32). A native `Command` for
+    /// the same dispatch-order reason `/addworld` already is: an actual
+    /// world removal needs `&mut App`, which the TF engine layer doesn't
+    /// have (`tf::builtins::cmd_unworld` bounces here via `ClayCommand`,
+    /// same as its own `/addworld` sibling) - see
+    /// `commands::execute_remove_world_command`.
+    RemoveWorld { names: Vec<String> },
     /// /edit [filename] - open split-screen editor for world notes or file
     Edit { filename: Option<String> },
     /// /edit -l - open notes list popup
@@ -2205,11 +2310,15 @@ pub fn parse_command(input: &str) -> Command {
         "/__connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
         "/connect" => parse_remote_attach_command(args),
         "/import" => parse_import_command(args),
-        "/disconnect" | "/dc" => Command::Disconnect,
+        "/disconnect" | "/dc" => {
+            let world = if args.is_empty() { None } else { Some(args.join(" ")) };
+            Command::Disconnect { world }
+        }
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
         "/font" => Command::Font,
         "/send" => parse_send_command(args, trimmed),
+        "/log" => parse_log_command(args, trimmed),
         "/remote" => {
             if args.len() >= 2 && args[0] == "--kill" {
                 if let Ok(id) = args[1].parse::<u64>() {
@@ -2245,6 +2354,16 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "/addworld" => parse_addworld_command(args),
+        // /unworld <name>... (finding 32/Job 14c): each name is processed
+        // independently by `execute_remove_world_command`, so they're all
+        // forwarded together rather than only taking args[0].
+        "/unworld" => {
+            if args.is_empty() {
+                Command::Unknown { cmd: trimmed.to_string() }
+            } else {
+                Command::RemoveWorld { names: args.iter().map(|s| s.to_string()).collect() }
+            }
+        }
         "/note" => {
             if args.first() == Some(&"-l") {
                 Command::EditList
@@ -2318,42 +2437,85 @@ pub fn parse_command(input: &str) -> Command {
     }
 }
 
-/// Parse /worlds command with its various forms
+/// Parse /worlds command with its various forms: `/world [-lqnxfb] [<name>]`,
+/// `/world [-lqnxfb] <host> <port>` (see /help world, /help fg, /help connect).
+/// Clay's own `-e` (edit) is checked first, exactly as before - it's a Clay
+/// extra, not one of TF's six.
+///
+/// TF's six connect-side letters actually come from two other commands: real
+/// TF's own `/help world` says "The -lqnxfb options are the same as those for
+/// /fg and /connect" - `l`/`q`/`x`/`f`/`b` are `/connect`'s (used when
+/// `<name>` isn't open yet), and `n` is `/fg`'s (used when it already is - see
+/// `cmd_fg`'s own `-n` doc comment for why that's a no-op in Clay). Clay has
+/// no single generic "connect with these flags" entry point, so the connect-
+/// side letters collapse onto the existing granular Commands below:
+///   -b            -> WorldConnectBackground (background always wins)
+///   -l (no -b)    -> WorldConnectNoLogin
+///   neither       -> WorldSwitch (Clay's default: foreground and connect)
+/// `-f` is accepted, not distinct: it's already WorldSwitch's default when
+/// neither -f nor -b is given. `-q` (quiet login) is accepted, not distinct:
+/// Clay has no separate "quiet" login-message path to suppress. `-n` is
+/// accepted, not distinct for the *named*-world form (nothing to background -
+/// see cmd_fg); `-x` is honored only for the host+port form below, where
+/// there's no pre-existing world setting to fall back to.
 fn parse_world_command(args: &[&str]) -> Command {
     if args.is_empty() {
         return Command::WorldSelector;
     }
 
-    match args[0] {
-        "-e" => {
-            // /worlds -e [name] - edit world
-            let name = if args.len() > 1 {
-                Some(args[1..].join(" "))
-            } else {
-                None
-            };
-            Command::WorldEdit { name }
-        }
-        "-l" => {
-            // /worlds -l <name> - connect without auto-login
-            if args.len() > 1 {
-                Command::WorldConnectNoLogin { name: args[1..].join(" ") }
-            } else {
-                Command::Unknown { cmd: "/worlds -l".to_string() }
+    if args[0] == "-e" {
+        // /worlds -e [name] - edit world (Clay extra, unchanged)
+        let name = if args.len() > 1 { Some(args[1..].join(" ")) } else { None };
+        return Command::WorldEdit { name };
+    }
+
+    let mut no_login = false;
+    let mut background = false;
+    let mut force_ssl = false;
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i];
+        if tok.len() > 1 && tok.starts_with('-') && tok[1..].chars().all(|c| "lqnxfb".contains(c)) {
+            for c in tok[1..].chars() {
+                match c {
+                    'l' => no_login = true,
+                    'b' => background = true,
+                    'x' => force_ssl = true,
+                    _ => {} // q/n/f: accepted, not distinct - see doc comment
+                }
             }
+            i += 1;
+        } else {
+            break;
         }
-        "-b" => {
-            // /worlds -b <name> - connect in background without switching
-            if args.len() > 1 {
-                Command::WorldConnectBackground { name: args[1..].join(" ") }
-            } else {
-                Command::Unknown { cmd: "/worlds -b".to_string() }
-            }
-        }
-        _ => {
-            // /worlds <name> - switch to or connect to named world
-            Command::WorldSwitch { name: args.join(" ") }
-        }
+    }
+
+    let rest = &args[i..];
+    if rest.is_empty() {
+        return Command::WorldSelector;
+    }
+
+    // /world <host> <port> - TF's own second form. Exactly 2 remaining tokens
+    // is unambiguous: a Clay world name is always exactly 1 token (no spaces
+    // allowed, same rule /addworld enforces).
+    if rest.len() == 2 {
+        return Command::WorldConnectHostPort {
+            host: rest[0].to_string(),
+            port: rest[1].to_string(),
+            use_ssl: force_ssl,
+            no_login,
+            background,
+        };
+    }
+    let _ = force_ssl; // accepted, not distinct for the named-world form (see doc comment)
+
+    let name = rest.join(" ");
+    if background {
+        Command::WorldConnectBackground { name }
+    } else if no_login {
+        Command::WorldConnectNoLogin { name }
+    } else {
+        Command::WorldSwitch { name }
     }
 }
 
@@ -2409,17 +2571,34 @@ fn parse_import_command(args: &[&str]) -> Command {
     Command::Import { addr }
 }
 
-/// Parse /addworld command (TF-compatible world creation)
+/// Parse /addworld command (TF-compatible world creation, `/help addworld`)
 ///
 /// Formats:
-///   /addworld [-xe] [-Ttype] name [char pass] host port
-///   /addworld [-Ttype] name
+///   /addworld [-pxe] [-T<type>] [-s<srchost>] <name> [<char> <pass>] <host> <port> [<file>]
+///   /addworld [-T<type>] [-s<srchost>] <name>
+///   /addworld [-T<type>] DEFAULT [<char> <pass> [<file>]]
 ///
 /// Options:
 ///   -x  Use SSL/TLS
 ///   -e  Echo (ignored)
-///   -Ttype  World type (ignored, defaults to MUD)
 ///   -p  No proxy (ignored)
+///   -T<type>  World type (ignored, defaults to MUD)
+///   -s<srchost>  Local bind address for the connection - accepted, not
+///                persisted: `WorldSettings` has no such field, same
+///                treatment as -e/-p/-T's existing no-ops. `-T`/`-s` take the
+///                REST of their own token as an attached value (never
+///                bundled with other short flags) - critical for `-s`, since
+///                an unbundled per-char scan would misread a srchost value
+///                containing 'x'/'e'/'p' as those boolean flags.
+///   [<file>]  Per-world script loaded on connect - kept in the TF engine's
+///             own memory only (`world_info(name, "file")`), never a
+///             persisted `Command::AddWorld` field (finding 31 / plan Job
+///             14b). Stripped out here per stdlib.tf's own `/addworld`
+///             wrapper mapping (verified against its source): {#}<=4 tokens
+///             -> name,host,port,[file]; {#}>4 -> name,char,pass,host,port,
+///             [file].
+///   DEFAULT   Fallback character/password/file for any world missing its
+///             own (`Command::AddWorldDefault`, see its own doc comment).
 fn parse_addworld_command(args: &[&str]) -> Command {
     if args.is_empty() {
         return Command::Unknown { cmd: "/addworld".to_string() };
@@ -2431,12 +2610,13 @@ fn parse_addworld_command(args: &[&str]) -> Command {
     // Parse options
     for arg in args {
         if let Some(flags) = arg.strip_prefix('-') {
-            // Parse option flags
+            if flags.starts_with('T') || flags.starts_with('s') {
+                continue; // -T<type> / -s<srchost>: attached value, discarded (see doc comment)
+            }
             for c in flags.chars() {
                 match c {
                     'x' => use_ssl = true,
                     'e' | 'p' => {} // Ignored: echo, proxy
-                    'T' => break,   // -Ttype: skip the rest of this arg
                     _ => {}
                 }
             }
@@ -2445,122 +2625,167 @@ fn parse_addworld_command(args: &[&str]) -> Command {
         }
     }
 
-    // Remaining args interpretation:
-    // 1 arg:  name (connectionless world)
-    // 3 args: name host port
-    // 5 args: name char pass host port
-
-    match remaining_args.len() {
-        0 => Command::Unknown { cmd: "/addworld".to_string() },
-        1 => {
-            // Just name - connectionless world
-            Command::AddWorld {
-                name: remaining_args[0].to_string(),
-                host: None,
-                port: None,
-                user: None,
-                password: None,
-                use_ssl,
-            }
-        }
-        2 => {
-            // name host (assume default port or error)
-            Command::AddWorld {
-                name: remaining_args[0].to_string(),
-                host: Some(remaining_args[1].to_string()),
-                port: None,
-                user: None,
-                password: None,
-                use_ssl,
-            }
-        }
-        3 => {
-            // name host port
-            Command::AddWorld {
-                name: remaining_args[0].to_string(),
-                host: Some(remaining_args[1].to_string()),
-                port: Some(remaining_args[2].to_string()),
-                user: None,
-                password: None,
-                use_ssl,
-            }
-        }
-        4 => {
-            // Could be: name char host port (missing pass) or name char pass host (missing port)
-            // Assume: name char host port (user without password)
-            Command::AddWorld {
-                name: remaining_args[0].to_string(),
-                host: Some(remaining_args[2].to_string()),
-                port: Some(remaining_args[3].to_string()),
-                user: Some(remaining_args[1].to_string()),
-                password: None,
-                use_ssl,
-            }
-        }
-        _ => {
-            // 5+ args: name char pass host port [file]
-            Command::AddWorld {
-                name: remaining_args[0].to_string(),
-                host: Some(remaining_args[3].to_string()),
-                port: Some(remaining_args[4].to_string()),
-                user: Some(remaining_args[1].to_string()),
-                password: Some(remaining_args[2].to_string()),
-                use_ssl,
-            }
-        }
+    if remaining_args.is_empty() {
+        return Command::Unknown { cmd: "/addworld".to_string() };
     }
+
+    // /addworld [-T<type>] DEFAULT [<char> <pass> [<file>]]
+    if remaining_args[0].eq_ignore_ascii_case("default") {
+        let rest = &remaining_args[1..];
+        let (character, password, file) = match rest.len() {
+            0 => (None, None, None),
+            1 => (Some(rest[0].to_string()), None, None),
+            2 => (Some(rest[0].to_string()), Some(rest[1].to_string()), None),
+            _ => (Some(rest[0].to_string()), Some(rest[1].to_string()), Some(rest[2..].join(" "))),
+        };
+        return Command::AddWorldDefault { character, password, file };
+    }
+
+    let name = remaining_args[0];
+
+    // Trailing [<file>], per stdlib.tf's own /addworld wrapper mapping (see
+    // doc comment): exactly 4 raw tokens -> name,host,port,file; 6 or more ->
+    // name,char,pass,host,port,file. Everything else is unchanged from
+    // before (`core` is just `remaining_args` verbatim).
+    let (core, file): (&[&str], Option<String>) = match remaining_args.len() {
+        4 => (&remaining_args[..3], Some(remaining_args[3].to_string())),
+        n if n >= 6 => (&remaining_args[..5], Some(remaining_args[5..].join(" "))),
+        _ => (&remaining_args[..], None),
+    };
+
+    // core.len() interpretation (matches the pre-Job-14b mapping exactly,
+    // just parameterized over `core` instead of `remaining_args`):
+    // 1: name (connectionless)   2: name host   3: name host port
+    // 5+: name char pass host port
+    let (host, port, user, password) = match core.len() {
+        1 => (None, None, None, None),
+        2 => (Some(core[1].to_string()), None, None, None),
+        3 => (Some(core[1].to_string()), Some(core[2].to_string()), None, None),
+        _ => (
+            Some(core[3].to_string()),
+            Some(core[4].to_string()),
+            Some(core[1].to_string()),
+            Some(core[2].to_string()),
+        ),
+    };
+
+    Command::AddWorld { name: name.to_string(), host, port, user, password, use_ssl, file }
 }
 
 /// Parse /send command with flags
 fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
     let mut all_worlds = false;
     let mut target_world: Option<String> = None;
+    let mut world_type: Option<String> = None;
     let mut no_newline = false;
+    let mut run_hook = false;
     let mut text_start = 0;
 
     for (i, arg) in args.iter().enumerate() {
         if *arg == "-W" {
             all_worlds = true;
             text_start = i + 1;
+        } else if let Some(t) = arg.strip_prefix("-T") {
+            world_type = Some(t.to_string());
+            text_start = i + 1;
         } else if let Some(world) = arg.strip_prefix("-w") {
-            target_world = Some(world.to_string());
+            // Bare "-w" (blank world) means the current world - same as omitting
+            // -w entirely (/help send).
+            if !world.is_empty() {
+                target_world = Some(world.to_string());
+            }
             text_start = i + 1;
         } else if *arg == "-n" {
             no_newline = true;
+            text_start = i + 1;
+        } else if *arg == "-h" {
+            run_hook = true;
             text_start = i + 1;
         } else {
             break;
         }
     }
 
-    // Get the text after flags - use original string to preserve spacing
-    let text = if text_start < args.len() {
-        // Find position of first non-flag argument in original string
-        let mut pos = 0;
-        let mut found_flags = 0;
-        for c in full_cmd.chars() {
-            if found_flags > text_start { // +1 for /send itself
-                break;
-            }
-            if c.is_whitespace() && pos > 0 {
-                // Check if we just finished a word
-                let prev_nonws = full_cmd[..pos].chars().rev().find(|c| !c.is_whitespace());
-                if prev_nonws.is_some() {
-                    found_flags += 1;
-                }
-            }
-            pos += c.len_utf8();
+    let text = remaining_text_after_flags(args, full_cmd, text_start);
+
+    Command::Send { text, all_worlds, target_world, world_type, no_newline, run_hook }
+}
+
+/// Everything in `full_cmd` after the first `text_start` whitespace-delimited tokens,
+/// preserving the ORIGINAL spacing/casing of whatever follows (unlike `args`, which is
+/// already whitespace-split). Shared by every `/command [-flags] <free-form text>` parser
+/// that needs to recover that trailing text exactly - `/send` and `/log` (both take a
+/// message/filename that must not be re-split or re-joined with single spaces).
+fn remaining_text_after_flags(args: &[&str], full_cmd: &str, text_start: usize) -> String {
+    if text_start >= args.len() {
+        return String::new();
+    }
+    // Find position of first non-flag argument in original string
+    let mut pos = 0;
+    let mut found_flags = 0;
+    for c in full_cmd.chars() {
+        if found_flags > text_start {
+            break;
         }
-        // Skip whitespace after last flag
-        while pos < full_cmd.len() && full_cmd[pos..].starts_with(char::is_whitespace) {
-            pos += 1;
+        if c.is_whitespace() && pos > 0 {
+            // Check if we just finished a word
+            let prev_nonws = full_cmd[..pos].chars().rev().find(|c| !c.is_whitespace());
+            if prev_nonws.is_some() {
+                found_flags += 1;
+            }
         }
-        full_cmd[pos..].to_string()
+        pos += c.len_utf8();
+    }
+    // Skip whitespace after last flag
+    while pos < full_cmd.len() && full_cmd[pos..].starts_with(char::is_whitespace) {
+        pos += 1;
+    }
+    full_cmd[pos..].to_string()
+}
+
+/// Parse /log command with flags (`/help log`: `/LOG [-ligw[<world>]] [OFF|ON|<file>]`).
+fn parse_log_command(args: &[&str], full_cmd: &str) -> Command {
+    let mut world: Option<String> = None;
+    let mut log_input = false;
+    let mut log_local = false;
+    let mut log_global = false;
+    let mut text_start = 0;
+
+    for (i, arg) in args.iter().enumerate() {
+        if let Some(w) = arg.strip_prefix("-w") {
+            world = Some(w.to_string());
+            text_start = i + 1;
+        } else if *arg == "-i" {
+            log_input = true;
+            text_start = i + 1;
+        } else if *arg == "-l" {
+            log_local = true;
+            text_start = i + 1;
+        } else if *arg == "-g" {
+            log_global = true;
+            text_start = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    let action_text = remaining_text_after_flags(args, full_cmd, text_start);
+    let action_text = action_text.trim();
+    let any_selector = world.is_some() || log_input || log_local || log_global;
+
+    let action = if action_text.is_empty() {
+        // Real tf: "(none) with an -ligw option, same as ON"; "(none), with no option,
+        // lists all open logs".
+        if any_selector { LogAction::On } else { LogAction::Status }
+    } else if action_text.eq_ignore_ascii_case("off") {
+        LogAction::Off
+    } else if action_text.eq_ignore_ascii_case("on") {
+        LogAction::On
     } else {
-        String::new()
+        LogAction::File(action_text.to_string())
     };
 
-    Command::Send { text, all_worlds, target_world, no_newline }
+    Command::Log { world, log_input, log_local, log_global, action }
 }
 
 pub(crate) fn get_reload_state_path() -> PathBuf {
@@ -2828,6 +3053,12 @@ pub struct World {
     pub settings: WorldSettings,
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
+    /// TF's `/log <file>` (finding: real tf logs to an arbitrary path, not Clay's normal
+    /// auto-computed `logs/<name>.<date>.log`) - when set, `get_log_path` returns this
+    /// instead. Session-only, like `log_handle`/`log_date` themselves: not a `WorldSettings`
+    /// field, so it is intentionally NOT persisted to settings.dat or restored on `/reload` -
+    /// exactly like the open file handle it controls, it starts fresh every process/`/log ON`.
+    pub log_custom_path: Option<std::path::PathBuf>,
     pub scrollback_tx: Option<scrollback::ArchiveSender>,
     #[cfg(unix)]
     socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only)
@@ -3073,6 +3304,7 @@ impl World {
             settings: WorldSettings::default(),
             log_handle: None,
             log_date: None,
+            log_custom_path: None,
             scrollback_tx: None,
             socket_fd: None,
             proxy_socket_fd: None,
@@ -3149,8 +3381,12 @@ impl World {
         logs_dir
     }
 
-    /// Get the full path to this world's log file for the current date
+    /// Get the full path to this world's log file for the current date, or `log_custom_path`
+    /// verbatim when TF's `/log <file>` set one (see that field's doc comment).
     fn get_log_path(&self) -> std::path::PathBuf {
+        if let Some(ref custom) = self.log_custom_path {
+            return custom.clone();
+        }
         let date_str = Self::get_current_date_string();
         // Sanitize world name for use in filename (replace invalid chars with _)
         let safe_name: String = self.name.chars()
@@ -4176,13 +4412,31 @@ pub struct App {
     pub settings: Settings,
     pub confirm_dialog: ConfirmDialog,
     pub filter_popup: FilterPopup,
+    /// Job 15's `/relimit`: the most recently APPLIED `/limit` (not the currently open
+    /// one - `/unlimit` leaves this alone, so `/limit foo%; /unlimit%; /relimit`
+    /// reapplies `foo`, matching real tf's "/relimit repeats the last /limit").
+    last_limit: Option<(String, bool, bool, tf::TfMatchMode)>,
     pub search_popup: SearchPopup,
     /// Split-screen text editor for notes and files
     pub editor: EditorState,
     /// New unified popup manager (gradual migration from old popup types)
     pub popup_manager: popup::PopupManager,
     pub last_ctrl_c: Option<std::time::Instant>,
-    pub last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
+    /// Buffered multi-keystroke chord prefix (`^X` waiting for `^R`, a bare
+    /// `Escape` waiting for whatever follows it, ...) - replaces the old
+    /// `last_escape: Option<Instant>`, which only ever understood ONE
+    /// specific two-keystroke shape. See `chords.rs` (plan Phase 2 step
+    /// P2.2) and `chords::resolve_key_name`, the single lookup shared by
+    /// `input_handler::handle_key_event` and
+    /// `remote_client::handle_remote_client_key` (Job 17 found that pair
+    /// duplicated).
+    pub chord: chords::ChordState,
+    /// How long a buffered chord prefix stays alive without a continuation
+    /// before it's dropped (or, if it has its own binding, fired) - default
+    /// `chords::DEFAULT_CHORD_WINDOW` (500ms, matching the old hardcoded
+    /// Escape window exactly). Tests set this to `Duration::ZERO` to force
+    /// immediate expiry without sleeping for real.
+    pub chord_window: std::time::Duration,
     pub literal_next: bool, // When true, next keypress inserts literally (Ctrl+V)
     pub show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
     pub highlight_actions: bool, // F8 toggles - highlight lines matching action patterns
@@ -4237,6 +4491,24 @@ pub struct App {
     pub theme_file: theme::ThemeFile,
     /// Configurable keyboard bindings (TF defaults + user customizations from ~/.clay/keybindings.dat)
     pub keybindings: keybindings::KeyBindings,
+    /// Last `tf_bound_keys_json()` value actually broadcast to clients (TF-parity plan Job
+    /// 22a/P2.7) - `refresh_tf_bound_keys_if_changed`'s own cache, so a fresh
+    /// `GlobalSettingsUpdated` only goes out when a `/bind`/`/def -b`/`-B`/`/unbind`/
+    /// `/undef`/`/undefn`/`/undeft`/`/purge` actually changed the answer, not on every
+    /// typed command.
+    last_tf_bound_keys_json: String,
+    /// SSH remote-console client's own local mirror of the last `GlobalSettingsMsg::
+    /// tf_bound_keys_json` the server sent (TF-parity plan Job 22c), parsed in
+    /// `apply_global_settings`. Unlike the master server (which computes that list live
+    /// from its own `tf_engine.keybindings`/`macros` - see `App::tf_bound_keys_json`'s doc
+    /// comment), a `--console=host` client never runs the server's TF engine locally, so
+    /// this is the only way `remote_client::handle_remote_client_key` can tell "the server
+    /// has a `/bind`/`-b`/`-B` or `key_<name>` macro on this key" and route it through
+    /// `WsMessage::RunKeyBinding` instead of falling through to a local UI action -
+    /// mirrors app.js's `tfBoundKeys` Set exactly. Always empty for the master console
+    /// (the in-process `App` a `--console` server itself uses), which resolves bindings
+    /// directly through its own real `app.tf_engine` instead.
+    pub(crate) tf_bound_keys: std::collections::HashSet<String>,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Remote client mode: pending /update request (Some(force_flag))
@@ -4361,11 +4633,13 @@ impl App {
             settings: Settings::default(),
             confirm_dialog: ConfirmDialog::new(),
             filter_popup: FilterPopup::new(),
+            last_limit: None,
             search_popup: SearchPopup::new(),
             editor: EditorState::new(),
             popup_manager: popup::PopupManager::new(),
             last_ctrl_c: None,
-            last_escape: None,
+            chord: chords::ChordState::new(),
+            chord_window: chords::DEFAULT_CHORD_WINDOW,
             literal_next: false,
             show_tags: false, // Default: hide tags
             highlight_actions: false, // Default: don't highlight action matches
@@ -4392,7 +4666,9 @@ impl App {
             user_connections: std::collections::HashMap::new(),
             tf_engine: tf::TfEngine::new(),
             theme_file: theme::ThemeFile::with_defaults(),
-            keybindings: keybindings::KeyBindings::tf_defaults(),
+            keybindings: keybindings::KeyBindings::defaults(),
+            last_tf_bound_keys_json: String::new(),
+            tf_bound_keys: std::collections::HashSet::new(),
             ws_client_tx: None, // Set when running as remote client (--console mode)
             pending_update: None,
             pending_reload: false,
@@ -4491,6 +4767,58 @@ impl App {
         self.theme_file.get(self.settings.gui_theme.name())
     }
 
+    /// JSON array of every canonical key name (`crate::keynames` grammar) currently
+    /// answered by a `/bind`/`-b`/`-B` macro (`tf_engine.keybindings`, the console's own
+    /// lookup cache - see `chords::resolve_bound_command`) OR a `key_<name>` macro
+    /// (`tf_engine.macros`, Job 21/P2.5's named-key layer) - TF-parity plan Job 22a/P2.7.
+    /// These are console-only customizations today: a web/GUI client has no way to learn
+    /// about them, so pressing that key there just runs the client's own built-in action
+    /// (or nothing) instead of the bound command. Sent as `GlobalSettingsMsg::
+    /// tf_bound_keys_json` so a client can check this list before running its own action
+    /// and, for a hit, send `WsMessage::RunKeyBinding` instead (Job 22b's own JS side).
+    pub fn tf_bound_keys_json(&self) -> String {
+        let mut keys: std::collections::BTreeSet<String> =
+            self.tf_engine.keybindings.keys().cloned().collect();
+        for m in &self.tf_engine.macros {
+            let lname = m.name.to_ascii_lowercase();
+            if let Some(tf_name) = lname.strip_prefix("key_") {
+                if let Ok(token) = keynames::tf_name_to_token(tf_name) {
+                    keys.insert(keynames::KeySeq(vec![token]).canonical());
+                }
+            }
+        }
+        let mut json = String::from("[");
+        for (i, key) in keys.iter().enumerate() {
+            if i > 0 { json.push(','); }
+            json.push('"');
+            json.push_str(&key.replace('\\', "\\\\").replace('"', "\\\""));
+            json.push('"');
+        }
+        json.push(']');
+        json
+    }
+
+    /// Recompute `tf_bound_keys_json()` and, if it actually changed since the last time
+    /// this was called, broadcast a fresh `GlobalSettingsUpdated` so every connected
+    /// web/GUI client learns about a new/removed `/bind`, `/def -b`/`-B`, `/unbind`,
+    /// `/undef`, `/undefn`, `/undeft` or `/purge` right away (TF-parity plan Job 22a/P2.7).
+    /// Cheap enough to call after every typed command: a string compare against the last
+    /// value actually broadcast, no serialization unless it changed. Called from the
+    /// console's own per-typed-command loop (`apply_pending_tf_console_ops`) and from the
+    /// tail of `handle_ws_send_command`/`daemon::handle_daemon_ws_message`, which between
+    /// them cover every place a `/bind`-family command can run in single-user mode.
+    pub(crate) fn refresh_tf_bound_keys_if_changed(&mut self) {
+        let fresh = self.tf_bound_keys_json();
+        if fresh != self.last_tf_bound_keys_json {
+            self.last_tf_bound_keys_json = fresh;
+            let settings_msg = self.build_global_settings_msg();
+            self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                settings: settings_msg,
+                input_height: self.input_height,
+            });
+        }
+    }
+
     /// Build a GlobalSettingsMsg from current app state
     pub fn build_global_settings_msg(&self) -> GlobalSettingsMsg {
         GlobalSettingsMsg {
@@ -4542,6 +4870,7 @@ impl App {
             icon_bar: self.settings.icon_bar.name().to_string(),
             theme_colors_json: self.gui_theme_colors().to_json(),
             keybindings_json: self.keybindings.to_json(),
+            tf_bound_keys_json: self.tf_bound_keys_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
             ws_password: self.settings.websocket_password.clone(),
         }
@@ -4621,6 +4950,15 @@ impl App {
         if !settings.keybindings_json.is_empty() {
             self.keybindings = keybindings::KeyBindings::from_json(&settings.keybindings_json);
         }
+        // TF-parity plan Job 22c: sync the SSH remote console's own local mirror of the
+        // server's `/bind`/`-b`/`-B`/`key_<name>`-bound keys (see `App::tf_bound_keys`'s
+        // doc comment). A web/GUI client re-parses `tf_bound_keys_json` on every
+        // `GlobalSettingsMsg` unconditionally (app.js), not just when non-empty - an empty
+        // array is a real, meaningful state (every binding just got `/unbind`/`/purge`d),
+        // not "field absent", so this must clear `tf_bound_keys` rather than leave it stale.
+        self.tf_bound_keys = serde_json::from_str::<Vec<String>>(&settings.tf_bound_keys_json)
+            .map(|keys| keys.into_iter().collect())
+            .unwrap_or_default();
     }
 
     /// Ensure there's at least one world (creates initial world if needed)
@@ -4724,15 +5062,37 @@ impl App {
             cursor_position: self.input.cursor_position,
         };
 
+        // TF-parity plan Job 20 (P2.4): mirror `kbnum`/`insert` into the engine as plain
+        // global variables, so a key-bound `/bind` TF command (and, once Job 21 adds the
+        // `dokey_<name>`/kbfunc.tf wrapper layer, a real kbfunc.tf macro) can read
+        // `%kbnum`/`%insert` the same way real TF's keybinding layer does (tf-help
+        // #kbnum: "when any other keybinding is typed, that keybinding may use the value
+        // of %kbnum"). The reverse sync - reading back whatever the command left them at,
+        // and unconditionally clearing kbnum - happens in `process_pending_keyboard_ops`,
+        // called right after `execute()` at this function's own call site.
+        self.tf_engine.set_global("kbnum", tf::TfValue::Integer(self.input.kbnum.unwrap_or(0)));
+        self.tf_engine.set_global("insert", tf::TfValue::Integer(if self.input.insert { 1 } else { 0 }));
+
         // Sync ban list snapshot for TF's own /ban (cmd_banlist) - see ban_info_cache's
         // doc comment. get_ban_info() is a few RwLock reads over what's normally an empty
         // or tiny list, cheap enough to refresh unconditionally like world_info_cache above.
         self.tf_engine.ban_info_cache = self.ban_list.get_ban_info();
     }
 
-    /// Process pending keyboard operations from TF functions
-    fn process_pending_keyboard_ops(&mut self) {
+    /// Process pending keyboard operations from TF functions and `/dokey`.
+    ///
+    /// Most ops (`Goto`/`Delete`/`WordLeft`/`WordRight`/`Insert`) mutate `self.input`
+    /// directly and produce no observable `KeyAction` - they're plain buffer edits.
+    /// `PendingKeyboardOp::Dokey` names need real App/World state that `cmd_dokey` can't
+    /// reach on its own (`World::paused`, scrollback, the world list, ...) - see
+    /// `perform_dokey` - and some of them (NEWLINE submitting the input, REDRAW/REFRESH
+    /// repainting, SOCKETB/SOCKETF switching worlds) resolve to the same `KeyAction` a live
+    /// key press would produce. The caller must handle the returned actions the same way it
+    /// handles `handle_key_event`'s result (see the call site in `run_app`, inside the
+    /// `KeyAction::SendCommand` arm's `/dokey` sub-branch).
+    fn process_pending_keyboard_ops(&mut self) -> Vec<KeyAction> {
         let ops: Vec<tf::PendingKeyboardOp> = self.tf_engine.pending_keyboard_ops.drain(..).collect();
+        let mut actions = Vec::new();
         for op in ops {
             match op {
                 tf::PendingKeyboardOp::Goto(pos) => {
@@ -4783,15 +5143,103 @@ impl App {
                     }
                     self.input.cursor_position = pos;
                 }
-                tf::PendingKeyboardOp::Insert(text) => {
+                tf::PendingKeyboardOp::Insert(text, was_insert) => {
                     let chars: Vec<char> = self.input.buffer.chars().collect();
                     let pos = self.input.cursor_position.min(chars.len());
                     let before: String = chars[..pos].iter().collect();
-                    let after: String = chars[pos..].iter().collect();
-                    self.input.buffer = format!("{}{}{}", before, text, after);
-                    self.input.cursor_position = pos + text.chars().count();
+                    if was_insert {
+                        let after: String = chars[pos..].iter().collect();
+                        self.input.buffer = format!("{}{}{}", before, text, after);
+                        self.input.cursor_position = pos + text.chars().count();
+                    } else {
+                        // Overwrite mode (TF's `%insert` off at push time - see
+                        // `PendingKeyboardOp::Insert`'s doc comment): replace characters
+                        // starting at the cursor instead of pushing the rest of the line
+                        // forward.
+                        let text_chars: Vec<char> = text.chars().collect();
+                        let overwrite_end = (pos + text_chars.len()).min(chars.len());
+                        let after: String = chars[overwrite_end..].iter().collect();
+                        self.input.buffer = format!("{}{}{}", before, text, after);
+                        self.input.cursor_position = pos + text_chars.len();
+                    }
+                }
+                tf::PendingKeyboardOp::Dokey(name) => {
+                    if let Some(action) = self.perform_dokey(name) {
+                        actions.push(action);
+                    }
                 }
             }
+        }
+
+        // TF-parity plan Job 20 (P2.4): read back `%insert` (a command may have changed it,
+        // e.g. a plain `/set insert=0`) and unconditionally clear `%kbnum` on both sides -
+        // tf-help #kbnum: "Whether the keybinding uses the value or not, %kbnum is cleared
+        // after the keybinding has run." Paired with `sync_tf_world_info`'s mirror *into*
+        // the engine right before `execute()`, at the same call site (`run_app`'s
+        // `KeyAction::SendCommand` handling) this function's own doc comment already points
+        // at for `/dokey`.
+        self.input.insert = self.tf_engine.insert_mode();
+        self.input.clear_kbnum();
+        self.tf_engine.unset_global("kbnum");
+
+        actions
+    }
+
+    /// Perform one `/dokey` name against real App/World state (see
+    /// `process_pending_keyboard_ops`'s doc comment). Returns the `KeyAction` the caller
+    /// must additionally act on, if any. Reuses `input_handler::dispatch_action` with an
+    /// existing action id wherever one already does the right thing, so keys and `/dokey`
+    /// share the same code path; the handful with no action at all (UP/DOWN's pure cursor
+    /// motion, NEWLINE) are implemented directly here instead. Job 19 (plan Phase 2 step
+    /// P2.3) gave the rest of the previously bespoke names real action ids - CLEAR, PAUSE,
+    /// RECALLBEG/RECALLEND, and the half-page/one-line scroll directions - and this now
+    /// calls `dispatch_action` for every one of them instead of duplicating their bodies.
+    fn perform_dokey(&mut self, name: tf::DokeyName) -> Option<KeyAction> {
+        use tf::DokeyName::*;
+        match name {
+            BackwardWord => { dispatch_action("delete_word_backward", self); None }
+            ForwardWord => { dispatch_action("delete_word_forward", self); None }
+            KillToEol => { dispatch_action("kill_to_end", self); None }
+            // Pure cursor motion - no history fallback (that's the key's job, not
+            // /dokey UP/DOWN's; see finding A in the TF-parity plan).
+            CursorUp => { self.input.move_cursor_up(); None }
+            CursorDown => { self.input.move_cursor_down(); None }
+            Newline => {
+                let input = self.input.take_input();
+                if input.is_empty() && !self.current_world().connected {
+                    return None;
+                }
+                // /dump is passive — don't reset more-mode state (mirrors the real Enter
+                // key in input_handler::handle_key_event).
+                if !input.trim().eq_ignore_ascii_case("/dump") {
+                    self.current_world_mut().reset_more_mode_on_send();
+                }
+                Some(KeyAction::SendCommand(input))
+            }
+            HistoryPrev => { dispatch_action("history_prev", self); None }
+            HistoryNext => { dispatch_action("history_next", self); None }
+            HistoryBegin => { dispatch_action("recall_begin", self); None }
+            HistoryEnd => { dispatch_action("recall_end", self); None }
+            HistorySearchBack => { dispatch_action("history_search_backward", self); None }
+            HistorySearchForward => { dispatch_action("history_search_forward", self); None }
+            // SOCKETB/SOCKETF cycle CONNECTED worlds only, in list order (see
+            // `cycle_connected_world`'s doc comment) - NOT world_prev/world_next's
+            // alphabetical/unseen-first cycling over "active" worlds, which is what these
+            // used to (incorrectly) share.
+            WorldPrev => Some(dispatch_action("world_socket_prev", self)),
+            WorldNext => Some(dispatch_action("world_socket_next", self)),
+            Redraw => Some(dispatch_action("redraw", self)),
+            ClearView => { dispatch_action("clear_screen", self); None }
+            Pause => { dispatch_action("pause_output", self); None }
+            LiteralNext => { dispatch_action("literal_next", self); None }
+            PageForward => { dispatch_action("scroll_page_down", self); None }
+            PageBackward => { dispatch_action("scroll_page_up", self); None }
+            HalfPageForward => { dispatch_action("scroll_half_page", self); None }
+            HalfPageBackward => { dispatch_action("scroll_half_page_back", self); None }
+            LineForward => { dispatch_action("scroll_line_forward", self); None }
+            LineBackward => { dispatch_action("scroll_line_back", self); None }
+            Flush => { dispatch_action("flush_output", self); None }
+            SelectiveFlush => { dispatch_action("selective_flush", self); None }
         }
     }
 
@@ -6392,6 +6840,39 @@ impl App {
         }
     }
 
+    /// Cycle to the previous (`direction < 0`) or next (`direction > 0`) CONNECTED world, in
+    /// `self.worlds` list order - TF's SOCKETB/SOCKETF (`/fg -<`/`/fg ->`, Job 14b's
+    /// `cmd_fg`), exposed here as actions `world_socket_prev`/`world_socket_next` (plan Job
+    /// 19). Deliberately NOT `next_world`/`prev_world`'s alphabetical/unseen-first cycling
+    /// over "active" worlds (connected OR with unseen/pending output) - this only considers
+    /// worlds that are actually connected, in the order they appear in `self.worlds` (the
+    /// same order `sync_tf_world_info` builds `tf_engine.world_info_cache` in, so this
+    /// matches what `/fg -</->` itself would cycle to without needing that cache to be
+    /// fresh). Returns `None` (and does not call `switch_world`) when there's nothing to
+    /// cycle to - no connected worlds at all, or only the current one - mirroring
+    /// `util::calculate_world_switch`'s own "no-op switch" convention.
+    fn cycle_connected_world(&mut self, direction: i32) -> Option<usize> {
+        let connected: Vec<usize> = self.worlds.iter().enumerate()
+            .filter(|(_, w)| w.connected)
+            .map(|(i, _)| i)
+            .collect();
+        if connected.is_empty() {
+            return None;
+        }
+        let current_pos = connected.iter().position(|&i| i == self.current_world_index);
+        let len = connected.len() as i32;
+        let target_pos = match current_pos {
+            Some(pos) => (((pos as i32 + direction) % len) + len) % len,
+            None => 0,
+        };
+        let target = connected[target_pos as usize];
+        if target == self.current_world_index {
+            return None;
+        }
+        self.switch_world(target);
+        Some(target)
+    }
+
     fn find_world(&self, name: &str) -> Option<usize> {
         self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name))
     }
@@ -7489,6 +7970,46 @@ impl App {
         self.emit_client_text(world_idx, &format!("Error: {}", err), is_daemon_mode);
     }
 
+    /// Fire a TF hook event with `arg` as its argument text, and dispatch
+    /// whatever the matching macro(s) produced through the same channels every
+    /// other TF-result dispatch site uses: messages/errors via
+    /// `emit_client_text`/`emit_tf_error`, `SendToMud` forwarded to
+    /// `world_idx`'s own connection, `ClayCommand` run back through the TF
+    /// engine. This is the ONE shared helper every hook-firing call site uses
+    /// (CLAUDE.md: "prefer one shared helper over patching a copy") - the
+    /// pre-Job-10 CONNECT/DISCONNECT call sites each hand-rolled this dispatch
+    /// 3-4 times, and every one of those copies silently dropped `messages`/
+    /// `errors` (a `/def -hCONNECT foo = /echo hi` never showed "hi" on a real
+    /// connect) - see finding C.10 / plan step P1.9.
+    ///
+    /// `world_idx`: `None` when there is no live world context at all (GMCP/
+    /// MSDP can fire before any world exists) - messages/errors/sends are
+    /// simply skipped in that case, only `clay_commands` still run.
+    ///
+    /// Returns whether a non-quiet macro matched - SEND callers use this to
+    /// decide whether the original text should still be sent (see `/help
+    /// hooks`'s SEND rule).
+    pub(crate) fn fire_tf_hook(&mut self, world_idx: Option<usize>, event: tf::TfHookEvent, arg: &str, is_daemon_mode: bool) -> bool {
+        let hook_result = tf::bridge::fire_event(&mut self.tf_engine, event, arg);
+        if let Some(idx) = world_idx {
+            for msg in &hook_result.messages {
+                self.emit_client_text(idx, msg, is_daemon_mode);
+            }
+            for err in &hook_result.errors {
+                self.emit_tf_error(idx, err, is_daemon_mode);
+            }
+            for cmd in &hook_result.send_commands {
+                if let Some(tx) = self.worlds.get(idx).and_then(|w| w.command_tx.as_ref()) {
+                    let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
+                }
+            }
+        }
+        for cmd in &hook_result.clay_commands {
+            let _ = self.tf_engine.execute(cmd);
+        }
+        hook_result.matched_non_quiet
+    }
+
     /// `Command::*Usage` rendering (e.g. `/dict` with no args). One shared copy so the text
     /// stays consistent — the WS/daemon copies used to carry only the bare "Usage: /dict
     /// <word>" line, missing the explanation/example lines console's version had.
@@ -7836,7 +8357,7 @@ impl App {
             WsMessage::SendCommand { .. } | WsMessage::SwitchWorld { .. } |
             WsMessage::ReleasePending { .. } | WsMessage::SelectiveFlush { .. } |
             WsMessage::MarkWorldSeen { .. } | WsMessage::ConnectWorld { .. } |
-            WsMessage::DisconnectWorld { .. }
+            WsMessage::DisconnectWorld { .. } | WsMessage::RunKeyBinding { .. }
         );
         if !is_user_action {
             return;
@@ -9544,7 +10065,8 @@ impl App {
                     }
                 }
 
-                let tr = process_triggers(line, &world_name_for_triggers, &actions, &mut self.tf_engine);
+                let world_type_for_triggers = self.worlds[world_idx].settings.world_type.name();
+                let tr = process_triggers(line, &world_name_for_triggers, world_type_for_triggers, &actions, &mut self.tf_engine);
                 commands_to_execute.extend(tr.send_commands);
                 tf_commands_to_execute.extend(tr.clay_commands);
                 tf_messages.extend(tr.messages);
@@ -9723,11 +10245,11 @@ impl App {
 
     /// Handle Disconnected event for a world.
     fn handle_disconnected(&mut self, world_idx: usize) {
-        // Fire TF DISCONNECT hook before cleaning up
-        let hook_result = tf::bridge::fire_event(&mut self.tf_engine, tf::TfHookEvent::Disconnect);
-        for cmd in hook_result.clay_commands {
-            let _ = self.tf_engine.execute(&cmd);
-        }
+        // Fire TF DISCONNECT hook before cleaning up - see /help hooks:
+        // "DISCONNECT world, reason". Clay doesn't track a disconnect reason
+        // string yet, so the world name is the whole argument text for now.
+        let world_name = self.worlds[world_idx].name.clone();
+        self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Disconnect, &world_name, false);
 
         let more_mode = self.settings.more_mode_enabled;
         // Push prompt to output before clearing
@@ -10051,8 +10573,8 @@ impl App {
         if self.worlds[world_idx].gmcp_user_enabled {
             self.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.to_string()));
             self.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.to_string()));
-            let results = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Gmcp);
-            for r in results {
+            let outcome = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Gmcp, package);
+            for r in outcome.results {
                 if let crate::tf::TfCommandResult::SendToMud(text) = r {
                     self.send_to_world(world_idx, text);
                 }
@@ -10066,8 +10588,8 @@ impl App {
         // Fire TF MSDP hook
         self.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.to_string()));
         self.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.to_string()));
-        let results = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Msdp);
-        for r in results {
+        let outcome = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Msdp, variable);
+        for r in outcome.results {
             if let crate::tf::TfCommandResult::SendToMud(text) = r {
                 self.send_to_world(world_idx, text);
             }
@@ -10561,14 +11083,11 @@ impl App {
                 }
             }
 
-            // Fire TF CONNECT hook
-            let hook_result = tf::bridge::fire_event(&mut self.tf_engine, tf::TfHookEvent::Connect);
-            for cmd in hook_result.send_commands {
-                let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
-            }
-            for cmd in hook_result.clay_commands {
-                let _ = self.tf_engine.execute(&cmd);
-            }
+            // Fire TF CONNECT hook - see /help hooks: "CONNECT world, cipher".
+            // Clay doesn't track a cipher name, so the world name is the whole
+            // argument text.
+            let world_name_for_hook = self.worlds[world_idx].name.clone();
+            self.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Connect, &world_name_for_hook, false);
 
             // Send auto-login if configured
             let skip_login = self.worlds[world_idx].skip_auto_login;
@@ -10630,9 +11149,21 @@ impl App {
     }
 
     /// Handle WsMessage::SendCommand - processes the command and returns a WsAsyncAction
-    /// if an async operation (connect/disconnect) is needed.
-    #[allow(clippy::too_many_lines)]
+    /// if an async operation (connect/disconnect) is needed. Thin wrapper around
+    /// `handle_ws_send_command_impl` that also refreshes `tf_bound_keys_json` afterward
+    /// (TF-parity plan Job 22a/P2.7) - a `/bind`/`/def -b`/`-B`/`/unbind`/`/undef`/
+    /// `/undefn`/`/undeft`/`/purge` typed by any WS/GUI/web client reaches the TF engine
+    /// through here, so this is the one place in the single-user master's WS dispatch that
+    /// must check afterward (see `App::refresh_tf_bound_keys_if_changed`'s own doc comment
+    /// for why a cheap string-compare-then-broadcast beats inspecting the command text).
     fn handle_ws_send_command(&mut self, client_id: u64, world_index: usize, command: &str, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
+        let result = self.handle_ws_send_command_impl(client_id, world_index, command, event_tx);
+        self.refresh_tf_bound_keys_if_changed();
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_ws_send_command_impl(&mut self, client_id: u64, world_index: usize, command: &str, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
         // Determine the current world name for action world-scoping.
         let world_name = self.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
         // For slash-less input, rewrite "name args" → "/name args" when "name" matches an
@@ -10787,78 +11318,11 @@ impl App {
             Command::Unknown { cmd } => {
                 self.emit_client_text(world_index, &format!("Unknown command: {}", cmd), false);
             }
-            Command::Send { text, all_worlds, target_world, no_newline } => {
-                // Handle /send command
-                // Helper to create the write command
-                let make_write_cmd = |t: &str| -> WriteCommand {
-                    if no_newline {
-                        WriteCommand::Raw(t.as_bytes().to_vec())
-                    } else {
-                        WriteCommand::Text(t.to_string())
-                    }
-                };
-
-                if all_worlds {
-                    // Send to all connected worlds
-                    let mut sent_count = 0;
-                    for world in self.worlds.iter_mut() {
-                        if world.connected {
-                            if let Some(tx) = &world.command_tx {
-                                if tx.try_send(make_write_cmd(&text)).is_ok() {
-                                    world.last_send_time = Some(std::time::Instant::now());
-                                    sent_count += 1;
-                                }
-                            }
-                        }
-                    }
-                    if sent_count == 0 {
-                        self.emit_client_text(world_index, "No connected worlds to send to.", false);
-                    }
-                } else if let Some(ref target) = target_world {
-                    // Send to specific world by name
-                    if let Some(world) = self.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
-                        if world.connected {
-                            if let Some(tx) = &world.command_tx {
-                                let _ = tx.try_send(make_write_cmd(&text));
-                                world.last_send_time = Some(std::time::Instant::now());
-                            }
-                        } else {
-                            self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                                world_index,
-                                data: format!("World '{}' is not connected.", target),
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
-                            });
-                        }
-                    } else {
-                        // Wording matches the console copy (commands.rs) exactly.
-                        self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                            world_index,
-                            data: format!("World '{}' not found.", target),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
-                        });
-                    }
-                } else {
-                    // Send to current world (the one this command came from)
-                    if world_index < self.worlds.len() {
-                        if !self.worlds[world_index].connected {
-                            self.emit_client_text(world_index, "Not connected. Use /worlds to connect.", false);
-                        } else if let Some(tx) = &self.worlds[world_index].command_tx {
-                            if tx.try_send(make_write_cmd(&text)).is_ok() {
-                                self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                            } else {
-                                self.emit_client_text(world_index, "Failed to send command.", false);
-                            }
-                        }
-                    }
-                }
+            Command::Send { text, all_worlds, target_world, world_type, no_newline, run_hook } => {
+                execute_send_command(self, &text, all_worlds, &target_world, &world_type, no_newline, run_hook, world_index, false);
+            }
+            Command::Log { world, log_input, log_local: _, log_global: _, action } => {
+                execute_log_command(self, &world, log_input, &action, world_index, false);
             }
             Command::RemoteAttach { addr, close, cancel } => {
                 // Only the master's own local GUI webview (connected from loopback) may
@@ -10896,40 +11360,8 @@ impl App {
                     }
                 }
             }
-            Command::Disconnect => {
-                // Disconnect the specified world
-                if world_index < self.worlds.len() && self.worlds[world_index].connected {
-                    // Kill proxy process if one exists
-                    #[cfg(unix)]
-                    if let Some(proxy_pid) = self.worlds[world_index].proxy_pid {
-                        unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
-                    }
-                    #[cfg(windows)]
-                    if let Some(proxy_pid) = self.worlds[world_index].proxy_pid {
-                        crate::platform::kill_proxy_process(proxy_pid);
-                    }
-                    self.worlds[world_index].clear_connection_state(true, true);
-                    self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                        world_index,
-                        data: "Disconnected.".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0, end_seq: None,
-                        flush: false, gagged: false, highlight_colors: Vec::new(),
-                    });
-                    self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
-                } else {
-                    self.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                        world_index,
-                        data: "Not connected.".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0, end_seq: None,
-                        flush: false, gagged: false, highlight_colors: Vec::new(),
-                    });
-                }
+            Command::Disconnect { world } => {
+                execute_disconnect_command(self, &world, world_index, false);
             }
             Command::Flush => {
                 // Clear output buffer for this world
@@ -11140,57 +11572,20 @@ impl App {
                 });
             }
             // AddWorld - add or update world definition
-            Command::AddWorld { name, host, port, user, password, use_ssl } => {
-                let existing_idx = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
-
-                let world_idx = if let Some(idx) = existing_idx {
-                    idx
-                } else {
-                    // Validate name - matches console's checks (commands.rs), missing here
-                    // before meant a web/GUI/Android client could create a broken world entry.
-                    if name.is_empty() {
-                        self.emit_client_text(world_index, "Error: World name cannot be empty", false);
-                        return WsAsyncAction::Done;
-                    }
-                    if name.contains(' ') {
-                        self.emit_client_text(world_index, "Error: World name cannot contain spaces", false);
-                        return WsAsyncAction::Done;
-                    }
-                    if name.starts_with('(') {
-                        self.emit_client_text(world_index, "Error: World name cannot start with '('", false);
-                        return WsAsyncAction::Done;
-                    }
-                    let new_world = World::new(&name);
-                    self.worlds.push(new_world);
-                    self.worlds.len() - 1
-                };
-
-                if let Some(h) = host {
-                    self.worlds[world_idx].settings.hostname = h;
+            Command::AddWorld { name, host, port, user, password, use_ssl, file } => {
+                execute_add_world_command(self, name, host, port, user, password, use_ssl, file, world_index, false);
+            }
+            Command::AddWorldDefault { character, password, file } => {
+                execute_add_world_default_command(self, character, password, file, world_index, false);
+            }
+            Command::RemoveWorld { names } => {
+                execute_remove_world_command(self, &names, world_index, false);
+            }
+            Command::WorldConnectHostPort { host, port, use_ssl, no_login, background } => {
+                match prepare_world_connect_host_port(self, &host, &port, use_ssl, no_login, background) {
+                    Ok(followup) => return self.handle_ws_send_command(client_id, world_index, &followup, event_tx),
+                    Err(e) => self.emit_client_text(world_index, &e, false),
                 }
-                if let Some(p) = port {
-                    self.worlds[world_idx].settings.port = p;
-                }
-                if let Some(u) = user {
-                    self.worlds[world_idx].settings.user = u;
-                }
-                if let Some(p) = password {
-                    self.worlds[world_idx].settings.password = p;
-                }
-                self.worlds[world_idx].settings.use_ssl = use_ssl;
-
-                let _ = persistence::save_settings(self);
-
-                let action = if existing_idx.is_some() { "Updated" } else { "Added" };
-                let host_info = if !self.worlds[world_idx].settings.hostname.is_empty() {
-                    format!(" ({}:{}{})",
-                        self.worlds[world_idx].settings.hostname,
-                        self.worlds[world_idx].settings.port,
-                        if use_ssl { " SSL" } else { "" })
-                } else {
-                    " (connectionless)".to_string()
-                };
-                self.emit_client_text(world_index, &format!("{} world '{}'{}.", action, name, host_info), false);
             }
             // Connect command - needs async follow-up
             Command::Connect { .. } => {
@@ -11409,6 +11804,7 @@ impl App {
                     synchronous: false,
                     on_prompt: false,
                     priority: 0,
+                    kind: tf::ProcessKind::Quote,
                 });
             }
             None
@@ -11541,6 +11937,40 @@ impl App {
                 }
 
                 return self.handle_ws_send_command(client_id, world_index, &command, event_tx);
+            }
+            // TF-parity plan Job 22a/P2.7: a client learned via `GlobalSettingsMsg::
+            // tf_bound_keys_json` that `key` is bound by a `/bind`/`-b`/`-B` or `key_<name>`
+            // macro on this server, and is asking us to run it instead of its own built-in
+            // action. Resolved the exact same way the master console's own live keypress is
+            // (`chords::resolve_bound_command` - `/bind` first, then `key_<name>`), then
+            // executed via the same `handle_ws_send_command` path a typed command takes, so
+            // output routes back to this client exactly like any other command.
+            WsMessage::RunKeyBinding { key, kbnum } => {
+                if let Some(cmd) = chords::resolve_bound_command(self, &key) {
+                    let world_index = self.ws_client_worlds.get(&client_id)
+                        .map(|s| s.world_index)
+                        .unwrap_or(self.current_world_index);
+                    // `handle_ws_send_command_impl` calls `sync_tf_world_info()`, which
+                    // unconditionally sets the TF engine's `%kbnum` global FROM
+                    // `self.input.kbnum` (Job 20/P2.4's own console-side mirror) - so setting
+                    // the global directly here would just be clobbered the instant that runs.
+                    // Swapping the client's kbnum into `self.input.kbnum` for the duration of
+                    // this one dispatch reuses that exact same mirror with no new plumbing.
+                    // `self.input` is the interactive console's own local input area, not
+                    // this WS client's - restored right after so the console is never
+                    // observably affected (this whole handler runs synchronously on the one
+                    // event-loop thread, so no keypress can interleave in between).
+                    let prev_kbnum = self.input.kbnum;
+                    self.input.kbnum = kbnum;
+                    let async_action = self.handle_ws_send_command(client_id, world_index, &cmd, event_tx);
+                    self.input.kbnum = prev_kbnum;
+                    // tf-help #kbnum: "kbnum is cleared after the keybinding has run" -
+                    // unconditionally, whether or not the bound command actually consumed it.
+                    self.tf_engine.unset_global("kbnum");
+                    return async_action;
+                }
+                // Unknown key (stale client-side cache, or a race with an /unbind since the
+                // client last synced) - ignore silently, per the plan's own ruling.
             }
             WsMessage::SwitchWorld { world_index } => {
                 // Switch only the requesting client's world, not the console
@@ -12903,10 +13333,6 @@ impl App {
         }
     }
 
-    fn scroll_output_up(&mut self) {
-        self.scroll_output_up_rows(self.page_step());
-    }
-
     fn scroll_output_up_by(&mut self, lines: usize) {
         self.scroll_output_up_rows(lines.max(1));
     }
@@ -12931,7 +13357,25 @@ impl App {
     /// Release one screenful of pending lines and broadcast to WebSocket clients.
     /// Used by both Tab and PgDn when at the bottom and paused.
     pub(crate) fn release_pending_screenful(&mut self) {
-        let mut visual_budget = (self.output_height as usize).saturating_sub(2);
+        let visual_budget = (self.output_height as usize).saturating_sub(2);
+        self.release_pending_up_to(visual_budget);
+    }
+
+    /// `/dokey`'s forward-scroll names (HPAGE, LINE) share this: while paused and parked at
+    /// the bottom, "forward" means releasing pending output the same way Tab/PgDn do, just
+    /// with a smaller row budget; otherwise it's a plain viewport move.
+    fn dokey_scroll_forward(&mut self, rows: usize) {
+        if self.current_world().is_at_bottom() && self.current_world().paused {
+            self.release_pending_up_to(rows.max(1));
+        } else {
+            self.move_viewport_down(rows.max(1));
+        }
+    }
+
+    /// Core of `release_pending_screenful`, parameterized by row budget so
+    /// `dokey_scroll_forward`'s smaller HPAGE/LINE releases share the same partial-line and
+    /// broadcast handling instead of duplicating it.
+    fn release_pending_up_to(&mut self, mut visual_budget: usize) {
         let output_width = self.output_width as usize;
         let world_idx = self.current_world_index;
         let width = output_width.max(1);
@@ -16590,6 +17034,8 @@ pub async fn run_app_headless(
                     }
                     AppEvent::ConnectionFailed(world_name, error) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
+                            // CONFAIL hook - see /help hooks: "CONFAIL world, reason".
+                            app.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Confail, &format!("{} {}", world_name, error), false);
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                             // A pin mismatch needs the user to explicitly trust the new
                             // certificate (via the web/WebView CertMismatch dialog this
@@ -17114,6 +17560,36 @@ pub async fn run_app_headless(
             process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
         }
     }
+}
+
+/// Full terminal teardown/rebuild shared by `KeyAction::Redraw` and `KeyAction::Refresh`
+/// (TF-parity plan Job 19/P2.3) - the only difference between the two is whether the
+/// caller runs `World::filter_to_server_output` first (Redraw: Clay's historical ^L,
+/// action `redraw_server_only`; Refresh: TF's real plain repaint, action `refresh_line`),
+/// which this helper deliberately does NOT do, so it can't be called with the wrong one.
+fn perform_terminal_redraw(app: &mut App, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    // Always disable mouse capture to clear any stuck state
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    app.mouse_capture_active = false;
+    let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    enable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste,
+        Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
+    // Re-enable mouse capture only if a popup is currently visible
+    if app.settings.mouse_enabled && app.has_new_popup() {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        app.mouse_capture_active = true;
+    }
+    terminal.clear()?;
+    app.needs_output_redraw = true;
+    Ok(())
 }
 
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
@@ -18299,28 +18775,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // markers on the same lines are its own and must survive our
                             // Ctrl+L, exactly as they would if we weren't connected at all.
                             app.current_world_mut().filter_to_server_output();
-                            // Full terminal reset: unconditionally tear down and re-setup
-                            // Always disable mouse capture to clear any stuck state
-                            let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                            app.mouse_capture_active = false;
-                            let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-                            disable_raw_mode()?;
-                            execute!(std::io::stdout(), LeaveAlternateScreen)?;
-                            enable_raw_mode()?;
-                            execute!(
-                                std::io::stdout(),
-                                EnterAlternateScreen,
-                                crossterm::event::EnableBracketedPaste,
-                                Clear(ClearType::All),
-                                cursor::MoveTo(0, 0)
-                            )?;
-                            // Re-enable mouse capture only if a popup is currently visible
-                            if app.settings.mouse_enabled && app.has_new_popup() {
-                                let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                                app.mouse_capture_active = true;
-                            }
-                            terminal.clear()?;
-                            app.needs_output_redraw = true;
+                            perform_terminal_redraw(&mut app, &mut *terminal)?;
+                        }
+                        // TF's real REFRESH/^L: plain repaint, no line filtering (action
+                        // `refresh_line` - Job 22 makes this the new ^L default).
+                        KeyAction::Refresh => {
+                            perform_terminal_redraw(&mut app, &mut *terminal)?;
                         }
                         KeyAction::Connect => {
                             if !app.current_world().connected
@@ -18541,39 +19001,98 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.add_output("Internal error: not a command");
                                     }
                                     tf::TfCommandResult::UnknownCommand(cmd_name) => {
+                                        // NOMACRO hook: "name (% <name>: No such command or macro)" -
+                                        // see /help hooks and finding C.10 / plan step P1.9.
+                                        let world_idx_for_hook = app.current_world_index;
+                                        app.fire_tf_hook(Some(world_idx_for_hook), tf::TfHookEvent::Nomacro, &cmd_name, false);
                                         // Show the command with its original prefix
                                         let prefix = if cmd_name.starts_with("//") { "" } else { "/" };
                                         app.add_output(&format!("Unknown command: {}{}", prefix, cmd_name));
                                     }
-                                    tf::TfCommandResult::ExitLoad => {
+                                    tf::TfCommandResult::ExitLoad(_) => {
                                         // ExitLoad from command line means nothing (not in a file load)
                                         // This shouldn't normally happen since cmd_exit checks loading_files
                                     }
                                     tf::TfCommandResult::Return(_) => {
                                         // Return outside of macro execution - no-op
                                     }
+                                    tf::TfCommandResult::Result(val) => {
+                                        // Typed directly (not inside a macro), /result is being
+                                        // "called as a command" exactly like any other top-level
+                                        // command - see builtins::cmd_result's doc comment.
+                                        if !val.is_empty() {
+                                            let world_idx = app.current_world_index;
+                                            app.emit_client_text(world_idx, &val, false);
+                                        }
+                                    }
                                 }
                                 // Process any pending world operations from TF functions like addworld()
                                 process_pending_world_ops(&mut app);
                                 // Process any pending commands from TF macro execution
                                 process_pending_tf_commands(&mut app);
-                                // Process any pending keyboard operations from TF functions like kbgoto()
-                                app.process_pending_keyboard_ops();
+                                // Process any text queued by TF's echo() expression function
+                                process_pending_tf_outputs(&mut app);
+                                // Process /xtitle, /more, /wrap and the /limit family
+                                // (Job 15) - console-only, see its own doc comment.
+                                apply_pending_tf_console_ops(&mut app);
+                                // Process any pending keyboard operations from TF functions
+                                // like kbgoto(), and /dokey names that resolve to a
+                                // KeyAction (NEWLINE -> SendCommand, REDRAW -> Redraw,
+                                // SOCKETB/F -> SwitchedWorld). Handled the same way a live
+                                // key press's result is handled in the Key event arm above,
+                                // minus the splash-clear/history-rewrite/`/N` niceties that
+                                // are specific to an actual keystroke - see
+                                // App::process_pending_keyboard_ops's doc comment.
+                                for dokey_action in app.process_pending_keyboard_ops() {
+                                    match dokey_action {
+                                        KeyAction::SendCommand(text) => {
+                                            if !text.is_empty()
+                                                && handle_command(&text, &mut app, event_tx.clone()).await
+                                            {
+                                                return Ok(());
+                                            }
+                                        }
+                                        KeyAction::Redraw => {
+                                            app.current_world_mut().filter_to_server_output();
+                                            perform_terminal_redraw(&mut app, &mut *terminal)?;
+                                        }
+                                        KeyAction::Refresh => {
+                                            perform_terminal_redraw(&mut app, &mut *terminal)?;
+                                        }
+                                        // UnseenCleared is already broadcast by switch_world() itself.
+                                        KeyAction::SwitchedWorld(_) => {}
+                                        KeyAction::None
+                                        | KeyAction::Quit
+                                        | KeyAction::Connect
+                                        | KeyAction::Reload
+                                        | KeyAction::Suspend
+                                        | KeyAction::RunImport { .. } => {}
+                                    }
+                                }
                             } else if app.current_world().connected {
-                                if let Some(tx) = &app.current_world().command_tx {
-                                    let world_idx_for_record = app.current_world_index;
-                                    let cmd_for_record = cmd.clone();
-                                    if tx.send(WriteCommand::Text(cmd)).await.is_err() {
-                                        app.add_output("Failed to send command");
-                                    } else {
-                                        let now = std::time::Instant::now();
-                                        app.current_world_mut().last_send_time = Some(now);
-                                        app.current_world_mut().last_user_command_time = Some(now);
-                                        app.current_world_mut().prompt.clear();
-                                        // Reset more-mode counter after successfully sending command
-                                        // This ensures the counter is 0 when the server response arrives
-                                        app.current_world_mut().lines_since_pause = 0;
-                                        app.record_user_input(world_idx_for_record, &cmd_for_record);
+                                // SEND hook: typed plain text (not a "/" command - see
+                                // is_tf_command above) about to go to the MUD. A matching
+                                // non-quiet hook means the original text is NOT sent - this
+                                // is how alias.tf/spedwalk.tf/map.tf work (see /help hooks'
+                                // SEND rule and finding C.10 / plan step P1.9).
+                                let world_idx_for_hook = app.current_world_index;
+                                let suppressed = app.fire_tf_hook(Some(world_idx_for_hook), tf::TfHookEvent::Send, &cmd, false);
+                                if !suppressed {
+                                    if let Some(tx) = &app.current_world().command_tx {
+                                        let world_idx_for_record = app.current_world_index;
+                                        let cmd_for_record = cmd.clone();
+                                        if tx.send(WriteCommand::Text(cmd)).await.is_err() {
+                                            app.add_output("Failed to send command");
+                                        } else {
+                                            let now = std::time::Instant::now();
+                                            app.current_world_mut().last_send_time = Some(now);
+                                            app.current_world_mut().last_user_command_time = Some(now);
+                                            app.current_world_mut().prompt.clear();
+                                            // Reset more-mode counter after successfully sending command
+                                            // This ensures the counter is 0 when the server response arrives
+                                            app.current_world_mut().lines_since_pause = 0;
+                                            app.record_user_input(world_idx_for_record, &cmd_for_record);
+                                        }
                                     }
                                 }
                             } else {
@@ -18766,10 +19285,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
                             let world_name_for_triggers = world_name.clone();
+                            let world_type_for_triggers = app.worlds[world_idx].settings.world_type.name();
                             let actions = app.settings.actions.clone();
 
                             // Check action and TF triggers on the message
-                            let tr = process_triggers(&message, &world_name_for_triggers, &actions, &mut app.tf_engine);
+                            let tr = process_triggers(&message, &world_name_for_triggers, world_type_for_triggers, &actions, &mut app.tf_engine);
                             let commands_to_execute = tr.send_commands;
                             let tf_commands_to_execute = tr.clay_commands;
                             for msg in &tr.messages {
@@ -19021,6 +19541,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::ConnectionFailed(world_name, error) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
+                            // CONFAIL hook - see /help hooks: "CONFAIL world, reason".
+                            app.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Confail, &format!("{} {}", world_name, error), false);
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                             if let Some(mismatch) = app.check_and_broadcast_cert_mismatch(world_idx) {
                                 // Don't clobber a popup the user already has open; the
@@ -19693,10 +20215,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
                         let world_name_for_triggers = world_name.clone();
+                        let world_type_for_triggers = app.worlds[world_idx].settings.world_type.name();
                         let actions = app.settings.actions.clone();
 
                         // Check action and TF triggers on the message
-                        let tr = process_triggers(&message, &world_name_for_triggers, &actions, &mut app.tf_engine);
+                        let tr = process_triggers(&message, &world_name_for_triggers, world_type_for_triggers, &actions, &mut app.tf_engine);
                         let commands_to_execute = tr.send_commands;
                         let tf_commands_to_execute = tr.clay_commands;
                         for msg in &tr.messages {
@@ -19885,6 +20408,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Background connection failed
                 AppEvent::ConnectionFailed(world_name, error) => {
                     if let Some(world_idx) = app.find_world_index(&world_name) {
+                        // CONFAIL hook - see /help hooks: "CONFAIL world, reason".
+                        app.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Confail, &format!("{} {}", world_name, error), false);
                         app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                         if let Some(mismatch) = app.check_and_broadcast_cert_mismatch(world_idx) {
                             if app.popup_manager.current().is_none() {

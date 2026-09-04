@@ -1,0 +1,2 @@
+one=DEF all= count=0 rest= last= allbutlast=
+one=a all=a b c count=3 rest=b c last=c allbutlast=a b

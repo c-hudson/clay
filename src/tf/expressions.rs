@@ -62,6 +62,22 @@ pub enum Token {
     LBrace,      // { for variable substitution
     RBrace,      // }
 
+    // Command/expression/macro substitution operands - real TF's own
+    // "expressions" help lists these as legitimate Operand forms alongside
+    // string/numeric literals and {selector} ("Command substitutions like
+    // $(/listworlds -s)", "Macro substitutions like ${COMPRESS_SUFFIX}",
+    // and $[...] itself - accepted with a "legal, but redundant" warning -
+    // verified directly against real tf 5.0 beta 8). Each token carries the
+    // still-unsubstituted, balance-extracted text between its delimiters;
+    // it is resolved lazily by the evaluator (Expr::CommandSub/ExprSub/
+    // MacroSub), not eagerly during lexing, so a ternary/&&/|| branch that
+    // is never taken never runs its command substitution's side effects
+    // (lisp.tf's own `/unique` recursion depends on exactly this - see the
+    // job report for the "$(...) inside $[...]" investigation this fixes).
+    CommandSub(String), // $(...)
+    ExprSub(String),    // $[...]
+    MacroSub(String),   // ${...}
+
     // Misc
     Comma,
 
@@ -144,6 +160,33 @@ impl Lexer {
         if c == '}' {
             self.advance();
             return Ok(Token::RBrace);
+        }
+
+        // $(...) / $[...] / ${...} - command/expression/macro substitution
+        // operands (see the Token variants' own doc comment). Extraction
+        // only tracks the matching delimiter pair (mirroring
+        // variables::extract_balanced, reused here), so e.g. the "{stack}"
+        // inside "$(/cdr %{stack})" is just plain content to the paren
+        // count, not a nesting hazard.
+        if c == '$' {
+            if let Some(next) = self.peek_next() {
+                if next == '(' || next == '[' || next == '{' {
+                    self.advance(); // consume '$'
+                    self.advance(); // consume the opening delimiter
+                    let (close, make_tok): (char, fn(String) -> Token) = match next {
+                        '(' => (')', Token::CommandSub),
+                        '[' => (']', Token::ExprSub),
+                        _ => ('}', Token::MacroSub),
+                    };
+                    return match super::variables::extract_balanced(&self.chars, self.pos, next, close) {
+                        Some((content, end_idx)) => {
+                            self.pos = end_idx + 1;
+                            Ok(make_tok(content))
+                        }
+                        None => Err(format!("Unterminated ${}...", next)),
+                    };
+                }
+            }
         }
 
         // Operators
@@ -361,22 +404,40 @@ impl Parser {
         }
     }
 
-    /// Parse a full expression
+    /// Parse a full expression, including TF's lowest-precedence comma
+    /// operator. Only the genuine top-level entry point (this function, and
+    /// the "(e)" grouping case in parse_primary) should call this - a
+    /// function call's own argument list uses `,` as the argument
+    /// separator, not the sequencing operator, so parse_args calls
+    /// parse_assignment directly instead (see its own doc comment).
     pub fn parse(&mut self) -> Result<Expr, String> {
-        self.parse_assignment()
+        self.parse_comma()
     }
 
     // Precedence levels (lowest to highest):
-    // 1. Assignment (:=)
-    // 2. Ternary (?:)
-    // 3. Logical OR (|)
-    // 4. Logical AND (&)
-    // 5. Equality (==, !=, =~, !~, =/, !/)
-    // 6. Comparison (<, <=, >, >=)
-    // 7. Addition (+, -)
-    // 8. Multiplication (*, /, %)
-    // 9. Unary (!, -, ++, --)
-    // 10. Primary (literals, variables, function calls, parentheses)
+    // 1. Comma (,)
+    // 2. Assignment (:=)
+    // 3. Ternary (?:)
+    // 4. Logical OR (|)
+    // 5. Logical AND (&)
+    // 6. Equality (==, !=, =~, !~, =/, !/)
+    // 7. Comparison (<, <=, >, >=)
+    // 8. Addition (+, -)
+    // 9. Multiplication (*, /, %)
+    // 10. Unary (!, -, ++, --)
+    // 11. Primary (literals, variables, function calls, parentheses)
+
+    fn parse_comma(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_assignment()?;
+
+        while self.peek() == &Token::Comma {
+            self.advance();
+            let right = self.parse_assignment()?;
+            expr = Expr::BinaryOp(Box::new(expr), BinaryOp::Comma, Box::new(right));
+        }
+
+        Ok(expr)
+    }
 
     fn parse_assignment(&mut self) -> Result<Expr, String> {
         let expr = self.parse_ternary()?;
@@ -403,10 +464,21 @@ impl Parser {
             self.advance();
 
             // Check for omitted true value: expr ? : false_expr
+            //
+            // The true branch is parsed at COMMA precedence (not `or`),
+            // matching C's own ternary grammar (and verified directly
+            // against real tf: "1 ? 2,3 : 4" evaluates to 3 with no parens
+            // needed) - the comma operator is only excluded from the FALSE
+            // branch and the condition itself. stdlib.tf's own `/nth`
+            // depends on exactly this: `{1} > 0 ? shift({1}), {1} : ""`
+            // needs "shift({1}), {1}" to parse as one comma-expression
+            // (evaluate the shift for its side effect, then read the -now
+            // shifted- {1}), not stop at the first comma and choke on a
+            // stray ":" it can never find.
             let true_expr = if self.peek() == &Token::Colon {
                 Box::new(condition.clone())
             } else {
-                Box::new(self.parse_or()?)
+                Box::new(self.parse_comma()?)
             };
 
             self.expect(Token::Colon)?;
@@ -576,14 +648,37 @@ impl Parser {
                 }
             }
             Token::LBrace => {
-                // {varname}, {*}, {n}, or {-n} substitution
+                // {varname}, {*}, {n}, {-n}, {L}/{LN} (Nth positional
+                // parameter from the end), {-L}/{-LN} (all but the last N) -
+                // see /help substitution's selector grammar, and
+                // variables::resolve_extended_selector for the shared
+                // "-N"/"L"/"-L" evaluation (also used by the "%..." text-
+                // substitution forms in variables.rs). A trailing
+                // "-default" after a plain selector (e.g. "{1-DEF}") is
+                // accepted but the default itself is only implemented for
+                // the "%{...}" text-substitution form; here it just falls
+                // back to the selector's own value (empty if unset), which
+                // matches real TF whenever the selector isn't actually
+                // empty - nothing in this codebase's test corpus needs a
+                // real default evaluated inside a bare "{...}" expression.
                 self.advance();
 
-                // Check what's inside the braces
                 let is_star = matches!(self.peek(), Token::Star);
                 let is_minus = matches!(self.peek(), Token::Minus);
                 let integer_val = if let Token::Integer(n) = self.peek() { Some(*n) } else { None };
                 let ident_val = if let Token::Identifier(s) = self.peek() { Some(s.clone()) } else { None };
+
+                // Consume an optional "-default" suffix after a selector
+                // has already been parsed (just before the closing brace).
+                let skip_default_suffix = |p: &mut Self| -> Result<(), String> {
+                    if matches!(p.peek(), Token::Minus) {
+                        p.advance();
+                        if !matches!(p.peek(), Token::RBrace) {
+                            p.advance();
+                        }
+                    }
+                    Ok(())
+                };
 
                 if is_star {
                     // {*} - all arguments
@@ -591,30 +686,31 @@ impl Parser {
                     self.expect(Token::RBrace)?;
                     Ok(Expr::Variable("*".to_string()))
                 } else if is_minus {
-                    // {-n} - argument from end
+                    // {-n} / {-Ln} - "except first n" / "except last n"
                     self.advance();
-                    if let Token::Integer(n) = self.advance() {
-                        self.expect(Token::RBrace)?;
-                        Ok(Expr::Variable(format!("-{}", n)))
-                    } else {
-                        Err("Expected number after - in {-n}".to_string())
+                    match self.peek().clone() {
+                        Token::Integer(n) => {
+                            self.advance();
+                            self.expect(Token::RBrace)?;
+                            Ok(Expr::Variable(format!("-{}", n)))
+                        }
+                        Token::Identifier(s) if s.strip_prefix('L').is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit())) => {
+                            self.advance();
+                            self.expect(Token::RBrace)?;
+                            Ok(Expr::Variable(format!("-{}", s)))
+                        }
+                        other => Err(format!("Expected number or L<n> after - in {{-n}}, got {:?}", other)),
                     }
                 } else if let Some(n) = integer_val {
-                    // {n} or {n-} - positional argument or range to end
+                    // {n} or {n-default}
                     self.advance();
-                    // Check for {n-} pattern (args from n to end)
-                    if matches!(self.peek(), Token::Minus) {
-                        self.advance();
-                        self.expect(Token::RBrace)?;
-                        // Return special variable name for "n to end" range
-                        Ok(Expr::Variable(format!("{}-", n)))
-                    } else {
-                        self.expect(Token::RBrace)?;
-                        Ok(Expr::Variable(n.to_string()))
-                    }
+                    skip_default_suffix(self)?;
+                    self.expect(Token::RBrace)?;
+                    Ok(Expr::Variable(n.to_string()))
                 } else if let Some(name) = ident_val {
-                    // {varname} - variable
+                    // {varname}, {L}/{Ln}, or either with a "-default" suffix
                     self.advance();
+                    skip_default_suffix(self)?;
                     self.expect(Token::RBrace)?;
                     Ok(Expr::Variable(name))
                 } else {
@@ -627,6 +723,18 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
+            Token::CommandSub(cmd) => {
+                self.advance();
+                Ok(Expr::CommandSub(cmd))
+            }
+            Token::ExprSub(expr_text) => {
+                self.advance();
+                Ok(Expr::ExprSub(expr_text))
+            }
+            Token::MacroSub(name) => {
+                self.advance();
+                Ok(Expr::MacroSub(name))
+            }
             _ => Err(format!("Unexpected token: {:?}", self.peek())),
         }
     }
@@ -638,11 +746,16 @@ impl Parser {
             return Ok(args);
         }
 
-        args.push(self.parse()?);
+        // Each argument is parsed at assignment precedence, NOT via
+        // parse()/parse_comma() - here, "," is the argument separator, not
+        // TF's comma-sequencing operator (that operator is only reachable
+        // when explicitly parenthesized, e.g. "f((a,b), c)" - same rule as
+        // C, which TF's expression grammar is modeled on).
+        args.push(self.parse_assignment()?);
 
         while self.peek() == &Token::Comma {
             self.advance();
-            args.push(self.parse()?);
+            args.push(self.parse_assignment()?);
         }
 
         Ok(args)
@@ -660,6 +773,12 @@ pub enum BinaryOp {
     StrEq, StrNe, GlobMatch, GlobNoMatch,
     // Logical
     And, Or,
+    // Sequencing: `e1, e2` evaluates both, left to right, and yields e2's
+    // value (see /help expressions' operator table - TF's lowest-precedence
+    // operator, "only useful if e1 has some side effect"). Used throughout
+    // real TF library scripts as `/while (shift(), {#}) ...` or
+    // `/test (result:=result*n), --n` - two side effects in one call.
+    Comma,
 }
 
 /// Unary operators
@@ -681,6 +800,13 @@ pub enum Expr {
     PreIncrement(String),
     PreDecrement(String),
     FunctionCall(String, Vec<Expr>),
+    /// $(...) command substitution as an expression operand - see the
+    /// Token::CommandSub doc comment. Resolved lazily by the evaluator.
+    CommandSub(String),
+    /// $[...] nested expression substitution as an operand (Token::ExprSub).
+    ExprSub(String),
+    /// ${...} macro/variable substitution as an operand (Token::MacroSub).
+    MacroSub(String),
 }
 
 /// Expression evaluator
@@ -704,41 +830,17 @@ impl<'a> Evaluator<'a> {
             Expr::Literal(val) => Ok(val.clone()),
 
             Expr::Variable(name) => {
-                // Handle special variable names for argument access
-                if name.ends_with('-') && name.len() > 1 {
-                    // {n-} - arguments from position n to end, joined with spaces
-                    if let Ok(start) = name[..name.len()-1].parse::<usize>() {
-                        let argc = self.engine.get_var("#")
-                            .and_then(|v| v.to_int())
-                            .unwrap_or(0) as usize;
-                        if start > 0 && start <= argc {
-                            // Collect args from start to end
-                            let mut parts = Vec::new();
-                            for i in start..=argc {
-                                if let Some(val) = self.engine.get_var(&i.to_string()) {
-                                    parts.push(val.to_string_value());
-                                }
-                            }
-                            return Ok(TfValue::String(parts.join(" ")));
-                        }
-                    }
-                    return Ok(TfValue::String(String::new()));
-                } else if let Some(rest) = name.strip_prefix('-') {
-                    // {-n} - argument from end (1-indexed from end)
-                    if let Ok(n) = rest.parse::<usize>() {
-                        // Get total argument count
-                        let argc = self.engine.get_var("#")
-                            .and_then(|v| v.to_int())
-                            .unwrap_or(0) as usize;
-                        if n > 0 && n <= argc {
-                            // -1 = last arg, -2 = second to last, etc.
-                            let idx = argc - n + 1;
-                            return self.engine.get_var(&idx.to_string())
-                                .cloned()
-                                .ok_or_else(|| format!("Argument {} not found", idx));
-                        }
-                    }
-                    return Ok(TfValue::String(String::new()));
+                // "-N" (all positional parameters except the first N), "L"/
+                // "LN" (Nth from the end) and "-L"/"-LN" (all but the last
+                // N) are the selector forms that aren't just a plain local-
+                // variable lookup - see resolve_extended_selector's doc
+                // comment (shared with the "%..." text-substitution forms
+                // in variables.rs, so both contexts agree). Verified
+                // against real TinyFugue directly: for args "a b c d",
+                // "{-1}" is "b c d" (except the first), not "d" - this used
+                // to compute the latter (TF's "L1" meaning) here instead.
+                if let Some(value) = super::variables::resolve_extended_selector(self.engine, name) {
+                    return Ok(TfValue::String(value));
                 }
                 // Return empty string for undefined variables (TF behavior)
                 Ok(self.engine.get_var(name)
@@ -782,8 +884,12 @@ impl<'a> Evaluator<'a> {
             }
 
             Expr::Assign(name, value) => {
+                // TF's `:=` (finding 20): update the binding wherever it
+                // already lives, else create it as a global - never just
+                // the innermost local scope. See
+                // `TfEngine::set_existing_or_global`'s doc comment.
                 let val = self.eval(value)?;
-                self.engine.set_local(name, val.clone());
+                self.engine.set_existing_or_global(name, val.clone());
                 Ok(val)
             }
 
@@ -802,7 +908,9 @@ impl<'a> Evaluator<'a> {
                         }
                     }
                 };
-                self.engine.set_local(name, new_val.clone());
+                // ++/-- follow the same "update wherever it lives" rule as
+                // `:=` (finding 20).
+                self.engine.set_existing_or_global(name, new_val.clone());
                 Ok(new_val)
             }
 
@@ -821,12 +929,61 @@ impl<'a> Evaluator<'a> {
                         }
                     }
                 };
-                self.engine.set_local(name, new_val.clone());
+                self.engine.set_existing_or_global(name, new_val.clone());
                 Ok(new_val)
             }
 
             Expr::FunctionCall(name, args) => {
                 self.eval_function(name, args)
+            }
+
+            // $(...) as an expression operand (see the Token::CommandSub
+            // doc comment): mirror variables::substitute_commands' own
+            // top-level $() handling exactly - expand %vars in the
+            // extracted command text (any further-nested $(...)/$[...] in
+            // there is resolved when the invoked command's own arguments
+            // are substituted during its normal execution, not here), run
+            // it, and use its output as this operand's string value. A
+            // command error becomes an inline "[error: ...]" string rather
+            // than aborting the whole expression, matching
+            // execute_for_substitution's existing convention for the
+            // text-substitution case.
+            Expr::CommandSub(cmd_text) => {
+                // Full substitution (not just %vars), matching
+                // variables::substitute_commands' own top-level $(...)
+                // handler and for the same reason - a $(...) inside an
+                // expression can itself contain another $(...)/$[...]/
+                // ${...} (lisp.tf's own `/unique` recursion).
+                let cmd = super::variables::substitute_commands(self.engine, cmd_text);
+                let output = super::variables::execute_for_substitution(self.engine, &cmd);
+                Ok(TfValue::String(output))
+            }
+
+            // $[...] nested inside another expression - real tf accepts
+            // this (with a "legal, but redundant" warning; verified
+            // directly against real tf 5.0 beta 8) and evaluates it as a
+            // genuine sub-expression whose VALUE becomes the operand - not
+            // textual splicing, which would turn a string result into a
+            // bareword variable-reference lookup instead of a literal.
+            Expr::ExprSub(expr_text) => {
+                let sub = super::variables::substitute_dollar_braces(self.engine, expr_text);
+                evaluate(self.engine, &sub)
+            }
+
+            // ${...} - macro/variable substitution as an operand, matching
+            // variables::substitute_commands' own top-level "${varname}"
+            // handling: a variable's value, else a same-named simple
+            // macro's (no trigger, no hook) body text, else empty.
+            Expr::MacroSub(name) => {
+                if let Some(value) = self.engine.get_var(name) {
+                    Ok(value.clone())
+                } else if let Some(macro_def) = self.engine.macros.iter()
+                    .find(|m| m.name == *name && m.trigger.is_none() && m.hook.is_none())
+                {
+                    Ok(TfValue::String(macro_def.body.clone()))
+                } else {
+                    Ok(TfValue::String(String::new()))
+                }
             }
         }
     }
@@ -855,10 +1012,19 @@ impl<'a> Evaluator<'a> {
         let right_val = self.eval(right)?;
 
         match op {
-            // Arithmetic
-            BinaryOp::Add => self.eval_arithmetic(&left_val, &right_val, |a, b| a + b, |a, b| a + b),
-            BinaryOp::Sub => self.eval_arithmetic(&left_val, &right_val, |a, b| a - b, |a, b| a - b),
-            BinaryOp::Mul => self.eval_arithmetic(&left_val, &right_val, |a, b| a * b, |a, b| a * b),
+            // Arithmetic. Integer ops use wrapping arithmetic, not `+`/`-`/`*`
+            // directly: a script whose recursion doesn't bottom out the way
+            // Clay expects (e.g. a macro using /result to return a value -
+            // finding C.5 - before that's implemented) can otherwise build an
+            // i64 product large enough to overflow, which panics the whole
+            // process in a debug build (and silently UB-free-but-still-wrong
+            // wraps in release) - surfaced by lib_factoral.tf once P1.3 let
+            // /require actually reach factoral.tf's rfact()/ifact(). A script
+            // should never be able to crash the client; wrapping matches what
+            // most native TF builds' underlying C `long` arithmetic does too.
+            BinaryOp::Add => self.eval_arithmetic(&left_val, &right_val, |a, b| a.wrapping_add(b), |a, b| a + b),
+            BinaryOp::Sub => self.eval_arithmetic(&left_val, &right_val, |a, b| a.wrapping_sub(b), |a, b| a - b),
+            BinaryOp::Mul => self.eval_arithmetic(&left_val, &right_val, |a, b| a.wrapping_mul(b), |a, b| a * b),
             BinaryOp::Div => {
                 // Check for division by zero
                 let right_num = right_val.to_float().unwrap_or(0.0);
@@ -926,6 +1092,10 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Integer(if result { 1 } else { 0 }))
             }
 
+            // e1, e2 - both already evaluated above, left to right; the
+            // comma operator's value is simply e2's.
+            BinaryOp::Comma => Ok(right_val),
+
             // Already handled above
             BinaryOp::And | BinaryOp::Or => unreachable!(),
         }
@@ -992,7 +1162,19 @@ impl<'a> Evaluator<'a> {
                     return Err("strlen requires 1 argument".to_string());
                 }
                 let s = self.eval(&args[0])?.to_string_value();
-                Ok(TfValue::Integer(s.chars().count() as i64))
+                // Real TF's strings carry attributes out-of-band, so
+                // strlen() never counts an attribute byte, only visible
+                // text - verified against tf-lib's cylon.tf, whose
+                // strlen(cylon0) (after decode_attr()) is exactly the
+                // number of *visible* characters. Clay represents an
+                // attributed string pragmatically as plain text with
+                // embedded ANSI/`@{...}` codes (see decode_attr's doc
+                // comment), so strlen() has to strip those back out before
+                // counting - see `parser::strip_all_attributes`. This is a
+                // no-op for any ordinary string, since one never contains
+                // that markup in the first place.
+                let visible = super::parser::strip_all_attributes(&s);
+                Ok(TfValue::Integer(visible.chars().count() as i64))
             }
 
             "substr" => {
@@ -1459,24 +1641,64 @@ impl<'a> Evaluator<'a> {
                             self.engine.regex_captures.push(String::new());
                         }
                     }
+                    // Also expose P0-P9/PL/PR as ordinary local variables,
+                    // matching what a trigger match does
+                    // (macros::execute_macro_with_context) - real tf's own
+                    // "/help substitution" says the %P subs "get their
+                    // values from the last successful regexp match in
+                    // scope ... or in which it occurred (i.e., with
+                    // regmatch())", and %PL/%PR already read from local
+                    // vars (variables::substitute_variables), not from
+                    // regex_captures. Without this, textencode.tf's own
+                    // "{PL}"/"{P0}"/"{PR}" (the bare EXPRESSION-brace form,
+                    // evaluated here via Expr::Variable, which only ever
+                    // checks local vars) stayed stuck on whatever a prior
+                    // trigger left them at - verified directly against real
+                    // tf that a bare regmatch() call updates them the same
+                    // way a trigger match does.
+                    let captured: Vec<String> = self.engine.regex_captures.iter().take(10).cloned().collect();
+                    for (i, cap) in captured.into_iter().enumerate() {
+                        self.engine.set_local(&format!("P{}", i), TfValue::String(cap));
+                    }
+                    let whole = caps.get(0).unwrap();
+                    self.engine.set_local("PL", TfValue::String(text[..whole.start()].to_string()));
+                    self.engine.set_local("PR", TfValue::String(text[whole.end()..].to_string()));
                     Ok(TfValue::Integer(1))
                 } else {
-                    // No match - clear captures
+                    // No match - clear captures (and the same P0-P9/PL/PR
+                    // locals, matching real tf's own observed behavior:
+                    // a failed regmatch() clears them rather than leaving
+                    // a stale prior match in place).
                     for _ in 0..10 {
                         self.engine.regex_captures.push(String::new());
                     }
+                    for i in 0..10 {
+                        self.engine.set_local(&format!("P{}", i), TfValue::String(String::new()));
+                    }
+                    self.engine.set_local("PL", TfValue::String(String::new()));
+                    self.engine.set_local("PR", TfValue::String(String::new()));
                     Ok(TfValue::Integer(0))
                 }
             }
 
-            // replace(str, old, new [, count]) - string replacement
+            // replace(old, new, str [, count]) - string replacement.
+            // TF argument order (finding B's replace() ruling / plan step
+            // P1.10): real tf's replace(s1, s2, s3) returns s3 with every
+            // occurrence of s1 replaced by s2 - Clay used to take
+            // (str, old, new) instead, which silently produced the wrong
+            // result for anyone porting a real TF script. Clay's own
+            // /replace command already used TF's order, so this is a
+            // release-note-worthy behavior change to the *function* only.
+            // The optional 4th `count` argument (limit how many occurrences
+            // are replaced) is a Clay-only extension beyond TF's exact
+            // 3-argument replace(s1, s2, s3).
             "replace" => {
                 if args.len() < 3 || args.len() > 4 {
-                    return Err("replace requires 3 or 4 arguments (str, old, new [, count])".to_string());
+                    return Err("replace requires 3 or 4 arguments (old, new, str [, count])".to_string());
                 }
-                let text = self.eval(&args[0])?.to_string_value();
-                let old = self.eval(&args[1])?.to_string_value();
-                let new = self.eval(&args[2])?.to_string_value();
+                let old = self.eval(&args[0])?.to_string_value();
+                let new = self.eval(&args[1])?.to_string_value();
+                let text = self.eval(&args[2])?.to_string_value();
 
                 if old.is_empty() {
                     return Ok(TfValue::String(text));
@@ -1617,54 +1839,151 @@ impl<'a> Evaluator<'a> {
             }
 
             // getopts(optstring, arglist) - parse command-line options
+            // getopts(optstring [, init]) - parse the CURRENT macro's own
+            // positional parameters (%1.. / %*), NOT a separate argument
+            // list (finding C.11 / plan step P1.10's getopts() fix - the
+            // old implementation took a literal arg-list string as its
+            // 2nd argument, which isn't what real tf's 2-argument form
+            // means at all: it's the *initial value* every opt_x local is
+            // set to before parsing, used so a caller can tell "flag was
+            // off" apart from "flag wasn't even mentioned"). <optstring>
+            // letters may carry a ":" (string argument), "#" (integer
+            // expression argument) or "@" (time argument, treated as a
+            // plain string here - Clay has no separate time-argument type)
+            // suffix; a bare letter is a boolean flag. Per `/help options`,
+            // an option's argument must be attached to the same token (no
+            // space) - possibly via the bundled-cluster form (e.g. "-n5" or
+            // "-abn5"), same as `/def`'s own bundled short options (finding
+            // 24, `macros::parse_option_char`). On success, every letter in
+            // <optstring> found on the command line gets a local `opt_X`
+            // variable, and the consumed leading tokens are shifted out of
+            // %1../%*/%# - exactly like `/shift` - so stdlib macros that
+            // call getopts() then go on to use %* for the remaining,
+            // non-option arguments (e.g. /echo, /send, /world).
             "getopts" => {
-                if args.len() != 2 {
-                    return Err("getopts requires 2 arguments (optstring, arglist)".to_string());
+                if args.is_empty() || args.len() > 2 {
+                    return Err("getopts requires 1 or 2 arguments (optstring[, init])".to_string());
                 }
                 let optstring = self.eval(&args[0])?.to_string_value();
-                let arglist = self.eval(&args[1])?.to_string_value();
+                let init = if args.len() == 2 {
+                    Some(self.eval(&args[1])?)
+                } else {
+                    None
+                };
 
-                // Parse optstring to find which options take values (followed by :)
-                let mut opts_with_values = std::collections::HashSet::new();
-                let mut chars = optstring.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if chars.peek() == Some(&':') {
-                        opts_with_values.insert(c);
-                        chars.next();
+                #[derive(Clone, Copy, PartialEq)]
+                enum OptKind { Flag, Str, Int, Time }
+                let mut spec: Vec<(char, OptKind)> = Vec::new();
+                let mut opt_chars = optstring.chars().peekable();
+                while let Some(c) = opt_chars.next() {
+                    let kind = match opt_chars.peek() {
+                        Some(':') => { opt_chars.next(); OptKind::Str }
+                        Some('#') => { opt_chars.next(); OptKind::Int }
+                        Some('@') => { opt_chars.next(); OptKind::Time }
+                        _ => OptKind::Flag,
+                    };
+                    spec.push((c, kind));
+                }
+
+                if let Some(init_val) = &init {
+                    for (letter, _) in &spec {
+                        self.engine.set_local(&format!("opt_{}", letter), init_val.clone());
                     }
                 }
 
-                // Parse arguments
-                let args_vec: Vec<&str> = arglist.split_whitespace().collect();
-                let mut i = 0;
-                while i < args_vec.len() {
-                    let arg = args_vec[i];
-                    if arg.starts_with('-') && arg.len() > 1 {
-                        let opt_char = arg.chars().nth(1).unwrap();
-                        let var_name = format!("opt_{}", opt_char);
+                // Read the calling macro's own positional parameters.
+                let argc = self.engine.get_var("#").and_then(|v| v.to_int()).unwrap_or(0).max(0) as usize;
+                let mut tokens: Vec<String> = (1..=argc)
+                    .map(|i| self.engine.get_var(&i.to_string()).map(|v| v.to_string_value()).unwrap_or_default())
+                    .collect();
 
-                        if opts_with_values.contains(&opt_char) {
-                            // Option takes a value
-                            let value = if arg.len() > 2 {
-                                // Value attached: -fvalue
-                                arg[2..].to_string()
-                            } else if i + 1 < args_vec.len() {
-                                // Value is next argument
-                                i += 1;
-                                args_vec[i].to_string()
-                            } else {
-                                String::new()
-                            };
-                            self.engine.set_global(&var_name, TfValue::String(value));
-                        } else {
-                            // Boolean flag
-                            self.engine.set_global(&var_name, TfValue::Integer(1));
+                let mut consumed = 0usize;
+                let mut ok = true;
+                while consumed < tokens.len() {
+                    let tok = tokens[consumed].clone();
+                    // "A '-' or '--' by itself may be used to mark the end
+                    // of the options" (`/help options`, verified directly
+                    // against real tf 5.0 beta 8) - both forms are
+                    // themselves consumed/shifted out of the remaining
+                    // args, not just "--". A bare "-" used to fall into the
+                    // next arm's `break` with `consumed` left unincremented,
+                    // so it stayed in `{*}` as leftover literal text instead
+                    // of being shifted away (surfaced by stdlib.tf's own
+                    // "/def -i echo = ..." macro - once preloaded, it
+                    // shadows Clay's native /echo builtin per finding 16,
+                    // so any script calling "/echo -p - text..." - the
+                    // stdlib idiom for "a message that itself might start
+                    // with '-'" - reached this bug via the macro's own
+                    // `getopts("a:poerAw:")` call).
+                    if tok == "-" || tok == "--" {
+                        consumed += 1;
+                        break;
+                    }
+                    if !tok.starts_with('-') {
+                        break;
+                    }
+                    // Parse the bundled flag cluster within this one token.
+                    let mut rest = tok[1..].to_string();
+                    loop {
+                        let mut it = rest.chars();
+                        let c = match it.next() {
+                            Some(c) => c,
+                            None => break,
+                        };
+                        let after = it.as_str().to_string();
+                        match spec.iter().find(|(letter, _)| *letter == c) {
+                            None => {
+                                ok = false;
+                            }
+                            Some((_, OptKind::Flag)) => {
+                                self.engine.set_local(&format!("opt_{}", c), TfValue::Integer(1));
+                                rest = after;
+                                continue;
+                            }
+                            Some((_, kind)) => {
+                                if after.is_empty() {
+                                    // No argument attached to this token -
+                                    // real tf requires no space between an
+                                    // option and its argument.
+                                    ok = false;
+                                } else {
+                                    let value = if *kind == OptKind::Int {
+                                        TfValue::from(after.as_str())
+                                    } else {
+                                        TfValue::String(after)
+                                    };
+                                    self.engine.set_local(&format!("opt_{}", c), value);
+                                }
+                            }
                         }
+                        break;
                     }
-                    i += 1;
+                    consumed += 1;
+                    if !ok {
+                        break;
+                    }
                 }
 
-                Ok(TfValue::Integer(1))
+                // Shift: drop the consumed leading tokens (finding C.11).
+                if consumed > 0 {
+                    tokens.drain(0..consumed);
+                    let new_argc = tokens.len();
+                    for (i, tok) in tokens.iter().enumerate() {
+                        self.engine.set_local(&(i + 1).to_string(), TfValue::String(tok.clone()));
+                    }
+                    for i in (new_argc + 1)..=argc {
+                        self.engine.set_local(&i.to_string(), TfValue::String(String::new()));
+                    }
+                    self.engine.set_local("#", TfValue::Integer(new_argc as i64));
+                    self.engine.set_local("*", TfValue::String(tokens.join(" ")));
+                }
+
+                // Real tf prints an error message and returns 0 on a bad
+                // option; Clay skips the message (no macro-name context is
+                // available here) but preserves the "return 0, don't raise
+                // an expression error" contract callers rely on
+                // (e.g. "/if (!getopts(...)) /return 0%; /endif").
+                Ok(TfValue::Integer(if ok { 1 } else { 0 }))
             }
 
             // fg_world() - get foreground (current) world name
@@ -1695,6 +2014,13 @@ impl<'a> Evaluator<'a> {
                             "password" | "pass" => TfValue::String(w.password.clone()),
                             "login" => TfValue::Integer(if w.is_connected { 1 } else { 0 }),
                             "ssl" | "secure" => TfValue::Integer(if w.use_ssl { 1 } else { 0 }),
+                            // `/addworld ... [<file>]` (finding 31): engine memory only, keyed
+                            // by lower-cased world name, falling back to DEFAULT's own file
+                            // the same way character/password do (see variables.rs).
+                            "file" | "mfile" => {
+                                let own = self.engine.world_files.get(&w.name.to_lowercase()).cloned();
+                                TfValue::String(own.or_else(|| self.engine.default_world_file.clone()).unwrap_or_default())
+                            }
                             _ => TfValue::String(String::new()),
                         };
                         Ok(value)
@@ -1872,62 +2198,36 @@ impl<'a> Evaluator<'a> {
             }
 
             // ftime(format, time) - format a time value
+            // ftime([format [, time]]) - format a system time (finding
+            // C.11's "one-argument ftime" gap plus a few of TF's own
+            // format specifiers). One argument formats *now*; the time
+            // argument, if given, is whatever mktime()/time() produced
+            // (Integer or Float - a fractional part becomes sub-second
+            // digits for "%." / "%@"). Formatting uses *local* time, like
+            // real tf's own ftime() and like `mktime()` above.
             "ftime" => {
-                if args.len() != 2 {
-                    return Err("ftime requires 2 arguments (format, time)".to_string());
+                if args.is_empty() || args.len() > 2 {
+                    return Err("ftime requires 1 or 2 arguments (format[, time])".to_string());
                 }
                 let format = self.eval(&args[0])?.to_string_value();
-                let timestamp = self.eval(&args[1])?.to_int().unwrap_or(0);
+                let (epoch_secs, frac_secs): (i64, f64) = if args.len() == 2 {
+                    let t = self.eval(&args[1])?.to_float().unwrap_or(0.0);
+                    (t.floor() as i64, t - t.floor())
+                } else {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    (now.as_secs() as i64, now.subsec_nanos() as f64 / 1_000_000_000.0)
+                };
 
-                // Basic strftime-like formatting
-                use std::time::{Duration, UNIX_EPOCH};
-                let datetime = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
-                let secs_since_epoch = datetime.duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                // Calculate time components (UTC)
-                let secs = secs_since_epoch % 60;
-                let mins = (secs_since_epoch / 60) % 60;
-                let hours = (secs_since_epoch / 3600) % 24;
-                let days_since_epoch = secs_since_epoch / 86400;
-
-                // Simple date calculation (not accounting for leap years properly, but close enough)
-                let mut year = 1970i64;
-                let mut remaining_days = days_since_epoch as i64;
-                loop {
-                    let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 366 } else { 365 };
-                    if remaining_days < days_in_year {
-                        break;
-                    }
-                    remaining_days -= days_in_year;
-                    year += 1;
+                if format == "@" {
+                    return Ok(TfValue::String(format!(
+                        "{}.{:06}", epoch_secs, (frac_secs * 1_000_000.0).round() as i64
+                    )));
                 }
 
-                let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-                let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-                let mut month = 1;
-                for (i, &days) in days_in_month.iter().enumerate() {
-                    let d = if i == 1 && leap { 29 } else { days };
-                    if remaining_days < d {
-                        break;
-                    }
-                    remaining_days -= d;
-                    month += 1;
-                }
-                let day = remaining_days + 1;
-
-                // Apply format substitutions
-                let result = format
-                    .replace("%Y", &format!("{:04}", year))
-                    .replace("%m", &format!("{:02}", month))
-                    .replace("%d", &format!("{:02}", day))
-                    .replace("%H", &format!("{:02}", hours))
-                    .replace("%M", &format!("{:02}", mins))
-                    .replace("%S", &format!("{:02}", secs))
-                    .replace("%%", "%");
-
-                Ok(TfValue::String(result))
+                let lt = crate::util::local_time_from_epoch(epoch_secs);
+                Ok(TfValue::String(format_tf_time(&lt, epoch_secs, frac_secs, &format)))
             }
 
             // fwrite(filename, text) - append text to file
@@ -2127,7 +2427,8 @@ impl<'a> Evaluator<'a> {
                     return Err("input requires at least 1 argument (text)".to_string());
                 }
                 let text = self.eval(&args[0])?.to_string_value();
-                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Insert(text));
+                let insert_mode = self.engine.insert_mode();
+                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Insert(text, insert_mode));
                 Ok(TfValue::Integer(1))
             }
 
@@ -2446,6 +2747,247 @@ impl<'a> Evaluator<'a> {
                 Err("read() is obsolete. Use tfread() instead.".to_string())
             }
 
+            // features([name]) - list, or test, TF's optional build features
+            // (finding C.11). Verified directly against real tf 5.0 beta 8's
+            // own `/features` output: this build has every feature on
+            // except "core" (crash core-dumping) and "SOCKS" (proxy
+            // support), which Clay doesn't have either. Case-insensitive,
+            // per `/help features`.
+            "features" => {
+                let (order, off) = features_table();
+                if args.is_empty() {
+                    let parts: Vec<String> = order.iter().map(|(key, disp)| {
+                        let on = !off.contains(key);
+                        format!("{}{}", if on { "+" } else { "-" }, disp)
+                    }).collect();
+                    Ok(TfValue::String(parts.join(" ")))
+                } else if args.len() == 1 {
+                    let name = self.eval(&args[0])?.to_string_value().to_lowercase();
+                    let known = order.iter().any(|(key, _)| *key == name);
+                    let on = known && !off.contains(&name.as_str());
+                    Ok(TfValue::Integer(if on { 1 } else { 0 }))
+                } else {
+                    Err("features requires 0 or 1 arguments".to_string())
+                }
+            }
+
+            // mktime(year [,month [,day [,hour [,minute [,second [,usec]]]]]])
+            // - epoch seconds for a date/time in the local time zone
+            // (finding C.11). Omitted month/day default to 1, other omitted
+            // fields default to 0, matching `/help mktime`. Out-of-range
+            // fields (month 13, day 32, ...) are normalized the same way a
+            // real mktime(3) - and hence real tf's own mktime(), a thin
+            // wrapper around it - does.
+            "mktime" => {
+                if args.is_empty() || args.len() > 7 {
+                    return Err("mktime requires 1 to 7 arguments (year[, month[, day[, hour[, minute[, second[, usec]]]]]])".to_string());
+                }
+                let year = self.eval(&args[0])?.to_int().unwrap_or(1970);
+                let month = if args.len() > 1 { self.eval(&args[1])?.to_int().unwrap_or(1) } else { 1 };
+                let day = if args.len() > 2 { self.eval(&args[2])?.to_int().unwrap_or(1) } else { 1 };
+                let hour = if args.len() > 3 { self.eval(&args[3])?.to_int().unwrap_or(0) } else { 0 };
+                let minute = if args.len() > 4 { self.eval(&args[4])?.to_int().unwrap_or(0) } else { 0 };
+                let second = if args.len() > 5 { self.eval(&args[5])?.to_int().unwrap_or(0) } else { 0 };
+                let usec = if args.len() > 6 { self.eval(&args[6])?.to_int().unwrap_or(0) } else { 0 };
+
+                let epoch = crate::util::epoch_from_local_time(year, month, day, hour, minute, second);
+                if usec != 0 {
+                    Ok(TfValue::Float(epoch as f64 + usec as f64 / 1_000_000.0))
+                } else {
+                    Ok(TfValue::Integer(epoch))
+                }
+            }
+
+            // cputime() - process CPU time in seconds, or -1 if unavailable.
+            "cputime" => {
+                if !args.is_empty() {
+                    return Err("cputime requires 0 arguments".to_string());
+                }
+                Ok(TfValue::Float(process_cpu_time_secs()))
+            }
+
+            // ln(n) - natural logarithm (finding C.11; real tf also exposes
+            // this as log()/log10(), already implemented elsewhere).
+            "ln" => {
+                if args.len() != 1 {
+                    return Err("ln requires 1 argument".to_string());
+                }
+                let n = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                if n <= 0.0 {
+                    return Err("ln: argument must be positive".to_string());
+                }
+                Ok(TfValue::Float(n.ln()))
+            }
+
+            // morepaused([world]) - 1 if the world's output is paused by
+            // more-mode or `/dokey pause` (finding C.11). Defined in terms
+            // of moresize(), which Clay's engine always reports as 0 (more-
+            // mode paging state lives in the main App, not TfEngine) - so
+            // this always reports "not paused" too, matching functions.tf's
+            // own expectation.
+            "morepaused" => {
+                if args.len() > 1 {
+                    return Err("morepaused requires 0 or 1 arguments".to_string());
+                }
+                if !args.is_empty() {
+                    let _ = self.eval(&args[0])?;
+                }
+                Ok(TfValue::Integer(0))
+            }
+
+            // winlines() - output window height (finding C.11): lines()
+            // minus the status/input rows Clay reserves at the bottom of
+            // the screen. lines() itself is a fixed default of 24 (see its
+            // own arm above - Clay doesn't track real terminal height in
+            // TfEngine).
+            "winlines" => {
+                if !args.is_empty() {
+                    return Err("winlines requires 0 arguments".to_string());
+                }
+                Ok(TfValue::Integer(22))
+            }
+
+            // strip_attr(s) - remove all display attributes (finding C.11).
+            "strip_attr" => {
+                if args.len() != 1 {
+                    return Err("strip_attr requires 1 argument".to_string());
+                }
+                let s = self.eval(&args[0])?.to_string_value();
+                Ok(TfValue::String(super::parser::strip_all_attributes(&s)))
+            }
+
+            // decode_attr(s1 [, s2 [, f]]) - interpret "@{attr}" codes in s1
+            // as display attributes, the same way /echo -p does (finding
+            // C.11). Clay represents the result pragmatically as plain text
+            // with the attributes encoded directly as embedded ANSI SGR
+            // escapes, rather than a true out-of-band attribute channel -
+            // see `strlen()`'s doc comment for why that matters. If s2 is
+            // given, its attributes (a comma-separated list, as in /echo
+            // -a<attrs>) are applied to the whole string; if f is given and
+            // falsy, "@{...}" codes in s1 are NOT interpreted (useful for
+            // applying only s2's attributes).
+            "decode_attr" => {
+                if args.is_empty() || args.len() > 3 {
+                    return Err("decode_attr requires 1 to 3 arguments (s1 [, s2 [, f]])".to_string());
+                }
+                let s = self.eval(&args[0])?.to_string_value();
+                let interpret = if args.len() >= 3 {
+                    self.eval(&args[2])?.to_bool()
+                } else {
+                    true
+                };
+                let mut decoded = if interpret {
+                    super::parser::process_attr_codes(&s)
+                } else {
+                    s
+                };
+                if args.len() >= 2 {
+                    let attrs = self.eval(&args[1])?.to_string_value();
+                    let prefix = super::parser::attrs_to_ansi_prefix(&attrs);
+                    if !prefix.is_empty() {
+                        decoded = format!("{}{}\x1b[0m", prefix, decoded);
+                    }
+                }
+                Ok(TfValue::String(decoded))
+            }
+
+            // encode_attr(s) - inverse of decode_attr(): re-encode Clay's
+            // ANSI-embedded attributed-string representation as "@{attr}"
+            // markup text (finding C.11).
+            "encode_attr" => {
+                if args.len() != 1 {
+                    return Err("encode_attr requires 1 argument".to_string());
+                }
+                let s = self.eval(&args[0])?.to_string_value();
+                Ok(TfValue::String(super::parser::encode_attr(&s)))
+            }
+
+            // decode_ansi(s) / encode_ansi(s) - convert between raw
+            // terminal ANSI attribute codes and the internal attributed-
+            // string representation (finding C.11). Since Clay's pragmatic
+            // representation of an attributed string already *is* plain
+            // text with embedded ANSI SGR escapes (see decode_attr's doc
+            // comment), converting between "raw ANSI" and "internal form"
+            // is a no-op in both directions for Clay - decode_ansi() is
+            // exact identity, and encode_ansi() only has real work to do
+            // when its input still has undecoded "@{...}" markup (e.g. text
+            // that was never passed through decode_attr()), which it
+            // decodes exactly like decode_attr() would.
+            "decode_ansi" => {
+                if args.len() != 1 {
+                    return Err("decode_ansi requires 1 argument".to_string());
+                }
+                Ok(TfValue::String(self.eval(&args[0])?.to_string_value()))
+            }
+            "encode_ansi" => {
+                if args.len() != 1 {
+                    return Err("encode_ansi requires 1 argument".to_string());
+                }
+                let s = self.eval(&args[0])?.to_string_value();
+                Ok(TfValue::String(super::parser::process_attr_codes(&s)))
+            }
+
+            // strcmpattr(s1, s2) - like strcmp(), but strings must also
+            // match in attributes to be considered equal (finding C.11).
+            // Since Clay embeds attributes directly in the text (see
+            // decode_attr's doc comment), an ordinary string comparison
+            // already differs whenever either the visible text or its
+            // attributes differ - exactly strcmpattr's contract - so this
+            // needs no extra encode/decode step.
+            "strcmpattr" => {
+                if args.len() != 2 {
+                    return Err("strcmpattr requires 2 arguments".to_string());
+                }
+                let a = self.eval(&args[0])?.to_string_value();
+                let b = self.eval(&args[1])?.to_string_value();
+                Ok(TfValue::Integer(a.cmp(&b) as i64))
+            }
+
+            // is_open([world]) - whether a world's socket is open (finding
+            // C.11). Clay doesn't distinguish "socket open but not yet
+            // connected" from "connected" the way real tf can, so this is a
+            // pragmatic alias for is_connected() - see that arm above.
+            "is_open" => {
+                if args.len() > 1 {
+                    return Err("is_open requires 0 or 1 arguments".to_string());
+                }
+                let open = if args.is_empty() {
+                    let current = self.engine.current_world.clone().unwrap_or_default();
+                    self.engine.world_info_cache.iter()
+                        .find(|w| w.name == current)
+                        .map(|w| w.is_connected)
+                        .unwrap_or(false)
+                } else {
+                    let name = self.eval(&args[0])?.to_string_value();
+                    self.engine.world_info_cache.iter()
+                        .find(|w| w.name.eq_ignore_ascii_case(&name))
+                        .map(|w| w.is_connected)
+                        .unwrap_or(false)
+                };
+                Ok(TfValue::Integer(if open { 1 } else { 0 }))
+            }
+
+            // gethostname() - the local host's name (finding C.11).
+            "gethostname" => {
+                if !args.is_empty() {
+                    return Err("gethostname requires 0 arguments".to_string());
+                }
+                Ok(TfValue::String(get_hostname()))
+            }
+
+            // status_fields([i]) - fields of status row i (finding C.11).
+            // Clay has no configurable status bar, so this always reports
+            // an empty list, matching functions.tf's own expectation.
+            "status_fields" => {
+                if args.len() > 1 {
+                    return Err("status_fields requires 0 or 1 arguments".to_string());
+                }
+                if !args.is_empty() {
+                    let _ = self.eval(&args[0])?;
+                }
+                Ok(TfValue::String(String::new()))
+            }
+
             _ => {
                 // Try calling as a user-defined macro
                 let macro_def = self.engine.macros.iter()
@@ -2458,12 +3000,22 @@ impl<'a> Evaluator<'a> {
                         arg_strs.push(self.eval(arg)?.to_string_value());
                     }
                     let arg_refs: Vec<&str> = arg_strs.iter().map(|s| s.as_str()).collect();
-                    let results = super::macros::execute_macro(self.engine, &macro_def, &arg_refs, None);
-                    // Process results: collect messages, handle Return
+                    // Called as a function (`name(args)`), not a command - a
+                    // /result in the body must behave exactly like /return
+                    // (no echo), per execute_macro_with_context's doc comment.
+                    let results = super::macros::execute_macro_with_context(
+                        self.engine, &macro_def, &arg_refs, None, true,
+                    );
+                    // Process results: collect messages, handle Return/Result.
+                    // Neither variant is actually pushed into `results` by
+                    // execute_macro (it sets %? and breaks instead - see
+                    // there), so the real propagation path is the `?`
+                    // fallback below; these arms are kept for symmetry/
+                    // robustness in case that ever changes.
                     let mut return_val = None;
                     for result in &results {
                         match result {
-                            super::TfCommandResult::Return(val) => {
+                            super::TfCommandResult::Return(val) | super::TfCommandResult::Result(val) => {
                                 return_val = Some(TfValue::from(val.as_str()));
                             }
                             super::TfCommandResult::Error(e) => {
@@ -2609,6 +3161,24 @@ fn glob_to_regex(pattern: &str) -> String {
     result
 }
 
+/// The `features()` expression function's table, shared with the `/features` COMMAND
+/// (`builtins::cmd_features`, Job 15) so the two can never drift apart. Verified
+/// directly against real tf 5.0 beta 8's own `/features` output: this build has every
+/// feature on except "core" (crash core-dumping) and "SOCKS" (proxy support), which
+/// Clay doesn't have either. Returns (name/display-name pairs in tf's own order, the
+/// subset of names that are off).
+pub fn features_table() -> (&'static [(&'static str, &'static str)], &'static [&'static str]) {
+    const ORDER: [(&str, &str); 14] = [
+        ("256colors", "256colors"), ("core", "core"), ("float", "float"),
+        ("ftime", "ftime"), ("history", "history"), ("ipv6", "IPv6"),
+        ("locale", "locale"), ("mccpv1", "MCCPv1"), ("mccpv2", "MCCPv2"),
+        ("process", "process"), ("socks", "SOCKS"), ("ssl", "ssl"),
+        ("subsecond", "subsecond"), ("tz", "TZ"),
+    ];
+    const OFF: [&str; 2] = ["core", "socks"];
+    (&ORDER, &OFF)
+}
+
 /// Simple random number generator (xorshift32)
 pub fn simple_random() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2628,6 +3198,114 @@ pub fn simple_random() -> u32 {
 
     SEED.store(x, std::sync::atomic::Ordering::Relaxed);
     x
+}
+
+/// Process CPU time (user + system) in seconds, for the `cputime()`
+/// function. Matches real tf's own documented fallback of -1 when
+/// unavailable.
+#[cfg(unix)]
+pub(crate) fn process_cpu_time_secs() -> f64 {
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(0 /* RUSAGE_SELF */, &mut usage) == 0 {
+            let user = usage.ru_utime.tv_sec as f64 + usage.ru_utime.tv_usec as f64 / 1_000_000.0;
+            let sys = usage.ru_stime.tv_sec as f64 + usage.ru_stime.tv_usec as f64 / 1_000_000.0;
+            user + sys
+        } else {
+            -1.0
+        }
+    }
+}
+#[cfg(not(unix))]
+pub(crate) fn process_cpu_time_secs() -> f64 {
+    -1.0
+}
+
+/// The local host's name, for the `gethostname()` function. Real tf
+/// returns an empty string if the host name isn't available; Clay does the
+/// same on any error or on a platform without a hostname syscall binding.
+#[cfg(unix)]
+fn get_hostname() -> String {
+    let mut buf = [0u8; 256];
+    unsafe {
+        if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
+        }
+    }
+    String::new()
+}
+#[cfg(not(unix))]
+fn get_hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
+}
+
+/// Format a local time for the `ftime()` function, supporting real TF's
+/// documented specifiers that are cheap to add given `crate::util::LocalTime`
+/// (see `/help ftime` for the full table) plus its two nonstandard
+/// subsecond extensions, `%@` (raw epoch, to the microsecond) and `%.`
+/// (microseconds since the last whole second) - both needed by tf-lib's
+/// at.tf (`ftime("%F %T.%.", t)`). Unknown specifiers pass through
+/// literally, matching `util::format_local_time`'s own convention.
+pub(crate) fn format_tf_time(lt: &crate::util::LocalTime, epoch_secs: i64, frac_secs: f64, fmt: &str) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const MONTHS: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ];
+    let usec = (frac_secs * 1_000_000.0).round() as i64;
+    let weekday = (lt.weekday.rem_euclid(7)) as usize;
+    let month_idx = ((lt.month - 1).rem_euclid(12)) as usize;
+
+    let mut result = String::with_capacity(fmt.len() + 8);
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            result.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => result.push_str(&format!("{:04}", lt.year)),
+            Some('y') => result.push_str(&format!("{:02}", lt.year.rem_euclid(100))),
+            Some('m') => result.push_str(&format!("{:02}", lt.month)),
+            Some('d') => result.push_str(&format!("{:02}", lt.day)),
+            Some('H') => result.push_str(&format!("{:02}", lt.hour)),
+            Some('I') => {
+                let h12 = match lt.hour % 12 { 0 => 12, h => h };
+                result.push_str(&format!("{:02}", h12));
+            }
+            Some('M') => result.push_str(&format!("{:02}", lt.minute)),
+            Some('S') => result.push_str(&format!("{:02}", lt.second)),
+            Some('p') => result.push_str(if lt.hour < 12 { "AM" } else { "PM" }),
+            Some('a') => result.push_str(&WEEKDAYS[weekday][..3]),
+            Some('A') => result.push_str(WEEKDAYS[weekday]),
+            Some('b') => result.push_str(&MONTHS[month_idx][..3]),
+            Some('B') => result.push_str(MONTHS[month_idx]),
+            Some('F') => result.push_str(&format!("{:04}-{:02}-{:02}", lt.year, lt.month, lt.day)),
+            Some('T') => result.push_str(&format!("{:02}:{:02}:{:02}", lt.hour, lt.minute, lt.second)),
+            Some('j') => result.push_str(&format!("{:03}", day_of_year(lt))),
+            Some('w') => result.push_str(&weekday.to_string()),
+            Some('s') => result.push_str(&epoch_secs.to_string()),
+            Some('@') => result.push_str(&format!("{}.{:06}", epoch_secs, usec)),
+            Some('.') => result.push_str(&format!("{:06}", usec)),
+            Some('%') => result.push('%'),
+            Some(x) => { result.push('%'); result.push(x); }
+            None => result.push('%'),
+        }
+    }
+    result
+}
+
+/// 1-based day of year, for ftime()'s "%j".
+fn day_of_year(lt: &crate::util::LocalTime) -> i32 {
+    const CUM_DAYS: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let leap = (lt.year % 4 == 0 && lt.year % 100 != 0) || lt.year % 400 == 0;
+    let month_idx = ((lt.month - 1).clamp(0, 11)) as usize;
+    let mut days = CUM_DAYS[month_idx] + lt.day;
+    if leap && lt.month > 2 {
+        days += 1;
+    }
+    days
 }
 
 /// Parse and evaluate an expression string
@@ -2740,6 +3418,62 @@ mod tests {
         assert_eq!(engine.get_var("x").map(|v| v.to_int()), Some(Some(10)));
     }
 
+    /// Set up positional parameters "a b c d" (#=4) the same way
+    /// execute_macro does, for the "{...}" selector tests below.
+    fn set_args(engine: &mut TfEngine, args: &[&str]) {
+        engine.set_global("#", TfValue::Integer(args.len() as i64));
+        for (i, arg) in args.iter().enumerate() {
+            engine.set_global(&(i + 1).to_string(), TfValue::String(arg.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_eval_brace_selectors() {
+        // {n} and {#} were already correct; {-1} used to compute "the last
+        // argument" (TF's "L1" meaning) instead of its real meaning, "all
+        // but the first" - verified directly against real tf 5.0 beta 8
+        // (see resolve_extended_selector's doc comment). {L}/{LN} and
+        // {-L}/{-LN} were entirely unimplemented (bare {L} resolved to an
+        // empty, undefined variable named "L").
+        let mut engine = TfEngine::new();
+        set_args(&mut engine, &["a", "b", "c", "d"]);
+
+        assert_eq!(evaluate(&mut engine, "{1}").unwrap(), TfValue::String("a".to_string()));
+        assert_eq!(evaluate(&mut engine, "{#}").unwrap(), TfValue::Integer(4));
+
+        assert_eq!(evaluate(&mut engine, "{-1}").unwrap(), TfValue::String("b c d".to_string()));
+        assert_eq!(evaluate(&mut engine, "{-2}").unwrap(), TfValue::String("c d".to_string()));
+
+        assert_eq!(evaluate(&mut engine, "{L}").unwrap(), TfValue::String("d".to_string()));
+        assert_eq!(evaluate(&mut engine, "{L2}").unwrap(), TfValue::String("c".to_string()));
+
+        assert_eq!(evaluate(&mut engine, "{-L}").unwrap(), TfValue::String("a b c".to_string()));
+        assert_eq!(evaluate(&mut engine, "{-L2}").unwrap(), TfValue::String("a b".to_string()));
+    }
+
+    #[test]
+    fn test_eval_comma_operator() {
+        // "e1, e2" - TF's lowest-precedence operator: evaluate both, left
+        // to right, keep e2's value (/help expressions' operator table).
+        // Entirely unimplemented before this job - needed by real tf-lib
+        // idioms like "/while (shift(), {#}) ..." and
+        // "/test (result:=result*n), --n".
+        let mut engine = TfEngine::new();
+        assert_eq!(evaluate(&mut engine, "(x := 1), (y := 2)").unwrap(), TfValue::Integer(2));
+        assert_eq!(engine.get_var("x").and_then(|v| v.to_int()), Some(1));
+        assert_eq!(engine.get_var("y").and_then(|v| v.to_int()), Some(2));
+
+        // A bare (unparenthesized) top-level comma also works - this is
+        // how a /if//while//for condition's own text reaches evaluate()
+        // (the condition parser strips only the outer parens).
+        assert_eq!(evaluate(&mut engine, "z := 5, z > 3").unwrap(), TfValue::Integer(1));
+
+        // Comma inside a function call's argument list is still the
+        // argument separator, NOT the sequencing operator - min(1,2,3)
+        // must still receive three arguments, not one comma-chained one.
+        assert_eq!(evaluate(&mut engine, "min(3, 1, 4)").unwrap(), TfValue::Integer(1));
+    }
+
     #[test]
     fn test_eval_functions() {
         let mut engine = TfEngine::new();
@@ -2808,5 +3542,376 @@ mod tests {
         assert_eq!(evaluate(&mut engine, "keycode(char(3))").unwrap(), TfValue::String("^C".to_string()));
         // DEL returns ^?
         assert_eq!(evaluate(&mut engine, "keycode(char(127))").unwrap(), TfValue::String("^?".to_string()));
+    }
+
+    // =========================================================================
+    // Job 11: functions from finding C.11, replace()'s TF argument order,
+    // finding 20's `:=` scope rule.
+    // =========================================================================
+
+    #[test]
+    fn test_features_function() {
+        let mut engine = TfEngine::new();
+        // Verified against real tf 5.0 beta 8's own /features output.
+        for on in ["256colors", "float", "ftime", "history", "IPv6", "locale",
+                   "MCCPv1", "MCCPv2", "process", "ssl", "subsecond", "TZ"] {
+            assert_eq!(
+                evaluate(&mut engine, &format!("features(\"{}\")", on)).unwrap(),
+                TfValue::Integer(1),
+                "feature {} should be on",
+                on
+            );
+        }
+        for off in ["core", "SOCKS"] {
+            assert_eq!(
+                evaluate(&mut engine, &format!("features(\"{}\")", off)).unwrap(),
+                TfValue::Integer(0),
+                "feature {} should be off",
+                off
+            );
+        }
+        // Case-insensitive, per /help features.
+        assert_eq!(evaluate(&mut engine, "features(\"SSL\")").unwrap(), TfValue::Integer(1));
+        // Unknown name: 0, not an error.
+        assert_eq!(evaluate(&mut engine, "features(\"nope\")").unwrap(), TfValue::Integer(0));
+        // No-argument form: "+name -name ..." list.
+        let list = evaluate(&mut engine, "features()").unwrap().to_string_value();
+        assert!(list.contains("+256colors"), "list: {}", list);
+        assert!(list.contains("-core"), "list: {}", list);
+        assert!(list.contains("-SOCKS"), "list: {}", list);
+    }
+
+    #[test]
+    fn test_mktime_function() {
+        let mut engine = TfEngine::new();
+        // Basic sanity: a date decades after the epoch is a large positive
+        // number, and later dates are later epochs.
+        let t1 = evaluate(&mut engine, "mktime(2001,9,9,0,0,0)").unwrap().to_int().unwrap();
+        assert!(t1 > 0);
+        let t2 = evaluate(&mut engine, "mktime(2001,9,10,0,0,0)").unwrap().to_int().unwrap();
+        assert!(t2 > t1, "a later date must have a later epoch");
+        // Omitted fields default to 1 (month/day) or 0 (hour/minute/second),
+        // per /help mktime.
+        let t3 = evaluate(&mut engine, "mktime(2001)").unwrap().to_int().unwrap();
+        let t4 = evaluate(&mut engine, "mktime(2001,1,1,0,0,0)").unwrap().to_int().unwrap();
+        assert_eq!(t3, t4);
+        // usec argument produces a Float.
+        let t5 = evaluate(&mut engine, "mktime(2001,1,1,0,0,0,500000)").unwrap();
+        match t5 {
+            TfValue::Float(f) => assert!((f - (t4 as f64 + 0.5)).abs() < 1e-9),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_ftime_function() {
+        let mut engine = TfEngine::new();
+        // 2-argument form, a fixed timestamp - deterministic.
+        assert_eq!(
+            evaluate(&mut engine, "ftime(\"%Y-%m\", 1000000000)").unwrap(),
+            TfValue::String("2001-09".to_string())
+        );
+        // %F / %T / %. / %@ extensions.
+        assert_eq!(
+            evaluate(&mut engine, "ftime(\"%F\", 1000000000)").unwrap().to_string_value().len(),
+            10 // "YYYY-MM-DD"
+        );
+        assert_eq!(
+            evaluate(&mut engine, "ftime(\"%.\", 1000000000)").unwrap(),
+            TfValue::String("000000".to_string())
+        );
+        let at = evaluate(&mut engine, "ftime(\"@\", 1000000000)").unwrap().to_string_value();
+        assert_eq!(at, "1000000000.000000");
+        // 1-argument form (format only) = now: just check it doesn't error
+        // and produces a 4-digit year.
+        let now_year = evaluate(&mut engine, "ftime(\"%Y\")").unwrap().to_string_value();
+        assert_eq!(now_year.len(), 4);
+    }
+
+    #[test]
+    fn test_cputime_function() {
+        let mut engine = TfEngine::new();
+        let v = evaluate(&mut engine, "cputime()").unwrap().to_float().unwrap();
+        assert!(v >= 0.0 || v == -1.0, "cputime should be nonneg or -1: {}", v);
+    }
+
+    #[test]
+    fn test_ln_function() {
+        let mut engine = TfEngine::new();
+        assert_eq!(evaluate(&mut engine, "ln(1)").unwrap(), TfValue::Float(0.0));
+        let ln2 = evaluate(&mut engine, "ln(2)").unwrap().to_float().unwrap();
+        assert!((ln2 - std::f64::consts::LN_2).abs() < 1e-9);
+        assert!(evaluate(&mut engine, "ln(-1)").is_err());
+        assert!(evaluate(&mut engine, "ln(0)").is_err());
+    }
+
+    #[test]
+    fn test_morepaused_and_winlines_functions() {
+        let mut engine = TfEngine::new();
+        // moresize() always reports 0 (more-mode isn't tracked by TfEngine),
+        // so morepaused() - defined in terms of it - always reports 0 too.
+        assert_eq!(evaluate(&mut engine, "morepaused()").unwrap(), TfValue::Integer(0));
+        assert_eq!(evaluate(&mut engine, "morepaused(\"somWorld\")").unwrap(), TfValue::Integer(0));
+        let wl = evaluate(&mut engine, "winlines()").unwrap().to_int().unwrap();
+        assert!(wl > 0);
+    }
+
+    #[test]
+    fn test_strip_attr_function() {
+        let mut engine = TfEngine::new();
+        assert_eq!(evaluate(&mut engine, "strip_attr(\"x\")").unwrap(), TfValue::String("x".to_string()));
+        // Raw, undecoded "@{...}" markup is stripped.
+        assert_eq!(
+            evaluate(&mut engine, "strip_attr(\"@{Cred}hello@{n}\")").unwrap(),
+            TfValue::String("hello".to_string())
+        );
+        // Already-decoded (embedded ANSI) text is stripped too, down to
+        // just the visible text.
+        let decoded = super::super::parser::process_attr_codes("@{Cred}hi@{n}");
+        assert_ne!(decoded, "hi", "decode_attr should have embedded real ANSI");
+        assert_eq!(super::super::parser::strip_all_attributes(&decoded), "hi");
+    }
+
+    #[test]
+    fn test_decode_attr_and_strlen_ignore_attributes() {
+        let mut engine = TfEngine::new();
+        // cylon.tf's own case: decode_attr() on a string built from
+        // "@{Cbgblack}" + six single-space "@{Cbgrgb...} @{}" runs + 7
+        // trailing spaces + "@{n}" has exactly 13 *visible* characters -
+        // strlen() must not count the embedded ANSI bytes decode_attr()
+        // produces (verified end-to-end against real tf via lib_cylon.tf).
+        let cylon0 = "@{Cbgblack}@{Cbgrgb100} @{}@{Cbgrgb200} @{}@{Cbgrgb300} @{}@{Cbgrgb400} @{}@{Cbgrgb500} @{}@{Cbgrgb000} @{}       @{n}";
+        engine.set_global("cylon0", TfValue::String(cylon0.to_string()));
+        let r = evaluate(&mut engine, "cylon0 := decode_attr(cylon0)");
+        assert!(r.is_ok(), "{:?}", r);
+        assert_eq!(evaluate(&mut engine, "strlen(cylon0)").unwrap(), TfValue::Integer(13));
+    }
+
+    #[test]
+    fn test_encode_attr_round_trips_decode_attr() {
+        // Round-trips exactly for every color-attribute form attr_to_ansi
+        // supports (named, bright, 216-cube, grayscale) plus the basic
+        // bold/underline/reverse/reset codes - going straight through
+        // parser::process_attr_codes/encode_attr avoids needing a real
+        // ESC byte inside a Rust string literal.
+        for code in ["@{Cbgblack}", "@{Cbgrgb500}", "@{Crgb320}", "@{Cgray10}",
+                     "@{Cbggray10}", "@{n}", "@{B}", "@{U}", "@{Cred}", "@{Cbgred}"] {
+            let name = &code[2..code.len() - 1];
+            let decoded = super::super::parser::process_attr_codes(code);
+            assert_ne!(decoded, code, "{} should have been converted to ANSI", code);
+            assert_eq!(super::super::parser::encode_attr(&decoded), format!("@{{{}}}", name), "round-trip failed for {}", code);
+        }
+    }
+
+    #[test]
+    fn test_decode_ansi_and_encode_ansi_functions() {
+        let mut engine = TfEngine::new();
+        // decode_ansi is identity for Clay's representation.
+        assert_eq!(
+            evaluate(&mut engine, "decode_ansi(\"plain text\")").unwrap(),
+            TfValue::String("plain text".to_string())
+        );
+        // encode_ansi decodes any remaining "@{...}" markup.
+        let r = evaluate(&mut engine, "encode_ansi(\"@{n}x\")").unwrap().to_string_value();
+        assert!(r.ends_with('x'));
+        assert_ne!(r, "@{n}x");
+    }
+
+    #[test]
+    fn test_strcmpattr_function() {
+        let mut engine = TfEngine::new();
+        assert_eq!(evaluate(&mut engine, "strcmpattr(\"a\", \"a\")").unwrap(), TfValue::Integer(0));
+        assert_ne!(evaluate(&mut engine, "strcmpattr(\"a\", \"b\")").unwrap(), TfValue::Integer(0));
+    }
+
+    #[test]
+    fn test_is_open_and_gethostname_and_status_fields_functions() {
+        let mut engine = TfEngine::new();
+        assert_eq!(evaluate(&mut engine, "is_open()").unwrap(), TfValue::Integer(0));
+        assert_eq!(evaluate(&mut engine, "is_open(\"noworld\")").unwrap(), TfValue::Integer(0));
+        // gethostname() should at least not error; content is host-dependent.
+        assert!(evaluate(&mut engine, "gethostname()").is_ok());
+        assert_eq!(evaluate(&mut engine, "status_fields()").unwrap(), TfValue::String(String::new()));
+        assert_eq!(evaluate(&mut engine, "status_fields(0)").unwrap(), TfValue::String(String::new()));
+    }
+
+    #[test]
+    fn test_replace_function_tf_argument_order() {
+        let mut engine = TfEngine::new();
+        // TF order: replace(old, new, str) - "a" -> "o" in "banana" = "bonono".
+        assert_eq!(
+            evaluate(&mut engine, "replace(\"a\", \"o\", \"banana\")").unwrap(),
+            TfValue::String("bonono".to_string())
+        );
+        // Clay's optional 4th `count` argument still works in the new
+        // order: replace only the first occurrence.
+        assert_eq!(
+            evaluate(&mut engine, "replace(\"a\", \"o\", \"banana\", 1)").unwrap(),
+            TfValue::String("bonana".to_string())
+        );
+    }
+
+    #[test]
+    fn test_getopts_two_arg_form_with_flags_and_shift() {
+        let mut engine = TfEngine::new();
+        engine.push_scope();
+        engine.set_local("#", TfValue::Integer(3));
+        engine.set_local("1", TfValue::String("-v".to_string()));
+        engine.set_local("2", TfValue::String("rest1".to_string()));
+        engine.set_local("3", TfValue::String("rest2".to_string()));
+        engine.set_local("*", TfValue::String("-v rest1 rest2".to_string()));
+
+        let r = evaluate(&mut engine, "getopts(\"v\", \"\")").unwrap();
+        assert_eq!(r, TfValue::Integer(1));
+        assert_eq!(engine.get_var("opt_v"), Some(&TfValue::Integer(1)));
+        // The consumed "-v" token is shifted out of the positional params.
+        assert_eq!(engine.get_var("#"), Some(&TfValue::Integer(2)));
+        assert_eq!(engine.get_var("1").map(|v| v.to_string_value()), Some("rest1".to_string()));
+        assert_eq!(engine.get_var("2").map(|v| v.to_string_value()), Some("rest2".to_string()));
+        assert_eq!(engine.get_var("*").map(|v| v.to_string_value()), Some("rest1 rest2".to_string()));
+        engine.pop_scope();
+    }
+
+    #[test]
+    fn test_getopts_one_arg_form_no_options_present() {
+        let mut engine = TfEngine::new();
+        engine.push_scope();
+        engine.set_local("#", TfValue::Integer(1));
+        engine.set_local("1", TfValue::String("badtime".to_string()));
+        engine.set_local("*", TfValue::String("badtime".to_string()));
+        // 1-argument form: no init value given.
+        let r = evaluate(&mut engine, "getopts(\"v\")").unwrap();
+        assert_eq!(r, TfValue::Integer(1), "no '-' token is not an error");
+        assert_eq!(engine.get_var("opt_v"), None, "opt_v was never set and had no init value");
+        // Nothing consumed - args unchanged.
+        assert_eq!(engine.get_var("#"), Some(&TfValue::Integer(1)));
+        assert_eq!(engine.get_var("1").map(|v| v.to_string_value()), Some("badtime".to_string()));
+        engine.pop_scope();
+    }
+
+    #[test]
+    fn test_getopts_init_value_and_numeric_suffix() {
+        let mut engine = TfEngine::new();
+        engine.push_scope();
+        engine.set_local("#", TfValue::Integer(1));
+        engine.set_local("1", TfValue::String("-n5".to_string()));
+        engine.set_local("*", TfValue::String("-n5".to_string()));
+        // "n#" - an integer-expression argument, bundled inline.
+        let r = evaluate(&mut engine, "getopts(\"an#s:\", \"\")").unwrap();
+        assert_eq!(r, TfValue::Integer(1));
+        assert_eq!(engine.get_var("opt_n"), Some(&TfValue::Integer(5)));
+        // "a" and "s" were declared but not present: initialized to "" by
+        // the 2-argument form's <init>.
+        assert_eq!(engine.get_var("opt_a"), Some(&TfValue::String(String::new())));
+        assert_eq!(engine.get_var("opt_s"), Some(&TfValue::String(String::new())));
+        engine.pop_scope();
+    }
+
+    #[test]
+    fn test_assign_scope_rule_finding_20() {
+        // := updates an existing LOCAL binding wherever it lives, updates
+        // an existing GLOBAL if there's no local, and otherwise creates a
+        // new GLOBAL - never just the innermost local scope.
+        let mut engine = TfEngine::new();
+
+        // Neither local nor global exists: creates a global.
+        assert_eq!(evaluate(&mut engine, "newvar := 5").unwrap(), TfValue::Integer(5));
+        assert_eq!(engine.global_vars.get("newvar"), Some(&TfValue::Integer(5)));
+        assert!(engine.local_vars_stack.is_empty());
+
+        // Only a global exists: := updates the global, even from inside a
+        // local scope (stack-q.tf's own /push idiom).
+        engine.push_scope();
+        evaluate(&mut engine, "newvar := 6").unwrap();
+        assert_eq!(engine.global_vars.get("newvar"), Some(&TfValue::Integer(6)));
+        assert!(
+            engine.local_vars_stack.last().unwrap().get("newvar").is_none(),
+            "must not have created a local shadow"
+        );
+        engine.pop_scope();
+
+        // A local binding exists (via /let-equivalent set_local): :=
+        // updates THAT binding, not the (nonexistent, or even a
+        // pre-existing but different) global.
+        engine.set_global("shadowed", TfValue::Integer(100));
+        engine.push_scope();
+        engine.set_local("shadowed", TfValue::Integer(1));
+        evaluate(&mut engine, "shadowed := 2").unwrap();
+        assert_eq!(engine.local_vars_stack.last().unwrap().get("shadowed"), Some(&TfValue::Integer(2)));
+        assert_eq!(engine.global_vars.get("shadowed"), Some(&TfValue::Integer(100)), "global must be untouched");
+        engine.pop_scope();
+
+        // ++ / -- follow the same rule.
+        engine.set_global("counter", TfValue::Integer(1));
+        engine.push_scope();
+        evaluate(&mut engine, "++counter").unwrap();
+        assert_eq!(engine.global_vars.get("counter"), Some(&TfValue::Integer(2)));
+        engine.pop_scope();
+    }
+
+    /// Finding 31 / plan Job 14b: `/addworld ... <name> ... [<file>]`'s per-world script
+    /// is kept in `TfEngine::world_files` (never persisted) and read back through
+    /// `world_info(name, "file")`, falling back to DEFAULT's own file when the world
+    /// has none of its own - same fallback rule as character/password (variables.rs).
+    #[test]
+    fn test_world_info_file_field_and_default_fallback() {
+        use crate::tf::WorldInfoCache;
+
+        let mut engine = TfEngine::new();
+        engine.world_info_cache = vec![
+            WorldInfoCache { name: "HasFile".to_string(), ..Default::default() },
+            WorldInfoCache { name: "NoFile".to_string(), ..Default::default() },
+        ];
+        engine.world_files.insert("hasfile".to_string(), "/tmp/hasfile.tf".to_string());
+        engine.default_world_file = Some("/tmp/default.tf".to_string());
+
+        assert_eq!(
+            evaluate(&mut engine, r#"world_info("HasFile", "file")"#).unwrap(),
+            TfValue::String("/tmp/hasfile.tf".to_string())
+        );
+        assert_eq!(
+            evaluate(&mut engine, r#"world_info("NoFile", "file")"#).unwrap(),
+            TfValue::String("/tmp/default.tf".to_string()),
+            "a world with no file of its own falls back to DEFAULT's"
+        );
+        assert_eq!(
+            evaluate(&mut engine, r#"world_info("Unknown", "mfile")"#).unwrap(),
+            TfValue::String(String::new()),
+            "an unknown world name has no cache entry to fall back through"
+        );
+    }
+
+    /// Job 15b-i: a ternary's TRUE branch must allow the comma operator
+    /// with no parentheses needed - real tf's grammar mirrors C's here
+    /// (verified directly against real tf: `/eval /echo $[1 ? 2,3 : 4]`
+    /// -> "3", `$[0 ? 2,3 : 4]` -> "4"). `parse_ternary` used to call
+    /// `parse_or` for the true branch (comma-operator precedence, the
+    /// LOWEST level, was never reached), so stdlib.tf's own "/nth"
+    /// one-liner (`/result {1} > 0 ? shift({1}), {1} : ""`) errored
+    /// "Expected Colon, got Comma" instead of evaluating the shift for
+    /// its side effect and reading the (now-shifted) {1}. The comma
+    /// operator must still be excluded from the CONDITION and the FALSE
+    /// branch, matching C - only the true branch changed.
+    #[test]
+    fn test_ternary_true_branch_allows_comma_operator() {
+        let mut engine = TfEngine::new();
+        assert_eq!(evaluate(&mut engine, "1 ? 2,3 : 4").unwrap(), TfValue::Integer(3));
+        assert_eq!(evaluate(&mut engine, "0 ? 2,3 : 4").unwrap(), TfValue::Integer(4));
+    }
+
+    /// stdlib.tf's own "/nth" idiom, end to end.
+    #[test]
+    fn test_ternary_comma_operator_shift_side_effect_idiom() {
+        let mut engine = TfEngine::new();
+        engine.set_local("1", TfValue::Integer(2));
+        engine.set_local("2", TfValue::String("a".to_string()));
+        engine.set_local("3", TfValue::String("b".to_string()));
+        engine.set_local("4", TfValue::String("c".to_string()));
+        engine.set_local("*", TfValue::String("a b c".to_string()));
+        engine.set_local("#", TfValue::Integer(3));
+        assert_eq!(
+            evaluate(&mut engine, r#"{1} > 0 ? shift({1}), {1} : """#).unwrap(),
+            TfValue::String("b".to_string())
+        );
     }
 }

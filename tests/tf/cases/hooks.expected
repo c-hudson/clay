@@ -1,0 +1,3 @@
+connect-hook
+greet bob
+send-hook greet bob

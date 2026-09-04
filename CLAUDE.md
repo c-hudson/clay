@@ -80,7 +80,7 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 
 **TF (TinyFugue) Engine:**
 - `src/tf/mod.rs` - TF engine state, variable storage, macro registry
-- `src/tf/parser.rs` - Command parsing/routing, command implementations
+- `src/tf/parser.rs` - Command parsing/routing, command implementations, `/help` text
 - `src/tf/macros.rs` - Macro definition, trigger matching, execution
 - `src/tf/builtins.rs` - Built-in TF commands (/echo, /set, /load, /quote, etc.)
 - `src/tf/control_flow.rs` - /if, /while, /for block execution
@@ -88,6 +88,9 @@ Clay is a terminal-based MUD client built with ratatui/crossterm for TUI and tok
 - `src/tf/variables.rs` - Variable substitution (%{var}, %Pn, positional params)
 - `src/tf/hooks.rs` - Hook event system (CONNECT, DISCONNECT, LOAD, etc.)
 - `src/tf/bridge.rs` - Bridge between TF engine and App
+- `src/tf/script_tests.rs` - `#[cfg(test)]` runner for `tests/tf/cases/*.tf` fixtures (see "TinyFugue Compatibility" below)
+- `src/keynames.rs` - Canonical key-name grammar (chords, TF raw forms, `key_<name>` naming layer), shared by `keybindings.dat`, `/bind`, and the web keybind editor
+- `src/chords.rs` - Multi-keystroke chord buffering (`ChordState`), shared by the console and the SSH remote console
 
 **Web Interface:**
 - `src/web/index.html` - HTML template
@@ -156,6 +159,50 @@ Incoming connections are gated in `src/http.rs` before anything is served. Desig
 **Other D7 invariants**: secret files go through `util::write_secret_file`/`secure_create_file`/`secure_append_file` (0600; `~/.clay` is 0700) — never plain `File::create` for anything holding a password/key/token. Static-secret comparisons use `util::constant_time_eq`. Multiuser handlers taking a client `world_index` must check `world.owner == username` (see `ConnectWorld`/`SwitchWorld` in `daemon.rs`). MUD text reaching the web client must be escaped — `app.js` `escapeHtml` (incl. quotes) + `sanitizeHtml` on output sinks, and any HTML-building helper (e.g. `convertDiscordEmojis`) must escape what it interpolates. GMCP media URLs are http/https-only with internal targets refused.
 
 **The web server is always TLS-capable for remote clients; localhost is always plain (D8).** The single-user `/web` popup no longer has a Protocol setting — `web_secure` is kept in `Settings`/`GlobalSettingsMsg`/settings.dat only for wire/import compat, never read to choose HTTP vs HTTPS. `resolve_web_cert_files()` (main.rs) picks a user-provided cert (`websocket_cert_file`/`websocket_key_file` — "Custom Cert File: Yes" in the popup) if set, else an auto-generated self-signed cert whose PEM now lives in `Settings.web_cert_pem`/`web_key_pem` (public cert base64'd cleartext, private key base64'd-then-`secret()`-encrypted — same at-rest mechanism as `websocket_auth_key`), materialized to `~/.clay/cert.pem`/`key.pem` as a derived on-disk cache. In the TLS accept loop (`http.rs`, both native-tls and rustls variants), the existing first-byte-peek branch that used to redirect any non-TLS request to HTTPS now instead serves a **loopback** connection plain via `route_connection` (no handshake) — remote non-TLS requests still redirect. This is why the GUI WebView (`ws://127.0.0.1`) never sees a cert prompt while remote clients always get TLS. Auto-approval on the Clay↔Clay path needs no new work — the existing D7 `TofuVerifier` pinning already silently trusts on first connect and only blocks+prompts on a later mismatch, for every outbound Clay client (remote console, WebView proxy, Android). Only `--multiuser` (`daemon.rs`) keeps the old manual `web_secure`/cert-file toggle — it isn't reachable from `/web` and wasn't touched. Auth Key is read-only in `/web`/web-settings now; Copy/Regen/Delete live in a "Modify Key" sub-popup (TUI: `popup/definitions/modify_key.rs`; web/GUI: `showModifyKeyDialog` in `app.js`), with Regen/Delete reusing `App::handle_ws_key_request`/`handle_ws_key_revoke` (immediate effect, broadcast to all clients) rather than waiting on the popup's own Save. See `SECURITY-ROADMAP.md` D8.
+
+### TinyFugue Compatibility
+
+Clay's TinyFugue (TF) compatibility layer (`src/tf/`) and its keybinding grammar
+(`src/keynames.rs`, `src/chords.rs`, `src/keybindings.rs`) are specced against real TF
+5.0 in `TINYFUGUE-COMPAT.md` (design record — per-key and per-command ruling tables,
+changed defaults, intentional differences) and `docs/markdown/06-tf-commands.md` /
+`docs/markdown/07-keyboard-shortcuts.md` (user-facing).
+
+- **Script-test suite**: `tests/tf/cases/*.tf` + `.expected`, run via `cargo test
+  tf_script` (harness: `src/tf/script_tests.rs`). Add a fixture by writing the `.tf`
+  file, then run `tools/tf-oracle.sh --write <name>.tf` to generate its `.expected`
+  from real `tf` (needs `tf` on `PATH` — `apt install tf5`) — never hand-write an
+  `.expected` file. A case needing the real TF library starts with `;; requires-lib`
+  and is skipped (not failed) when `$TFLIBDIR`/`/usr/share/tf5/tf-lib` isn't found.
+- **The xfail ledger** (`tests/tf/xfail.txt`, format `case-name | substring-of-failure`):
+  a known-failing case is listed here, not silently left red. A listed case that
+  starts passing is itself a test failure ("remove it from xfail.txt") — that's the
+  signal a fix landed. Never add an entry to make a red test green without a real,
+  understood gap behind it.
+- **Key-name grammar and dispatch order**: every key name (`keybindings.dat`, `/bind`,
+  a live keypress, the web keybind editor) is canonicalized through
+  `crate::keynames::parse_key_name`/`KeySeq::canonical` — this is the one place chords
+  (`^X^R`), TF's raw spellings (`^[b`, `\033`), and case-significant `Esc-` forms
+  (`Esc-j` != `Esc-J`) are understood. A pressed key resolves in this order, identical
+  on console and web/GUI/SSH-console clients: (1) a `/bind`/`/def -b`/`-B` match, (2) a
+  `key_<name>` macro, (3) the built-in action table (`ACTIONS`/`dispatch_action`), (4)
+  literal character input.
+- **Three-UI rule for a new action id**: adding to `ACTIONS` in `src/keybindings.rs`
+  is not enough on its own — `dispatch_action` (console), `dispatchActionImpl` in
+  `app.js` (web/GUI), and the keybind editor's action list (it reads `actions_json`,
+  but a new category string also needs adding to its own `order` array or the whole
+  category is silently hidden) all need the new id, or an interface silently can't run
+  it. `RunKeyBinding{key, kbnum}` is the wire message a remote client sends back to the
+  server when a keypress matches a TF `/bind` entry the server told it about
+  (`tf_bound_keys_json`/`GlobalSettingsMsg`) — TF `/bind` state lives only in the
+  server's own `TfEngine`, so a remote client can't run one locally.
+- **Two traps found the hard way**: `%;` (TF's command separator) is **not**
+  quote-aware — a naive quote-aware splitter looks more correct but is wrong; real TF
+  splits on every `%;` regardless of surrounding quotes. And TinyFugue does **not**
+  expand `%var`/`$[...]`/`$(...)` on a bare top-level line read from a file — only
+  inside a macro body, or via `/eval`'s own substitution pass; a script-test probe
+  that needs expansion must be wrapped in a macro or `/eval`, and any engine change
+  that substitutes a top-level file line unconditionally is reintroducing this bug.
 
 ### /release Skill
 

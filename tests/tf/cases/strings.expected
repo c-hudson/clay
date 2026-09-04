@@ -1,0 +1,8 @@
+strlen=5
+substr1=world
+substr2=hello
+strchr=2
+strcat=foobarbaz
+toupper=HELLO
+tolower=hello
+pad=[   hi]

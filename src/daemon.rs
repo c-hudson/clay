@@ -18,7 +18,9 @@ use crate::{
 };
 use crate::actions::{action_commands_to_run,
     find_invocable_action, rewrite_slashless_action};
-use crate::commands::{connect_slack, connect_discord};
+use crate::commands::{connect_slack, connect_discord, execute_send_command, execute_log_command,
+    execute_disconnect_command, execute_add_world_command, execute_add_world_default_command,
+    execute_remove_world_command, prepare_world_connect_host_port};
 // Only used by the #[cfg(test)] helpers below (RemoteConsole's own non-test use moved into
 // the now-shared App::handle_cycle_world in main.rs - T39).
 #[cfg(test)]
@@ -600,8 +602,25 @@ pub async fn run_daemon_server() -> io::Result<()> {
     }
 }
 
-/// Handle WebSocket message in daemon mode
+/// Handle WebSocket message in daemon mode. Thin wrapper around
+/// `handle_daemon_ws_message_impl` that also refreshes `tf_bound_keys_json` afterward
+/// (TF-parity plan Job 22a/P2.7 - see `App::refresh_tf_bound_keys_if_changed`'s own doc
+/// comment). This function is also used outside `-D`/`--multiuser` proper: main.rs's
+/// GUI/headless run loops (`run_master_webgui`, `run_app_headless`) dispatch every WS
+/// message through it too, so this one wrapper covers every single-user WS/GUI/web client
+/// path that isn't the interactive console's own `handle_ws_send_command`/
+/// `apply_pending_tf_console_ops` (main.rs/commands.rs).
 pub async fn handle_daemon_ws_message(
+    app: &mut App,
+    client_id: u64,
+    msg: WsMessage,
+    event_tx: &mpsc::Sender<AppEvent>,
+) {
+    handle_daemon_ws_message_impl(app, client_id, msg, event_tx).await;
+    app.refresh_tf_bound_keys_if_changed();
+}
+
+async fn handle_daemon_ws_message_impl(
     app: &mut App,
     client_id: u64,
     msg: WsMessage,
@@ -616,6 +635,34 @@ pub async fn handle_daemon_ws_message(
     // pause tracking (T38).
     app.auto_resume_if_user_action(client_id, &msg);
     match msg {
+        // TF-parity plan Job 22a/P2.7: same handling as the master WS's own
+        // `App::handle_ws_client_msg` arm (main.rs) - resolve `key` the same way the
+        // console does (`chords::resolve_bound_command`), then run the result exactly like
+        // a typed `SendCommand` by recursing into this same function (mirrors the existing
+        // `WorldConnectHostPort` followup recursion further down). This is what makes
+        // `RunKeyBinding` work for GUI/headless single-user modes too, not just the
+        // interactive TUI console - `run_master_webgui`/`run_app_headless` dispatch every
+        // WS message through `handle_daemon_ws_message`.
+        WsMessage::RunKeyBinding { key, kbnum } => {
+            if let Some(cmd) = crate::chords::resolve_bound_command(app, &key) {
+                let world_index = app.ws_client_worlds.get(&client_id)
+                    .map(|s| s.world_index)
+                    .unwrap_or(app.current_world_index);
+                // See main.rs's identical `RunKeyBinding` handler for why this swaps
+                // through `app.input.kbnum` rather than writing the TF `%kbnum` global
+                // directly - `sync_tf_world_info()` (called by the recursive `SendCommand`
+                // dispatch below) unconditionally overwrites it from there.
+                let prev_kbnum = app.input.kbnum;
+                app.input.kbnum = kbnum;
+                Box::pin(handle_daemon_ws_message_impl(
+                    app, client_id, WsMessage::SendCommand { world_index, command: cmd }, event_tx,
+                )).await;
+                app.input.kbnum = prev_kbnum;
+                app.tf_engine.unset_global("kbnum");
+            }
+            // Unknown key (stale client-side cache, or a race with an /unbind) - ignore
+            // silently, per the plan's own ruling.
+        }
         WsMessage::SendCommand { world_index, command } => {
             // Determine the current world name for action world-scoping.
             let world_name = app.worlds.get(world_index).map(|w| w.name.clone()).unwrap_or_default();
@@ -740,14 +787,21 @@ pub async fn handle_daemon_ws_message(
                     }
                 }
                 Command::NotACommand { text } => {
-                    // Regular text - send to MUD
+                    // SEND hook: typed plain text about to go to the MUD. A matching
+                    // non-quiet hook means the original text is NOT sent - see /help
+                    // hooks' SEND rule and finding C.10 / plan step P1.9 (this is the
+                    // "headless/daemon" half of the same shared-helper wiring the
+                    // console loop does in main.rs).
                     if world_index < app.worlds.len() {
-                        let sent = app.worlds[world_index].command_tx.as_ref()
-                            .is_some_and(|tx| tx.try_send(WriteCommand::Text(text.clone())).is_ok());
-                        if sent {
-                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                            app.worlds[world_index].prompt.clear();
-                            app.record_user_input(world_index, &text);
+                        let suppressed = app.fire_tf_hook(Some(world_index), tf::TfHookEvent::Send, &text, true);
+                        if !suppressed {
+                            let sent = app.worlds[world_index].command_tx.as_ref()
+                                .is_some_and(|tx| tx.try_send(WriteCommand::Text(text.clone())).is_ok());
+                            if sent {
+                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                app.worlds[world_index].prompt.clear();
+                                app.record_user_input(world_index, &text);
+                            }
                         }
                     }
                 }
@@ -808,113 +862,25 @@ pub async fn handle_daemon_ws_message(
                     app.emit_client_text(world_index, &help_text, true);
                 }
                 Command::Unknown { cmd } => {
+                    // NOMACRO hook - see /help hooks and finding C.10 / plan step P1.9.
+                    app.fire_tf_hook(Some(world_index), tf::TfHookEvent::Nomacro, &cmd, true);
                     app.emit_client_text(world_index, &format!("Unknown command: {}", cmd), true);
                 }
-                Command::Send { text, all_worlds, target_world, no_newline } => {
-                    let make_write_cmd = |t: &str| -> WriteCommand {
-                        if no_newline {
-                            WriteCommand::Raw(t.as_bytes().to_vec())
-                        } else {
-                            WriteCommand::Text(t.to_string())
-                        }
-                    };
-
-                    if all_worlds {
-                        let mut sent_count = 0;
-                        for world in app.worlds.iter_mut() {
-                            if world.connected {
-                                if let Some(tx) = &world.command_tx {
-                                    if tx.try_send(make_write_cmd(&text)).is_ok() {
-                                        world.last_send_time = Some(std::time::Instant::now());
-                                        sent_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                        if sent_count == 0 {
-                            app.emit_client_text(world_index, "No connected worlds to send to.", true);
-                        }
-                    } else if let Some(ref target) = target_world {
-                        if let Some(world) = app.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
-                            if world.connected {
-                                if let Some(tx) = &world.command_tx {
-                                    let _ = tx.try_send(make_write_cmd(&text));
-                                    world.last_send_time = Some(std::time::Instant::now());
-                                }
-                            } else {
-                                app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                                    world_index,
-                                    data: format!("World '{}' is not connected.", target),
-                                    is_viewed: false,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0, end_seq: None,
-                                    flush: false, gagged: false, highlight_colors: Vec::new(),
-                                });
-                            }
-                        } else {
-                            // Wording matches the console copy (commands.rs) exactly.
-                            app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                                world_index,
-                                data: format!("World '{}' not found.", target),
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0, end_seq: None,
-                                flush: false, gagged: false, highlight_colors: Vec::new(),
-                            });
-                        }
-                    } else if world_index < app.worlds.len() {
-                        if !app.worlds[world_index].connected {
-                            app.emit_client_text(world_index, "Not connected. Use /worlds to connect.", true);
-                        } else if let Some(tx) = &app.worlds[world_index].command_tx {
-                            if tx.try_send(make_write_cmd(&text)).is_ok() {
-                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                            } else {
-                                app.emit_client_text(world_index, "Failed to send command.", true);
-                            }
-                        }
-                    }
+                Command::Send { text, all_worlds, target_world, world_type, no_newline, run_hook } => {
+                    execute_send_command(app, &text, all_worlds, &target_world, &world_type, no_newline, run_hook, world_index, true);
                 }
-                Command::Disconnect => {
-                    if world_index < app.worlds.len() && app.worlds[world_index].connected {
-                        #[cfg(unix)]
-                        if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
-                            unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
-                        }
-                        #[cfg(windows)]
-                        if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
-                            crate::platform::kill_proxy_process(proxy_pid);
-                        }
-                        // Use the same World::clear_connection_state the console/master-WS
-                        // paths use, instead of an inline field-by-field copy - the inline
-                        // version here was missing several fields (skip_auto_login,
-                        // negotiated_encoding, telnet_mode, naws_enabled/naws_sent_size,
-                        // fansi_detect_until/fansi_login_pending, active_media, timing
-                        // fields), leaking stale state into the next connection attempt on
-                        // this world in daemon mode.
-                        app.worlds[world_index].clear_connection_state(true, true);
-                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                            world_index,
-                            data: "Disconnected.".to_string(),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
-                        });
-                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
-                    } else {
-                        app.ws_broadcast(WsMessage::ServerData { archive_sourced: false,
-                            world_index,
-                            data: "Not connected.".to_string(),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0, end_seq: None,
-                            flush: false, gagged: false, highlight_colors: Vec::new(),
-                        });
-                    }
+                Command::Log { world, log_input, log_local: _, log_global: _, action } => {
+                    execute_log_command(app, &world, log_input, &action, world_index, true);
+                }
+                Command::Disconnect { world } => {
+                    // Uses the same World::clear_connection_state the console/master-WS paths
+                    // use (via execute_disconnect_command), instead of an inline field-by-field
+                    // copy - see the removed comment's own history: the old inline version here
+                    // was missing several fields (skip_auto_login, negotiated_encoding,
+                    // telnet_mode, naws_enabled/naws_sent_size, fansi_detect_until/
+                    // fansi_login_pending, active_media, timing fields), leaking stale state
+                    // into the next connection attempt on this world in daemon mode.
+                    execute_disconnect_command(app, &world, world_index, true);
                 }
                 Command::Flush => {
                     if world_index < app.worlds.len() {
@@ -1158,62 +1124,22 @@ pub async fn handle_daemon_ws_message(
                     });
                 }
                 // AddWorld - add or update world definition
-                Command::AddWorld { name, host, port, user, password, use_ssl } => {
-                    let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
-
-                    let world_idx = if let Some(idx) = existing_idx {
-                        idx
-                    } else {
-                        // Validate name - matches console's checks (commands.rs), missing here
-                        // before meant a daemon-mode client could create a broken world entry.
-                        if name.is_empty() {
-                            app.emit_client_text(world_index, "Error: World name cannot be empty", true);
-                            return;
-                        }
-                        if name.contains(' ') {
-                            app.emit_client_text(world_index, "Error: World name cannot contain spaces", true);
-                            return;
-                        }
-                        if name.starts_with('(') {
-                            app.emit_client_text(world_index, "Error: World name cannot start with '('", true);
-                            return;
-                        }
-                        let mut new_world = World::new(&name);
-                        // Every other world-creation path wires this (see
-                        // App::find_or_create_world); without it a world added
-                        // through the daemon never archives a single line.
-                        new_world.scrollback_tx =
-                            app.scrollback.as_ref().map(|db| db.sender());
-                        app.worlds.push(new_world);
-                        app.worlds.len() - 1
-                    };
-
-                    if let Some(h) = host {
-                        app.worlds[world_idx].settings.hostname = h;
+                Command::AddWorld { name, host, port, user, password, use_ssl, file } => {
+                    execute_add_world_command(app, name, host, port, user, password, use_ssl, file, world_index, true);
+                }
+                Command::AddWorldDefault { character, password, file } => {
+                    execute_add_world_default_command(app, character, password, file, world_index, true);
+                }
+                Command::RemoveWorld { names } => {
+                    execute_remove_world_command(app, &names, world_index, true);
+                }
+                Command::WorldConnectHostPort { host, port, use_ssl, no_login, background } => {
+                    match prepare_world_connect_host_port(app, &host, &port, use_ssl, no_login, background) {
+                        Ok(followup) => return Box::pin(handle_daemon_ws_message(
+                            app, client_id, WsMessage::SendCommand { world_index, command: followup }, event_tx,
+                        )).await,
+                        Err(e) => app.emit_client_text(world_index, &e, true),
                     }
-                    if let Some(p) = port {
-                        app.worlds[world_idx].settings.port = p;
-                    }
-                    if let Some(u) = user {
-                        app.worlds[world_idx].settings.user = u;
-                    }
-                    if let Some(p) = password {
-                        app.worlds[world_idx].settings.password = p;
-                    }
-                    app.worlds[world_idx].settings.use_ssl = use_ssl;
-
-                    let _ = persistence::save_settings(app);
-
-                    let action = if existing_idx.is_some() { "Updated" } else { "Added" };
-                    let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
-                        format!(" ({}:{}{})",
-                            app.worlds[world_idx].settings.hostname,
-                            app.worlds[world_idx].settings.port,
-                            if use_ssl { " SSL" } else { "" })
-                    } else {
-                        " (connectionless)".to_string()
-                    };
-                    app.emit_client_text(world_index, &format!("{} world '{}'{}.", action, name, host_info), true);
                 }
                 // Connect command - use daemon connection logic
                 Command::Connect { .. } => {

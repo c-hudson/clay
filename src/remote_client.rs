@@ -1926,23 +1926,15 @@ pub(crate) fn handle_remote_client_key(
         return false;
     }
 
-    // Helper to check if escape was pressed recently (for Escape+key sequences)
-    let recent_escape = app.last_escape
-        .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
-        .unwrap_or(false);
-
-    // Track bare Escape key presses for Escape+key sequences
-    if key.code == Esc && key.modifiers.is_empty() {
-        app.last_escape = Some(std::time::Instant::now());
-        return false;
-    }
-
-    // Convert key event to canonical name, handling Esc+key sequences
-    let key_name = if recent_escape && matches!(key.code, Char(_) | Backspace) {
-        app.last_escape = None;
-        keybindings::escape_key_to_name(key.code, key.modifiers)
-    } else {
-        keybindings::key_event_to_name(key.code, key.modifiers)
+    // Resolve this keystroke through the shared chord machinery (plan Phase
+    // 2 step P2.2). See `input_handler::handle_key_event`'s identical call -
+    // `crate::chords::resolve_key_name` is the single lookup both console
+    // paths now share, so they can't drift the way Job 17 found this
+    // Escape-handling block had (`app.chord`, `crate::chords`).
+    let key_name = match crate::chords::resolve_key_name(app, key.code, key.modifiers) {
+        crate::chords::KeyResolution::Pending => return false,
+        crate::chords::KeyResolution::NotAKey => None,
+        crate::chords::KeyResolution::Dispatch(name) => Some(name),
     };
 
     // Clear history search state on any non-search key
@@ -1953,14 +1945,28 @@ pub(crate) fn handle_remote_client_key(
         }
     }
 
-    // Check TF /bind bindings first (runtime bindings from /bind command)
+    // TF-parity plan Job 22c: this client's own `app.tf_engine` never runs macros or
+    // receives `/bind`/`/def` definitions locally (typed commands go straight to
+    // `WsMessage::SendCommand`, executed by the SERVER's own TF engine) - so the previous
+    // `chords::resolve_bound_command(app, name)` check that used to live here was always a
+    // structural no-op against an always-empty `app.tf_engine` (Job 22a's own report).
+    // Instead, mirror app.js's `tfBoundKeys`: `GlobalSettingsMsg::tf_bound_keys_json`
+    // (parsed into `app.tf_bound_keys` by `apply_global_settings`) tells this client which
+    // keystrokes the SERVER answers with a `/bind`/`-b`/`-B` or `key_<name>` macro, so it
+    // can hand those off via `WsMessage::RunKeyBinding` instead of running a built-in
+    // action - the server resolves it the same way a live console keypress would
+    // (`WsMessage::RunKeyBinding`'s own handler calls the shared `chords::
+    // resolve_bound_command` against ITS OWN real `tf_engine`). Same dispatch order
+    // app.js uses: `tf_bound_keys_json` first, then the action table below.
     if let Some(ref name) = key_name {
-        let tf_name = canonical_to_tf_key_name(name);
-        if let Some(cmd) = app.tf_engine.keybindings.get(&tf_name).cloned() {
-            let _ = ws_tx.send(WsMessage::SendCommand {
-                world_index: app.current_world_index,
-                command: cmd,
-            });
+        if app.tf_bound_keys.contains(name) {
+            // Send the raw kbnum (possibly None), not `take_kbnum()`'s defaulted-to-1
+            // value - the server mirrors this straight into its own `self.input.kbnum`
+            // and lets the bound command's own kbnum-consuming logic (or lack of it)
+            // decide what an absent prefix means, exactly like a locally-bound key would.
+            let kbnum = app.input.kbnum;
+            app.input.clear_kbnum();
+            let _ = ws_tx.send(WsMessage::RunKeyBinding { key: name.clone(), kbnum });
             return false;
         }
     }
@@ -2101,9 +2107,18 @@ pub(crate) fn handle_remote_client_key(
                             world_index: app.current_world_index,
                         });
                     }
-                    Command::Disconnect => {
-                        let _ = ws_tx.send(WsMessage::DisconnectWorld {
+                    Command::Disconnect { world } => {
+                        // Route through the normal command pipeline (like WorldConnectNoLogin
+                        // above) so the server can resolve -ALL/a named world - the dedicated
+                        // WsMessage::DisconnectWorld only ever targets the caller's own current
+                        // world and knows nothing about either.
+                        let command = match world {
+                            Some(w) => format!("/disconnect {}", w),
+                            None => "/disconnect".to_string(),
+                        };
+                        let _ = ws_tx.send(WsMessage::SendCommand {
                             world_index: app.current_world_index,
+                            command,
                         });
                     }
                     Command::RemoteAttach { addr, close, cancel } => {
@@ -2157,6 +2172,35 @@ pub(crate) fn handle_remote_client_key(
     }
     false
 }
+/// Compute the target world index for TF SOCKETB/SOCKETF (`world_socket_prev/next`,
+/// TF-parity plan Job 22a, finding 38) - same connected-only, list-order cycling as the
+/// master console's own `App::cycle_connected_world`, but read-only: this client has no
+/// authority to switch worlds locally (only the server's `SwitchWorld` broadcast actually
+/// moves any client's `current_world_index`), so it only computes the target and leaves
+/// sending `SwitchWorld` to the caller. `None` if there are no connected worlds, or if the
+/// computed target is the world already current (nothing to do).
+fn cycle_connected_world_target(app: &App, direction: i32) -> Option<usize> {
+    let connected: Vec<usize> = app.worlds.iter().enumerate()
+        .filter(|(_, w)| w.connected)
+        .map(|(i, _)| i)
+        .collect();
+    if connected.is_empty() {
+        return None;
+    }
+    let current_pos = connected.iter().position(|&i| i == app.current_world_index);
+    let len = connected.len() as i32;
+    let target_pos = match current_pos {
+        Some(pos) => (((pos as i32 + direction) % len) + len) % len,
+        None => 0,
+    };
+    let target = connected[target_pos as usize];
+    if target == app.current_world_index {
+        None
+    } else {
+        Some(target)
+    }
+}
+
 /// Dispatch a keybinding action for remote console client.
 /// Similar to dispatch_action() but sends WsMessages instead of direct App mutations for world ops.
 /// Returns true if quit was requested.
@@ -2166,49 +2210,158 @@ pub(crate) fn dispatch_remote_action(
     ws_tx: &mpsc::UnboundedSender<WsMessage>,
 ) -> bool {
     match action {
-        // Cursor Movement
-        "cursor_left" => { app.input.move_cursor_left(); }
-        "cursor_right" => { app.input.move_cursor_right(); }
-        "cursor_word_left" => { app.input.word_left(); }
-        "cursor_word_right" => { app.input.word_right(); }
+        // Cursor Movement - kbnum-aware (TF-parity plan Job 20/P2.4): kbnum is purely
+        // client-side here (this client has no TF engine execution of its own bound
+        // commands - `/bind`-bound keys are forwarded to the server as-is, below), so this
+        // only needs to mirror `input_handler::dispatch_action_impl`'s local editing
+        // behavior, not the engine-variable round trip that function's doc comment
+        // describes for the master console.
+        "cursor_left" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.move_cursor_left(); } }
+            else { for _ in 0..(-n) { app.input.move_cursor_right(); } }
+        }
+        "cursor_right" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.move_cursor_right(); } }
+            else { for _ in 0..(-n) { app.input.move_cursor_left(); } }
+        }
+        "cursor_word_left" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.word_left(); } }
+            else { for _ in 0..(-n) { app.input.word_right(); } }
+        }
+        "cursor_word_right" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.word_right(); } }
+            else { for _ in 0..(-n) { app.input.word_left(); } }
+        }
         "cursor_home" => { app.input.home(); }
         "cursor_end" => { app.input.end(); }
         "cursor_up" => {
-            if app.input.move_cursor_up() {
-                app.input.history_prev();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { if app.input.move_cursor_up() { app.input.history_prev(); } }
+            } else {
+                for _ in 0..(-n) { if app.input.move_cursor_down() { app.input.history_next(); } }
             }
         }
         "cursor_down" => {
-            if app.input.move_cursor_down() {
-                app.input.history_next();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { if app.input.move_cursor_down() { app.input.history_next(); } }
+            } else {
+                for _ in 0..(-n) { if app.input.move_cursor_up() { app.input.history_prev(); } }
             }
         }
 
         // Editing
-        "delete_backward" => { app.input.delete_char(); app.last_input_was_delete = true; }
-        "delete_forward" => { app.input.delete_char_forward(); app.last_input_was_delete = true; }
-        "delete_word_backward" => { app.input.delete_word_before_cursor(); }
-        "delete_word_forward" => { app.input.delete_word_forward(); }
-        "delete_word_backward_punct" => { app.input.backward_kill_word_punctuation(); }
+        "delete_backward" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.delete_char(); } }
+            else { for _ in 0..(-n) { app.input.delete_char_forward(); } }
+            app.last_input_was_delete = true;
+        }
+        "delete_forward" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.delete_char_forward(); } }
+            else { for _ in 0..(-n) { app.input.delete_char(); } }
+            app.last_input_was_delete = true;
+        }
+        "delete_word_backward" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.delete_word_before_cursor(); } }
+            else { for _ in 0..(-n) { app.input.delete_word_forward(); } }
+        }
+        "delete_word_forward" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.delete_word_forward(); } }
+            else { for _ in 0..(-n) { app.input.delete_word_before_cursor(); } }
+        }
+        "delete_word_backward_punct" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.backward_kill_word_punctuation(); } }
+            else { for _ in 0..(-n) { app.input.delete_word_forward(); } }
+        }
         "kill_to_end" => { app.input.kill_to_end(); }
         "clear_line" => { app.input.clear(); }
-        "transpose_chars" => { app.input.transpose_chars(); }
+        "transpose_chars" => {
+            let n = app.input.take_kbnum_positive();
+            for _ in 0..n { app.input.transpose_chars(); }
+        }
         "literal_next" => { app.literal_next = true; }
-        "capitalize_word" => { app.input.capitalize_word(); }
-        "lowercase_word" => { app.input.lowercase_word(); }
-        "uppercase_word" => { app.input.uppercase_word(); }
+        "capitalize_word" => {
+            let n = app.input.take_kbnum_positive();
+            for _ in 0..n { app.input.capitalize_word(); }
+        }
+        "lowercase_word" => {
+            let n = app.input.take_kbnum_positive();
+            for _ in 0..n { app.input.lowercase_word(); }
+        }
+        "uppercase_word" => {
+            let n = app.input.take_kbnum_positive();
+            for _ in 0..n { app.input.uppercase_word(); }
+        }
         "collapse_spaces" => { app.input.collapse_spaces(); }
         "goto_matching_bracket" => { app.input.goto_matching_bracket(); }
         "insert_last_arg" => { app.input.last_argument(); }
         "yank" => { app.input.yank(); }
+        // TF `Insert`/`Esc-v` and numeric-prefix entry (Job 20/P2.4) - purely client-side,
+        // same as the editing actions above.
+        "toggle_insert" => { app.input.insert = !app.input.insert; }
+        "kbnum_0" => { app.input.kbnum_digit(0); }
+        "kbnum_1" => { app.input.kbnum_digit(1); }
+        "kbnum_2" => { app.input.kbnum_digit(2); }
+        "kbnum_3" => { app.input.kbnum_digit(3); }
+        "kbnum_4" => { app.input.kbnum_digit(4); }
+        "kbnum_5" => { app.input.kbnum_digit(5); }
+        "kbnum_6" => { app.input.kbnum_digit(6); }
+        "kbnum_7" => { app.input.kbnum_digit(7); }
+        "kbnum_8" => { app.input.kbnum_digit(8); }
+        "kbnum_9" => { app.input.kbnum_digit(9); }
+        "kbnum_negative" => { app.input.kbnum_negative(); }
+        // TF-parity plan Job 19 (P2.3).
+        "kill_to_start" => { app.input.kill_to_start(); app.last_input_was_delete = true; }
+        "expand_line" => {
+            let text = app.input.buffer.clone();
+            let expanded = crate::tf::variables::substitute_commands(&mut app.tf_engine, &text);
+            app.input.buffer = expanded;
+            app.input.cursor_position = app.input.buffer.len();
+        }
+        "completion" => { perform_completion(app); }
 
         // History
-        "history_prev" => { app.input.history_prev(); }
-        "history_next" => { app.input.history_next(); }
-        "history_search_backward" => { app.input.history_search_backward(); }
-        "history_search_forward" => { app.input.history_search_forward(); }
+        "history_prev" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.history_prev(); } }
+            else { for _ in 0..(-n) { app.input.history_next(); } }
+        }
+        "history_next" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.history_next(); } }
+            else { for _ in 0..(-n) { app.input.history_prev(); } }
+        }
+        "history_search_backward" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.history_search_backward(); } }
+            else { for _ in 0..(-n) { app.input.history_search_forward(); } }
+        }
+        "history_search_forward" => {
+            let n = app.input.take_kbnum();
+            if n >= 0 { for _ in 0..n { app.input.history_search_forward(); } }
+            else { for _ in 0..(-n) { app.input.history_search_backward(); } }
+        }
+        // TF RECALLBEG/RECALLEND (Job 19), kbnum-aware since Job 20 - see
+        // `InputArea::history_begin_n`'s doc comment.
+        "recall_begin" => { let n = app.input.take_kbnum(); app.input.history_begin_n(n); }
+        "recall_end" => { let n = app.input.take_kbnum(); app.input.history_end_n(n); }
 
-        // Scrollback
+        // Scrollback - deliberately left kbnum-unaware for this client (Job 20/P2.4 scope
+        // decision): `scroll_page_up`'s backfill request sizing and `scroll_half_page`'s
+        // pending-release-vs-viewport-move branch both need to stay in lockstep with the
+        // request/count they send the server, which isn't worth the risk of touching here;
+        // the master console's equivalent actions (`input_handler::dispatch_action_impl`)
+        // are the fully kbnum-aware ones.
         "scroll_page_up" => {
             // Row-exact, measured the way render_output_crossterm actually wraps (this client
             // shares that renderer). The old logical-index subtraction ignored wrapping
@@ -2236,6 +2389,9 @@ pub(crate) fn dispatch_remote_action(
             let scroll_amount = (app.output_height as usize).saturating_sub(2).max(1);
             app.move_viewport_down(scroll_amount);
         }
+        // TF PAGEBACK: real alias of scroll_page_up, including its backfill request -
+        // recurses into this same function rather than duplicating that body.
+        "scroll_page_back" => { dispatch_remote_action("scroll_page_up", app, ws_tx); }
         "scroll_half_page" => {
             let half = (app.output_height as usize).saturating_sub(2) / 2;
             let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
@@ -2248,6 +2404,21 @@ pub(crate) fn dispatch_remote_action(
                 app.move_viewport_up(half.max(1));
             }
         }
+        // TF HPAGEBACK/LINE/LINEBACK (Job 19) - local viewport moves only, same fidelity
+        // level as this client's existing scroll_half_page above (no backfill request for
+        // a small move; scroll_page_up/scroll_page_back are the ones that trigger one).
+        "scroll_half_page_back" => {
+            let half = (app.output_height as usize).saturating_sub(2) / 2;
+            app.move_viewport_up(half.max(1));
+        }
+        "scroll_line_forward" => { app.move_viewport_down(1); }
+        "scroll_line_back" => { app.move_viewport_up(1); }
+        // TF CLEAR/PAUSE (Job 19).
+        "clear_screen" => {
+            app.needs_terminal_clear = true;
+            app.needs_output_redraw = true;
+        }
+        "pause_output" => { app.current_world_mut().paused = true; }
         "flush_output" => {
             let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
             if app.current_world().paused && has_pending {
@@ -2305,6 +2476,28 @@ pub(crate) fn dispatch_remote_action(
         "world_forward" => {
             let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
         }
+        // TF /bg (= /fg -n): no-op in Clay's single-pane console (Job 19; see
+        // dispatch_action's own version for the full rationale).
+        "bg_all_worlds" => {}
+        // world_socket_prev/world_socket_next (TF SOCKETB/SOCKETF): cycle CONNECTED worlds
+        // only, in list order - TF-parity plan Job 22a, finding 38. This client already
+        // caches the full world list with each world's `connected` flag kept current by
+        // `App::handle_remote_ws_message`'s `WorldConnected`/`WorldDisconnected` handlers, so
+        // the target can be computed locally exactly like the master console's own
+        // `App::cycle_connected_world` - no new WsMessage needed, just the existing
+        // `SwitchWorld` once the target index is known.
+        "world_socket_prev" => {
+            let n = app.input.take_kbnum() as i32;
+            if let Some(idx) = cycle_connected_world_target(app, -n) {
+                let _ = ws_tx.send(WsMessage::SwitchWorld { world_index: idx });
+            }
+        }
+        "world_socket_next" => {
+            let n = app.input.take_kbnum() as i32;
+            if let Some(idx) = cycle_connected_world_target(app, n) {
+                let _ = ws_tx.send(WsMessage::SwitchWorld { world_index: idx });
+            }
+        }
 
         // System
         "help" => {
@@ -2314,8 +2507,16 @@ pub(crate) fn dispatch_remote_action(
                 app.open_help_popup_new();
             }
         }
-        "redraw" => {
+        "redraw" | "redraw_server_only" => {
             app.current_world_mut().filter_to_server_output();
+            app.needs_terminal_clear = true;
+            app.needs_output_redraw = true;
+        }
+        // TF's real REFRESH/^L: plain repaint, no line filtering (Job 22 makes this the new
+        // ^L default) - see this file's `"redraw_server_only"` arm just above for the
+        // filtering variant, and `dispatch_action`'s `KeyAction::Refresh` for the master
+        // console's equivalent split.
+        "refresh_line" => {
             app.needs_terminal_clear = true;
             app.needs_output_redraw = true;
         }
@@ -2350,6 +2551,22 @@ pub(crate) fn dispatch_remote_action(
                 app.filter_popup.open();
             }
         }
+        // TF-parity plan Job 22a (`Esc-L`): same open/close toggle as `filter_popup` above -
+        // this client's `FilterPopup` is purely local UI state (finding 33: the real
+        // `/limit`/`/unlimit`/`/relimit` pattern-matching semantics are console-only, driven
+        // through the TF engine this client doesn't run), so "toggle" here just means
+        // show/hide the popup rather than reapplying a remembered pattern.
+        "toggle_limit" => {
+            if app.filter_popup.visible {
+                app.filter_popup.visible = false;
+            } else {
+                app.filter_popup.open();
+            }
+        }
+        // TF-parity plan Job 22a (`^X^V`): same text as a typed `/version`.
+        "show_version" => {
+            app.add_output(&crate::get_version_string());
+        }
         "toggle_action_highlight" => {
             app.highlight_actions = !app.highlight_actions;
             app.needs_output_redraw = true;
@@ -2375,6 +2592,12 @@ pub(crate) fn dispatch_remote_action(
             if app.input_height > 1 { app.input_height -= 1; }
         }
         _ => {}
+    }
+    // TF-parity plan Job 20 (P2.4): same auto-clear rule as
+    // `input_handler::dispatch_action` - every action other than the numeric-prefix-
+    // building ones cancels a pending kbnum, whether or not it consumed one.
+    if !is_kbnum_setting_action(action) {
+        app.input.clear_kbnum();
     }
     false
 }
@@ -2490,5 +2713,229 @@ pub(crate) fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
             app.needs_output_redraw = true;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal `App` with `connected.len()` worlds named `w0`, `w1`, ... whose
+    /// `connected` flags match `connected` in order - enough to exercise
+    /// `cycle_connected_world_target` without any real network/WS setup (this remote
+    /// client's own `App.worlds`/`connected` cache is kept current in practice by
+    /// `App::handle_remote_ws_message`'s `WorldConnected`/`WorldDisconnected` handlers -
+    /// see that function's doc comment).
+    fn make_test_app_with_worlds(connected: &[bool]) -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        for (i, &is_connected) in connected.iter().enumerate() {
+            let mut w = crate::World::new(&format!("w{i}"));
+            w.connected = is_connected;
+            app.worlds.push(w);
+        }
+        app.current_world_index = 0;
+        app
+    }
+
+    #[test]
+    fn test_cycle_connected_world_target_skips_disconnected_worlds() {
+        // worlds: 0 connected, 1 DISCONNECTED, 2 connected, 3 connected.
+        let mut app = make_test_app_with_worlds(&[true, false, true, true]);
+        app.current_world_index = 0;
+        assert_eq!(cycle_connected_world_target(&app, 1), Some(2),
+            "next connected world after 0 is 2 - 1 must be skipped");
+        assert_eq!(cycle_connected_world_target(&app, -1), Some(3),
+            "previous connected world from 0 wraps around to the last connected one (3)");
+    }
+
+    #[test]
+    fn test_cycle_connected_world_target_none_when_only_current_is_connected() {
+        let app = make_test_app_with_worlds(&[true, false, false]);
+        assert_eq!(cycle_connected_world_target(&app, 1), None,
+            "only one connected world exists (the current one) - nothing to cycle to");
+    }
+
+    #[test]
+    fn test_cycle_connected_world_target_none_when_nothing_connected() {
+        let app = make_test_app_with_worlds(&[false, false]);
+        assert_eq!(cycle_connected_world_target(&app, 1), None);
+    }
+
+    #[test]
+    fn test_cycle_connected_world_target_falls_back_to_first_when_current_is_disconnected() {
+        // current_world_index (1) is itself disconnected - falls back to the first
+        // connected world in list order, mirroring the master's own
+        // `App::cycle_connected_world`'s `None => 0` rule.
+        let mut app = make_test_app_with_worlds(&[false, false, true, true]);
+        app.current_world_index = 1;
+        assert_eq!(cycle_connected_world_target(&app, 1), Some(2));
+    }
+
+    #[test]
+    fn test_cycle_connected_world_target_multi_step_kbnum_direction() {
+        // Mirrors the kbnum-as-step-count behavior world_socket_prev/next give this: a
+        // direction magnitude greater than 1 steps that many connected worlds at once.
+        let app = make_test_app_with_worlds(&[true, true, true, true]);
+        assert_eq!(cycle_connected_world_target(&app, 2), Some(2));
+        assert_eq!(cycle_connected_world_target(&app, -2), Some(2));
+    }
+
+    // ---- TF-parity plan Job 22c: this client's `app.tf_bound_keys` (its local mirror of
+    // `GlobalSettingsMsg::tf_bound_keys_json`) must route a matching keypress to
+    // `WsMessage::RunKeyBinding` instead of the dead `chords::resolve_bound_command(app,
+    // name)` lookup this used to run against its own always-empty `app.tf_engine` (Job
+    // 22a's own report). ----
+
+    /// Pull exactly one queued message off `rx` without blocking (this is a plain, non-async
+    /// `#[test]`, and `UnboundedSender::send` never needs a runtime).
+    fn try_recv(rx: &mut mpsc::UnboundedReceiver<WsMessage>) -> Option<WsMessage> {
+        rx.try_recv().ok()
+    }
+
+    #[test]
+    fn test_server_bound_key_sends_run_key_binding_not_a_local_action() {
+        let mut app = make_test_app_with_worlds(&[true]);
+        app.tf_bound_keys.insert("^T".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let quit = handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL), &tx);
+        assert!(!quit);
+        match try_recv(&mut rx) {
+            Some(WsMessage::RunKeyBinding { key, kbnum }) => {
+                assert_eq!(key, "^T");
+                assert_eq!(kbnum, None, "no kbnum was set, so None should be forwarded as-is");
+            }
+            other => panic!("expected RunKeyBinding for ^T, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_server_bound_key_takes_priority_over_the_local_action_table() {
+        // "Home" defaults to the local "cursor_home" action - but if the SERVER also has a
+        // /bind or key_<name> macro on it (tf_bound_keys), that must win, exactly matching
+        // app.js's dispatch order (tf_bound_keys_json first, then the action table).
+        let mut app = make_test_app_with_worlds(&[true]);
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 5;
+        app.tf_bound_keys.insert("Home".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &tx);
+
+        assert_eq!(app.input.cursor_position, 5,
+            "the local cursor_home action must NOT have run - the server-bound path wins");
+        match try_recv(&mut rx) {
+            Some(WsMessage::RunKeyBinding { key, .. }) => assert_eq!(key, "Home"),
+            other => panic!("expected RunKeyBinding for Home, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_non_server_bound_key_still_falls_through_to_the_local_action_table() {
+        // Regression guard: a key NOT in tf_bound_keys must behave exactly as before this
+        // job - "Home" runs the local cursor_home action, no WsMessage sent for it.
+        let mut app = make_test_app_with_worlds(&[true]);
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 5;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &tx);
+
+        assert_eq!(app.input.cursor_position, 0, "plain Home should still move the cursor locally");
+        assert!(try_recv(&mut rx).is_none(), "no RunKeyBinding should be sent for an unbound key");
+    }
+
+    #[test]
+    fn test_server_bound_key_forwards_and_clears_kbnum() {
+        let mut app = make_test_app_with_worlds(&[true]);
+        app.tf_bound_keys.insert("^T".to_string());
+        app.input.kbnum = Some(7);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL), &tx);
+
+        match try_recv(&mut rx) {
+            Some(WsMessage::RunKeyBinding { kbnum, .. }) => assert_eq!(kbnum, Some(7)),
+            other => panic!("expected RunKeyBinding carrying kbnum=7, got {other:?}"),
+        }
+        assert_eq!(app.input.kbnum, None, "kbnum must be consumed (cleared) like any other dispatch");
+    }
+
+    #[test]
+    fn test_esc_x_bound_only_on_the_server_still_completes_as_a_chord() {
+        // Nothing local (no /bind, no action-table entry) recognizes "Esc-x" - only
+        // app.tf_bound_keys (the server's own /bind) does. Without folding tf_bound_keys
+        // into chords::resolve_key_name's has_binding closure, the second keystroke would
+        // abandon the chord (has_binding("Esc-x") false) and resolve to NotAKey instead of
+        // completing - this is finding A's chord-prefix-awareness requirement for Job 22c.
+        let mut app = make_test_app_with_worlds(&[true]);
+        app.tf_bound_keys.insert("Esc-x".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // Bare Escape always just buffers (hardcoded exception) - no dispatch yet.
+        let quit1 = handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(!quit1);
+        assert!(try_recv(&mut rx).is_none(), "a bare Escape must never itself dispatch anything");
+
+        // Now 'x': the compound "Esc-x" token must resolve as a real, complete binding.
+        let quit2 = handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &tx);
+        assert!(!quit2);
+        match try_recv(&mut rx) {
+            Some(WsMessage::RunKeyBinding { key, .. }) => assert_eq!(key, "Esc-x"),
+            other => panic!("expected RunKeyBinding for Esc-x (server-only binding), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_two_token_chord_bound_only_on_the_server_buffers_then_completes() {
+        // A genuine (non-Escape) two-keystroke chord, "^X^Y", registered ONLY in
+        // tf_bound_keys - exercises the `is_prefix` half specifically: without folding
+        // server_bound_keys into is_prefix too, the lone "^X" keystroke would resolve
+        // immediately (nothing else makes it look like a prefix) instead of buffering, and
+        // "^X^Y" would never be seen as one sequence.
+        let mut app = make_test_app_with_worlds(&[true]);
+        app.tf_bound_keys.insert("^X^Y".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let quit1 = handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &tx);
+        assert!(!quit1);
+        assert!(try_recv(&mut rx).is_none(), "^X alone must only buffer, not dispatch");
+
+        let quit2 = handle_remote_client_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL), &tx);
+        assert!(!quit2);
+        match try_recv(&mut rx) {
+            Some(WsMessage::RunKeyBinding { key, .. }) => assert_eq!(key, "^X^Y"),
+            other => panic!("expected RunKeyBinding for the completed ^X^Y chord, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_global_settings_populates_tf_bound_keys_from_json() {
+        // GlobalSettingsMsg::tf_bound_keys_json arrives both in InitialState and in a live
+        // GlobalSettingsUpdated broadcast - drive it through the latter (handle_remote_ws_message),
+        // the actual message type a running remote console receives it from.
+        let mut app = App::new();
+        let mut settings = app.build_global_settings_msg();
+        settings.tf_bound_keys_json = r#"["^X","Esc-Left"]"#.to_string();
+        app.handle_remote_ws_message(WsMessage::GlobalSettingsUpdated { settings, input_height: 3 });
+
+        assert!(app.tf_bound_keys.contains("^X"));
+        assert!(app.tf_bound_keys.contains("Esc-Left"));
+        assert_eq!(app.tf_bound_keys.len(), 2);
+    }
+
+    #[test]
+    fn test_apply_global_settings_clears_tf_bound_keys_when_json_is_empty_array() {
+        // An empty `[]` is a real, meaningful state (every /bind was /unbind/purged on the
+        // server), not "field absent" - a stale non-empty local set from a previous
+        // GlobalSettingsUpdated must be cleared, not left stuck.
+        let mut app = App::new();
+        app.tf_bound_keys.insert("^X".to_string());
+        let mut settings = app.build_global_settings_msg();
+        settings.tf_bound_keys_json = "[]".to_string();
+        app.handle_remote_ws_message(WsMessage::GlobalSettingsUpdated { settings, input_height: 3 });
+
+        assert!(app.tf_bound_keys.is_empty());
     }
 }

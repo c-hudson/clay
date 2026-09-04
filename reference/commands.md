@@ -28,61 +28,93 @@
 
 ## Keyboard Controls (TF Defaults)
 
-### World Switching
-- `Ctrl+Up/Down` - Cycle through active worlds (connected OR with unseen output)
-- `Shift+Up/Down` - Cycle through all worlds
-- `Escape` then `w` - Switch to world with activity (priority: oldest pending → unseen output → previous world)
+Clay's default keybindings follow TinyFugue 5.0's own keymap; `^Q` and `^R`
+are the only two Clay keeps at their historical (non-TF) meaning, plus a
+handful of Clay-only extras (the F-keys, `^Y`, `Shift-Up/Down`, `Alt-Up/Down`).
+The full, generated-from-code table (every default, every chord, the numeric
+prefix, insert mode) lives in `docs/markdown/07-keyboard-shortcuts.md` and is
+kept honest by `cargo test test_docs_key_table_matches_defaults`
+(`src/keybindings.rs`). This section is a summary; see that file for
+anything not covered here, and `TINYFUGUE-COMPAT.md` for which defaults
+changed from Clay's pre-parity keymap and why.
 
-World switching behavior is controlled by the "World Switching" setting:
-1. **Unseen First**: If any OTHER world has unseen output, switch to the world that received unseen output first (oldest unseen). Done.
-2. **Alphabetical** (or when no unseen): Switch to the alphabetically next world by name. Wraps from the last world back to the first.
+The web and GUI clients dispatch keys through the *same* four-level order as
+the console (see "Configurable Keybindings" below) and share the same
+default table — a TF `/bind` entry set on the server reaches them too via
+`RunKeyBinding` (see below). Known exceptions: `expand_line` (`Esc-^E`) is a
+console/GUI-local no-op in the plain browser client (no safe wire path to
+substitute a remote client's own input line), and `world_socket_prev/next`
+reuse the browser's existing "switch to a known world index" helper rather
+than a dedicated wire message.
+
+### World Switching
+- `Esc-Left`/`Esc-Right` - Cycle *connected* worlds only (TF SOCKETB/SOCKETF)
+- `Esc-{`/`Esc-}` - Cycle *active* worlds (`world_prev`/`world_next`, unseen output first)
+- `Shift+Up/Down` - Cycle through all worlds (including disconnected)
+- `Escape` then `w` - Switch to world with activity (priority: oldest pending → unseen output → previous world)
+- `^]` - Background all worlds (TF `/bg`); a no-op in Clay's single-pane console
+
+Clay's own "unseen-first" active-world cycling (action ids `world_next`/
+`world_prev`, governed by the "World Switching" setting in `/setup` -
+Unseen First vs. Alphabetical) keeps `Esc-{`/`Esc-}`: TF binds those to socket
+cycling too, so Clay spends the redundant pair on its own cycling instead.
 
 ### Input Area
 - `Left/Right` or `Ctrl+B/Ctrl+F` - Move cursor one character
-- `Escape` then `b/f` - Move cursor one word left/right (TF: wleft/wright)
+- `Escape` then `b/f`, or `Ctrl+Left/Right` - Move cursor one word left/right (TF: wleft/wright)
 - `Up/Down` - Move cursor up/down in multi-line input (TF default)
 - `Ctrl+A` or `Home` - Jump to start of line
 - `Ctrl+E` or `End` - Jump to end of line
-- `Ctrl+U` - Clear line
+- `Ctrl+U` - Kill to start of line (TF's real `^U`; kill ring kept - Clay's older "clear whole line" meaning is the separate `clear_line` action, unbound by default)
 - `Ctrl+W` - Delete word backward (space-delimited)
 - `Ctrl+K` - Kill to end of line (pushes to kill ring)
 - `Ctrl+D` - Delete character forward
 - `Ctrl+Y` - Yank (paste from kill ring)
 - `Ctrl+T` - Transpose two characters before cursor
 - `Ctrl+V` - Insert next character literally (console only, not web)
-- `Ctrl+P/N` - Previous/Next command history
+- `Ctrl+P/N` or `Ctrl+Up/Down` - Previous/Next command history
+- `Ctrl+Home/End` or `Esc-<`/`Esc->` - Jump to oldest/newest history entry (TF RECALLBEG/RECALLEND)
+- `Insert` or `Escape v` - Toggle insert/overwrite mode
+- `Escape 0`-`9` / `Escape -` - Build a numeric repeat-count prefix (`%kbnum`; shown as `[N]` in the separator bar, cleared by the next non-digit action or `^G`)
 - `Ctrl+Q` - Spell suggestions / cycle and replace
-- `Ctrl+G` - Terminal bell/beep
-- `Tab` - Command completion (when input starts with `/` or `#`); more-mode takes priority if paused
+- `Ctrl+G` - Terminal bell/beep; also cancels a buffered chord or numeric prefix
+- `Tab` / `Escape Tab` - Release pending output (more-mode priority) / command completion
 - `Escape` then `c/l/u` - Capitalize / lowercase / uppercase word
 - `Escape` then `d` - Delete word forward (pushes to kill ring)
 - `Escape` then `Space` - Collapse multiple spaces around cursor to one
-- `Escape` then `-` - Jump to matching bracket (`()[]{}`)
+- `Escape` then `=` - Jump to matching bracket (`()[]{}`)
 - `Escape` then `.` or `_` - Insert last word from previous history entry
 - `Escape` then `p` - Search history backward (entries starting with current input)
 - `Escape` then `n` - Search history forward (continues backward search)
-- `Escape` then `Backspace` - Delete word backward (punctuation-delimited, pushes to kill ring)
+- `Escape` then `Backspace` (or `Esc-^H`, `^X^?`) - Delete word backward (punctuation-delimited, pushes to kill ring)
 - `Alt+Up/Down` - Resize input area (1-15 lines)
 
 **Kill Ring:** `Ctrl+K`, `Ctrl+U`, `Ctrl+W`, `Escape+d`, and `Escape+Backspace` push deleted text to the kill ring. `Ctrl+Y` pastes the most recent entry.
 
 ### Output Scrollback
 - `PageUp` - Scroll back in history (enables more-pause)
-- `PageDown` - Scroll forward (unpauses if at bottom)
-- `Tab` - Release one screenful of pending lines (when paused); scroll down like PgDn (when viewing history)
+- `PageDown` or `Ctrl+PageDown` - Scroll forward / release all pending (unpauses if at bottom)
+- `Tab` - Release one screenful of pending lines (when paused); command completion when input starts with `/`; otherwise pages like PgDn
 - `Escape` then `j` - Jump to end, release all pending lines
 - `Escape` then `J` (uppercase) - Selective flush: keep only highlighted pending lines, discard rest
 - `Escape` then `h` - Half-page scroll up or release half screenful of pending
+- `Escape` then `^N`/`^P` - Scroll one line forward/back (TF LINE/LINEBACK)
+- `Escape` then `^L` - Clear the view without dropping scrollback (TF CLEAR)
+- `^S` - Pause the current world (TF PAUSE)
+- `Escape L` - Toggle the F4 filter popup's last-applied limit on/off
+- `^X[`/`^X]`/`^X{`/`^X}` - Half-page back/forward, page back/forward (TF's own `^X` prefix map)
 - `F4` - Open filter popup to search output
 
 ### General
 - `F1` - Open help popup
 - `F2` - Toggle MUD tag display (show/hide tags like `[channel:]` and timestamps)
+- `F5` - Search command history
 - `F8` - Toggle action pattern highlighting (highlight lines matching action patterns without running commands)
 - `F9` - Toggle GMCP media audio (master mute switch, starts muted)
 - `Ctrl+C` - Press twice within 15 seconds to quit
-- `Ctrl+L` - Redraw screen (filters out client-generated output, keeps only MUD server data)
-- `Ctrl+R` - Hot reload (same as /reload)
+- `Ctrl+L` - Refresh screen (plain repaint, TF REFRESH). Clay's older "repaint and drop client-generated lines" meaning is the separate `redraw_server_only` action, unbound by default.
+- `Ctrl+R` or `^X^R` - Hot reload (same as /reload)
+- `^X^V` - Show version (same as /version)
 - `Ctrl+Z` - Suspend process (use `fg` to resume)
 - `Enter` - Send command
 
@@ -92,9 +124,8 @@ World switching behavior is controlled by the "World Switching" setting:
 - `Left/Right` - Navigate between buttons (when on button row); change select/toggle values
 - `Enter` - Edit text field / Toggle option / Activate button
 - `Space` - Toggle boolean / Cycle options
-- `S/C/D/O` - Shortcut keys for Save/Cancel/Delete/Connect buttons (when available)
 - `Esc` - Close popup or cancel text edit
-- Buttons have highlighted shortcut letters
+- Buttons have highlighted shortcut letters (the actual letter varies by popup and button - e.g. the World Selector's Add/Edit/Delete/Cancel/Connect buttons are `A`/`E`/`D`/`C`/`O`)
 - Popups size dynamically based on content
 
 ### Mouse Controls (when Console Mouse enabled in /setup, default: on)
@@ -105,65 +136,35 @@ World switching behavior is controlled by the "World Switching" setting:
 - Click and drag in scrollable content or list fields to highlight lines of text
 - Any keyboard input clears the highlight
 
-## Web Interface Controls
-
-- `Up/Down` - Switch between active worlds
-- `PageUp/PageDown` - Scroll output history
-- `Tab` - Release one screenful when paused; scroll down one screenful otherwise
-- `Escape+j` - Jump to end, release all pending
-- `Escape+J` - Selective flush (keep highlighted pending, discard rest)
-- `Escape+w` or `Alt+w` - Switch to world with activity (oldest pending/unseen)
-- `Escape+b` / `Escape+f` - Move cursor one word left/right
-- `Escape+h` - Half-page scroll/release
-- `Ctrl+P/N` - Command history navigation
-- `Ctrl+U` - Clear input
-- `Ctrl+W` - Delete word before cursor
-- `Ctrl+A` - Move cursor to beginning of line
-- `Ctrl+T` - Transpose characters
-- `Alt+Up/Down` - Resize input area
-- `Escape+Space` - Collapse multiple spaces to one
-- `Escape+-` - Goto matching bracket
-- `Escape+.` / `Escape+_` - Insert last word of previous history
-- `Escape+p` / `Escape+n` - Search history backward/forward
-- `Escape+Backspace` - Delete word back (punctuation-delimited)
-- `F2` - Toggle MUD tag display
-- `F4` - Open filter popup to search output
-- `F8` - Toggle action pattern highlighting
-- `F9` - Toggle GMCP media audio
-- `Enter` - Send command
-
-## GUI Keyboard Shortcuts
-
-### World Switching
-- `Up/Down` - Cycle through active worlds
-- `Shift+Up/Down` - Cycle through all worlds
-
-### Menu Shortcuts
-- `Ctrl+L` - Open World List popup
-- `Ctrl+E` - Open World Editor for current world
-- `Ctrl+S` - Open Setup popup
-- `Ctrl+O` - Connect current world
-- `Ctrl+D` - Disconnect current world
-
-### Other
-- `F2` - Toggle MUD tag display
-- `F4` - Open filter popup
-- `F8` - Toggle action pattern highlighting
-- `F9` - Toggle GMCP media audio
-- `PageUp/PageDown` - Scroll output
-- `Alt+Up/Down` - Resize input area
-
 ## Configurable Keybindings
 
-All non-character keys are configurable via `~/.clay.key.dat`. Defaults follow TinyFugue conventions. Two layers checked in order:
-1. TF `/bind` bindings (runtime, from `/bind` command)
-2. Action bindings (from `~/.clay.key.dat`, falling back to TF defaults)
+All non-character keys are configurable via `~/.clay/keybindings.dat` (INI
+format; the legacy `~/.clay.key.dat` path is no longer used - old installs
+migrate automatically). Defaults follow TinyFugue conventions (see above).
 
-**Key name format:** `^A` (Ctrl+A), `Esc-x` (Escape then x), `F1`-`F12`, `Up`, `Down`, `Left`, `Right`, `PageUp`, `PageDown`, `Home`, `End`, `Insert`, `Delete`, `Backspace`, `Tab`, `Enter`, `Escape`, `Shift-Up`, `Ctrl-Down`, `Alt-Up`, etc.
+**Dispatch order**, checked for every keypress, console and web/GUI alike:
+1. A TF `/bind`/`/def -b`/`/def -B` binding for the exact key (or chord) pressed - runtime, set via `/bind` and stored in the TF engine, not `keybindings.dat`. On a remote (web/GUI/SSH-console) client, the server tells the client which keys it has TF bindings for (`tf_bound_keys_json`/`GlobalSettingsMsg`) and the client sends a matched keypress back as `WsMessage::RunKeyBinding{key, kbnum}` for the server to actually run.
+2. A `key_<name>` macro (TF's own two-level naming for physical keys - `/def key_f5 = ...`, `/def key_esc_left = ...`; see `/help keys`).
+3. The built-in action table (`keybindings.dat`, falling back to the compiled-in defaults).
+4. Ordinary literal character input (nothing bound - the key is just typed).
 
-**Action IDs:** Each binding maps a key name to an action ID string (e.g. `cursor_home`, `history_prev`, `world_next`). See `keybindings::ACTIONS` for the full list.
+**Key name grammar** (`src/keynames.rs`): `^A` (Ctrl+A, upper-cased on
+letters), a named key (`Up`, `Down`, `Left`, `Right`, `PageUp`/`PgUp`,
+`PageDown`/`PgDn`, `Home`, `End`, `Insert`/`Ins`, `Delete`/`Del`,
+`Backspace`/`BS`, `Tab`, `Enter`/`Return`, `Escape`/`Esc`, `Space`,
+`F1`-`F20`), a real terminal modifier held with a named key (`Ctrl-Up`,
+`Shift-Tab`, `Alt-Down` - one physical keystroke), `Esc-<token>` (Escape then
+one more token, case-significant: `Esc-j` != `Esc-J`) - `Alt-x`/`Meta-x`/`@x`
+are accepted spellings of the same `Esc-x`, except before a named key, where
+they mean the real modifier instead (`Alt-Up` = `Ctrl-Up`'s sibling, not
+`Esc-Up`) - or a chord: two or more tokens written back to back with no
+separator (`^X^R`, `Esc-^N`). TinyFugue's own raw spellings are also
+accepted and normalised: `^[b`, `\033`, `\0x1B`, `\27` (the escape byte), and
+raw terminal escape sequences (`^[[1;5A`). See `/help bind`.
 
-**File format (`~/.clay.key.dat`):**
+**Action IDs:** Each binding maps a key name to an action ID string (e.g. `cursor_home`, `history_prev`, `world_socket_next`). See `keybindings::ACTIONS` for the full list, or the keybind editor's own category list.
+
+**File format (`~/.clay/keybindings.dat`):**
 ```ini
 [bindings]
 Up = world_next

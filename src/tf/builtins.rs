@@ -40,44 +40,137 @@ pub fn cmd_beep(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(Some(beeps))
 }
 
-/// /time [format] - Display current time
-pub fn cmd_time(args: &str) -> TfCommandResult {
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// /time [<format>] - TF: print the current time formatted by `<format>`
+/// (`ftime()`-style; defaults to `%time_format`, itself defaulting to
+/// "%H:%M" - see `/help time` and `/help ftime()`, both verified against
+/// real tf), and set `%?` to the formatted string, same as `ftime()` itself.
+///
+/// `/time /command...` (an argument starting with `/`) is Clay's own kept
+/// extension (finding B: "both" ruling) rather than a TF form: run
+/// `<command>` and report how long it took. TF's own equivalent is the
+/// native `/runtime` below, which this does NOT replace - `/time /cmd` never
+/// substitutes `args` itself (see the `is_recall_command`-style exemption in
+/// `parser::execute_tf_command` - a format string's own "%" strftime
+/// specifiers, e.g. `-t"%H:%M:%S"`-shaped text, must not be eaten as TF
+/// variable sigils before `cmd_time` ever sees them), so `<command>` gets
+/// substituted fresh, exactly as if it had been typed directly.
+pub fn cmd_time(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let format = args.trim();
-
-    if format.is_empty() {
-        // Default format: human readable (local time)
-        let lt = crate::util::local_time_now();
-        TfCommandResult::Success(Some(format!("{:02}:{:02}:{:02}", lt.hour, lt.minute, lt.second)))
-    } else if format == "%s" || format == "epoch" {
-        // Unix timestamp
-        TfCommandResult::Success(Some(now.to_string()))
-    } else {
-        // For now, just return the timestamp
-        // Full strftime support could be added later
-        TfCommandResult::Success(Some(now.to_string()))
+    if let Some(rest) = args.strip_prefix('/') {
+        if rest.trim().is_empty() {
+            return TfCommandResult::Error("Usage: /time /command".to_string());
+        }
+        let full_cmd = format!("/{}", rest);
+        let start = Instant::now();
+        let result = super::parser::execute_command(engine, &full_cmd);
+        let elapsed = start.elapsed();
+        let timing = TfCommandResult::Success(Some(format!("Elapsed: {:.3}s", elapsed.as_secs_f64())));
+        return super::parser::aggregate_results_with_engine(engine, vec![result, timing]);
     }
+
+    let format = if args.is_empty() {
+        engine.get_var("time_format")
+            .map(|v| v.to_string_value())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "%H:%M".to_string())
+    } else {
+        args.to_string()
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let epoch_secs = now.as_secs() as i64;
+    let frac_secs = now.subsec_nanos() as f64 / 1_000_000_000.0;
+
+    // "@" is ftime()'s own raw-system-time shorthand (`/help ftime()`), same as
+    // expressions::evaluate's "ftime" function arm handles it.
+    let formatted = if format == "@" {
+        format!("{}.{:06}", epoch_secs, (frac_secs * 1_000_000.0).round() as i64)
+    } else {
+        let lt = crate::util::local_time_from_epoch(epoch_secs);
+        super::expressions::format_tf_time(&lt, epoch_secs, frac_secs, &format)
+    };
+
+    engine.set_global("?", super::TfValue::String(formatted.clone()));
+    TfCommandResult::Success(Some(formatted))
 }
 
-/// /lcd [directory] - Change local directory
+/// /runtime <command> - TF's stdlib macro (`stdlib.tf`: `/def -i runtime = ...
+/// /test real:=time(), cpu:=cputime()%; /eval -s0 %{*}%; /let result=%?%;
+/// /_echo real=$[time() - real] cpu=$[cputime() - cpu]%; /return result`),
+/// implemented natively instead of shipped as GPL stdlib text (same
+/// "native, not a shipped stdlib" call as the rest of finding C.11's
+/// one-liners - survives hot reload, no three-UI plumbing needed). Runs
+/// `<command>` exactly like `/eval -s0` (no extra substitution pass - `args`
+/// already went through the ordinary top-level substitution before
+/// `cmd_runtime` ever sees it, same as any other command's arguments), then
+/// prints TF's own `"real=<secs> cpu=<secs>"` line - verified directly
+/// against real tf's own `/runtime /echo x` output shape (the exact digits
+/// are inherently timing-dependent and not reproducible). `cputime()` is -1
+/// when unavailable (`expressions::process_cpu_time_secs`'s own documented
+/// fallback); `cpu=` is then also -1, matching real tf on such a platform.
+pub fn cmd_runtime(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let text = args.trim();
+    if text.is_empty() {
+        return TfCommandResult::Error("Usage: /runtime <command>".to_string());
+    }
+
+    let start_wall = Instant::now();
+    let start_cpu = super::expressions::process_cpu_time_secs();
+
+    let inner = if text.starts_with('/') {
+        super::parser::execute_command_substituted(engine, text)
+    } else {
+        TfCommandResult::SendToMud(text.to_string())
+    };
+
+    let real = start_wall.elapsed().as_secs_f64();
+    let cpu = if start_cpu >= 0.0 {
+        let end_cpu = super::expressions::process_cpu_time_secs();
+        if end_cpu >= 0.0 { end_cpu - start_cpu } else { -1.0 }
+    } else {
+        -1.0
+    };
+
+    let timing_line = format!(
+        "real={} cpu={}",
+        super::TfValue::Float(real).to_string_value(),
+        super::TfValue::Float(cpu).to_string_value(),
+    );
+
+    super::parser::aggregate_results_with_engine(engine, vec![inner, TfCommandResult::Success(Some(timing_line))])
+}
+
+/// /lcd [<dir>] - Change local directory, or with no `<dir>`, report the
+/// current one (`/help lcd`: "If <dir> is omitted with /lcd, the current
+/// directory is displayed"). Message wording matches real tf directly
+/// (verified: bare /lcd, and a successful `/lcd <dir>`, both say "Current
+/// directory is <path>" - real tf does NOT say "Changed to <path>"; a
+/// missing directory says "LCD: <path>: No such file or directory").
 pub fn cmd_lcd(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    // /restrict FILE disables /lcd outright, report form included (`/help restrict`
+    // level 2 explicitly lists "/lcd"; verified directly: a bare `/lcd` under
+    // /restrict FILE also errors "LCD: restricted", not just a directory change).
+    if engine.restrict_level >= super::RestrictLevel::File {
+        return TfCommandResult::Error("LCD: restricted".to_string());
+    }
+
     let dir = args.trim();
 
     if dir.is_empty() {
-        // Show current directory
+        // Show current directory. Real tf's own %? after a successful /lcd (report or
+        // change) is 1, not the printed path (verified directly - unlike /pwd below,
+        // which returns the path itself) - see this function's other return sites.
+        engine.set_global("?", super::TfValue::Integer(1));
         if let Some(ref cd) = engine.current_dir {
-            return TfCommandResult::Success(Some(cd.clone()));
+            return TfCommandResult::Success(Some(format!("Current directory is {}", cd)));
         }
         if let Ok(cwd) = std::env::current_dir() {
-            return TfCommandResult::Success(Some(cwd.display().to_string()));
+            return TfCommandResult::Success(Some(format!("Current directory is {}", cwd.display())));
         }
-        return TfCommandResult::Success(Some(".".to_string()));
+        return TfCommandResult::Success(Some("Current directory is .".to_string()));
     }
 
     // Expand ~ to home directory
@@ -102,18 +195,96 @@ pub fn cmd_lcd(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let path = Path::new(&expanded);
     if path.is_dir() {
         engine.current_dir = Some(expanded.clone());
-        TfCommandResult::Success(Some(format!("Changed to {}", expanded)))
+        engine.set_global("?", super::TfValue::Integer(1));
+        TfCommandResult::Success(Some(format!("Current directory is {}", expanded)))
     } else {
-        TfCommandResult::Error(format!("Directory not found: {}", expanded))
+        engine.set_global("?", super::TfValue::Integer(0));
+        TfCommandResult::Error(format!("LCD: {}: No such file or directory", expanded))
     }
 }
 
-/// /sh command - Execute shell command
-pub fn cmd_sh(args: &str) -> TfCommandResult {
-    let cmd = args.trim();
+/// /cd [<dir>] - Change local directory, defaulting to `$HOME` when `<dir>`
+/// is omitted (unlike bare `/lcd`, which reports the current directory
+/// instead - `/help lcd`: "If <dir> is omitted with /cd, %{HOME} is
+/// assumed", matching stdlib.tf's own `/def -i cd = /lcd %{*-%HOME}`).
+pub fn cmd_cd(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let dir = args.trim();
+    if dir.is_empty() {
+        match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() => cmd_lcd(engine, &home),
+            _ => TfCommandResult::Error("CD: HOME is not set".to_string()),
+        }
+    } else {
+        cmd_lcd(engine, dir)
+    }
+}
 
+/// /pwd - Display the current working directory (`/help lcd`: "/pwd
+/// displays the current working directory", matching stdlib.tf's own `/def
+/// -i pwd = /last $(/@lcd)` - i.e. always the bare-/lcd report form, with
+/// none of its own "Current directory is" wrapper: real tf's `/last`
+/// extracts just the value there, verified directly - `/pwd` prints only
+/// the path).
+pub fn cmd_pwd(engine: &mut TfEngine) -> TfCommandResult {
+    let path = if let Some(ref cd) = engine.current_dir {
+        cd.clone()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.display().to_string()
+    } else {
+        ".".to_string()
+    };
+    // Command form both prints and returns the path itself (Job 15, verified directly:
+    // %? after /pwd holds the same path text) - unlike /lcd's own %?, which is a plain
+    // 1/0 success flag.
+    engine.set_global("?", super::TfValue::String(path.clone()));
+    TfCommandResult::Success(Some(path))
+}
+
+/// /sh [-q] [<command>] - Execute a shell command (`/help sh`). With no
+/// `<command>`, real tf spawns an interactive shell in place; Clay's TUI
+/// owns the whole screen and has no safe way to hand it to a subprocess
+/// (unlike real tf's visual-mode "fix the screen first, restore it after"),
+/// so bare `/sh` reports that instead of hanging (plan Job 14c). With a
+/// `<command>`, runs it via `/bin/sh -c` and captures output (unchanged
+/// from before this job); `-q` suppresses both the SHELL hook and the "%
+/// Executing command: <command>" message real tf prints by default
+/// (`/help sh`: "the SHELL hook will not be called, and the 'Executing'
+/// line will not be printed" - `/help hooks`' own SHELL entry gives the
+/// default message shape, "type, command '% Executing <type>: <command>'";
+/// "command" as `<type>` is verified directly against real tf for this
+/// one-shot form).
+pub fn cmd_sh(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if engine.restrict_level >= super::RestrictLevel::Shell {
+        return TfCommandResult::Error("SH: restricted".to_string());
+    }
+    let mut args = args.trim();
+    let mut quiet = false;
+    if let Some(rest) = args.strip_prefix("-q") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            quiet = true;
+            args = rest.trim_start();
+        }
+    }
+
+    let cmd = args;
     if cmd.is_empty() {
-        return TfCommandResult::Error("Usage: /sh command".to_string());
+        return TfCommandResult::Error(
+            "SH: an interactive shell is not supported in Clay; use /sh <command>".to_string()
+        );
+    }
+
+    let mut messages = Vec::new();
+    if !quiet {
+        let outcome = super::hooks::fire_hook(engine, super::TfHookEvent::Shell, &format!("command {}", cmd));
+        let gagged = outcome.matched_any && outcome.first_fired_gagged == Some(true);
+        if !gagged {
+            messages.push(format!("Executing command: {}", cmd));
+        }
+        for r in outcome.results {
+            if let TfCommandResult::Success(Some(m)) = r {
+                messages.push(m);
+            }
+        }
     }
 
     // Execute command and capture output
@@ -125,25 +296,20 @@ pub fn cmd_sh(args: &str) -> TfCommandResult {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-
-            let mut result = String::new();
             if !stdout.is_empty() {
-                result.push_str(&stdout);
+                messages.push(stdout.trim_end().to_string());
             }
             if !stderr.is_empty() {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(&stderr);
-            }
-
-            if result.is_empty() {
-                TfCommandResult::Success(None)
-            } else {
-                TfCommandResult::Success(Some(result.trim_end().to_string()))
+                messages.push(stderr.trim_end().to_string());
             }
         }
-        Err(e) => TfCommandResult::Error(format!("Failed to execute: {}", e)),
+        Err(e) => return TfCommandResult::Error(format!("Failed to execute: {}", e)),
+    }
+
+    if messages.is_empty() {
+        TfCommandResult::Success(None)
+    } else {
+        TfCommandResult::Success(Some(messages.join("\n")))
     }
 }
 
@@ -372,6 +538,11 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     // Read lines from the source
     let lines: Vec<String> = match source_char {
         '\'' => {
+            // /restrict FILE disables /quote's file-read source (`/help restrict` level
+            // 2: "'quote' with '"; verified directly: "QUOTE: files restricted").
+            if engine.restrict_level >= super::RestrictLevel::File {
+                return TfCommandResult::Error("QUOTE: files restricted".to_string());
+            }
             // File source - expand ~ to home directory
             let path = if let Some(rest) = source_value.strip_prefix("~/") {
                 if let Some(home) = home::home_dir() {
@@ -397,9 +568,27 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                 Err(e) => return TfCommandResult::Error(format!("Cannot open file '{}': {}", path, e)),
             }
         }
-        '`' => {
-            // Internal command source (Clay/TF command)
-            let result = super::parser::execute_command(engine, &source_value);
+        '`' | '#' => {
+            // `<TF_cmd>: capture the command's own output (finding 14) - executed through
+            // the engine exactly like a typed command, so every `Success(Some(msg))` line
+            // (a multi-line message split apart) becomes one generated line, `Error`
+            // aborts the whole /quote, and a `Recall` result (either typed directly as
+            // `` `"/recall args" `` or via the shorthand below) is bounced back to the
+            // caller with the world's output_lines it needs - cmd_quote itself has none.
+            // Native Clay captures (cmd_connections/`/l`, `/fg`, `/ban`) already return
+            // real `Success(Some(text))` from `execute_command` (see those functions' own
+            // doc comments), so they fall out of this the same way any other command does.
+            //
+            // #<recall_args>: TF's own shorthand for "capture `/recall <recall_args>`'s
+            // output" (`/help quote`'s own "nearly equivalent pairs" list: "/quote <opts>
+            // `/recall <args>" == "/quote <opts> #<args>") - prepend "/recall " so it
+            // reaches the exact same Recall-result path as spelling it out with a backtick.
+            let command_text = if source_char == '#' {
+                format!("/recall {}", source_value)
+            } else {
+                source_value.clone()
+            };
+            let result = super::parser::execute_command(engine, &command_text);
             match result {
                 TfCommandResult::Success(Some(msg)) => {
                     msg.lines()
@@ -410,7 +599,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                     vec![]
                 }
                 TfCommandResult::Error(e) => {
-                    return TfCommandResult::Error(format!("Command '{}' failed: {}", source_value, e));
+                    return TfCommandResult::Error(format!("Command '{}' failed: {}", command_text, e));
                 }
                 TfCommandResult::Recall(opts) => {
                     // Recall needs output_lines from the world - pass to caller
@@ -430,6 +619,12 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
             }
         }
         '!' => {
+            // /restrict SHELL disables /quote's shell-command source (`/help restrict`
+            // level 1: "Disables ... '/quote !'"; verified directly: "QUOTE: <cmd>:
+            // Operation not permitted").
+            if engine.restrict_level >= super::RestrictLevel::Shell {
+                return TfCommandResult::Error(format!("QUOTE: {}: Operation not permitted", source_value));
+            }
             // Shell command source
             let mut cmd_builder = Command::new("sh");
             cmd_builder.arg("-c").arg(&source_value)
@@ -455,26 +650,6 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                     lines
                 }
                 Err(e) => return TfCommandResult::Error(format!("Cannot execute shell command '{}': {}", source_value, e)),
-            }
-        }
-        '#' => {
-            // Alternative syntax for internal commands (same as backtick)
-            let result = super::parser::execute_command(engine, &source_value);
-            match result {
-                TfCommandResult::Success(Some(msg)) => {
-                    msg.lines()
-                        .map(|line| format!("{}{}{}", prefix, line, suffix))
-                        .collect()
-                }
-                TfCommandResult::Success(None) => {
-                    vec![]
-                }
-                TfCommandResult::Error(e) => {
-                    return TfCommandResult::Error(format!("Command '{}' failed: {}", source_value, e));
-                }
-                _ => {
-                    vec![]
-                }
             }
         }
         _ => unreachable!(),
@@ -657,13 +832,15 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
                     }
                 }
                 'a' => {
-                    // -aattrs - for now just support -ag (show gagged)
-                    if i + 1 < opt_chars.len() && opt_chars[i+1] == 'g' {
-                        opts.show_gagged = true;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
+                    // -a<attrs> (/help recall: "suppress specified attributes, e.g. -ag
+                    // shows gagged lines") - consumes the rest of this token as the
+                    // attribute list, same convention -t/-m/-w already use here. Only 'g'
+                    // has a distinct effect (see RecallOptions::suppress_attrs's doc
+                    // comment); any other letter is accepted and stored, not applied.
+                    let attrs: String = opt_chars[i+1..].iter().collect();
+                    opts.show_gagged = attrs.contains('g');
+                    opts.suppress_attrs = attrs;
+                    i = opt_chars.len();
                 }
                 'm' => {
                     // -mstyle
@@ -918,41 +1095,51 @@ fn resolve_file_path(engine: &TfEngine, filename: &str) -> Option<String> {
         return None;
     }
 
-    // Search order for relative paths:
+    // Search order for relative paths (matches real TF):
     // 1. Current directory (from /lcd or actual cwd)
-    // 2. Directories in TFPATH
-    // 3. TFLIBDIR
+    // 2. If `filename` has no directory component: each directory in the
+    //    engine's %TFPATH (colon-separated, TF semantics)
+    // 3. If `filename` has no directory component: %TFLIBDIR
 
-    let search_dirs: Vec<String> = {
-        let mut dirs = Vec::new();
-
-        // Current directory
-        if let Some(ref cd) = engine.current_dir {
-            dirs.push(cd.clone());
-        } else if let Ok(cwd) = std::env::current_dir() {
-            dirs.push(cwd.display().to_string());
+    if let Some(ref cd) = engine.current_dir {
+        let full_path = format!("{}/{}", cd, expanded);
+        if Path::new(&full_path).exists() {
+            return Some(full_path);
         }
+    } else if let Ok(cwd) = std::env::current_dir() {
+        let full_path = cwd.join(&expanded);
+        if full_path.exists() {
+            return Some(full_path.display().to_string());
+        }
+    }
 
-        // TFPATH (colon-separated list of directories)
-        if let Ok(tfpath) = std::env::var("TFPATH") {
-            for dir in tfpath.split(':') {
-                if !dir.is_empty() {
-                    dirs.push(dir.to_string());
-                }
+    // TF only searches TFPATH/TFLIBDIR for a bare filename (no '/' in it) -
+    // a path with a directory component (even a relative one like
+    // "sub/file.tf") is never joined onto a library directory.
+    if expanded.contains('/') {
+        return None;
+    }
+
+    let mut search_dirs: Vec<String> = Vec::new();
+
+    // %TFPATH (colon-separated list of directories), read as an engine
+    // variable (set with /set, or defaulted from $TFPATH at engine start -
+    // see TfEngine::new) rather than the process environment.
+    if let Some(tfpath) = engine.get_var("TFPATH").map(|v| v.to_string_value()) {
+        for dir in tfpath.split(':') {
+            if !dir.is_empty() {
+                search_dirs.push(dir.to_string());
             }
         }
+    }
 
-        // TFLIBDIR (fallback if TFPATH not set)
-        if let Ok(tflibdir) = std::env::var("TFLIBDIR") {
-            if !tflibdir.is_empty() {
-                dirs.push(tflibdir);
-            }
+    // %TFLIBDIR (searched after TFPATH), same source.
+    if let Some(tflibdir) = engine.get_var("TFLIBDIR").map(|v| v.to_string_value()) {
+        if !tflibdir.is_empty() {
+            search_dirs.push(tflibdir);
         }
+    }
 
-        dirs
-    };
-
-    // Search each directory
     for dir in search_dirs {
         let full_path = format!("{}/{}", dir, expanded);
         if Path::new(&full_path).exists() {
@@ -963,18 +1150,81 @@ fn resolve_file_path(engine: &TfEngine, filename: &str) -> Option<String> {
     None
 }
 
-/// Internal load implementation used by both /load and /require
-fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfCommandResult {
+/// Fire the LOADFAIL hook for a failed `/load`/`/require` and build the
+/// result `load_file_internal` should return (finding 34). LOADFAIL was
+/// already being fired (`hooks::fire_hook`) at both of `load_file_internal`'s
+/// error sites, but the call's own `HookOutcome` was discarded and the
+/// default error text returned unconditionally - so a matching `-ag` (gag)
+/// hook macro, like stdlib.tf's own
+///
+/// ```text
+/// /def -hloadfail -ag ~gagloadfail
+/// /eval /load %{TFLIBDIR}/local.tf
+/// /undef ~gagloadfail
+/// ```
+///
+/// (guarding the load of an admin-optional file that legitimately doesn't
+/// exist on most installs), could never actually suppress anything. Verified
+/// directly against real tf 5.0 beta 8: a NON-gagged LOADFAIL hook fires
+/// AND the default error message still appears (in that order - error
+/// first, then the hook's own output); a GAGGED hook suppresses the default
+/// error message entirely (matching TF's general "-ag" hook convention -
+/// see `/help hooks`' SEND example) and only the hook's own output (if any -
+/// stdlib.tf's own gag macro has an empty body, so nothing else prints)
+/// shows. `first_fired_gagged` records only the FIRST macro that matched,
+/// per `fire_hook`'s own doc comment - the same "one hook decides" rule
+/// already used for CONFAIL/REDEF/SEND elsewhere in this file and parser.rs.
+fn fire_loadfail(engine: &mut TfEngine, hook_arg: &str, default_error: String) -> TfCommandResult {
+    let outcome = super::hooks::fire_hook(engine, super::TfHookEvent::Loadfail, hook_arg);
+    let gagged = outcome.matched_any && outcome.first_fired_gagged == Some(true);
+    let hook_text: Vec<String> = outcome.results.into_iter().filter_map(|r| match r {
+        TfCommandResult::Success(Some(m)) => Some(m),
+        TfCommandResult::Error(e) => Some(e),
+        _ => None,
+    }).collect();
+    if gagged {
+        if hook_text.is_empty() {
+            TfCommandResult::Success(None)
+        } else {
+            TfCommandResult::Success(Some(hook_text.join("\n")))
+        }
+    } else {
+        let mut lines = vec![default_error];
+        lines.extend(hook_text);
+        TfCommandResult::Error(lines.join("\n"))
+    }
+}
+
+/// Internal load implementation used by both /load and /require.
+///
+/// `pub(crate)` (not just used by `cmd_load`/`cmd_require`): the Phase 0 TF-script
+/// test harness (`src/tf/script_tests.rs`) calls this directly to run a whole
+/// fixture file headlessly and inspect the aggregated result, without going
+/// through the App/TUI at all. See that module for the harness itself.
+pub(crate) fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfCommandResult {
     // Resolve the file path
     let resolved = match resolve_file_path(engine, filename) {
         Some(p) => p,
-        None => return TfCommandResult::Error(format!("Cannot find file: {}", filename)),
+        None => {
+            let reason = "Cannot find file";
+            return fire_loadfail(
+                engine,
+                &format!("{} {}", filename, reason),
+                format!("{}: {}", reason, filename),
+            );
+        }
     };
 
     // Open the file
     let file = match fs::File::open(&resolved) {
         Ok(f) => f,
-        Err(e) => return TfCommandResult::Error(format!("Cannot open '{}': {}", resolved, e)),
+        Err(e) => {
+            return fire_loadfail(
+                engine,
+                &format!("{} {}", resolved, e),
+                format!("Cannot open '{}': {}", resolved, e),
+            );
+        }
     };
 
     // Track that we're loading this file (for nested loads)
@@ -988,18 +1238,39 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
 
     let reader = BufReader::new(file);
     let lines_iter = reader.lines().map(|l| l.unwrap_or_default());
-    let (line_results, exit_early) = load_lines(engine, lines_iter, &resolved);
+    let (line_results, exit_remaining, open_line) = load_lines(engine, lines_iter, &resolved);
     results.extend(line_results);
+
+    // EOF safety net (finding C.3): a file can leave the engine waiting on an
+    // /if, /while or /for that never reaches its terminator - historically
+    // this happened whenever a single-line block's closing keyword was glued
+    // directly to "%;" with no space (now fixed - see
+    // control_flow::split_percent_semi), but a script can still open a block
+    // it genuinely never closes, or hit some other gap that leaves one open.
+    // Either way, /load and /require must not leave the engine permanently
+    // stuck waiting for a line that already went by - so reset the state and
+    // report where the still-open block started. This does NOT apply to
+    // someone interactively typing a multi-line /if a line at a time - that
+    // path never calls load_file_internal, so it keeps waiting for /endif as
+    // before.
+    if !matches!(engine.control_state, super::control_flow::ControlState::None) {
+        engine.control_state = super::control_flow::ControlState::None;
+        results.push(TfCommandResult::Error(format!(
+            "{}:{}: unterminated /if, /while or /for (block opened here)",
+            resolved,
+            open_line.unwrap_or(0)
+        )));
+    }
 
     // Remove this file from the loading stack
     engine.loading_files.pop();
 
     // Fire LOAD hook (even for early exit)
-    let hook_results = super::hooks::fire_hook(engine, super::TfHookEvent::Load);
-    results.extend(hook_results);
+    let hook_outcome = super::hooks::fire_hook(engine, super::TfHookEvent::Load, &resolved);
+    results.extend(hook_outcome.results);
 
     // Collect errors for detailed output
-    let errors: Vec<String> = results.iter()
+    let mut errors: Vec<String> = results.iter()
         .filter_map(|r| match r {
             TfCommandResult::Error(e) => Some(e.clone()),
             _ => None,
@@ -1007,18 +1278,116 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
         .collect();
 
     if !errors.is_empty() {
-        // Build multi-line output with summary and error details
-        let mut output = format!("Loaded '{}' with {} error(s)", resolved, errors.len());
+        // Finding 22: a file's successfully-echoed lines used to be discarded
+        // entirely the moment ANY later line in the same file errored - real TF
+        // interleaves output and errors instead. Fold the successful lines the
+        // same way the error-free path below does (fold_load_result), and put
+        // them ahead of the existing "Loaded ... with N error(s)" summary in
+        // ONE TfCommandResult::Error - extending the result type is more
+        // invasive than this call site needs, since a Success(Some) text and
+        // an Error can't both be returned. Callers that need the two halves
+        // back apart (script_tests::run_script) split on the summary line -
+        // see is_load_error_summary_line's doc comment there.
+        let mut messages: Vec<String> = Vec::new();
+        let mut extra_errors: Vec<String> = Vec::new();
+        for result in results {
+            fold_load_result(engine, result, &mut messages, &mut extra_errors);
+        }
+        errors.extend(extra_errors);
+
+        let mut output = String::new();
+        if !messages.is_empty() {
+            output.push_str(&messages.join("\n"));
+            output.push('\n');
+        }
+        output.push_str(&format!("Loaded '{}' with {} error(s)", resolved, errors.len()));
         for error in &errors {
             output.push_str(&format!("\n   {}", error));
         }
         TfCommandResult::Error(output)
-    } else if exit_early {
-        // Success with early exit - no output (silent)
+    } else if let Some(remaining) = exit_remaining {
+        // Early exit, no errors - silent, except when there are still more
+        // enclosing /load's to abort (`/exit n` with n > 1): re-raise
+        // ExitLoad so the next `load_file_internal` up the call stack
+        // catches it the same way this one just did.
+        if remaining > 0 {
+            TfCommandResult::ExitLoad(remaining)
+        } else {
+            TfCommandResult::Success(None)
+        }
+    } else {
+        // Aggregate the file's own output instead of discarding it. This used to
+        // unconditionally return Success(None) here - every /echo (etc.) a loaded
+        // file produced at top level was silently thrown away even though errors
+        // were preserved just above. Fold `results` the same way
+        // `aggregate_results_with_engine` folds a macro body's results.
+        aggregate_load_results(engine, &resolved, results)
+    }
+}
+
+/// Fold a loaded file's per-line results into one `TfCommandResult`, mirroring
+/// `aggregate_results_with_engine`'s treatment of a macro body: join echoed text,
+/// queue MUD sends, and resolve a Clay-command pass-through (what /eval currently
+/// produces for an already-substituted `/command` - see `cmd_eval`) exactly the
+/// way interactive dispatch does (`Command::ActionCommand` in commands.rs: try the
+/// TF engine once more, and if that is *also* a pass-through, give up - it must be
+/// a genuinely Clay-native command, which a headless file load has no way to run).
+/// Only called on the error-free path; `load_file_internal` keeps its own error
+/// formatting untouched above.
+fn aggregate_load_results(engine: &mut TfEngine, source: &str, results: Vec<TfCommandResult>) -> TfCommandResult {
+    let mut messages: Vec<String> = Vec::new();
+    let mut extra_errors: Vec<String> = Vec::new();
+
+    for result in results {
+        fold_load_result(engine, result, &mut messages, &mut extra_errors);
+    }
+
+    if !extra_errors.is_empty() {
+        let mut output = format!("Loaded '{}' with {} error(s)", source, extra_errors.len());
+        for error in &extra_errors {
+            output.push_str(&format!("\n   {}", error));
+        }
+        TfCommandResult::Error(output)
+    } else if messages.is_empty() {
         TfCommandResult::Success(None)
     } else {
-        // Success - no completion output (silent like TF)
-        TfCommandResult::Success(None)
+        TfCommandResult::Success(Some(messages.join("\n")))
+    }
+}
+
+/// See `aggregate_load_results`. Recurses at most once (via the `ClayCommand`
+/// arm resolving into another call), matching the "avoid recursion" bound
+/// `Command::ActionCommand`'s own TF-engine fallback uses.
+fn fold_load_result(
+    engine: &mut TfEngine,
+    result: TfCommandResult,
+    messages: &mut Vec<String>,
+    extra_errors: &mut Vec<String>,
+) {
+    match result {
+        TfCommandResult::Success(Some(msg)) => messages.push(msg),
+        TfCommandResult::SendToMud(cmd) => {
+            engine.pending_commands.push(super::TfCommand {
+                command: cmd,
+                world: None,
+                no_eol: false,
+            });
+        }
+        TfCommandResult::ClayCommand(cmd) if cmd.starts_with('/') => {
+            let resolved = super::parser::execute_command(engine, &cmd);
+            match resolved {
+                // Resolving again produced another pass-through: this is a
+                // genuinely Clay-native command (e.g. /quit) that a headless
+                // file load has no App to hand it to. Nothing more to do.
+                TfCommandResult::ClayCommand(_) => {}
+                TfCommandResult::Error(e) => extra_errors.push(e),
+                other => fold_load_result(engine, other, messages, extra_errors),
+            }
+        }
+        // ClayCommand with non-'/' text, Quote/Recall/RepeatProcess,
+        // Return/ExitLoad/NotTfCommand/UnknownCommand: none of these occur at
+        // top level in practice; not meaningful to aggregate.
+        _ => {}
     }
 }
 
@@ -1027,7 +1396,7 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
 pub fn load_from_str(engine: &mut TfEngine, content: &str) -> TfCommandResult {
     let source = "<embedded>";
     let lines_iter = content.lines().map(|l| l.to_string());
-    let (results, _exit_early) = load_lines(engine, lines_iter, source);
+    let (results, _exit_remaining, _open_line) = load_lines(engine, lines_iter, source);
 
     let errors: Vec<String> = results.iter()
         .filter_map(|r| match r {
@@ -1048,15 +1417,54 @@ pub fn load_from_str(engine: &mut TfEngine, content: &str) -> TfCommandResult {
 }
 
 /// Core line processing shared by file loading and string loading.
-/// Returns (results, exit_early).
-fn load_lines(engine: &mut super::TfEngine, lines: impl Iterator<Item = String>, source: &str) -> (Vec<TfCommandResult>, bool) {
+/// Returns `(results, exit_remaining, open_line)`. `exit_remaining` is
+/// `None` when no `/exit` fired; `Some(k)` when one did - `k` is how many
+/// MORE enclosing `/load`s (beyond this one, already absorbed) still need
+/// aborting, i.e. `/exit`'s own count minus one (`TfCommandResult::ExitLoad`'s
+/// doc comment) - `load_file_internal` re-raises `ExitLoad(k)` when `k > 0`
+/// instead of its usual `Success(None)`. `open_line` is the 1-based line
+/// number at which `engine.control_state` most recently transitioned from
+/// `None` to an open `/if`/`/while`/`/for` (`None` if it never did). Since a
+/// nested control-flow construct is accumulated as raw body text inside the
+/// outer one rather than as its own `control_state` transition (see
+/// `control_flow::process_control_line`), this is exactly the line where
+/// whatever block is still open at EOF was opened - used by
+/// `load_file_internal`'s finding-C.3 safety net to report where an
+/// unterminated block started.
+/// Drain `engine.pending_outputs` (the side channel the `echo()` expression
+/// function - and hence any macro built on top of it, like real TF stdlib's
+/// own "/echo" - uses instead of a direct `Success(Some(text))` return),
+/// appending each queued line to `results` in order. Called once per
+/// physical line by `load_lines` so an echo()'d line lands immediately after
+/// the line that produced it, not batched at the very end of the file (see
+/// `load_lines`' own call site comment) - matches how the App's live
+/// `commands::process_pending_tf_outputs` treats the exact same queue
+/// (`process_attr_codes` on the text, `attrs` still undisplayed - same
+/// documented gap as `/echo`'s own `-a<attrs>`).
+fn drain_pending_echo_outputs(engine: &mut super::TfEngine, results: &mut Vec<TfCommandResult>) {
+    for output in engine.pending_outputs.drain(..) {
+        results.push(TfCommandResult::Success(Some(super::parser::process_attr_codes(&output.text))));
+    }
+}
+
+fn load_lines(engine: &mut super::TfEngine, lines: impl Iterator<Item = String>, source: &str) -> (Vec<TfCommandResult>, Option<u32>, Option<usize>) {
     let mut results = Vec::new();
     let mut line_num = 0;
     let mut continued_line = String::new();
-    let mut exit_early = false;
+    let mut exit_remaining: Option<u32> = None;
+    let mut open_line: Option<usize> = None;
+
+    // Track the line currently being processed, in lockstep with `load_file_internal`'s
+    // own `loading_files` push/pop around this call - see `TfEngine::diag_location_prefix`
+    // (finding 25) for what reads this. Pushed/popped here rather than by the caller since
+    // this is the only place `line_num` actually changes.
+    engine.loading_lines.push(0);
 
     for line in lines {
         line_num += 1;
+        if let Some(last) = engine.loading_lines.last_mut() {
+            *last = line_num;
+        }
 
         // Strip leading whitespace
         let trimmed = line.trim_start();
@@ -1104,27 +1512,52 @@ fn load_lines(engine: &mut super::TfEngine, lines: impl Iterator<Item = String>,
         }
 
         // Execute the line
+        let was_none = matches!(engine.control_state, super::control_flow::ControlState::None);
         let result = if trimmed.starts_with('/') {
             super::parser::execute_command(engine, trimmed)
         } else {
             // Non-command lines are sent to the MUD in TF, but we ignore them in Clay
             continue;
         };
+        if was_none && !matches!(engine.control_state, super::control_flow::ControlState::None) {
+            open_line = Some(line_num);
+        }
 
         match &result {
             TfCommandResult::Error(e) => {
                 results.push(TfCommandResult::Error(format!("{}:{}: {}", source, line_num, e)));
             }
-            TfCommandResult::ExitLoad => {
-                // /exit was called - stop loading
-                exit_early = true;
+            TfCommandResult::ExitLoad(n) => {
+                // /exit was called - stop loading. This level absorbs one of
+                // its `n` enclosing /load's; whatever's left (n - 1) still
+                // needs aborting further out (see this function's own doc
+                // comment and `TfCommandResult::ExitLoad`'s).
+                exit_remaining = Some(n.saturating_sub(1));
+                drain_pending_echo_outputs(engine, &mut results);
                 break;
             }
             _ => results.push(result),
         }
+
+        // Drain whatever the echo() expression function queued while
+        // evaluating THIS line, immediately - not once at the very end after
+        // the whole file loads. A user-defined macro shadows a same-named
+        // builtin (finding 16), and real TinyFugue's own stdlib.tf defines
+        // "/echo" as exactly such a macro (a thin wrapper around the echo()
+        // function, `/return echo({*}, ...)`) - so any script that
+        // `/require`s stdlib.tf routes every "/echo" through this side
+        // channel instead of `cmd_echo`'s direct `Success(Some(text))`.
+        // Draining only after the whole file (as `script_tests::run_script`
+        // used to, and as this function itself used to not do at all) puts
+        // every echo()'d line after the file's own last direct result
+        // instead of interleaved in the order they actually ran - silently
+        // reordering any file with more than one such line.
+        drain_pending_echo_outputs(engine, &mut results);
     }
 
-    (results, exit_early)
+    engine.loading_lines.pop();
+
+    (results, exit_remaining, open_line)
 }
 
 /// /load [-q] filename - Load and execute a TF script file
@@ -1137,6 +1570,10 @@ fn load_lines(engine: &mut super::TfEngine, lines: impl Iterator<Item = String>,
 /// Lines ending in '\' continue on the next line (use %\ for literal backslash).
 /// Use /exit to abort loading early.
 pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if engine.restrict_level >= super::RestrictLevel::File {
+        return TfCommandResult::Error("LOAD: restricted".to_string());
+    }
+
     let args = args.trim();
 
     if args.is_empty() {
@@ -1163,6 +1600,10 @@ pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 /// Same as /load, but if the file has already registered a token via /loaded,
 /// the file will not be read again (but the LOAD hook is still called).
 pub fn cmd_require(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if engine.restrict_level >= super::RestrictLevel::File {
+        return TfCommandResult::Error("LOAD: restricted".to_string());
+    }
+
     let args = args.trim();
 
     if args.is_empty() {
@@ -1202,7 +1643,7 @@ pub fn cmd_loaded(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Check if already loaded
     if engine.loaded_tokens.contains(token) {
         // Already loaded - abort this file load
-        return TfCommandResult::ExitLoad;
+        return TfCommandResult::ExitLoad(1);
     }
 
     // Register the token
@@ -1210,17 +1651,26 @@ pub fn cmd_loaded(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(None)
 }
 
-/// /exit - Abort loading the current file early
+/// /exit [n] - Abort loading the current file early (`/help exit`).
 ///
-/// When called during /load or /require, stops reading the current file.
-/// When called outside of file loading, this is equivalent to /quit.
-pub fn cmd_exit(engine: &TfEngine) -> TfCommandResult {
+/// "When called directly or indirectly during a /load, /exit aborts
+/// execution of all enclosing macro bodies" - the macro-body half is
+/// `execute_macro_with_context`'s own `TfCommandResult::ExitLoad(_)` check,
+/// not this function - "and aborts <n> (default 1) enclosing /load's."
+/// `n` floors at 1 (`/exit 0` and `/exit -5` both behave like a bare
+/// `/exit` - verified directly against real tf); `load_file_internal`
+/// decrements it by one per enclosing file as it propagates outward.
+///
+/// "When called outside of a /load, /exit has no effect" (verified directly
+/// against real tf - NOT "equivalent to /quit", despite this function's old
+/// doc comment, which real tf's own help flatly contradicts).
+pub fn cmd_exit(engine: &TfEngine, args: &str) -> TfCommandResult {
     if engine.loading_files.is_empty() {
         // Not loading a file - /exit has no effect (per TF spec)
         TfCommandResult::Success(None)
     } else {
-        // Loading a file - abort early
-        TfCommandResult::ExitLoad
+        let n = args.trim().parse::<i64>().unwrap_or(1).max(1) as u32;
+        TfCommandResult::ExitLoad(n)
     }
 }
 
@@ -1356,13 +1806,68 @@ pub fn cmd_export(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// /save filename - Save macros to a file
-pub fn cmd_save(engine: &TfEngine, args: &str) -> TfCommandResult {
-    let filename = args.trim();
-
-    if filename.is_empty() {
-        return TfCommandResult::Error("Usage: /save filename".to_string());
+/// /save [-a] <file> [<list-options>] - Save matching macros to `<file>`,
+/// one per line in reloadable `/def` form (`/help save`: "the <list-options>
+/// are the same as those in the /list command" - `macros::MacroFilter`, Job
+/// 7's grammar; "Invisible macros will not be saved unless -i is
+/// specified" - `MacroFilter`'s own default `InvisibleMode`). `-a` appends;
+/// otherwise `<file>` is overwritten. Real tf's own `/save` writes ONLY
+/// macros (no variables, no keybinding table) - verified directly against
+/// real tf; the previous Clay implementation also dumped every variable and
+/// every raw `/bind` entry unconditionally, ignoring its own arguments
+/// entirely (no filter support, no `-a`), which is why a `/save` round-trip
+/// through `/load` used to duplicate content instead of reproducing it.
+///
+/// Message wording matches real tf directly (verified): "Writing macros to
+/// <file>" / "Appending macros to <file>" - not the previous "Saved to
+/// '<file>'".
+pub fn cmd_save(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if engine.restrict_level >= super::RestrictLevel::File {
+        return TfCommandResult::Error("SAVE: restricted".to_string());
     }
+    let mut rest = args.trim_start();
+
+    // "-a" must be its own token (`/help save`: "/SAVE [-a] <file>") - unlike
+    // <list-options>' own `-a<attrs>` (a completely different option, /def's
+    // attribute flag), which only ever appears further along.
+    let append = if let Some(after) = rest.strip_prefix("-a") {
+        if after.is_empty() || after.starts_with(char::is_whitespace) {
+            rest = after.trim_start();
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let (filename, options) = match rest.find(char::is_whitespace) {
+        Some(pos) => (&rest[..pos], rest[pos..].trim_start()),
+        None => (rest, ""),
+    };
+    if filename.is_empty() {
+        return TfCommandResult::Error("Usage: /save [-a] <file> [<list-options>]".to_string());
+    }
+
+    let default_style = super::macros::default_matching_style(engine);
+    let filter = match super::macros::MacroFilter::parse(options, super::macros::FilterKind::List, default_style) {
+        Ok(f) => f,
+        Err(e) => return TfCommandResult::Error(e),
+    };
+
+    let mut matched: Vec<&super::TfMacro> = engine.macros.iter().filter(|m| filter.matches(m)).collect();
+    if filter.sort {
+        matched.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    let mut last_number = 0u32;
+    let mut output = String::new();
+    for macro_def in &matched {
+        output.push_str(&super::macros::format_def_line(macro_def));
+        output.push('\n');
+        last_number = macro_def.sequence_number;
+    }
+    engine.set_global("?", super::TfValue::Integer(last_number as i64));
 
     // Expand ~ to home directory
     let expanded = if filename.starts_with('~') {
@@ -1382,107 +1887,33 @@ pub fn cmd_save(engine: &TfEngine, args: &str) -> TfCommandResult {
         filename.to_string()
     };
 
-    let mut output = String::new();
+    let write_result = if append {
+        use std::io::Write as _;
+        fs::OpenOptions::new().create(true).append(true).open(&expanded)
+            .and_then(|mut f| f.write_all(output.as_bytes()))
+    } else {
+        fs::write(&expanded, &output)
+    };
 
-    // Save global variables
-    output.push_str(";; TinyFugue script generated by Clay\n");
-    output.push_str(";; Variables\n");
-    for (name, value) in &engine.global_vars {
-        output.push_str(&format!("/set {} {}\n", name, value.to_string_value()));
-    }
-
-    // Save macros
-    output.push_str("\n;; Macros\n");
-    for macro_def in &engine.macros {
-        // Skip internal macros
-        if macro_def.name.starts_with("__") {
-            continue;
+    match write_result {
+        Ok(()) => {
+            let verb = if append { "Appending" } else { "Writing" };
+            TfCommandResult::Success(Some(format!("{} macros to {}", verb, expanded)))
         }
-
-        let mut def_line = String::from("/def ");
-
-        // Add flags
-        if let Some(ref trigger) = macro_def.trigger {
-            if !trigger.pattern.is_empty() {
-                def_line.push_str(&format!("-t\"{}\" ", trigger.pattern));
-                if trigger.match_mode != super::TfMatchMode::Glob {
-                    def_line.push_str(&format!("-m{:?} ", trigger.match_mode).to_lowercase());
-                }
-            }
-        }
-
-        if macro_def.priority != 0 {
-            def_line.push_str(&format!("-p{} ", macro_def.priority));
-        }
-        if macro_def.fall_through {
-            def_line.push_str("-F ");
-        }
-        if let Some(n) = macro_def.one_shot {
-            if n == 1 {
-                def_line.push_str("-1 ");
-            } else {
-                def_line.push_str(&format!("-n{} ", n));
-            }
-        }
-        if let Some(ref hook) = macro_def.hook {
-            def_line.push_str(&format!("-h{:?} ", hook));
-        }
-        if let Some(ref keys) = macro_def.keybinding {
-            def_line.push_str(&format!("-b\"{}\" ", keys));
-        }
-        if let Some(ref world) = macro_def.world {
-            def_line.push_str(&format!("-w\"{}\" ", world));
-        }
-        if let Some(ref cond) = macro_def.condition {
-            def_line.push_str(&format!("-E\"{}\" ", cond));
-        }
-        if let Some(prob) = macro_def.probability {
-            def_line.push_str(&format!("-c{} ", prob));
-        }
-
-        // Add attributes
-        let mut attrs: Vec<String> = Vec::new();
-        if macro_def.attributes.gag { attrs.push("gag".to_string()); }
-        if macro_def.attributes.bold { attrs.push("bold".to_string()); }
-        if macro_def.attributes.underline { attrs.push("underline".to_string()); }
-        if macro_def.attributes.reverse { attrs.push("reverse".to_string()); }
-        if macro_def.attributes.flash { attrs.push("flash".to_string()); }
-        if macro_def.attributes.dim { attrs.push("dim".to_string()); }
-        if macro_def.attributes.bell { attrs.push("bell".to_string()); }
-        if let Some(ref color) = macro_def.attributes.hilite {
-            attrs.push(format!("hilite:{}", color));
-        }
-        if !attrs.is_empty() {
-            def_line.push_str(&format!("-a{} ", attrs.join(",")));
-        }
-
-        def_line.push_str(&format!("{} = {}\n", macro_def.name, macro_def.body));
-        output.push_str(&def_line);
-    }
-
-    // Save keybindings
-    output.push_str("\n;; Keybindings\n");
-    for (key, cmd) in &engine.keybindings {
-        output.push_str(&format!("/bind {} = {}\n", key, cmd));
-    }
-
-    // Write to file
-    match fs::write(&expanded, output) {
-        Ok(()) => TfCommandResult::Success(Some(format!("Saved to '{}'", expanded))),
         Err(e) => TfCommandResult::Error(format!("Cannot write '{}': {}", expanded, e)),
     }
 }
 
-/// /log [filename] - Toggle logging to file
-/// Note: Actual logging needs main.rs integration, this just returns a message
+/// /log [-w[<world>]] [-i] [-l] [-g] [OFF|ON|<file>] - per-world output logging.
+///
+/// Resolving this needs `&mut App` (per-world settings, enumerating every world for a bare
+/// `/log`), which this engine-only function does not have - always bounces to Clay's own
+/// `/log` (`Command::Log`, parsed by `parse_log_command` and executed by
+/// `commands::execute_log_command`), the same way `/send`'s flag forms do. See
+/// `execute_log_command`'s doc comment for exactly what maps onto Clay's simpler
+/// one-log-per-world model and what's accepted but not distinct.
 pub fn cmd_log(args: &str) -> TfCommandResult {
-    let filename = args.trim();
-
-    if filename.is_empty() {
-        TfCommandResult::Success(Some("Usage: /log filename - Toggle logging (requires main.rs integration)".to_string()))
-    } else {
-        TfCommandResult::Success(Some(format!("Log '{}' - requires main.rs integration", filename)))
-    }
+    TfCommandResult::ClayCommand(format!("/log {}", args.trim()))
 }
 
 /// Parse a TF time string into a Duration
@@ -1664,19 +2095,106 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         synchronous: false,
         on_prompt,
         priority,
+        kind: super::ProcessKind::Repeat,
     };
 
     TfCommandResult::RepeatProcess(process)
 }
 
-/// /ps - List background processes
-pub fn cmd_ps(engine: &TfEngine) -> TfCommandResult {
+/// /ps [-srq] [-w[<world>]] [<pid>] - List information about background
+/// `/quote`/`/repeat` processes, or one specific `<pid>` (`/help ps`).
+/// Clay's own PID/INTERVAL/REMAINING/COMMAND table predates this job and is
+/// kept as-is - real tf's PID/NEXT/T/D/WORLD/PTIME/COUNT/COMMAND columns
+/// don't all map onto `TfProcess` (there's no tracked per-process /quote
+/// line disposition, for instance - plan Job 14c: "implement what maps onto
+/// Clay's TfProcess fields, accept the rest"), so only the documented
+/// FILTERS are new here: `-s` (PIDs only, one line, space-separated - no
+/// header), `-r`/`-q` (`ProcessKind` - a real /repeat vs. a delayed /quote
+/// line), `-w[<world>]` (bare `-w` means the current world, same as
+/// `cmd_histsize`'s own -w; validated against `world_info_cache`), and a
+/// trailing `<pid>` to show just one process. A totally-empty process list
+/// keeps Clay's existing friendly "No background processes." message; a
+/// FILTERED-to-empty result instead shows the (possibly headerless, for -s)
+/// empty table, matching real tf's own behavior of always showing the
+/// header for a plain `/ps` with none running (verified directly against
+/// real tf).
+pub fn cmd_ps(engine: &TfEngine, args: &str) -> TfCommandResult {
+    let mut remaining = args.trim();
+    let mut short = false;
+    let mut repeats_only = false;
+    let mut quotes_only = false;
+    let mut world_arg: Option<Option<String>> = None; // Some(None) = bare -w; Some(Some(name)) = -w<name>
+
+    while let Some(rest) = remaining.strip_prefix('-') {
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after_w) = rest.strip_prefix('w') {
+            let token_end = after_w.find(char::is_whitespace).unwrap_or(after_w.len());
+            let (value, tail) = after_w.split_at(token_end);
+            world_arg = Some(if value.is_empty() { None } else { Some(value.to_string()) });
+            remaining = tail.trim_start();
+            continue;
+        }
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (token, tail) = rest.split_at(token_end);
+        if !token.is_empty() && token.chars().all(|c| "srq".contains(c)) {
+            for c in token.chars() {
+                match c {
+                    's' => short = true,
+                    'r' => repeats_only = true,
+                    'q' => quotes_only = true,
+                    _ => unreachable!("filtered to srq above"),
+                }
+            }
+            remaining = tail.trim_start();
+            continue;
+        }
+        break;
+    }
+
+    let world_filter = match world_arg {
+        Some(name) => {
+            let resolved = name.or_else(|| engine.current_world.clone());
+            match resolved {
+                Some(name) if engine.world_info_cache.iter().any(|w| w.name.eq_ignore_ascii_case(&name)) => Some(name),
+                Some(name) => return TfCommandResult::Error(format!("PS -w: No world {}", name)),
+                None => return TfCommandResult::Error("PS -w: No world".to_string()),
+            }
+        }
+        None => None,
+    };
+
+    let pid_filter: Option<u32> = if remaining.is_empty() {
+        None
+    } else {
+        match remaining.parse::<u32>() {
+            Ok(pid) => Some(pid),
+            Err(_) => return TfCommandResult::Error(format!("Invalid pid: {}", remaining)),
+        }
+    };
+
     if engine.processes.is_empty() {
         return TfCommandResult::Success(Some("No background processes.".to_string()));
     }
 
+    let procs: Vec<&TfProcess> = engine.processes.iter()
+        .filter(|p| !repeats_only || p.kind == super::ProcessKind::Repeat)
+        .filter(|p| !quotes_only || p.kind == super::ProcessKind::Quote)
+        .filter(|p| world_filter.as_deref().map_or(true, |w| p.world.as_deref().is_some_and(|pw| pw.eq_ignore_ascii_case(w))))
+        .filter(|p| pid_filter.map_or(true, |pid| p.id == pid))
+        .collect();
+
+    if short {
+        if procs.is_empty() {
+            return TfCommandResult::Success(None);
+        }
+        let ids: Vec<String> = procs.iter().map(|p| p.id.to_string()).collect();
+        return TfCommandResult::Success(Some(ids.join(" ")));
+    }
+
     let mut lines = vec![format!("{:<6} {:<12} {:<10} {}", "PID", "INTERVAL", "REMAINING", "COMMAND")];
-    for p in &engine.processes {
+    for p in procs {
         let interval_str = format_duration(p.interval);
         let remaining_str = match p.remaining {
             Some(r) => r.to_string(),
@@ -1708,23 +2226,49 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-/// /kill pid - Kill background process
+/// /kill <pid>... - For each `<pid>` given, terminate the corresponding
+/// process (`/help kill`). Each pid is processed independently - one bad
+/// pid doesn't stop the rest (same pattern as /undef and /undefn: `/kill 1
+/// nosuch 2` still kills both 1 and 2). Silent on success (matches real
+/// tf's own behaviour - verified directly: neither pid is echoed back); a
+/// missing or non-numeric pid prints its own `% [loc]KILL: ...` diagnostic
+/// (`TfEngine::format_diag`, finding 25's convention), real tf's own
+/// wording ("no process N" / "invalid or missing numeric argument",
+/// matching `/undefn`'s own two failure messages).
 pub fn cmd_kill(engine: &mut TfEngine, args: &str) -> TfCommandResult {
-    let pid_str = args.trim();
-    if pid_str.is_empty() {
-        return TfCommandResult::Error("Usage: /kill pid".to_string());
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: /kill <pid>...".to_string());
     }
 
-    if let Ok(pid) = pid_str.parse::<u32>() {
-        let before = engine.processes.len();
-        engine.processes.retain(|p| p.id != pid);
-        if engine.processes.len() < before {
-            TfCommandResult::Success(Some(format!("Process {} killed.", pid)))
-        } else {
-            TfCommandResult::Error(format!("Process {} not found.", pid))
+    let mut messages = Vec::new();
+    for tok in args.split_whitespace() {
+        match tok.parse::<u32>() {
+            Ok(pid) => {
+                let before = engine.processes.len();
+                engine.processes.retain(|p| p.id != pid);
+                if engine.processes.len() < before {
+                    // KILL hook: "pid (process ends)" - see /help hooks.
+                    let outcome = super::hooks::fire_hook(engine, super::TfHookEvent::Kill, &pid.to_string());
+                    for r in outcome.results {
+                        if let TfCommandResult::Success(Some(m)) = r {
+                            messages.push(m);
+                        }
+                    }
+                } else {
+                    messages.push(engine.format_diag(&format!("KILL: no process {}", pid)));
+                }
+            }
+            Err(_) => {
+                messages.push(engine.format_diag("KILL: invalid or missing numeric argument"));
+            }
         }
+    }
+
+    if messages.is_empty() {
+        TfCommandResult::Success(None)
     } else {
-        TfCommandResult::Error(format!("Invalid pid: {}", pid_str))
+        TfCommandResult::Success(Some(messages.join("\n")))
     }
 }
 
@@ -1735,7 +2279,10 @@ pub use super::macros::glob_to_regex;
 // Tier 1: Simple commands
 // =============================================================================
 
-/// /toggle var - Toggle a variable between 0 and 1
+/// /toggle var - Toggle a variable between 0 and 1. Silent on success - real tf's own
+/// `/toggle` (`/help toggle`) never echoes the new value (verified directly: only a
+/// following `/echo %var` prints anything); Clay used to echo "name=newval" here, which
+/// duplicated output for any script that also reads the variable back afterward (Job 15).
 pub fn cmd_toggle(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let name = args.trim();
     if name.is_empty() {
@@ -1748,7 +2295,7 @@ pub fn cmd_toggle(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
     let new_val = if current == 0 { 1 } else { 0 };
     engine.set_global(name, super::TfValue::Integer(new_val));
-    TfCommandResult::Success(Some(format!("{}={}", name, new_val)))
+    TfCommandResult::Success(None)
 }
 
 /// /return [expr] - Stop macro execution, set %? to expr result
@@ -1764,19 +2311,20 @@ pub fn cmd_return(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// /not expr - Negate: set %? to logical negation of expr
-pub fn cmd_not(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+/// /result [expr] - like /return, but when the enclosing macro was called
+/// as a command (not as a function), the value is also echoed to tfout -
+/// see macros::execute_macro_with_context. With no expression the value is
+/// the empty string (TF: "If the expression is omitted, the return value
+/// of the macro is the empty string" - unlike /return, whose no-argument
+/// default is preserved above as-is per this job's brief).
+pub fn cmd_result(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: /not expression".to_string());
+        return TfCommandResult::Result(String::new());
     }
 
     match super::expressions::evaluate(engine, args) {
-        Ok(value) => {
-            let negated = if value.to_bool() { 0i64 } else { 1i64 };
-            engine.set_global("?", super::TfValue::Integer(negated));
-            TfCommandResult::Success(None)
-        }
+        Ok(value) => TfCommandResult::Result(value.to_string_value()),
         Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
     }
 }
@@ -1787,104 +2335,372 @@ pub fn cmd_suspend() -> TfCommandResult {
 }
 
 /// /dokey name - Execute an edit key function by name
+///
+/// TF's full 35-name vocabulary (see `tf-help`'s `/dokey` table, and finding A / plan step
+/// P1.11 in the TF-parity plan). Sets `%?` to TF's documented return value where that's
+/// cheap to compute from the cached `KeyboardBufferState` (movement/deletion -> new cursor
+/// position - deleting *forward* of the cursor never moves it, so DCH/DWORD/DEOL return the
+/// unchanged position); everything else (recall, search, world switch, scrolling, redraw,
+/// pause, ...) sets it to 1, same as `/not`'s pattern of `set_global("?", ...)` alongside
+/// `Success(None)`.
+///
+/// Names that only need the cached buffer/cursor (BSPC, DLINE, LEFT, RIGHT, HOME, END, DCH,
+/// WLEFT, WRIGHT) are performed synchronously via the existing `Goto`/`Delete`/`WordLeft`/
+/// `WordRight` ops. Everything else needs real App/World state (input history, scrollback,
+/// the world list, ...) that the engine can't reach, so it's deferred via
+/// `PendingKeyboardOp::Dokey` to `App::process_pending_keyboard_ops` - see that function's
+/// doc comment for how the resulting `KeyAction`s (NEWLINE -> `SendCommand`, REDRAW ->
+/// `Redraw`, SOCKETB/F -> `SwitchedWorld`) are handled at the call site.
 pub fn cmd_dokey(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    use super::{DokeyName, PendingKeyboardOp, TfValue};
+
     let name = args.trim().to_uppercase();
     if name.is_empty() {
         return TfCommandResult::Error("Usage: /dokey keyname".to_string());
     }
 
+    // Cheap, synchronous names: cmd_dokey already has everything it needs in
+    // `engine.keyboard_state`, so these don't need a PendingKeyboardOp::Dokey round trip.
     match name.as_str() {
         "BSPC" | "BACKSPACE" => {
-            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Delete(-1));
-            TfCommandResult::Success(None)
+            let pos = engine.keyboard_state.cursor_position;
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Delete(-1));
+            engine.set_global("?", TfValue::Integer(pos.saturating_sub(1) as i64));
+            return TfCommandResult::Success(None);
         }
         "DLINE" | "DELINE" => {
             // Delete entire line
-            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(0));
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Goto(0));
             let len = engine.keyboard_state.buffer.len() as i32;
             if len > 0 {
-                engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Delete(len));
+                engine.pending_keyboard_ops.push(PendingKeyboardOp::Delete(len));
             }
-            TfCommandResult::Success(None)
+            engine.set_global("?", TfValue::Integer(0));
+            return TfCommandResult::Success(None);
         }
-        "UP" | "RECALLB" => TfCommandResult::ClayCommand("__dokey_up".to_string()),
-        "DOWN" | "RECALLF" => TfCommandResult::ClayCommand("__dokey_down".to_string()),
         "LEFT" => {
             let pos = engine.keyboard_state.cursor_position;
             if pos > 0 {
-                engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(pos - 1));
+                engine.pending_keyboard_ops.push(PendingKeyboardOp::Goto(pos - 1));
             }
-            TfCommandResult::Success(None)
+            engine.set_global("?", TfValue::Integer(pos.saturating_sub(1) as i64));
+            return TfCommandResult::Success(None);
         }
         "RIGHT" => {
             let pos = engine.keyboard_state.cursor_position;
             let len = engine.keyboard_state.buffer.chars().count();
-            if pos < len {
-                engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(pos + 1));
-            }
-            TfCommandResult::Success(None)
+            let new_pos = if pos < len {
+                engine.pending_keyboard_ops.push(PendingKeyboardOp::Goto(pos + 1));
+                pos + 1
+            } else {
+                pos
+            };
+            engine.set_global("?", TfValue::Integer(new_pos as i64));
+            return TfCommandResult::Success(None);
         }
         "HOME" => {
-            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(0));
-            TfCommandResult::Success(None)
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Goto(0));
+            engine.set_global("?", TfValue::Integer(0));
+            return TfCommandResult::Success(None);
         }
         "END" => {
             let len = engine.keyboard_state.buffer.chars().count();
-            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(len));
-            TfCommandResult::Success(None)
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Goto(len));
+            engine.set_global("?", TfValue::Integer(len as i64));
+            return TfCommandResult::Success(None);
         }
         "DCH" | "DELETE" => {
-            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Delete(1));
-            TfCommandResult::Success(None)
+            let pos = engine.keyboard_state.cursor_position;
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Delete(1));
+            engine.set_global("?", TfValue::Integer(pos as i64));
+            return TfCommandResult::Success(None);
         }
         "WLEFT" => {
-            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::WordLeft);
-            TfCommandResult::Success(None)
+            let chars: Vec<char> = engine.keyboard_state.buffer.chars().collect();
+            let mut pos = engine.keyboard_state.cursor_position;
+            while pos > 0 && !chars[pos - 1].is_alphanumeric() {
+                pos -= 1;
+            }
+            while pos > 0 && chars[pos - 1].is_alphanumeric() {
+                pos -= 1;
+            }
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::WordLeft);
+            engine.set_global("?", TfValue::Integer(pos as i64));
+            return TfCommandResult::Success(None);
         }
         "WRIGHT" => {
-            engine.pending_keyboard_ops.push(super::PendingKeyboardOp::WordRight);
-            TfCommandResult::Success(None)
+            let chars: Vec<char> = engine.keyboard_state.buffer.chars().collect();
+            let mut pos = engine.keyboard_state.cursor_position;
+            while pos < chars.len() && chars[pos].is_alphanumeric() {
+                pos += 1;
+            }
+            while pos < chars.len() && !chars[pos].is_alphanumeric() {
+                pos += 1;
+            }
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::WordRight);
+            engine.set_global("?", TfValue::Integer(pos as i64));
+            return TfCommandResult::Success(None);
         }
-        "NEWLINE" | "ENTER" => TfCommandResult::ClayCommand("__dokey_enter".to_string()),
-        "REFRESH" | "REDRAW" => TfCommandResult::ClayCommand("/redraw".to_string()),
-        "FLUSH" => TfCommandResult::ClayCommand("__dokey_flush".to_string()),
-        "HPAGE" | "PAGEUP" => TfCommandResult::ClayCommand("__dokey_pageup".to_string()),
-        "PAGE" | "PAGEDN" | "PAGEDOWN" => TfCommandResult::ClayCommand("__dokey_pagedown".to_string()),
-        "SEARCHB" => TfCommandResult::ClayCommand("__dokey_searchb".to_string()),
-        "SEARCHF" => TfCommandResult::ClayCommand("__dokey_searchf".to_string()),
-        "LNEXT" => TfCommandResult::Success(None), // No-op in Clay
-        "PAUSE" => TfCommandResult::ClayCommand("__dokey_pause".to_string()),
-        _ => TfCommandResult::Error(format!("Unknown key name: {}", name)),
+        "BWORD" => {
+            // Same skip-whitespace-then-skip-word algorithm as
+            // InputArea::delete_word_before_cursor, run here against the cached buffer so
+            // the cursor's landing position is cheap to report in %? without waiting for
+            // App::process_pending_keyboard_ops to actually perform the delete.
+            let buf = &engine.keyboard_state.buffer;
+            let pos = engine.keyboard_state.cursor_position.min(buf.len());
+            let mut chars: Vec<char> = buf[..pos].chars().collect();
+            while chars.last().is_some_and(|c| c.is_whitespace()) {
+                chars.pop();
+            }
+            while chars.last().is_some_and(|c| !c.is_whitespace()) {
+                chars.pop();
+            }
+            let new_pos: usize = chars.iter().map(|c| c.len_utf8()).sum();
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Dokey(DokeyName::BackwardWord));
+            engine.set_global("?", TfValue::Integer(new_pos as i64));
+            return TfCommandResult::Success(None);
+        }
+        "DWORD" => {
+            // Deleting forward of the cursor never moves it.
+            let pos = engine.keyboard_state.cursor_position;
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Dokey(DokeyName::ForwardWord));
+            engine.set_global("?", TfValue::Integer(pos as i64));
+            return TfCommandResult::Success(None);
+        }
+        "DEOL" => {
+            let pos = engine.keyboard_state.cursor_position;
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Dokey(DokeyName::KillToEol));
+            engine.set_global("?", TfValue::Integer(pos as i64));
+            return TfCommandResult::Success(None);
+        }
+        _ => {}
+    }
+
+    // Everything else needs real App/World state - deferred via PendingKeyboardOp::Dokey.
+    // TF: "The return values of other actions aren't very useful" - 1 for all of them.
+    let dokey_name = match name.as_str() {
+        "UP" => DokeyName::CursorUp,
+        "DOWN" => DokeyName::CursorDown,
+        "NEWLINE" | "ENTER" => DokeyName::Newline,
+        "RECALLB" => DokeyName::HistoryPrev,
+        "RECALLF" => DokeyName::HistoryNext,
+        "RECALLBEG" => DokeyName::HistoryBegin,
+        "RECALLEND" => DokeyName::HistoryEnd,
+        "SEARCHB" => DokeyName::HistorySearchBack,
+        "SEARCHF" => DokeyName::HistorySearchForward,
+        "SOCKETB" => DokeyName::WorldPrev,
+        "SOCKETF" => DokeyName::WorldNext,
+        "REDRAW" | "REFRESH" => DokeyName::Redraw,
+        "CLEAR" => DokeyName::ClearView,
+        "PAUSE" => DokeyName::Pause,
+        "LNEXT" => DokeyName::LiteralNext,
+        "PAGE" | "PAGEDN" | "PAGEDOWN" | "PGDN" => DokeyName::PageForward,
+        "PAGEBACK" | "PAGEUP" | "PGUP" => DokeyName::PageBackward,
+        "HPAGE" => DokeyName::HalfPageForward,
+        "HPAGEBACK" => DokeyName::HalfPageBackward,
+        "LINE" => DokeyName::LineForward,
+        "LINEBACK" => DokeyName::LineBackward,
+        "FLUSH" => DokeyName::Flush,
+        "SELFLUSH" => DokeyName::SelectiveFlush,
+        _ => return TfCommandResult::Error(format!("Unknown key name: {}", name)),
+    };
+    engine.pending_keyboard_ops.push(PendingKeyboardOp::Dokey(dokey_name));
+    engine.set_global("?", TfValue::Integer(1));
+    TfCommandResult::Success(None)
+}
+
+/// Every name TinyFugue's own `tf-lib/kbfunc.tf` defines a `/def -i dokey_<name>
+/// = ...` wrapper macro for (see that file's own comment block and its 36
+/// `dokey_<name>` lines) - the set `is_tf_command_name` accepts a `dokey_`
+/// prefix for, and [`cmd_dokey_named`]'s own `match` arms below. TF-parity plan
+/// Job 21 / P2.5.
+pub const DOKEY_WRAPPER_NAMES: &[&str] = &[
+    "bspc", "bword", "dch", "deol", "dline", "down", "dword", "end", "home", "left",
+    "lnext", "newline", "pause", "recallb", "recallbeg", "recallend", "recallf",
+    "redraw", "right", "searchb", "searchf", "socketb", "socketf", "up", "wleft",
+    "wright", "page", "pageback", "hpage", "hpageback", "line", "lineback", "flush",
+    "selflush", "pgup", "pgdn",
+];
+
+/// True iff `name` (already lower-cased, with no `dokey_` prefix) is one of
+/// [`DOKEY_WRAPPER_NAMES`].
+pub fn is_dokey_wrapper_name(name: &str) -> bool {
+    DOKEY_WRAPPER_NAMES.contains(&name)
+}
+
+/// The current numeric prefix the way kbfunc.tf's own `(kbnum?:1)` idiom reads
+/// it: `%kbnum` mirrored into `engine.global_vars` right before `execute()`
+/// (`App::sync_tf_world_info`, TF-parity plan Job 20/P2.4) - unset *or exactly
+/// zero* both default to `1`, matching TF's `?:` truthiness test exactly the
+/// way `InputArea::take_kbnum` does on the App side.
+fn engine_kbnum(engine: &TfEngine) -> i64 {
+    match engine.global_vars.get("kbnum").and_then(super::TfValue::to_int) {
+        Some(n) if n != 0 => n,
+        _ => 1,
     }
 }
 
-/// /histsize [-lig] [size] - Get/set history buffer size
-pub fn cmd_histsize(engine: &mut TfEngine, args: &str) -> TfCommandResult {
-    let args = args.trim();
+/// `/dokey_<name>` (TF-parity plan Job 21/P2.5): the "second level" of TF's own
+/// two-level key mapping (`/help keys`'s "Mapping Named Keys to functions" -
+/// `key_<name>` macros call these). Real kbfunc.tf defines them as invisible
+/// `-i` macros, which shadow this native fallback whenever the library is
+/// loaded via ordinary macro-before-builtin precedence (`execute_command_impl`
+/// checks `engine.macros` before `is_tf_command_name` - nothing special is
+/// needed here for that).
+///
+/// Real TF's own `/dokey` builtin ([`cmd_dokey`]) is always a single step -
+/// see that function's doc comment - so the handful of these wrappers that
+/// kbfunc.tf documents as reading `%kbnum` itself (`dokey_left = /@test
+/// kbgoto(kbpoint() - (kbnum?:1))`, and BSPC/DCH/WLEFT/WRIGHT/UP/DOWN
+/// alongside it) have to apply that multiplication at this layer instead,
+/// exactly the way the library macro does - a negative `kbnum` reverses
+/// direction (tf-help `#kbnum`), same convention as `input_handler::
+/// dispatch_action`'s own kbnum-aware arms. Everything else forwards to
+/// `cmd_dokey` completely unchanged, either because it is already kbnum-aware
+/// one layer down (DWORD, and every name `perform_dokey` routes through
+/// `dispatch_action` - RECALLB/RECALLF/SEARCHB/SEARCHF/SOCKETB/SOCKETF/PAGE/
+/// PAGEBACK/HPAGE/HPAGEBACK/LINE/LINEBACK all read `app.input.kbnum` there,
+/// Job 20) or because kbfunc.tf's own body doesn't read `kbnum` for it either
+/// (HOME/END/DLINE/DEOL/BWORD/NEWLINE/RECALLBEG/RECALLEND/REDRAW/PAUSE/LNEXT/
+/// FLUSH/SELFLUSH).
+pub fn cmd_dokey_named(engine: &mut TfEngine, name: &str) -> TfCommandResult {
+    use super::{DokeyName, PendingKeyboardOp, TfValue};
 
-    if args.is_empty() {
-        let size = engine.get_var("histsize")
-            .and_then(|v| v.to_int())
-            .unwrap_or(1000);
-        return TfCommandResult::Success(Some(format!("histsize={}", size)));
+    let n = engine_kbnum(engine);
+
+    match name {
+        "left" => {
+            let pos = engine.keyboard_state.cursor_position as i64;
+            let len = engine.keyboard_state.buffer.chars().count() as i64;
+            let new_pos = (pos - n).clamp(0, len);
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Goto(new_pos as usize));
+            engine.set_global("?", TfValue::Integer(new_pos));
+            TfCommandResult::Success(None)
+        }
+        "right" => {
+            let pos = engine.keyboard_state.cursor_position as i64;
+            let len = engine.keyboard_state.buffer.chars().count() as i64;
+            let new_pos = (pos + n).clamp(0, len);
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Goto(new_pos as usize));
+            engine.set_global("?", TfValue::Integer(new_pos));
+            TfCommandResult::Success(None)
+        }
+        "bspc" => {
+            let pos = engine.keyboard_state.cursor_position as i64;
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Delete(-n as i32));
+            let new_pos = if n >= 0 { (pos - n).max(0) } else { pos };
+            engine.set_global("?", TfValue::Integer(new_pos));
+            TfCommandResult::Success(None)
+        }
+        "dch" => {
+            let pos = engine.keyboard_state.cursor_position as i64;
+            engine.pending_keyboard_ops.push(PendingKeyboardOp::Delete(n as i32));
+            let new_pos = if n >= 0 { pos } else { (pos + n).max(0) };
+            engine.set_global("?", TfValue::Integer(new_pos));
+            TfCommandResult::Success(None)
+        }
+        "wleft" => {
+            let count = n.unsigned_abs();
+            let forward = n < 0; // negative kbnum reverses direction
+            let chars: Vec<char> = engine.keyboard_state.buffer.chars().collect();
+            let mut pos = engine.keyboard_state.cursor_position.min(chars.len());
+            for _ in 0..count {
+                if forward {
+                    while pos < chars.len() && chars[pos].is_alphanumeric() { pos += 1; }
+                    while pos < chars.len() && !chars[pos].is_alphanumeric() { pos += 1; }
+                    engine.pending_keyboard_ops.push(PendingKeyboardOp::WordRight);
+                } else {
+                    while pos > 0 && !chars[pos - 1].is_alphanumeric() { pos -= 1; }
+                    while pos > 0 && chars[pos - 1].is_alphanumeric() { pos -= 1; }
+                    engine.pending_keyboard_ops.push(PendingKeyboardOp::WordLeft);
+                }
+            }
+            engine.set_global("?", TfValue::Integer(pos as i64));
+            TfCommandResult::Success(None)
+        }
+        "wright" => {
+            let count = n.unsigned_abs();
+            let backward = n < 0; // negative kbnum reverses direction
+            let chars: Vec<char> = engine.keyboard_state.buffer.chars().collect();
+            let mut pos = engine.keyboard_state.cursor_position.min(chars.len());
+            for _ in 0..count {
+                if backward {
+                    while pos > 0 && !chars[pos - 1].is_alphanumeric() { pos -= 1; }
+                    while pos > 0 && chars[pos - 1].is_alphanumeric() { pos -= 1; }
+                    engine.pending_keyboard_ops.push(PendingKeyboardOp::WordLeft);
+                } else {
+                    while pos < chars.len() && chars[pos].is_alphanumeric() { pos += 1; }
+                    while pos < chars.len() && !chars[pos].is_alphanumeric() { pos += 1; }
+                    engine.pending_keyboard_ops.push(PendingKeyboardOp::WordRight);
+                }
+            }
+            engine.set_global("?", TfValue::Integer(pos as i64));
+            TfCommandResult::Success(None)
+        }
+        "up" => {
+            let count = n.unsigned_abs();
+            let dokey = if n >= 0 { DokeyName::CursorUp } else { DokeyName::CursorDown };
+            for _ in 0..count { engine.pending_keyboard_ops.push(PendingKeyboardOp::Dokey(dokey)); }
+            engine.set_global("?", TfValue::Integer(1));
+            TfCommandResult::Success(None)
+        }
+        "down" => {
+            let count = n.unsigned_abs();
+            let dokey = if n >= 0 { DokeyName::CursorDown } else { DokeyName::CursorUp };
+            for _ in 0..count { engine.pending_keyboard_ops.push(PendingKeyboardOp::Dokey(dokey)); }
+            engine.set_global("?", TfValue::Integer(1));
+            TfCommandResult::Success(None)
+        }
+        // Everything else forwards unchanged to the raw single-step primitive -
+        // see this function's own doc comment for why each of these either
+        // already honors `kbnum` one layer down or is correct not to.
+        other => cmd_dokey(engine, &other.to_uppercase()),
+    }
+}
+
+/// /histsize [-lig] [-w[<world>]] [<size>] - Get/set history buffer size
+/// (`/help histsize`). Real TF tracks four independent histories (local,
+/// input, global - the default - and per-world); Clay has always tracked
+/// just the one shared `%{histsize}` value for all of them, and `-l`/`-i`/
+/// `-g` remain accepted-but-not-distinct (unchanged by this job, including
+/// defaulting to `-i`'s behavior rather than real tf's own `-g` default -
+/// plan Job 14c's own ruling, not an oversight).
+///
+/// `-w[<world>]` is new (Job 14c): Clay has no per-world scrollback size
+/// limit to report separately, so once the world name is validated (real
+/// tf's own "No world <name>" diagnostic on a bad name, or on a bare `-w`
+/// with no current world - `TfEngine::current_world`/`world_info_cache`),
+/// it falls through to the same shared value as -g/-l/-i.
+pub fn cmd_histsize(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let mut remaining = args.trim();
+    let mut world_arg: Option<Option<String>> = None; // Some(None) = bare -w; Some(Some(name)) = -w<name>
+
+    while let Some(rest) = remaining.strip_prefix('-') {
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after_w) = rest.strip_prefix('w') {
+            let token_end = after_w.find(char::is_whitespace).unwrap_or(after_w.len());
+            let (value, tail) = after_w.split_at(token_end);
+            world_arg = Some(if value.is_empty() { None } else { Some(value.to_string()) });
+            remaining = tail.trim_start();
+            continue;
+        }
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (token, tail) = rest.split_at(token_end);
+        if !token.is_empty() && token.chars().all(|c| "lig".contains(c)) {
+            remaining = tail.trim_start();
+            continue;
+        }
+        break;
     }
 
-    // Parse options
-    let mut remaining = args;
-    let mut _mode = 'i'; // default: input history
-
-    while remaining.starts_with('-') {
-        if remaining.starts_with("-i") {
-            _mode = 'i';
-            remaining = remaining[2..].trim_start();
-        } else if remaining.starts_with("-l") {
-            _mode = 'l';
-            remaining = remaining[2..].trim_start();
-        } else if remaining.starts_with("-g") {
-            _mode = 'g';
-            remaining = remaining[2..].trim_start();
-        } else {
-            break;
+    if let Some(world_name) = world_arg {
+        let resolved = world_name.or_else(|| engine.current_world.clone());
+        match resolved {
+            Some(name) if engine.world_info_cache.iter().any(|w| w.name.eq_ignore_ascii_case(&name)) => {}
+            Some(name) => return TfCommandResult::Error(format!("HISTSIZE -w: No world {}", name)),
+            None => return TfCommandResult::Error("HISTSIZE -w: No world".to_string()),
         }
     }
 
@@ -1955,7 +2771,6 @@ pub fn cmd_sub(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
 /// /replace old new string - Replace occurrences in string
 pub fn cmd_replace(engine: &mut TfEngine, args: &str) -> TfCommandResult {
-    let _ = engine;
     let args = args.trim();
     if args.is_empty() {
         return TfCommandResult::Error("Usage: /replace old new string".to_string());
@@ -1972,6 +2787,11 @@ pub fn cmd_replace(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let string = parts[2];
 
     let result = string.replace(old, new);
+    // Command form both echoes the result AND sets %? to it (Job 15, verified directly
+    // against real tf: `/replace a o banana` prints "bonono" and a following `%?` also
+    // reads "bonono") - same "echo (command) or return (function)" dual nature as
+    // /escape and /pwd below.
+    engine.set_global("?", super::TfValue::String(result.clone()));
     TfCommandResult::Success(Some(result))
 }
 
@@ -2141,13 +2961,21 @@ pub fn cmd_untrig(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 // Tier 3: World management
 // =============================================================================
 
-/// /unworld name - Remove world definition
+/// /unworld <name>... - For each `<name>` given, remove the definition of
+/// the world with that name (`/help unworld`). Bounces to Clay's own native
+/// `/unworld` (`Command::RemoveWorld`, `commands::execute_remove_world_command`)
+/// the same way `/addworld` already does - this engine-only function has no
+/// `&mut App` to actually delete a world with (the previous implementation
+/// bounced to a Clay `/close` command that has never existed, so `/unworld`
+/// did nothing at all before this job). Multiple names are forwarded as one
+/// space-separated `Command::RemoveWorld` call so each is diagnosed
+/// independently, same pattern as /kill and /undef.
 pub fn cmd_unworld(args: &str) -> TfCommandResult {
-    let name = args.trim();
-    if name.is_empty() {
-        return TfCommandResult::Error("Usage: /unworld name".to_string());
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: /unworld <name>...".to_string());
     }
-    TfCommandResult::ClayCommand(format!("/close {}", name))
+    TfCommandResult::ClayCommand(format!("/unworld {}", args))
 }
 
 // =============================================================================
@@ -2327,11 +3155,393 @@ pub fn cmd_watchname(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
+// =============================================================================
+// Job 15: missing builtins + stdlib one-liners (see the TF-parity plan, section B
+// "Missing TF commands", and Phase 1 step P1.14).
+// =============================================================================
+
+/// /ismacro <macro-options> - the command FORM (distinct from the `ismacro(name)`
+/// expression FUNCTION in expressions.rs, which only ever does an exact-name check).
+/// Takes the same macro-option filter grammar `/list`/`/purge` use (Job 7's
+/// `MacroFilter`) and sets %? to the sequence number of the LAST macro that matches
+/// every given option, or 0 if none match - no output is echoed either way, matching
+/// real tf's own `/ismacro` (a stdlib.tf macro, `/def -i ismacro = /test tfclose("o")%;
+/// /@list -s -i %{*-@}`) exactly (verified directly: only %? changes).
+///
+/// This is what unblocks kbbind.tf's own `~bind_if_not_bound` (finding 28): once
+/// stdlib.tf is NOT loaded (no macro named "ismacro" in scope to shadow this), a plain
+/// `/ismacro -msimple -ib'^R'` reaches this native command instead of falling through
+/// to Clay's Clay-command fallback as literal, unsubstituted text. The OTHER half of
+/// finding 28 - that macro's own condition losing its "%1" - was a separate bug in
+/// `control_flow::evaluate_condition` (see that function's own doc comment), fixed
+/// alongside this.
+pub fn cmd_ismacro(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let default_style = super::macros::default_matching_style(engine);
+    // Real tf's own "/ismacro" is itself a stdlib.tf macro whose body
+    // hardcodes "-i" ahead of whatever the caller passed (`/def -i ismacro
+    // = /test tfclose("o")%; /@list -s -i %{*-@}`) - so a caller that
+    // never mentions invisibility at all still matches an invisible macro
+    // (verified directly: `/def -i foo = ...` then a bare `/ismacro foo`,
+    // with no "-i" of its own, leaves %? nonzero). Prepending it here the
+    // same way, ahead of the caller's own args, means a caller-supplied
+    // "-I" (only-invisible) still wins - same left-to-right override order
+    // real tf's own reconstructed command line has. Without this,
+    // spedwalk.tf's own "/if /ismacro ~speedwalk%; /then ..." toggle never
+    // saw its own (invisible, `-i`-defined) hook macro as already defined,
+    // so `/speedwalk` could only ever take the "enable" branch.
+    let filter = match super::macros::MacroFilter::parse(&format!("-i {}", args), super::macros::FilterKind::List, default_style) {
+        Ok(f) => f,
+        Err(e) => return TfCommandResult::Error(e),
+    };
+    let last = engine.macros.iter()
+        .filter(|m| filter.matches(m))
+        .map(|m| m.sequence_number)
+        .max()
+        .unwrap_or(0);
+    engine.set_global("?", super::TfValue::Integer(last as i64));
+    TfCommandResult::Success(None)
+}
+
+/// /isvar <name> - 1 if <name> is set as a variable (local or global scope), else 0.
+/// No output, %? only - same shape as /ismacro above and real tf's own `/isvar`
+/// (`/def -i isvar = /test tfclose("o")%; /listvar -msimple -- %*`).
+pub fn cmd_isvar(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let name = args.trim().trim_start_matches('%');
+    let set = if name.is_empty() { false } else { engine.get_var(name).is_some() };
+    engine.set_global("?", super::TfValue::Integer(if set { 1 } else { 0 }));
+    TfCommandResult::Success(None)
+}
+
+/// /features [<name>] - with no argument, prints the same `+name`/`-name` list as the
+/// `features()` expression function (sharing its table, `super::expressions::features_table`);
+/// with a `<name>`, sets %? to 1/0 (enabled/disabled or unknown) and prints nothing -
+/// verified directly against real tf 5.0 beta 8 for both forms.
+pub fn cmd_features(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let name = args.trim();
+    let (order, off) = super::expressions::features_table();
+    if name.is_empty() {
+        let parts: Vec<String> = order.iter().map(|(key, disp)| {
+            let on = !off.contains(key);
+            format!("{}{}", if on { "+" } else { "-" }, disp)
+        }).collect();
+        TfCommandResult::Success(Some(parts.join(" ")))
+    } else {
+        let lname = name.to_lowercase();
+        let known = order.iter().any(|(key, _)| *key == lname);
+        let on = known && !off.contains(&lname.as_str());
+        engine.set_global("?", super::TfValue::Integer(if on { 1 } else { 0 }));
+        TfCommandResult::Success(None)
+    }
+}
+
+/// /true - stdlib.tf: `/def -i true = /@test 1`. Silent (no output), sets %?=1. Note
+/// `/not <command>` (finding 13) lives in `parser.rs` as `cmd_not`, not here - it needs
+/// `execute_command_substituted`/`parse_eval_level`, both private to that module.
+pub fn cmd_true(engine: &mut TfEngine, _args: &str) -> TfCommandResult {
+    engine.set_global("?", super::TfValue::Integer(1));
+    TfCommandResult::Success(None)
+}
+
+/// /false - stdlib.tf: `/def -i false = /@test 0`. Silent, %?=0.
+pub fn cmd_false(engine: &mut TfEngine, _args: &str) -> TfCommandResult {
+    engine.set_global("?", super::TfValue::Integer(0));
+    TfCommandResult::Success(None)
+}
+
+/// /: - stdlib.tf's null command: `/def -i : = /@test 1`. Silent, %?=1 (same as /true -
+/// TF documents both as a no-op that "always succeeds").
+pub fn cmd_null(engine: &mut TfEngine, _args: &str) -> TfCommandResult {
+    engine.set_global("?", super::TfValue::Integer(1));
+    TfCommandResult::Success(None)
+}
+
+/// /first <args...> - stdlib.tf: `/def -i first = /result {1}`. Prints (command form)
+/// and returns (%?) the first whitespace-separated word of its arguments.
+pub fn cmd_first(args: &str) -> TfCommandResult {
+    let first = args.split_whitespace().next().unwrap_or("").to_string();
+    TfCommandResult::Result(first)
+}
+
+/// /rest <args...> - stdlib.tf: `/def -i rest = /result {-1}` - TF's `{-N}` means "all
+/// but the first N" (finding C.5, fixed Job 8), so `{-1}` is every word after the first.
+pub fn cmd_rest(args: &str) -> TfCommandResult {
+    let rest = match args.trim().split_once(char::is_whitespace) {
+        Some((_, rest)) => rest.trim_start().to_string(),
+        None => String::new(),
+    };
+    TfCommandResult::Result(rest)
+}
+
+/// /last <args...> - stdlib.tf: `/def -i last = /result {L}` - the last word.
+pub fn cmd_last(args: &str) -> TfCommandResult {
+    let last = args.split_whitespace().last().unwrap_or("").to_string();
+    TfCommandResult::Result(last)
+}
+
+/// /nth <n> <args...> (stdlib.tf: `/def -i nth = /result {1} > 0 ? shift({1}), {1} : ""`):
+/// drop the first <n> words, then take the next one (1-based). Real tf: a non-numeric
+/// or non-positive <n> gives "" (verified: `{1} > 0` is false whenever `{1}` isn't a
+/// positive number - TF's own `>` on a non-numeric string is false, not an error).
+pub fn cmd_nth(args: &str) -> TfCommandResult {
+    let mut words = args.split_whitespace();
+    let n = match words.next().and_then(|s| s.parse::<i64>().ok()) {
+        Some(n) if n > 0 => n as usize,
+        _ => return TfCommandResult::Result(String::new()),
+    };
+    let nth = words.nth(n - 1).unwrap_or("").to_string();
+    TfCommandResult::Result(nth)
+}
+
+/// /ver - stdlib.tf's own `/ver` extracts just the version number out of `/version`'s
+/// text via a regexp match on real tf's own output shape ("version X.Y. Copyright").
+/// Clay's `/version` output doesn't have that shape (`get_version_string()`: "Clay vX.Y.Z
+/// (build ...) [platform/arch]"), so this returns Clay's bare version number directly
+/// (the `VERSION` constant) rather than porting a regexp that would never match.
+pub fn cmd_ver() -> TfCommandResult {
+    TfCommandResult::Result(crate::VERSION.to_string())
+}
+
+/// /nogag [<pattern>] - `/help nogag`: with no argument, turn off the `%gag` flag
+/// (disabling all gag attributes) and print "% Gags disabled."; with a <pattern>,
+/// remove a gag-attributed macro matching it (delegates to the existing `/untrig -ag`
+/// implementation, per this job's own brief).
+pub fn cmd_nogag(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let pattern = args.trim();
+    if pattern.is_empty() {
+        engine.set_global("gag", super::TfValue::Integer(0));
+        TfCommandResult::Success(Some("Gags disabled.".to_string()))
+    } else {
+        cmd_untrig(engine, &format!("-ag {}", pattern))
+    }
+}
+
+/// /sys <command> - a genuine native builtin (unlike real tf's own `/sys`, which is a
+/// stdlib.tf macro over `/quote -S -decho`, `/def -i sys = /quote -S -decho \!!%{*-:}` -
+/// this job's brief asks for it natively instead). Runs `<command>` inline via `sh -c`
+/// (no interactive tty, same constraint `/sh` documents), echoes every stdout/stderr
+/// line, and sets %? to the REAL process exit status (verified directly against real
+/// tf's own `/sys`/`/quote`: %? after a shell command is its exit code, e.g. 7 after
+/// "exit 7" - not a 0/1 boolean the way most other commands' %? is). Honours /restrict
+/// (>= SHELL refuses, matching real tf's own "/sh" and "/quote !").
+pub fn cmd_sys(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if engine.restrict_level >= super::RestrictLevel::Shell {
+        return TfCommandResult::Error("SYS: restricted".to_string());
+    }
+    let cmd = args.trim();
+    if cmd.is_empty() {
+        return TfCommandResult::Error("Usage: /sys <command>".to_string());
+    }
+    match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+        Ok(output) => {
+            let mut lines = Vec::new();
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                lines.push(line.to_string());
+            }
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                lines.push(line.to_string());
+            }
+            let code = output.status.code().unwrap_or(-1) as i64;
+            engine.set_global("?", super::TfValue::Integer(code));
+            if lines.is_empty() {
+                TfCommandResult::Success(None)
+            } else {
+                TfCommandResult::Success(Some(lines.join("\n")))
+            }
+        }
+        Err(e) => TfCommandResult::Error(format!("SYS: {}", e)),
+    }
+}
+
+/// /restrict [SHELL|FILE|WORLD] - report or raise TF's security ratchet (`RestrictLevel`).
+/// No argument: print "% restriction level: <level>" (verified directly against real
+/// tf, lower-case level name). With an argument: raise the level - never lower it, per
+/// `/help restrict`: "Once restriction has been set to a particular level, it can not
+/// be lowered." Silent on success (verified: setting a level prints nothing itself,
+/// only a later bare `/restrict` reports it).
+pub fn cmd_restrict(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let arg = args.trim();
+    if arg.is_empty() {
+        return TfCommandResult::Success(Some(format!("restriction level: {}", engine.restrict_level.name())));
+    }
+    match super::RestrictLevel::parse(arg) {
+        Some(level) => {
+            if level > engine.restrict_level {
+                engine.restrict_level = level;
+            }
+            TfCommandResult::Success(None)
+        }
+        None => TfCommandResult::Error(format!("RESTRICT: {}: not a valid restriction level", arg)),
+    }
+}
+
+/// /core - real tf: on receipt of a fatal signal, dump core if `features("core")` is
+/// enabled (a debugging aid for tf's own C implementation). Meaningless for Clay, which
+/// has no such native crash-dump concept - report that instead of silently no-opping,
+/// matching the wording style of Clay's other "not applicable" stubs (`/telnet`,
+/// `/changes`, ...).
+pub fn cmd_core() -> TfCommandResult {
+    TfCommandResult::Success(Some("% /core: Not supported in Clay.".to_string()))
+}
+
+/// /xtitle <text> - put <text> on the console's terminal-tab/titlebar (`/help xtitle`,
+/// tools.tf's own `/def -i xtitle = ...`, implemented natively here per this job's
+/// brief). The engine has no terminal to write to - queues the request
+/// (`TfEngine::pending_xtitle`) for `App::apply_pending_tf_console_ops` (main.rs) to
+/// apply via crossterm's `SetTitle` command, mirroring `/dokey`'s own
+/// `PendingKeyboardOp` "engine records, App drains" pattern. CLAUDE.md forbids ever
+/// printing a raw escape sequence into the output area once the TUI is live - this
+/// never does; `SetTitle` is queued straight to stdout by the drain. Console-only by
+/// construction: a web/GUI/remote-console/daemon client has no terminal tab of its own
+/// to rename, so `/xtitle` there is accepted (the field is set) but has no visible
+/// effect - not a missing feature, just nothing to apply it to.
+pub fn cmd_xtitle(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let text = args.trim();
+    if text.is_empty() {
+        return TfCommandResult::Error("Usage: /xtitle <text>".to_string());
+    }
+    engine.pending_xtitle = Some(text.to_string());
+    TfCommandResult::Success(None)
+}
+
+/// /more [on|off|1|0] - `/help more`: "Sets the value of the %{more} flag." Real tf's
+/// own `/more` is a stdlib.tf macro (`/def -i more = /if (...) /echo -e ...%; /endif%;
+/// /set more %*`) whose bare/invalid form is actually an ERROR (verified directly:
+/// `/more` with no argument gives "more: Invalid more value \"\".  Valid values are:
+/// off (0), on (1)." - %more is a validated boolean flag and `/set more` with an empty
+/// value fails validation). This job's brief additionally asks /more to toggle CLAY's
+/// own real more-mode setting (`Settings::more_mode_enabled`), which this engine has no
+/// access to - queues the request (`TfEngine::pending_more_mode`) for
+/// `App::apply_pending_tf_console_ops` to apply, persist and broadcast (console-only,
+/// same reasoning as `/xtitle` above - see that function's doc comment). Also updates
+/// the TF-visible `%more` variable unconditionally so a script reading `%{more}` back
+/// sees the new value regardless of which client set it.
+pub fn cmd_more(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let arg = args.trim();
+    let on = match arg.to_lowercase().as_str() {
+        "on" | "1" => true,
+        "off" | "0" => false,
+        _ => {
+            return TfCommandResult::Error(format!(
+                "more: Invalid more value \"{}\".  Valid values are: off (0), on (1).", arg
+            ));
+        }
+    };
+    engine.set_global("more", super::TfValue::Integer(if on { 1 } else { 0 }));
+    engine.pending_more_mode = Some(on);
+    TfCommandResult::Success(None)
+}
+
+/// /wrap [on|off|<n>] - stdlib.tf: `/def -i wrap = /if ({*} =/ '[0-9]*') /set
+/// wrapsize=%*%; /set wrap=1%; /else /set wrap %*%; /endif` - a numeric argument sets
+/// `%wrapsize` and turns `%wrap` on; otherwise the argument (normally on/off) is set
+/// into `%wrap` directly. Clay has a real analogue only for the numeric form: `Settings
+/// ::wrapspace`, the console's own hang-indent wrap width (see its own doc comment in
+/// main.rs) - queues `TfEngine::pending_wrapspace` for the same console-only drain as
+/// `/more`/`/xtitle` above when given a number. `on`/`off` have no Clay-side output-
+/// wrapping concept to toggle, so they only update the TF-visible `%wrap` variable, per
+/// this job's own "otherwise accept and document" brief.
+pub fn cmd_wrap(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let arg = args.trim();
+    if arg.is_empty() {
+        return TfCommandResult::Error("Usage: /wrap [on|off|<n>]".to_string());
+    }
+    if let Ok(n) = arg.parse::<i64>() {
+        engine.set_global("wrapsize", super::TfValue::Integer(n));
+        engine.set_global("wrap", super::TfValue::Integer(1));
+        engine.pending_wrapspace = Some(n.clamp(0, u8::MAX as i64) as u8);
+    } else {
+        engine.set_global("wrap", super::TfValue::from(arg));
+    }
+    TfCommandResult::Success(None)
+}
+
+/// /limit [-v] [-a] [-m<style>] [<pattern>] - `/help limit`: redraw the window showing
+/// only lines matching <pattern> (`-v`: only NON-matching lines; `-a`: only lines with
+/// attributes; `-m<style>`: simple/glob/regexp instead of `%matching`'s default). A
+/// real feature (a filtered scrollback view), implemented on top of Clay's existing F4
+/// filter popup (`FilterPopup`, main.rs) rather than a new one - this engine has no
+/// access to `App`/`FilterPopup`, so it only parses the arguments and queues a
+/// `PendingLimitOp` for `App::apply_pending_tf_console_ops` to act on (same "engine
+/// records, App drains" pattern as `/xtitle`/`/more`/`/wrap` above).
+///
+/// Console-only by construction (finding 33 in the TF-parity plan): a web/GUI client's
+/// F4 filter is independent client-side state (`app.js`'s own `openFilterPopup`), and
+/// there is no existing WS message that drives it remotely from server-side text -
+/// building one is explicitly out of this job's scope.
+///
+/// With no options and no pattern, real tf's `/limit` silently returns 1/0 via %? ("a
+/// limit is in effect" or not) - queues `PendingLimitOp::Report` instead, which prints
+/// a short status line, since %? can't survive the queued round trip to `App` (a
+/// documented deviation, not an oversight).
+pub fn cmd_limit(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let mut remaining = args.trim();
+    let mut invert = false;
+    let mut attrs_only = false;
+    let mut explicit_style: Option<super::TfMatchMode> = None;
+
+    loop {
+        if let Some(rest) = remaining.strip_prefix("-v") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                invert = true;
+                remaining = rest.trim_start();
+                continue;
+            }
+        }
+        if let Some(rest) = remaining.strip_prefix("-a") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                attrs_only = true;
+                remaining = rest.trim_start();
+                continue;
+            }
+        }
+        if let Some(rest) = remaining.strip_prefix("-m") {
+            let (value, after) = match rest.find(char::is_whitespace) {
+                Some(pos) => (&rest[..pos], rest[pos..].trim_start()),
+                None => (rest, ""),
+            };
+            match super::TfMatchMode::parse(value) {
+                Some(m) => {
+                    explicit_style = Some(m);
+                    remaining = after;
+                    continue;
+                }
+                None => return TfCommandResult::Error(format!("Unknown match mode: {}", value)),
+            }
+        }
+        break;
+    }
+
+    let pattern = if remaining.is_empty() { None } else { Some(remaining.to_string()) };
+    if pattern.is_none() && !invert && !attrs_only && explicit_style.is_none() {
+        engine.pending_limit_op = Some(super::PendingLimitOp::Report);
+    } else {
+        let style = explicit_style.unwrap_or_else(|| super::macros::default_matching_style(engine));
+        engine.pending_limit_op = Some(super::PendingLimitOp::Apply { pattern, invert, attrs_only, style });
+    }
+    TfCommandResult::Success(None)
+}
+
+/// /unlimit - clear any active `/limit`. See `cmd_limit`'s doc comment.
+pub fn cmd_unlimit(engine: &mut TfEngine, _args: &str) -> TfCommandResult {
+    engine.pending_limit_op = Some(super::PendingLimitOp::Clear);
+    TfCommandResult::Success(None)
+}
+
+/// /relimit - re-apply the most recently applied `/limit`. See `cmd_limit`'s doc comment.
+pub fn cmd_relimit(engine: &mut TfEngine, _args: &str) -> TfCommandResult {
+    engine.pending_limit_op = Some(super::PendingLimitOp::Reapply);
+    TfCommandResult::Success(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::QuoteDisposition;
     use super::super::RecallRange;
+    use super::super::ProcessKind;
+    use super::super::WorldInfoCache;
+    use super::super::macros;
+    use super::super::parser::execute_command;
 
     // ---- /recall argument parsing tests ----
 
@@ -2358,6 +3568,68 @@ mod tests {
         // dead no-op for a while - see actions.rs's RecallSource::Input arm).
         assert_eq!(recall_opts("-i north").source, RecallSource::Input);
         assert_eq!(recall_opts("-i *tell*").pattern.as_deref(), Some("*tell*"));
+    }
+
+    #[test]
+    fn test_recall_a_attrs_generalized() {
+        // -ag: the one attribute letter with a distinct effect (show gagged lines).
+        let opts = recall_opts("-ag combat");
+        assert!(opts.show_gagged);
+        assert_eq!(opts.suppress_attrs, "g");
+        assert_eq!(opts.pattern.as_deref(), Some("combat"));
+
+        // -a<attrs> now consumes the WHOLE token as the attribute list (matching -t/-m/-w's
+        // own "rest of token" convention here), not just a lone trailing 'g' - a multi-letter
+        // list still sets show_gagged when 'g' is anywhere in it, and the full list is kept
+        // for round-tripping even though only 'g' has a distinct effect today.
+        let opts = recall_opts("-agu combat");
+        assert!(opts.show_gagged);
+        assert_eq!(opts.suppress_attrs, "gu");
+
+        // An attribute list without 'g' must NOT show gagged lines.
+        let opts = recall_opts("-au combat");
+        assert!(!opts.show_gagged);
+        assert_eq!(opts.suppress_attrs, "u");
+    }
+
+    #[test]
+    fn test_recall_context_options_parse() {
+        let opts = recall_opts("-A2 combat");
+        assert_eq!(opts.context_after, 2);
+        assert_eq!(opts.context_before, 0);
+
+        let opts = recall_opts("-B3 combat");
+        assert_eq!(opts.context_before, 3);
+        assert_eq!(opts.context_after, 0);
+
+        let opts = recall_opts("-C1 combat");
+        assert_eq!(opts.context_before, 1);
+        assert_eq!(opts.context_after, 1);
+
+        // Combined, in one command line.
+        let opts = recall_opts("-B1 -A1 combat");
+        assert_eq!(opts.context_before, 1);
+        assert_eq!(opts.context_after, 1);
+    }
+
+    #[test]
+    fn test_recall_hash_range_prefix_parses() {
+        // "#" must be recognized immediately before <range>, setting show_line_numbers and
+        // NOT itself becoming part of the range/pattern text.
+        let opts = recall_opts("#10");
+        assert!(opts.show_line_numbers);
+        assert_eq!(opts.range, RecallRange::Last(10));
+
+        let opts = recall_opts("#1-5 combat");
+        assert!(opts.show_line_numbers);
+        assert_eq!(opts.range, RecallRange::Range(1, 5));
+        assert_eq!(opts.pattern.as_deref(), Some("combat"));
+
+        // "#" combined with a preceding option.
+        let opts = recall_opts("-l #10");
+        assert!(opts.show_line_numbers);
+        assert_eq!(opts.source, RecallSource::Local);
+        assert_eq!(opts.range, RecallRange::Last(10));
     }
 
     #[test]
@@ -2420,14 +3692,79 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_time() {
-        let result = cmd_time("");
-        assert!(matches!(result, TfCommandResult::Success(Some(_))));
+    fn test_cmd_beep_on_off_case_insensitive_and_count_capped() {
+        let mut engine = super::TfEngine::new();
 
-        let result = cmd_time("%s");
+        // ON/OFF (uppercase, matching /help beep's own usage text) work the same as
+        // lowercase, and set the "beep" variable.
+        cmd_beep(&mut engine, "OFF");
+        assert_eq!(engine.get_var("beep").map(|v| v.to_string_value()).as_deref(), Some("0"));
+        cmd_beep(&mut engine, "ON");
+        assert_eq!(engine.get_var("beep").map(|v| v.to_string_value()).as_deref(), Some("1"));
+
+        // A huge count is capped sensibly rather than generating gigabytes of output.
+        let result = cmd_beep(&mut engine, "999999");
+        match result {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s.len(), 100, "expected the count to be capped at 100 beeps"),
+            other => panic!("Expected Success(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cmd_time() {
+        let mut engine = TfEngine::new();
+
+        // No format: defaults to %time_format ("%H:%M" - see TfEngine::new), which
+        // never contains a literal digit-only string, but %? must still be set to
+        // whatever it produced.
+        let result = cmd_time(&mut engine, "");
+        assert!(matches!(result, TfCommandResult::Success(Some(_))));
+        assert!(engine.get_var("?").is_some());
+
+        // An explicit numeric-yielding format
+        let result = cmd_time(&mut engine, "%s");
         if let TfCommandResult::Success(Some(s)) = result {
             assert!(s.parse::<u64>().is_ok());
+        } else {
+            panic!("expected Success(Some(_))");
         }
+
+        // A 4-digit year, unaffected by the current date
+        let result = cmd_time(&mut engine, "%Y");
+        if let TfCommandResult::Success(Some(s)) = result {
+            assert_eq!(s.len(), 4);
+            assert!(s.chars().all(|c| c.is_ascii_digit()));
+        } else {
+            panic!("expected Success(Some(_))");
+        }
+
+        // Clay's own kept extension: /time /command times a nested command instead.
+        let result = cmd_time(&mut engine, "/echo hi");
+        match result {
+            TfCommandResult::Success(Some(msg)) => {
+                assert!(msg.contains("hi"), "expected the echoed text in {msg:?}");
+                assert!(msg.contains("Elapsed:"), "expected a timing line in {msg:?}");
+            }
+            other => panic!("expected Success(Some(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_runtime() {
+        let mut engine = TfEngine::new();
+
+        let result = cmd_runtime(&mut engine, "/echo hi");
+        match result {
+            TfCommandResult::Success(Some(msg)) => {
+                assert!(msg.contains("hi"), "expected the echoed text in {msg:?}");
+                assert!(msg.contains("real="), "expected TF's real= line in {msg:?}");
+                assert!(msg.contains("cpu="), "expected TF's cpu= line in {msg:?}");
+            }
+            other => panic!("expected Success(Some(_)), got {other:?}"),
+        }
+
+        // No argument is an error, matching /help runtime's "Usage" shape.
+        assert!(matches!(cmd_runtime(&mut engine, ""), TfCommandResult::Error(_)));
     }
 
     #[test]
@@ -2530,13 +3867,36 @@ mod tests {
 
     #[test]
     fn test_cmd_sh() {
-        let result = cmd_sh("echo hello");
+        let mut engine = TfEngine::new();
+        let result = cmd_sh(&mut engine, "echo hello");
         if let TfCommandResult::Success(Some(s)) = result {
             assert!(s.contains("hello"));
         }
 
-        let result = cmd_sh("");
+        // Bare /sh (no command): Clay can't hand the TUI to an interactive
+        // shell, so this must error rather than hang (plan Job 14c).
+        let result = cmd_sh(&mut engine, "");
         assert!(matches!(result, TfCommandResult::Error(_)));
+    }
+
+    /// Job 14c: `-q` suppresses both the SHELL hook and the default
+    /// "Executing command: ..." message; without it, the message is present.
+    #[test]
+    fn test_cmd_sh_quiet_suppresses_executing_message() {
+        let mut engine = TfEngine::new();
+
+        let result = cmd_sh(&mut engine, "echo hi");
+        match result {
+            TfCommandResult::Success(Some(s)) => assert!(s.contains("Executing command: echo hi")),
+            other => panic!("expected Success(Some(_)) with an Executing line, got {:?}", other),
+        }
+
+        let result = cmd_sh(&mut engine, "-q echo hi");
+        match result {
+            TfCommandResult::Success(Some(s)) => assert!(!s.contains("Executing")),
+            TfCommandResult::Success(None) => {}
+            other => panic!("expected Success without an Executing line, got {:?}", other),
+        }
     }
 
     #[test]
@@ -2670,7 +4030,7 @@ mod tests {
     fn test_cmd_quote_l_captures_connections_output() {
         let mut engine = TfEngine::new();
         engine.current_world = Some("MyMud".to_string());
-        engine.world_info_cache.push(super::super::WorldInfoCache {
+        engine.world_info_cache.push(WorldInfoCache {
             name: "MyMud".to_string(),
             is_connected: true,
             unseen_lines: 3,
@@ -2711,7 +4071,7 @@ mod tests {
     fn test_cmd_quote_fg_no_args_captures_connections_output() {
         let mut engine = TfEngine::new();
         engine.current_world = Some("MyMud".to_string());
-        engine.world_info_cache.push(super::super::WorldInfoCache {
+        engine.world_info_cache.push(WorldInfoCache {
             name: "MyMud".to_string(),
             is_connected: true,
             ..Default::default()
@@ -2763,6 +4123,68 @@ mod tests {
                     "expected the banned host to appear in captured output: {:?}", lines);
             }
             other => panic!("Expected Quote result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cmd_quote_backtick_captures_tf_command_output_finding_14() {
+        // The exact mechanism grep.tf's /fgrep relies on: `` `"<TF_cmd>" `` must capture
+        // the command's actual output (execute it through the engine and collect every
+        // Success(Some) line), not produce an empty/uncaptured invocation.
+        let mut engine = TfEngine::new();
+
+        let result = cmd_quote(&mut engine, "`/echo banana");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert_eq!(lines, vec!["banana".to_string()]);
+            }
+            other => panic!("Expected Quote result, got {:?}", other),
+        }
+
+        // A multi-line Success(Some) message must be split into one generated line each.
+        let result = cmd_quote(&mut engine, "`/echo one\ntwo\nthree");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert_eq!(lines, vec!["one".to_string(), "two".to_string(), "three".to_string()]);
+            }
+            other => panic!("Expected Quote result, got {:?}", other),
+        }
+
+        // <pre> is prepended to every captured line.
+        let result = cmd_quote(&mut engine, "captured: `/echo banana");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert_eq!(lines, vec!["captured: banana".to_string()]);
+            }
+            other => panic!("Expected Quote result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cmd_quote_hash_source_is_recall_shorthand() {
+        // "/help quote"'s own "nearly equivalent pairs": `/quote <opts> `/recall <args>`
+        // == `/quote <opts> #<args>` - the '#' source must reach the SAME Recall-result
+        // path the explicit backtick form does (needs the caller's output_lines, so it
+        // comes back as recall_opts, not already-resolved lines).
+        let mut engine = TfEngine::new();
+
+        let result = cmd_quote(&mut engine, "#\"combat\"");
+        match result {
+            TfCommandResult::Quote { recall_opts: Some((opts, prefix)), lines, .. } => {
+                assert_eq!(opts.pattern.as_deref(), Some("combat"));
+                assert_eq!(prefix, "");
+                assert!(lines.is_empty());
+            }
+            other => panic!("Expected Quote with recall_opts, got {:?}", other),
+        }
+
+        // Explicit backtick spelling of the exact same thing must behave identically.
+        let result = cmd_quote(&mut engine, "`\"/recall combat\"");
+        match result {
+            TfCommandResult::Quote { recall_opts: Some((opts, _)), .. } => {
+                assert_eq!(opts.pattern.as_deref(), Some("combat"));
+            }
+            other => panic!("Expected Quote with recall_opts, got {:?}", other),
         }
     }
 
@@ -2961,7 +4383,7 @@ mod tests {
             "trigger pattern wrong: {}", trigger.pattern);
 
         // Fire the trigger
-        let results = crate::tf::macros::process_triggers(&mut engine, "Hello World", None);
+        let results = crate::tf::macros::process_triggers(&mut engine, "Hello World", None, None);
 
         // The trigger should have fired and set P1 = "World"
         // Then {P1} in the expression should resolve, substr gets "W"
@@ -3039,4 +4461,666 @@ mod tests {
         assert_eq!(decrypted, "Hello World3.14",
             "Mode 1 decrypt should recover original text, got: '{}'", decrypted);
     }
+
+    // ---- resolve_file_path / %TFPATH / %TFLIBDIR search (finding C.2) ----
+
+    /// A fresh, unique scratch directory under the system temp dir, so
+    /// parallel `#[test]` threads never collide. Caller removes it.
+    fn unique_scratch_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "clay_tf_resolve_{}_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            n
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn test_resolve_file_path_finds_via_tflibdir() {
+        let cwd_dir = unique_scratch_dir("cwd_empty");
+        let lib_dir = unique_scratch_dir("tflibdir");
+        std::fs::write(lib_dir.join("dummy_lib.tf"), "/echo hi\n").unwrap();
+
+        let mut engine = TfEngine::new();
+        engine.current_dir = Some(cwd_dir.display().to_string());
+        engine.set_global("TFLIBDIR", super::super::TfValue::String(lib_dir.display().to_string()));
+
+        let resolved = resolve_file_path(&engine, "dummy_lib.tf");
+        assert_eq!(
+            resolved,
+            Some(lib_dir.join("dummy_lib.tf").display().to_string()),
+            "bare filename should resolve via %TFLIBDIR when not found relative to cwd"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd_dir);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn test_resolve_file_path_finds_via_tfpath_entry() {
+        let cwd_dir = unique_scratch_dir("cwd_empty2");
+        let unrelated_dir = unique_scratch_dir("tfpath_miss");
+        let path_dir = unique_scratch_dir("tfpath_hit");
+        std::fs::write(path_dir.join("dummy_path.tf"), "/echo hi\n").unwrap();
+
+        let mut engine = TfEngine::new();
+        engine.current_dir = Some(cwd_dir.display().to_string());
+        // TFPATH is colon-separated (TF semantics); the first entry doesn't
+        // have the file, the second does.
+        engine.set_global(
+            "TFPATH",
+            super::super::TfValue::String(format!("{}:{}", unrelated_dir.display(), path_dir.display())),
+        );
+
+        let resolved = resolve_file_path(&engine, "dummy_path.tf");
+        assert_eq!(
+            resolved,
+            Some(path_dir.join("dummy_path.tf").display().to_string()),
+            "bare filename should resolve via a %TFPATH directory when not found relative to cwd"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd_dir);
+        let _ = std::fs::remove_dir_all(&unrelated_dir);
+        let _ = std::fs::remove_dir_all(&path_dir);
+    }
+
+    #[test]
+    fn test_resolve_file_path_prefers_cwd_over_tflibdir() {
+        let cwd_dir = unique_scratch_dir("cwd_hit");
+        let lib_dir = unique_scratch_dir("tflibdir_also_has_it");
+        // Same filename in both places - the cwd copy must win.
+        std::fs::write(cwd_dir.join("shared_name.tf"), "/echo from-cwd\n").unwrap();
+        std::fs::write(lib_dir.join("shared_name.tf"), "/echo from-tflibdir\n").unwrap();
+
+        let mut engine = TfEngine::new();
+        engine.current_dir = Some(cwd_dir.display().to_string());
+        engine.set_global("TFLIBDIR", super::super::TfValue::String(lib_dir.display().to_string()));
+
+        let resolved = resolve_file_path(&engine, "shared_name.tf");
+        assert_eq!(
+            resolved,
+            Some(cwd_dir.join("shared_name.tf").display().to_string()),
+            "a file present relative to the current directory must win over %TFLIBDIR"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd_dir);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn test_resolve_file_path_with_directory_component_ignores_tfpath() {
+        // A filename that already has a directory component ("sub/x.tf")
+        // must never be joined onto a %TFPATH/%TFLIBDIR entry - only a bare
+        // filename gets that search, matching real TF.
+        let cwd_dir = unique_scratch_dir("cwd_empty3");
+        let lib_dir = unique_scratch_dir("tflibdir_with_sub");
+        std::fs::create_dir_all(lib_dir.join("sub")).unwrap();
+        std::fs::write(lib_dir.join("sub").join("x.tf"), "/echo hi\n").unwrap();
+
+        let mut engine = TfEngine::new();
+        engine.current_dir = Some(cwd_dir.display().to_string());
+        engine.set_global("TFLIBDIR", super::super::TfValue::String(lib_dir.display().to_string()));
+
+        let resolved = resolve_file_path(&engine, "sub/x.tf");
+        assert_eq!(resolved, None, "a filename with a directory component must not search %TFLIBDIR");
+
+        let _ = std::fs::remove_dir_all(&cwd_dir);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    /// Plan Job 14c: `/KILL <pid>...` processes each pid independently - a
+    /// bad pid in the middle doesn't stop the rest from being killed
+    /// (verified directly against real tf: `/kill 1 nosuch 2` still kills
+    /// both 1 and 2), and is silent on success.
+    #[test]
+    fn test_kill_multiple_pids_processed_independently() {
+        let mut engine = TfEngine::new();
+        for id in [1u32, 2u32] {
+            engine.processes.push(TfProcess {
+                id,
+                command: "/echo hi".to_string(),
+                interval: Duration::from_secs(10),
+                count: Some(1),
+                remaining: Some(1),
+                next_run: Instant::now(),
+                world: None,
+                synchronous: false,
+                on_prompt: false,
+                priority: 0,
+                kind: ProcessKind::Repeat,
+            });
+        }
+
+        match cmd_kill(&mut engine, "1 nosuch 2") {
+            TfCommandResult::Success(Some(msg)) => {
+                assert!(msg.contains("invalid or missing numeric argument"), "got {msg:?}");
+            }
+            other => panic!("expected a single diagnostic for the bad token, got {:?}", other),
+        }
+        assert!(engine.processes.is_empty(), "both 1 and 2 should have been killed");
+
+        // Silent on success.
+        engine.processes.push(TfProcess {
+            id: 3,
+            command: "/echo hi".to_string(),
+            interval: Duration::from_secs(10),
+            count: Some(1),
+            remaining: Some(1),
+            next_run: Instant::now(),
+            world: None,
+            synchronous: false,
+            on_prompt: false,
+            priority: 0,
+            kind: ProcessKind::Repeat,
+        });
+        assert!(matches!(cmd_kill(&mut engine, "3"), TfCommandResult::Success(None)));
+    }
+
+    /// Plan Job 14c: `/ps -r`/`-q` filter by `ProcessKind`; `-s` lists PIDs
+    /// only; `-w<world>` filters by world and validates the name.
+    #[test]
+    fn test_ps_filters() {
+        let mut engine = TfEngine::new();
+        engine.world_info_cache.push(WorldInfoCache {
+            name: "myworld".to_string(),
+            ..Default::default()
+        });
+        engine.processes.push(TfProcess {
+            id: 1,
+            command: "/echo repeat".to_string(),
+            interval: Duration::from_secs(10),
+            count: None,
+            remaining: None,
+            next_run: Instant::now(),
+            world: Some("myworld".to_string()),
+            synchronous: false,
+            on_prompt: false,
+            priority: 0,
+            kind: ProcessKind::Repeat,
+        });
+        engine.processes.push(TfProcess {
+            id: 2,
+            command: "line".to_string(),
+            interval: Duration::from_secs(1),
+            count: Some(1),
+            remaining: Some(1),
+            next_run: Instant::now(),
+            world: None,
+            synchronous: false,
+            on_prompt: false,
+            priority: 0,
+            kind: ProcessKind::Quote,
+        });
+
+        match cmd_ps(&engine, "-s") {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, "1 2"),
+            other => panic!("expected both pids, got {:?}", other),
+        }
+        match cmd_ps(&engine, "-r -s") {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, "1"),
+            other => panic!("expected only the repeat's pid, got {:?}", other),
+        }
+        match cmd_ps(&engine, "-q -s") {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, "2"),
+            other => panic!("expected only the quote's pid, got {:?}", other),
+        }
+        match cmd_ps(&engine, "-wmyworld -s") {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, "1"),
+            other => panic!("expected only the world-scoped process, got {:?}", other),
+        }
+        match cmd_ps(&engine, "-wnosuchworld") {
+            TfCommandResult::Error(e) => assert!(e.contains("No world nosuchworld")),
+            other => panic!("expected a No world diagnostic, got {:?}", other),
+        }
+        match cmd_ps(&engine, "1") {
+            TfCommandResult::Success(Some(s)) => {
+                assert!(s.lines().any(|line| line.trim_start().starts_with('1')),
+                    "table should contain pid 1's row: {s:?}");
+                assert!(!s.contains("line"), "should not contain the other process: {s:?}");
+            }
+            other => panic!("expected a one-row table, got {:?}", other),
+        }
+    }
+
+    /// Plan Job 14c: `-w[<world>]` reports/sets the same shared value as
+    /// -g/-l/-i (Clay has no separate per-world history size), but still
+    /// validates the world name.
+    #[test]
+    fn test_histsize_dash_w() {
+        let mut engine = TfEngine::new();
+        engine.world_info_cache.push(WorldInfoCache {
+            name: "myworld".to_string(),
+            ..Default::default()
+        });
+
+        match cmd_histsize(&mut engine, "-wmyworld 500") {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, "histsize=500"),
+            other => panic!("got {:?}", other),
+        }
+        // The shared value really was changed.
+        match cmd_histsize(&mut engine, "") {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, "histsize=500"),
+            other => panic!("got {:?}", other),
+        }
+        match cmd_histsize(&mut engine, "-wnosuchworld") {
+            TfCommandResult::Error(e) => assert!(e.contains("No world nosuchworld")),
+            other => panic!("expected a No world diagnostic, got {:?}", other),
+        }
+    }
+
+    /// Plan Job 14c: bare `/lcd` reports the current directory; `/cd` with
+    /// no argument defaults to `$HOME` instead (`/help lcd`); `/pwd` always
+    /// reports the current directory with no wrapper text.
+    #[test]
+    fn test_lcd_cd_pwd() {
+        let mut engine = TfEngine::new();
+        let dir = unique_scratch_dir("lcd_cd_pwd");
+        let dir_str = dir.display().to_string();
+
+        match cmd_lcd(&mut engine, &dir_str) {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, format!("Current directory is {}", dir_str)),
+            other => panic!("got {:?}", other),
+        }
+        match cmd_lcd(&mut engine, "") {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, format!("Current directory is {}", dir_str)),
+            other => panic!("got {:?}", other),
+        }
+        match cmd_pwd(&mut engine) {
+            TfCommandResult::Success(Some(s)) => assert_eq!(s, dir_str, "pwd has no 'Current directory is' wrapper"),
+            other => panic!("got {:?}", other),
+        }
+
+        // /cd with no argument defaults to $HOME.
+        std::env::set_var("HOME", dir.parent().unwrap());
+        match cmd_cd(&mut engine, "") {
+            TfCommandResult::Success(Some(s)) => {
+                assert_eq!(s, format!("Current directory is {}", dir.parent().unwrap().display()));
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan Job 14c: `/save -mglob -h0 -b{} -t{} ?*` (stdlib's own
+    /// `/savedef` idiom) saves only matching, non-invisible macros in
+    /// reloadable `/def` form, and a subsequent `/load` reproduces them
+    /// exactly - the round trip the plan's own test list calls for.
+    #[test]
+    fn test_save_mglob_filters_then_load_round_trips() {
+        let mut engine = TfEngine::new();
+        // Plain def: matches the /savedef-style filter below.
+        execute_command(&mut engine, "/def plainmac = /echo plain");
+        // Has a trigger: -t{} (glob, matches only an EMPTY trigger) excludes it.
+        execute_command(&mut engine, "/def -t\"foo*\" trigmac = /echo trig");
+        // Invisible: excluded by default (no -i on /save's own filter).
+        execute_command(&mut engine, "/def -i hiddenmac = /echo hidden");
+
+        let dir = unique_scratch_dir("save_load_roundtrip");
+        let file = dir.join("saved.tf");
+        let file_str = file.display().to_string();
+
+        match cmd_save(&mut engine, &format!("{} -mglob -h0 -b{{}} -t{{}} ?*", file_str)) {
+            TfCommandResult::Success(Some(s)) => assert!(s.starts_with("Writing macros to")),
+            other => panic!("got {:?}", other),
+        }
+
+        let saved = std::fs::read_to_string(&file).expect("saved file must exist");
+        assert!(saved.contains("plainmac"), "saved file should contain plainmac: {saved:?}");
+        assert!(!saved.contains("trigmac"), "saved file should exclude the triggered macro: {saved:?}");
+        assert!(!saved.contains("hiddenmac"), "saved file should exclude the invisible macro: {saved:?}");
+
+        // Round-trip: undef everything, then /load the saved file back.
+        macros::undef_macro(&mut engine, "plainmac");
+        assert!(!engine.macros.iter().any(|m| m.name == "plainmac"));
+
+        if let TfCommandResult::Error(e) = cmd_load(&mut engine, &file_str) {
+            panic!("load of saved file failed: {e}");
+        }
+        let reloaded = engine.macros.iter().find(|m| m.name == "plainmac")
+            .expect("plainmac should be back after /load");
+        assert_eq!(reloaded.body, "/echo plain");
+
+        // -a appends rather than overwriting.
+        match cmd_save(&mut engine, &format!("-a {} -mglob ?*", file_str)) {
+            TfCommandResult::Success(Some(s)) => assert!(s.starts_with("Appending macros to")),
+            other => panic!("got {:?}", other),
+        }
+        let appended = std::fs::read_to_string(&file).unwrap();
+        assert!(appended.len() > saved.len(), "-a should have appended, not overwritten");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan Job 14c: `/exit [n]` aborts `n` (default/floor 1) ENCLOSING
+    /// `/load`s (`/help exit`). Verified directly against real tf with this
+    /// exact two-level nesting shape: `/exit 2` from the innermost file
+    /// aborts both it and its caller, but not a third, outer level.
+    /// Verified via variable state, not echoed text: a `/load` that ends via
+    /// early exit is silent on success (pre-existing behavior, unrelated to
+    /// this job's own `n`-count addition - `load_file_internal`'s own doc
+    /// comment on its `exit_remaining` handling), so a level that got
+    /// aborted never surfaces its own "before" text either. `/set` side
+    /// effects aren't affected by that, and more directly show exactly how
+    /// many levels actually ran to completion.
+    #[test]
+    fn test_exit_n_aborts_n_enclosing_loads() {
+        let dir = unique_scratch_dir("exit_n_nested_loads");
+        let inner = dir.join("inner.tf");
+        let outer = dir.join("outer.tf");
+        let top = dir.join("top.tf");
+        // /exit 2 from inner.tf must abort both inner.tf and outer.tf, but
+        // NOT top.tf - a third enclosing level (verified directly against
+        // real tf with this exact 3-level shape).
+        std::fs::write(&inner, "/exit 2\n/set inner_ran_after 1\n").unwrap();
+        std::fs::write(&outer, format!("/load {}\n/set outer_ran_after 1\n", inner.display())).unwrap();
+        std::fs::write(&top, format!("/load {}\n/set top_ran_after 1\n", outer.display())).unwrap();
+
+        let mut engine = TfEngine::new();
+        if let TfCommandResult::Error(e) = cmd_load(&mut engine, &top.display().to_string()) {
+            panic!("load of top.tf failed: {e}");
+        }
+
+        assert!(engine.get_var("inner_ran_after").is_none(), "exit 2 should abort inner.tf");
+        assert!(engine.get_var("outer_ran_after").is_none(), "exit 2 should abort outer.tf too");
+        assert!(engine.get_var("top_ran_after").is_some(),
+            "exit 2 should NOT reach a third enclosing level (top.tf)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare `/exit` (n=1, the default) only aborts the file it's actually
+    /// in - the caller's own remaining lines still run.
+    #[test]
+    fn test_bare_exit_aborts_only_the_current_file() {
+        let dir = unique_scratch_dir("exit_default_one_level");
+        let inner = dir.join("inner.tf");
+        let outer = dir.join("outer.tf");
+        std::fs::write(&inner, "/exit\n/set inner_ran_after 1\n").unwrap();
+        std::fs::write(&outer, format!("/load {}\n/set outer_ran_after 1\n", inner.display())).unwrap();
+
+        let mut engine = TfEngine::new();
+        if let TfCommandResult::Error(e) = cmd_load(&mut engine, &outer.display().to_string()) {
+            panic!("load of outer.tf failed: {e}");
+        }
+
+        assert!(engine.get_var("inner_ran_after").is_none(), "bare /exit should abort the inner file");
+        assert!(engine.get_var("outer_ran_after").is_some(), "bare /exit should NOT abort the outer file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan Job 14c / finding 32: `/unworld <name>...` bounces to Clay's
+    /// native `Command::RemoveWorld` (this engine-only function has no
+    /// `&mut App` to actually delete a world with) - the previous
+    /// implementation bounced to a `/close` command that never existed, so
+    /// /unworld silently did nothing at all before this job.
+    #[test]
+    fn test_cmd_unworld_bounces_to_native_removeworld_command() {
+        match cmd_unworld("foo bar") {
+            TfCommandResult::ClayCommand(cmd) => assert_eq!(cmd, "/unworld foo bar"),
+            other => panic!("got {:?}", other),
+        }
+        assert!(matches!(cmd_unworld(""), TfCommandResult::Error(_)));
+    }
+
+    // ========================================================================
+    // Job 15: missing builtins + stdlib one-liners
+    // ========================================================================
+
+    #[test]
+    fn test_cmd_ismacro_sets_last_matching_sequence_number_or_zero() {
+        let mut engine = TfEngine::new();
+        engine.add_macro(macros::parse_def("foo = /echo hi").unwrap());
+        let foo_seq = engine.add_macro(macros::parse_def("bar = /echo bye").unwrap());
+
+        assert!(matches!(cmd_ismacro(&mut engine, "bar"), TfCommandResult::Success(None)));
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(foo_seq as i64));
+
+        assert!(matches!(cmd_ismacro(&mut engine, "no_such_macro"), TfCommandResult::Success(None)));
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(0));
+    }
+
+    /// Finding 28's own reproduction: `-msimple -ib'<pattern>'` filters by bind text.
+    #[test]
+    fn test_cmd_ismacro_bind_filter_matches_kbbind_idiom() {
+        let mut engine = TfEngine::new();
+        // This engine's very first macro legitimately gets sequence number 0, same as
+        // "no match" - so a second, later macro is used here to keep the assertion
+        // unambiguous (a real /ismacro caller can't tell "matched seq 0" from "no
+        // match" either, but that's a real tf property, not a test artifact).
+        engine.add_macro(macros::parse_def("placeholder = /echo unrelated").unwrap());
+        let bound_seq = engine.add_macro(macros::parse_def("-ib'^R' = /dokey refresh").unwrap());
+
+        cmd_ismacro(&mut engine, "-msimple -ib'^R'");
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(bound_seq as i64), "a macro bound to ^R should match");
+
+        cmd_ismacro(&mut engine, "-msimple -ib'^Q'");
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(0), "nothing is bound to ^Q");
+    }
+
+    #[test]
+    fn test_cmd_isvar_any_scope_no_output() {
+        let mut engine = TfEngine::new();
+        engine.set_global("HOME", crate::tf::TfValue::String("/home/x".to_string()));
+        assert!(matches!(cmd_isvar(&mut engine, "HOME"), TfCommandResult::Success(None)));
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(1));
+
+        assert!(matches!(cmd_isvar(&mut engine, "no_such_var_xyz"), TfCommandResult::Success(None)));
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(0));
+
+        engine.push_scope();
+        engine.set_local("localonly", crate::tf::TfValue::Integer(1));
+        cmd_isvar(&mut engine, "localonly");
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(1), "isvar must see local scope too");
+    }
+
+    #[test]
+    fn test_cmd_features_list_and_single_name() {
+        let mut engine = TfEngine::new();
+        match cmd_features(&mut engine, "") {
+            TfCommandResult::Success(Some(s)) => {
+                assert!(s.contains("+ssl"));
+                assert!(s.contains("-core"));
+            }
+            other => panic!("expected the full list: {other:?}"),
+        }
+
+        assert!(matches!(cmd_features(&mut engine, "ssl"), TfCommandResult::Success(None)));
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(1));
+
+        cmd_features(&mut engine, "CORE");
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(0), "case-insensitive, and core is off");
+
+        cmd_features(&mut engine, "no_such_feature");
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(0));
+    }
+
+    #[test]
+    fn test_cmd_true_false_null_are_silent_and_set_status() {
+        let mut engine = TfEngine::new();
+        assert!(matches!(cmd_true(&mut engine, ""), TfCommandResult::Success(None)));
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(1));
+        assert!(matches!(cmd_false(&mut engine, ""), TfCommandResult::Success(None)));
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(0));
+        assert!(matches!(cmd_null(&mut engine, ""), TfCommandResult::Success(None)));
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(1));
+    }
+
+    #[test]
+    fn test_cmd_first_rest_last_nth() {
+        assert!(matches!(cmd_first("a b c"), TfCommandResult::Result(ref s) if s == "a"));
+        assert!(matches!(cmd_rest("a b c"), TfCommandResult::Result(ref s) if s == "b c"));
+        assert!(matches!(cmd_last("a b c"), TfCommandResult::Result(ref s) if s == "c"));
+        assert!(matches!(cmd_nth("2 a b c"), TfCommandResult::Result(ref s) if s == "b"));
+        // Edge cases matching real tf: a single word has empty /rest; nth with a
+        // non-positive or out-of-range n gives "".
+        assert!(matches!(cmd_rest("only"), TfCommandResult::Result(ref s) if s.is_empty()));
+        assert!(matches!(cmd_nth("0 a b c"), TfCommandResult::Result(ref s) if s.is_empty()));
+        assert!(matches!(cmd_nth("99 a b c"), TfCommandResult::Result(ref s) if s.is_empty()));
+    }
+
+    #[test]
+    fn test_cmd_ver_returns_bare_version_constant() {
+        assert!(matches!(cmd_ver(), TfCommandResult::Result(ref s) if s == crate::VERSION));
+    }
+
+    #[test]
+    fn test_cmd_nogag_no_arg_disables_and_sets_gag_zero() {
+        let mut engine = TfEngine::new();
+        match cmd_nogag(&mut engine, "") {
+            TfCommandResult::Success(Some(ref s)) => assert_eq!(s, "Gags disabled."),
+            other => panic!("got {:?}", other),
+        }
+        assert_eq!(engine.get_var("gag").and_then(|v| v.to_int()), Some(0));
+    }
+
+    #[test]
+    fn test_cmd_nogag_with_pattern_delegates_to_untrig() {
+        let mut engine = TfEngine::new();
+        engine.add_macro(macros::parse_def("-ag -t'foo*' = /echo gagged").unwrap());
+        cmd_nogag(&mut engine, "foo*");
+        assert!(engine.macros.is_empty(), "the gag-attributed trigger matching the pattern should be removed");
+    }
+
+    #[test]
+    fn test_cmd_sys_runs_shell_and_sets_real_exit_status() {
+        let mut engine = TfEngine::new();
+        match cmd_sys(&mut engine, "echo hi") {
+            TfCommandResult::Success(Some(ref s)) => assert_eq!(s, "hi"),
+            other => panic!("got {:?}", other),
+        }
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(0));
+
+        cmd_sys(&mut engine, "exit 7");
+        assert_eq!(engine.get_var("?").and_then(|v| v.to_int()), Some(7), "%? must be the real exit code, not a 0/1 boolean");
+    }
+
+    #[test]
+    fn test_cmd_restrict_report_and_monotonic_raise() {
+        let mut engine = TfEngine::new();
+        match cmd_restrict(&mut engine, "") {
+            TfCommandResult::Success(Some(ref s)) => assert_eq!(s, "restriction level: none"),
+            other => panic!("got {:?}", other),
+        }
+
+        assert!(matches!(cmd_restrict(&mut engine, "FILE"), TfCommandResult::Success(None)));
+        match cmd_restrict(&mut engine, "") {
+            TfCommandResult::Success(Some(ref s)) => assert_eq!(s, "restriction level: file"),
+            other => panic!("got {:?}", other),
+        }
+
+        // Never lowered, even by an explicit attempt to set a lower level.
+        cmd_restrict(&mut engine, "SHELL");
+        assert_eq!(engine.restrict_level, crate::tf::RestrictLevel::File, "restrict must never be lowered");
+
+        cmd_restrict(&mut engine, "WORLD");
+        assert_eq!(engine.restrict_level, crate::tf::RestrictLevel::World);
+
+        assert!(matches!(cmd_restrict(&mut engine, "bogus"), TfCommandResult::Error(_)));
+    }
+
+    #[test]
+    fn test_restrict_shell_blocks_sh_and_sys() {
+        let mut engine = TfEngine::new();
+        cmd_restrict(&mut engine, "SHELL");
+        assert!(matches!(cmd_sh(&mut engine, "echo hi"), TfCommandResult::Error(ref e) if e == "SH: restricted"));
+        assert!(matches!(cmd_sys(&mut engine, "echo hi"), TfCommandResult::Error(ref e) if e == "SYS: restricted"));
+    }
+
+    #[test]
+    fn test_restrict_file_blocks_load_save_lcd() {
+        let mut engine = TfEngine::new();
+        cmd_restrict(&mut engine, "FILE");
+        assert!(matches!(cmd_load(&mut engine, "foo.tf"), TfCommandResult::Error(ref e) if e == "LOAD: restricted"));
+        assert!(matches!(cmd_save(&mut engine, "foo.tf"), TfCommandResult::Error(ref e) if e == "SAVE: restricted"));
+        assert!(matches!(cmd_lcd(&mut engine, "/tmp"), TfCommandResult::Error(ref e) if e == "LCD: restricted"));
+        assert!(matches!(cmd_lcd(&mut engine, ""), TfCommandResult::Error(ref e) if e == "LCD: restricted"), "the report form is restricted too");
+        // /restrict FILE implies SHELL.
+        assert!(matches!(cmd_sh(&mut engine, "echo hi"), TfCommandResult::Error(_)));
+    }
+
+    #[test]
+    fn test_cmd_core_reports_not_supported() {
+        match cmd_core() {
+            TfCommandResult::Success(Some(ref s)) => assert!(s.contains("Not supported in Clay")),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cmd_xtitle_queues_and_requires_text() {
+        let mut engine = TfEngine::new();
+        assert!(matches!(cmd_xtitle(&mut engine, "My Title"), TfCommandResult::Success(None)));
+        assert_eq!(engine.pending_xtitle, Some("My Title".to_string()));
+        assert!(matches!(cmd_xtitle(&mut engine, ""), TfCommandResult::Error(_)));
+    }
+
+    #[test]
+    fn test_cmd_more_valid_values_and_error() {
+        let mut engine = TfEngine::new();
+        assert!(matches!(cmd_more(&mut engine, "on"), TfCommandResult::Success(None)));
+        assert_eq!(engine.pending_more_mode, Some(true));
+        assert_eq!(engine.get_var("more").and_then(|v| v.to_int()), Some(1));
+
+        assert!(matches!(cmd_more(&mut engine, "0"), TfCommandResult::Success(None)));
+        assert_eq!(engine.pending_more_mode, Some(false));
+
+        match cmd_more(&mut engine, "") {
+            TfCommandResult::Error(e) => assert!(e.contains("Invalid more value")),
+            other => panic!("bare /more should error like real tf: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_wrap_numeric_vs_on_off() {
+        let mut engine = TfEngine::new();
+        assert!(matches!(cmd_wrap(&mut engine, "12"), TfCommandResult::Success(None)));
+        assert_eq!(engine.pending_wrapspace, Some(12));
+        assert_eq!(engine.get_var("wrapsize").and_then(|v| v.to_int()), Some(12));
+        assert_eq!(engine.get_var("wrap").and_then(|v| v.to_int()), Some(1));
+
+        engine.pending_wrapspace.take(); // drain what the numeric call above queued
+        assert!(matches!(cmd_wrap(&mut engine, "off"), TfCommandResult::Success(None)));
+        assert_eq!(engine.pending_wrapspace, None, "on/off has no Clay-side wrap-width equivalent to queue");
+        assert_eq!(engine.get_var("wrap").map(|v| v.to_string_value()), Some("off".to_string()));
+
+        assert!(matches!(cmd_wrap(&mut engine, ""), TfCommandResult::Error(_)));
+    }
+
+    #[test]
+    fn test_cmd_limit_family_queues_the_right_pending_op() {
+        let mut engine = TfEngine::new();
+        cmd_limit(&mut engine, "-v -a -msimple foo");
+        match engine.pending_limit_op.take() {
+            Some(crate::tf::PendingLimitOp::Apply { pattern, invert, attrs_only, style }) => {
+                assert_eq!(pattern.as_deref(), Some("foo"));
+                assert!(invert);
+                assert!(attrs_only);
+                assert_eq!(style, crate::tf::TfMatchMode::Simple);
+            }
+            other => panic!("got {:?}", other),
+        }
+
+        cmd_limit(&mut engine, "");
+        assert!(matches!(engine.pending_limit_op.take(), Some(crate::tf::PendingLimitOp::Report)));
+
+        cmd_unlimit(&mut engine, "");
+        assert!(matches!(engine.pending_limit_op.take(), Some(crate::tf::PendingLimitOp::Clear)));
+
+        cmd_relimit(&mut engine, "");
+        assert!(matches!(engine.pending_limit_op.take(), Some(crate::tf::PendingLimitOp::Reapply)));
+
+        assert!(matches!(cmd_limit(&mut engine, "-mbogus x"), TfCommandResult::Error(_)));
+    }
 }
+

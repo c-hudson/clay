@@ -627,7 +627,6 @@ let actions = [];         // [{id, name, category}]
 let savedSnapshot = '';   // JSON.stringify of bindings at last save
 let selectedAction = null;
 let capturing = false;
-let lastEscapeTime = 0;
 let pendingCapture = null; // {key, conflictAction} awaiting confirmation
 let saveStatusTimeout = null;
 let findMode = false;
@@ -798,83 +797,248 @@ function sha256Fallback(message) {
   function ror(n, b) { return ((n >>> b) | (n << (32 - b))) >>> 0; }
 }
 
-// Key name conversion (matches Rust canonical format)
-function keyEventToName(e) {
-  const key = e.key;
-  const code = e.code;
+// ============================================================================
+// Key-name grammar + chord capture (TinyFugue-parity plan Job 22b/P2.7 - JS port of
+// src/keynames.rs and src/chords.rs; see src/web/app.js's own copy of this same port
+// for the fuller explanatory comments - duplicated here because this editor is served
+// as a standalone page with no shared script include).
+// ============================================================================
 
-  // Modifier-only keys
-  if (['Control', 'Alt', 'Shift', 'Meta'].includes(key)) return null;
+const NAMED_KEY_WORDS = ['PageDown', 'PageUp', 'Backspace', 'Escape', 'Insert',
+  'Delete', 'Enter', 'Space', 'Home', 'End', 'Tab', 'Up', 'Down', 'Left', 'Right']
+  .sort((a, b) => b.length - a.length);
 
-  // Ctrl+letter
-  if (e.ctrlKey && !e.altKey && key.length === 1) {
-    return '^' + key.toUpperCase();
+function matchNamedKeyWord(s) {
+  for (const w of NAMED_KEY_WORDS) {
+    if (s.startsWith(w)) return w;
   }
-
-  // Alt+letter (also handles Esc+letter via escape tracking)
-  if (e.altKey && !e.ctrlKey && key.length === 1) {
-    return 'Esc-' + key;
+  const m = /^F([0-9]{1,2})/.exec(s);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 20) return 'F' + n;
   }
-
-  // Function keys
-  if (key.startsWith('F') && key.length >= 2) {
-    const n = parseInt(key.slice(1));
-    if (n >= 1 && n <= 12) return 'F' + n;
-  }
-
-  // Arrow keys with modifiers
-  const arrowMap = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right' };
-  if (arrowMap[key]) {
-    const arrow = arrowMap[key];
-    if (e.shiftKey && !e.ctrlKey && !e.altKey) return 'Shift-' + arrow;
-    if (e.ctrlKey && !e.shiftKey && !e.altKey) return 'Ctrl-' + arrow;
-    if (e.altKey && !e.ctrlKey && !e.shiftKey) return 'Alt-' + arrow;
-    return arrow;
-  }
-
-  // Special keys
-  const specialMap = {
-    PageUp: 'PageUp', PageDown: 'PageDown',
-    Home: 'Home', End: 'End',
-    Insert: 'Insert', Delete: 'Delete',
-    Backspace: e.altKey ? 'Esc-Backspace' : 'Backspace',
-    Tab: 'Tab', Enter: 'Enter', Escape: 'Escape',
-    ' ': e.ctrlKey ? '^Space' : (e.altKey ? 'Esc-Space' : null),
-  };
-  if (specialMap[key] !== undefined) return specialMap[key];
-
-  // Ctrl+special
-  if (e.ctrlKey) {
-    if (key === 'a' || key === 'A') return '^A';
-    // Generic ctrl+letter
-    if (key.length === 1 && key.match(/[a-zA-Z]/)) return '^' + key.toUpperCase();
-  }
-
   return null;
 }
 
-// Escape sequence tracking for terminals
-function handleEscapeSequence(e) {
-  const now = Date.now();
-  if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-    lastEscapeTime = now;
-    return null; // Don't capture bare Escape yet
+function parseCanonicalToken(s) {
+  if (s.length === 0) return null;
+  if (s.startsWith('Esc-')) {
+    const inner = parseCanonicalToken(s.slice(4));
+    if (!inner) return null;
+    return { token: 'Esc-' + inner.token, rest: inner.rest };
   }
-
-  // Check if this follows a recent Escape
-  if (now - lastEscapeTime < 500 && lastEscapeTime > 0) {
-    lastEscapeTime = 0;
-    if (e.key.length === 1 && !e.ctrlKey && !e.altKey) {
-      if (e.key === ' ') return 'Esc-Space';
-      if (e.key === '-') return 'Esc--';
-      if (e.key === '.') return 'Esc-.';
-      if (e.key === '_') return 'Esc-_';
-      return 'Esc-' + e.key;
+  for (const prefix of ['Ctrl-', 'Shift-', 'Alt-']) {
+    if (s.startsWith(prefix)) {
+      const rest = s.slice(prefix.length);
+      const named = matchNamedKeyWord(rest);
+      if (named) return { token: prefix + named, rest: rest.slice(named.length) };
     }
-    if (e.key === 'Backspace') return 'Esc-Backspace';
+  }
+  if (s[0] === '^') {
+    const rest = s.slice(1);
+    const ch = Array.from(rest)[0] || '';
+    return { token: '^' + ch, rest: rest.slice(ch.length) };
+  }
+  const named = matchNamedKeyWord(s);
+  if (named) return { token: named, rest: s.slice(named.length) };
+  const ch = Array.from(s)[0];
+  return { token: ch, rest: s.slice(ch.length) };
+}
+
+function tokenizeCanonical(s) {
+  const tokens = [];
+  let rest = s;
+  let guard = 0;
+  while (rest.length > 0 && guard++ < 64) {
+    const r = parseCanonicalToken(rest);
+    if (!r) break;
+    tokens.push(r.token);
+    rest = r.rest;
+  }
+  return tokens;
+}
+
+// A named-key word for `named`, honoring a Shift/Ctrl/Alt modifier on `e` as a real
+// "Modified-" token - mirrors keybindings::modified_or_named's Shift>Ctrl>Alt priority,
+// shared by arrows and (finding 41 / Job 22c) every other named key below.
+function namedWithModifier(named, e) {
+  if (e.shiftKey) return 'Shift-' + named;
+  if (e.ctrlKey) return 'Ctrl-' + named;
+  if (e.altKey) return 'Alt-' + named;
+  return named;
+}
+
+// Top-level (no chord in progress) keystroke -> canonical-text token, or null for an
+// ordinary unmodified character. Mirrors keybindings::key_event_to_token exactly.
+// Finding 41 / Job 22c: PageUp/PageDown/Home/End/Insert/Delete/Tab/Enter now honor
+// Shift/Ctrl/Alt via namedWithModifier, same as arrows already did - see app.js's own
+// copy of this function for the detailed rationale.
+function keyEventToToken(e) {
+  const key = e.key;
+  if (e.metaKey) return null;
+  if (e.ctrlKey && key.length === 1) return '^' + key.toUpperCase();
+  if (e.altKey && key.length === 1) return 'Esc-' + key; // preserves case
+  const arrowMap = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right' };
+  if (arrowMap[key]) return namedWithModifier(arrowMap[key], e);
+  if (key === 'PageUp') return namedWithModifier('PageUp', e);
+  if (key === 'PageDown') return namedWithModifier('PageDown', e);
+  if (key === 'Home') return namedWithModifier('Home', e);
+  if (key === 'End') return namedWithModifier('End', e);
+  if (key === 'Insert') return namedWithModifier('Insert', e);
+  if (key === 'Delete') return namedWithModifier('Delete', e);
+  if (key === 'Backspace') return e.altKey ? 'Esc-Backspace' : 'Backspace';
+  if (key === 'Tab') return namedWithModifier('Tab', e);
+  if (key === 'Enter') return namedWithModifier('Enter', e);
+  if (key === 'Escape') return 'Escape';
+  const m = /^F([0-9]{1,2})$/.exec(key);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 20) return key;
+  }
+  return null;
+}
+
+// Inner token for a keystroke arriving while a chord is already buffered (bare Escape
+// or a genuine multi-token prefix). Mirrors keybindings::escape_key_to_token exactly:
+// handles plain characters (case preserved) and never applies Shift/Alt to an arrow
+// (Esc-Left is Escape-then-Left as two keystrokes, not one modified chord). Finding 41 /
+// Job 22c: PageUp/PageDown/Home/End/Insert/Delete/Tab/Enter DO honor a real modifier
+// here too - the caller prepends "Esc-" to whatever this returns.
+function escapeKeyToToken(e) {
+  const key = e.key;
+  if (e.metaKey) return null;
+  if (e.ctrlKey && key.length === 1) return '^' + key.toUpperCase();
+  if (key === ' ') return 'Space';
+  if (key.length === 1) return key; // preserve case
+  if (key === 'Backspace') return 'Backspace';
+  if (key === 'Tab') return namedWithModifier('Tab', e);
+  if (key === 'Enter') return namedWithModifier('Enter', e);
+  if (key === 'Escape') return 'Escape';
+  if (key === 'ArrowUp') return 'Up';
+  if (key === 'ArrowDown') return 'Down';
+  if (key === 'ArrowLeft') return 'Left';
+  if (key === 'ArrowRight') return 'Right';
+  if (key === 'PageUp') return namedWithModifier('PageUp', e);
+  if (key === 'PageDown') return namedWithModifier('PageDown', e);
+  if (key === 'Home') return namedWithModifier('Home', e);
+  if (key === 'End') return namedWithModifier('End', e);
+  if (key === 'Insert') return namedWithModifier('Insert', e);
+  if (key === 'Delete') return namedWithModifier('Delete', e);
+  const m = /^F([0-9]{1,2})$/.exec(key);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 20) return key;
+  }
+  return null;
+}
+
+function isPrefixOfAnyKeys(boundKeys, candidateTokens) {
+  for (const key of boundKeys) {
+    const toks = tokenizeCanonical(key);
+    if (toks.length <= candidateTokens.length) continue;
+    let match = true;
+    for (let i = 0; i < candidateTokens.length; i++) {
+      if (toks[i] !== candidateTokens[i]) { match = false; break; }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+// Chord state for capture (mirrors src/chords.rs's ChordState). `bindings` already
+// holds the FULL effective key->action set (defaults merged with customizations -
+// KeyBindings::to_json() serializes the whole map, not a diff), so it alone is enough
+// for is_prefix/has_binding here - there's no separate tf_bound_keys_json concept in
+// this standalone editor.
+const CAPTURE_CANCEL_TOKEN = '^G';
+const CAPTURE_CHORD_WINDOW_MS = 500;
+const captureChord = { pending: [], armedAt: null };
+
+function captureChordIsPending() {
+  return captureChord.pending.length > 0;
+}
+
+function captureChordCancel() {
+  captureChord.pending = [];
+  captureChord.armedAt = null;
+}
+
+// A pressed "^X" is always treated as a valid chord start in this editor, even when
+// nothing currently uses it as a prefix - TF's own well-known ^X keymap convention
+// (kbbind.tf), so a user can capture a brand-new ^X-prefixed chord that doesn't
+// already exist. Real live keypress resolution (the console, app.js) has no such
+// carve-out - only a dedicated "capture a binding" UI can safely offer it.
+function captureIsPrefix(candidateTokens) {
+  if (candidateTokens.length === 1 && candidateTokens[0] === '^X') return true;
+  return isPrefixOfAnyKeys(Object.keys(bindings), candidateTokens);
+}
+
+function captureChordPush(token, now) {
+  if (captureChord.pending.length > 0 &&
+      captureChord.pending[captureChord.pending.length - 1] === 'Escape') {
+    captureChord.pending.pop();
+    captureChord.pending.push('Esc-' + token);
+  } else {
+    captureChord.pending.push(token);
   }
 
-  return keyEventToName(e);
+  const candidate = captureChord.pending.slice();
+
+  if (candidate[candidate.length - 1] === 'Escape') {
+    captureChord.armedAt = now;
+    return { type: 'pending' };
+  }
+
+  if (captureIsPrefix(candidate)) {
+    captureChord.armedAt = now;
+    return { type: 'pending' };
+  }
+
+  captureChord.pending = [];
+  captureChord.armedAt = null;
+
+  // Emit the concatenated name regardless of whether it's currently bound to anything -
+  // capture's whole purpose is proposing a (possibly brand-new) binding, unlike a live
+  // keypress dispatch which only ever acts on an EXISTING one (no abandon/replay here:
+  // once a prefix keystroke starts a capture, the very next keystroke always completes
+  // it as a two-token chord).
+  return { type: 'dispatch', name: candidate.join('') };
+}
+
+function captureChordExpired(now, windowMs) {
+  if (captureChord.armedAt === null) return null;
+  if (now - captureChord.armedAt < windowMs) return null;
+  const seq = captureChord.pending;
+  captureChord.pending = [];
+  captureChord.armedAt = null;
+  if (seq.length === 1 && seq[0] === 'Escape') return null;
+  return seq.join(''); // whatever was buffered, bound or not - same "emit it" rule as push
+}
+
+// Resolve one physical keydown during capture (or Find-mode capture) against the
+// buffered chord state. Returns {type:'pending'} | {type:'dispatch', name} |
+// {type:'notakey'} - mirrors chords::resolve_key_name's shape (see app.js).
+function resolveCaptureKeyName(e) {
+  const now = Date.now();
+
+  if (captureChordIsPending()) {
+    const fired = captureChordExpired(now, CAPTURE_CHORD_WINDOW_MS);
+    if (fired !== null) return { type: 'dispatch', name: fired };
+  }
+
+  const midChord = captureChordIsPending();
+  const token = midChord ? escapeKeyToToken(e) : keyEventToToken(e);
+
+  if (token === null) {
+    if (midChord) captureChordCancel();
+    return { type: 'notakey' };
+  }
+  if (midChord && token === CAPTURE_CANCEL_TOKEN) {
+    captureChordCancel();
+    return { type: 'notakey' };
+  }
+
+  return captureChordPush(token, now);
 }
 
 // Get all keys bound to an action
@@ -923,7 +1087,10 @@ function rebuildActionList() {
     categories[action.category].push(action);
   }
 
-  const order = ['Cursor', 'Editing', 'History', 'Scrollback', 'World', 'System', 'Clay'];
+  // TinyFugue-parity plan Job 22b/P2.7: 'Numeric prefix' is a new category
+  // (keybindings::ACTIONS' kbnum_0..9/kbnum_negative) - without it here, those actions
+  // exist in actions_json but can never be selected in this left-hand list at all.
+  const order = ['Cursor', 'Editing', 'History', 'Scrollback', 'World', 'System', 'Numeric prefix', 'Clay'];
   for (const cat of order) {
     if (!categories[cat]) continue;
     const group = document.createElement('div');
@@ -1097,6 +1264,7 @@ function clearAllBindings() {
 function toggleCapture() {
   capturing = !capturing;
   pendingCapture = null;
+  captureChordCancel();
   rebuildDetail();
   if (capturing) {
     // Focus the button for key capture
@@ -1196,15 +1364,17 @@ document.addEventListener('keydown', function(e) {
     e.preventDefault();
     e.stopPropagation();
 
-    // Escape closes the find overlay
+    // Escape closes the find overlay (never buffers as a potential Esc-chord start,
+    // unlike ordinary capture mode below - Escape is find's own cancel key).
     if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      captureChordCancel();
       closeFind();
       return;
     }
 
-    const name = handleEscapeSequence(e);
-    if (name) {
-      doFind(name);
+    const resolution = resolveCaptureKeyName(e);
+    if (resolution.type === 'dispatch') {
+      doFind(resolution.name);
     }
     return;
   }
@@ -1223,9 +1393,9 @@ document.addEventListener('keydown', function(e) {
     e.preventDefault();
     e.stopPropagation();
 
-    const name = handleEscapeSequence(e);
-    if (name) {
-      applyCapture(name);
+    const resolution = resolveCaptureKeyName(e);
+    if (resolution.type === 'dispatch') {
+      applyCapture(resolution.name);
     }
     return;
   }
@@ -1237,6 +1407,7 @@ function openFind() {
   findKey = null;
   findMatches = [];
   findIndex = 0;
+  captureChordCancel();
   const overlay = document.getElementById('findOverlay');
   overlay.classList.remove('hidden');
   document.getElementById('findContent').innerHTML =
@@ -1312,6 +1483,7 @@ function resetFind() {
   findKey = null;
   findMatches = [];
   findIndex = 0;
+  captureChordCancel();
   document.querySelectorAll('.action-item.find-match').forEach(el => el.classList.remove('find-match'));
   document.getElementById('findContent').innerHTML =
     '<div class="find-capture-area">Press a key combination...</div>';

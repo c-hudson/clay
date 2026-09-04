@@ -1961,6 +1961,94 @@
             "-g must include server output + client notices + captured input, all together");
     }
 
+    // ========== /recall -A/-B/-C: context lines ==========
+
+    #[test]
+    fn test_recall_context_around_single_match() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        for text in ["line1", "line2", "line3 apple", "line4", "line5"] {
+            let seq = app.worlds[0].next_seq; app.worlds[0].next_seq += 1;
+            app.worlds[0].output_lines.push(OutputLine::new(text.to_string(), seq));
+        }
+
+        let opts = tf::RecallOptions {
+            range: tf::RecallRange::All,
+            pattern: Some("apple".to_string()),
+            match_style: tf::RecallMatchStyle::Simple,
+            context_before: 1,
+            context_after: 1,
+            ..tf::RecallOptions::default()
+        };
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
+        assert_eq!(matches, vec!["line2".to_string(), "line3 apple".to_string(), "line4".to_string()],
+            "-B1 -A1 must include one line of context on each side of the match");
+    }
+
+    #[test]
+    fn test_recall_context_merges_overlapping_and_separates_distant_groups() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        // Matches at index 2 ("apple") and 3 ("apple2") are adjacent once -A1/-B1 expand
+        // them, so they must merge into ONE contiguous group with no repeated line and no
+        // "--" separator. The match at index 8 is far enough away to form its own group,
+        // separated by "--" (real tf: "groups of lines that are not adjacent in history
+        // will be separated by '--'").
+        let lines = [
+            "line0", "line1", "apple", "apple2", "line4", "line5", "line6", "line7",
+            "apple3", "line9",
+        ];
+        for text in lines {
+            let seq = app.worlds[0].next_seq; app.worlds[0].next_seq += 1;
+            app.worlds[0].output_lines.push(OutputLine::new(text.to_string(), seq));
+        }
+
+        let opts = tf::RecallOptions {
+            range: tf::RecallRange::All,
+            pattern: Some("apple*".to_string()),
+            match_style: tf::RecallMatchStyle::Glob,
+            context_before: 1,
+            context_after: 1,
+            ..tf::RecallOptions::default()
+        };
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
+        assert_eq!(matches, vec![
+            "line1".to_string(), "apple".to_string(), "apple2".to_string(), "line4".to_string(),
+            "--".to_string(),
+            "line7".to_string(), "apple3".to_string(), "line9".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn test_recall_no_context_options_means_no_separators() {
+        // Without -A/-B/-C, non-adjacent matches must NOT get a "--" separator - that's
+        // exclusively a context-mode behavior (verified directly against real tf).
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        for text in ["apple", "line1", "line2", "apple2"] {
+            let seq = app.worlds[0].next_seq; app.worlds[0].next_seq += 1;
+            app.worlds[0].output_lines.push(OutputLine::new(text.to_string(), seq));
+        }
+
+        let opts = tf::RecallOptions {
+            range: tf::RecallRange::All,
+            pattern: Some("apple*".to_string()),
+            match_style: tf::RecallMatchStyle::Glob,
+            ..tf::RecallOptions::default()
+        };
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
+        assert_eq!(matches, vec!["apple".to_string(), "apple2".to_string()]);
+    }
+
     #[test]
     fn test_input_line_invisible_until_show_tags() {
         let mut app = App::new();
@@ -4944,7 +5032,13 @@
             for tok_caps in token_re.captures_iter(&arm_caps[1]) {
                 let name = tok_caps[1].to_lowercase();
                 // /__connect is explicitly internal-use-only (Connect buttons), not a
-                // user-typed command - out of scope for JS's INTERNAL_COMMANDS.
+                // user-typed command - out of scope for JS's INTERNAL_COMMANDS, and NOT
+                // temporary (finding 30): never add it to INTERNAL_COMMANDS, never
+                // remove this exemption.
+                //
+                // /log and /unworld used to be exempted here too (Jobs 14a/14c added them
+                // as native Commands before app.js's own parity work landed) - both are
+                // now listed in INTERNAL_COMMANDS (Job 22b/P2.7), so the exemption is gone.
                 if name != "__connect" {
                     rust_commands.push(name);
                 }
@@ -4957,20 +5051,37 @@
              extraction regex likely broke against a source change. Commands found: {:?}",
             rust_commands.len(), rust_commands);
 
+        // TF-engine commands (tf/parser.rs's own dispatch - `is_tf_command_name`/
+        // `execute_tf_command`, not `main.rs`'s `parse_command`) that Job 22b/P2.7 added
+        // to INTERNAL_COMMANDS purely for tab-completion completeness (TinyFugue-parity
+        // plan Phase 1's missing-builtins/stdlib work). These never have - and never will
+        // have - a `parse_command` match arm (a web/GUI client's typed text reaches them
+        // via the TF engine fallback, same as the console), so they're a permanent
+        // allowlist here rather than a "remove once added to Rust" temporary exemption
+        // like /log/`/unworld` used to be.
+        let tf_only_completion_commands: std::collections::HashSet<&str> = [
+            "cd", "pwd", "runtime", "ismacro", "isvar", "features", "restrict", "sys",
+            "xtitle", "more", "wrap", "limit", "unlimit", "relimit", "result",
+            "first", "rest", "last", "nth", "ver", "man", "nogag",
+        ].into_iter().collect();
+
         // --- Compare ---
         let js_set: std::collections::HashSet<&str> = js_commands.iter().map(|s| s.as_str()).collect();
         let rust_set: std::collections::HashSet<&str> = rust_commands.iter().map(|s| s.as_str()).collect();
 
         let missing_from_js: Vec<&&str> = rust_set.difference(&js_set).collect();
-        let extra_in_js: Vec<&&str> = js_set.difference(&rust_set).collect();
+        let extra_in_js: Vec<&&str> = js_set.difference(&rust_set)
+            .filter(|s| !tf_only_completion_commands.contains(**s))
+            .collect();
 
         assert!(missing_from_js.is_empty() && extra_in_js.is_empty(),
             "Command parity mismatch between Rust parse_command() and JS INTERNAL_COMMANDS!\n\
              Missing from JS (present in Rust): {:?}\n\
-             Extra in JS (not in Rust): {:?}\n\
+             Extra in JS (not in Rust, and not a known TF-only completion command): {:?}\n\
              \n\
              To fix: update INTERNAL_COMMANDS in src/web/app.js (parse_command() is scanned \
-             directly now, so there's no second Rust-side list to keep in sync here).",
+             directly now, so there's no second Rust-side list to keep in sync here) - or, \
+             for a genuine TF-engine-only command, add it to tf_only_completion_commands above.",
             missing_from_js, extra_in_js);
     }
 
@@ -5983,6 +6094,259 @@ if you're more curious.\"";
             }
             other => panic!("Expected RemoteAttach, got {:?}", other),
         }
+    }
+
+    // ---- /send flag parsing (finding B: TF options to add) ----
+
+    #[test]
+    fn test_parse_send_plain() {
+        match parse_command("/send say hello") {
+            Command::Send { text, all_worlds, target_world, world_type, no_newline, run_hook } => {
+                assert_eq!(text, "say hello");
+                assert!(!all_worlds);
+                assert_eq!(target_world, None);
+                assert_eq!(world_type, None);
+                assert!(!no_newline);
+                assert!(!run_hook);
+            }
+            other => panic!("Expected Send, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_send_all_worlds_and_no_newline() {
+        match parse_command("/send -W -n quit") {
+            Command::Send { text, all_worlds, no_newline, .. } => {
+                assert_eq!(text, "quit");
+                assert!(all_worlds);
+                assert!(no_newline);
+            }
+            other => panic!("Expected Send, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_send_world_type() {
+        match parse_command("/send -Tmud who") {
+            Command::Send { text, world_type, .. } => {
+                assert_eq!(text, "who");
+                assert_eq!(world_type.as_deref(), Some("mud"));
+            }
+            other => panic!("Expected Send, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_send_run_hook() {
+        match parse_command("/send -h say hi") {
+            Command::Send { text, run_hook, .. } => {
+                assert_eq!(text, "say hi");
+                assert!(run_hook);
+            }
+            other => panic!("Expected Send, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_send_bare_w_means_current_world() {
+        // Bare -w (no attached world name, space-separated from what follows) is the
+        // current world - the following word is the literal MESSAGE text, per real tf's
+        // own -w[<world>] convention (NOT a Clay-specific "-w <world>" shorthand).
+        match parse_command("/send -w hello world") {
+            Command::Send { text, target_world, .. } => {
+                assert_eq!(target_world, None);
+                assert_eq!(text, "hello world");
+            }
+            other => panic!("Expected Send, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_send_attached_world() {
+        match parse_command("/send -wOtherMUD look") {
+            Command::Send { text, target_world, .. } => {
+                assert_eq!(target_world.as_deref(), Some("OtherMUD"));
+                assert_eq!(text, "look");
+            }
+            other => panic!("Expected Send, got {:?}", other),
+        }
+    }
+
+    fn send_test_world(name: &str, connected: bool) -> World {
+        let mut w = World::new(name);
+        w.connected = connected;
+        w
+    }
+
+    #[test]
+    fn test_execute_send_command_world_type_fanout() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.worlds.push(send_test_world("Beta", true));
+        app.worlds[1].settings.world_type = WorldType::Slack;
+        app.current_world_index = 0;
+
+        // -Tmud must reach only the (connected) MUD-type world, not the Slack one - both
+        // worlds default to WorldType::Mud except where explicitly set above.
+        execute_send_command(&mut app, "who", false, &None, &Some("mud".to_string()), false, false, 0, false);
+        // Neither world has a command_tx (no real connection), so the send itself can't
+        // succeed - this just confirms world-type resolution doesn't error out or panic,
+        // and reports back through emit_client_text without crashing when there's no tx.
+        // (Full send-success coverage needs a real command_tx, exercised elsewhere.)
+    }
+
+    #[test]
+    fn test_execute_send_command_no_connected_worlds_reports_message() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", false));
+        app.current_world_index = 0;
+
+        execute_send_command(&mut app, "quit", true, &None, &None, false, false, 0, false);
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("No connected worlds")));
+        assert!(found, "expected a 'no connected worlds' message, got: {:?}", *log);
+    }
+
+    #[test]
+    fn test_execute_send_command_named_world_not_found() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+
+        execute_send_command(&mut app, "look", false, &Some("Nope".to_string()), &None, false, false, 0, false);
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("'Nope' not found")));
+        assert!(found, "expected a world-not-found message, got: {:?}", *log);
+    }
+
+    // ---- /log flag parsing (finding B: TF options to add) ----
+
+    #[test]
+    fn test_parse_log_bare_is_status() {
+        match parse_command("/log") {
+            Command::Log { world, log_input, log_local, log_global, action } => {
+                assert_eq!(world, None);
+                assert!(!log_input && !log_local && !log_global);
+                assert_eq!(action, LogAction::Status);
+            }
+            other => panic!("Expected Log, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_log_on_off_file() {
+        match parse_command("/log ON") {
+            Command::Log { action, .. } => assert_eq!(action, LogAction::On),
+            other => panic!("Expected Log, got {:?}", other),
+        }
+        match parse_command("/log OFF") {
+            Command::Log { action, .. } => assert_eq!(action, LogAction::Off),
+            other => panic!("Expected Log, got {:?}", other),
+        }
+        match parse_command("/log ~/mud.log") {
+            Command::Log { action, .. } => assert_eq!(action, LogAction::File("~/mud.log".to_string())),
+            other => panic!("Expected Log, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_log_selector_with_no_action_defaults_to_on() {
+        // Real tf: "(none) with an -ligw option, same as ON".
+        match parse_command("/log -wOtherMUD") {
+            Command::Log { world, action, .. } => {
+                assert_eq!(world.as_deref(), Some("OtherMUD"));
+                assert_eq!(action, LogAction::On);
+            }
+            other => panic!("Expected Log, got {:?}", other),
+        }
+        match parse_command("/log -i") {
+            Command::Log { log_input, action, .. } => {
+                assert!(log_input);
+                assert_eq!(action, LogAction::On);
+            }
+            other => panic!("Expected Log, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_log_bare_w_and_flags() {
+        match parse_command("/log -w -l -g OFF") {
+            Command::Log { world, log_local, log_global, action, .. } => {
+                assert_eq!(world, Some(String::new()));
+                assert!(log_local);
+                assert!(log_global);
+                assert_eq!(action, LogAction::Off);
+            }
+            other => panic!("Expected Log, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execute_log_command_on_and_off_toggle_world_settings() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.current_world_index = 0;
+
+        execute_log_command(&mut app, &None, false, &LogAction::On, 0, false);
+        assert!(app.worlds[0].settings.log_enabled, "ON must enable logging for the target world");
+
+        execute_log_command(&mut app, &None, false, &LogAction::Off, 0, false);
+        assert!(!app.worlds[0].settings.log_enabled, "OFF must disable logging for the target world");
+    }
+
+    #[test]
+    fn test_execute_log_command_file_sets_custom_path_and_off_clears_it() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.current_world_index = 0;
+
+        let tmp = std::env::temp_dir().join(format!("clay-test-log-{}.log", std::process::id()));
+        let tmp_str = tmp.to_string_lossy().to_string();
+        execute_log_command(&mut app, &None, false, &LogAction::File(tmp_str.clone()), 0, false);
+        assert!(app.worlds[0].settings.log_enabled);
+        assert_eq!(app.worlds[0].log_custom_path.as_deref(), Some(tmp.as_path()));
+        assert!(tmp.exists(), "/log <file> must actually create/open the given file");
+
+        execute_log_command(&mut app, &None, false, &LogAction::Off, 0, false);
+        assert!(!app.worlds[0].settings.log_enabled);
+        assert_eq!(app.worlds[0].log_custom_path, None, "OFF must clear a custom path so a later ON goes back to the normal file");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_execute_log_command_i_toggles_global_log_input_enabled() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.current_world_index = 0;
+        app.settings.log_input_enabled = false;
+
+        execute_log_command(&mut app, &None, true, &LogAction::On, 0, false);
+        assert!(app.settings.log_input_enabled, "-i ON must enable the global log_input_enabled setting");
+
+        execute_log_command(&mut app, &None, true, &LogAction::Off, 0, false);
+        assert!(!app.settings.log_input_enabled, "-i OFF must disable it again");
+    }
+
+    #[test]
+    fn test_execute_log_command_bare_lists_all_logging_worlds() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.worlds.push(World::new("Beta"));
+        app.current_world_index = 0;
+        app.worlds[0].settings.log_enabled = true;
+
+        execute_log_command(&mut app, &None, false, &LogAction::Status, 0, false);
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("Alpha") && !data.contains("Beta")));
+        assert!(found, "bare /log must list only the logging world(s), got: {:?}", *log);
     }
 
     /// Serializes tests that toggle the process-wide LOCAL_SERVER_LOOPBACK_ONLY static so
@@ -11499,4 +11863,2145 @@ third
         let w = restored.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
         assert_eq!(w.seq_epoch, epoch, "epoch must survive a full save/load round trip");
         assert_eq!(w.next_seq, 500);
+    }
+
+    // ---- TinyFugue keybinding parity (plan Phase 0 P0.6) ----
+    //
+    // Coverage for `investigate-differences-between-tinyfugu-fluffy-stallman.md`, finding A
+    // (keybindings) and Phase 0 step P0.6. Three tests below are `#[ignore]`d: they pin bugs
+    // that Phase 1/2 fix deliberately (the `/bind Esc-<letter>` case-fold, missing `Esc-<arrow>`
+    // names, and incomplete `/dokey` name coverage). The rest are regression guards for
+    // behaviour that already works today, so Phase 2's key-grammar rewrite can't silently break
+    // one of these while adding TF's missing chords.
+
+    fn make_key_test_app() -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app
+    }
+
+    /// Fire a bare crossterm key event through the real dispatch path. `KeyEvent::new` already
+    /// produces `KeyEventKind::Press` (the only kind the terminal event loop forwards to
+    /// `handle_key_event` -- see main.rs's `if key.kind != KeyEventKind::Press { continue; }`).
+    fn send_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
+        handle_key_event(KeyEvent::new(code, modifiers), app)
+    }
+
+    /// Fire an Esc-prefixed chord: a bare Escape (which only arms `app.last_escape` and returns
+    /// `KeyAction::None` -- see `handle_key_event`) followed immediately by the given key, the
+    /// same way a real terminal delivers "Esc" then e.g. "j" as two separate key events inside
+    /// the 500ms window.
+    fn send_esc_then(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
+        let escape_result = handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), app);
+        assert!(matches!(escape_result, KeyAction::None),
+            "a bare Esc press must never itself produce an action");
+        handle_key_event(KeyEvent::new(code, modifiers), app)
+    }
+
+    /// Human-readable description of a `KeyAction` for assertion failure messages (the enum has
+    /// no `Debug` impl).
+    fn describe_key_action(action: &KeyAction) -> String {
+        match action {
+            KeyAction::Quit => "Quit".to_string(),
+            KeyAction::SendCommand(cmd) => format!("SendCommand({cmd:?})"),
+            KeyAction::Connect => "Connect".to_string(),
+            KeyAction::Redraw => "Redraw".to_string(),
+            KeyAction::Refresh => "Refresh".to_string(),
+            KeyAction::Reload => "Reload".to_string(),
+            KeyAction::Suspend => "Suspend".to_string(),
+            KeyAction::SwitchedWorld(idx) => format!("SwitchedWorld({idx})"),
+            KeyAction::RunImport { addr, .. } => format!("RunImport({addr})"),
+            KeyAction::None => "None".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_tf_keys_bind_esc_case() {
+        // finding A, bug 1: hooks::bind_key (via parse_key_name) stores "/bind Esc-j" verbatim
+        // as "Esc-j" and "/bind Esc-J" verbatim as "Esc-J" (parse_key_name has no case-fold for
+        // an "Esc-" prefix, unlike its shift-/ctrl-/alt- handling). But
+        // input_handler::canonical_to_tf_key_name maps *both* a pressed Esc-j and a pressed
+        // Esc-J to the same lookup key "Alt-J" (it always uppercases). So neither binding is
+        // ever found by the pressed-key lookup, and both keystrokes instead fall through to
+        // Esc-j/Esc-J's own (also-default-bound) flush_output / selective_flush actions.
+        let mut app = make_key_test_app();
+
+        let bind_lower = app.tf_engine.execute("/bind Esc-j = /echo lower");
+        assert!(matches!(bind_lower, tf::TfCommandResult::Success(_)),
+            "/bind Esc-j = ... should be accepted; got {bind_lower:?}");
+        let bind_upper = app.tf_engine.execute("/bind Esc-J = /echo upper");
+        assert!(matches!(bind_upper, tf::TfCommandResult::Success(_)),
+            "/bind Esc-J = ... should be accepted; got {bind_upper:?}");
+
+        let lower = send_esc_then(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        match lower {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo lower"),
+            other => panic!(
+                "Esc,j should fire the /bind Esc-j command; got {} instead (case-fold bug)",
+                describe_key_action(&other)),
+        }
+
+        let upper = send_esc_then(&mut app, KeyCode::Char('J'), KeyModifiers::NONE);
+        match upper {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo upper"),
+            other => panic!(
+                "Esc,J should fire the /bind Esc-J command; got {} instead (case-fold bug)",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_keys_bind_alt_form_fires() {
+        // Guards the one working path referenced by finding A: canonical_to_tf_key_name always
+        // uppercases an Esc-<letter> name to "Alt-<LETTER>" for the pressed-key lookup, and
+        // hooks::parse_key_name normalises "/bind Alt-j" to that same "Alt-J" -- so binding
+        // through the Alt- spelling (rather than the Esc- spelling covered by the ignored test
+        // above) does fire today. Must keep passing after Phase 2's key-grammar rewrite makes
+        // Esc- also work, since that's an addition, not a replacement.
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/bind Alt-j = /echo alt");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/bind Alt-j = ... should be accepted; got {bound:?}");
+
+        let action = send_esc_then(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        match action {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo alt"),
+            other => panic!(
+                "Esc,j should fire the /bind Alt-j command via the Alt- normalisation path; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_keys_bind_raw_esc_sequence_fires() {
+        // plan P2.1 acceptance: "/bind ^[b = ..." (TF's own raw Esc-prefix
+        // spelling) must fire on a real Esc,b keypress, the same as binding
+        // through the canonical "Esc-b" spelling would.
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/bind ^[b = /echo rawesc");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/bind ^[b = ... should be accepted; got {bound:?}");
+
+        let action = send_esc_then(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        match action {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo rawesc"),
+            other => panic!("Esc,b should fire the /bind ^[b command; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_def_bind_raw_up_arrow_fires() {
+        // plan P2.1 acceptance: "/def -b'^[[A' = ..." (TF's raw byte sequence
+        // for the Up arrow) must fire on a real Up keypress - no Escape
+        // involved, since ^[[A is the terminal's own atomic encoding of Up,
+        // not an Esc-prefix chord (see keynames.rs's module doc comment).
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/def -b'^[[A' = /echo uparrow");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/def -b'^[[A' = ... should be accepted; got {bound:?}");
+
+        let action = send_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        match action {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo uparrow"),
+            other => panic!("Up should fire the /def -b'^[[A' command; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_keys_default_actions_dispatch() {
+        // Regression guard for a representative slice of TF-default bindings that finding A
+        // lists as "Identical already" between Clay and TF.
+
+        // ^A / ^E: home and end.
+        {
+            let mut app = make_key_test_app();
+            app.input.buffer = "hello".to_string();
+            app.input.cursor_position = 5;
+            send_key(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+            assert_eq!(app.input.cursor_position, 0, "^A should move the cursor to column 0");
+            send_key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            assert_eq!(app.input.cursor_position, 5, "^E should move the cursor to the end");
+        }
+
+        // ^K: kill from the cursor to end of line.
+        {
+            let mut app = make_key_test_app();
+            app.input.buffer = "hello world".to_string();
+            app.input.cursor_position = 5;
+            send_key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+            assert_eq!(app.input.buffer, "hello", "^K should delete from the cursor to end of line");
+            assert_eq!(app.input.cursor_position, 5);
+            assert_eq!(app.input.kill_ring.last().map(String::as_str), Some(" world"));
+        }
+
+        // ^W: delete the previous word.
+        {
+            let mut app = make_key_test_app();
+            app.input.buffer = "hello world".to_string();
+            app.input.cursor_position = 11;
+            send_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert_eq!(app.input.buffer, "hello ", "^W should delete the word before the cursor");
+            assert_eq!(app.input.cursor_position, 6);
+        }
+
+        // Esc-b / Esc-f: word-left / word-right motion.
+        {
+            let mut app = make_key_test_app();
+            app.input.buffer = "hello world".to_string();
+            app.input.cursor_position = 11;
+            send_esc_then(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+            assert_eq!(app.input.cursor_position, 6, "Esc-b should move to the start of \"world\"");
+            send_esc_then(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+            assert_eq!(app.input.cursor_position, 11, "Esc-f should move back to the end");
+        }
+
+        // ^P: recall the previous command from history after one Enter-sent command.
+        {
+            let mut app = make_key_test_app();
+            app.input.buffer = "look".to_string();
+            app.input.cursor_position = 4;
+            let sent = send_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            match sent {
+                KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "look"),
+                other => panic!("Enter should send the typed command; got {}", describe_key_action(&other)),
+            }
+            assert_eq!(app.input.buffer, "", "Enter should clear the input buffer");
+            send_key(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+            assert_eq!(app.input.buffer, "look", "^P should recall the just-sent command from history");
+            assert_eq!(app.input.cursor_position, 4);
+        }
+
+        // PageUp: scrolls the viewport up when there's more output than fits on screen.
+        {
+            let mut app = make_key_test_app();
+            for i in 0..40u64 {
+                let seq = app.worlds[0].next_seq;
+                app.worlds[0].next_seq += 1;
+                app.worlds[0].output_lines.push(OutputLine::new(format!("line {i}"), seq));
+            }
+            let bottom = app.worlds[0].output_lines.len() - 1;
+            app.worlds[0].scroll_offset = bottom; // start "at the bottom", following live output
+            send_key(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+            assert!(app.worlds[0].scroll_offset < bottom,
+                "PageUp should scroll the viewport up when there's a full screen of output \
+                 (scroll_offset stayed at {bottom})");
+        }
+    }
+
+    #[test]
+    fn test_tf_dokey_working_names() {
+        // Regression guard for the /dokey names cmd_dokey already implements correctly (plan
+        // section C.11 / finding A: "/dokey accepts 20 of 35 names"). The remaining names,
+        // including several that are "accepted" but dead, are covered by the ignored
+        // test_tf_dokey_all_names_are_handled below.
+        fn setup(buffer: &str, cursor: usize) -> App {
+            let mut app = make_key_test_app();
+            app.input.buffer = buffer.to_string();
+            app.input.cursor_position = cursor;
+            app
+        }
+        // Mirrors the real command path (main.rs: `app.sync_tf_world_info(); ...
+        // app.tf_engine.execute(cmd); ... app.process_pending_keyboard_ops();`).
+        fn run_dokey(app: &mut App, name: &str) -> Vec<KeyAction> {
+            app.sync_tf_world_info();
+            let result = app.tf_engine.execute(&format!("/dokey {name}"));
+            assert!(matches!(result, tf::TfCommandResult::Success(_)),
+                "/dokey {name} should succeed today; got {result:?}");
+            app.process_pending_keyboard_ops()
+        }
+
+        // BSPC: backspace at the cursor.
+        {
+            let mut app = setup("hello", 5);
+            run_dokey(&mut app, "BSPC");
+            assert_eq!(app.input.buffer, "hell");
+            assert_eq!(app.input.cursor_position, 4);
+        }
+
+        // DLINE: delete the whole line regardless of cursor position.
+        {
+            let mut app = setup("hello", 2);
+            run_dokey(&mut app, "DLINE");
+            assert_eq!(app.input.buffer, "");
+            assert_eq!(app.input.cursor_position, 0);
+        }
+
+        // LEFT / RIGHT: move the cursor by one position.
+        {
+            let mut app = setup("hello", 3);
+            run_dokey(&mut app, "LEFT");
+            assert_eq!(app.input.cursor_position, 2);
+            run_dokey(&mut app, "RIGHT");
+            assert_eq!(app.input.cursor_position, 3);
+        }
+
+        // HOME / END.
+        {
+            let mut app = setup("hello", 3);
+            run_dokey(&mut app, "HOME");
+            assert_eq!(app.input.cursor_position, 0);
+            run_dokey(&mut app, "END");
+            assert_eq!(app.input.cursor_position, 5);
+        }
+
+        // DCH: delete the character under the cursor.
+        {
+            let mut app = setup("hello", 2);
+            run_dokey(&mut app, "DCH");
+            assert_eq!(app.input.buffer, "helo");
+            assert_eq!(app.input.cursor_position, 2);
+        }
+
+        // WLEFT / WRIGHT: word motion, implemented separately from Esc-b/Esc-f's
+        // InputArea::word_left/word_right (this is process_pending_keyboard_ops's own
+        // WordLeft/WordRight arms, and it orders the skip-word/skip-space steps differently).
+        {
+            let mut app = setup("hello world", 11);
+            run_dokey(&mut app, "WLEFT");
+            assert_eq!(app.input.cursor_position, 6, "WLEFT should land at the start of \"world\"");
+            run_dokey(&mut app, "WRIGHT");
+            assert_eq!(app.input.cursor_position, 11,
+                "WRIGHT from the start of a word should land at the end of that word");
+        }
+
+        // BWORD: delete the word before the cursor (space-delimited), like ^W.
+        {
+            let mut app = setup("hello world", 11);
+            run_dokey(&mut app, "BWORD");
+            assert_eq!(app.input.buffer, "hello ");
+            assert_eq!(app.input.cursor_position, 6);
+        }
+
+        // DWORD: delete the word after the cursor; the cursor itself doesn't move.
+        {
+            let mut app = setup("hello world", 5);
+            run_dokey(&mut app, "DWORD");
+            assert_eq!(app.input.buffer, "hello");
+            assert_eq!(app.input.cursor_position, 5);
+        }
+
+        // DEOL: delete from the cursor to the end of the line; cursor doesn't move.
+        {
+            let mut app = setup("hello world", 5);
+            run_dokey(&mut app, "DEOL");
+            assert_eq!(app.input.buffer, "hello");
+            assert_eq!(app.input.cursor_position, 5);
+        }
+
+        // UP / DOWN: pure cursor motion within a multi-line input, no history fallback
+        // (that's the key's job, not /dokey UP/DOWN's - see finding A).
+        {
+            let mut app = setup("line one\nline two", 17);
+            run_dokey(&mut app, "UP");
+            assert_eq!(app.input.cursor_position, 8, "UP should land at the same column on the line above");
+            run_dokey(&mut app, "DOWN");
+            assert_eq!(app.input.cursor_position, 17, "DOWN should return to the original column");
+        }
+
+        // NEWLINE: submit the input line exactly as Enter does, and return SendCommand.
+        {
+            let mut app = setup("look", 4);
+            let actions = run_dokey(&mut app, "NEWLINE");
+            assert_eq!(app.input.buffer, "", "NEWLINE should clear the input buffer");
+            match actions.as_slice() {
+                [KeyAction::SendCommand(cmd)] => assert_eq!(cmd, "look"),
+                other => panic!("NEWLINE should return exactly one SendCommand; got [{}]",
+                    other.iter().map(describe_key_action).collect::<Vec<_>>().join(", ")),
+            }
+        }
+
+        // RECALLB / RECALLF: history prev/next.
+        {
+            let mut app = setup("", 0);
+            app.input.history = vec!["look".to_string(), "north".to_string()];
+            run_dokey(&mut app, "RECALLB");
+            assert_eq!(app.input.buffer, "north");
+            run_dokey(&mut app, "RECALLB");
+            assert_eq!(app.input.buffer, "look");
+            run_dokey(&mut app, "RECALLF");
+            assert_eq!(app.input.buffer, "north");
+        }
+
+        // RECALLBEG / RECALLEND: first/last history entry.
+        {
+            let mut app = setup("something", 9);
+            app.input.history = vec!["look".to_string(), "north".to_string(), "south".to_string()];
+            run_dokey(&mut app, "RECALLBEG");
+            assert_eq!(app.input.buffer, "look");
+            run_dokey(&mut app, "RECALLEND");
+            assert_eq!(app.input.buffer, "south");
+        }
+
+        // SEARCHB / SEARCHF: history prefix search.
+        {
+            let mut app = setup("n", 1);
+            app.input.history = vec!["look".to_string(), "north".to_string(), "nudge".to_string()];
+            run_dokey(&mut app, "SEARCHB");
+            assert_eq!(app.input.buffer, "nudge",
+                "SEARCHB should find the most recent entry starting with the current prefix");
+            run_dokey(&mut app, "SEARCHB");
+            assert_eq!(app.input.buffer, "north", "SEARCHB again should continue backward");
+            run_dokey(&mut app, "SEARCHF");
+            assert_eq!(app.input.buffer, "nudge", "SEARCHF should move forward again");
+        }
+
+        // LNEXT: arm literal-next.
+        {
+            let mut app = setup("", 0);
+            assert!(!app.literal_next);
+            run_dokey(&mut app, "LNEXT");
+            assert!(app.literal_next, "LNEXT should arm literal-next");
+        }
+
+        // CLEAR: clear the output view without dropping any lines (scrollback refills it).
+        {
+            let mut app = setup("", 0);
+            app.needs_terminal_clear = false;
+            app.needs_output_redraw = false;
+            app.worlds[0].output_lines.push(OutputLine::new("keep me".to_string(), 0));
+            run_dokey(&mut app, "CLEAR");
+            assert!(app.needs_terminal_clear, "CLEAR should request a terminal clear");
+            assert!(app.needs_output_redraw, "CLEAR should request an output redraw");
+            assert_eq!(app.worlds[0].output_lines.len(), 1,
+                "CLEAR must not drop any lines - scrollback refills the view");
+        }
+
+        // PAUSE: pause the current world so new output queues as pending.
+        {
+            let mut app = setup("", 0);
+            assert!(!app.worlds[0].paused);
+            run_dokey(&mut app, "PAUSE");
+            assert!(app.worlds[0].paused, "PAUSE should pause the current world's output");
+        }
+
+        // REDRAW / REFRESH: repaint, via the same "redraw" action a live ^L press uses.
+        {
+            let mut app = setup("", 0);
+            let actions = run_dokey(&mut app, "REDRAW");
+            assert!(matches!(actions.as_slice(), [KeyAction::Redraw]),
+                "REDRAW should return exactly one KeyAction::Redraw; got [{}]",
+                actions.iter().map(describe_key_action).collect::<Vec<_>>().join(", "));
+            let actions = run_dokey(&mut app, "REFRESH");
+            assert!(matches!(actions.as_slice(), [KeyAction::Redraw]),
+                "REFRESH should return exactly one KeyAction::Redraw; got [{}]",
+                actions.iter().map(describe_key_action).collect::<Vec<_>>().join(", "));
+        }
+
+        // SOCKETB / SOCKETF: switch to the previous/next world.
+        {
+            let mut app = setup("", 0);
+            app.worlds.push(World::new("second"));
+            // World cycling only considers connected worlds (or ones with unseen/pending
+            // output) - see util::world_should_cycle.
+            app.worlds[0].connected = true;
+            app.worlds[1].connected = true;
+            app.current_world_index = 0;
+            let actions = run_dokey(&mut app, "SOCKETF");
+            assert_eq!(app.current_world_index, 1, "SOCKETF should switch to the next world");
+            assert!(matches!(actions.as_slice(), [KeyAction::SwitchedWorld(1)]));
+            let actions = run_dokey(&mut app, "SOCKETB");
+            assert_eq!(app.current_world_index, 0, "SOCKETB should switch back to the previous world");
+            assert!(matches!(actions.as_slice(), [KeyAction::SwitchedWorld(0)]));
+        }
+
+        // PAGE / PAGEBACK: full-page scroll, same magnitude as the PageUp/PageDown keys
+        // (PGDN/PGUP are aliases of these, not of HPAGE/HPAGEBACK).
+        {
+            let mut app = setup("", 0);
+            for i in 0..40u64 {
+                let seq = app.worlds[0].next_seq;
+                app.worlds[0].next_seq += 1;
+                app.worlds[0].output_lines.push(OutputLine::new(format!("line {i}"), seq));
+            }
+            let bottom = app.worlds[0].output_lines.len() - 1;
+            app.worlds[0].scroll_offset = bottom;
+            run_dokey(&mut app, "PAGEBACK");
+            assert!(app.worlds[0].scroll_offset < bottom, "PAGEBACK should scroll the viewport up");
+            let scrolled_to = app.worlds[0].scroll_offset;
+            run_dokey(&mut app, "PAGE");
+            assert!(app.worlds[0].scroll_offset > scrolled_to, "PAGE should scroll back toward the bottom");
+        }
+
+        // HPAGE / HPAGEBACK: half-page scroll, forward direction fixed (previously
+        // mis-wired to page-up - see finding A in the TF-parity plan).
+        {
+            let mut app = setup("", 0);
+            for i in 0..40u64 {
+                let seq = app.worlds[0].next_seq;
+                app.worlds[0].next_seq += 1;
+                app.worlds[0].output_lines.push(OutputLine::new(format!("line {i}"), seq));
+            }
+            let bottom = app.worlds[0].output_lines.len() - 1;
+            app.worlds[0].scroll_offset = bottom;
+            run_dokey(&mut app, "HPAGEBACK");
+            assert!(app.worlds[0].scroll_offset < bottom, "HPAGEBACK should scroll the viewport up");
+            let scrolled_to = app.worlds[0].scroll_offset;
+            run_dokey(&mut app, "HPAGE");
+            assert!(app.worlds[0].scroll_offset > scrolled_to,
+                "HPAGE should scroll forward (toward newer output), not back up");
+        }
+
+        // LINE / LINEBACK: one-line scroll.
+        {
+            let mut app = setup("", 0);
+            for i in 0..40u64 {
+                let seq = app.worlds[0].next_seq;
+                app.worlds[0].next_seq += 1;
+                app.worlds[0].output_lines.push(OutputLine::new(format!("line {i}"), seq));
+            }
+            let bottom = app.worlds[0].output_lines.len() - 1;
+            app.worlds[0].scroll_offset = bottom;
+            run_dokey(&mut app, "LINEBACK");
+            assert!(app.worlds[0].scroll_offset < bottom, "LINEBACK should scroll the viewport up by one line");
+            let scrolled_to = app.worlds[0].scroll_offset;
+            run_dokey(&mut app, "LINE");
+            assert!(app.worlds[0].scroll_offset > scrolled_to, "LINE should scroll back down by one line");
+        }
+
+        // FLUSH: jump to the end, releasing all pending output.
+        {
+            let mut app = setup("", 0);
+            app.worlds[0].paused = true;
+            for i in 0..5u64 {
+                let seq = app.worlds[0].next_seq;
+                app.worlds[0].next_seq += 1;
+                app.worlds[0].pending_lines.push(OutputLine::new(format!("pending {i}"), seq));
+            }
+            run_dokey(&mut app, "FLUSH");
+            assert!(app.worlds[0].pending_lines.is_empty(), "FLUSH should release all pending lines");
+            assert!(!app.worlds[0].paused, "FLUSH should clear the pause");
+        }
+
+        // SELFLUSH: keep highlighted pending lines, drop the rest, and jump to the end.
+        {
+            let mut app = setup("", 0);
+            app.worlds[0].paused = true;
+            for i in 0..3u64 {
+                let seq = app.worlds[0].next_seq;
+                app.worlds[0].next_seq += 1;
+                app.worlds[0].pending_lines.push(OutputLine::new(format!("plain {i}"), seq));
+            }
+            let seq = app.worlds[0].next_seq;
+            app.worlds[0].next_seq += 1;
+            let mut highlighted = OutputLine::new("highlighted".to_string(), seq);
+            highlighted.highlight_color = Some("red".to_string());
+            app.worlds[0].pending_lines.push(highlighted);
+            run_dokey(&mut app, "SELFLUSH");
+            assert!(app.worlds[0].pending_lines.is_empty(), "SELFLUSH should clear pending_lines");
+            assert!(!app.worlds[0].paused, "SELFLUSH should clear the pause");
+            assert!(app.worlds[0].output_lines.iter().any(|l| l.text == "highlighted"),
+                "SELFLUSH should keep highlighted pending lines");
+            assert!(!app.worlds[0].output_lines.iter().any(|l| l.text == "plain 0"),
+                "SELFLUSH should drop non-highlighted pending lines");
+        }
+    }
+
+    /// Plan Job 14c: `/grab <text>` replaces the input buffer, discarding
+    /// whatever was already there (`/help grab`: "Any text already in the
+    /// input buffer is discarded" - the one difference from `/input`, which
+    /// inserts without discarding). Mirrors `test_tf_dokey_working_names`'s
+    /// own pattern above: sync keyboard state, execute through the TF
+    /// engine, then drain PendingKeyboardOps the same way the real command
+    /// path does (`App::process_pending_keyboard_ops`).
+    #[test]
+    fn test_tf_grab_replaces_input_buffer() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "leftover text".to_string();
+        app.input.cursor_position = 5;
+
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute("/grab new text");
+        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        app.process_pending_keyboard_ops();
+
+        assert_eq!(app.input.buffer, "new text");
+        assert_eq!(app.input.cursor_position, "new text".chars().count());
+    }
+
+    #[test]
+    fn test_tf_dokey_all_names_are_handled() {
+        // TinyFugue's full /dokey vocabulary, from tf-help's /dokey table (also quoted in the
+        // plan doc). Clay's cmd_dokey (src/tf/builtins.rs) only implements a subset (finding A
+        // / plan section C.11: "/dokey accepts 20 of 35 names ... UP DOWN NEWLINE FLUSH PAGE
+        // HPAGE SEARCHB SEARCHF PAUSE emit __dokey_* strings that nothing handles (dead)").
+        const TF_DOKEY_NAMES: &[&str] = &[
+            "BSPC", "BWORD", "DLINE", "REFRESH", "LNEXT", "UP", "DOWN", "RIGHT", "LEFT",
+            "NEWLINE", "RECALLB", "RECALLF", "RECALLBEG", "RECALLEND", "SEARCHB", "SEARCHF",
+            "SOCKETB", "SOCKETF", "DWORD", "DCH", "REDRAW", "CLEAR", "HOME", "END", "WLEFT",
+            "WRIGHT", "DEOL", "PAUSE", "PAGE", "PAGEBACK", "HPAGE", "HPAGEBACK", "PGUP", "PGDN",
+            "LINE", "LINEBACK", "FLUSH", "SELFLUSH",
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+
+        for name in TF_DOKEY_NAMES {
+            let mut engine = tf::TfEngine::new();
+            let result = engine.execute(&format!("/dokey {name}"));
+            match result {
+                tf::TfCommandResult::Error(ref e) => {
+                    failures.push(format!("{name}: Error({e:?})"));
+                }
+                tf::TfCommandResult::ClayCommand(ref cmd) => {
+                    match parse_command(cmd) {
+                        Command::Unknown { .. } => {
+                            failures.push(format!(
+                                "{name}: ClayCommand({cmd:?}) -> Command::Unknown"));
+                        }
+                        Command::NotACommand { .. } => {
+                            failures.push(format!(
+                                "{name}: ClayCommand({cmd:?}) has no leading '/', so \
+                                 handle_command's parse_command treats it as plain text and \
+                                 sends it to the MUD instead of handling it"));
+                        }
+                        Command::ActionCommand { .. } => {
+                            // No user-defined action named this exists on a fresh engine, so
+                            // handle_command's ActionCommand arm falls through to
+                            // app.tf_engine.execute(cmd) again (commands.rs's
+                            // "no matching action - try TF engine" branch) -- probe that exact
+                            // fallback the same way. A *second* ClayCommand is exactly as dead
+                            // as UnknownCommand/Error here: commands.rs's own comment on this
+                            // path is "Avoid recursion - just show unknown" -- it does not loop,
+                            // it prints "Unknown command: <name>" (e.g. /dokey REFRESH and
+                            // REDRAW both resolve to ClayCommand("/redraw"), and "/redraw" is
+                            // not a real TF command, so this exact case fires).
+                            let mut probe = tf::TfEngine::new();
+                            match probe.execute(cmd) {
+                                tf::TfCommandResult::UnknownCommand(_)
+                                | tf::TfCommandResult::Error(_)
+                                | tf::TfCommandResult::ClayCommand(_) => {
+                                    failures.push(format!(
+                                        "{name}: ClayCommand({cmd:?}) has no matching action and \
+                                         isn't a real TF command either -- dead end"));
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(failures.is_empty(),
+            "/dokey names that are not fully handled today ({} of {}):\n{}",
+            failures.len(), TF_DOKEY_NAMES.len(), failures.join("\n"));
+    }
+
+    // ---- Plan Job 21 (P2.5): native `dokey_<name>` wrapper commands ----
+    //
+    // Real kbfunc.tf defines `dokey_<name>` as invisible `-i` macros around the raw,
+    // always-single-step `/dokey NAME` builtin (some of them - BSPC/DCH/LEFT/RIGHT/
+    // WLEFT/WRIGHT/UP/DOWN - reading `%kbnum` themselves to multiply it); these tests
+    // cover Clay's native fallback for when that library isn't loaded.
+
+    #[test]
+    fn test_dokey_named_home_moves_cursor() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 3;
+
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute("/dokey_home");
+        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        app.process_pending_keyboard_ops();
+
+        assert_eq!(app.input.cursor_position, 0, "/dokey_home should move the cursor to the start");
+    }
+
+    #[test]
+    fn test_dokey_named_left_honors_kbnum() {
+        // Plan Job 21/P2.5's own worked example: Esc-3 (kbnum=3) then /dokey_left
+        // moves three characters - real TF's own /dokey builtin is always a single
+        // step (see cmd_dokey's own doc comment), but kbfunc.tf's dokey_left wrapper
+        // macro reads %kbnum itself (`kbgoto(kbpoint() - (kbnum?:1))`), which is
+        // exactly what cmd_dokey_named must reproduce natively.
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello world".to_string();
+        app.input.cursor_position = 11;
+
+        // `Esc-3` has no default binding to the `kbnum_3` action yet (Job 20's own
+        // note: that binding lands in Job 22) - drive kbnum entry directly the same
+        // way `test_kbnum_engine_mirror_visible_in_bound_command_then_cleared` does.
+        dispatch_action("kbnum_3", &mut app);
+        assert_eq!(app.input.kbnum, Some(3));
+
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute("/dokey_left");
+        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        app.process_pending_keyboard_ops();
+
+        assert_eq!(app.input.cursor_position, 8, "/dokey_left with kbnum=3 should move three characters left");
+    }
+
+    #[test]
+    fn test_dokey_named_negative_kbnum_reverses_direction() {
+        // tf-help #kbnum: "For keybindings that have a sense of direction, negative
+        // values of kbnum reverse that direction".
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello world".to_string();
+        app.input.cursor_position = 0;
+        app.input.kbnum = Some(-2);
+
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute("/dokey_right");
+        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        app.process_pending_keyboard_ops();
+
+        assert_eq!(app.input.cursor_position, 0,
+            "a negative kbnum reverses direction - /dokey_right should move LEFT, clamped at 0");
+    }
+
+    #[test]
+    fn test_dokey_named_dch_honors_kbnum() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello world".to_string();
+        app.input.cursor_position = 0;
+        app.input.kbnum = Some(3);
+
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute("/dokey_dch");
+        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        app.process_pending_keyboard_ops();
+
+        assert_eq!(app.input.buffer, "lo world", "/dokey_dch with kbnum=3 should delete three characters forward");
+        assert_eq!(app.input.cursor_position, 0, "deleting forward of the cursor never moves it");
+    }
+
+    // ---- Plan Job 21 (P2.5): `key_<name>` named-key indirection + `/def -B` ----
+
+    #[test]
+    fn test_key_name_macro_overrides_default_action() {
+        // `/def key_f5 = ...` overrides F5's default action (search_popup) - TF's
+        // own two-level key mapping (`/help keys`'s "Mapping Named Keys to
+        // functions"), checked after `/bind` but before the built-in action table.
+        let mut app = make_key_test_app();
+        let def = app.tf_engine.execute("/def key_f5 = /echo hi");
+        assert!(matches!(def, tf::TfCommandResult::Success(_)), "got {def:?}");
+
+        let action = send_key(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        match action {
+            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/key_f5"),
+            other => panic!(
+                "F5 should fire the key_f5 macro, not the default search_popup action; got {}",
+                describe_key_action(&other)
+            ),
+        }
+        assert!(!app.search_popup.visible, "the default F5 action must not also have run");
+    }
+
+    #[test]
+    fn test_key_name_macro_esc_left() {
+        let mut app = make_key_test_app();
+        let def = app.tf_engine.execute("/def key_esc_left = /echo hi");
+        assert!(matches!(def, tf::TfCommandResult::Success(_)), "got {def:?}");
+
+        let action = send_esc_then(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        match action {
+            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/key_esc_left"),
+            other => panic!("Esc,Left should fire the key_esc_left macro; got {}", describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_key_name_meta_falls_back_to_esc_when_undefined() {
+        // TF's own rule: key_meta_<x> is tried first, and falls back to
+        // key_esc_<x> when undefined - some terminals can't tell Alt-Left apart
+        // from Esc then Left.
+        let mut app = make_key_test_app();
+        let def = app.tf_engine.execute("/def key_esc_left = /echo fallback");
+        assert!(matches!(def, tf::TfCommandResult::Success(_)), "got {def:?}");
+
+        let action = send_key(&mut app, KeyCode::Left, KeyModifiers::ALT);
+        match action {
+            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/key_esc_left"),
+            other => panic!("Alt-Left should fall back to key_esc_left when key_meta_left is undefined; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_key_name_meta_defined_wins_over_esc_fallback() {
+        let mut app = make_key_test_app();
+        app.tf_engine.execute("/def key_esc_left = /echo fallback");
+        app.tf_engine.execute("/def key_meta_left = /echo meta");
+
+        let action = send_key(&mut app, KeyCode::Left, KeyModifiers::ALT);
+        match action {
+            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/key_meta_left"),
+            other => panic!("Alt-Left should prefer key_meta_left when it IS defined; got {}", describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_def_capital_b_named_key_binding_fires() {
+        let mut app = make_key_test_app();
+        let def = app.tf_engine.execute(r#"/def -B"F5" = /echo b"#);
+        assert!(matches!(def, tf::TfCommandResult::Success(_)), "got {def:?}");
+
+        let action = send_key(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        match action {
+            KeyAction::SendCommand(cmd) => assert_eq!(cmd, "/echo b"),
+            other => panic!("F5 should fire the -B\"F5\" nameless macro's body; got {}", describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_def_capital_b_rejects_nkp_names() {
+        let mut app = make_key_test_app();
+        let def = app.tf_engine.execute("/def -B'nkp5' = /echo x");
+        assert!(matches!(def, tf::TfCommandResult::Error(_)),
+            "-B'nkp5' should error (no Clay equivalent for numeric-keypad names); got {def:?}");
+    }
+
+    #[test]
+    fn test_dokey_named_shadowed_by_user_macro() {
+        // kbfunc.tf's own invisible dokey_<name> macros (and any user's own
+        // `/def dokey_home = ...`) must shadow this native fallback - ordinary
+        // macro-before-builtin precedence (execute_command_impl checks
+        // engine.macros before is_tf_command_name), nothing dokey-specific needed.
+        let mut app = make_key_test_app();
+        app.tf_engine.execute("/def dokey_home = /echo shadowed");
+        let result = app.tf_engine.execute("/dokey_home");
+        match result {
+            tf::TfCommandResult::Success(Some(s)) => assert_eq!(s, "shadowed"),
+            other => panic!("a user-defined dokey_home macro should shadow the native command; got {other:?}"),
+        }
+    }
+
+    // ---- Plan Job 19 (P2.3): new bindable actions, console side ----
+    //
+    // Every id below is new in `keybindings::ACTIONS`/`input_handler::dispatch_action`.
+    // `perform_dokey` (main.rs) now calls `dispatch_action` for each of these instead of
+    // duplicating their bodies - `test_tf_dokey_working_names`/`test_tf_dokey_all_names_are_handled`
+    // above already cover the `/dokey` side of that sharing and must keep passing unchanged.
+
+    fn push_lines(app: &mut App, count: u64) {
+        for i in 0..count {
+            let seq = app.worlds[0].next_seq;
+            app.worlds[0].next_seq += 1;
+            app.worlds[0].output_lines.push(OutputLine::new(format!("line {i}"), seq));
+        }
+    }
+
+    #[test]
+    fn test_action_recall_begin_end() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "something".to_string();
+        app.input.cursor_position = 9;
+        app.input.history = vec!["look".to_string(), "north".to_string(), "south".to_string()];
+
+        dispatch_action("recall_begin", &mut app);
+        assert_eq!(app.input.buffer, "look", "recall_begin should jump to the oldest history entry");
+
+        dispatch_action("recall_end", &mut app);
+        assert_eq!(app.input.buffer, "south", "recall_end should jump to the newest history entry");
+    }
+
+    /// Finding 41 / Job 22c end-to-end: `Ctrl-Home` is a default binding for `recall_begin`
+    /// (`KeyBindings::defaults()`), but before this fix `key_event_to_token` dropped the Ctrl
+    /// modifier on `KeyCode::Home` entirely, so a real Ctrl-Home keypress named itself plain
+    /// `"Home"` and could never reach the `recall_begin` binding at all. Drives the full
+    /// `handle_key_event` path (not `dispatch_action` directly) so it also exercises the
+    /// lookup that finding 41 broke.
+    #[test]
+    fn test_ctrl_home_dispatches_recall_begin() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "something".to_string();
+        app.input.cursor_position = 9;
+        app.input.history = vec!["look".to_string(), "north".to_string(), "south".to_string()];
+
+        let action = send_key(&mut app, KeyCode::Home, KeyModifiers::CONTROL);
+        assert!(matches!(action, KeyAction::None),
+            "recall_begin doesn't produce a KeyAction; got {}", describe_key_action(&action));
+        assert_eq!(app.input.buffer, "look",
+            "Ctrl-Home should have dispatched recall_begin and jumped to the oldest history entry");
+
+        // Sanity: a bare (unmodified) Home must still behave as plain cursor-home, not
+        // recall_begin - this fix must not have widened Home's own default binding.
+        let mut app2 = make_key_test_app();
+        app2.input.buffer = "hello".to_string();
+        app2.input.cursor_position = 5;
+        send_key(&mut app2, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app2.input.cursor_position, 0, "plain Home should still move the cursor, not recall");
+        assert_eq!(app2.input.buffer, "hello", "plain Home must not trigger recall_begin");
+    }
+
+    #[test]
+    fn test_action_scroll_line_forward_and_back() {
+        let mut app = make_key_test_app();
+        push_lines(&mut app, 40);
+        let bottom = app.worlds[0].output_lines.len() - 1;
+        app.worlds[0].scroll_offset = bottom;
+
+        dispatch_action("scroll_line_back", &mut app);
+        assert!(app.worlds[0].scroll_offset < bottom,
+            "scroll_line_back should move the viewport up by one line");
+        let scrolled_to = app.worlds[0].scroll_offset;
+
+        dispatch_action("scroll_line_forward", &mut app);
+        assert!(app.worlds[0].scroll_offset > scrolled_to,
+            "scroll_line_forward should move the viewport back down by one line");
+    }
+
+    #[test]
+    fn test_action_scroll_page_back_is_alias_of_scroll_page_up() {
+        // Two identically-set-up apps: one driven through each id. If they diverge, this
+        // stopped being a real alias.
+        let mut app_alias = make_key_test_app();
+        push_lines(&mut app_alias, 60);
+        let bottom = app_alias.worlds[0].output_lines.len() - 1;
+        app_alias.worlds[0].scroll_offset = bottom;
+
+        let mut app_original = make_key_test_app();
+        push_lines(&mut app_original, 60);
+        app_original.worlds[0].scroll_offset = bottom;
+
+        dispatch_action("scroll_page_back", &mut app_alias);
+        dispatch_action("scroll_page_up", &mut app_original);
+
+        assert!(app_alias.worlds[0].scroll_offset < bottom, "scroll_page_back should scroll up");
+        assert_eq!(app_alias.worlds[0].scroll_offset, app_original.worlds[0].scroll_offset,
+            "scroll_page_back must produce the exact same result as scroll_page_up");
+    }
+
+    #[test]
+    fn test_action_scroll_half_page_back() {
+        let mut app = make_key_test_app();
+        push_lines(&mut app, 40);
+        let bottom = app.worlds[0].output_lines.len() - 1;
+        app.worlds[0].scroll_offset = bottom;
+
+        dispatch_action("scroll_half_page_back", &mut app);
+        assert!(app.worlds[0].scroll_offset < bottom,
+            "scroll_half_page_back should scroll the viewport up");
+
+        // And scroll_half_page (existing action, now sharing dokey_scroll_forward with
+        // /dokey HPAGE - see its own comment in dispatch_action) moves back toward the
+        // bottom, i.e. genuinely "forward" - the bug this job fixed along the way.
+        let scrolled_to = app.worlds[0].scroll_offset;
+        dispatch_action("scroll_half_page", &mut app);
+        assert!(app.worlds[0].scroll_offset > scrolled_to,
+            "scroll_half_page should scroll forward (toward newer output), not further back");
+    }
+
+    #[test]
+    fn test_action_clear_screen() {
+        let mut app = make_key_test_app();
+        app.needs_terminal_clear = false;
+        app.needs_output_redraw = false;
+        app.worlds[0].output_lines.push(OutputLine::new("keep me".to_string(), 0));
+
+        dispatch_action("clear_screen", &mut app);
+
+        assert!(app.needs_terminal_clear, "clear_screen should request a terminal clear");
+        assert!(app.needs_output_redraw, "clear_screen should request an output redraw");
+        assert_eq!(app.worlds[0].output_lines.len(), 1,
+            "clear_screen must not drop any lines - scrollback refills the view");
+    }
+
+    #[test]
+    fn test_action_pause_output() {
+        let mut app = make_key_test_app();
+        assert!(!app.worlds[0].paused);
+        dispatch_action("pause_output", &mut app);
+        assert!(app.worlds[0].paused, "pause_output should pause the current world's output");
+    }
+
+    #[test]
+    fn test_action_kill_to_start_pushes_kill_ring() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello world".to_string();
+        app.input.cursor_position = 5; // just after "hello"
+
+        dispatch_action("kill_to_start", &mut app);
+
+        assert_eq!(app.input.buffer, " world",
+            "kill_to_start should delete from the start of the line to the cursor");
+        assert_eq!(app.input.cursor_position, 0);
+        assert_eq!(app.input.kill_ring.last().map(String::as_str), Some("hello"),
+            "kill_to_start should push the killed text to the kill ring");
+    }
+
+    #[test]
+    fn test_action_expand_line_substitutes_expressions() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "say $[1+1]".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        dispatch_action("expand_line", &mut app);
+
+        assert_eq!(app.input.buffer, "say 2",
+            "expand_line should substitute %var/$[]/$() in the current input line in place");
+        assert_eq!(app.input.cursor_position, app.input.buffer.len());
+    }
+
+    #[test]
+    fn test_action_completion_completes_slash_command() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "/hel".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        dispatch_action("completion", &mut app);
+
+        assert_eq!(app.input.buffer, "/help",
+            "completion should complete a partial slash command the same way Tab does");
+    }
+
+    #[test]
+    fn test_action_world_socket_prev_next_cycle_connected_only() {
+        // Three worlds: alpha and gamma are CONNECTED; beta is not connected but has unseen
+        // output, so world_next/world_prev's "active worlds" cycling (unseen-first) WOULD
+        // visit it - world_socket_prev/next must not, since TF's SOCKETB/SOCKETF (/fg -</->)
+        // only ever cycles actual open sockets. This is the "distinct from world_prev/next"
+        // requirement, demonstrated rather than just asserted.
+        let mut app = make_key_test_app();
+        app.worlds[0].name = "alpha".to_string();
+        app.worlds[0].connected = true;
+        app.worlds.push(World::new("beta"));
+        app.worlds[1].connected = false;
+        app.worlds[1].unseen_lines = 5;
+        app.worlds.push(World::new("gamma"));
+        app.worlds[2].connected = true;
+        app.current_world_index = 0;
+
+        // world_socket_next skips beta (not connected) and lands directly on gamma.
+        let action = dispatch_action("world_socket_next", &mut app);
+        assert_eq!(app.current_world_index, 2,
+            "world_socket_next should skip the disconnected world and land on the next \
+             CONNECTED one");
+        assert!(matches!(action, KeyAction::SwitchedWorld(2)));
+
+        // world_socket_prev cycles back the same connected-only way.
+        let action = dispatch_action("world_socket_prev", &mut app);
+        assert_eq!(app.current_world_index, 0);
+        assert!(matches!(action, KeyAction::SwitchedWorld(0)));
+
+        // Contrast: world_next (existing action, "active worlds", unseen-first) DOES visit
+        // the disconnected-but-unseen beta from the same starting position.
+        let action = dispatch_action("world_next", &mut app);
+        assert_eq!(app.current_world_index, 1,
+            "world_next's unseen-first active-world cycling should visit beta, unlike \
+             world_socket_next");
+        assert!(matches!(action, KeyAction::SwitchedWorld(1)));
+    }
+
+    #[test]
+    fn test_action_world_socket_prev_next_noop_when_nothing_to_cycle_to() {
+        // Only the current world is connected - nothing else to cycle to.
+        let mut app = make_key_test_app();
+        app.worlds[0].connected = true;
+        assert_eq!(app.worlds.len(), 1);
+
+        let action = dispatch_action("world_socket_next", &mut app);
+        assert_eq!(app.current_world_index, 0);
+        assert!(matches!(action, KeyAction::None));
+
+        // No connected worlds at all.
+        app.worlds[0].connected = false;
+        let action = dispatch_action("world_socket_prev", &mut app);
+        assert_eq!(app.current_world_index, 0);
+        assert!(matches!(action, KeyAction::None));
+    }
+
+    #[test]
+    fn test_action_bg_all_worlds_is_noop() {
+        // TF /bg (= /fg -n): nothing to represent in Clay's single-pane console - see
+        // dispatch_action's own doc comment on this arm.
+        let mut app = make_key_test_app();
+        app.worlds.push(World::new("second"));
+        app.current_world_index = 0;
+
+        let action = dispatch_action("bg_all_worlds", &mut app);
+
+        assert!(matches!(action, KeyAction::None));
+        assert_eq!(app.current_world_index, 0, "bg_all_worlds must not change the current world");
+        assert_eq!(app.worlds.len(), 2, "bg_all_worlds must not touch the world list");
+    }
+
+    #[test]
+    fn test_action_refresh_line_vs_redraw_server_only() {
+        // TF's real REFRESH/^L (plain repaint) vs. Clay's historical filtering ^L: the two
+        // must be distinguishable at the KeyAction level so the call site in main.rs knows
+        // whether to run World::filter_to_server_output first (see KeyAction::Refresh's own
+        // doc comment).
+        let mut app = make_key_test_app();
+        let refresh = dispatch_action("refresh_line", &mut app);
+        assert!(matches!(refresh, KeyAction::Refresh),
+            "refresh_line should return KeyAction::Refresh, not KeyAction::Redraw");
+
+        let redraw = dispatch_action("redraw_server_only", &mut app);
+        assert!(matches!(redraw, KeyAction::Redraw),
+            "redraw_server_only should return KeyAction::Redraw (Clay's historical ^L)");
+    }
+
+    #[test]
+    fn test_dispatch_action_handles_every_action_id() {
+        // Every entry in keybindings::ACTIONS must be recognised by dispatch_action - an id
+        // present in the editor/settings.dat grammar but silently unhandled would look like a
+        // real binding that quietly does nothing. dispatch_action_is_known distinguishes "a
+        // known action that happens to produce KeyAction::None" from "fell through to the
+        // unknown-action arm", which dispatch_action's return value alone cannot do.
+        let mut app = make_key_test_app();
+        let mut unhandled: Vec<&str> = Vec::new();
+        for action in keybindings::ACTIONS {
+            if !dispatch_action_is_known(action.id, &mut app) {
+                unhandled.push(action.id);
+            }
+        }
+        assert!(unhandled.is_empty(),
+            "keybindings::ACTIONS entries not handled by dispatch_action: {:#?}", unhandled);
+    }
+
+    // ---- Plan Job 20 (P2.4): kbnum (numeric prefix) + insert mode ----
+    //
+    // `Esc-0`..`Esc-9`/`Esc--` have no default key binding yet (Job 22 lands the new
+    // default table per finding A's ruling), so these tests dispatch the
+    // `kbnum_N`/`kbnum_negative` action ids directly - exactly what a future `Esc-N`
+    // keypress will do - and drive the *consuming* side through a real keypress wherever
+    // an existing default binding already reaches it (`Esc-d`, `Esc-c`, `^G`, arrow keys).
+
+    #[test]
+    fn test_kbnum_esc3_then_delete_word_forward_deletes_three_words() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "one two three four five".to_string();
+        app.input.cursor_position = 0;
+        dispatch_action("kbnum_3", &mut app);
+        assert_eq!(app.input.kbnum, Some(3));
+
+        let action = send_esc_then(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(matches!(action, KeyAction::None));
+        assert_eq!(app.input.buffer, " four five", "Esc-3 Esc-d should delete three words");
+        assert_eq!(app.input.kbnum, None, "kbnum must be cleared after use");
+    }
+
+    #[test]
+    fn test_kbnum_esc2_cursor_left_moves_two() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 5;
+        dispatch_action("kbnum_2", &mut app);
+        send_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.input.cursor_position, 3, "Esc-2 Left should move left two");
+    }
+
+    #[test]
+    fn test_kbnum_negative_two_cursor_left_moves_right() {
+        // TF: `Esc - 4 PgDn` behaves like `PgUp` 4 times (tf-help #kbnum) - a negative
+        // kbnum reverses the direction of any keybinding with a sense of direction.
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 1;
+        dispatch_action("kbnum_negative", &mut app);
+        dispatch_action("kbnum_2", &mut app);
+        assert_eq!(app.input.kbnum, Some(-2));
+        send_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.input.cursor_position, 3,
+            "Esc-- Esc-2 then Left should move right two (negative kbnum reverses direction)");
+    }
+
+    #[test]
+    fn test_kbnum_bell_cancels_without_consuming() {
+        // kbbind.tf: "^G does NOT honor kbnum, so it can be used to cancel kbnum entry."
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 5;
+        dispatch_action("kbnum_5", &mut app);
+        assert_eq!(app.input.kbnum, Some(5));
+        send_key(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL); // ^G = bell
+        assert_eq!(app.input.kbnum, None, "^G must cancel a pending prefix");
+        send_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.input.cursor_position, 4,
+            "the next Left should move only one - the cancelled prefix must not still apply");
+    }
+
+    #[test]
+    fn test_kbnum_typed_char_clears_pending_prefix() {
+        let mut app = make_key_test_app();
+        dispatch_action("kbnum_5", &mut app);
+        assert_eq!(app.input.kbnum, Some(5));
+        send_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.input.kbnum, None, "an ordinary typed character cancels a pending prefix");
+        assert_eq!(app.input.buffer, "x");
+    }
+
+    #[test]
+    fn test_kbnum_esc2_capitalize_word_does_two_words() {
+        let mut app = make_key_test_app();
+        app.input.buffer = "one two three".to_string();
+        app.input.cursor_position = 0;
+        dispatch_action("kbnum_2", &mut app);
+        send_esc_then(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(app.input.buffer, "One Two three", "Esc-2 Esc-c should capitalize two words");
+    }
+
+    #[test]
+    fn test_kbnum_digits_accumulate_across_two_esc_presses() {
+        // TF: "ESC 1 2 x is the same as typing x 12 times" - Clay's discrete Esc-N chords
+        // reach the same accumulated value (see InputArea::kbnum_digit's doc comment for
+        // how this differs mechanically from real TF's own bare-digit-appends reader).
+        let mut app = make_key_test_app();
+        dispatch_action("kbnum_1", &mut app);
+        dispatch_action("kbnum_2", &mut app);
+        assert_eq!(app.input.kbnum, Some(12));
+    }
+
+    #[test]
+    fn test_toggle_insert_flips_mode() {
+        let mut app = make_key_test_app();
+        assert!(app.input.insert, "insert mode defaults to on");
+        dispatch_action("toggle_insert", &mut app);
+        assert!(!app.input.insert);
+        dispatch_action("toggle_insert", &mut app);
+        assert!(app.input.insert);
+    }
+
+    #[test]
+    fn test_insert_off_typing_overwrites_and_appends_at_end() {
+        let mut app = make_key_test_app();
+        app.input.insert = false;
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 0;
+        send_key(&mut app, KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(app.input.buffer, "Xello", "overwrite mode replaces the char under the cursor");
+        app.input.cursor_position = app.input.buffer.len();
+        send_key(&mut app, KeyCode::Char('!'), KeyModifiers::NONE);
+        assert_eq!(app.input.buffer, "Xello!", "at end of line, overwrite mode just appends");
+    }
+
+    #[test]
+    fn test_set_insert_from_tf_command_reflected_in_input_area() {
+        // Mirrors the real command path (main.rs: sync_tf_world_info(); execute(cmd);
+        // process_pending_keyboard_ops()) - see process_pending_keyboard_ops's own doc
+        // comment on the read-back-and-clear step this depends on.
+        let mut app = make_key_test_app();
+        assert!(app.input.insert);
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute("/set insert=0");
+        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        app.process_pending_keyboard_ops();
+        assert!(!app.input.insert, "/set insert=0 must be reflected back into InputArea.insert");
+    }
+
+    #[test]
+    fn test_input_command_respects_insert_mode() {
+        // `/input` (and the `input()` expression function kbfunc.tf's kb_* macros use) is
+        // the TF-side path that actually writes into the buffer under `%insert` - this is
+        // what "/dokey respects it" means in practice, since none of cmd_dokey's own
+        // synchronous names (BSPC/LEFT/RIGHT/...) insert arbitrary text.
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 0;
+        app.input.insert = false;
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute("/input X");
+        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        app.process_pending_keyboard_ops();
+        assert_eq!(app.input.buffer, "Xello", "/input should overwrite when insert mode is off");
+    }
+
+    #[test]
+    fn test_pending_insert_captures_mode_at_push_time_not_drain_time() {
+        // kbfunc.tf's kb_capitalize_word/kb_downcase_word/kb_upcase_word/kb_transpose_chars
+        // all temporarily `/set insert=0` around their own `input()` call and restore it
+        // before the macro returns - by the time process_pending_keyboard_ops drains the
+        // queue, the engine's live `insert` variable is already back to its original value.
+        // PendingKeyboardOp::Insert must capture the mode at push time (its own doc
+        // comment) or this whole macro family would silently stop overwriting.
+        let mut app = make_key_test_app();
+        app.input.buffer = "hello".to_string();
+        app.input.cursor_position = 0;
+        app.tf_engine.set_global("insert", tf::TfValue::Integer(0));
+        let insert_mode = app.tf_engine.insert_mode();
+        app.tf_engine.pending_keyboard_ops.push(tf::PendingKeyboardOp::Insert("X".to_string(), insert_mode));
+        app.tf_engine.set_global("insert", tf::TfValue::Integer(1)); // the macro restores it
+        app.process_pending_keyboard_ops();
+        assert_eq!(app.input.buffer, "Xello",
+            "the queued op must use insert=0 (captured when pushed), not the restored insert=1");
+    }
+
+    #[test]
+    fn test_kbnum_engine_mirror_visible_in_bound_command_then_cleared() {
+        // Requirement 1: a key-bound TF command can read $[kbnum] the same way real TF's
+        // keybinding layer does (tf-help #kbnum), and kbnum is cleared afterward either way.
+        //
+        // Bound via `/def -b` here (plain `/bind` now behaves identically - finding 40 /
+        // plan Job 21 fixed the substitution-timing gap this comment used to document, see
+        // `test_bind_defers_substitution_to_keypress` below for the regression test).
+        // `/def -b`'s body defers substitution to invocation time like any other macro
+        // body, which is what real TF's keybinding layer actually relies on (kbfunc.tf's
+        // dokey_* macros read %kbnum fresh every time they fire) - this is the mechanism
+        // Job 21's named-key layer builds on, so it's the one this test exercises.
+        let mut app = make_key_test_app();
+        dispatch_action("kbnum_4", &mut app);
+        assert_eq!(app.input.kbnum, Some(4));
+
+        // No space around `=`: `/let name = value` (spaced) mis-splits in Clay's own
+        // `split_set_or_let_value` today (a separate, pre-existing quirk unrelated to this
+        // job - it folds the `=` itself into the value), so `name=value` is used here.
+        let bound = app.tf_engine.execute("/def -b'^[x' = /let kbnum_seen=$[kbnum]");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)), "got {bound:?}");
+
+        let action = send_esc_then(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        let cmd = match action {
+            KeyAction::SendCommand(cmd) => cmd,
+            other => panic!("Esc,x should fire the /def -b'^[x' command; got {}", describe_key_action(&other)),
+        };
+
+        // Mirrors the real command path (main.rs's KeyAction::SendCommand handling).
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute(&cmd);
+        assert!(matches!(result, tf::TfCommandResult::Success(_)), "got {result:?}");
+        app.process_pending_keyboard_ops();
+
+        assert_eq!(app.tf_engine.get_var("kbnum_seen").map(|v| v.to_string_value()), Some("4".to_string()),
+            "the bound command should have seen kbnum=4 via the engine mirror");
+        assert_eq!(app.input.kbnum, None, "kbnum must be cleared once the bound command has run");
+    }
+
+    #[test]
+    fn test_bind_defers_substitution_to_keypress() {
+        // Finding 40 / plan Job 21: real TF's own `/help bind` says "/bind <sequence> =
+        // <command> is equivalent to /def -b"<sequence>" = <command>" - so a plain /bind's
+        // command text must defer %var substitution to keypress time exactly like /def -b's
+        // body always has, not substitute eagerly at bind-registration time. Before this
+        // fix, `/bind Esc-x = /echo %{foo}` would freeze "%{foo}" to whatever `foo` held the
+        // moment `/bind` itself was typed.
+        let mut app = make_key_test_app();
+        app.tf_engine.execute("/set foo=one");
+
+        let bound = app.tf_engine.execute("/bind Esc-x = /echo %{foo}");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)), "/bind Esc-x = ... should be accepted; got {bound:?}");
+
+        app.tf_engine.execute("/set foo=two");
+
+        let action = send_esc_then(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        let cmd = match action {
+            KeyAction::SendCommand(cmd) => cmd,
+            other => panic!("Esc,x should fire the /bind Esc-x command; got {}", describe_key_action(&other)),
+        };
+
+        app.sync_tf_world_info();
+        let result = app.tf_engine.execute(&cmd);
+        match result {
+            tf::TfCommandResult::Success(Some(s)) => assert_eq!(s, "two",
+                "the bound command must substitute %{{foo}} fresh at keypress time, not at bind time"),
+            other => panic!("expected Success(Some(\"two\")), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unbind_removes_the_backing_macro() {
+        // Finding 40 / plan Job 21: /bind now creates a real (nameless) macro rather than a
+        // bare cache entry, so /unbind must remove that macro too - real TF's own /help
+        // unbind: "Removes a macro with the keybinding <sequence>".
+        let mut app = make_key_test_app();
+        let before = app.tf_engine.macros.len();
+        let bound = app.tf_engine.execute("/bind Esc-x = /echo hi");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)), "got {bound:?}");
+        assert_eq!(app.tf_engine.macros.len(), before + 1, "/bind should add exactly one macro");
+
+        let unbound = app.tf_engine.execute("/unbind Esc-x");
+        assert!(matches!(unbound, tf::TfCommandResult::Success(_)), "got {unbound:?}");
+        assert_eq!(app.tf_engine.macros.len(), before, "/unbind should remove the macro /bind created");
+        assert_eq!(tf::hooks::get_binding(&app.tf_engine, "Esc-x"), None);
+
+        let action = send_esc_then(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(!matches!(action, KeyAction::SendCommand(ref c) if c == "/echo hi"),
+            "Esc,x must no longer fire the unbound command; got {}", describe_key_action(&action));
+    }
+
+    // ---- Plan Job 22a (P2.6/P2.7): new default table + WsMessage::RunKeyBinding ----
+
+    #[test]
+    fn test_run_key_binding_executes_bound_command_for_client_and_mirrors_kbnum() {
+        // TF-parity plan Job 22a/P2.7: WsMessage::RunKeyBinding is how a web/GUI client runs
+        // a server-side `/bind`/`key_<name>` binding it learned about via
+        // `GlobalSettingsMsg::tf_bound_keys_json` instead of running its own built-in
+        // action. It must resolve the key through the exact same lookup the console's own
+        // live keypress uses (`chords::resolve_bound_command`: `/bind` first, then
+        // `key_<name>`), execute the result through the ordinary `handle_ws_send_command`
+        // path (so output lands in the target world's own output_lines, exactly like a
+        // typed command), and mirror the client's own kbnum into the engine for the
+        // duration - cleared afterward either way (tf-help #kbnum).
+        let mut app = make_key_test_app();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+
+        // The plan's own worked example: %{foo} defers to keypress time (finding 40/Job 21).
+        let bound = app.tf_engine.execute("/bind Esc-x = /echo %{foo}");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)), "got {bound:?}");
+        app.tf_engine.execute("/set foo=hello");
+
+        // A second binding that reads $[kbnum] directly, to prove the client's kbnum was
+        // genuinely visible to the bound command while it ran (not just cleared after).
+        let bound2 = app.tf_engine.execute("/bind Esc-y = /let kbnum_seen=$[kbnum]");
+        assert!(matches!(bound2, tf::TfCommandResult::Success(_)), "got {bound2:?}");
+
+        let client_id = 99;
+        app.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: 0,
+            visible_lines: 24,
+            visible_columns: 80,
+            dimensions: None,
+            paused: false,
+            visible: true,
+            disconnected_at: None,
+        });
+
+        let before = app.worlds[0].output_lines.len();
+        let action = app.handle_ws_client_msg(client_id, WsMessage::RunKeyBinding {
+            key: "Esc-x".to_string(),
+            kbnum: Some(7),
+        }, &event_tx);
+        assert!(matches!(action, WsAsyncAction::Done));
+
+        let new_text: Vec<&str> = app.worlds[0].output_lines[before..].iter().map(|l| l.text.as_str()).collect();
+        assert!(new_text.iter().any(|t| t.contains("hello")),
+            "expected the bound command's echo (\"hello\") in the world's own output, got: {new_text:?}");
+
+        // kbnum was cleared after Esc-x's dispatch, and the console's own local kbnum
+        // (unrelated to this WS client) was never observably touched.
+        assert!(!app.tf_engine.global_vars.contains_key("kbnum"),
+            "the engine's %kbnum mirror must be cleared after the bound command has run");
+        assert_eq!(app.input.kbnum, None,
+            "the console's own kbnum must be unaffected by a WS client's RunKeyBinding");
+
+        // Now prove kbnum was genuinely APPLIED while the command ran, via the second binding.
+        let action2 = app.handle_ws_client_msg(client_id, WsMessage::RunKeyBinding {
+            key: "Esc-y".to_string(),
+            kbnum: Some(9),
+        }, &event_tx);
+        assert!(matches!(action2, WsAsyncAction::Done));
+        assert_eq!(app.tf_engine.get_var("kbnum_seen").map(|v| v.to_string_value()), Some("9".to_string()),
+            "the bound command should have seen kbnum=9 via the engine mirror while it ran");
+        assert!(!app.tf_engine.global_vars.contains_key("kbnum"), "kbnum must be cleared again");
+    }
+
+    #[test]
+    fn test_run_key_binding_unknown_key_is_ignored_silently() {
+        // Plan ruling: a key with no /bind or key_<name> binding (stale client-side cache,
+        // or a race with an /unbind) must be a silent no-op, never an error.
+        let mut app = make_key_test_app();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let before = app.worlds[0].output_lines.len();
+
+        let action = app.handle_ws_client_msg(99, WsMessage::RunKeyBinding {
+            key: "Esc-x".to_string(),
+            kbnum: None,
+        }, &event_tx);
+
+        assert!(matches!(action, WsAsyncAction::Done));
+        assert_eq!(app.worlds[0].output_lines.len(), before, "an unbound key must produce no output");
+    }
+
+    #[test]
+    fn test_tf_bound_keys_json_lists_bind_and_key_name_macros() {
+        // GlobalSettingsMsg::tf_bound_keys_json (Job 22a/P2.7) must list a canonical key
+        // name for both binding layers a client can't otherwise see: a `/bind` (real
+        // nameless macro since finding 40) and a `key_<name>` macro (Job 21's named-key
+        // layer), but not an ordinary user macro that happens to not be either.
+        let mut app = make_key_test_app();
+        app.tf_engine.execute("/bind Esc-x = /echo hi");
+        app.tf_engine.execute("/def key_f5 = /echo f5");
+        app.tf_engine.execute("/def not_a_key_macro = /echo nope");
+
+        let json = app.tf_bound_keys_json();
+        assert!(json.contains("\"Esc-x\""), "expected Esc-x in {json}");
+        assert!(json.contains("\"F5\""), "expected F5 (from key_f5) in {json}");
+        assert!(!json.contains("not_a_key_macro"), "an unrelated macro name must not leak in: {json}");
+    }
+
+    #[test]
+    fn test_toggle_limit_action_opens_and_closes_filter_popup() {
+        // Plan ruling table, Esc-L: toggle_limit re-applies the last /limit if none is
+        // active, else clears it (reusing Job 15's own PendingLimitOp/apply_limit_op).
+        let mut app = make_key_test_app();
+        app.worlds[0].output_lines.push(OutputLine::new("hello world".to_string(), 0));
+        assert!(!app.filter_popup.visible);
+
+        // No previous /limit yet: toggling just reports nothing to reapply (no panic, no
+        // popup opened) - matches PendingLimitOp::Reapply's own documented behavior.
+        dispatch_action("toggle_limit", &mut app);
+        assert!(!app.filter_popup.visible);
+
+        // Apply a real /limit, then toggle should close it...
+        app.tf_engine.execute("/limit hello");
+        apply_pending_tf_console_ops(&mut app);
+        assert!(app.filter_popup.visible, "/limit should have opened the filter popup");
+
+        dispatch_action("toggle_limit", &mut app);
+        assert!(!app.filter_popup.visible, "toggle_limit should close an active limit");
+
+        // ...and toggling again should reapply it.
+        dispatch_action("toggle_limit", &mut app);
+        assert!(app.filter_popup.visible, "toggle_limit should reapply the last /limit");
+    }
+
+    #[test]
+    fn test_show_version_action_prints_version_string() {
+        let mut app = make_key_test_app();
+        let before = app.worlds[0].output_lines.len();
+        dispatch_action("show_version", &mut app);
+        let new_text: Vec<&str> = app.worlds[0].output_lines[before..].iter().map(|l| l.text.as_str()).collect();
+        assert!(new_text.iter().any(|t| t.contains(&get_version_string())),
+            "expected the version string in output, got: {new_text:?}");
+    }
+
+    #[test]
+    fn test_tf_keys_esc_arrow_named() {
+        // finding A / plan P2.1: TF's Esc-Left socket-switch chord needs escape_key_to_name to
+        // produce a name for arrow/special keys following an Esc, which it doesn't today (only
+        // Char and Backspace are handled; everything else falls to `_ => None`).
+        let result = keybindings::escape_key_to_name(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(result, Some("Esc-Left".to_string()),
+            "escape_key_to_name(Left) should name the Esc-Left chord; got {result:?}");
+    }
+
+    // ---- Plan Job 18 (P2.2): chord input (^X^R, Esc-^N, Esc-Left, ^G cancel, expiry) ----
+    //
+    // `App.last_escape` (one hardcoded Escape-then-key shape) is replaced by `App.chord`
+    // (`chords::ChordState`), which generalises the same idea to any key that's a genuine
+    // prefix of a longer binding. `chords::resolve_key_name` is the single lookup both
+    // `input_handler::handle_key_event` and `remote_client::handle_remote_client_key` now
+    // share (Job 17 found that logic duplicated) - these tests drive it only through the
+    // console path (`send_key`/`send_esc_then`), since the two are identical by construction.
+
+    #[test]
+    fn test_tf_chord_two_key_binding_fires() {
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/bind ^X^R = /echo chord");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/bind ^X^R = ... should be accepted; got {bound:?}");
+
+        let x = send_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(x, KeyAction::None), "^X alone must only buffer, not dispatch");
+        assert!(app.chord.is_pending(), "^X should be buffered waiting for ^R");
+
+        let r = send_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        match r {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo chord"),
+            other => panic!("^X^R should fire the /bind ^X^R command; got {}",
+                describe_key_action(&other)),
+        }
+        assert!(!app.chord.is_pending(), "completing a chord must clear the buffered prefix");
+    }
+
+    #[test]
+    fn test_tf_chord_unbound_followup_replays_and_clears_prefix() {
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/bind ^X^R = /echo chord");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/bind ^X^R = ... should be accepted; got {bound:?}");
+
+        let x = send_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(x, KeyAction::None));
+        assert!(app.chord.is_pending(), "^X should be buffered waiting for ^R");
+
+        // 'q' doesn't continue any ^X-prefixed binding - it must be replayed
+        // as ordinary typed input (inserted into the buffer), not silently
+        // swallowed, and it must not leave ^X's prefix stranded for a later,
+        // unrelated keystroke to (mis)combine with.
+        let q = send_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(matches!(q, KeyAction::None));
+        assert!(!app.chord.is_pending(), "an abandoned chord must not leave a stale prefix");
+        assert_eq!(app.input.buffer, "q",
+            "the follow-up key must be replayed as ordinary typed input, not eaten");
+
+        // And ^X^R still fires normally afterward - proving there's no
+        // leftover state from the abandoned attempt.
+        let x2 = send_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(x2, KeyAction::None));
+        let r2 = send_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        match r2 {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo chord"),
+            other => panic!("^X^R should still fire after an unrelated abandon; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_chord_def_dash_b_two_token_binding_fires() {
+        // Plan example: `/def -b'^X[' = ...` - the same chord machinery as
+        // `/bind`, just defined through `/def`'s `-b` option (macros.rs's
+        // `parse_option_char('b'|'B')` already normalises through the same
+        // `keynames::parse_key_name`, per Job 17).
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/def -b'^X[' = /echo bracket");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/def -b'^X[' = ... should be accepted; got {bound:?}");
+
+        let x = send_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(x, KeyAction::None));
+        assert!(app.chord.is_pending(), "^X should be buffered waiting for [");
+
+        let bracket = send_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        match bracket {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo bracket"),
+            other => panic!("^X[ should fire the /def -b'^X[' command; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_chord_ctrl_g_cancels_pending_prefix() {
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/bind ^X^R = /echo chord");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/bind ^X^R = ... should be accepted; got {bound:?}");
+
+        let x = send_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(x, KeyAction::None));
+        assert!(app.chord.is_pending(), "^X should be buffered waiting for ^R");
+
+        // ^G is TF's chord/kbnum cancel key: it must clear the buffered
+        // prefix without dispatching anything (in particular, NOT ^G's own
+        // default "bell" action - cancelling is silent).
+        let g = send_key(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(matches!(g, KeyAction::None), "^G must not itself dispatch anything while cancelling");
+        assert!(!app.chord.is_pending(), "^G must cancel the buffered ^X prefix");
+
+        // Prove there's no stale state left behind: a fresh ^X^R still
+        // fires normally right after the cancel.
+        let x2 = send_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(x2, KeyAction::None));
+        let r2 = send_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        match r2 {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo chord"),
+            other => panic!("^X^R should fire normally after a ^G cancel; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_chord_esc_ctrl_n_fires() {
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/bind Esc-^N = /echo escctrln");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/bind Esc-^N = ... should be accepted; got {bound:?}");
+
+        let action = send_esc_then(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        match action {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo escctrln"),
+            other => panic!("Esc,^N should fire the /bind Esc-^N command; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_chord_esc_left_fires() {
+        let mut app = make_key_test_app();
+        let bound = app.tf_engine.execute("/bind Esc-Left = /echo escleft");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/bind Esc-Left = ... should be accepted; got {bound:?}");
+
+        let action = send_esc_then(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        match action {
+            KeyAction::SendCommand(ref cmd) => assert_eq!(cmd, "/echo escleft"),
+            other => panic!("Esc,Left should fire the /bind Esc-Left command; got {}",
+                describe_key_action(&other)),
+        }
+    }
+
+    #[test]
+    fn test_tf_chord_expiry_drops_stale_prefix() {
+        let mut app = make_key_test_app();
+        app.chord_window = std::time::Duration::ZERO;
+        let bound = app.tf_engine.execute("/bind ^X^R = /echo chord");
+        assert!(matches!(bound, tf::TfCommandResult::Success(_)),
+            "/bind ^X^R = ... should be accepted; got {bound:?}");
+
+        let x = send_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(matches!(x, KeyAction::None));
+        assert!(app.chord.is_pending());
+
+        // With a zero window, ANY later instant counts as expired.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // ^R now arrives too late: the buffered ^X has already gone stale,
+        // so this must be treated as a plain, fresh ^R keystroke (which has
+        // its own unrelated default binding, "reload") rather than
+        // completing ^X^R.
+        let r = send_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(matches!(r, KeyAction::Reload),
+            "expired ^X must not combine with a later ^R - plain ^R should dispatch its own \
+             default binding instead; got {}", describe_key_action(&r));
+        assert!(!app.chord.is_pending(), "expiry must drop the stale prefix");
+    }
+
+    // ---- Plan Job 14b: /world, /addworld, /dc native parsing + dispatch ----
+
+    #[test]
+    fn test_parse_dc_bare_is_current_world() {
+        assert!(matches!(parse_command("/dc"), Command::Disconnect { world: None }));
+        assert!(matches!(parse_command("/disconnect"), Command::Disconnect { world: None }));
+    }
+
+    #[test]
+    fn test_parse_dc_named_world_and_all() {
+        match parse_command("/dc MyMUD") {
+            Command::Disconnect { world } => assert_eq!(world, Some("MyMUD".to_string())),
+            other => panic!("expected Disconnect, got {:?}", other),
+        }
+        match parse_command("/dc -ALL") {
+            Command::Disconnect { world } => assert_eq!(world, Some("-ALL".to_string())),
+            other => panic!("expected Disconnect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execute_disconnect_command_named_world() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.worlds.push(send_test_world("Beta", true));
+        app.current_world_index = 0;
+
+        execute_disconnect_command(&mut app, &Some("Beta".to_string()), 0, false);
+
+        assert!(app.worlds[0].connected, "Alpha (not named) must stay connected");
+        assert!(!app.worlds[1].connected, "Beta must be disconnected");
+    }
+
+    #[test]
+    fn test_execute_disconnect_command_all() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.worlds.push(send_test_world("Beta", false));
+        app.worlds.push(send_test_world("Gamma", true));
+        app.current_world_index = 0;
+
+        execute_disconnect_command(&mut app, &Some("-ALL".to_string()), 0, false);
+
+        assert!(!app.worlds[0].connected);
+        assert!(!app.worlds[1].connected, "already disconnected, must stay so");
+        assert!(!app.worlds[2].connected);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let disconnected_count = log.iter().filter(|m| matches!(m, WsMessage::WorldDisconnected { .. })).count();
+        assert_eq!(disconnected_count, 2, "-ALL must broadcast WorldDisconnected only for the worlds that were actually connected");
+    }
+
+    #[test]
+    fn test_execute_disconnect_command_unknown_world_reports_not_found() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+
+        execute_disconnect_command(&mut app, &Some("Nope".to_string()), 0, false);
+        assert!(app.worlds[0].connected, "unrelated world must be untouched");
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("'Nope' not found")));
+        assert!(found, "expected a world-not-found message, got: {:?}", *log);
+    }
+
+    #[test]
+    fn test_parse_addworld_default_form() {
+        match parse_command("/addworld DEFAULT hero secret") {
+            Command::AddWorldDefault { character, password, file } => {
+                assert_eq!(character, Some("hero".to_string()));
+                assert_eq!(password, Some("secret".to_string()));
+                assert_eq!(file, None);
+            }
+            other => panic!("expected AddWorldDefault, got {:?}", other),
+        }
+        // Case-insensitive, and with a file argument.
+        match parse_command("/addworld default hero secret /tmp/x.tf") {
+            Command::AddWorldDefault { character, password, file } => {
+                assert_eq!(character, Some("hero".to_string()));
+                assert_eq!(password, Some("secret".to_string()));
+                assert_eq!(file, Some("/tmp/x.tf".to_string()));
+            }
+            other => panic!("expected AddWorldDefault, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_addworld_captures_trailing_file() {
+        // 4 raw tokens: name host port file (was misparsed as name/char/host/port before
+        // Job 14b - see parse_addworld_command's own doc comment).
+        match parse_command("/addworld Cave cave.tcp.com 2283 /tmp/cave.tf") {
+            Command::AddWorld { name, host, port, user, password, file, .. } => {
+                assert_eq!(name, "Cave");
+                assert_eq!(host, Some("cave.tcp.com".to_string()));
+                assert_eq!(port, Some("2283".to_string()));
+                assert_eq!(user, None);
+                assert_eq!(password, None);
+                assert_eq!(file, Some("/tmp/cave.tf".to_string()));
+            }
+            other => panic!("expected AddWorld, got {:?}", other),
+        }
+
+        // 6 raw tokens: name char pass host port file.
+        match parse_command("/addworld Cave hero secret cave.tcp.com 2283 /tmp/cave.tf") {
+            Command::AddWorld { name, host, port, user, password, file, .. } => {
+                assert_eq!(name, "Cave");
+                assert_eq!(user, Some("hero".to_string()));
+                assert_eq!(password, Some("secret".to_string()));
+                assert_eq!(host, Some("cave.tcp.com".to_string()));
+                assert_eq!(port, Some("2283".to_string()));
+                assert_eq!(file, Some("/tmp/cave.tf".to_string()));
+            }
+            other => panic!("expected AddWorld, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_addworld_srchost_not_misread_as_bundled_flags() {
+        // -s<srchost> must consume the rest of its own token - a srchost value
+        // containing 'x' must NOT be misread as the -x (SSL) flag.
+        match parse_command("/addworld -sexample.com Cave cave.tcp.com 2283") {
+            Command::AddWorld { use_ssl, .. } => {
+                assert!(!use_ssl, "srchost 'example.com' contains 'x' but must not enable SSL");
+            }
+            other => panic!("expected AddWorld, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execute_add_world_command_stores_file_in_tf_engine() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Placeholder", false));
+
+        execute_add_world_command(
+            &mut app, "Cave".to_string(), Some("cave.tcp.com".to_string()), Some("2283".to_string()),
+            None, None, false, Some("/tmp/cave.tf".to_string()), 0, false,
+        );
+
+        assert!(app.worlds.iter().any(|w| w.name == "Cave"));
+        assert_eq!(app.tf_engine.world_files.get("cave"), Some(&"/tmp/cave.tf".to_string()));
+    }
+
+    #[test]
+    fn test_execute_add_world_command_wires_scrollback_tx() {
+        // Regression guard: this used to be missing on the console and WS dispatch
+        // paths (only daemon.rs remembered it), so a world added outside daemon mode
+        // never archived a single line to scrollback.db.
+        let dir = std::env::temp_dir().join(format!("clay_test_addworld_scrollback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("scrollback.db");
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Placeholder", false));
+        app.scrollback = Some(crate::scrollback::ScrollbackDb::open(&db_path, &[]).expect("open archive"));
+
+        execute_add_world_command(
+            &mut app, "Cave".to_string(), Some("cave.tcp.com".to_string()), Some("2283".to_string()),
+            None, None, false, None, 0, false,
+        );
+
+        let idx = app.worlds.iter().position(|w| w.name == "Cave").unwrap();
+        assert!(app.worlds[idx].scrollback_tx.is_some());
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan Job 14c / finding 32: `/unworld <name>...` actually removes each
+    /// named world - the previous implementation bounced to a Clay `/close`
+    /// command that never existed, so it silently did nothing at all. Each
+    /// name is processed independently (a missing name doesn't stop the
+    /// rest, same as /kill and /undef), and Clay's own "never delete the
+    /// last world" rule gets its own diagnostic instead of a silent no-op.
+    #[test]
+    fn test_execute_remove_world_command_removes_named_worlds() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Alpha", false));
+        app.worlds.push(send_test_world("Beta", false));
+        app.worlds.push(send_test_world("Gamma", false));
+
+        execute_remove_world_command(
+            &mut app,
+            &["Alpha".to_string(), "NoSuch".to_string(), "Gamma".to_string()],
+            0, false,
+        );
+
+        assert!(!app.worlds.iter().any(|w| w.name == "Alpha"));
+        assert!(!app.worlds.iter().any(|w| w.name == "Gamma"));
+        assert!(app.worlds.iter().any(|w| w.name == "Beta"), "Beta was not named for removal");
+    }
+
+    #[test]
+    fn test_execute_remove_world_command_never_removes_the_last_world() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Solo", false));
+
+        execute_remove_world_command(&mut app, &["Solo".to_string()], 0, false);
+
+        assert_eq!(app.worlds.len(), 1, "the last remaining world must never be removed");
+        assert!(app.worlds.iter().any(|w| w.name == "Solo"));
+    }
+
+    /// The full command dispatch path (`parse_command` -> `Command::RemoveWorld`)
+    /// also works, exercising the native-arm route (finding 32) rather than
+    /// calling the shared executor directly.
+    #[test]
+    fn test_unworld_command_parses_multiple_names() {
+        match parse_command("/unworld Alpha Beta") {
+            Command::RemoveWorld { names } => assert_eq!(names, vec!["Alpha".to_string(), "Beta".to_string()]),
+            other => panic!("expected Command::RemoveWorld, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execute_add_world_default_command_sets_engine_globals() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Placeholder", false));
+        app.current_world_index = 0;
+
+        execute_add_world_default_command(
+            &mut app, Some("hero".to_string()), Some("secret".to_string()), Some("/tmp/def.tf".to_string()), 0, false,
+        );
+
+        assert_eq!(app.tf_engine.default_world_character, Some("hero".to_string()));
+        assert_eq!(app.tf_engine.default_world_password, Some("secret".to_string()));
+        assert_eq!(app.tf_engine.default_world_file, Some("/tmp/def.tf".to_string()));
+        // DEFAULT must never become a real world entry (would show up in /listworlds).
+        assert!(!app.worlds.iter().any(|w| w.name.eq_ignore_ascii_case("default")));
+    }
+
+    #[test]
+    fn test_parse_world_host_port_form() {
+        match parse_command("/worlds mud.example.com 4000") {
+            Command::WorldConnectHostPort { host, port, use_ssl, no_login, background } => {
+                assert_eq!(host, "mud.example.com");
+                assert_eq!(port, "4000");
+                assert!(!use_ssl && !no_login && !background);
+            }
+            other => panic!("expected WorldConnectHostPort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_world_host_port_form_with_flags() {
+        match parse_command("/worlds -x -b mud.example.com 4443") {
+            Command::WorldConnectHostPort { host, port, use_ssl, no_login, background } => {
+                assert_eq!(host, "mud.example.com");
+                assert_eq!(port, "4443");
+                assert!(use_ssl);
+                assert!(!no_login);
+                assert!(background);
+            }
+            other => panic!("expected WorldConnectHostPort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_world_named_form_flags_choose_the_right_command() {
+        assert!(matches!(parse_command("/worlds -b MyMUD"), Command::WorldConnectBackground { .. }));
+        assert!(matches!(parse_command("/worlds -l MyMUD"), Command::WorldConnectNoLogin { .. }));
+        // -q/-n/-x/-f are accepted, not distinct for the named-world form.
+        assert!(matches!(parse_command("/worlds -q -x -f MyMUD"), Command::WorldSwitch { .. }));
+        // -b wins when combined with -l (background always wins - see doc comment).
+        assert!(matches!(parse_command("/worlds -l -b MyMUD"), Command::WorldConnectBackground { .. }));
+    }
+
+    #[test]
+    fn test_prepare_world_connect_host_port_creates_temp_world_and_followup() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Placeholder", false));
+
+        let followup = prepare_world_connect_host_port(&mut app, "mud.example.com", "4000", false, false, false).unwrap();
+        assert_eq!(followup, "/worlds mud.example.com:4000");
+        let idx = app.worlds.iter().position(|w| w.name == "mud.example.com:4000").unwrap();
+        assert_eq!(app.worlds[idx].settings.hostname, "mud.example.com");
+        assert_eq!(app.worlds[idx].settings.port, "4000");
+
+        let followup_bg = prepare_world_connect_host_port(&mut app, "mud.example.com", "4000", true, false, true).unwrap();
+        assert_eq!(followup_bg, "/worlds -b mud.example.com:4000", "SSL flag doesn't change the follow-up form, only -b/-l do");
+    }
+
+    // ========================================================================
+    // Job 15: App-level tests for /xtitle and the /limit family - both are
+    // implemented as "engine records, App drains" (TfEngine::pending_xtitle /
+    // pending_limit_op), drained by `apply_pending_tf_console_ops` (commands.rs).
+    // ========================================================================
+
+    /// /xtitle must never write anything into a world's own output - CLAUDE.md forbids
+    /// a raw escape sequence reaching the output area once the TUI is live, and
+    /// `apply_pending_tf_console_ops`'s own drain sends the title straight to stdout
+    /// via crossterm's `SetTitle`, never through `add_output`/`output_lines`.
+    #[test]
+    fn test_xtitle_queues_pending_title_and_never_touches_output() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Test", false));
+
+        match app.tf_engine.execute("/xtitle My Title") {
+            tf::TfCommandResult::Success(None) => {}
+            other => panic!("expected silent success, got {:?}", other),
+        }
+        assert_eq!(app.tf_engine.pending_xtitle, Some("My Title".to_string()));
+
+        let lines_before = app.current_world().output_lines.len();
+        apply_pending_tf_console_ops(&mut app);
+        assert!(app.tf_engine.pending_xtitle.is_none(), "drain must consume the pending title");
+        assert_eq!(
+            app.current_world().output_lines.len(), lines_before,
+            "/xtitle must never append a line to output_lines - the title goes straight \
+             to crossterm's SetTitle, not through add_output"
+        );
+    }
+
+    /// A bare /xtitle (no text) is a clear, immediate error - never queues anything.
+    #[test]
+    fn test_xtitle_bare_is_an_error_and_queues_nothing() {
+        let mut app = App::new();
+        assert!(matches!(app.tf_engine.execute("/xtitle"), tf::TfCommandResult::Error(_)));
+        assert!(app.tf_engine.pending_xtitle.is_none());
+    }
+
+    /// /limit <pattern> opens the F4 filter popup pre-filled and pre-filtered;
+    /// /unlimit closes it; /relimit re-applies the most recently APPLIED /limit (not
+    /// just whatever was last open - /unlimit itself must not clear `last_limit`).
+    #[test]
+    fn test_limit_family_drives_filter_popup() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Test", false));
+        app.current_world_mut().output_lines.push(make_output_line("hello world", false));
+        app.current_world_mut().output_lines.push(make_output_line("goodbye", false));
+
+        app.tf_engine.execute("/limit hello");
+        apply_pending_tf_console_ops(&mut app);
+        assert!(app.filter_popup.visible, "/limit must open the filter popup");
+        assert_eq!(app.filter_popup.filtered_indices, vec![0], "only the matching line survives");
+
+        app.tf_engine.execute("/unlimit");
+        apply_pending_tf_console_ops(&mut app);
+        assert!(!app.filter_popup.visible, "/unlimit must close the filter popup");
+
+        app.tf_engine.execute("/relimit");
+        apply_pending_tf_console_ops(&mut app);
+        assert!(app.filter_popup.visible, "/relimit must reopen the last-applied /limit");
+        assert_eq!(app.filter_popup.filtered_indices, vec![0]);
+    }
+
+    /// /limit -v inverts the match (only non-matching lines survive); /limit -a keeps
+    /// only lines with attributes, even with no pattern at all (the rendering gate must
+    /// activate on `attrs_only` alone, not just a non-empty filter_text).
+    #[test]
+    fn test_limit_invert_and_attrs_only() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Test", false));
+        app.current_world_mut().output_lines.push(make_output_line("hello world", false));
+        app.current_world_mut().output_lines.push(make_output_line("goodbye", false));
+
+        app.tf_engine.execute("/limit -v hello");
+        apply_pending_tf_console_ops(&mut app);
+        assert_eq!(app.filter_popup.filtered_indices, vec![1], "-v keeps only NON-matching lines");
+
+        let mut attributed = make_output_line("\x1b[31mred alert\x1b[0m", false);
+        attributed.highlight_color = Some("red".to_string());
+        app.current_world_mut().output_lines.push(attributed);
+
+        app.tf_engine.execute("/limit -a");
+        apply_pending_tf_console_ops(&mut app);
+        assert_eq!(app.filter_popup.filtered_indices, vec![2], "-a with no pattern keeps only attributed lines");
+    }
+
+    /// -mregexp uses a real regex (not just glob-style wildcards); -msimple is a plain
+    /// literal substring match even when the pattern contains regex/glob metacharacters.
+    #[test]
+    fn test_limit_explicit_match_styles() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Test", false));
+        app.current_world_mut().output_lines.push(make_output_line("error: connection lost", false));
+        app.current_world_mut().output_lines.push(make_output_line("warning: low health", false));
+        app.current_world_mut().output_lines.push(make_output_line("literal a.b text", false));
+
+        app.tf_engine.execute("/limit -mregexp ^(error|warning):");
+        apply_pending_tf_console_ops(&mut app);
+        assert_eq!(app.filter_popup.filtered_indices, vec![0, 1], "-mregexp must use real regex alternation/anchors");
+
+        app.tf_engine.execute("/limit -msimple a.b");
+        apply_pending_tf_console_ops(&mut app);
+        assert_eq!(app.filter_popup.filtered_indices, vec![2], "-msimple treats '.' as a literal character, not any-char");
+    }
+
+    /// Bare /limit (no options, no pattern) reports status instead of opening/changing
+    /// anything - real tf answers this silently via %?, which can't survive the queued
+    /// round trip to App, so Clay prints a short status line instead (documented
+    /// deviation - see cmd_limit's own doc comment).
+    #[test]
+    fn test_limit_bare_reports_without_opening_popup() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Test", false));
+
+        let lines_before = app.current_world().output_lines.len();
+        app.tf_engine.execute("/limit");
+        apply_pending_tf_console_ops(&mut app);
+        assert!(!app.filter_popup.visible, "bare /limit must not open the popup");
+        assert!(
+            app.current_world().output_lines.len() > lines_before,
+            "bare /limit should print a status line"
+        );
+    }
+
+    /// /more toggles Clay's real more-mode setting (not just a TF variable) and persists/
+    /// broadcasts it; a bare or invalid /more is a clear error, matching real tf.
+    #[test]
+    fn test_more_toggles_settings_more_mode_enabled() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.current_world_index = 0;
+        app.worlds.push(send_test_world("Test", false));
+        app.settings.more_mode_enabled = false;
+
+        app.tf_engine.execute("/more on");
+        apply_pending_tf_console_ops(&mut app);
+        assert!(app.settings.more_mode_enabled, "/more on must flip Settings::more_mode_enabled");
+        assert_eq!(app.tf_engine.get_var("more").map(|v| v.to_string_value()), Some("1".to_string()));
+
+        app.tf_engine.execute("/more off");
+        apply_pending_tf_console_ops(&mut app);
+        assert!(!app.settings.more_mode_enabled);
+
+        assert!(matches!(app.tf_engine.execute("/more"), tf::TfCommandResult::Error(_)),
+            "bare /more is an error, matching real tf's own validated %more flag");
+        assert!(matches!(app.tf_engine.execute("/more sideways"), tf::TfCommandResult::Error(_)));
+    }
+
+    /// /wrap <n> sets Clay's real Settings::wrapspace (clamped to u8); /wrap on|off has
+    /// no Clay-side equivalent and only updates the TF-visible %wrap variable.
+    #[test]
+    fn test_wrap_numeric_sets_settings_wrapspace() {
+        let mut app = App::new();
+        app.settings.wrapspace = 0;
+
+        app.tf_engine.execute("/wrap 5");
+        apply_pending_tf_console_ops(&mut app);
+        assert_eq!(app.settings.wrapspace, 5);
+        assert_eq!(app.tf_engine.get_var("wrapsize").map(|v| v.to_string_value()), Some("5".to_string()));
+        assert_eq!(app.tf_engine.get_var("wrap").map(|v| v.to_string_value()), Some("1".to_string()));
+
+        app.tf_engine.execute("/wrap off");
+        apply_pending_tf_console_ops(&mut app);
+        assert_eq!(app.settings.wrapspace, 5, "on/off has no Clay-side wrap-width equivalent");
+        assert_eq!(app.tf_engine.get_var("wrap").map(|v| v.to_string_value()), Some("off".to_string()));
     }

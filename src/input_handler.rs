@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::{
-    popup, persistence, keybindings,
+    popup, persistence, chords,
     SpellChecker,
     WsMessage,
     Theme, WorldSwitchMode,
@@ -56,7 +56,11 @@ pub(crate) enum KeyAction {
     Quit,
     SendCommand(String),
     Connect, // Trigger connection from settings popup
-    Redraw,  // Force screen redraw
+    Redraw,  // Force screen redraw + drop client-generated lines (TF-parity plan: action
+             // `redraw_server_only`, Clay's historical ^L behavior)
+    Refresh, // Force screen redraw only, no line filtering (TF's real REFRESH/^L; action
+             // `refresh_line`) - see the two `KeyAction::Redraw` call sites in `run_app`,
+             // which handle `Refresh` identically minus the `filter_to_server_output` call.
     Reload,  // Trigger /reload
     Suspend, // Ctrl+Z to suspend process
     SwitchedWorld(usize), // Console switched to this world, broadcast unseen clear
@@ -1163,140 +1167,17 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         }
     }
 
-    // Handle Tab for command completion when input starts with / (only if not in more-mode)
+    // Handle Tab for command completion when input starts with / (only if not in more-mode).
+    // The actual completion logic lives in `perform_completion` (shared with the standalone
+    // `completion` action - TF-parity plan Job 19/P2.3, bound to Esc-Tab from Job 22 onward)
+    // so Tab and Esc-Tab can never drift into two different completion behaviors. Tab itself
+    // keeps its historical fallback: if nothing completed, fall through to whatever Tab would
+    // otherwise do (its default `tab_key` paging action).
     let is_command_prefix = app.input.buffer.starts_with('/');
-    if key.code == KeyCode::Tab && key.modifiers.is_empty() && is_command_prefix {
-        // Get the current partial command (everything up to first space, or whole buffer)
-        let input = app.input.buffer.clone();
-        let partial = if let Some(space_pos) = input.find(' ') {
-            &input[..space_pos]
-        } else {
-            input.as_str()
-        };
-
-        // Check if this is a /worlds or /world command with arguments (for world name completion)
-        let is_worlds_cmd = partial.eq_ignore_ascii_case("/worlds") || partial.eq_ignore_ascii_case("/world");
-        if is_worlds_cmd && input.contains(' ') {
-            // World name completion for /worlds and /world commands
-            let args_part = &input[input.find(' ').unwrap() + 1..];
-
-            // Parse out -e or -l flag if present
-            let (has_flag, partial_name) = if args_part.starts_with("-e ") || args_part.starts_with("-E ")
-                || args_part.starts_with("-l ") || args_part.starts_with("-L ")
-            {
-                (true, args_part[3..].trim_start())
-            } else if args_part == "-e" || args_part == "-E" || args_part == "-l" || args_part == "-L" {
-                // Just the flag with no world name yet
-                return KeyAction::None;
-            } else {
-                (false, args_part)
-            };
-
-            // Get matching world names
-            let partial_lower = partial_name.to_lowercase();
-            let mut world_matches: Vec<String> = app.worlds.iter()
-                .map(|w| w.name.clone())
-                .filter(|name| name.to_lowercase().starts_with(&partial_lower))
-                .collect();
-            world_matches.sort_by_key(|a| a.to_lowercase());
-
-            if !world_matches.is_empty() {
-                // Find current match index
-                let current_idx = world_matches.iter().position(|m| m.eq_ignore_ascii_case(partial_name));
-                let next_idx = match current_idx {
-                    Some(idx) => (idx + 1) % world_matches.len(),
-                    None => 0,
-                };
-
-                // Build the completed input
-                let completion = &world_matches[next_idx];
-                let flag_part = if has_flag {
-                    if args_part.starts_with("-e") || args_part.starts_with("-E") {
-                        "-e "
-                    } else {
-                        "-l "
-                    }
-                } else {
-                    ""
-                };
-                app.input.buffer = format!("{} {}{}", partial, flag_part, completion);
-                app.input.cursor_position = app.input.buffer.len();
-            }
-            return KeyAction::None;
-        }
-
-        // Only complete if we're still in the command part (no space yet or cursor before space)
-        if !input.contains(' ') || app.input.cursor_position <= input.find(' ').unwrap_or(input.len()) {
-            let matches = {
-                // Unified / commands: Clay commands + TF commands + manual actions + macros
-                let internal_commands = vec![
-                    // Clay-specific commands
-                    "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections",
-                    "/setup", "/web", "/actions", "/reload", "/update", "/quit", "/gag",
-                    "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify",
-                    // TF commands (now available with / prefix)
-                    "/set", "/unset", "/let", "/echo", "/send", "/beep", "/quote",
-                    "/expr", "/test", "/eval", "/if", "/elseif", "/else", "/endif",
-                    "/while", "/done", "/for", "/break", "/def", "/undef", "/undefn",
-                    "/undeft", "/list", "/purge", "/bind", "/unbind", "/load", "/save",
-                    "/lcd", "/time", "/version", "/ps", "/kill", "/sh", "/recall",
-                    "/setenv", "/listvar", "/repeat", "/fg", "/trigger", "/input",
-                    "/grab", "/ungag", "/exit", "/addworld",
-                    // TF-specific versions (for conflicting commands)
-                    "/tfhelp", "/tfgag",
-                ];
-
-                // Get manual actions (no patterns = manual-only via /name)
-                let manual_actions: Vec<String> = app.settings.actions.iter()
-                    .filter(|a| a.patterns.is_empty())
-                    .map(|a| format!("/{}", a.name))
-                    .collect();
-
-                // Get user-defined macro names
-                let macro_names: Vec<String> = app.tf_engine.macros.iter()
-                    .map(|m| format!("/{}", m.name))
-                    .collect();
-
-                // Find all matches
-                let partial_lower = partial.to_lowercase();
-                let mut m: Vec<String> = internal_commands.iter()
-                    .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                    .map(|s| s.to_string())
-                    .collect();
-                m.extend(manual_actions.iter()
-                    .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                    .cloned());
-                m.extend(macro_names.iter()
-                    .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                    .cloned());
-                m.sort();
-                m.dedup();
-                m
-            };
-
-            if !matches.is_empty() {
-                // Find current match index if we're already on a completed command
-                let current_idx = matches.iter().position(|m| m.eq_ignore_ascii_case(partial));
-
-                // Get next match (cycle through)
-                let next_idx = match current_idx {
-                    Some(idx) => (idx + 1) % matches.len(),
-                    None => 0,
-                };
-
-                // Replace the command part with the completion
-                let completion = &matches[next_idx];
-                if input.contains(' ') {
-                    // Preserve arguments after the command
-                    let args_start = input.find(' ').unwrap();
-                    app.input.buffer = format!("{}{}", completion, &input[args_start..]);
-                } else {
-                    app.input.buffer = completion.clone();
-                }
-                app.input.cursor_position = completion.len();
-                return KeyAction::None;
-            }
-        }
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() && is_command_prefix
+        && perform_completion(app)
+    {
+        return KeyAction::None;
     }
 
     // Ctrl+V literal next: insert next character literally
@@ -1308,23 +1189,16 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
-    // Helper to check if escape was pressed recently (for Escape+key sequences)
-    let recent_escape = app.last_escape
-        .map(|t| t.elapsed() < Duration::from_millis(500))
-        .unwrap_or(false);
-
-    // Track bare Escape key presses for Escape+key sequences
-    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
-        app.last_escape = Some(std::time::Instant::now());
-        return KeyAction::None;
-    }
-
-    // Convert key event to canonical name, handling Esc+key sequences
-    let key_name = if recent_escape && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace) {
-        app.last_escape = None;
-        keybindings::escape_key_to_name(key.code, key.modifiers)
-    } else {
-        keybindings::key_event_to_name(key.code, key.modifiers)
+    // Resolve this keystroke through the shared chord machinery (plan Phase
+    // 2 step P2.2): handles a bare Escape waiting for its Esc-<token>
+    // continuation exactly as before, plus genuinely new chords like
+    // `^X^R` (`app.chord`, `crate::chords`) - shared with
+    // `remote_client::handle_remote_client_key` so the two lookup paths
+    // Job 17 found duplicated can't drift again.
+    let key_name = match chords::resolve_key_name(app, key.code, key.modifiers) {
+        chords::KeyResolution::Pending => return KeyAction::None,
+        chords::KeyResolution::NotAKey => None,
+        chords::KeyResolution::Dispatch(name) => Some(name),
     };
 
     // Clear history search state on any non-search key
@@ -1335,16 +1209,33 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         }
     }
 
-    // Check TF /bind bindings first (runtime bindings from /bind command)
+    // TF-parity plan finding A / Phase 2 step P2.5: a resolved keystroke is
+    // dispatched in this fixed order -
+    //   1. a `/bind`/`/def -b`/`-B` binding (a real, possibly-nameless TF
+    //      macro since finding 40 - see `hooks::get_binding`'s own doc
+    //      comment for the `engine.keybindings` lookup cache it reads)
+    //   2. a `key_<name>` macro (TF's own two-level named-key mapping,
+    //      `/help keys`'s "Mapping Named Keys to functions" - `keynames::
+    //      key_macro_names`)
+    //   3. the built-in action table (`app.keybindings.get_action`)
+    //   4. plain character input
+    // - matching real TF's own layering exactly (a direct `/bind`/`-b`
+    // always wins over the named-key macro layer, which in turn is how a
+    // script overrides Clay's own built-in behavior for a key).
+
+    // 1-2. Check TF /bind bindings, then a `key_<name>` macro - shared with
+    // `remote_client::handle_remote_client_key` and `App::handle_ws_client_msg`'s
+    // `WsMessage::RunKeyBinding` handler (Job 22a/P2.7) via `chords::resolve_bound_command`,
+    // so the three "what does this bound key run" lookups can never drift apart. `key_name`
+    // is already the same canonical form `/bind`/`/def -b`/`-B` normalize their key into
+    // (see keynames.rs and tf::hooks::bind_key), so no separate translation is needed here.
     if let Some(ref name) = key_name {
-        // Map our canonical names to TF's key name format for lookup
-        let tf_name = canonical_to_tf_key_name(name);
-        if let Some(cmd) = app.tf_engine.keybindings.get(&tf_name).cloned() {
+        if let Some(cmd) = chords::resolve_bound_command(app, name) {
             return KeyAction::SendCommand(cmd);
         }
     }
 
-    // Check configurable action bindings
+    // 3. Check configurable action bindings
     if let Some(ref name) = key_name {
         if let Some(action_id) = app.keybindings.get_action(name).map(|s| s.to_string()) {
             return dispatch_action(&action_id, app);
@@ -1473,39 +1364,228 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) {
     app.input.insert_str(&sanitize_paste(text, true));
 }
 
-/// Convert our canonical key names to TF's parse_key_name format for /bind lookup.
-pub(crate) fn canonical_to_tf_key_name(name: &str) -> String {
-    // Our format -> TF format:
-    // "Esc-x" -> "Alt-X" (TF normalizes to Alt-)
-    if let Some(rest) = name.strip_prefix("Esc-") {
-        return format!("Alt-{}", rest.to_uppercase());
+/// Tab-style `/`-command (and `/worlds`/`/world` name) completion against the current
+/// input buffer. Shared by the inline Tab handling above (only tried when the buffer
+/// already starts with `/` and more-mode isn't intercepting the keystroke first) and the
+/// standalone `completion` action (TF-parity plan Job 19/P2.3 - bound to Esc-Tab from Job
+/// 22 onward, so completion can be invoked without Tab's own more-mode-paging priority
+/// getting in the way). Returns true if it consumed the keystroke (replaced the buffer, or
+/// there was nothing left to do but nothing else should happen either - the bare `-e`/`-l`
+/// flag case below); false means "found no match", so a Tab-key caller should fall through
+/// to whatever Tab would otherwise do.
+pub(crate) fn perform_completion(app: &mut App) -> bool {
+    let input = app.input.buffer.clone();
+    let partial = if let Some(space_pos) = input.find(' ') {
+        &input[..space_pos]
+    } else {
+        input.as_str()
+    };
+
+    // Check if this is a /worlds or /world command with arguments (for world name completion)
+    let is_worlds_cmd = partial.eq_ignore_ascii_case("/worlds") || partial.eq_ignore_ascii_case("/world");
+    if is_worlds_cmd && input.contains(' ') {
+        // World name completion for /worlds and /world commands
+        let args_part = &input[input.find(' ').unwrap() + 1..];
+
+        // Parse out -e or -l flag if present
+        let (has_flag, partial_name) = if args_part.starts_with("-e ") || args_part.starts_with("-E ")
+            || args_part.starts_with("-l ") || args_part.starts_with("-L ")
+        {
+            (true, args_part[3..].trim_start())
+        } else if args_part == "-e" || args_part == "-E" || args_part == "-l" || args_part == "-L" {
+            // Just the flag with no world name yet
+            return true;
+        } else {
+            (false, args_part)
+        };
+
+        // Get matching world names
+        let partial_lower = partial_name.to_lowercase();
+        let mut world_matches: Vec<String> = app.worlds.iter()
+            .map(|w| w.name.clone())
+            .filter(|name| name.to_lowercase().starts_with(&partial_lower))
+            .collect();
+        world_matches.sort_by_key(|a| a.to_lowercase());
+
+        if !world_matches.is_empty() {
+            // Find current match index
+            let current_idx = world_matches.iter().position(|m| m.eq_ignore_ascii_case(partial_name));
+            let next_idx = match current_idx {
+                Some(idx) => (idx + 1) % world_matches.len(),
+                None => 0,
+            };
+
+            // Build the completed input
+            let completion = &world_matches[next_idx];
+            let flag_part = if has_flag {
+                if args_part.starts_with("-e") || args_part.starts_with("-E") {
+                    "-e "
+                } else {
+                    "-l "
+                }
+            } else {
+                ""
+            };
+            app.input.buffer = format!("{} {}{}", partial, flag_part, completion);
+            app.input.cursor_position = app.input.buffer.len();
+        }
+        return true;
     }
-    // "Ctrl-Up" -> needs to stay as-is since TF doesn't have these
-    // "Shift-Up" -> same
-    // "^A" -> "^A" (same format)
-    // "F1" -> "F1" (same format)
-    // Special keys like "PageUp", "Home", etc. match TF format
-    name.to_string()
+
+    // Only complete if we're still in the command part (no space yet or cursor before space)
+    if !input.contains(' ') || app.input.cursor_position <= input.find(' ').unwrap_or(input.len()) {
+        let matches = {
+            // Unified / commands: Clay commands + TF commands + manual actions + macros
+            let internal_commands = vec![
+                // Clay-specific commands
+                "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections",
+                "/setup", "/web", "/actions", "/reload", "/update", "/quit", "/gag",
+                "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify",
+                // TF commands (now available with / prefix)
+                "/set", "/unset", "/let", "/echo", "/send", "/beep", "/quote",
+                "/expr", "/test", "/eval", "/if", "/elseif", "/else", "/endif",
+                "/while", "/done", "/for", "/break", "/def", "/undef", "/undefn",
+                "/undeft", "/list", "/purge", "/bind", "/unbind", "/load", "/save",
+                "/lcd", "/time", "/version", "/ps", "/kill", "/sh", "/recall",
+                "/setenv", "/listvar", "/repeat", "/fg", "/trigger", "/input",
+                "/grab", "/ungag", "/exit", "/addworld",
+                // TF-specific versions (for conflicting commands)
+                "/tfhelp", "/tfgag",
+            ];
+
+            // Get manual actions (no patterns = manual-only via /name)
+            let manual_actions: Vec<String> = app.settings.actions.iter()
+                .filter(|a| a.patterns.is_empty())
+                .map(|a| format!("/{}", a.name))
+                .collect();
+
+            // Get user-defined macro names
+            let macro_names: Vec<String> = app.tf_engine.macros.iter()
+                .map(|m| format!("/{}", m.name))
+                .collect();
+
+            // Find all matches
+            let partial_lower = partial.to_lowercase();
+            let mut m: Vec<String> = internal_commands.iter()
+                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                .map(|s| s.to_string())
+                .collect();
+            m.extend(manual_actions.iter()
+                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                .cloned());
+            m.extend(macro_names.iter()
+                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                .cloned());
+            m.sort();
+            m.dedup();
+            m
+        };
+
+        if !matches.is_empty() {
+            // Find current match index if we're already on a completed command
+            let current_idx = matches.iter().position(|m| m.eq_ignore_ascii_case(partial));
+
+            // Get next match (cycle through)
+            let next_idx = match current_idx {
+                Some(idx) => (idx + 1) % matches.len(),
+                None => 0,
+            };
+
+            // Replace the command part with the completion
+            let completion = &matches[next_idx];
+            if input.contains(' ') {
+                // Preserve arguments after the command
+                let args_start = input.find(' ').unwrap();
+                app.input.buffer = format!("{}{}", completion, &input[args_start..]);
+            } else {
+                app.input.buffer = completion.clone();
+            }
+            app.input.cursor_position = completion.len();
+            return true;
+        }
+    }
+    false
 }
 
-/// Dispatch a keybinding action ID to the corresponding behavior.
+/// True for the actions that *build* a pending numeric prefix (`Esc-0`..`Esc-9`/`Esc--`) -
+/// the one exception to "every other action clears `kbnum`" (`dispatch_action`'s own
+/// auto-clear below, and `remote_client::dispatch_remote_action`'s local-only mirror of the
+/// same rule). Shared so the two dispatchers can't drift on the exception list.
+pub(crate) fn is_kbnum_setting_action(action: &str) -> bool {
+    matches!(action,
+        "kbnum_0" | "kbnum_1" | "kbnum_2" | "kbnum_3" | "kbnum_4"
+        | "kbnum_5" | "kbnum_6" | "kbnum_7" | "kbnum_8" | "kbnum_9"
+        | "kbnum_negative")
+}
+
+/// Dispatch a keybinding action ID to the corresponding behavior. Every id in
+/// `keybindings::ACTIONS` must be handled here (see `dispatch_action_impl`'s doc comment) -
+/// unrecognised ids (e.g. a stale name left in an old `keybindings.dat`) fall through to
+/// `KeyAction::None` rather than panicking, since a corrupt binding must never crash the app.
+///
+/// TF-parity plan Job 20 (P2.4): any action other than the numeric-prefix-building ones
+/// above clears a pending `kbnum`, whether or not it actually consumed one (tf-help
+/// #kbnum: "Whether the keybinding uses the value or not, %kbnum is cleared after the
+/// keybinding has run") - this is also what makes `bell`/`^G` cancel a pending prefix
+/// without honoring it (kbbind.tf: "^G does NOT honor kbnum, so it can be used to cancel
+/// kbnum entry"), with no special case needed in `bell`'s own arm.
 pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
-    match action {
-        // Cursor Movement
+    let result = dispatch_action_impl(action, app).unwrap_or(KeyAction::None);
+    if !is_kbnum_setting_action(action) {
+        app.input.clear_kbnum();
+    }
+    result
+}
+
+/// Test-only: distinguishes "recognised action id that happens to produce `KeyAction::None`"
+/// from "fell through to the unknown-action arm", which `dispatch_action` alone can't do
+/// since both cases return the same value. Backs
+/// `test_dispatch_action_handles_every_action_id` (src/tests.rs), which iterates
+/// `keybindings::ACTIONS` and asserts every id is recognised here.
+#[cfg(test)]
+pub(crate) fn dispatch_action_is_known(action: &str, app: &mut App) -> bool {
+    dispatch_action_impl(action, app).is_some()
+}
+
+fn dispatch_action_impl(action: &str, app: &mut App) -> Option<KeyAction> {
+    Some(match action {
+        // Cursor Movement - all four honor a pending numeric prefix (TF-parity plan Job 20
+        // /P2.4): `n = kbnum.unwrap_or(1)` (kbfunc.tf: `dokey_left = /@test kbgoto(kbpoint()
+        // - (kbnum?:1))`), with a negative `n` reversing direction (tf-help #kbnum).
         "cursor_left" => {
-            app.input.move_cursor_left();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.move_cursor_left(); }
+            } else {
+                for _ in 0..(-n) { app.input.move_cursor_right(); }
+            }
             KeyAction::None
         }
         "cursor_right" => {
-            app.input.move_cursor_right();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.move_cursor_right(); }
+            } else {
+                for _ in 0..(-n) { app.input.move_cursor_left(); }
+            }
             KeyAction::None
         }
         "cursor_word_left" => {
-            app.input.word_left();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.word_left(); }
+            } else {
+                for _ in 0..(-n) { app.input.word_right(); }
+            }
             KeyAction::None
         }
         "cursor_word_right" => {
-            app.input.word_right();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.word_right(); }
+            } else {
+                for _ in 0..(-n) { app.input.word_left(); }
+            }
             KeyAction::None
         }
         "cursor_home" => {
@@ -1517,43 +1597,86 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
             KeyAction::None
         }
         "cursor_up" => {
-            if app.input.move_cursor_up() {
-                app.input.history_prev();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n {
+                    if app.input.move_cursor_up() { app.input.history_prev(); }
+                }
+            } else {
+                for _ in 0..(-n) {
+                    if app.input.move_cursor_down() { app.input.history_next(); }
+                }
             }
             KeyAction::None
         }
         "cursor_down" => {
-            if app.input.move_cursor_down() {
-                app.input.history_next();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n {
+                    if app.input.move_cursor_down() { app.input.history_next(); }
+                }
+            } else {
+                for _ in 0..(-n) {
+                    if app.input.move_cursor_up() { app.input.history_prev(); }
+                }
             }
             KeyAction::None
         }
 
-        // Editing
+        // Editing - deletion actions honor `n = kbnum.unwrap_or(1)`, negative `n` reversing
+        // direction, same as the cursor-movement arms above (TF-parity plan Job 20/P2.4;
+        // kbfunc.tf: `dokey_bspc = /@test kbdel(kbpoint() - (kbnum?:1))`).
         "delete_backward" => {
-            app.input.delete_char();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.delete_char(); }
+            } else {
+                for _ in 0..(-n) { app.input.delete_char_forward(); }
+            }
             app.last_input_was_delete = true;
             KeyAction::None
         }
         "delete_forward" => {
-            app.input.delete_char_forward();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.delete_char_forward(); }
+            } else {
+                for _ in 0..(-n) { app.input.delete_char(); }
+            }
             app.last_input_was_delete = true;
             KeyAction::None
         }
         "delete_word_backward" => {
-            app.input.delete_word_before_cursor();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.delete_word_before_cursor(); }
+            } else {
+                for _ in 0..(-n) { app.input.delete_word_forward(); }
+            }
             app.spell_state.reset();
             app.suggestion_message = None;
             app.last_input_was_delete = true;
             KeyAction::None
         }
         "delete_word_forward" => {
-            app.input.delete_word_forward();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.delete_word_forward(); }
+            } else {
+                for _ in 0..(-n) { app.input.delete_word_before_cursor(); }
+            }
             app.last_input_was_delete = true;
             KeyAction::None
         }
+        // No punctuation-aware *forward* variant exists to reverse into, so a negative
+        // prefix falls back to the plain (non-punctuation) forward delete.
         "delete_word_backward_punct" => {
-            app.input.backward_kill_word_punctuation();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.backward_kill_word_punctuation(); }
+            } else {
+                for _ in 0..(-n) { app.input.delete_word_forward(); }
+            }
             app.last_input_was_delete = true;
             KeyAction::None
         }
@@ -1568,24 +1691,35 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
             app.suggestion_message = None;
             KeyAction::None
         }
+        // Repeat, not direction (there's no "transpose backward") - TF's own
+        // kb_transpose_chars uses kbnum to widen the swapped substring instead, which
+        // Clay's simpler two-char transpose_chars has no equivalent of; repeating it `n`
+        // times is the closest faithful match to "most kbnum keybindings are a repeat
+        // count" (tf-help #kbnum).
         "transpose_chars" => {
-            app.input.transpose_chars();
+            let n = app.input.take_kbnum_positive();
+            for _ in 0..n { app.input.transpose_chars(); }
             KeyAction::None
         }
         "literal_next" => {
             app.literal_next = true;
             KeyAction::None
         }
+        // Word-case actions: TF's kb_capitalize_word/kb_downcase_word/kb_upcase_word all use
+        // `/repeat -S $[kbnum>0?+kbnum:1]` - no direction, negative/zero both default to 1.
         "capitalize_word" => {
-            app.input.capitalize_word();
+            let n = app.input.take_kbnum_positive();
+            for _ in 0..n { app.input.capitalize_word(); }
             KeyAction::None
         }
         "lowercase_word" => {
-            app.input.lowercase_word();
+            let n = app.input.take_kbnum_positive();
+            for _ in 0..n { app.input.lowercase_word(); }
             KeyAction::None
         }
         "uppercase_word" => {
-            app.input.uppercase_word();
+            let n = app.input.take_kbnum_positive();
+            for _ in 0..n { app.input.uppercase_word(); }
             KeyAction::None
         }
         "collapse_spaces" => {
@@ -1604,86 +1738,107 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
             app.input.yank();
             KeyAction::None
         }
+        // TF `Insert`/`Esc-v`: `/@test insert := !insert` (kbbind.tf).
+        "toggle_insert" => {
+            app.input.insert = !app.input.insert;
+            KeyAction::None
+        }
+        // TF-parity plan Job 20 (P2.4): numeric prefix entry. See
+        // `InputArea::kbnum_digit`/`kbnum_negative` for the accumulation rule.
+        "kbnum_0" => { app.input.kbnum_digit(0); KeyAction::None }
+        "kbnum_1" => { app.input.kbnum_digit(1); KeyAction::None }
+        "kbnum_2" => { app.input.kbnum_digit(2); KeyAction::None }
+        "kbnum_3" => { app.input.kbnum_digit(3); KeyAction::None }
+        "kbnum_4" => { app.input.kbnum_digit(4); KeyAction::None }
+        "kbnum_5" => { app.input.kbnum_digit(5); KeyAction::None }
+        "kbnum_6" => { app.input.kbnum_digit(6); KeyAction::None }
+        "kbnum_7" => { app.input.kbnum_digit(7); KeyAction::None }
+        "kbnum_8" => { app.input.kbnum_digit(8); KeyAction::None }
+        "kbnum_9" => { app.input.kbnum_digit(9); KeyAction::None }
+        "kbnum_negative" => { app.input.kbnum_negative(); KeyAction::None }
 
-        // History
+        // History - repeat `n` times in the given direction, negative `n` reversing
+        // (TF-parity plan Job 20/P2.4).
         "history_prev" => {
-            app.input.history_prev();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.history_prev(); }
+            } else {
+                for _ in 0..(-n) { app.input.history_next(); }
+            }
             app.spell_state.reset();
             KeyAction::None
         }
         "history_next" => {
-            app.input.history_next();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.history_next(); }
+            } else {
+                for _ in 0..(-n) { app.input.history_prev(); }
+            }
             app.spell_state.reset();
             KeyAction::None
         }
         "history_search_backward" => {
-            app.input.history_search_backward();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.history_search_backward(); }
+            } else {
+                for _ in 0..(-n) { app.input.history_search_forward(); }
+            }
             KeyAction::None
         }
         "history_search_forward" => {
-            app.input.history_search_forward();
+            let n = app.input.take_kbnum();
+            if n >= 0 {
+                for _ in 0..n { app.input.history_search_forward(); }
+            } else {
+                for _ in 0..(-n) { app.input.history_search_backward(); }
+            }
             KeyAction::None
         }
 
-        // Scrollback
+        // Scrollback - "page/half-page/line scroll actions" all honor kbnum as a row-count
+        // multiplier, negative `n` reversing direction (TF-parity plan Job 20/P2.4;
+        // kbfunc.tf: `dokey_page = /test morescroll(winlines() * (kbnum?:1))`,
+        // `dokey_pageback = /test morescroll(-winlines() * (kbnum?:1))`).
         "scroll_page_up" => {
-            app.scroll_output_up();
+            let n = app.input.take_kbnum();
+            let rows = app.page_step().saturating_mul(n.unsigned_abs() as usize).max(1);
+            if n >= 0 {
+                app.scroll_output_up_by(rows);
+            } else {
+                app.dokey_scroll_forward(rows);
+            }
             KeyAction::None
         }
         "scroll_page_down" => {
-            if app.current_world().is_at_bottom() && app.current_world().paused {
-                app.release_pending_screenful();
+            let n = app.input.take_kbnum();
+            let rows = app.page_step().saturating_mul(n.unsigned_abs() as usize).max(1);
+            if n >= 0 {
+                app.dokey_scroll_forward(rows);
             } else {
-                app.scroll_output_down();
+                app.scroll_output_up_by(rows);
             }
             KeyAction::None
         }
+        // TF HPAGE: half page forward. Shares `dokey_scroll_forward` with `/dokey HPAGE`
+        // (`perform_dokey`'s HalfPageForward) instead of a bespoke body - the old one only
+        // ever scrolled backward (`scroll_output_up_by`) outside the "paused with pending
+        // output" case, which was wrong for a key whose whole point is "forward": scrolled
+        // up in history with more-mode off, or paused with nothing pending yet, both need
+        // to move toward the bottom, not further away from it. `dokey_scroll_forward`
+        // already handles the "release pending while parked at the bottom" case via
+        // `release_pending_up_to` (the same row-budget-aware release `Tab`/PgDn use), so
+        // nothing here is lost - see that function's own doc comment.
         "scroll_half_page" => {
-            let half = (app.output_height as usize).saturating_sub(2) / 2;
-            if app.current_world().paused && !app.current_world().pending_lines.is_empty() {
-                let visual_budget = half.max(1);
-                let output_width = app.output_width as usize;
-                let world_idx = app.current_world_index;
-                let mut released = 0;
-                let mut visual_used = 0;
-                let pending_len = app.worlds[world_idx].pending_lines.len();
-                // Row budget measured the way the renderer draws. This used to divide the
-                // line's *byte* length by the width, which over-counts multi-byte text,
-                // under-counts word-wrap ragged edges, and ignores the ▶/🛢️/timestamp
-                // prefixes entirely.
-                let metrics = crate::rendering::RowMetrics::new(&app.settings, app.show_tags, output_width.max(1));
-                for i in 0..pending_len {
-                    let line = &app.worlds[world_idx].pending_lines[i];
-                    let line_visual = metrics.rows(line).max(1);
-                    if visual_used + line_visual > visual_budget && released > 0 {
-                        break;
-                    }
-                    visual_used += line_visual;
-                    released += 1;
-                }
-                if released > 0 {
-                    let lines: Vec<_> = app.worlds[world_idx].pending_lines.drain(..released).collect();
-                    app.worlds[world_idx].output_lines.extend(lines.iter().cloned());
-                    // Route through the shared release broadcaster (see its doc comment on
-                    // App::broadcast_released_lines) instead of a local copy of the batching
-                    // loop that hardcoded `from_server: true` for every line - pending_lines
-                    // can hold a mix of real server output and client-generated content (e.g.
-                    // a /recall that overflowed a screenful while paused), and forcing
-                    // from_server: true mismarked the latter, losing its "✨ " client-line
-                    // marker on the receiving end.
-                    app.broadcast_released_lines(world_idx, &lines, None); // console key
-                    if app.worlds[world_idx].pending_lines.is_empty() {
-                        app.worlds[world_idx].paused = false;
-                        app.worlds[world_idx].lines_since_pause = 0;
-                    }
-                    let pending_count = app.worlds[world_idx].pending_lines.len();
-                    app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
-                    app.broadcast_activity();
-                }
+            let n = app.input.take_kbnum();
+            let half = (app.page_step() / 2).max(1).saturating_mul(n.unsigned_abs() as usize).max(1);
+            if n >= 0 {
+                app.dokey_scroll_forward(half);
             } else {
-                app.scroll_output_up_by(half.max(1));
+                app.scroll_output_up_by(half);
             }
-            app.needs_output_redraw = true;
             KeyAction::None
         }
         "flush_output" => {
@@ -1785,7 +1940,7 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
             // Double-press Ctrl+C logic
             if let Some(last_time) = app.last_ctrl_c {
                 if last_time.elapsed() < Duration::from_secs(15) {
-                    return KeyAction::Quit;
+                    return Some(KeyAction::Quit);
                 }
             }
             app.last_ctrl_c = Some(std::time::Instant::now());
@@ -1857,6 +2012,151 @@ pub(crate) fn dispatch_action(action: &str, app: &mut App) -> KeyAction {
             KeyAction::None
         }
 
-        _ => KeyAction::None,
-    }
+        // TF-parity plan Job 19 (P2.3): new bindable actions, reusing the exact code paths
+        // `App::perform_dokey` uses so `/dokey NAME` and the keyboard action share one
+        // implementation (see `perform_dokey`'s own doc comment for the reverse direction).
+
+        // History: TF RECALLBEG/RECALLEND, kbnum-aware (Job 20/P2.4) - see
+        // `InputArea::history_begin_n`'s doc comment for the "n-th entry from that end"
+        // interpretation (real RECALLBEG/RECALLEND are C builtins with no kbfunc.tf wrapper
+        // to read a documented kbnum behavior from).
+        "recall_begin" => {
+            let n = app.input.take_kbnum();
+            app.input.history_begin_n(n);
+            KeyAction::None
+        }
+        "recall_end" => {
+            let n = app.input.take_kbnum();
+            app.input.history_end_n(n);
+            KeyAction::None
+        }
+
+        // Scrollback: TF LINE/LINEBACK - scroll by exactly one output line, times kbnum.
+        "scroll_line_forward" => {
+            let n = app.input.take_kbnum();
+            let amount = n.unsigned_abs().max(1) as usize;
+            if n >= 0 {
+                app.dokey_scroll_forward(amount);
+            } else {
+                app.scroll_output_up_by(amount);
+            }
+            KeyAction::None
+        }
+        "scroll_line_back" => {
+            let n = app.input.take_kbnum();
+            let amount = n.unsigned_abs().max(1) as usize;
+            if n >= 0 {
+                app.scroll_output_up_by(amount);
+            } else {
+                app.dokey_scroll_forward(amount);
+            }
+            KeyAction::None
+        }
+        // TF PAGEBACK is identical to scroll_page_up (full page backward) - a real alias,
+        // not a second implementation, so the two can never drift apart.
+        "scroll_page_back" => dispatch_action("scroll_page_up", app),
+        // TF HPAGEBACK: half page backward (scroll_half_page's own arm, above, covers
+        // HPAGE/forward - see its doc comment there).
+        "scroll_half_page_back" => {
+            let n = app.input.take_kbnum();
+            let half = (app.page_step() / 2).max(1).saturating_mul(n.unsigned_abs() as usize).max(1);
+            if n >= 0 {
+                app.scroll_output_up_by(half);
+            } else {
+                app.dokey_scroll_forward(half);
+            }
+            KeyAction::None
+        }
+        // TF CLEAR: empty the view without dropping any lines - scrollback (still fully
+        // intact in output_lines) refills it on the next draw.
+        "clear_screen" => {
+            app.needs_terminal_clear = true;
+            app.needs_output_redraw = true;
+            KeyAction::None
+        }
+        // TF PAUSE: pause the current world so new output queues as pending.
+        "pause_output" => {
+            app.current_world_mut().paused = true;
+            KeyAction::None
+        }
+
+        // Editing: TF kb_backward_kill_line (real TF's own ^U).
+        "kill_to_start" => {
+            app.input.kill_to_start();
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+        // TF kb_expand_line (`/eval /grab $(/recall -i 1)`): TF's own input history
+        // "records ... the current line" (tf-help's `history` topic), so this reduces to
+        // one substitution pass over the current buffer, replacing it with the result.
+        "expand_line" => {
+            let text = app.input.buffer.clone();
+            let expanded = crate::tf::variables::substitute_commands(&mut app.tf_engine, &text);
+            app.input.buffer = expanded;
+            app.input.cursor_position = app.input.buffer.len();
+            KeyAction::None
+        }
+        // Tab completion as a standalone, unconditional action (Esc-Tab), sharing
+        // `perform_completion` with Tab's own inline handling above.
+        "completion" => {
+            perform_completion(app);
+            KeyAction::None
+        }
+
+        // World: TF SOCKETB/SOCKETF (`/fg -<`/`/fg ->`) - cycle CONNECTED worlds only, in
+        // world-list order, `n = kbnum.unwrap_or(1)` connected worlds at a time
+        // (kbfunc.tf: `dokey_socketb = /fg -c$[-kbnum?:-1]`, `dokey_socketf = /fg
+        // -c$[+kbnum?:1]` - `cmd_fg`'s `-c<N>` already takes an arbitrary step count, so
+        // this needs no per-step looping).
+        "world_socket_prev" => {
+            let n = app.input.take_kbnum() as i32;
+            match app.cycle_connected_world(-n) {
+                Some(idx) => KeyAction::SwitchedWorld(idx),
+                None => KeyAction::None,
+            }
+        }
+        "world_socket_next" => {
+            let n = app.input.take_kbnum() as i32;
+            match app.cycle_connected_world(n) {
+                Some(idx) => KeyAction::SwitchedWorld(idx),
+                None => KeyAction::None,
+            }
+        }
+        // TF /bg (= /fg -n): background every world / no foreground - a no-op in Clay's
+        // single-pane console, exactly like cmd_fg's own -n handling (tf/parser.rs).
+        "bg_all_worlds" => KeyAction::None,
+
+        // System: TF REFRESH (plain repaint) vs. Clay's historical filtering ^L. Both
+        // trigger the same terminal teardown/rebuild at the call site; only `Redraw` also
+        // runs `World::filter_to_server_output` there (see `KeyAction::Refresh`'s doc
+        // comment).
+        "refresh_line" => KeyAction::Refresh,
+        "redraw_server_only" => KeyAction::Redraw,
+
+        // TF-parity plan Job 22a (P2.6/finding A ruling table, `Esc-L`): toggle the F4
+        // filter popup between "no limit" and "the last limit applied" - real TF has no
+        // single dokey for this (`/limit`/`/unlimit`/`/relimit` are separate commands), so
+        // this is Clay's own convenience binding, reusing Job 15's `PendingLimitOp` plumbing
+        // directly (`commands::apply_limit_op`) rather than the queued round trip
+        // `apply_pending_tf_console_ops` drains for a typed command - a live keypress
+        // already holds `&mut App`.
+        "toggle_limit" => {
+            let op = if app.filter_popup.visible {
+                crate::tf::PendingLimitOp::Clear
+            } else {
+                crate::tf::PendingLimitOp::Reapply
+            };
+            crate::commands::apply_limit_op(app, op);
+            KeyAction::None
+        }
+        // TF-parity plan Job 22a (`^X^V`): same text `Command::Version` prints for a typed
+        // `/version` (main.rs's `handle_command`) - not a `KeyAction::SendCommand("/version")`
+        // round trip, since this is simpler and behaves identically.
+        "show_version" => {
+            app.add_output(&crate::get_version_string());
+            KeyAction::None
+        }
+
+        _ => return None,
+    })
 }

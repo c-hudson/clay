@@ -1066,9 +1066,11 @@ pub(crate) fn render_output_crossterm(app: &App) {
         highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns)
     };
 
-    // Check if filter popup is active with a non-empty filter
+    // Check if filter popup is active with a non-empty filter, OR (Job 15's /limit -a)
+    // an attrs-only filter with no pattern at all - either way `filtered_indices` is
+    // meaningful and must be used instead of falling through to normal rendering.
     // If filter is active but no matches, show nothing (don't fall through to normal rendering)
-    if app.filter_popup.visible && !app.filter_popup.filter_text.is_empty() {
+    if app.filter_popup.visible && (!app.filter_popup.filter_text.is_empty() || app.filter_popup.attrs_only) {
         // If no matches, visual_lines stays empty - that's correct behavior
         if !app.filter_popup.filtered_indices.is_empty() {
             // Use filtered indices
@@ -1919,6 +1921,15 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // GMCP indicator (only shown when F9 toggled to enable GMCP processing)
     let gmcp_indicator = if world.gmcp_user_enabled { " [g]" } else { "" };
 
+    // Numeric prefix indicator (TF-parity plan Job 20/P2.4): shown only while a kbnum
+    // prefix is pending (Esc-0..9/Esc--), mirroring real TF's own status-line kbnum
+    // display (tf-help #kbnum: "the current %kbnum value is displayed near the right end
+    // of the status line").
+    let kbnum_indicator = match app.input.kbnum {
+        Some(n) => format!(" [{n}]"),
+        None => String::new(),
+    };
+
     // Activity indicator - positioned at column 24
     const ACTIVITY_POSITION: usize = 24;
     // In remote client mode, use the server's activity count
@@ -1993,11 +2004,26 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // Calculate position: status + ball (2 chars) + world name + tag indicator + gmcp indicator
+        // Numeric prefix indicator (bold, like a real TF status line's kbnum display)
+        if !kbnum_indicator.is_empty() {
+            spans.push(Span::styled(
+                kbnum_indicator.clone(),
+                Style::default().fg(theme.fg_highlight()).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Calculate position: status + ball (2 chars) + world name + tag/gmcp/kbnum indicators
         status_str.len() + 2 + world_display.len() + tag_indicator.len() + gmcp_indicator.len()
+            + kbnum_indicator.len()
     } else {
-        // World never connected - don't show ball or name
-        status_str.len()
+        // World never connected - don't show ball or name (still show kbnum, if pending)
+        if !kbnum_indicator.is_empty() {
+            spans.push(Span::styled(
+                kbnum_indicator.clone(),
+                Style::default().fg(theme.fg_highlight()).add_modifier(Modifier::BOLD),
+            ));
+        }
+        status_str.len() + kbnum_indicator.len()
     };
 
     // Pad to reach position 24 (or as close as possible)

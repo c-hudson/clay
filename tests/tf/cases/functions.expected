@@ -1,0 +1,9 @@
+features=1
+ftime=2001-09
+mktime_positive=1
+replace=bonono
+strip_attr=x
+morepaused=0
+winlines_positive=1
+cputime_nonneg=1
+ln1=0.

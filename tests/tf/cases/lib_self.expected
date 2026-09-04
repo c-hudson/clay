@@ -1,0 +1,1 @@
+/let q="%;/let p=%% %;/let f=strcat("/let q=",q,p,";/let p=",p,p," ",p,";/let f=",f,p,";/test echo(",p,"f)")%;/test echo(%f)

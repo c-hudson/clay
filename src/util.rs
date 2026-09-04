@@ -324,6 +324,46 @@ pub fn local_time_now() -> LocalTime {
     local_time_from_epoch(epoch_secs)
 }
 
+/// Inverse of `local_time_from_epoch`: convert broken-down local time
+/// fields to epoch seconds. Backs TF's `mktime()` function (`expressions.rs`).
+/// Out-of-range fields (month 13, day 32, ...) are normalized the same way
+/// a real `mktime(3)` does - e.g. `mktime(2001, 13, 1, ...)` becomes
+/// 2002-01-01 - which is also what real tf's own `mktime()` does, since
+/// it's a thin wrapper around the same libc call.
+#[cfg(unix)]
+#[allow(deprecated)]
+pub fn epoch_from_local_time(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = (year - 1900) as i32;
+    tm.tm_mon = (month - 1) as i32;
+    tm.tm_mday = day as i32;
+    tm.tm_hour = hour as i32;
+    tm.tm_min = minute as i32;
+    tm.tm_sec = second as i32;
+    tm.tm_isdst = -1;
+    unsafe { libc::mktime(&mut tm) as i64 }
+}
+
+/// Windows fallback: no `libc::mktime` binding available, so this computes
+/// the epoch directly from the civil calendar (Howard Hinnant's
+/// `days_from_civil` algorithm), treating the fields as UTC rather than
+/// true local time. Out-of-range fields are still normalized correctly
+/// (the algorithm is defined for any integer inputs), just without a
+/// timezone/DST adjustment - Windows isn't part of this project's tested
+/// build matrix for the TF layer, so exact local-time fidelity there is a
+/// known gap rather than a verified behavior.
+#[cfg(windows)]
+pub fn epoch_from_local_time(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64; // [0, 399]
+    let mp = (month + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468; // days since 1970-01-01
+    days * 86400 + hour * 3600 + minute * 60 + second
+}
+
 /// Format a `LocalTime` using a strftime-style format string.
 ///
 /// Supported specifiers (TinyFugue `/recall -t[format]` compatible):

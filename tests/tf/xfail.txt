@@ -1,0 +1,1018 @@
+# Known-failing tf-script cases (Phase 0 of the TinyFugue-parity plan).
+#
+# Format: case-name | substring-of-expected-failure
+#   - Blank lines and lines starting with '#' are ignored.
+#   - A listed case MUST fail, and its failure report (errors joined with a
+#     description of the first echoed/expected mismatch) must contain the
+#     given substring, or the test reports the real failure text instead.
+#   - A listed case that PASSES is itself a test failure ("remove it from
+#     xfail.txt") - flip it as part of the Phase 1 step that fixes the gap.
+#
+# See tests/tf/README.md and finding C in the plan for the underlying gaps.
+
+# C.5 and C.6 are fixed (Job 8): /result implemented (macros::
+# execute_macro_with_context distinguishes "called as a command" - echoes -
+# from "called as a function" - doesn't); "/@name" builtin-bypass prefix
+# implemented; a user-defined macro now takes precedence over a same-named
+# builtin (finding 16 - see is_control_flow_keyword's carve-out for the
+# handful of names that must never be shadowable); %{name-default}, %L,
+# %-N, %-L and their braced forms implemented in variables.rs, and the
+# matching {-N}/{L}/{-L} selectors in expressions.rs (which also corrected
+# {-N}'s actual meaning - "all but the first N", not "Nth from the end",
+# verified directly against real tf); finding 15's "%%;" literal fix in
+# macros::split_body_preserving_control_flow (now reuses control_flow::
+# split_percent_semi instead of a second, escape-blind splitter).
+# macro_result, positional, at_prefix, lib_factoral and lib_tick pass
+# outright now and were removed. Getting /result to actually reach
+# execute_macro's own per-command loop from inside a nested /if/while/for
+# block (needed by lib_factoral.tf's ifact()/rfact(), both of which call
+# /result from inside a branch) also required propagating Return/Result
+# through aggregate_results/aggregate_results_with_engine instead of
+# silently absorbing them (they used to turn into a bare Success there) -
+# not one of finding C's numbered gaps, surfaced while making /result work
+# for real. Likewise, TF's lowest-precedence comma operator ("e1, e2":
+# evaluate both, keep e2's value - used throughout tf-lib as
+# "/while (shift(), {#}) ..." and "/test (x:=y), --z") was entirely
+# unimplemented - the expression grammar had no operator between
+# assignment and a function call's own argument-separating "," at all -
+# needed by lisp.tf's /reverse (via /while) and factoral.tf's ifact() (via
+# /test); also not one of finding C's numbered gaps.
+#
+# C.2 is fixed (/require now finds every one of these via %TFLIBDIR - see
+# TfEngine::new's default and builtins::resolve_file_path). Each entry below
+# now points at that file's own NEXT real gap instead of "Cannot find file".
+# lib_complete, lib_hanoi, lib_kbregion, lib_quoter, lib_tools, lib_tr and
+# lib_worldq had no further gap at all and were removed (Job 6): their probes
+# (ismacro()/list_active_worlds() checks, mostly) passed outright then -
+# lib_tr was briefly back in this file as of Job 8 (finding 16's fix reached
+# tr.tf's real /tr macro for the first time, and its body used the C.8
+# command-form /while), and is gone again for good as of Job 9 below.
+#
+# C.4 is fixed (Job 7: /purge now honours a MacroFilter instead of ignoring
+# its arguments, and is silent on success like real TF - see purge_args.tf
+# and cmd_purge). purge_args and lib_kbstack (whose own /purge -i
+# key_esc_down previously shifted every later line via the bogus "N macro(s)
+# purged." message) both pass outright now and were removed.
+#
+# C.7 and C.8 are fixed (Job 9): TF's own `/for <var> <min> <max> <command>`
+# form (detected when the 4th token isn't an integer - split_for_command_form
+# in control_flow.rs) now runs <command> once per iteration with the loop
+# variable substituted fresh each time, never up front (execute_tf_command's
+# is_control_flow_command gate defers ALL of /if/while/for's substitution to
+# control_flow.rs, not just when the text happens to contain a literal "\n"
+# - previously a bare "/for i 1 3 /echo n=%i" saw "%i" substituted, using
+# whatever "i" held *before* the loop, before cmd_for ever ran). The
+# command-form condition ("/if /command%; /then ...", "/while /command%;
+# /do ...") is implemented the same way: control_flow::evaluate_condition
+# runs each "%;"-joined command in the condition's own list (every one
+# genuinely executes, side effects included - tf-help "evaluation": "the
+# return value of a <list> is the return value of the last command executed
+# in the list"), using the LAST one's own return status as the truth value
+# and leaving it in %? exactly as TF does; a leading "/!" negates one
+# command's status. for_syntax, if_command and lib_tr pass outright now and
+# were removed. This also exposed and fixed a latent bug of its own: a
+# depth-counter used to decide whether a body line opens a block awaiting a
+# later /done (group_body_lines and its three siblings, one each in
+# control_flow.rs/macros.rs) treated every "/for" token as such an opener -
+# true for Clay's own numeric block form, but TF's command-form /for is
+# fully self-contained and never has a matching /done, so a body containing
+# one (tf-lib's testcolor.tf 6x6x6 color-cube section nests three of them)
+# was wrongly merged with every sibling line after it while searching for a
+# "/done" that would never come - in practice an unbounded pathological
+# merge, hanging the whole test binary until this was root-caused and fixed
+# (control_flow::is_self_contained_for, shared by all four counters).
+
+# C.10 is fixed (Job 10): -h"EVENT pattern" now parses, and fire_hook matches
+# the pattern against the hook's own argument text the same way a trigger
+# matches a line. lib_alias passes outright now and was removed - /alias's
+# SEND hook has the gag attribute (-ag, so its own default hook-message
+# stand-in - see TfHookEvent::is_world_stream_event's doc comment on
+# cmd_trigger's -h branch - is suppressed), and its body correctly replaces
+# "greet bob" with "greetings bob".
+
+# Re-pointed (Job 8): fixing Return/Result propagation through a nested
+# /if (see the entry above) means /at's own "/if (!getopts(\"v\", \"\"))
+# /return 0%; /endif" guard now actually stops the macro immediately
+# instead of the Return being silently dropped and execution falling
+# through to the later "/test t += 24:00:00" line that used to surface
+# "Unexpected token: Eq" (the still-unimplemented "+=" compound-assignment
+# operator, C.11 territory). getopts() is itself still a real gap (likely
+# C.11, undocumented in finding C) - not root-caused further than that.
+#
+# C.11 is fixed (Job 11): getopts(), mktime() and ftime()'s "%F"/"%T"/"%."
+# specifiers are all implemented now, and all independently verified
+# correct in isolation (e.g. `getopts("v", "")` against a synthetic
+# {#, 1, 2, 3, *} scope behaves exactly per spec, and
+# `mktime(2099,1,1,0,0,0,"000000")` round-trips through `ftime("%F %T.%.")`
+# to "2099-01-01 00:00:00.000000", the exact text /at's own probe needs).
+# The fixture still produces no output at all, though - not this job's
+# scope: even the FIRST probe ("/at badtime /echo x", which never even
+# calls getopts() with a "-v" token to consume) silently produces nothing
+# instead of the expected usage message, and stepping through /at's body
+# one line at a time shows its very first "/if (!getopts(...)) /return
+# 0%; /endif" line, run in isolation with the same scope, does NOT return
+# early - so the silent stop happens somewhere in the rest of the body's
+# long "%;"-joined chain of nested /if/else blocks, a control-flow-only
+# issue unrelated to any of getopts()/mktime()/ftime()/replace() or this
+# job's other three items (finding 19/20/24). Not root-caused further.
+#
+# Fixed (Job 15b-i, 2026-09-03): the "silent stop" was
+# aggregate_results_with_engine's own Return/Result arm (parser.rs)
+# discarding every Success(Some(...)) text collected earlier in the SAME
+# /if-block once a /return fires - at.tf's usage-message branch is exactly
+# "/echo ...%; /set ...%; /return 0", so the echo's own text never
+# survived to be seen. Fixed by queueing that discarded text into
+# engine.pending_outputs (the same side channel `echo()` already uses)
+# before propagating the Return/Result marker outward, drained per
+# top-level line by builtins::load_lines (also fixed here - it used to
+# drain pending_outputs only once, at the very end of a whole file, which
+# silently reordered any file with more than one echo()-producing line
+# ahead of the file's own last direct result; see stdlib_macros' entry).
+# Two more, smaller gaps surfaced once that unblocked real output: "%0"
+# ("the name of the executing macro" per /help substitution) was never
+# set as a local var, so at.tf's own "/echo ... /%0 ..." usage/date
+# messages printed a bare "/" instead of "/at" - fixed in
+# macros::execute_macro_with_context. And "%{P1-$[ftime(...)]}" (a
+# %{selector-default} whose DEFAULT itself contains a $[...] expression)
+# left literal, unsubstituted "%{P1-20}%{P2-26}" text as at.tf's own
+# "year" value - substitute_commands' plain-buffer-around-$-regions
+# strategy flushed "%{P1-" alone right before the "$[...]", handing
+# substitute_variables an unterminated %{...} span it could only leave
+# literal; fixed by extracting the WHOLE %{...} span up front in
+# substitute_commands and resolving it as one unit (recursing into the
+# default text for its own %/$ substitution). That in turn exposed that
+# %{Pn}/%{PL}/%{PR} (the BRACED form of a regex capture reference) never
+# read engine.regex_captures at all, unlike the bare %Pn form - fixed via
+# a new shared variables::resolve_braced_selector helper. Also found and
+# fixed along the way: `execute_if_encoded`/`execute_while_encoded`/
+# `execute_for_encoded`'s dispatch in parser.rs (execute_command_impl)
+# used the OTHER, engine-less `aggregate_results` (marked #[allow(dead_
+# code)] and documented "for tests" - actually live production code for
+# every /if/while/for condition reached through the inline-block path,
+# since `execute_if_block` et al. encode conditions as a
+# "__tf_if_eval__..." string dispatched right back through
+# execute_command_impl) instead of `aggregate_results_with_engine`, so it
+# could never have benefited from the pending_outputs fix above; switched
+# all 5 call sites to the engine-aware version and deleted the dead
+# duplicate. lib_at passes outright now and was removed.
+
+# C.11 is fixed (Job 11): features() is implemented (verified directly
+# against real tf's own /features output on this build: every feature on
+# except "core" and "SOCKS"). color.tf's own "/if (!features("256colors"))
+# /exit%; /endif" guard now correctly falls through into its 256-color
+# /for loops instead of exiting immediately - but those loops hit a
+# different, pre-existing gap: their body text doubly-escapes the loop
+# variables ("start_color_rgb%%%{red}%%%{green}%%%{blue}", needed so the
+# innermost of three nested command-form /for loops sees %{red} etc. at
+# the right substitution depth), and Clay's /for only unescapes one level,
+# leaving literal "%0"/"%1"/... in the variable name instead of the actual
+# digit - not one of finding C's numbered gaps, and not this job's four
+# assigned items (functions/replace/getopts, /set-/let-trim, := scope,
+# bundled options) - a nested-/for substitution-depth issue instead.
+#
+# Fixed (Job 15b-i, 2026-09-03): derived TF's actual escaping rule by
+# direct experiment against real tf (`/eval /echo [%{x}] [%%{x}]
+# [%%%{x}] [%%%%{x}]` -> "[5] [%{x}] [%%{x}] [%%%{x}]", same for a bare
+# run of "$" before "[...]") - a run of N consecutive '%' (or '$') is a
+# live substitution introducer ONLY when N == 1; N >= 2 collapses to
+# EXACTLY (N - 1) literal characters, with whatever follows left
+# completely untouched this pass. Clay's old code instead did a naive
+# pairwise "%%" -> "%" collapse and then evaluated the leftover single %
+# immediately, which is why an odd-length run (color.tf's own
+# "%%%{red}") evaluated one nesting level too early. Rewrote the run-
+# length handling in variables::substitute_variables (%) and
+# variables::substitute_commands ($), and matched control_flow::
+# split_percent_semi's own "%;" run-length check to the same rule (a
+# "%%%;" 3-run must NOT split until it's been reduced to a bare 1-run by
+# two prior substitution passes - needed for the SAME triple-nested /for
+# to place its literal "%;" separator between two /set commands at the
+# right depth too). The other half of the fix: real tf substitutes a
+# nested /for or /while's own header and body text once PER ENCLOSING
+# ITERATION (tf-help /for: "<Commands> are executed in a new evaluation
+# scope") - control_flow::execute_for_loop/execute_while_loop used to
+# skip substitution entirely for any body line that looked like a nested
+# /if, /while or /for, deferring completely to the inner construct's own
+# single pass, which is one pass short for nesting deeper than one level.
+# Fixed by always substituting a nested /while or /for there (still NOT a
+# nested /if - verified separately that an /if needs no extra escaping,
+# since its own dispatch, execute_inline_if_block, already substitutes
+# each branch line itself; doing it twice there corrupts any
+# already-resolved value that happens to contain a literal % or $, which
+# is exactly what broke crypt.tf's byte-at-a-time cipher construction
+# during this fix - see test_encrypt_decrypt_roundtrip/test_load_crypt_tf,
+# both green again once the /if exclusion was restored). Deliberately did
+# NOT make the analogous change in macros::execute_macro_with_context (a
+# MACRO's own body, at CALL time, must keep skipping ALL THREE - a bare
+# `/def loopmac = /for i 1 3 /echo n=%i` then `/loopmac` needs "%i" to
+# reach /for's own per-iteration pass unresolved, not be pre-emptied to
+# "" here before the loop variable exists at all; this is what
+# test_for_command_form_nested_in_macro_body pins). lib_color passes
+# outright now and was removed.
+
+# lib_cylon passes outright now (Job 11): decode_attr() is implemented,
+# reusing the existing @{...}-to-ANSI conversion `/echo -p` already used
+# (parser::process_attr_codes/attr_to_ansi, extended with real TF's
+# "C<name>"/"Cbg<name>" color-attribute naming - see attr_to_ansi's own
+# doc comment). strlen() was also fixed to strip embedded attribute
+# markup/ANSI before counting characters (parser::strip_all_attributes),
+# matching real TF's own out-of-band attribute model - verified this is
+# exactly what cylon.tf's own "strlen(cylon0)" (== 13, the number of
+# *visible* characters only) depends on.
+
+# Fixed (Job 14a, finding 14): grep.tf's /fgrep pipes a TF command's captured
+# OUTPUT through another macro via `/quote -S /_fgrep \`%-1` (backtick =
+# "capture this TF command's output," per TF's /quote help). Root-caused to
+# two separate bugs, neither of them the backtick capture itself (that part
+# already worked: cmd_quote's `` ` `` branch already called execute_command
+# and split Success(Some(msg)) into lines): (1) aggregate_results_with_engine
+# silently discarded any TfCommandResult::Quote produced from *inside* a
+# macro body (its `_ => {}` catch-all) - /quote's own Exec-disposition lines
+# ("/_fgrep banana") were never actually run when /quote was called from
+# fgrep's body, only when typed at top level; now resolved in-engine for a
+# synchronous, non-recall quote (Send queues into pending_commands, Echo
+# joins into the aggregate, Exec recurses through execute_command and folds
+# the result back in) and bounced upward unresolved (like /return/Result)
+# when it needs an App (a scheduled delay or a backtick /recall). (2) the
+# echo() expression function (grep.tf's `/_fgrep`: `/@test (...) &
+# echo({*})`) queued into engine.pending_outputs, which nothing anywhere in
+# the app ever drained - a dead sink since whenever it was added. Both fixed
+# together (aggregate_results_with_engine's new Quote arm, in parser.rs;
+# commands::process_pending_tf_outputs + script_tests::run_script's own
+# drain). lib_grep passes outright now and was removed.
+
+
+# Re-pointed (Job 8): /result now works, so /car /cdr /cadr /length
+# (fields 1-4) and /reverse (field 5, via /while (shift(), {#}) - needed
+# this job's new comma-operator support too) all match real tf exactly
+# now. /remove (field 6) and /unique (field 7) are still off - not one of
+# finding C's numbered gaps, and not this job's four assigned items either:
+# /remove's body does "/let _result=%{_result} %{1}" to prepend a
+# leading-space separator onto an initially-empty accumulator, but
+# cmd_let (parser.rs) unconditionally `.trim()`s its value before
+# assigning, silently eating exactly that leading space every time - so
+# the joined-with-spaces list comes out one space short throughout, and
+# /unique (which recurses through /remove) inherits the same drift.
+#
+# Finding 19 is fixed (Job 11): cmd_set/cmd_let no longer trim the value at
+# all (see `parser::split_set_or_let_value`'s doc comment for the exact
+# algorithm, verified directly against real tf's own leading/trailing-
+# space and tab-separator behavior) - /remove (field 6) now matches real
+# tf exactly ("| a c|", leading space and all). /unique (field 7) is still
+# off ("a" instead of "a b c") - not finding 19, and not this job's other
+# three items: /unique recurses through /remove via a different mechanism
+# of its own that isn't yet root-caused further.
+#
+# Fixed (Job 15b-ii, 2026-09-03): root-caused to two separate gaps, both
+# fixed. (1) `$(...)`/`$[...]` used INSIDE an expression (`/unique`'s own
+# body: "$[{#}>1 ? $(/unique $(/remove %1 %-1)) : \"\"]") were never real
+# operands to Clay's expression evaluator at all - `expressions.rs`'s
+# lexer had no token for a bare "$(" (matching real tf's own "expressions"
+# help, which lists "Command substitutions like $(/listworlds -s)" as a
+# genuine Operand form alongside string/numeric literals and {selector} -
+# verified directly against real tf 5.0 beta 8, including that a ternary
+# branch's own $(...) is evaluated lazily, only when that branch is taken -
+# `/unique`'s own recursion depends on exactly this short-circuit to
+# terminate). Added `Token`/`Expr::{CommandSub,ExprSub,MacroSub}` for
+# `$(...)`/`$[...]`/`${...}` as expression primitives, resolved by the
+# evaluator at the point each is reached (never eagerly during lexing).
+# (2) Once that made the nested command substitution actually run,
+# `parser::parse_macro_args`'s own "rest of the args starts and ends with
+# the same character" heuristic (meant for Clay's own `/decrypt`/`{-1}`
+# "x...x" idiom, per its old doc comment) was collapsing a perfectly
+# ordinary word list into one argument whenever it coincidentally matched
+# that shape - `/remove a b a c b`'s real args ["a","b","a","c","b"] were
+# being split into just ["a", "b a c b"], because the four-word remainder
+# "b a c b" both starts and ends with 'b'. Real TF has no such rule
+# (`/help substitution`: "each space-separated word is a positional
+# parameter", no exception) and doesn't need one - `{-1}`'s own "join with
+# a single space" semantics already reconstructs a `/decrypt`-style
+# payload correctly, since `/encrypt`'s own output never contains a literal
+# space to begin with (it encodes one as "%b" specifically to survive
+# ordinary word-splitting). Removed the heuristic entirely, down to a bare
+# `split_whitespace()`; `test_encrypt_decrypt_roundtrip` still passes
+# without it. lib_lisp passes outright now and was removed.
+
+# Re-pointed (Job 9): C.8 is fixed - kbbind.tf's own "/if /command%;
+# /then ..." condition-form macros (~bind_if_not_bound and friends) now
+# parse and evaluate correctly, so the file gets all the way through its
+# own content into the kbfunc.tf it /requires. C.10 is fixed (Job 10 - see
+# lib_kbfunc's own entry below for what NOMACRO parsing unblocked in that
+# file), so kbbind.tf now loads all the way through to its own
+# "/undef ~gag_redef" line - not one of finding C's numbered gaps, and not
+# Job 10's own scope: Clay's /undef announces success ("Macro 'x'
+# undefined.") where real TF's /undef is silent on success (verified
+# directly against real tf) - a Bucket-A/B ruling for a later job, not
+# something Job 10 touches.
+#
+# Re-pointed (Job 11): finding 24's bundled short options are fixed
+# (macros::parse_option_char, called in a loop from parse_def so a
+# no-argument flag like "-i"/"-F" continues parsing the rest of the same
+# token as more flags) - kbbind.tf's own many "-ib'...'" idioms parse
+# correctly now, and the "Macro '~gag_redef' undefined." message is no
+# longer the case's own first symptom (it's still printed - the /undef
+# Bucket-A/B ruling above remains unfixed - but the load now continues
+# well past it into `kbfunc.tf` again). That exposes a genuinely new gap,
+# not one of finding C's numbered gaps and not this job's four assigned
+# items: kbbind.tf's "/if /!ismacro -msimple -ib'%1'%; /then ..."
+# (line 9) is itself a command-form condition whose OWN "%1" never gets
+# substituted before "/ismacro ..." runs (visible directly: even routed to
+# Clay's Clay-command fallback, since there is no native /ismacro command,
+# the text still reads "ib'%1'" verbatim) - and when a "ismacro" MACRO
+# *does* exist in scope (as it does once stdlib.tf's own definition is
+# reachable, in stdlib_macros.tf's preload chain - see that entry), the
+# invoked macro's own %1../%* end up empty rather than the intended
+# "-msimple -ib'Up'"-shaped filter, a control-flow/macro-invocation issue
+# in the same family as lib_at's, not this job's scope. Downstream of
+# that, kbbind.tf's own /require of kbfunc.tf hits a second new,
+# also-not-this-job's-scope gap - see lib_kbfunc's own entry.
+#
+# Re-pointed (Job 12): finding 27 is fixed - TfEngine::new now seeds the
+# global "maxpri" (2147483647), same value stdlib.tf itself sets at line
+# 64, so kbfunc.tf's own "-ip%maxpri" no longer depends on stdlib.tf having
+# been loaded first (see lib_kbfunc's own entry below, now removed - the
+# case passes outright). With that fixed, kbbind.tf's /require of kbfunc.tf
+# no longer errors, so `transcript.errors` is empty and the "Invalid
+# priority:" substring is gone. Nothing else here is fixed by Job 12
+# (out of scope: /dokey parity): the case's failure is now purely the two
+# gaps already on record above - the /undef-not-silent Bucket-A/B ruling
+# ("Macro '~gag_redef' undefined." as the file's first echoed line, still
+# unfixed) and the "/if /!ismacro ...'%1'..." substitution bug (three
+# stray "[clay: /ismacro -msimple -ib'%1']" echoes right after it, also
+# still unfixed) - both simply visible now instead of being masked by the
+# invalid-priority error that used to abort the chain first.
+#
+# Re-pointed (Job 13): finding 25 is fixed - /undef is silent on success now
+# (real tf's own behavior, verified directly), so "Macro '~gag_redef'
+# undefined." is gone from the case's output entirely: kbbind.tf's own
+# "/def -i -ag -hREDEF ~gag_redef" / ... / "/undef ~gag_redef" idiom now
+# works exactly as intended (silently gag every REDEF message while the
+# file's many key-name macros get (re)defined, then clean up the gag macro
+# without any message of its own). That was the FIRST of the case's two
+# already-recorded gaps; the second - kbbind.tf's own "/if /!ismacro
+# -msimple -ib'%1'%; /then ..." (line 9) not substituting its own "%1"
+# before "/ismacro ..." runs - is untouched by this job's four assigned
+# items and is now the case's only remaining symptom, visible immediately
+# as its own first echoed line instead of being preceded by the /undef
+# message.
+#
+# Finding 28 is fixed (Job 15), on both halves: `control_flow::evaluate_condition`
+# now substitutes each command-form condition piece (`variables::substitute_commands`)
+# right before running it, instead of leaving the raw macro-body text (with its own
+# unexpanded "%1"/"%*") untouched - a command-form `/if`'s condition previously never
+# went through the substitution every other body line already got. And `/ismacro` is
+# now a native command (`builtins::cmd_ismacro`, Job 15's own "missing builtins" list)
+# using Job 7's `MacroFilter` grammar, so a script that (like kbbind.tf here) never
+# loads stdlib.tf's own same-named macro reaches it instead of the old Clay-command
+# fallback. With both fixed, kbbind.tf's own `~bind_if_not_bound` works exactly as
+# intended and the case passes outright - removed.
+
+# C.10 is fixed (Job 10): all 31 TF hook events parse, case-insensitively
+# (kbfunc.tf itself uses "-hnomacro" lowercase). kbfunc.tf's own NOMACRO hook
+# now registers and the file loads cleanly - lib_kbfunc passed outright then.
+#
+# Re-pointed (Job 11): finding 24's bundled short options are fixed (see
+# lib_kbbind's own entry above), and kbfunc.tf's own line 149 -
+# "/eval /def -ip%maxpri -mregexp -h'REDEF macro (dokey|kb)_'
+# ~hook_redef_dokey = ..." - depends on a GLOBAL variable, "maxpri", that
+# only stdlib.tf itself ever defines (/set maxpri=2147483647). Before this
+# job's fix, an unset "%maxpri" (substituting to "") turned "-ip" into a
+# malformed "-i" + "p" pair that the old, non-bundling parser silently
+# misparsed as a garbage macro NAME instead of an error (harmless only
+# because this fixture's own probes never look at ~hook_redef_dokey) - so
+# the file "loaded cleanly" by accident. Now that bundled clusters parse
+# correctly, "-ip" with nothing attached (no space allowed between an
+# option and its argument, per `/help options`) is correctly rejected as
+# an invalid priority - which is what real tf does too in the exact same
+# circumstance (verified: %maxpri is never defined when tf-lib's kbfunc.tf
+# is /require'd on its own, without stdlib.tf's own auto-load providing
+# it first). This is a pre-existing gap in the fixture's own environment
+# (this test, unlike a real tf session, never auto-loads stdlib.tf before
+# a bare `/require kbfunc.tf`), surfaced - not caused - by this job's
+# correctness fix, and not one of finding C's numbered gaps.
+#
+# Fixed (Job 12, finding 27): TfEngine::new now seeds the global "maxpri"
+# (2147483647) unconditionally, matching what a real tf session already
+# has by the time any script runs (stdlib.tf is always auto-loaded first;
+# it's the one that sets "maxpri" there too). "-ip%maxpri" now substitutes
+# to a real number even when kbfunc.tf is /require'd on its own, so the
+# "Invalid priority:" error above is gone and the case passes outright.
+# lib_kbfunc was removed from this ledger.
+
+# Re-pointed (Job 10): C.10 is fixed (-h"EVENT pattern" now parses and
+# matches like a trigger), but map.tf's /mark defines _map_hook via
+# "/def -iFp9999 -mglob -h'send {n|s|e|w|...}' _map_hook = ..." - a BUNDLED
+# short-option cluster ("-iFp9999" = -i, -F, -p9999 in one token, the same
+# getopt-style bundling MacroFilter::parse already implements for /list and
+# /purge). Not one of finding C's numbered gaps, and not Job 10's scope:
+# macros::parse_def's own parse_option has no such bundling at all - each
+# call only ever strips ONE flag character and returns everything else
+# (including any following "-X" tokens) as "rest" verbatim, so after
+# consuming "-i" the loop sees "Fp9999 -mglob -h'...' _map_hook = ..." next,
+# which doesn't start with "-", ending option parsing right there and
+# folding the whole remainder into the macro's own NAME (verified directly:
+# the resulting macro's name is literally "Fp9999 -mglob -h'send {n|s|e|w|
+# ne|sw|nw|se|u|d}' _map_hook"). _map_hook itself is therefore never
+# created, so /unmark's own "/undef _map_hook" can't find it.
+#
+# Finding 24 is fixed (Job 11): "-iFp9999" now parses as the bundled
+# cluster it is (i, F, then p9999 consuming the rest of the token - see
+# macros::parse_option_char's doc comment), so _map_hook is genuinely
+# created and /unmark's "/undef _map_hook" now finds it. Not this job's
+# scope, though: Clay's /undef announces success ("Macro 'x' undefined.")
+# where real TF's /undef is silent (same pre-existing Bucket-A/B ruling
+# noted in lib_kbbind's own entry), so /unmark's last line prints that
+# instead of map.tf's own "% Mapping disabled." message.
+#
+# Finding 25 is fixed (Job 13): /undef is silent on success now, so
+# /unmark's "/undef _map_hook" no longer prints anything of its own and
+# map.tf's own "% Mapping disabled." is the case's last line exactly as
+# real tf shows it. lib_map passes outright now and was removed.
+
+# Not one of finding C's numbered gaps - surfaced while re-pointing this
+# entry (Job 6): self.tf is a quine that relies on "%;" vs the "%%;"-escaped
+# literal being split apart exactly the way TF's own body splitter does;
+# macros::split_body_preserving_control_flow (a separate function from the
+# one this job fixed in control_flow.rs) still does a plain, unescaped
+# `body.split("%;")`, so the quine's own %%; markers don't survive intact
+# and /self produces nothing instead of its own source text.
+#
+# Re-pointed (Job 8): the ledger comment above predates Job 8's own fix -
+# split_body_preserving_control_flow already reuses control_flow::
+# split_percent_semi (not a plain `body.split("%;")`) by the time this job
+# started. The real, still-current bug (verified directly against real
+# tf) was the OPPOSITE of what was suspected: split_percent_semi (and
+# macros::split_body_preserving_control_flow on top of it) was
+# QUOTE-AWARE, skipping any "%;" found inside a single- or double-quoted
+# region - but real tf's own "%;" body-splitting is NOT quote-aware at
+# all (`/def foo = /let x="a%;b"%; /echo x=%x` then `/foo` under real tf
+# splits INTO the quoted string, leaving x="a and sending the orphaned
+# `b"` to the [nonexistent] world as plain text - verified directly).
+# self.tf's own quine text has an ODD count of `"` characters (13) that
+# could never balance under quote-tracking in the first place, and
+# depends on some of its "%;" occurrences splitting apart what a
+# quote-aware reader would call "inside a string". Fixed (Job 15b-i,
+# 2026-09-03) by removing quote-tracking from control_flow::
+# split_percent_semi entirely - it now matches real tf's blind,
+# unconditional "%;" splitting (still %-run-length-aware, per lib_color's
+# entry, so an escaped "%%;" still isn't a separator). No existing test
+# for this function exercised a "%;" inside quotes, so nothing else
+# regressed. lib_self passes outright now and was removed.
+
+# Re-pointed (Job 9): C.8 is fixed, but spedwalk.tf's /speedwalk body is
+# defined through an outer "/eval \ /def -i speedwalk = ... /if
+# /ismacro ~speedwalk%%; /then ... /endif" wrapper (TF's own idiom for a
+# /def body that needs "%%;"/"%%{...}" preserved through one substitution
+# pass - see tf-help /for's own explanation of the same escaping, quoted
+# in the plan). Not one of finding C's numbered gaps and not this job's
+# two assigned items: Clay's /eval doesn't yet do TF's documented "one
+# more substitution pass" (Bucket-A, a later job), but its ARGUMENT still
+# gets the *ordinary* substitution every non-control-flow command's args
+# get (execute_tf_command) - which happens to unescape "%%;"/"%%%" to
+# "%;"/"%%" anyway, just once too early (at /eval-dispatch time instead of
+# at /def-body-execution time) and inconsistently through the rest of the
+# body (e.g. "%{maxpri}" inside the nested /def also gets substituted at
+# define time). By the time /speedwalk's body is actually captured and
+# later split on "%;", the surviving structure doesn't come back together
+# into a clean "/if ... /then ... /else ... /endif" - it errors instead of
+# hanging or mis-executing, which is what P1.8's own error handling is for.
+#
+# Fixed (Job 15b-i, 2026-09-03): the escape-run-length fix (see lib_color's
+# entry) resolved the "%%;"/"%%{...}" survival this entry describes -
+# /speedwalk's /if/then/else/endif structure now comes back together
+# cleanly. That surfaced ONE further, genuinely new gap: real tf's own
+# "/ismacro" (a stdlib.tf macro, `/def -i ismacro = /test tfclose("o")%;
+# /@list -s -i %{*-@}`) hardcodes "-i" ahead of whatever the caller
+# passes, so it matches an INVISIBLE macro even when the caller's own
+# args never mention invisibility (verified directly: `/def -i foo = ...`
+# then a bare `/ismacro foo`, no "-i" of its own, leaves %? nonzero).
+# Clay's native `/ismacro` command (builtins::cmd_ismacro, added in Job
+# 15 for when stdlib.tf isn't loaded) passed the caller's args straight
+# to MacroFilter::parse with no such default, so it silently excluded
+# spedwalk.tf's own `~speedwalk` hook (defined with `-ip%{maxpri}`,
+# hence invisible) from `/if /ismacro ~speedwalk%; /then ...` - `/speedwalk`
+# could therefore only ever see "not yet defined" and take the "enable"
+# branch, never "disable". Fixed by prepending "-i " to the args before
+# parsing (a caller-supplied "-I" still overrides it, same left-to-right
+# order real tf's own reconstructed command line has). lib_spedwalk
+# passes outright now and was removed.
+
+# Finding 20 is fixed (Job 11): Expr::Assign/PreIncrement/PreDecrement now
+# call `TfEngine::set_existing_or_global`, which updates a `:=`/`++`/`--`
+# target wherever it's already bound (innermost local scope outward) and
+# only creates a new binding, at the GLOBAL level, when it isn't bound
+# anywhere - so /push's own "%{2-stack} := strcat(...)" now genuinely
+# persists the "stack" global across separate /push calls (verified
+# directly: after "/push x" then "/push y", the global var "stack" holds
+# "y x ", exactly as it should). The fixture still produces no output,
+# though - not finding 20, and not this job's scope: /pop's body needs
+# TF's own "/eval: one more substitution pass, then execute" behavior
+# (Bucket-A ruling, assigned to a later job/P1.12) to turn its
+# "/eval /car %{stack}" (itself the result of one substitution pass over
+# "/eval /car %%{%{1-stack}}") into "/car y x " - Clay's /eval today does
+# no such second pass, so it re-dispatches the argument text completely
+# unsubstituted, and `/car %{stack}` (with a literal, un-expanded
+# "%{stack}") never reaches lisp.tf's real /car with useful input. Same
+# failure shape as before ("echoed has 0 line(s)"), different actual cause.
+#
+# Re-pointed (Job 13): finding B's /eval ruling is fixed - /eval now does
+# its own real substitution pass (parser::cmd_eval, exempted from the
+# generic top-level pass so it can do its own instead - see
+# execute_tf_command's "is_eval_command"), so /pop's own "/eval /car
+# %{stack}" genuinely reaches lisp.tf's real /car with real arguments for
+# the first time (previously a complete no-op, per the note above). That
+# also exposed a genuine, pre-existing latent bug this job's own fix
+# incidentally repaired as a side effect: /eval used to return a
+# `TfCommandResult::ClayCommand` pass-through for the caller to resolve
+# LATER (only `builtins::fold_load_result`, at the very END of a whole
+# file's load, ever actually ran it) - so a bare top-level "/eval /cmd"
+# line inside a file effectively executed AFTER every later line in the
+# same file, not inline where it was written. `cmd_eval` now dispatches
+# immediately via `execute_command_substituted`, matching real tf's own
+# ordering.
+#
+# Progress, not a fix, though - not one of finding C's numbered gaps, and
+# not this job's four assigned items: /pop's OWN second body command,
+# "/@test %{1-stack} := $$(/cdr %%{%{1-stack}})" (not wrapped in /eval),
+# is designed to have its own "$$"/"%%" escaping resolved by a SECOND
+# substitution layer the way "/eval /car %{stack}" is - but after the one
+# pass execute_macro's own per-command loop already gives it, the surviving
+# literal "$(/cdr %{stack})" text is handed directly to `cmd_test`, and
+# Clay's expression evaluator (`expressions.rs`'s lexer) has no token for a
+# bare "$(" at all (it only understands "$[...]" function-call-style
+# substitution inside an expression), so `/test` errors "Unexpected
+# character: $" - a distinct, deeper gap (command substitution as an
+# expression primitive, not just a text-substitution one) surfaced for the
+# first time by this job's own correctness fix, not root-caused further.
+#
+# Fixed (Job 15b-ii, 2026-09-03): the "$(" expression-primitive gap this
+# entry already named is the same one lib_lisp's own entry (above) fixes -
+# see there for the `Token`/`Expr::CommandSub` (and `ExprSub`/`MacroSub`)
+# addition. That alone still left `/dequeue` broken, though (a SECOND,
+# separate gap): `/def -i dequeue = /pop %1-queue` relies on real tf's own
+# unbraced "%N-default" form (`/help substitution`: brackets "may be
+# omitted if there is no default and the text following it can not be
+# misinterpreted as part of the selector" - the omission is legal WITH a
+# default too, verified directly against real tf 5.0 beta 8: "%1-queue"
+# with %1 unset expands to "queue", with %1="X" it expands to just "X",
+# never "X-queue"). Clay's digit-selector arm in
+# `variables::substitute_variables` only ever substituted the single digit
+# itself, leaving a following "-queue" as plain literal text - so calling
+# `/dequeue` with no args produced "/pop -queue" instead of "/pop queue",
+# meaning /pop operated on a variable literally named "-queue" instead of
+# the "queue" accumulator `/enqueue` actually writes to. Extended that arm
+# to recognise a literal "-" right after the digit and consume a default
+# clause exactly like the braced "%{n-default}" form already does (see the
+# new doc comment there for the exact stop-character set, verified against
+# real tf across several probes - plain prose including spaces is NOT a
+# stop condition, but quotes/parens/braces/brackets/";"/":" are, and
+# another "%"/"$" ends it and is left for the outer scan to process on its
+# own either way). lib_stack-q passes outright now and was removed.
+
+# Re-pointed (Job 9): C.7 is fixed - testcolor.tf's own TF-form "/for _i 0
+# 7 ..." loops (including the triple-nested 6x6x6 color-cube section) now
+# run and produce real output. The file's later "/if (!features(...))
+# .../endif" (C.11, features() unimplemented) still errors, though - and
+# not one of finding C's numbered gaps, and not this job's two assigned
+# items: load_file_internal's error path (builtins::load_file_internal)
+# only preserves a loaded file's own /echo output on the error-FREE path
+# (aggregate_load_results's own doc comment already says so) - any error
+# anywhere in the file replaces the whole thing with just the "Loaded ...
+# with N error(s)" summary, discarding every earlier successful /echo.
+# So the *first* observable symptom here is "no output at all" rather
+# than the 15 lines of color tables that ran successfully before the
+# failing /if.
+#
+# C.11 is fixed (Job 11): features() is implemented, so the "/if
+# (!features("256colors")) .../endif" guard no longer errors and the file
+# now loads cleanly all the way through, producing real output for the
+# first time - "Basic colors:"/"Bright colors:" (lines 1-2) match real tf
+# exactly. Not this job's scope, though: the very next two lines - a bare
+# "/_echo" (blank separator) and "/_echo 6x6x6 color cubes:" - go missing
+# entirely, so "r=..." (the line after them) appears as echoed line 3
+# instead of line 5. Not one of finding C's numbered gaps and not this
+# job's four assigned items - some interaction between the immediately
+# preceding backslash-continued, "%;"-joined "/if (!features(...))
+# /_echo ...%; /exit%; /endif" block (whose condition is now false, so it
+# should do nothing) and the two independent /_echo lines right after it;
+# not root-caused further.
+#
+# Re-pointed (Job 13): finding B's /eval ruling is fixed, and it changes
+# WHICH line diverges first here too - not this job's four assigned items,
+# and surfacing a harness limitation rather than an engine bug. The file's
+# very first line now diverges instead of line 3: `/eval /set
+# _line=%{_line}{n} @` (mid-way through building the "Basic colors:" row)
+# used to be a `ClayCommand` pass-through that (see lib_stack-q's own
+# entry above for the general mechanism) only actually ran at the very
+# END of the whole file's load - so by the time the SECOND /for loop and
+# the final "/eval /echo -p ..." line ran, `%{_line}` was still missing
+# the "{n}" (reset) text this line was supposed to have already added.
+# Now that `/eval` dispatches immediately, `_line` correctly contains
+# "@{n}" by the time `/echo -p` processes it, which `attr_to_ansi` (real
+# tf's "n"/"normal" attribute) correctly turns into a real ANSI reset
+# ("\x1b[0m") - genuinely more correct than before. But `tools/tf-
+# oracle.sh`'s filter strips ALL CSI sequences from real tf's raw output
+# before it's saved as `lib_testcolor.expected` (see tests/tf/README.md's
+# "Oracle" section), while `script_tests.rs`'s own `run_script`/
+# `record_result` never did the same for Clay's own "echoed" text - so a
+# genuine ANSI code landing in Clay's output for the first time (every
+# color/background attribute besides "n" already resolves to Clay's own
+# unrecognized-attribute empty string, per `attr_to_ansi`'s "C0"/"Cbg0"
+# etc. arms - not real TF's own naming, see the `lib_color` entry above)
+# now trips a byte-for-byte comparison the harness was never actually
+# equipped to make. Not one of finding C's numbered gaps, not this job's
+# scope (the harness's own missing ANSI-stripping step, and the still-
+# unmapped color-name gap `lib_color`'s entry already tracks), and not
+# root-caused further.
+#
+# Re-pointed (Job 15b-i, 2026-09-03 - not one of this job's own six cases,
+# but its own `.expected` changed as an unavoidable side effect of the
+# lib_self fix below, so re-verified here too). `tools/tf-oracle.sh`'s
+# filter used to leave a terminal-width-wrapped long line as two separate
+# physical lines (see lib_self's own entry for the fix and why); this
+# file's own ruler lines ("                      1         2 ...") are
+# long enough to wrap, and the old, un-rejoined `.expected` silently
+# dropped real content as a result. `--write` now regenerates a visibly
+# more complete `lib_testcolor.expected` (the b=0..5 6x6x6 rows and the
+# grayscale line are now present, and the old ANSI-reset mismatch this
+# entry originally tracked is gone along with the line it was on). Fixing
+# `builtins::load_lines` to drain `engine.pending_outputs` per top-level
+# line instead of once at the very end (see stdlib_macros' own entry)
+# also changed THIS case's own first divergence: testcolor.tf's very
+# first content line, "/test echo(\"...01234567...\")", uses the same
+# echo()-function side channel, so it now surfaces as Clay's first
+# echoed line instead of (incorrectly) its last - but real tf's own
+# output never shows this ruler line as persistent content at all. Not
+# root-caused further, and likely the same class of gap the README
+# already excludes `dokey.tf` for: TF's own non-visual/quiet batch mode
+# still emits raw terminal redraw control bytes (`\r`, backspaces) that
+# can overwrite earlier command-line echo before the final capture
+# settles, which Clay's headless, append-only transcript model has no
+# equivalent of. Left for Job 15b-ii/16, whichever picks this file back up.
+#
+# Progressed a great deal further (Job 15b-ii, 2026-09-03), still XFAIL on
+# a newly-surfaced, precisely-diagnosed architecture gap. The "ruler line
+# genuinely missing" question this entry opened with turned out to be a
+# real `tools/tf-oracle.sh` capture bug, not real tf's own behaviour:
+# real tf marks every line IT draws with a leading raw "ESC [ K"
+# (erase-to-end-of-line) sequence, while a genuine terminal-width word-wrap
+# continuation - the thing the oracle's rejoin step exists to reassemble -
+# never carries one (verified directly against raw, un-stripped tf 5.0
+# beta 8 output). The old rejoin heuristic looked only at CSI-stripped
+# leading whitespace, so it silently folded this file's own
+# "               01234567 01234567" ruler header into the immediately
+# preceding, dropped "% Loading commands from ...testcolor.tf." banner
+# line. `tools/tf-oracle.sh` now decides the new-line-vs-continuation
+# question on the raw line (marker still intact) and only strips CSI
+# afterward - requiring BOTH "no marker" AND "leading four spaces once
+# stripped" (marker alone isn't sufficient either: tf's own on-exit repeat
+# of its startup banner also lacks the marker, and would otherwise be
+# wrongly merged into whatever preceded it). `--write` was re-run for
+# every case; only `lib_testcolor.expected` changed (verified via
+# `md5sum` before/after every other `.expected`) - it now includes the
+# ruler header AND correctly un-merges a second, previously-undetected
+# false-positive rejoin further down in the same file (the two
+# "                      1  2..." grayscale ruler lines, wrongly rejoined
+# into one by the same old bug, are two genuinely separate tf output
+# lines). Once the header was restored, the actual first divergence became
+# line 2's own trailing `\x1b[0m` (this entry's own second symptom,
+# `attr_to_ansi`'s "n"/"normal" attribute correctly firing) - not a Clay
+# bug at all: `tools/tf-oracle.sh` strips ALL SGR codes from real tf's
+# capture (by design - `.expected` files are plain text), but
+# `script_tests.rs` was comparing Clay's own un-stripped `echoed` text
+# against that already-ANSI-free `.expected`, an apples-to-oranges
+# comparison for any case (like this one) that legitimately produces real
+# color codes. Fixed with a new `normalize_echoed_lines` (applied only to
+# Clay's `echoed` side, deliberately not to `.expected`/the live oracle
+# capture - stripping those too would be a silent no-op that could also
+# mask a genuine future oracle regression) rather than narrowly patching
+# around one line, per this job's own instruction not to let the harness
+# silently strip ANSI.
+#
+# That exposed the file's real next gap: testcolor.tf's own bare
+# "/_echo"/"/_echo 6x6x6 color cubes:" lines (this entry's own third
+# symptom) call stdlib.tf's "/def -i _echo = /test echo({*})" - never
+# defined in this harness, since (per C.12's fixture convention) stdlib
+# isn't auto-loaded the way a real tf session always has it. Added
+# ";; preload: stdlib.tf" to lib_testcolor.tf itself (a Clay-harness-only
+# comment, ignored by real tf and verified with `--write` to change
+# nothing in `lib_testcolor.expected`, since real tf already has stdlib
+# loaded either way). That in turn required finding 34 (LOADFAIL, fixed
+# this job - see stdlib_macros' own entry) to let stdlib.tf's own preload
+# reach cleanly to completion at all, and then surfaced two more gaps
+# specific to what preloading stdlib.tf actually changes: stdlib.tf's own
+# "/def -i echo = ..." macro (real TF's own /echo, built out of the
+# `echo()` function plus `getopts("a:poerAw:")` for its flag parsing) now
+# shadows Clay's native `/echo` builtin per finding 16, so testcolor.tf's
+# own "/echo -p - Basic colors:  ..." calls stopped reaching Clay's
+# hand-written `cmd_echo` entirely once stdlib was preloaded and went
+# through getopts() instead - which had a real, separately-useful bug:
+# `/help options`' own "A '-' or '--' by itself may be used to mark the
+# end of the options" applies to BOTH forms, but Clay's getopts() only
+# ever consumed "--"; a bare "-" fell into the "not an option, stop"
+# branch without incrementing `consumed`, so it stayed as leftover literal
+# text in `{*}` instead of being shifted away (fixed - both forms are
+# consumed the same way now).
+#
+# With that fixed, the file's ONLY remaining divergence is "Basic colors:
+# ########" (Clay, one space) vs "Basic colors:  ########" (real tf, two
+# spaces) - not a getopts bug, and not root-caused further: it's a
+# genuine architecture gap in how positional parameters are represented at
+# all, not something local to this file, echo, or getopts. The literal
+# text "Basic colors:  %{_line}{}" (two spaces, straight from testcolor.tf
+# source) becomes /echo's own argument string, which is split into
+# individual `%1../%*` positional words via plain whitespace-splitting the
+# moment `/echo` (now a macro) is invoked - collapsing the double space
+# into a single word boundary before ANY of getopts()'s own token-shifting
+# even runs. Real tf's own getopts()/argument-shifting must retain the
+# ORIGINAL, exact-spacing command-line text internally and reconstruct
+# "the remainder after N shifted tokens" as a substring of it, rather than
+# rejoining split words with `join(" ")` the way Clay's `parse_macro_args`/
+# `getopts()`/`shift()` all do - otherwise real tf's own capture (this
+# entry's `.expected`, generated by literally running `tf -f
+# testcolor.tf`, which goes through this exact stdlib-shadowed /echo
+# pipeline too) could not have preserved it either. Retrofitting that
+# (keeping each scope's original, unsplit argument text alongside its
+# split `%1../%*` array, and having shift/getopts slice into it instead of
+# rejoining) touches macro-invocation plumbing broadly, not "one small
+# bug" - left for a future job. Not one of finding C's numbered gaps.
+lib_testcolor | echoed "Basic colors: ########", expected "Basic colors:  ########"
+
+# Re-pointed (Job 8): /result now works (textencode/textdecode both reach
+# it and produce *a* value), but the value is wrong - not one of finding
+# C's numbered gaps, and not this job's four assigned items: /textencode's
+# /while loop drives on regmatch()/{PL}/{P0}/{PR} (regexp match, left-of-
+# match, whole-match, right-of-match) and single-quoted character literals
+# ('_'), and something in that combination (untouched by this job) isn't
+# producing the right substitution/looping behaviour.
+#
+# Fixed (Job 15b-ii, 2026-09-03): root-caused to `regmatch()`
+# (expressions.rs) only ever updating `engine.regex_captures` (the array
+# the "%P0".."%P9" TEXT-substitution form reads) and never the P0-P9/PL/PR
+# LOCAL VARIABLES that a trigger match sets (macros::
+# execute_macro_with_context) and that the bare `{P0}`/`{PL}`/`{PR}`
+# EXPRESSION-brace form (`Expr::Variable`, which only ever checks local
+# vars) actually depends on - so inside textencode.tf's own
+# "/while (regmatch(...)) ... {PL} ... {P0} ... {PR} ..." loop, all three
+# just kept reading whatever (nothing) a prior trigger had left them at,
+# not the match `regmatch()` had just performed. Real tf's own "/help
+# substitution" already says the %P subs come from "the last successful
+# regexp match in scope ... or in which it occurred (i.e., with
+# regmatch())" - verified directly against real tf 5.0 beta 8 that a bare
+# regmatch() call updates {PL}/{P0}/{PR} the same way a trigger does, and
+# that a FAILED regmatch() clears them rather than leaving a stale prior
+# match. `regmatch()` now sets both (`regex_captures` and the matching
+# P0-P9/PL/PR locals) on every call, matched or not. lib_textencode passes
+# outright now and was removed.
+
+# Not one of finding C's numbered gaps - surfaced while re-pointing this
+# entry (Job 6): TF's "%|" pipe operator (a List separator like "%;" that
+# connects one command's output to the next command's input - see the
+# file's own comment) isn't implemented at all, so /uniq never receives
+# dup3's piped output and passes its input through unchanged.
+lib_textutil | line 2: echoed "x", expected "y"
+
+# Re-pointed (Job 10): C.10 is fixed (all 31 events parse case-insensitively,
+# including tintin.tf's lowercase "-h'send ^#...'" combined-pattern form).
+# The file now loads and its /showme, /math, /variable probes all work - but
+# real tf's own oracle output for this file starts with a REDEF hook's
+# default message ("% ...tintin.tf, line 73: DEF: Redefined macro split",
+# since both stdlib.tf and tintin.tf define a macro named "split"), which
+# Clay never prints: REDEF is accepted (TfHookEvent::parse) but isn't one of
+# the events Job 10 wires up anywhere (not in its assigned list - see the
+# plan's P1.9 step 3 - and Clay has no natural "a macro was just redefined,
+# and here is its old attributes to gag" call site the way CONNECT/SEND/etc
+# do), so it simply never fires, same as MAIL/SHELL/SIGUSR1/etc.
+#
+# Finding 25 is fixed (Job 13): DEF now fires the REDEF hook and prints the
+# default "% [loc]DEF: Redefined macro <name>" message itself when nothing
+# gags it (verified directly, both interactively and with a mid-load
+# location, and against a REDEF hook that DOES gag it - see
+# test_def_redefinition_prints_redef_message_with_and_without_location and
+# test_def_redefinition_is_gagged_by_a_redef_hook in parser.rs). This case's
+# own failure is unchanged, though: it only ever redefines "split" because a
+# REAL tf session has stdlib.tf's own "split" already loaded before ANY
+# script runs, and this test harness's `;; requires-lib` deliberately does
+# NOT auto-load all of stdlib.tf the way a real tf session does (that's the
+# whole point of finding C.12's fixture convention) - so in Clay's engine
+# here, tintin.tf's "/def -i split = ..." is a first-time definition, not a
+# redefinition, and the REDEF hook has nothing to fire on. Preloading
+# stdlib.tf here (`;; preload: stdlib.tf`) was tried and rejected: stdlib.tf
+# itself still doesn't preload cleanly (see stdlib_macros's own entry below,
+# a completely different, already-tracked gap), so doing that would swap
+# this case's one missing line for hundreds of unrelated ones. Not one of
+# finding C's numbered gaps, not root-caused further, and not fixable
+# within this job's scope (it needs either C.2's stdlib auto-load or
+# stdlib_macros's own gap fixed first).
+#
+# Re-verified (Job 15b-i, 2026-09-03): re-checked whether adding
+# `;; preload: stdlib.tf` to lib_tintin.tf is now viable, per this job's
+# own instructions, now that finding C.1's escape-run-length bug (see
+# lib_color's entry) is fixed and the stdlib preload chain reaches much
+# further than before. Verdict: still no - stdlib.tf's own preload still
+# does not complete cleanly (see stdlib_macros's own entry for the
+# current, different blocking gap), so adding the directive would still
+# swap this case's one missing REDEF line for a large, unrelated failure
+# dump. Left as-is; not fixed by this job.
+#
+# Fixed (Job 15b-ii, 2026-09-03): finding 34 (LOADFAIL, see stdlib_macros'
+# own entry) was the last thing blocking stdlib.tf's own preload from
+# completing cleanly - with that fixed, preloading stdlib.tf now produces
+# zero errors, so `;; preload: stdlib.tf` is finally viable here exactly as
+# this entry's own prior attempts anticipated. Added the directive (a
+# Clay-harness-only comment, ignored by real tf and verified with
+# `--write` to change nothing in `lib_tintin.expected`, since real tf
+# already has stdlib loaded before this file - or any file - ever runs).
+# tintin.tf's own "/def -i split = ..." is now a genuine redefinition of
+# stdlib.tf's own "split" macro, so the REDEF hook fires and prints its
+# default message exactly as real tf's own oracle output shows. lib_tintin
+# passes outright now and was removed.
+
+# C.3 is fixed (the %;/endif lock-up no longer stops stdlib.tf loading), and
+# C.10 is fixed (Job 10 - all 31 hook events parse case-insensitively and
+# -h"EVENT pattern" parses), so stdlib.tf's own /hook definitions for PROMPT,
+# lowercase "loadfail", and SEND all register cleanly now. Preloading
+# stdlib.tf goes considerably further before erroring - it transitively
+# /requires tfstatus.tf, color.tf and testcolor.tf, none of which are pure
+# (tfstatus.tf's own C.11-territory variable-name gaps, color.tf's missing
+# features() and $[strcmpattr(...)]-shaped variable names), surfacing
+# getopts() (used by stdlib.tf's own /at internally, per its own "getopts
+# requires 2 arguments" error) as a real, previously-hidden C.11-territory
+# gap - not one of Job 10's four items. cmd_not (builtins.rs) is STILL
+# broken exactly as Job 6 found it (verified directly: "/not /test 1" still
+# errors "Expression error: Unexpected token: Slash", not one of finding
+# C's numbered gaps and not fixed by this job either) - it just no longer
+# shows up as the case's OWN first mismatch line, since the preload's own
+# errors (colour tables, getopts) come first and land the case here instead.
+#
+# C.11 is fixed (Job 11): getopts() (rewritten to parse the calling macro's
+# OWN %1../%*, per real TF, instead of Clay's old made-up "2nd argument is
+# a literal arg-list string" behavior - see expressions.rs's own doc
+# comment on the "getopts" arm) is verified correct in isolation, and the
+# "getopts requires 2 arguments" error is gone from the preload chain.
+# Preloading stdlib.tf now proceeds much further - all the way through
+# color.tf's own remaining gap (see lib_color's entry) and into
+# stdlib.tf's own "/eval /load -q %TFLIBDIR/kbbind.tf" line - and surfaces
+# a new, genuinely different gap, not one of finding C's numbered gaps and
+# not this job's four assigned items: kbbind.tf's line 9, "/if
+# /!ismacro -msimple -ib'%1'%; /then ...", invokes stdlib.tf's own
+# "ismacro" MACRO (`/def -i ismacro = /test tfclose("o")%; /@list -s -i
+# %{*-@}`) - which is DIFFERENT from Clay's native ismacro() FUNCTION and
+# only reachable via `/ismacro`-as-a-command, not `ismacro(...)` in an
+# expression - as a command-form /if condition. The invoked macro's own
+# %* ends up empty instead of "-msimple -ib'Up'"-shaped, so
+# "/@list -s -i %{*-@}" runs as an entirely unfiltered "/list -s -i",
+# dumping every one of stdlib.tf's ~140 macros (visible directly: the
+# preload's own error text starts "preload: Macro '~gag_redef'
+# undefined." - itself the pre-existing /undef-not-silent ruling noted in
+# lib_kbbind's entry - immediately followed by "0: loaded\n1: require\n2:
+# COMPRESS_SUFFIX\n..." for hundreds of lines). Same underlying
+# macro-invocation/control-flow gap as lib_kbbind's own re-pointed entry;
+# not root-caused further than that.
+#
+# Re-pointed (Job 13): finding 25 is fixed - /undef is silent on success,
+# so "preload: Macro '~gag_redef' undefined." is gone; the unfiltered
+# "/@list -s -i %{*-@}" dump (same root cause as above, still not this
+# job's scope) is now the preload's very first symptom instead.
+#
+# Re-pointed (Job 15): finding 28 is fixed on both halves (see lib_kbbind's own
+# entry above for the full explanation - `control_flow::evaluate_condition` now
+# substitutes a command-form condition's own text before running it, and
+# `/ismacro` is a native command now too, though stdlib.tf's OWN "ismacro" macro
+# still shadows it here once stdlib.tf is loaded, exactly as intended - see this
+# job's own report on which stdlib "-i" macros shadow Clay's new builtins). With
+# that fixed, "/@list -s -i %{*-@}" runs correctly filtered instead of dumping
+# every macro, and the preload proceeds vastly further: all the way through
+# kbbind.tf, kbfunc.tf, complete.tf and every other file stdlib.tf itself
+# transitively /requires, past color.tf's own already-tracked gap (Job 15b:
+# "%%%{red} nested substitution" - visible here as "Invalid variable name
+# 'start_color_rgb...'": color.tf's 6x6x6 RGB cube loop builds a variable name
+# like "start_color_rgb%r%g%b" and expects %r/%g/%b to be substituted into it
+# before the /set that defines it runs), and reaches stdlib.tf's OWN very last
+# line ("/require %TFLIBDIR/local.tf, line 778" - local.tf is a real,
+# optional, admin-only file that legitimately does not exist here, matching
+# real tf's own out-of-the-box behavior when it isn't installed). None of this
+# is Job 15's own scope (color.tf's gap is explicitly Job 15b's), so the
+# preload's failure is now that pre-existing, already-tracked gap - not a new
+# one - which is what "progress or pass" means for this case per Job 15's brief.
+#
+# Progressed a great deal further (Job 15b-i, 2026-09-03), still XFAIL.
+# Finding C.1's escape-run-length fix (lib_color's entry) gets color.tf's
+# own 6x6x6 RGB loop past the "Invalid variable name" error, and several
+# further gaps surfaced and were fixed along the way: `/def -Fp'maxpri'`
+# (a `-p<expr>` priority value that isn't a plain decimal literal - real
+# tf: "the argument to -p may be an expression that has a numeric value...
+# evaluated only once, when the macro is defined") errored "Invalid
+# priority: 'maxpri'" (macros::parse_option_char's 'p' arm only ever tried
+# `value.parse::<i32>()`); fixed by deferring a non-numeric value as a new
+# `TfMacro::priority_expr`, resolved against the engine (as a real TF
+# expression) by a new `macros::resolve_priority_expr`, called from both
+# `cmd_def` and `cmd_edit`. This unblocked stdlib.tf's own "/nth" one-
+# liner (`/result {1} > 0 ? shift({1}), {1} : ""`), which exposed a
+# genuinely separate parser bug: the comma operator was excluded from a
+# ternary's TRUE branch (`expressions::Parser::parse_ternary` called
+# `parse_or`, not `parse_comma`, for the middle operand) - real tf's own
+# grammar (mirroring C's) allows a bare comma there with no parens needed
+# ("1 ? 2,3 : 4" -> 3, verified directly), so "shift({1}), {1}" choked
+# with "Expected Colon, got Comma" instead of evaluating the shift for
+# its side effect and reading the (now-shifted) {1}. Also: `isvar("HOME")`
+# (a stdlib.tf-provided function wrapping `/listvar -msimple -- %*`)
+# always read 0 because (a) Clay never imported the process environment
+# into TF global variables at startup at all (real tf does, wholesale,
+# for every env var it finds, not just the documented "special" ones -
+# verified directly with an arbitrary custom env var) and (b) even once
+# "HOME" existed as a variable, `cmd_listvar` never set %? to anything
+# (it took `&TfEngine`, not `&mut`, so it structurally could not) and its
+# own option-parsing didn't recognize a bare "--" end-of-options marker
+# (real tf: "/listvar -msimple -- HOME" needs "--" consumed, not treated
+# as more flags, else "--" itself becomes the name pattern and matches
+# nothing) - both fixed (`TfEngine::new` now seeds every valid-identifier
+# env var; `cmd_listvar` takes `&mut TfEngine`, recognizes "--", and sets
+# %? to "the number of variables listed" per its own /help, verified
+# directly it's a true count, not a 0/1 flag). The preload now reaches
+# much further, past stdlib.tf's own remaining line - "/eval /load -q
+# %TFLIBDIR/local.tf" (an optional, admin-only file that legitimately
+# doesn't exist here, matching real tf's own out-of-the-box behavior) -
+# which errors "Cannot find file", visible in real tf's own startup on
+# every run yet never printed there: stdlib.tf immediately precedes it
+# with "/def -hloadfail -ag ~gagloadfail" specifically to gag that
+# expected failure via the LOADFAIL hook, and Clay has never wired
+# LOADFAIL to actually fire (`TfHookEvent::Loadfail` parses but nothing
+# calls `fire_hook` for it - same class of gap as findings 26's still-
+# unfired PROMPT/ACTIVITY/BGTEXT hooks, the Job 16 bucket). That's now
+# blocking stdlib.tf's own preload, one line short of clean, and needs
+# its own real hook-wiring work (fire LOADFAIL on a load error, generate
+# tf's own default message, and honor a matching macro's -ag gag) - out
+# of this job's scope. The chain got further still, though: preloading
+# now reaches kbbind.tf's own "/if /!ismacro -msimple -ib'%1'%; /then
+# ..." (line 9) - a command-form /if condition whose own "%1" (referring
+# to `~bind_if_not_bound`'s OWN caller-supplied key, e.g. "^R") is never
+# substituted before "/ismacro ..." runs, so the invoked "ismacro" macro
+# (stdlib.tf's own, `/def -i ismacro = /test tfclose("o")%; /@list -s -i
+# %{*-@}`) receives a literal, unsubstituted "%1" as part of its own %*,
+# and "/@list -s -i -msimple -ib'%1'" ends up filtering on nothing
+# meaningful, dumping the whole macro table (~600 lines, "0: loaded\n1:
+# require\n...") instead of matching anything - already flagged, in the
+# now-fixed Job-11-era comment above, as "a genuinely new gap... not this
+# job's scope" once stdlib.tf's own ismacro definition became reachable;
+# it has been reachable since that fix and remains exactly as
+# out-of-scope now. Not root-caused further; needs the command-form
+# condition's own substitution-timing bug fixed first (same family as
+# finding C.8, but for the CALLING macro's positional params rather than
+# the condition itself).
+#
+# Fixed (Job 15b-ii, 2026-09-03): finding 34 (LOADFAIL) was the actual last
+# blocker, exactly as this entry already suspected - `load_file_internal`
+# was already calling `hooks::fire_hook(..Loadfail..)` at both its error
+# sites, but threw away the returned `HookOutcome` and returned the default
+# error unconditionally, so stdlib.tf's own gag macro
+# (`/def -hloadfail -ag ~gagloadfail`, guarding "/eval /load
+# %TFLIBDIR/local.tf") could never actually suppress anything (verified
+# directly against real tf 5.0 beta 8: a non-gagged LOADFAIL hook fires AND
+# the default error still shows, in that order; a gagged one suppresses the
+# error entirely). New `builtins::fire_loadfail` checks
+# `outcome.first_fired_gagged` and returns `Success` instead of `Error` when
+# gagged, matching the same "one hook decides" pattern already used for
+# CONFAIL/REDEF/SEND elsewhere. Preloading stdlib.tf now completes with
+# zero errors end to end (verified directly: a bare `;; preload: stdlib.tf`
+# with no other content produces no "preload: ..." error line at all) -
+# whatever residual concern this entry's own kbbind.tf note above still had
+# no longer registers as a load error either way, so it doesn't block this
+# case (kbbind.tf's own command-form-condition substitution-timing gap, if
+# still present, isn't something stdlib_macros.tf's own probes - /first
+# /rest /last /nth /escape /replace /toggle /not /expr, isvar() - exercise).
+# stdlib_macros passes outright now and was removed.
+
+# C.10 is fixed (Job 10): all 31 TF hook events parse, and the combined
+# -h"EVENT pattern" syntax (including single-quoted) parses and matches
+# like a trigger against the firing hook's own argument text. hooks passes
+# outright now and was removed.
+
+# C.11 is fixed (Job 11): features, mktime, ftime (1-arg form), cputime,
+# ln, morepaused, winlines, strip_attr, and replace()'s TF argument order
+# are all implemented/fixed - functions passes outright now and was
+# removed.
+
+# B ruling is fixed (Job 13): /trigger now runs <text> through the real
+# trigger matcher (macros::process_triggers/match_trigger - same priority,
+# fall-through, one-shot and world rules a real socket line gets), instead
+# of matching macros whose *pattern string* overlapped the given text as a
+# plain substring. Also surfaced and fixed two bugs along the way, neither
+# of which is one of finding C's numbered gaps: process_triggers itself
+# passed an empty argument slice to execute_macro, so a trigger macro's own
+# %1../%*/%# (as opposed to %Pn regexp captures) were always empty -
+# `/help triggers`: "the <text> ... is given to the macro as arguments, as
+# if it had been called with `/<macro> <text>`" - fixed by splitting `line`
+# on whitespace, the same way hooks::fire_hook already did for hook
+# arguments; and bare "%?" (unbraced) was never substituted at all in plain
+# text (variables::substitute_variables had no case for it - only the
+# %{?} braced form worked, via its generic get_var fallback), needed for
+# /def's own new %?-setting (see below) to actually reach a plain "%?" in
+# script text. trigger passes outright now and was removed.
+
+# B ruling is fixed (Job 13): /undefn now takes macro NUMBER(s)
+# (`macros::undef_by_number`, `/UNDEFN <number>...`) instead of a name
+# pattern - name-pattern removal is `/purge -mglob` per the plan's own B
+# ruling. This needed /def to actually set %? to the new macro's own
+# sequence number first (`/help def`: "the return value of /def or /edit"),
+# which it never did before - undefn.tf's own "/eval /undefn %?" idiom
+# depends on exactly that. undefn passes outright now and was removed.

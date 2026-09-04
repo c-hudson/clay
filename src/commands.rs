@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 #[allow(unused_imports)]
 use crate::{
-    App, AppEvent, Command, World, WorldType, SocketFd,
+    App, AppEvent, Command, LogAction, World, WorldType, SocketFd,
     WsMessage, WriteCommand, StreamReader, StreamWriter,
     Encoding, AutoConnectType,
     parse_command, get_version_string,
@@ -1588,14 +1588,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
                                 app.current_world_mut().command_tx = Some(cmd_tx.clone());
 
-                                // Fire TF CONNECT hook
-                                let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
-                                for cmd in hook_result.send_commands {
-                                    let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
-                                }
-                                for cmd in hook_result.clay_commands {
-                                    let _ = app.tf_engine.execute(&cmd);
-                                }
+                                // Fire TF CONNECT hook - see /help hooks: "CONNECT world, cipher".
+                                let world_idx_for_hook = app.current_world_index;
+                                app.fire_tf_hook(Some(world_idx_for_hook), tf::TfHookEvent::Connect, &world_name, false);
 
                                 // Send auto-login if configured (for Connect type)
                                 // Requires BOTH username AND password to be set
@@ -1795,13 +1790,9 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
                                 app.current_world_mut().command_tx = Some(cmd_tx.clone());
 
-                                let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
-                                for cmd in hook_result.send_commands {
-                                    let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
-                                }
-                                for cmd in hook_result.clay_commands {
-                                    let _ = app.tf_engine.execute(&cmd);
-                                }
+                                // Fire TF CONNECT hook - see /help hooks: "CONNECT world, cipher".
+                                let world_idx_for_hook = app.current_world_index;
+                                app.fire_tf_hook(Some(world_idx_for_hook), tf::TfHookEvent::Connect, &world_name, false);
 
                                 let skip_login = app.current_world().skip_auto_login;
                                 let auto_connect_type = app.current_world().settings.auto_connect_type;
@@ -2289,24 +2280,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 }
             });
         }
-        Command::Disconnect => {
-            let world_index = app.current_world_index;
-            if app.current_world().connected {
-                // Kill proxy process if one exists
-                #[cfg(unix)]
-                if let Some(proxy_pid) = app.current_world().proxy_pid {
-                    unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
-                }
-                #[cfg(windows)]
-                if let Some(proxy_pid) = app.current_world().proxy_pid {
-                    kill_proxy_process(proxy_pid);
-                }
-                app.current_world_mut().clear_connection_state(true, true);
-                app.add_output("Disconnected.");
-                app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
-            } else {
-                app.add_output("Not connected.");
-            }
+        Command::Disconnect { world } => {
+            execute_disconnect_command(app, &world, app.current_world_index, false);
         }
         Command::Flush => {
             let line_count = app.current_world().output_lines.len();
@@ -2320,64 +2295,13 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             app.ws_broadcast(WsMessage::WorldFlushed { world_index });
             app.add_output(&format!("Flushed {} lines from output buffer.", line_count));
         }
-        Command::Send { text, all_worlds, target_world, no_newline } => {
-            // Send the text
-            let send_to_world = |world: &mut World, text: &str, no_newline: bool| -> bool {
-                if !world.connected {
-                    return false;
-                }
-                if let Some(tx) = &world.command_tx {
-                    let result = if no_newline {
-                        tx.try_send(WriteCommand::Raw(text.as_bytes().to_vec()))
-                    } else {
-                        tx.try_send(WriteCommand::Text(text.to_string()))
-                    };
-                    if result.is_ok() {
-                        world.last_send_time = Some(std::time::Instant::now());
-                        return true;
-                    }
-                }
-                false
-            };
-
-            if all_worlds {
-                // Send to all connected worlds
-                let mut sent_count = 0;
-                for world in &mut app.worlds {
-                    if send_to_world(world, &text, no_newline) {
-                        sent_count += 1;
-                    }
-                }
-                if sent_count == 0 {
-                    app.add_output("No connected worlds to send to.");
-                }
-            } else if let Some(world_name) = target_world {
-                // Send to specific world
-                if let Some(idx) = app.find_world(&world_name) {
-                    if !send_to_world(&mut app.worlds[idx], &text, no_newline) {
-                        app.add_output(&format!("World '{}' is not connected.", world_name));
-                    }
-                } else {
-                    app.add_output(&format!("World '{}' not found.", world_name));
-                }
-            } else {
-                // Send to current world
-                let world = app.current_world_mut();
-                if !world.connected {
-                    app.add_output("Not connected. Use /worlds to connect.");
-                } else if let Some(tx) = &world.command_tx {
-                    let result = if no_newline {
-                        tx.try_send(WriteCommand::Raw(text.as_bytes().to_vec()))
-                    } else {
-                        tx.try_send(WriteCommand::Text(text.to_string()))
-                    };
-                    if result.is_ok() {
-                        world.last_send_time = Some(std::time::Instant::now());
-                    } else {
-                        app.add_output("Failed to send command.");
-                    }
-                }
-            }
+        Command::Send { text, all_worlds, target_world, world_type, no_newline, run_hook } => {
+            let world_index = app.current_world_index;
+            execute_send_command(app, &text, all_worlds, &target_world, &world_type, no_newline, run_hook, world_index, false);
+        }
+        Command::Log { world, log_input, log_local: _, log_global: _, action } => {
+            let world_index = app.current_world_index;
+            execute_log_command(app, &world, log_input, &action, world_index, false);
         }
         Command::Reload => {
             // Hot reload is not available on Android/Termux
@@ -2661,65 +2585,21 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             // scrolls. /dump must be passive and not disturb more-mode state.
             let _ = app.write_debug_dump("console");
         }
-        Command::AddWorld { name, host, port, user, password, use_ssl } => {
-            // Check if world already exists (case-insensitive)
-            let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
-
-            let world_idx = if let Some(idx) = existing_idx {
-                // Update existing world
-                idx
-            } else {
-                // Create new world - validate name
-                if name.is_empty() {
-                    app.add_output("Error: World name cannot be empty");
-                    return false;
-                }
-                if name.contains(' ') {
-                    app.add_output("Error: World name cannot contain spaces");
-                    return false;
-                }
-                if name.starts_with('(') {
-                    app.add_output("Error: World name cannot start with '('");
-                    return false;
-                }
-
-                // Create new world
-                let new_world = World::new(&name);
-                app.worlds.push(new_world);
-                app.worlds.len() - 1
-            };
-
-            // Update world settings
-            if let Some(h) = host {
-                app.worlds[world_idx].settings.hostname = h;
+        Command::AddWorld { name, host, port, user, password, use_ssl, file } => {
+            execute_add_world_command(app, name, host, port, user, password, use_ssl, file, app.current_world_index, false);
+        }
+        Command::AddWorldDefault { character, password, file } => {
+            execute_add_world_default_command(app, character, password, file, app.current_world_index, false);
+        }
+        Command::RemoveWorld { names } => {
+            let world_idx = app.current_world_index;
+            execute_remove_world_command(app, &names, world_idx, false);
+        }
+        Command::WorldConnectHostPort { host, port, use_ssl, no_login, background } => {
+            match prepare_world_connect_host_port(app, &host, &port, use_ssl, no_login, background) {
+                Ok(followup) => return Box::pin(handle_command(&followup, app, event_tx)).await,
+                Err(e) => app.add_output(&e),
             }
-            if let Some(p) = port {
-                app.worlds[world_idx].settings.port = p;
-            }
-            if let Some(u) = user {
-                app.worlds[world_idx].settings.user = u;
-            }
-            if let Some(p) = password {
-                app.worlds[world_idx].settings.password = p;
-            }
-            app.worlds[world_idx].settings.use_ssl = use_ssl;
-
-            // Save settings to persist the new/updated world
-            if let Err(e) = persistence::save_settings(app) {
-                app.add_output(&format!("Warning: Failed to save settings: {}", e));
-            }
-
-            // Confirm the operation
-            let action = if existing_idx.is_some() { "Updated" } else { "Added" };
-            let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
-                format!(" ({}:{}{})",
-                    app.worlds[world_idx].settings.hostname,
-                    app.worlds[world_idx].settings.port,
-                    if use_ssl { " SSL" } else { "" })
-            } else {
-                " (connectionless)".to_string()
-            };
-            app.add_output(&format!("{} world '{}'{}.", action, name, host_info));
         }
         Command::EditList => {
             app.open_notes_list_popup();
@@ -2990,6 +2870,631 @@ pub(crate) fn process_pending_tf_commands(app: &mut App) {
             }
         }
     }
+}
+
+/// Process any pending text queued by the `echo()` expression function (the
+/// function form of `/echo`, used e.g. inside `/test`/`/if` expressions -
+/// see `expressions::evaluate`'s "echo" arm). Was previously queued into
+/// `engine.pending_outputs` and never drained anywhere - a dead sink, so
+/// `echo({*})`'s side effect silently vanished (finding 14's grep.tf: TF
+/// library macros like `/_fgrep`/`/_grep`/`/_egrep` rely on exactly this to
+/// print a matching line). Mirrors `process_pending_tf_commands` above:
+/// same drain-into-App-state shape, same single call site.
+pub(crate) fn process_pending_tf_outputs(app: &mut App) {
+    let outputs: Vec<tf::TfOutput> = app.tf_engine.pending_outputs.drain(..).collect();
+
+    for output in outputs {
+        let world_idx = if let Some(ref world_name) = output.world {
+            app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(world_name))
+                .unwrap_or(app.current_world_index)
+        } else {
+            app.current_world_index
+        };
+
+        if world_idx < app.worlds.len() {
+            // attrs (echo()'s 2nd argument) has no Clay-side attribute model to
+            // apply yet - same documented gap as /echo's own "-a<attrs>"
+            // command-line option - so only the text reaches the display.
+            let text = tf::parser::process_attr_codes(&output.text);
+            app.emit_client_text(world_idx, &text, false);
+        }
+    }
+}
+
+/// Job 15: drains the "engine records, App drains" queue `/xtitle`, `/more`, `/wrap`
+/// and the `/limit` family all use (`TfEngine::pending_xtitle`/`pending_more_mode`/
+/// `pending_wrapspace`/`pending_limit_op` - see each command's own doc comment in
+/// builtins.rs). **Console-only**: called from exactly one site, the interactive
+/// console TUI's own per-typed-command post-processing (main.rs, right alongside
+/// `process_pending_world_ops`/`process_pending_tf_commands`/`process_pending_tf_outputs`
+/// above) - never from the WS/daemon dispatch paths, which have no terminal to set a
+/// title on and no per-tick loop of their own to drain from. A WS/GUI/web client's
+/// `/xtitle`/`/more`/`/wrap`/`/limit` still reaches the TF engine (which is shared by
+/// the whole `App`) and sets these same fields, but nothing consumes them until the
+/// LOCAL console next processes a typed command - a documented rough edge (finding 33
+/// in the TF-parity plan), not a crash or data loss.
+pub(crate) fn apply_pending_tf_console_ops(app: &mut App) {
+    if let Some(title) = app.tf_engine.pending_xtitle.take() {
+        // crossterm's own SetTitle command, queued straight to stdout - CLAUDE.md's
+        // no-println!/eprintln! rule is about raw text/debug output corrupting the
+        // ratatui screen; a terminal control command like this one is the same
+        // mechanism the rest of the TUI already uses for mouse capture, alternate
+        // screen, etc. (see the many other `crossterm::execute!(std::io::stdout(), ...)`
+        // call sites in this file and main.rs) - never through `add_output`/the line
+        // buffer, so it can never reach `/recall` or a client's own output stream.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
+    }
+
+    if let Some(on) = app.tf_engine.pending_more_mode.take() {
+        app.settings.more_mode_enabled = on;
+        let _ = persistence::save_settings_with_source(app, "console");
+        let settings_msg = app.build_global_settings_msg();
+        app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
+        // Real tf's own /more macro only prints a message on the "on" branch
+        // (verified directly: "off" produces no output at all) - Clay's own message
+        // is unconditional-on-"on" rather than gated on kbnum/keybinding state the way
+        // stdlib.tf's own version is (Phase 2's TF-default keybindings aren't landed
+        // yet, so there's no reliable "is TAB bound to page" check to gate on here).
+        if on {
+            app.add_output("\"More\" paging enabled.  Use TAB to scroll.");
+        }
+    }
+
+    if let Some(wrapspace) = app.tf_engine.pending_wrapspace.take() {
+        if app.settings.wrapspace != wrapspace {
+            app.settings.wrapspace = wrapspace;
+            app.needs_output_redraw = true;
+        }
+        let _ = persistence::save_settings_with_source(app, "console");
+        let settings_msg = app.build_global_settings_msg();
+        app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
+    }
+
+    if let Some(op) = app.tf_engine.pending_limit_op.take() {
+        apply_limit_op(app, op);
+    }
+
+    // TF-parity plan Job 22a/P2.7: this is the console's own single per-typed-command site
+    // (see this function's own doc comment), so it's also the right place to check whether
+    // the just-executed command was a `/bind`/`/def -b`/`-B`/`/unbind`/`/undef`/`/undefn`/
+    // `/undeft`/`/purge` that changed which keys a web/GUI client should hand to the server
+    // via `RunKeyBinding` - cheap even when it wasn't (a string compare against the last
+    // value broadcast), so it's simplest to just always check rather than pattern-match the
+    // command text for the handful of TF verbs that can affect it.
+    app.refresh_tf_bound_keys_if_changed();
+}
+
+/// The actual `/limit`/`/unlimit`/`/relimit` work, driving the existing F4 filter popup
+/// (`FilterPopup`) - see `apply_pending_tf_console_ops`'s doc comment for why this is
+/// console-only, and `tf::PendingLimitOp`/`builtins::cmd_limit` for how a request gets
+/// here. `pub(crate)` so `input_handler::dispatch_action_impl`'s `toggle_limit` action
+/// (TF-parity plan Job 22a/P2.7, ruling table's `Esc-L`) can call it directly instead of
+/// going through the queued `pending_limit_op`/`apply_pending_tf_console_ops` round trip -
+/// a live keypress already has `&mut App` in hand, so there's nothing to queue.
+pub(crate) fn apply_limit_op(app: &mut App, op: tf::PendingLimitOp) {
+    match op {
+        tf::PendingLimitOp::Report => {
+            // Real tf's own bare `/limit` answers this silently via %? - Clay prints a
+            // short status line instead (documented in cmd_limit's own doc comment;
+            // %? can't survive the queued round trip to App).
+            let active = app.filter_popup.visible;
+            app.add_output(if active { "A limit is in effect." } else { "No limit is in effect." });
+        }
+        tf::PendingLimitOp::Clear => {
+            app.filter_popup.close();
+            app.needs_output_redraw = true;
+        }
+        tf::PendingLimitOp::Reapply => {
+            if let Some((pattern, invert, attrs_only, style)) = app.last_limit.clone() {
+                open_limit(app, pattern, invert, attrs_only, style);
+            } else {
+                app.add_output("No previous /limit to repeat.");
+            }
+        }
+        tf::PendingLimitOp::Apply { pattern, invert, attrs_only, style } => {
+            let pattern_text = pattern.unwrap_or_default();
+            app.last_limit = Some((pattern_text.clone(), invert, attrs_only, style));
+            open_limit(app, pattern_text, invert, attrs_only, style);
+        }
+    }
+}
+
+/// Shared by both `Apply` and `Reapply` above - sets the filter popup's fields and
+/// re-runs its own `update_filter` against the current world's output.
+fn open_limit(app: &mut App, pattern: String, invert: bool, attrs_only: bool, style: tf::TfMatchMode) {
+    app.filter_popup.style = style;
+    app.filter_popup.invert = invert;
+    app.filter_popup.attrs_only = attrs_only;
+    app.filter_popup.filter_text = pattern;
+    app.filter_popup.cursor = app.filter_popup.filter_text.len();
+    app.filter_popup.visible = true;
+    let output_lines = app.current_world().output_lines.clone();
+    app.filter_popup.update_filter(&output_lines);
+    app.needs_output_redraw = true;
+}
+
+/// Execute a resolved `Command::Send` against one or more target worlds - shared by all
+/// three interfaces that used to each hand-roll this (console: this file's own
+/// `Command::Send` arm, `--multiuser`/`-D`: daemon.rs, master WS: main.rs), which had
+/// drifted into three near-identical copies of the same all_worlds/target_world/no_newline
+/// logic (CLAUDE.md: prefer one shared helper over patching a copy). Adds TF's `-T<type>`
+/// (fan out to every connected world whose `WorldType::name()` glob-matches `world_type`,
+/// case-insensitively) and `-h`/`run_hook` (fire the SEND hook per target world first,
+/// skipping any world a matching non-quiet hook gags - see /help hooks' SEND rule and
+/// finding C.10) on top of the pre-existing -W/-w/-n behavior. `message_world_idx` is both
+/// the "current world" target when no -W/-T/-w is given and the destination for any
+/// informational text this produces (mirrors every other per-command-source `emit_client_text`
+/// call).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_send_command(
+    app: &mut App,
+    text: &str,
+    all_worlds: bool,
+    target_world: &Option<String>,
+    world_type: &Option<String>,
+    no_newline: bool,
+    run_hook: bool,
+    message_world_idx: usize,
+    is_daemon_mode: bool,
+) {
+    let make_write_cmd = |t: &str| -> WriteCommand {
+        if no_newline {
+            WriteCommand::Raw(t.as_bytes().to_vec())
+        } else {
+            WriteCommand::Text(t.to_string())
+        }
+    };
+
+    let targets: Vec<usize> = if all_worlds {
+        (0..app.worlds.len()).filter(|&i| app.worlds[i].connected).collect()
+    } else if let Some(type_pattern) = world_type {
+        let regex_pattern = crate::actions::wildcard_to_regex(type_pattern);
+        let re = regex::RegexBuilder::new(&regex_pattern).case_insensitive(true).build().ok();
+        (0..app.worlds.len())
+            .filter(|&i| app.worlds[i].connected)
+            .filter(|&i| {
+                let type_name = app.worlds[i].settings.world_type.name();
+                re.as_ref().is_some_and(|r| r.is_match(type_name))
+            })
+            .collect()
+    } else if let Some(target) = target_world {
+        match app.find_world(target) {
+            Some(idx) if app.worlds[idx].connected => vec![idx],
+            Some(_) => {
+                app.emit_client_text(message_world_idx, &format!("World '{}' is not connected.", target), is_daemon_mode);
+                return;
+            }
+            None => {
+                app.emit_client_text(message_world_idx, &format!("World '{}' not found.", target), is_daemon_mode);
+                return;
+            }
+        }
+    } else if message_world_idx < app.worlds.len() {
+        if !app.worlds[message_world_idx].connected {
+            app.emit_client_text(message_world_idx, "Not connected. Use /worlds to connect.", is_daemon_mode);
+            return;
+        }
+        vec![message_world_idx]
+    } else {
+        vec![]
+    };
+
+    if targets.is_empty() {
+        let msg = match world_type {
+            Some(t) => format!("No connected worlds match type '{}'.", t),
+            None => "No connected worlds to send to.".to_string(),
+        };
+        app.emit_client_text(message_world_idx, &msg, is_daemon_mode);
+        return;
+    }
+
+    let single_target = targets.len() == 1 && !all_worlds && world_type.is_none();
+    let mut sent_count = 0;
+    for idx in targets {
+        if run_hook {
+            // /help hooks' SEND rule: a matching non-quiet hook means the original text is
+            // NOT sent - the same behavior ordinary typed input already gets (main.rs's
+            // console key-handling loop). By default (run_hook == false) /send fires no
+            // hook at all, matching real TF's own documented default.
+            let suppressed = app.fire_tf_hook(Some(idx), tf::TfHookEvent::Send, text, is_daemon_mode);
+            if suppressed {
+                continue;
+            }
+        }
+        if let Some(tx) = &app.worlds[idx].command_tx {
+            if tx.try_send(make_write_cmd(text)).is_ok() {
+                app.worlds[idx].last_send_time = Some(std::time::Instant::now());
+                sent_count += 1;
+            }
+        }
+    }
+
+    if sent_count == 0 {
+        let msg = if single_target { "Failed to send command." } else { "No connected worlds to send to." };
+        app.emit_client_text(message_world_idx, msg, is_daemon_mode);
+    }
+}
+
+/// Execute a resolved `Command::Log` - shared by console (this file's own `Command::Log`
+/// arm), `--multiuser`/`-D` (daemon.rs) and master WS (main.rs), same reasoning as
+/// `execute_send_command`. Maps TF's multi-stream `/log` (`/help log`) onto Clay's simpler
+/// one-log-per-world model (`WorldSettings::log_enabled` + `World::open_log_file`):
+///
+/// - A totally bare `/log` (no -wilg selector at all) lists every world currently logging.
+///   Any selector present resolves to exactly one target world instead - named (`-w<world>`),
+///   explicitly current (bare `-w`), or current by default (nothing at all, once some other
+///   selector like `-i` made this a targeted call rather than the bare "list" case) - real
+///   tf's own "-g is assumed if -ligw not given" default is deliberately NOT followed here;
+///   Clay's per-world model has no combined-all-worlds stream to default to, so "current
+///   world" is the one sensible default (matches `/help send`'s already-established
+///   "no -w means current world" convention elsewhere in this same command family).
+/// - `-i` toggles the global `Settings.log_input_enabled` - the one real Clay analog to TF's
+///   separate "keyboard input" log stream.
+/// - `-l`/`-g` are accepted (so a script using them doesn't error) but have no distinct
+///   effect: Clay's per-world log already combines local and server output in one file, and
+///   Clay has no single combined-all-worlds stream for `-g` to mean anything different.
+/// - `ON` (re)opens the target's normal, auto-computed log file, clearing any earlier
+///   `<file>` override. `<file>` logs to that exact path instead (`World::log_custom_path`,
+///   `~` expanded the same way `/lcd` expands it). `OFF` stops logging and clears any
+///   override so a later `ON` goes back to the normal file.
+pub(crate) fn execute_log_command(
+    app: &mut App,
+    world: &Option<String>,
+    log_input: bool,
+    action: &LogAction,
+    message_world_idx: usize,
+    is_daemon_mode: bool,
+) {
+    // /restrict FILE disables /log (`/help restrict` level 2 lists it explicitly;
+    // verified directly: "LOG: restricted"). Only the actions that actually open a
+    // log file are blocked - Status (a read) and Off (never opens anything) are left
+    // alone, matching every other restrict guard in this job (report/disable forms
+    // stay available; only file-opening ones are refused).
+    if matches!(action, LogAction::On | LogAction::File(_))
+        && app.tf_engine.restrict_level >= tf::RestrictLevel::File
+    {
+        app.emit_client_text(message_world_idx, "LOG: restricted", is_daemon_mode);
+        return;
+    }
+
+    // Bare /log: no selector at all and no explicit action - list every logging world.
+    if world.is_none() && matches!(action, LogAction::Status) {
+        let logging: Vec<String> = app.worlds.iter()
+            .filter(|w| w.settings.log_enabled)
+            .map(|w| format!("{}: {}", w.name, w.get_log_path().display()))
+            .collect();
+        let msg = if logging.is_empty() {
+            "No logs are currently open.".to_string()
+        } else {
+            format!("Currently logging:\n{}", logging.join("\n"))
+        };
+        app.emit_client_text(message_world_idx, &msg, is_daemon_mode);
+        return;
+    }
+
+    let target_idx = match world {
+        Some(name) if !name.is_empty() => match app.find_world(name) {
+            Some(idx) => idx,
+            None => {
+                app.emit_client_text(message_world_idx, &format!("World '{}' not found.", name), is_daemon_mode);
+                return;
+            }
+        },
+        _ => message_world_idx,
+    };
+    if target_idx >= app.worlds.len() {
+        app.emit_client_text(message_world_idx, "Not connected. Use /worlds to connect.", is_daemon_mode);
+        return;
+    }
+    let world_name = app.worlds[target_idx].name.clone();
+
+    match action {
+        LogAction::Status => {
+            let msg = if app.worlds[target_idx].settings.log_enabled {
+                format!("{}: logging to {}", world_name, app.worlds[target_idx].get_log_path().display())
+            } else {
+                format!("{}: not logging.", world_name)
+            };
+            app.emit_client_text(message_world_idx, &msg, is_daemon_mode);
+        }
+        LogAction::On => {
+            app.worlds[target_idx].log_custom_path = None;
+            app.worlds[target_idx].settings.log_enabled = true;
+            let msg = if app.worlds[target_idx].open_log_file() {
+                format!("Logging {} to {}.", world_name, app.worlds[target_idx].get_log_path().display())
+            } else {
+                app.worlds[target_idx].settings.log_enabled = false;
+                "Failed to open log file.".to_string()
+            };
+            app.emit_client_text(message_world_idx, &msg, is_daemon_mode);
+            if log_input {
+                app.settings.log_input_enabled = true;
+            }
+        }
+        LogAction::File(path) => {
+            let expanded = expand_tilde_path(path);
+            app.worlds[target_idx].log_custom_path = Some(std::path::PathBuf::from(&expanded));
+            app.worlds[target_idx].settings.log_enabled = true;
+            let msg = if app.worlds[target_idx].open_log_file() {
+                format!("Logging {} to {}.", world_name, expanded)
+            } else {
+                app.worlds[target_idx].log_custom_path = None;
+                app.worlds[target_idx].settings.log_enabled = false;
+                format!("Cannot open '{}' for logging.", expanded)
+            };
+            app.emit_client_text(message_world_idx, &msg, is_daemon_mode);
+            if log_input {
+                app.settings.log_input_enabled = true;
+            }
+        }
+        LogAction::Off => {
+            app.worlds[target_idx].settings.log_enabled = false;
+            app.worlds[target_idx].close_log_file();
+            app.worlds[target_idx].log_custom_path = None;
+            app.emit_client_text(message_world_idx, &format!("Stopped logging {}.", world_name), is_daemon_mode);
+            if log_input {
+                app.settings.log_input_enabled = false;
+            }
+        }
+    }
+}
+
+/// Execute a resolved `Command::Disconnect` - shared by console (this file's own
+/// `Command::Disconnect` arm), `--multiuser`/`-D` (daemon.rs) and master WS
+/// (main.rs), same reasoning as `execute_send_command`/`execute_log_command`
+/// above: this one action (kill proxy, clear connection state, tell the user)
+/// used to be hand-rolled identically in all three places, which is exactly
+/// how the plan's own `-ALL`/named-world work would have drifted a third time.
+///
+/// `world`: `None` disconnects `message_world_idx` itself (the console's
+/// current world, or a WS/daemon client's own world); `Some("-ALL")` (case-
+/// insensitive, real TF's own spelling) disconnects every connected world;
+/// `Some(name)` disconnects one named world regardless of which world is
+/// "current" for the caller. Real TF's own `/dc` never fires the DISCONNECT
+/// hook (`/help dc`) - unchanged here, this only ever clears connection state.
+pub(crate) fn execute_disconnect_command(
+    app: &mut App,
+    world: &Option<String>,
+    message_world_idx: usize,
+    is_daemon_mode: bool,
+) {
+    let targets: Vec<usize> = match world {
+        None => vec![message_world_idx],
+        Some(w) if w.eq_ignore_ascii_case("-all") => {
+            (0..app.worlds.len()).filter(|&i| app.worlds[i].connected).collect()
+        }
+        Some(name) => match app.find_world(name) {
+            Some(idx) => vec![idx],
+            None => {
+                app.emit_client_text(message_world_idx, &format!("World '{}' not found.", name), is_daemon_mode);
+                return;
+            }
+        },
+    };
+
+    if targets.is_empty() {
+        app.emit_client_text(message_world_idx, "Not connected.", is_daemon_mode);
+        return;
+    }
+
+    for idx in targets {
+        if app.worlds[idx].connected {
+            #[cfg(unix)]
+            if let Some(proxy_pid) = app.worlds[idx].proxy_pid {
+                unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+            }
+            #[cfg(windows)]
+            if let Some(proxy_pid) = app.worlds[idx].proxy_pid {
+                kill_proxy_process(proxy_pid);
+            }
+            app.worlds[idx].clear_connection_state(true, true);
+            app.emit_client_text(idx, "Disconnected.", is_daemon_mode);
+            app.ws_broadcast(WsMessage::WorldDisconnected { world_index: idx });
+        } else {
+            app.emit_client_text(idx, "Not connected.", is_daemon_mode);
+        }
+    }
+}
+
+/// Shared `/addworld` create-or-update body: finds `name` (case-insensitive) or
+/// creates it, then applies the given settings. Returns `(world_idx, existed)`.
+///
+/// This used to be duplicated near-verbatim across commands.rs, daemon.rs and
+/// main.rs's `handle_ws_send_command` - and had actually drifted: only the
+/// daemon.rs copy remembered to wire `scrollback_tx` on a freshly-created
+/// world (matching `App::find_or_create_world`), so a world added via console
+/// or WS `/addworld` never archived a single line to scrollback.db. This is
+/// the one copy now; it fixes that gap for every caller at once.
+fn add_or_update_world(
+    app: &mut App,
+    name: &str,
+    host: Option<String>,
+    port: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+    use_ssl: bool,
+) -> Result<(usize, bool), String> {
+    let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name));
+    let world_idx = if let Some(idx) = existing_idx {
+        idx
+    } else {
+        if name.is_empty() {
+            return Err("Error: World name cannot be empty".to_string());
+        }
+        if name.contains(' ') {
+            return Err("Error: World name cannot contain spaces".to_string());
+        }
+        if name.starts_with('(') {
+            return Err("Error: World name cannot start with '('".to_string());
+        }
+        let mut new_world = World::new(name);
+        new_world.scrollback_tx = app.scrollback.as_ref().map(|db| db.sender());
+        app.worlds.push(new_world);
+        app.worlds.len() - 1
+    };
+
+    if let Some(h) = host { app.worlds[world_idx].settings.hostname = h; }
+    if let Some(p) = port { app.worlds[world_idx].settings.port = p; }
+    if let Some(u) = user { app.worlds[world_idx].settings.user = u; }
+    if let Some(p) = password { app.worlds[world_idx].settings.password = p; }
+    app.worlds[world_idx].settings.use_ssl = use_ssl;
+
+    Ok((world_idx, existing_idx.is_some()))
+}
+
+/// Execute a resolved `Command::AddWorld` - shared by console, daemon.rs and
+/// main.rs's `handle_ws_send_command` (see `add_or_update_world`'s own doc
+/// comment for why this consolidation exists). `file` (finding 31 / plan Job
+/// 14b) is stored in the TF engine's own memory only, keyed by lower-cased
+/// world name - never a persisted setting.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_add_world_command(
+    app: &mut App,
+    name: String,
+    host: Option<String>,
+    port: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+    use_ssl: bool,
+    file: Option<String>,
+    message_world_idx: usize,
+    is_daemon_mode: bool,
+) {
+    // /restrict WORLD disables /addworld (`/help restrict` level 3; verified directly:
+    // "addworld: restricted", lower-case unlike SH/LOAD/SAVE/LCD/LOG above - matches
+    // real tf's own inconsistent capitalization here).
+    if app.tf_engine.restrict_level >= tf::RestrictLevel::World {
+        app.emit_client_text(message_world_idx, "addworld: restricted", is_daemon_mode);
+        return;
+    }
+    match add_or_update_world(app, &name, host, port, user, password, use_ssl) {
+        Ok((world_idx, existed)) => {
+            if let Some(f) = file {
+                app.tf_engine.world_files.insert(name.to_lowercase(), f);
+            }
+            let _ = persistence::save_settings(app);
+            let action = if existed { "Updated" } else { "Added" };
+            let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
+                format!(" ({}:{}{})",
+                    app.worlds[world_idx].settings.hostname,
+                    app.worlds[world_idx].settings.port,
+                    if use_ssl { " SSL" } else { "" })
+            } else {
+                " (connectionless)".to_string()
+            };
+            app.emit_client_text(message_world_idx, &format!("{} world '{}'{}.", action, name, host_info), is_daemon_mode);
+        }
+        Err(e) => app.emit_client_text(message_world_idx, &e, is_daemon_mode),
+    }
+}
+
+/// Execute a resolved `Command::AddWorldDefault` (`/addworld DEFAULT ...`) -
+/// shared by console, daemon.rs and main.rs's `handle_ws_send_command`. Stores
+/// straight into TF engine globals rather than a real world entry - see the
+/// `Command::AddWorldDefault` and `TfEngine::default_world_character` doc
+/// comments for why (finding 31 / plan Job 14b).
+pub(crate) fn execute_add_world_default_command(
+    app: &mut App,
+    character: Option<String>,
+    password: Option<String>,
+    file: Option<String>,
+    message_world_idx: usize,
+    is_daemon_mode: bool,
+) {
+    app.tf_engine.default_world_character = character.filter(|s| !s.is_empty());
+    app.tf_engine.default_world_password = password.filter(|s| !s.is_empty());
+    app.tf_engine.default_world_file = file;
+    app.emit_client_text(message_world_idx, "Updated world 'DEFAULT'.", is_daemon_mode);
+}
+
+/// Execute a resolved `Command::RemoveWorld` (`/unworld <name>...`) - shared
+/// by console, daemon.rs and main.rs's `handle_ws_send_command`, exactly
+/// like `execute_add_world_command` above (see that function's own doc
+/// comment for why this consolidation exists, and `Command::RemoveWorld`'s
+/// for why /unworld needs a native `Command` at all). Each name is looked
+/// up fresh (never by a pre-computed index) since removing one shifts every
+/// later world's index - `/help unworld`: "For each <name> given, /unworld
+/// removes the definition of the world with that name", processed
+/// independently, matching /kill and /undef's own per-item diagnostics
+/// (`TfEngine::format_diag`, finding 25's convention). Silent on success.
+/// Clay never removes its last remaining world (`App::delete_world`'s own
+/// rule, a Clay-only UX guard with no TF equivalent) - that case gets its
+/// own diagnostic rather than being silently skipped.
+pub(crate) fn execute_remove_world_command(
+    app: &mut App,
+    names: &[String],
+    message_world_idx: usize,
+    is_daemon_mode: bool,
+) {
+    let mut messages = Vec::new();
+    for name in names {
+        match app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+            Some(idx) if app.worlds.len() > 1 => {
+                app.delete_world(idx);
+            }
+            Some(_) => {
+                messages.push(app.tf_engine.format_diag(&format!(
+                    "UNWORLD: Cannot remove '{}' (at least one world must remain).", name
+                )));
+            }
+            None => {
+                messages.push(app.tf_engine.format_diag(&format!("UNWORLD: No world {}", name)));
+            }
+        }
+    }
+    if !messages.is_empty() {
+        app.emit_client_text(message_world_idx, &messages.join("\n"), is_daemon_mode);
+    }
+}
+
+/// Create-or-update the temporary world for `/world <host> <port>`'s host+port
+/// form (`Command::WorldConnectHostPort`, see `parse_world_command`) and
+/// return the follow-up `/worlds ...` command string each dispatch site
+/// should re-run through its own command pipeline, reusing the existing
+/// WorldSwitch/WorldConnectNoLogin/WorldConnectBackground handling instead of
+/// a fourth copy of "switch and connect if needed". The three call sites'
+/// re-dispatch mechanisms differ too much to share (an async `Box::pin`
+/// recursion in commands.rs/daemon.rs vs. a plain sync self-call in main.rs's
+/// `handle_ws_send_command`), so this stops short of doing that part itself.
+pub(crate) fn prepare_world_connect_host_port(
+    app: &mut App,
+    host: &str,
+    port: &str,
+    use_ssl: bool,
+    no_login: bool,
+    background: bool,
+) -> Result<String, String> {
+    // /restrict WORLD disables the "/world <host> <port>" arbitrary-connection form
+    // (`/help restrict` level 3; verified directly against real tf: "CONNECT: arbitrary
+    // connections restricted", same message real tf's own `/connect <host> <port>`
+    // uses - Clay's own `/connect` is an unrelated remote-console-attach feature, not
+    // this raw-socket concept, so only this host/port form is guarded here).
+    if app.tf_engine.restrict_level >= tf::RestrictLevel::World {
+        return Err("CONNECT: arbitrary connections restricted".to_string());
+    }
+    let name = format!("{}:{}", host, port);
+    add_or_update_world(app, &name, Some(host.to_string()), Some(port.to_string()), None, None, use_ssl)?;
+    Ok(if background {
+        format!("/worlds -b {}", name)
+    } else if no_login {
+        format!("/worlds -l {}", name)
+    } else {
+        format!("/worlds {}", name)
+    })
+}
+
+/// Expand a leading `~` (home directory) in a user-supplied path, same convention `/lcd`
+/// already applies inline - factored out here so `/log <file>` gets it too.
+fn expand_tilde_path(path: &str) -> String {
+    if let Some(home) = home::home_dir() {
+        let home_str = home.to_string_lossy();
+        if path == "~" {
+            return home_str.to_string();
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            return format!("{}/{}", home_str, rest);
+        }
+    }
+    path.to_string()
 }
 
 

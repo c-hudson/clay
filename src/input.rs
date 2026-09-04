@@ -37,6 +37,24 @@ pub struct InputArea {
     pub search_prefix: Option<String>,  // Prefix being searched (set on first ^[p/^[n)
     pub search_index: Option<usize>,    // Position in history during search
     pub kill_ring: Vec<String>,         // Killed text history (for ^Y yank)
+    /// TF's numeric prefix (`%kbnum`, TF-parity plan Job 20/P2.4): accumulated by
+    /// `Esc-0`..`Esc-9`/`Esc--` (`kbnum_digit`/`kbnum_negative`), consumed by movement,
+    /// deletion, history and scroll actions via `take_kbnum`/`take_kbnum_positive`, and
+    /// cleared after every keystroke that doesn't itself extend it (`clear_kbnum`) - see
+    /// tf-help's `#kbnum` topic: "Whether the keybinding uses the value or not, %kbnum is
+    /// cleared after the keybinding has run."
+    pub kbnum: Option<i64>,
+    /// Sign applied to the *next* digit appended to `kbnum` (set by `kbnum_negative`,
+    /// reset to `1` whenever `kbnum` is cleared or consumed) - lets `Esc--` (which, like
+    /// real TF's `/set kbnum=-`, has no digits yet) remember that the number being typed
+    /// is negative until the first digit actually arrives.
+    kbnum_sign: i64,
+    /// TF's `%insert` variable: `true` = insert (default), `false` = overwrite. Toggled by
+    /// the `toggle_insert` action (TF: `Insert` key / `Esc-v`, `/@test insert := !insert`)
+    /// and by `/set insert=...` (mirrored in from the TF engine - see
+    /// `App::process_pending_keyboard_ops`). `insert_char` overwrites the character under
+    /// the cursor when this is `false` (appending instead, at end of line).
+    pub insert: bool,
 }
 
 impl InputArea {
@@ -54,6 +72,9 @@ impl InputArea {
             search_prefix: None,
             search_index: None,
             kill_ring: Vec::new(),
+            kbnum: None,
+            kbnum_sign: 1,
+            insert: true,
         }
     }
 
@@ -140,7 +161,25 @@ impl InputArea {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        self.buffer.insert(self.cursor_position, c);
+        // TF-parity plan Job 20 (P2.4): any typed character cancels a pending numeric
+        // prefix (tf-help #kbnum: "when any other keybinding is typed, that keybinding may
+        // use the value of %kbnum... %kbnum is cleared after the keybinding has run").
+        self.clear_kbnum();
+        if self.insert {
+            self.buffer.insert(self.cursor_position, c);
+        } else {
+            // Overwrite mode (TF's `%insert` off): replace the character under the cursor;
+            // at end of line there's nothing to overwrite, so just append.
+            if self.cursor_position < self.buffer.len() {
+                let mut end = self.cursor_position + 1;
+                while end < self.buffer.len() && !self.buffer.is_char_boundary(end) {
+                    end += 1;
+                }
+                self.buffer.replace_range(self.cursor_position..end, &c.to_string());
+            } else {
+                self.buffer.push(c);
+            }
+        }
         self.cursor_position += c.len_utf8();
         self.adjust_viewport();
         self.history_index = None;
@@ -152,10 +191,70 @@ impl InputArea {
         if s.is_empty() {
             return;
         }
+        self.clear_kbnum();
         self.buffer.insert_str(self.cursor_position, s);
         self.cursor_position += s.len();
         self.adjust_viewport();
         self.history_index = None;
+    }
+
+    /// Start a negative numeric-prefix entry (TF `Esc--`: `/set kbnum=-`). Overwrites any
+    /// prefix already pending, matching TF's own `/set` semantics - `Esc--` always begins a
+    /// fresh entry. No digits have arrived yet, so `kbnum` itself stays `None` until the
+    /// first `kbnum_digit` call; the sign is remembered separately (`kbnum_sign`).
+    pub fn kbnum_negative(&mut self) {
+        self.kbnum = None;
+        self.kbnum_sign = -1;
+    }
+
+    /// Append one digit (`0..=9`) to the pending numeric prefix (TF `Esc-0`..`Esc-9`).
+    /// tf-help #kbnum: "Once it is set, all typed digits are appended to it." Clamped to
+    /// TF's own documented default `%max_kbnum` (999) so a long run of accidental digits
+    /// can't turn a later repeat-count consumer into a very long loop.
+    pub fn kbnum_digit(&mut self, digit: i64) {
+        const MAX_KBNUM_MAGNITUDE: i64 = 999;
+        let magnitude = match self.kbnum {
+            Some(v) => (v.unsigned_abs() as i64 * 10 + digit).min(MAX_KBNUM_MAGNITUDE),
+            None => digit,
+        };
+        self.kbnum = Some(self.kbnum_sign * magnitude);
+    }
+
+    /// Clear any pending numeric prefix without using it (TF `^G`/`/beep`: kbbind.tf's own
+    /// comment - "^G does NOT honor kbnum, so it can be used to cancel kbnum entry" - and
+    /// every other keystroke that isn't itself a kbnum-setting one; see
+    /// `input_handler::dispatch_action`'s wrapper and `insert_char` above).
+    pub fn clear_kbnum(&mut self) {
+        self.kbnum = None;
+        self.kbnum_sign = 1;
+    }
+
+    /// Consume the pending numeric prefix as a signed repeat/motion count, clearing it.
+    /// Mirrors TF's ubiquitous `(kbnum?:1)` idiom (kbfunc.tf: `dokey_left = /@test
+    /// kbgoto(kbpoint() - (kbnum?:1))`) - unset *or exactly zero* both default to `1`,
+    /// since TF's `?:` tests truthiness, not presence. A negative result is meaningful to
+    /// callers with a sense of direction: reverse instead of clamping (tf-help #kbnum: "For
+    /// keybindings that have a sense of direction, negative values of kbnum reverse that
+    /// direction").
+    pub fn take_kbnum(&mut self) -> i64 {
+        let n = match self.kbnum {
+            Some(v) if v != 0 => v,
+            _ => 1,
+        };
+        self.clear_kbnum();
+        n
+    }
+
+    /// Like `take_kbnum`, but for actions with no sense of direction (word-case macros:
+    /// `kb_capitalize_word`/`kb_downcase_word`/`kb_upcase_word` all use `/repeat -S
+    /// $[kbnum>0?+kbnum:1]`) - zero *or negative* both default to `1` instead of reversing.
+    pub fn take_kbnum_positive(&mut self) -> i64 {
+        let n = match self.kbnum {
+            Some(v) if v > 0 => v,
+            _ => 1,
+        };
+        self.clear_kbnum();
+        n
     }
 
     pub fn delete_char(&mut self) {
@@ -221,6 +320,10 @@ impl InputArea {
         self.cursor_position = 0;
         self.viewport_start_line = 0;
         self.history_index = None;
+        // A pending numeric prefix belongs to the line being edited; clearing the line
+        // (including via `take_input`'s Enter-key path, which bypasses `dispatch_action`'s
+        // own auto-clear - see its doc comment) cancels it too.
+        self.clear_kbnum();
     }
 
     pub fn take_input(&mut self) -> String {
@@ -271,6 +374,60 @@ impl InputArea {
         self.adjust_viewport();
     }
 
+    /// Recall the first (oldest) history entry (TF: `/dokey RECALLBEG`, `Esc-<`).
+    pub fn history_begin(&mut self) {
+        self.history_begin_n(1);
+    }
+
+    /// Recall the last (most recent) history entry (TF: `/dokey RECALLEND`, `Esc->`).
+    pub fn history_end(&mut self) {
+        self.history_end_n(1);
+    }
+
+    /// `history_begin` with a numeric prefix (TF-parity plan Job 20/P2.4): recall the
+    /// `n`-th oldest entry (1-based) instead of always the very first. Real TF's RECALLBEG
+    /// is a C builtin with no kbfunc.tf wrapper to read its kbnum behavior from, so this is
+    /// Clay's own extension of the documented general rule (tf-help #kbnum: "negative
+    /// values of kbnum reverse that direction") applied to "jump to an end" the same way
+    /// it's applied to every other directional consumer.
+    pub fn history_begin_n(&mut self, n: i64) {
+        if self.history.is_empty() {
+            return;
+        }
+        if n < 0 {
+            self.history_end_n(-n);
+            return;
+        }
+        let last = self.history.len() as i64 - 1;
+        let idx = n.saturating_sub(1).clamp(0, last) as usize;
+        self.history_goto(idx);
+    }
+
+    /// `history_end` with a numeric prefix - see `history_begin_n`'s doc comment.
+    pub fn history_end_n(&mut self, n: i64) {
+        if self.history.is_empty() {
+            return;
+        }
+        if n < 0 {
+            self.history_begin_n(-n);
+            return;
+        }
+        let last = self.history.len() as i64 - 1;
+        let idx = (last - n.saturating_sub(1)).clamp(0, last) as usize;
+        self.history_goto(idx);
+    }
+
+    /// Jump directly to a specific history entry, same bookkeeping as `history_prev`/`next`.
+    fn history_goto(&mut self, idx: usize) {
+        if self.history_index.is_none() {
+            self.temp_input = self.buffer.clone();
+        }
+        self.history_index = Some(idx);
+        self.buffer = self.history[idx].clone();
+        self.cursor_position = self.buffer.len();
+        self.adjust_viewport();
+    }
+
     pub fn home(&mut self) {
         self.cursor_position = 0;
         self.adjust_viewport();
@@ -288,6 +445,21 @@ impl InputArea {
             self.kill_ring.push(killed);
         }
         self.buffer.truncate(self.cursor_position);
+    }
+
+    /// Delete from the start of the line to the cursor position (TF's `kb_backward_kill_line`,
+    /// real TF's own `^U` - Clay's `^U` has instead always meant "clear the whole line",
+    /// still available as the separate `clear_line` action/TF `DLINE`). Symmetric with
+    /// `kill_to_end`: pushes the killed text to the kill ring so `^Y`/`yank` can restore it,
+    /// unlike `clear`, which also empties the buffer but does not (by design) leave the
+    /// cursor position `clear_line` callers expect it to.
+    pub fn kill_to_start(&mut self) {
+        let killed = self.buffer[..self.cursor_position].to_string();
+        if !killed.is_empty() {
+            self.kill_ring.push(killed);
+        }
+        self.buffer = self.buffer[self.cursor_position..].to_string();
+        self.cursor_position = 0;
     }
 
     /// Delete forward to end of next word (Esc+D).
@@ -871,5 +1043,146 @@ impl InputArea {
 impl Default for InputArea {
     fn default() -> Self {
         Self::new(3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kbnum_digit_accumulates() {
+        let mut input = InputArea::default();
+        input.kbnum_digit(1);
+        input.kbnum_digit(2);
+        assert_eq!(input.kbnum, Some(12), "Esc-1 Esc-2 should accumulate to 12, TF-style");
+    }
+
+    #[test]
+    fn test_kbnum_negative_then_digit_keeps_sign() {
+        let mut input = InputArea::default();
+        input.kbnum_negative();
+        assert_eq!(input.kbnum, None, "Esc-- alone sets no value yet, only the pending sign");
+        input.kbnum_digit(2);
+        assert_eq!(input.kbnum, Some(-2));
+        input.kbnum_digit(3);
+        assert_eq!(input.kbnum, Some(-23), "further digits keep accumulating under the same sign");
+    }
+
+    #[test]
+    fn test_kbnum_negative_overwrites_pending_value() {
+        // TF: `/set kbnum=-` always starts a fresh entry (kbbind.tf's `^[-'`), matching
+        // ordinary `/set` semantics rather than appending onto whatever was there before.
+        let mut input = InputArea::default();
+        input.kbnum_digit(5);
+        input.kbnum_negative();
+        input.kbnum_digit(1);
+        assert_eq!(input.kbnum, Some(-1));
+    }
+
+    #[test]
+    fn test_take_kbnum_defaults_to_one() {
+        let mut input = InputArea::default();
+        assert_eq!(input.take_kbnum(), 1, "no pending prefix defaults to 1 (TF's kbnum?:1)");
+        input.kbnum_digit(0);
+        assert_eq!(input.take_kbnum(), 1, "an entered zero is falsy too, same as unset");
+    }
+
+    #[test]
+    fn test_take_kbnum_clears_after_use() {
+        let mut input = InputArea::default();
+        input.kbnum_digit(4);
+        assert_eq!(input.take_kbnum(), 4);
+        assert_eq!(input.kbnum, None, "kbnum must be cleared once consumed");
+    }
+
+    #[test]
+    fn test_take_kbnum_positive_clamps_negative_to_one() {
+        let mut input = InputArea::default();
+        input.kbnum_negative();
+        input.kbnum_digit(3);
+        assert_eq!(input.take_kbnum_positive(), 1,
+            "word-case actions (kb_capitalize_word's kbnum>0?+kbnum:1) never reverse");
+    }
+
+    #[test]
+    fn test_clear_kbnum_resets_sign() {
+        let mut input = InputArea::default();
+        input.kbnum_negative();
+        input.clear_kbnum();
+        input.kbnum_digit(7);
+        assert_eq!(input.kbnum, Some(7), "a cancelled negative entry must not leak its sign");
+    }
+
+    #[test]
+    fn test_typed_char_clears_pending_kbnum() {
+        let mut input = InputArea::default();
+        input.kbnum_digit(5);
+        input.insert_char('x');
+        assert_eq!(input.kbnum, None, "an ordinary typed character cancels a pending prefix");
+    }
+
+    #[test]
+    fn test_kbnum_digit_clamped_to_max() {
+        let mut input = InputArea::default();
+        for _ in 0..6 {
+            input.kbnum_digit(9);
+        }
+        assert_eq!(input.kbnum, Some(999), "TF's own default %max_kbnum is 999");
+    }
+
+    #[test]
+    fn test_insert_mode_default_true() {
+        assert!(InputArea::default().insert);
+    }
+
+    #[test]
+    fn test_insert_char_overwrites_when_insert_off() {
+        let mut input = InputArea { buffer: "hello".to_string(), insert: false, ..Default::default() };
+        input.insert_char('X');
+        assert_eq!(input.buffer, "Xello", "overwrite mode replaces the char under the cursor");
+        assert_eq!(input.cursor_position, 1);
+    }
+
+    #[test]
+    fn test_insert_char_appends_at_end_when_insert_off() {
+        let mut input = InputArea {
+            buffer: "hi".to_string(),
+            cursor_position: 2,
+            insert: false,
+            ..Default::default()
+        };
+        input.insert_char('!');
+        assert_eq!(input.buffer, "hi!", "at end of line, overwrite mode just appends");
+    }
+
+    #[test]
+    fn test_insert_char_inserts_when_insert_on() {
+        let mut input = InputArea { buffer: "hello".to_string(), ..Default::default() };
+        assert!(input.insert);
+        input.insert_char('X');
+        assert_eq!(input.buffer, "Xhello");
+    }
+
+    #[test]
+    fn test_history_begin_n_and_end_n() {
+        let mut input = InputArea {
+            history: vec!["one".into(), "two".into(), "three".into(), "four".into()],
+            ..Default::default()
+        };
+        input.history_begin_n(2);
+        assert_eq!(input.buffer, "two", "n=2 from the start is the 2nd-oldest entry");
+        input.history_end_n(2);
+        assert_eq!(input.buffer, "three", "n=2 from the end is the 2nd-newest entry");
+    }
+
+    #[test]
+    fn test_history_begin_n_negative_reverses_to_end() {
+        let mut input = InputArea {
+            history: vec!["one".into(), "two".into(), "three".into()],
+            ..Default::default()
+        };
+        input.history_begin_n(-1);
+        assert_eq!(input.buffer, "three", "negative n reverses RECALLBEG to count from the end");
     }
 }

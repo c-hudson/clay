@@ -11,10 +11,33 @@ pub mod macros;
 pub mod hooks;
 pub mod builtins;
 pub mod bridge;
+#[cfg(test)]
+mod script_tests;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use regex::Regex;
+
+/// `$TFLIBDIR` if it names a real directory, else the system TinyFugue
+/// library location (Debian's `tf5` package installs it at
+/// `/usr/share/tf5/tf-lib`), else `None`. Shared by `TfEngine::new()` (which
+/// seeds the engine's own `TFLIBDIR` variable from this) and
+/// `script_tests.rs`'s `tf_lib_dir()` (which uses the same resolution to
+/// decide whether a `;; requires-lib` fixture can run at all, then sets the
+/// engine variable explicitly to whatever it found - which wins over this
+/// default since it runs after `TfEngine::new()` returns).
+pub(crate) fn default_tflibdir() -> Option<String> {
+    if let Ok(dir) = std::env::var("TFLIBDIR") {
+        if !dir.is_empty() && std::path::Path::new(&dir).is_dir() {
+            return Some(dir);
+        }
+    }
+    const SYSTEM_TFLIBDIR: &str = "/usr/share/tf5/tf-lib";
+    if std::path::Path::new(SYSTEM_TFLIBDIR).is_dir() {
+        return Some(SYSTEM_TFLIBDIR.to_string());
+    }
+    None
+}
 
 /// Value types for TF variables
 #[derive(Debug, Clone, PartialEq)]
@@ -24,13 +47,34 @@ pub enum TfValue {
     Float(f64),
 }
 
+/// Format a float the way real TF displays a computed "real" value: fixed
+/// decimal notation, trailing zeros trimmed, but the decimal point always
+/// kept (even for a whole number) so a float never prints identically to an
+/// integer. Verified directly against real tf 5.0 beta 8: `pow(2,3)` prints
+/// "8.", `sqrt(4)` prints "2.", `6.0/2` prints "3.", `ln(1)` prints "0.",
+/// and `ln(2)` prints "0.693147180559945" (15 digits, untouched since none
+/// of them are trailing zeros). This is a close approximation of TF's own
+/// `%.15g`-ish formatting rather than a byte-exact port of it - real TF
+/// also has a separate code path that keeps exactly one trailing zero for
+/// some float **literals** combined with `+` (e.g. `3.0 + 0` prints
+/// "3.0", not "3."), which no fixture in this test suite depends on, so
+/// it isn't reproduced here.
+fn format_tf_float(f: f64) -> String {
+    if !f.is_finite() {
+        return f.to_string();
+    }
+    let fixed = format!("{:.15}", f);
+    let trimmed = fixed.trim_end_matches('0');
+    trimmed.to_string()
+}
+
 impl TfValue {
     /// Convert value to string representation
     pub fn to_string_value(&self) -> String {
         match self {
             TfValue::String(s) => s.clone(),
             TfValue::Integer(i) => i.to_string(),
-            TfValue::Float(f) => f.to_string(),
+            TfValue::Float(f) => format_tf_float(*f),
         }
     }
 
@@ -143,10 +187,30 @@ pub struct RecallOptions {
     pub show_timestamps: bool,      // -t
     pub timestamp_format: Option<String>,  // -t[format]
     pub show_line_numbers: bool,    // #
-    pub show_gagged: bool,          // -ag
+    pub show_gagged: bool,          // -a<attrs> containing 'g' (e.g. -ag)
+    /// The raw `-a<attrs>` value verbatim (comma-optional attribute letters, `/help
+    /// attributes`) - only 'g' (`show_gagged`, above) has a distinct effect in Clay's
+    /// recall today; every other letter is accepted (so a script using them doesn't error)
+    /// but otherwise a no-op, since Clay's history buffer doesn't track the rest of TF's
+    /// per-line display-attribute set. Kept for round-tripping/testability rather than
+    /// discarded the moment 'g' is checked.
+    pub suppress_attrs: String,
     pub context_before: usize,      // -Bn
     pub context_after: usize,       // -An
     pub archive: bool,              // -D (search disk archive)
+}
+
+/// Which command created a `TfProcess` - `/ps -r`/`-q` filter on this
+/// (`/help ps`: "-r list /repeats only. -q list /quotes only."). Real TF's
+/// own table also has a per-process "D" (disposition) column for quotes,
+/// which Clay doesn't track anywhere queryable, so `-r`/`-q` is as far as
+/// this job's `/ps` goes toward that grammar (plan Job 14c: "implement what
+/// maps onto Clay's TfProcess fields, accept the rest").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessKind {
+    #[default]
+    Repeat,
+    Quote,
 }
 
 /// A background repeat process
@@ -162,6 +226,7 @@ pub struct TfProcess {
     pub synchronous: bool,         // -S flag
     pub on_prompt: bool,           // -P flag
     pub priority: i32,             // -p option (higher = runs first)
+    pub kind: ProcessKind,         // /repeat vs. a delayed /quote line - /ps -r/-q
 }
 
 /// Disposition for /quote command output
@@ -204,51 +269,143 @@ pub enum TfCommandResult {
     },
     /// Return from macro execution with optional value for %?
     Return(String),
-    /// Abort file loading early (/exit during load)
-    ExitLoad,
+    /// /result: like Return (stops the macro, sets %?/the call's value), but
+    /// when the macro was called as a *command* (not as a `name(args)`
+    /// function) it also echoes the value to tfout - see builtins::cmd_result
+    /// and macros::execute_macro's handling of `called_as_function`.
+    Result(String),
+    /// Abort file loading early (/exit during load). Carries the number of
+    /// enclosing `/load`s still to abort, TF's own `/exit [n]` count
+    /// (default/floor 1 - see `builtins::cmd_exit`): `load_file_internal`
+    /// absorbs one level per catch and, while the count is still >1,
+    /// re-emits it decremented instead of the usual `Success(None)` so the
+    /// next enclosing `/load` keeps aborting too.
+    ExitLoad(u32),
     /// Not a TF command (doesn't start with /)
     NotTfCommand,
     /// Unknown TF command
     UnknownCommand(String),
 }
 
-/// Hook events that can trigger macros
+/// Hook events that can trigger macros. All 31 of real TF's own events (see
+/// `/help hooks` - `tf-help`'s `&hooks` section) plus Clay's own GMCP/MSDP
+/// extras (finding C.10 / plan step P1.9). `Bgtrig` is TF's current name for
+/// what used to be called `Background` - both strings still parse to it (see
+/// `parse`), matching tf-help's own note: "BGTRIG used to be called
+/// BACKGROUND, and the old name still works."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TfHookEvent {
+    Activity,
+    Bamf,
+    BgText,
+    Bgtrig,
+    Confail,
+    Conflict,
     Connect,
     Disconnect,
-    Login,
-    Prompt,
-    Send,
-    Activity,
-    World,
-    Resize,
+    Iconfail,
+    Kill,
     Load,
+    Loadfail,
+    Log,
+    Login,
+    Mail,
+    More,
+    Nomacro,
+    Pending,
+    Preactivity,
+    Process,
+    Prompt,
+    Proxy,
     Redef,
-    Background,
+    Resize,
+    Send,
+    Shadow,
+    Shell,
+    Sighup,
+    Sigterm,
+    Sigusr1,
+    Sigusr2,
+    World,
+    /// Clay-only extras - not real TF events, kept for GMCP/MSDP support.
     Gmcp,
     Msdp,
 }
 
 impl TfHookEvent {
-    /// Parse hook event from string
+    /// Parse hook event from string (case-insensitive, matching every `-h<event>`/
+    /// `/hook`/`/unhook`/`/trigger -h` site in real TF's own library - e.g.
+    /// `-hsend`, `-hloadfail`).
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
+            "ACTIVITY" => Some(TfHookEvent::Activity),
+            "BAMF" => Some(TfHookEvent::Bamf),
+            "BGTEXT" => Some(TfHookEvent::BgText),
+            "BGTRIG" | "BACKGROUND" => Some(TfHookEvent::Bgtrig),
+            "CONFAIL" => Some(TfHookEvent::Confail),
+            "CONFLICT" => Some(TfHookEvent::Conflict),
             "CONNECT" => Some(TfHookEvent::Connect),
             "DISCONNECT" => Some(TfHookEvent::Disconnect),
-            "LOGIN" => Some(TfHookEvent::Login),
-            "PROMPT" => Some(TfHookEvent::Prompt),
-            "SEND" => Some(TfHookEvent::Send),
-            "ACTIVITY" => Some(TfHookEvent::Activity),
-            "WORLD" => Some(TfHookEvent::World),
-            "RESIZE" => Some(TfHookEvent::Resize),
+            "ICONFAIL" => Some(TfHookEvent::Iconfail),
+            "KILL" => Some(TfHookEvent::Kill),
             "LOAD" => Some(TfHookEvent::Load),
+            "LOADFAIL" => Some(TfHookEvent::Loadfail),
+            "LOG" => Some(TfHookEvent::Log),
+            "LOGIN" => Some(TfHookEvent::Login),
+            "MAIL" => Some(TfHookEvent::Mail),
+            "MORE" => Some(TfHookEvent::More),
+            "NOMACRO" => Some(TfHookEvent::Nomacro),
+            "PENDING" => Some(TfHookEvent::Pending),
+            "PREACTIVITY" => Some(TfHookEvent::Preactivity),
+            "PROCESS" => Some(TfHookEvent::Process),
+            "PROMPT" => Some(TfHookEvent::Prompt),
+            "PROXY" => Some(TfHookEvent::Proxy),
             "REDEF" => Some(TfHookEvent::Redef),
-            "BACKGROUND" => Some(TfHookEvent::Background),
+            "RESIZE" => Some(TfHookEvent::Resize),
+            "SEND" => Some(TfHookEvent::Send),
+            "SHADOW" => Some(TfHookEvent::Shadow),
+            "SHELL" => Some(TfHookEvent::Shell),
+            "SIGHUP" => Some(TfHookEvent::Sighup),
+            "SIGTERM" => Some(TfHookEvent::Sigterm),
+            "SIGUSR1" => Some(TfHookEvent::Sigusr1),
+            "SIGUSR2" => Some(TfHookEvent::Sigusr2),
+            "WORLD" => Some(TfHookEvent::World),
             "GMCP" => Some(TfHookEvent::Gmcp),
             "MSDP" => Some(TfHookEvent::Msdp),
             _ => None,
         }
+    }
+
+    /// Canonical uppercase event name, e.g. for `/list`/`/hook` display and
+    /// `/trigger -h`'s own error messages. `{:?}` already renders every variant's
+    /// Rust name in a form `.to_uppercase()` turns back into the exact wire name
+    /// (`BgText` -> "BGTEXT", `Sigusr1` -> "SIGUSR1", ...), so this is just that,
+    /// named for callers that don't want to spell out the `format!` each time.
+    pub fn name(&self) -> String {
+        format!("{:?}", self).to_uppercase()
+    }
+
+    /// TF's own hook table (see `/help hooks`) tags six events "W": their default
+    /// message is displayed on the *world's own* output stream, not the generic
+    /// alert/tferr stream everything else uses. Verified directly against real tf
+    /// (`tf -n -v -q -f...`): `/trigger -h<event> <text>` never shows `<text>` as
+    /// local-echo feedback for one of these (there is no live world to route it to
+    /// under `/trigger`'s simulation), but does for every other event - see
+    /// `parser::cmd_trigger`'s `-h` branch, the only place this matters (finding
+    /// C.10 / plan step P1.9; `PENDING` is included too - empirically it never
+    /// echoed either, plausibly for the same "needs a real world" reason its own
+    /// first form is also tagged "W").
+    pub fn is_world_stream_event(&self) -> bool {
+        matches!(
+            self,
+            TfHookEvent::Bamf
+                | TfHookEvent::Confail
+                | TfHookEvent::Connect
+                | TfHookEvent::Disconnect
+                | TfHookEvent::Iconfail
+                | TfHookEvent::Pending
+                | TfHookEvent::World
+        )
     }
 }
 
@@ -276,7 +433,7 @@ impl TfMatchMode {
 }
 
 /// Attributes for macro display/behavior
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TfAttributes {
     pub gag: bool,
     pub norecord: bool,
@@ -304,9 +461,27 @@ pub struct TfMacro {
     pub body: String,
     pub trigger: Option<TfTrigger>,
     pub hook: Option<TfHookEvent>,
+    /// The `-h"EVENT pattern"` pattern text, if any (`None` for a bare `-hEVENT`,
+    /// which TF says matches every occurrence of the event - see `/help hook`'s
+    /// "pattern will default to *"). Matched against the firing event's own
+    /// argument text the same way a `-t` trigger pattern is matched against a MUD
+    /// line - same `-m` style, same unanchored substring search, same capture
+    /// groups (`hooks::fire_hook`) - see finding C.10 / plan step P1.9.
+    pub hook_pattern: Option<String>,
     pub keybinding: Option<String>,
     pub attributes: TfAttributes,
     pub priority: i32,
+    /// A `-p<expr>` whose value wasn't a plain decimal literal (e.g.
+    /// stdlib.tf's own `-Fp'maxpri'`), deferred until a caller with engine
+    /// access (`cmd_def`/`cmd_edit`) can evaluate it as a TF expression -
+    /// `parse_def` itself has no `TfEngine` to look variables up in. Real
+    /// tf: "/help def" -p: "the argument to -p may be an expression that
+    /// has a numeric value... evaluated only once, when the macro is
+    /// defined." Always `None` after `macros::resolve_priority_expr` has
+    /// run; never itself compared for macro-redefinition equality (see
+    /// `defs_equal_except_body`) since `priority` already reflects its
+    /// resolved value by then.
+    pub priority_expr: Option<String>,
     pub fall_through: bool,
     pub partial_hilite: bool,   // -P: hilite only the matched portion, not the whole line
     pub one_shot: Option<u32>,  // None = permanent, Some(n) = fire n times
@@ -315,6 +490,9 @@ pub struct TfMacro {
     pub probability: Option<f32>,   // 0.0 to 1.0
     pub world: Option<String>,      // Restrict to specific world
     pub sequence_number: u32,       // Sequential definition number (TF-compatible)
+    pub invisible: bool,            // -i/-I: hidden from /list, /save, /purge unless forced
+    pub quiet: bool,                // -q: doesn't count toward BACKGROUND hook / /trigger return value; SEND hook doesn't suppress the original input
+    pub world_type: Option<String>, // -T<type>: restrict trigger/hook matches to worlds of this type (glob/regexp per -m)
 }
 
 /// Per-world watchdog configuration override
@@ -338,8 +516,6 @@ pub struct TfEngine {
     pub macros: Vec<TfMacro>,
     /// Compiled regex cache for performance
     pub pattern_cache: HashMap<String, Regex>,
-    /// Hooks registered for events
-    pub hooks: HashMap<TfHookEvent, Vec<String>>,  // event -> macro names
     /// Key bindings (key sequence -> macro name or command)
     pub keybindings: HashMap<String, String>,
     /// Current working directory for /lcd
@@ -356,6 +532,13 @@ pub struct TfEngine {
     pub loaded_tokens: std::collections::HashSet<String>,
     /// Stack of files currently being loaded (for nested loads)
     pub loading_files: Vec<String>,
+    /// 1-based line number currently being processed in the matching entry of
+    /// `loading_files` (same stack depth - `builtins::load_lines` pushes/updates/
+    /// pops this in lockstep with `loading_files`). Used by `format_diag` to
+    /// reproduce real TF's "% <path>, line <N>: " location prefix on DEF/UNDEF/
+    /// UNDEFN diagnostics (finding 25) - empty outside of a file load, which is
+    /// exactly when real TF omits the prefix too.
+    pub loading_lines: Vec<usize>,
     /// Pending world operations (addworld calls from expressions)
     pub pending_world_ops: Vec<PendingWorldOp>,
     /// Regex capture groups from last regmatch() call (%P0-%P9)
@@ -392,6 +575,121 @@ pub struct TfEngine {
     pub watchname_enabled: bool,
     pub watchname_n1: usize,  // occurrence threshold (default 4)
     pub watchname_n2: usize,  // window size (default 5)
+    /// Current nested macro-call depth, incremented/decremented by
+    /// `macros::execute_macro` around each call - TF's own `max_recur`
+    /// guard (default 100; see `macros::MAX_MACRO_RECURSION`). Distinct
+    /// from `local_vars_stack.len()`, which also grows for /for and /while
+    /// loop-body scopes that aren't macro calls at all.
+    pub macro_call_depth: u32,
+    /// `/addworld DEFAULT <char> <pass> [<file>]` fallback character/password
+    /// (finding 31 / plan Job 14b): `${world_character}`/`${world_password}`
+    /// (`variables.rs`) fall back to these for any world whose own field is
+    /// empty, matching real TF's documented DEFAULT-world behavior. Engine
+    /// memory only - deliberately NOT a real entry in `world_info_cache` (that
+    /// would make a fake "DEFAULT" world show up in /listworlds) and never
+    /// persisted to settings.dat.
+    pub default_world_character: Option<String>,
+    pub default_world_password: Option<String>,
+    /// `/addworld ... <name> ... [<file>]`'s per-world script, keyed by world
+    /// name lower-cased - read back via `world_info(name, "file")`
+    /// (`expressions.rs`). Engine memory only (finding 31): real TF loads this
+    /// file automatically on connect, but wiring that up needs the persisted-
+    /// settings-field + three-UI work this job explicitly defers.
+    pub world_files: HashMap<String, String>,
+    /// `/addworld ... DEFAULT ... [<file>]`'s own file - fallback for
+    /// `world_info(name, "file")` when `world_files` has no entry for that
+    /// world, mirroring the character/password fallback above.
+    pub default_world_file: Option<String>,
+    /// `/xtitle <text>` (Job 15, finding B) - queued for the console main loop's own
+    /// drain (`App::apply_pending_tf_console_ops`, mirroring `pending_keyboard_ops`'
+    /// established "engine records, App drains" pattern) to apply via crossterm's
+    /// `SetTitle` command. CLAUDE.md forbids printing raw escape sequences into the
+    /// output area once the TUI is live - `SetTitle` is queued straight to stdout by
+    /// the drain, never through `add_output`/the line buffer. Only the console drain
+    /// site consumes this, so a web/GUI/remote-console/daemon client's `/xtitle` is
+    /// accepted (sets this field) but never visibly applied - none of those clients
+    /// own a terminal tab to rename, so that's not a missing feature, just a no-op
+    /// there (see `cmd_xtitle`'s own doc comment).
+    pub pending_xtitle: Option<String>,
+    /// `/more [on|off|1|0]` (Job 15) - queued for the same console-only drain as
+    /// `pending_xtitle`, which actually flips `Settings::more_mode_enabled` and
+    /// persists/broadcasts it. See `cmd_more`'s doc comment for why a bare `/more`
+    /// is an error (matches real tf) and why only `on` prints a message.
+    pub pending_more_mode: Option<bool>,
+    /// `/wrap <n>` (Job 15) - queued for the console drain, which applies it to
+    /// `Settings::wrapspace` (Clay's own real hang-indent wrap-width setting - see
+    /// `cmd_wrap`'s doc comment for why `on`/`off` have no Clay-side equivalent and
+    /// only update the TF-visible `%wrap` variable).
+    pub pending_wrapspace: Option<u8>,
+    /// `/limit`/`/unlimit`/`/relimit` (Job 15) - queued for the console drain, which
+    /// drives the existing F4 filter popup (`FilterPopup`, main.rs). See
+    /// `PendingLimitOp` and `cmd_limit`'s doc comment for why this is console-only
+    /// (finding 33 in the TF-parity plan).
+    pub pending_limit_op: Option<PendingLimitOp>,
+    /// `/restrict [SHELL|FILE|WORLD]` (Job 15) - TF's own monotonic security ratchet;
+    /// see `RestrictLevel` and `cmd_restrict`.
+    pub restrict_level: RestrictLevel,
+}
+
+/// TF's `/restrict` security levels (`/help restrict`), monotonically increasing -
+/// once raised, `cmd_restrict` never lowers it for the lifetime of the engine. Derives
+/// `Ord` so call sites just compare `engine.restrict_level >= RestrictLevel::Shell`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum RestrictLevel {
+    #[default]
+    None,
+    /// Disables `/sh`, `/sys`, `/quote !...`.
+    Shell,
+    /// Implies `Shell`. Disables `/load`, `/require`, `/save`, `/lcd` (and `/cd`, which
+    /// wraps it), `/log` (opening/redirecting a log file), `/quote '...'`.
+    File,
+    /// Implies `File`. Disables `/addworld` and the `/world <host> <port>` /
+    /// `/connect <host> <port>` "arbitrary connection" form.
+    World,
+}
+
+impl RestrictLevel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "SHELL" => Some(Self::Shell),
+            "FILE" => Some(Self::File),
+            "WORLD" => Some(Self::World),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Shell => "shell",
+            Self::File => "file",
+            Self::World => "world",
+        }
+    }
+}
+
+/// A queued `/limit`/`/unlimit`/`/relimit` request (Job 15) - the TF engine has no
+/// access to `App`/`FilterPopup`, so this only records *what* was asked for;
+/// `App::apply_pending_tf_console_ops` (main.rs) does the actual work. Console-only
+/// by construction - see `cmd_limit`'s doc comment and finding 33.
+#[derive(Debug, Clone)]
+pub enum PendingLimitOp {
+    /// Bare `/limit` (no options, no pattern): report whether a limit is active.
+    /// Real tf answers this silently via `%?`; Clay prints a short status line
+    /// instead (documented deviation - see `cmd_limit`).
+    Report,
+    /// `/unlimit`: clear any active limit.
+    Clear,
+    /// `/relimit`: re-apply the most recently applied `/limit`.
+    Reapply,
+    /// `/limit [-v] [-a] [-m<style>] [<pattern>]` with at least one option or a
+    /// pattern: apply a new limit.
+    Apply {
+        pattern: Option<String>,
+        invert: bool,
+        attrs_only: bool,
+        style: TfMatchMode,
+    },
 }
 
 /// A pending world operation to be processed by the main app
@@ -450,8 +748,82 @@ pub enum PendingKeyboardOp {
     WordLeft,
     /// Move cursor right by word
     WordRight,
-    /// Insert text at cursor
-    Insert(String),
+    /// Insert text at cursor. The `bool` is TF's `%insert` at the moment this op was
+    /// *pushed* (captured by the `input()` function/`/input`/`/grab`, not read again at
+    /// drain time) - kbfunc.tf's `kb_capitalize_word`/`kb_downcase_word`/`kb_upcase_word`/
+    /// `kb_transpose_chars` all temporarily `/set insert=0` around their own `input()`
+    /// calls and restore it before the macro returns, so by the time
+    /// `App::process_pending_keyboard_ops` drains the queue the engine's live `insert`
+    /// variable is already back to its original value - only the captured snapshot still
+    /// knows the op itself was meant to overwrite (TF-parity plan Job 20/P2.4).
+    Insert(String, bool),
+    /// A `/dokey` name that needs real App/World state (input history, scrollback,
+    /// the world list, ...) beyond the cached `KeyboardBufferState` `cmd_dokey` can see -
+    /// see `App::process_pending_keyboard_ops` / `App::perform_dokey`. The names that only
+    /// need the cached buffer (BSPC, DLINE, LEFT, RIGHT, HOME, END, DCH, WLEFT, WRIGHT) are
+    /// handled synchronously by `cmd_dokey` via the ops above instead.
+    Dokey(DokeyName),
+}
+
+/// `/dokey` names routed through `PendingKeyboardOp::Dokey` (see its doc comment). One
+/// variant per distinct *behavior* - TF spells several of these more than one way
+/// (`PAGEBACK`/`PGUP`, `PAGE`/`PGDN`, `REDRAW`/`REFRESH`), and `cmd_dokey` maps every
+/// spelling onto the same variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DokeyName {
+    /// BWORD: delete the word before the cursor (space-delimited).
+    BackwardWord,
+    /// DWORD: delete the word after the cursor.
+    ForwardWord,
+    /// DEOL: delete from the cursor to the end of the line.
+    KillToEol,
+    /// UP: move the cursor up one line within a multi-line input (no history fallback -
+    /// that's the *key's* job, not `/dokey UP`'s; see finding A in the TF-parity plan).
+    CursorUp,
+    /// DOWN: move the cursor down one line within a multi-line input.
+    CursorDown,
+    /// NEWLINE: submit the input line, exactly as pressing Enter does.
+    Newline,
+    /// RECALLB: recall the previous history entry.
+    HistoryPrev,
+    /// RECALLF: recall the next history entry.
+    HistoryNext,
+    /// RECALLBEG: recall the first (oldest) history entry.
+    HistoryBegin,
+    /// RECALLEND: recall the last (most recent) history entry.
+    HistoryEnd,
+    /// SEARCHB: search history backward for the current prefix.
+    HistorySearchBack,
+    /// SEARCHF: search history forward for the current prefix.
+    HistorySearchForward,
+    /// SOCKETB: switch to the previous world.
+    WorldPrev,
+    /// SOCKETF: switch to the next world.
+    WorldNext,
+    /// REDRAW/REFRESH: repaint the screen.
+    Redraw,
+    /// CLEAR: clear the output view (scrollback refills it on the next repaint).
+    ClearView,
+    /// PAUSE: pause output (more-mode) on the current world.
+    Pause,
+    /// LNEXT: treat the next key literally, ignoring any binding.
+    LiteralNext,
+    /// PAGE/PGDN: scroll one page forward ("more").
+    PageForward,
+    /// PAGEBACK/PGUP: scroll one page backward ("more").
+    PageBackward,
+    /// HPAGE: scroll half a page forward ("more").
+    HalfPageForward,
+    /// HPAGEBACK: scroll half a page backward ("more").
+    HalfPageBackward,
+    /// LINE: scroll forward one line ("more").
+    LineForward,
+    /// LINEBACK: scroll backward one line ("more").
+    LineBackward,
+    /// FLUSH: jump to the end of the scroll buffer, releasing all pending output.
+    Flush,
+    /// SELFLUSH: show highlighted pending lines and jump to the end of the buffer.
+    SelectiveFlush,
 }
 
 /// A pending command to send to a world (from send() function)
@@ -496,12 +868,108 @@ pub struct TfFileHandle {
 
 impl TfEngine {
     pub fn new() -> Self {
-        TfEngine {
+        let mut engine = TfEngine {
             watchdog_n1: 2,
             watchdog_n2: 5,
             watchname_n1: 4,
             watchname_n2: 5,
             ..Default::default()
+        };
+
+        // Real TF imports the WHOLE process environment as TF global
+        // variables at startup - not just the handful with special meaning
+        // to TF itself (HOME, SHELL, TERM, ... - `/help environment`'s own
+        // "usually inherited from the environment when TF starts" wording
+        // undersells it: verified directly against real tf that an
+        // arbitrary, TF-meaningless env var like MY_CUSTOM_TEST_VAR is
+        // ALSO a live TF variable afterward). This is what stdlib.tf's own
+        // "isvar" macro (`/def -i isvar = /test tfclose("o")%; /listvar
+        // -msimple -- %*`) depends on for `isvar("HOME")` - without this,
+        // /listvar finds nothing and it always reports 0. Skip a name that
+        // isn't a valid TF variable identifier (leading digit, or any
+        // character besides letters/digits/underscore) rather than crash
+        // or corrupt lookups on the rare env var real TF's own C `getenv`
+        // loop would have choked on too; TFLIBDIR/TFPATH/maxpri/
+        // time_format/redef below still get their own specific handling
+        // (defaults, non-env-derived values) and always take precedence
+        // over whatever this loop just set.
+        for (key, value) in std::env::vars() {
+            let mut chars = key.chars();
+            let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if valid {
+                engine.set_global(&key, TfValue::String(value));
+            }
+        }
+
+        // TFLIBDIR default - see `default_tflibdir`.
+        if let Some(dir) = default_tflibdir() {
+            engine.set_global("TFLIBDIR", TfValue::String(dir));
+        }
+
+        // stdlib.tf line 64 sets this at load time; kbfunc.tf's `-ip%maxpri` (and anything
+        // else that relies on stdlib having run) needs it even when stdlib itself hasn't
+        // been loaded (finding 27 / plan Job 12).
+        engine.set_global("maxpri", TfValue::Integer(2147483647));
+
+        // Predefined variable defaults (`/help time_format`, `/help redef`) - seeded
+        // unconditionally, same reasoning as `maxpri` above, so a script that reads
+        // `%time_format`/`%redef` before ever `/set`ting them sees real TF's own
+        // out-of-the-box value instead of an empty string (finding B's `/time` ruling
+        // and finding 25's `redef=off` ruling both depend on these).
+        engine.set_global("time_format", TfValue::String("%H:%M".to_string()));
+        engine.set_global("redef", TfValue::Integer(1));
+
+        // TFPATH: the $TFPATH environment variable, if set (TF itself
+        // leaves it unset by default; when it is set it's a colon-separated
+        // search list, same as $PATH).
+        if let Ok(tfpath) = std::env::var("TFPATH") {
+            if !tfpath.is_empty() {
+                engine.set_global("TFPATH", TfValue::String(tfpath));
+            }
+        }
+
+        engine
+    }
+
+    /// Real TF's "% [<path>, line <N>: ]" location prefix for a DEF/UNDEF/UNDEFN-style
+    /// diagnostic (finding 25): the path and line of whichever file is currently being
+    /// loaded (`loading_files`/`loading_lines`, maintained by `builtins::load_lines`),
+    /// or nothing at all when the diagnostic happens outside of a file load (typed
+    /// interactively, or from a macro body run interactively) - verified directly
+    /// against real tf 5.0 beta 8: `% /abs/path, line 3: DEF: Redefined macro a` while
+    /// loading a file, vs. plain `% DEF: Redefined macro a` typed at the prompt.
+    pub fn diag_location_prefix(&self) -> String {
+        match (self.loading_files.last(), self.loading_lines.last()) {
+            (Some(path), Some(line)) => format!("{}, line {}: ", path, line),
+            _ => String::new(),
+        }
+    }
+
+    /// Format a `"% ..."` diagnostic message, TF's own style for informational
+    /// command output that isn't really an error (DEF's REDEF notice, UNDEF/UNDEFN's
+    /// "was not defined" messages - finding 25) - `msg` is the category-tagged text
+    /// after the location prefix, e.g. `"DEF: Redefined macro a"`.
+    pub fn format_diag(&self, msg: &str) -> String {
+        format!("% {}{}", self.diag_location_prefix(), msg)
+    }
+
+    /// Whether `/def`'s redefinition of an existing named macro is currently allowed.
+    /// Real TF's `redef` flag (`/help redef`: "Allows redefinition of existing worlds,
+    /// keybindings, and named macros", default on) - when a script turns it off,
+    /// redefining an existing macro is a hard error instead (verified directly:
+    /// `% <path>, line N: DEF: macro a already exists`, and the OLD definition is
+    /// kept). Any value other than a literal "off"/"0" counts as on, matching how
+    /// this codebase already treats other on/off-worded TF flags (see e.g.
+    /// `expressions.rs`'s `send()` "no_eol" argument) rather than `TfValue::to_bool`,
+    /// which would misread the *string* "off" as truthy.
+    pub fn redef_enabled(&self) -> bool {
+        match self.get_var("redef") {
+            None => true,
+            Some(v) => {
+                let s = v.to_string_value();
+                !(s.eq_ignore_ascii_case("off") || s == "0")
+            }
         }
     }
 
@@ -515,6 +983,16 @@ impl TfEngine {
         }
         // Fall back to global
         self.global_vars.get(name)
+    }
+
+    /// Current `%insert` mode (TF-parity plan Job 20/P2.4): `true` (TF's default) unless
+    /// the variable is set and falsy. Read by `input()`/`cmd_input`/`cmd_grab` at the
+    /// moment they queue a `PendingKeyboardOp::Insert`, since a `kb_*` macro's own
+    /// temporary `/set insert=0` ... `/set insert=<old>` bracket has usually already
+    /// restored the variable by the time the op is drained - see that variant's doc
+    /// comment.
+    pub fn insert_mode(&self) -> bool {
+        self.get_var("insert").map(|v| v.to_bool()).unwrap_or(true)
     }
 
     /// Set a global variable
@@ -535,6 +1013,30 @@ impl TfEngine {
             // No local scope, treat as global
             self.set_global(name, value);
         }
+    }
+
+    /// Assign to a variable following TF's `:=` (and `++`/`--`/`+=`) rule
+    /// (finding 20): update the binding wherever it already lives - the
+    /// innermost local scope that has it, else the global table if it's
+    /// bound there - and only create a *new* binding, at the GLOBAL level,
+    /// when the name isn't bound anywhere yet. This is deliberately
+    /// different from `/let`, which always creates/updates the current
+    /// local scope (or global, if there is no local scope at all) and never
+    /// looks further out - see `set_local` above. Without this distinction,
+    /// an assignment inside a macro (e.g. stack-q.tf's
+    /// `/push`: `%{2-stack} := strcat(...)`) would write into the macro's
+    /// own scope and vanish the instant the macro returns, even though the
+    /// variable was actually a pre-existing global.
+    pub fn set_existing_or_global(&mut self, name: &str, value: TfValue) {
+        for scope in self.local_vars_stack.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), value);
+                return;
+            }
+        }
+        // Not bound in any local scope - update it if it's already a
+        // global, or create it there if it isn't bound anywhere at all.
+        self.set_global(name, value);
     }
 
     /// Push a new local variable scope (for macro execution)
