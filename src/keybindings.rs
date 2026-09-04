@@ -307,11 +307,11 @@ impl KeyBindings {
         // TF /bg (= /fg -n).
         b.insert("^]".into(), "bg_all_worlds".into());
 
-        // System. ^L is TF's real REFRESH (plain repaint) - Clay's own historical "repaint
-        // AND drop client lines" meaning becomes `redraw_server_only`, unbound by default
-        // (ruling table).
+        // System. ^L keeps Clay's own meaning - repaint AND drop client-generated lines
+        // (user ruling, same call as ^Q/^R). TF's plain REFRESH is the `refresh_line`
+        // action, unbound by default and still reachable via `/dokey REFRESH`.
         b.insert("F1".into(), "help".into());
-        b.insert("^L".into(), "refresh_line".into());
+        b.insert("^L".into(), "redraw".into());
         b.insert("^R".into(), "reload".into());
         b.insert("^G".into(), "bell".into());
         b.insert("^Z".into(), "suspend".into());
@@ -829,7 +829,7 @@ mod tests {
         ("^]", "bg_all_worlds"),
         // System
         ("F1", "help"),
-        ("^L", "refresh_line"),
+        ("^L", "redraw"),
         ("^R", "reload"),
         ("^G", "bell"),
         ("^Z", "suspend"),
@@ -1087,15 +1087,15 @@ mod tests {
     /// key's *old* default rather than its new one.
     #[test]
     fn test_old_dat_line_overriding_a_retargeted_default_still_loads_and_wins() {
-        let content = "[bindings]\n^L = redraw\n";
+        let content = "[bindings]\n^U = clear_line\n";
         let loaded = KeyBindings::from_dat_string(content);
-        assert_eq!(loaded.get_action("^L"), Some("redraw"),
-            "an explicit ^L = redraw line must win over the new default (refresh_line)");
+        assert_eq!(loaded.get_action("^U"), Some("clear_line"),
+            "an explicit ^U = clear_line line must win over the new default (kill_to_start)");
         // Sanity: the new default itself is indeed different, so this test would catch a
         // regression where `from_dat_string` silently dropped the override.
-        assert_eq!(KeyBindings::defaults().get_action("^L"), Some("refresh_line"));
-        // Everything else the file didn't mention still comes from the new defaults.
-        assert_eq!(loaded.get_action("^U"), Some("kill_to_start"));
+        assert_eq!(KeyBindings::defaults().get_action("^U"), Some("kill_to_start"));
+        // ^L is NOT retargeted - it keeps Clay's historical filtering redraw (user ruling).
+        assert_eq!(KeyBindings::defaults().get_action("^L"), Some("redraw"));
     }
 
     #[test]

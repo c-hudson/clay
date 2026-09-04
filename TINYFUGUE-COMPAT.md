@@ -59,7 +59,7 @@ name to an action id with no chord/kbnum/insert support at all. The rewrite:
 | `^R` | refresh line | hot reload | **Clay** |
 | `Ctrl-Up/Down` | recall history | switch active world | **TF**; world switching moves to `Esc-Left/Right` (TF socket cycling), `Esc-{`/`Esc-}` (Clay's unseen-first cycling), `Shift-Up/Down` |
 | `Tab` | page | completion if input starts with `/`, else page | **Clay**, plus `Esc-Tab` = completion |
-| `^L` | repaint | repaint + drop client-generated lines | **TF**; the filtering repaint becomes action `redraw_server_only`, unbound by default |
+| `^L` | repaint | repaint + drop client-generated lines | **Clay** (same call as `^Q`/`^R`); TF's plain repaint is action `refresh_line`, unbound by default |
 | `^U` | kill to start of line | clear whole line | **TF** (kill ring kept; whole-line clear = `clear_line`, TF's own `/dokey DLINE`, unbound by default) |
 | `Esc--` / `Esc-=` | kbnum negative / goto bracket | goto bracket / unbound | **TF** |
 | `^S`, `Insert`, `Esc-v`, `Ctrl-Left/Right`, `Ctrl-Home/End`, `Ctrl-PgDn`, `Esc-<`/`>`, `Esc-^N`/`^P`, `Esc-^L`, `Esc-^E`, `Esc-L`, `Esc-0..9`, `^X^R ^X^V ^X^? ^X[ ^X] ^X{ ^X}`, `^]` | bound | unbound | **added** (pure additions, no conflict) |
@@ -219,9 +219,6 @@ pre-parity behavior:
   governed by the "World Switching" setting), and `Shift-Up`/`Shift-Down` cycle
   *all* worlds (unchanged). TF binds `Esc-{`/`Esc-}` to socket cycling as well;
   Clay gives that redundant pair to its own cycling so both styles keep a key.
-- **`^L`** no longer drops client-generated lines on repaint — it's now a plain
-  refresh (TF REFRESH). The old behavior is the separate `redraw_server_only` action,
-  unbound by default.
 - **`^U`** now kills to the start of the line (kill ring kept) instead of clearing the
   whole line. The old behavior is the separate `clear_line` action (TF's own `/dokey
   DLINE`), unbound by default.
@@ -240,7 +237,6 @@ pre-parity behavior:
 ```ini
 Ctrl-Up = world_next
 Ctrl-Down = world_prev
-^L = redraw_server_only
 ^U = clear_line
 Esc-- = goto_matching_bracket
 ```
@@ -337,7 +333,7 @@ only checked on a machine that has it. Changing a default means changing all thr
 | `^F` | `cursor_right` |
 | `^G` | `bell` |
 | `^K` | `kill_to_end` |
-| `^L` | `refresh_line` |
+| `^L` | `redraw` |
 | `^N` | `history_next` |
 | `^P` | `history_prev` |
 | `^Q` | `spell_check` |

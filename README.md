@@ -315,7 +315,7 @@ handful of Clay-only extras like the F-keys). A summary:
 | `Tab` | Release one screenful (when paused) |
 | `Escape j` / `Escape J` | Release all pending / selective flush (keep hilite) |
 | `Escape h` | Half-page scroll up or release half screenful |
-| `Ctrl+L` | Refresh screen (plain repaint) |
+| `Ctrl+L` | Redraw screen, keeping only server output |
 | `F4` | Filter/search output |
 
 **General:**

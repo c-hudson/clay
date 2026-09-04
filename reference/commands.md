@@ -112,7 +112,7 @@ cycling too, so Clay spends the redundant pair on its own cycling instead.
 - `F8` - Toggle action pattern highlighting (highlight lines matching action patterns without running commands)
 - `F9` - Toggle GMCP media audio (master mute switch, starts muted)
 - `Ctrl+C` - Press twice within 15 seconds to quit
-- `Ctrl+L` - Refresh screen (plain repaint, TF REFRESH). Clay's older "repaint and drop client-generated lines" meaning is the separate `redraw_server_only` action, unbound by default.
+- `Ctrl+L` - Redraw screen, keeping only server output (drops client-generated lines); unchanged from earlier Clay releases. TF's plain repaint is the separate `refresh_line` action, unbound by default.
 - `Ctrl+R` or `^X^R` - Hot reload (same as /reload)
 - `^X^V` - Show version (same as /version)
 - `Ctrl+Z` - Suspend process (use `fg` to resume)

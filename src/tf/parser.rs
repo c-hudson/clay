@@ -2349,9 +2349,8 @@ Display:
 
 System:
   Ctrl+C (twice)       - Quit
-  Ctrl+L               - Refresh screen (plain repaint; redraw_server_only,
-                          Clay's old "repaint and drop client lines", is
-                          unbound by default - rebind it to get it back)
+  Ctrl+L               - Redraw screen, keeping only server output (TF's own
+                          plain repaint is the unbound refresh_line action)
   Ctrl+R, Ctrl+X Ctrl+R - Hot reload
   Ctrl+X Ctrl+V        - Show version
   Ctrl+Z               - Suspend
