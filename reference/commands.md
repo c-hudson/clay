@@ -97,7 +97,7 @@ cycling too, so Clay spends the redundant pair on its own cycling instead.
 - `Tab` - Release one screenful of pending lines (when paused); command completion when input starts with `/`; otherwise pages like PgDn
 - `Escape` then `j` - Jump to end, release all pending lines
 - `Escape` then `J` (uppercase) - Selective flush: keep only highlighted pending lines, discard rest
-- `Escape` then `h` - Half-page scroll up or release half screenful of pending
+- `Escape` then `h` - Half-page scroll forward (TF HPAGE), or release half a screenful of pending when paused; a negative numeric prefix (`Esc-- Esc-2 Esc-h`) scrolls back instead
 - `Escape` then `^N`/`^P` - Scroll one line forward/back (TF LINE/LINEBACK)
 - `Escape` then `^L` - Clear the view without dropping scrollback (TF CLEAR)
 - `^S` - Pause the current world (TF PAUSE)

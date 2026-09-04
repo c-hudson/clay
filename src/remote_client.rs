@@ -2512,10 +2512,11 @@ pub(crate) fn dispatch_remote_action(
             app.needs_terminal_clear = true;
             app.needs_output_redraw = true;
         }
-        // TF's real REFRESH/^L: plain repaint, no line filtering (Job 22 makes this the new
-        // ^L default) - see this file's `"redraw_server_only"` arm just above for the
-        // filtering variant, and `dispatch_action`'s `KeyAction::Refresh` for the master
-        // console's equivalent split.
+        // TF's real REFRESH: plain repaint, no line filtering. NOT the ^L default - ^L
+        // keeps Clay's own filtering redraw (the arm just above), per the user ruling
+        // that put ^L alongside ^Q/^R. This action is unbound by default and reachable
+        // via /dokey REFRESH or an explicit binding; `dispatch_action`'s
+        // `KeyAction::Refresh` is the master console's equivalent.
         "refresh_line" => {
             app.needs_terminal_clear = true;
             app.needs_output_redraw = true;

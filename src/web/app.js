@@ -12273,7 +12273,7 @@
         // Up button - short press: NEXT world, long press (1s): prev history.
         //
         // The two directions are deliberately not symmetrical. Short press follows the
-        // console's world-switch keys (Ctrl-Up/Shift-Up -> world_next, keybindings.rs), which
+        // console's world-switch keys (Esc-} / Shift-Up -> world_next, keybindings.rs), which
         // this client already honours on its own keyboard path; long press follows the input
         // area's plain Up = older command, which is both the console's behaviour and the
         // universal terminal convention. Short press used to call requestPrevWorld(), so the
