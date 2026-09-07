@@ -128,6 +128,106 @@ body {
     text-indent: calc(var(--wrapspace, 0) * -1ch);
 }
 
+/* ─── Status/Vitals Panel (mud-status-display.md Job 3) ───
+   A flex sibling of #output-container (see index.html), shown/hidden and
+   populated by updateStatsPanel() in app.js only when the current world's
+   World.stats is non-empty (plan D1). Every color here comes from the
+   existing --theme-*/derived variables so it follows the user's theme,
+   dark mode included - nothing is hard-coded. */
+.stats-panel {
+    flex-shrink: 0;
+    background: var(--theme-status-bar-bg, var(--theme-bg-surface, #1c1722));
+    border-top: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--theme-border-subtle, #221c2b);
+    font-family: var(--sans);
+    font-size: 11px;
+    user-select: none;
+    position: relative;
+    z-index: 2;
+}
+
+.stats-panel-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    cursor: pointer;
+    color: var(--theme-fg-secondary, #a89fb4);
+}
+
+.stats-panel-title {
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    font-size: 10px;
+}
+
+.stats-panel-toggle {
+    margin-left: auto;
+    font-size: 10px;
+    line-height: 1;
+    transition: transform var(--transition);
+}
+
+/* Collapsed: header stays (so the panel can be reopened), body hidden. This
+   toggles display on .stats-panel-body only - it never touches
+   #output-container directly, so the same scroll-guard call that wraps every
+   height-changing mutation in app.js covers this too. */
+.stats-panel.collapsed .stats-panel-toggle {
+    transform: rotate(-90deg);
+}
+
+.stats-panel.collapsed .stats-panel-body {
+    display: none;
+}
+
+.stats-panel-body {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px 16px;
+    padding: 2px 10px 6px;
+}
+
+.stat-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 110px;
+}
+
+.stat-label {
+    color: var(--theme-fg-secondary, #a89fb4);
+    white-space: nowrap;
+}
+
+.stat-value {
+    color: var(--text-color);
+    font-family: var(--mono);
+    white-space: nowrap;
+}
+
+.stat-gauge .stat-bar-track {
+    width: 60px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--theme-bg-elevated, #111);
+    border: 1px solid var(--border-color);
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.stat-gauge .stat-bar-fill {
+    height: 100%;
+    background: var(--accent-color);
+    width: 0%;
+}
+
+body.device-phone .stats-panel { font-size: 10.5px; }
+body.device-phone .stats-panel-body { padding: 2px 8px 5px; gap: 3px 12px; }
+body.device-phone .stat-row { min-width: 92px; }
+body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
+
 /* ANSI color classes - use theme variables with fallbacks */
 .ansi-black { color: var(--theme-ansi-0, #000000); }
 .ansi-red { color: var(--theme-ansi-1, #aa0000); }
@@ -854,6 +954,21 @@ body.theme-light .icon-bar {
     font-variant-ligatures: none;
     text-rendering: geometricPrecision;
     letter-spacing: 0;
+}
+
+/* ECHO masking (plan Phase 3, step 3.4): the server told us the connected MUD sent
+   IAC WILL ECHO (a password/login prompt) - mask what's typed so it isn't shown in the
+   clear, the same privacy property the console and SSH remote console get. This is
+   display-only: #input's own .value still holds the real text, which is all
+   sendCommand() ever reads - the actual gating against history/log/scrollback/broadcast
+   happens server-side (App::record_user_input) and in commandHistory client-side,
+   independently of this class (see updateStatusBar()'s toggle). -webkit-text-security
+   covers every WebView backend the GUI actually ships on (WebKitGTK/WKWebView/WebView2
+   are all WebKit- or Blink-based) plus Chromium/Safari in plain browser use; Firefox has
+   no equivalent property and falls back to plain text - a UX gap, not a security one,
+   since the real gating lives server-side regardless of what's drawn on screen. */
+#input.echo-masked {
+    -webkit-text-security: disc;
 }
 
 #send-btn {

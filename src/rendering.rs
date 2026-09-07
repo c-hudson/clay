@@ -277,10 +277,26 @@ pub(crate) fn wrap_ansi_line(line: &str, max_width: usize, indent: usize) -> Vec
 pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let total_height = f.size().height.max(3);  // Minimum 3 lines for output + separator + input
 
-    // Layout: output area, separator bar (1 line), input area
+    // Status display line (mud-status-display.md Job 4, plan D3): 0 or 1 rows, latched
+    // via World::stats_line_shown rather than read live off World::current_stat_entries()
+    // every frame. This is the entire point of the latch - see its own doc comment - and
+    // is why this check happens up here, ONCE, before output_height (and therefore
+    // dimensions_changed below) is computed at all: reading the live emptiness check
+    // directly into the layout would let a `Char.Vitals` update that briefly adds or drops
+    // a field re-trigger the resize storm dimensions_changed causes on every occurrence,
+    // exactly what D3 says this line must never do.
+    {
+        let world = app.current_world_mut();
+        if !world.stats_line_shown && !world.current_stat_entries().is_empty() {
+            world.stats_line_shown = true;
+        }
+    }
+    let stats_line_height: u16 = if app.current_world().stats_line_shown { 1 } else { 0 };
+
+    // Layout: output area, status line (0 or 1), separator bar (1 line), input area
     let separator_height = 1;
     let input_total_height = app.input_height;
-    let output_height = total_height.saturating_sub(separator_height + input_total_height);
+    let output_height = total_height.saturating_sub(separator_height + input_total_height + stats_line_height);
 
     // Store output dimensions for scrolling and more-mode calculations
     // Use max(1) to prevent any division by zero elsewhere
@@ -309,14 +325,16 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(output_height),
+            Constraint::Length(stats_line_height),
             Constraint::Length(separator_height),
             Constraint::Length(input_total_height),
         ])
         .split(f.size());
 
     let output_area = chunks[0];
-    let separator_area = chunks[1];
-    let input_area = chunks[2];
+    let stats_line_area = chunks[1];
+    let separator_area = chunks[2];
+    let input_area = chunks[3];
 
     // Update input dimensions and prompt length for viewport calculation
     app.input.set_dimensions(input_area.width, app.input_height);
@@ -368,6 +386,10 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         // Normal full-width output area
         render_output_area(f, app, output_area);
     }
+
+    // Render the status display line (plan Job 4/D3) - a no-op when stats_line_area has
+    // zero height, i.e. this world's latch hasn't fired (see the height computation above).
+    render_stats_line(f, app, stats_line_area);
 
     // Render separator bar
     render_separator_bar(f, app, separator_area);
@@ -1281,6 +1303,35 @@ pub(crate) fn render_output_crossterm(app: &App) {
         let _ = stdout.queue(Print("\x1b[K"));
     }
 
+    // Status display line (mud-status-display.md Job 4, plan D3): repainted here,
+    // unconditionally, rather than trusted to `render_stats_line`'s ratatui Paragraph
+    // (drawn moments earlier in the same `terminal.draw()` call). The reason is the
+    // exact hazard this row is uniquely exposed to: it can be a row that, until
+    // `World::stats_line_shown` last flipped from false to true, WAS an ordinary
+    // output row painted by this same bypass loop above. `render_output_area`'s
+    // ratatui `Clear` widget makes ratatui BELIEVE every output-area cell is already
+    // blank — this bypass is what actually puts pixels there, entirely outside
+    // ratatui's own buffer tracking — so on the very frame this row becomes the
+    // stats line, ratatui's diff sees "new blank space == remembered blank" for
+    // every inter-field gap in the new text and skips writing them, leaving
+    // whatever MUD text was physically sitting there a moment ago bleeding through
+    // the gaps — verified against the real binary in a pty (see the plan's job-4
+    // pty harness): "HEALTH963/1000" instead of "HEALTH 963/1000" on the exact
+    // frame the line appeared. Repainting unconditionally with an explicit
+    // erase-to-end-of-line here sidesteps the whole bug class rather than chasing
+    // it with a one-frame terminal-clear special case, and keeps this row correct
+    // on every subsequent update too (hp ticking every combat round included) as
+    // long as something marks `needs_output_redraw` when stats change — see
+    // `App::handle_gmcp_received`/`handle_msdp_received`.
+    if app.current_world().stats_line_shown {
+        let stats_row_y = visible_height as u16;
+        let entries = app.current_world().current_stat_entries();
+        let text = build_stats_line_text(&entries, term_width).unwrap_or_default();
+        let _ = stdout.queue(cursor::MoveTo(0, stats_row_y));
+        let _ = stdout.queue(Print(text));
+        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
+    }
+
     // Render filter popup if visible (must be after output so it's on top)
     if app.filter_popup.visible {
         let popup_width = 40usize.min(term_width);
@@ -1345,18 +1396,30 @@ pub(crate) fn render_output_crossterm(app: &App) {
     }
 
     // Calculate and set cursor position in input area
-    // This replicates the logic from render_input_area to avoid Save/Restore timing issues
+    // This replicates the logic from render_input_area to avoid Save/Restore timing issues.
+    // ECHO masking (plan Phase 3, step 3.4): this is the "second, crossterm-based replica"
+    // of render_input_area's cursor-column arithmetic - both call input_cursor_char_width
+    // so a masked world's cursor column agrees with what render_input actually draws
+    // (one INPUT_MASK_CHAR glyph per character) instead of the real, possibly-wider,
+    // character being typed.
     let prompt = &app.current_world().prompt;
     let prompt_len = strip_ansi_codes(prompt).chars().count();
     let cursor_line = app.input.cursor_line();
     let viewport_line = cursor_line.saturating_sub(app.input.viewport_start_line);
 
-    // Input area starts after output + separator bar (1 line)
-    let input_area_y = app.output_height + 1;
+    // Input area starts after output + status line (0 or 1, plan Job 4/D3) + separator
+    // bar (1 line). Reads the same World::stats_line_shown latch `ui()` used to size
+    // the layout this frame - not a live current_stat_entries() check - so this stays
+    // in agreement with the actual rendered layout even on the one frame where the
+    // latch just flipped (ui() already updated app.output_height by the time this
+    // crossterm pass runs after it).
+    let stats_line_height: u16 = if app.current_world().stats_line_shown { 1 } else { 0 };
+    let input_area_y = app.output_height + stats_line_height + 1;
     let input_area_width = term_width.max(1);
 
     if viewport_line < app.input_height as usize {
         // Calculate cursor column accounting for newlines in the buffer
+        let masked = app.current_world().echo_masked;
         let first_line_capacity = input_area_width.saturating_sub(prompt_len);
         let text_before_cursor = &app.input.buffer[..app.input.cursor_position];
 
@@ -1369,7 +1432,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
                 is_first_line = false;
                 continue;
             }
-            let cw = display_width(&c.to_string());
+            let cw = input_cursor_char_width(c, masked);
             let capacity = if is_first_line { first_line_capacity } else { input_area_width };
             col_width += cw;
             if capacity > 0 && col_width >= capacity {
@@ -1875,6 +1938,109 @@ pub(crate) fn format_more_count(count: usize) -> String {
     }
 }
 
+/// Per-entry display budget on the console status line (plan Job 4 security
+/// requirement): caps any single MUD-supplied key or value so one huge value cannot
+/// crowd out every other entry on this one shared row. Deliberately much tighter than
+/// `stats::MAX_STAT_FIELD_WIDTH` (used by the full `/stats` listing, which has a whole
+/// line per entry to spend) — this line has to fit several entries across one row.
+const STATS_LINE_FIELD_WIDTH: usize = 24;
+
+/// Separator placed between adjacent entries on the status line.
+const STATS_LINE_SEP: &str = "  ";
+
+/// Builds the console status line's plain text (plan Job 4, D3) for a row `max_width`
+/// columns wide, from `World::current_stat_entries()` in the exact order that method
+/// returns (vitals first, per D2 point 5 — never re-sorted here). `None` when there is
+/// nothing to show. The single source of truth for both places this row is ever
+/// painted — see `render_stats_line` (ratatui, used only while a popup/editor/splash
+/// covers the whole screen) and `render_output_crossterm`'s own repaint of this row
+/// (the one that's actually visible during ordinary MUD interaction) — so the two can
+/// never drift apart on what "the status line" contains.
+///
+/// Security (plan Job 4): every key and value here is MUD-supplied text (`Char.*`
+/// GMCP or an MSDP variable), so each one is run through `stats::sanitize_and_cap`
+/// before it is ever placed in the returned string - stripping C0 (incl. ESC/newline/
+/// CR/tab), C1 (the terminal-corrupting APC hazard CLAUDE.md documents), and DEL, then
+/// capping the rendered width so a single oversized value can't push every other entry
+/// off the row. This is the one thing that must never regress here: a raw MUD string
+/// reaching the terminal unsanitized.
+pub(crate) fn build_stats_line_text(entries: &[crate::stats::StatEntry], max_width: usize) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut text = String::new();
+    let mut used_width: usize = 0;
+    let mut shown = 0usize;
+
+    for entry in entries {
+        let key = crate::stats::sanitize_and_cap(&entry.key, STATS_LINE_FIELD_WIDTH);
+        let value_text = match &entry.value {
+            crate::stats::StatValue::Gauge { current, maximum } => format!(
+                "{}/{}",
+                crate::stats::sanitize_and_cap(current, STATS_LINE_FIELD_WIDTH),
+                crate::stats::sanitize_and_cap(maximum, STATS_LINE_FIELD_WIDTH),
+            ),
+            crate::stats::StatValue::Plain(v) => crate::stats::sanitize_and_cap(v, STATS_LINE_FIELD_WIDTH),
+        };
+        let key_width = display_width(&key);
+        let value_width = display_width(&value_text);
+        let sep_width = if text.is_empty() { 0 } else { display_width(STATS_LINE_SEP) };
+        // +1 for the single space between key and value.
+        let entry_width = key_width + 1 + value_width;
+        if used_width + sep_width + entry_width > max_width {
+            break;
+        }
+        if !text.is_empty() {
+            text.push_str(STATS_LINE_SEP);
+        }
+        text.push_str(&key);
+        text.push(' ');
+        text.push_str(&value_text);
+        used_width += sep_width + entry_width;
+        shown += 1;
+    }
+
+    let remaining = entries.len() - shown;
+    if remaining > 0 {
+        let marker = format!(" +{remaining} more");
+        // Only append the marker if it fits - otherwise the line is still correct,
+        // just without it, rather than overrunning max_width.
+        if used_width + display_width(&marker) <= max_width {
+            text.push_str(&marker);
+        }
+    }
+
+    Some(text)
+}
+
+/// Renders the fixed-height MUD status line (plan Job 4, D3) via ratatui. This path is
+/// only ever the one actually visible on screen while a popup, the split editor, or
+/// the splash screen covers the whole display — in every other state
+/// `render_output_crossterm`'s own repaint of this same row wins (it runs
+/// unconditionally, right after this ratatui pass, whenever it isn't itself skipped
+/// for exactly those same three reasons — see its doc comment for why it must
+/// independently repaint here rather than trust this ratatui draw).
+///
+/// A no-op when `area.height` is 0 (this world's `stats_line_shown` latch hasn't fired
+/// yet) or entries are empty (the world just disconnected and the latch hasn't caught
+/// up to that on this exact frame — better to render a blank reserved row for one
+/// frame than stale text).
+pub(crate) fn render_stats_line(f: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let entries = app.current_world().current_stat_entries();
+    let Some(text) = build_stats_line_text(&entries, area.width as usize) else {
+        return;
+    };
+
+    let theme = app.settings.theme;
+    let paragraph = Paragraph::new(Line::from(Span::raw(text)))
+        .style(Style::default().bg(theme.bg()).fg(theme.fg()));
+    f.render_widget(paragraph, area);
+}
+
 pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let world = app.current_world();
@@ -2071,6 +2237,26 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
+/// Fixed glyph substituted for every non-newline input character while
+/// `World::echo_masked` is set (plan Phase 3, step 3.4 / finding 7 — a MUD sent `IAC
+/// WILL ECHO`, the standard password/login-prompt signal). ASCII, not a Unicode bullet:
+/// `unicode_width` guarantees it exactly one display column on every terminal encoding,
+/// which is what keeps the masked cursor-column arithmetic below (and its crossterm
+/// replica in `render_output_crossterm`) exact for a wide/multi-byte character being
+/// typed into a masked prompt.
+const INPUT_MASK_CHAR: char = '*';
+
+/// Display width of one input-area character for cursor-column arithmetic, honoring
+/// ECHO masking: a masked world renders every non-newline character as one single-column
+/// `INPUT_MASK_CHAR` glyph, never the real character's own width, so a wide/multi-byte
+/// character typed into a masked password prompt doesn't leave the cursor sitting in the
+/// wrong column. Both `render_input_area`'s ratatui cursor placement below and
+/// `render_output_crossterm`'s crossterm replica of the same arithmetic call this - see
+/// that function's own comment for why the second copy exists at all.
+fn input_cursor_char_width(c: char, masked: bool) -> usize {
+    if masked { 1 } else { display_width(&c.to_string()) }
+}
+
 pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
     // Get prompt for current world only (clone to avoid borrow conflict)
     let prompt = app.current_world().prompt.clone();
@@ -2087,6 +2273,7 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
     let viewport_line = cursor_line.saturating_sub(app.input.viewport_start_line);
 
     if viewport_line < app.input_height as usize {
+        let masked = app.current_world().echo_masked;
         let inner_width = area.width.max(1) as usize;
         let first_line_capacity = inner_width.saturating_sub(prompt_len);
         let text_before_cursor = &app.input.buffer[..app.input.cursor_position];
@@ -2100,7 +2287,7 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
                 is_first_line = false;
                 continue;
             }
-            let cw = display_width(&c.to_string());
+            let cw = input_cursor_char_width(c, masked);
             let capacity = if is_first_line { first_line_capacity } else { inner_width };
             col_width += cw;
             if capacity > 0 && col_width >= capacity {
@@ -2141,8 +2328,22 @@ pub(crate) fn chars_for_line(chars: &[char], width: usize) -> (usize, bool) {
 
 pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
     let tc = app.settings.theme;
-    let misspelled = app.find_misspelled_words();
-    let chars: Vec<char> = app.input.buffer.chars().collect();
+    // ECHO masking (plan Phase 3, step 3.4 / finding 7): substitute every non-newline
+    // input character for INPUT_MASK_CHAR before any wrapping/width math runs, so the
+    // rest of this function (chars_for_line, chars_for_display_width, the spans built
+    // below) all measure and draw the masked glyphs rather than the real characters -
+    // there is no separate "masked width" path to keep in sync here, unlike the two
+    // cursor-column computations in render_input_area/render_output_crossterm, which
+    // operate on the raw buffer directly and need input_cursor_char_width instead.
+    // Spell-checking a masked line would be pointless and would still leak word
+    // boundaries via the misspelling highlight below, so it's skipped entirely.
+    let masked = app.current_world().echo_masked;
+    let misspelled: Vec<(usize, usize)> = if masked { Vec::new() } else { app.find_misspelled_words() };
+    let chars: Vec<char> = if masked {
+        app.input.buffer.chars().map(|c| if c == '\n' { '\n' } else { INPUT_MASK_CHAR }).collect()
+    } else {
+        app.input.buffer.chars().collect()
+    };
 
     // Calculate visible prompt length (without ANSI codes)
     let prompt_visible_len = strip_ansi_codes(prompt).chars().count();

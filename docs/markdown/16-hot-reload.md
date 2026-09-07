@@ -77,6 +77,20 @@ This allows seamless workflow:
 - TLS connections are preserved across reload
 - See **TLS Proxy** chapter for details
 
+### Compressed (MCCP2) Connections
+
+- Compression state (the zlib stream) lives only in process memory, exactly like TLS session state
+- A compressed world is **disconnected** on reload rather than left decoding garbage
+- Clay reports `Compressed (MCCP2) connection was closed during reload. Use /worlds to reconnect.`, or `...during crash recovery...` when recovering from a crash
+- This applies even with the TLS Proxy enabled. The proxy preserves the transport, but not the compression stream running inside it
+
+### MCP (MOO) Sessions
+
+- MCP session state does not survive a reload, and the server never resends its opening handshake
+- MCP therefore goes quiet on that connection until you reconnect
+- Unlike the MCCP2 case above this is **silent**, with no message shown
+- Reconnect the world to restore MCP features such as server-driven editing
+
 ### State Compatibility
 
 The new binary must be compatible with the saved state format. Major version changes may break reload compatibility.
@@ -149,6 +163,8 @@ This file is:
 |--------|--------|---------|
 | TCP connections | Preserved | Lost |
 | TLS connections | Requires TLS Proxy | Lost |
+| Compressed (MCCP2) connections | Disconnected, with a message | Lost |
+| MCP (MOO) sessions | Silently inactive until reconnect | Lost |
 | Output history | Preserved | Lost |
 | Scroll position | Preserved | Reset |
 | Settings | Preserved | Reloaded from file |

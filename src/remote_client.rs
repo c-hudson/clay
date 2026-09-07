@@ -1850,6 +1850,9 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.password = settings.password.clone();
                     app.worlds[idx].settings.use_ssl = settings.use_ssl;
                     app.worlds[idx].settings.log_enabled = settings.log_enabled;
+                    app.worlds[idx].settings.initiate_negotiation = settings.initiate_negotiation;
+                    app.worlds[idx].settings.msp_enabled = settings.msp_enabled;
+                    app.worlds[idx].settings.mcp_enabled = settings.mcp_enabled;
                     app.worlds[idx].settings.encoding = Encoding::from_name(&settings.encoding);
                     app.worlds[idx].settings.auto_connect_type = AutoConnectType::from_name(&settings.auto_connect);
                     app.worlds[idx].settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive);
@@ -1875,6 +1878,9 @@ pub(crate) fn handle_remote_client_key(
                         keep_alive_cmd: settings.keep_alive_cmd,
                         gmcp_packages: settings.gmcp_packages,
                         auto_reconnect_secs: settings.auto_reconnect_secs,
+                        initiate_negotiation: settings.initiate_negotiation,
+                        msp_enabled: settings.msp_enabled,
+                        mcp_enabled: settings.mcp_enabled,
                     });
                 }
             }
@@ -1980,7 +1986,13 @@ pub(crate) fn handle_remote_client_key(
 
     // Enter key (always active, not bound via action system)
     if key.code == Enter {
-            let cmd = app.input.take_input();
+            // ECHO masking (plan Phase 3, step 3.4): this client's own InputArea.history
+            // is local, in-memory arrow-key recall - independent of (and in addition to)
+            // the server's own record_user_input gate - so it needs the same guard
+            // (World::echo_masked is mirrored here via InitialState/EchoMaskChanged; see
+            // InputArea::take_input's doc comment).
+            let record_history = !app.current_world().echo_masked;
+            let cmd = app.input.take_input(record_history);
             if cmd.is_empty() {
                 // Send empty command to server (some MUDs use this for "look")
                 let _ = ws_tx.send(WsMessage::SendCommand {

@@ -166,6 +166,65 @@ Useful in action commands:
 /notify Someone is paging you!
 ```
 
+## Telnet Protocol Commands
+
+See the **Telnet Features** chapter for background on MSSP/MSDP/GMCP.
+
+### /mssp
+Show the current world's MSSP (MUD Server Status Protocol) data — name/value pairs the
+server volunteers about itself (player count, uptime, genre, and so on).
+
+```
+/mssp
+```
+
+Says so if the server hasn't sent any (MSSP not negotiated on this connection, or
+negotiated but nothing received yet).
+
+### /msdp
+Send an outbound MSDP (MUD Server Data Protocol) command to the current world.
+
+```
+/msdp <LIST|REPORT|UNREPORT|SEND> [target]
+```
+
+The verb is case-insensitive. A target is optional and, when given, is joined back into a
+single value (e.g. `/msdp REPORT HEALTH MANA` sends `HEALTH MANA` as one target).
+
+**Examples:**
+```
+/msdp LIST REPORTABLE_VARIABLES
+/msdp REPORT HEALTH
+```
+
+Refuses with a message if MSDP was never negotiated on this connection.
+
+Clay already sends `LIST REPORTABLE_VARIABLES` and reports back everything the server names
+in its reply as soon as MSDP negotiates (see the **Telnet Features** chapter), so `/msdp
+REPORT` by hand is mainly for a variable the automatic pass missed, or a server that doesn't
+answer `LIST`.
+
+### /stats
+Show the current world's status display — every stat derived from GMCP `Char.*` packages and
+MSDP variables received so far. Recognized vitals (health, mana, movement, experience, level)
+come first, then everything else alphabetically. A value paired with its maximum by name
+shape (`hp`/`maxhp`, `HEALTH`/`HEALTH_MAX`, and similar) renders as one current/maximum gauge
+entry; anything else renders as a plain labelled value — unrecognized fields are always shown
+rather than dropped, since there is no fixed schema to match them against.
+
+```
+/stats
+```
+
+Says so if the world hasn't sent any of this data yet. `/stats` only displays what has
+already arrived — it doesn't request anything itself. The same data drives the console's
+one-line status display above the separator bar and the collapsible status panel on web/GUI/
+Android (see the **Interface Overview** and **Web Interface** chapters); both appear
+automatically the moment any data arrives and disappear again on disconnect, with nothing to
+configure. Whether anything ever appears depends entirely on the MUD: GMCP `Char.*` and MSDP
+are common on Diku-family servers, but MOOs and MUSHes generally implement neither, so
+`/stats` — and the status line/panel — correctly stay empty there.
+
 ## Command Completion
 
 When input starts with `/`, press `Tab` to cycle through matching commands:

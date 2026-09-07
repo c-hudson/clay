@@ -434,6 +434,11 @@
         statusTime: document.getElementById('status-time'),
         statusBar: document.getElementById('status-bar'),
         statusItem: document.querySelector('#status-bar .status-item'),
+        // Status/vitals panel (mud-status-display.md Job 3)
+        statsPanel: document.getElementById('stats-panel'),
+        statsPanelHeader: document.getElementById('stats-panel-header'),
+        statsPanelToggle: document.getElementById('stats-panel-toggle'),
+        statsPanelBody: document.getElementById('stats-panel-body'),
         // World-tabs ribbon
         tabsRibbon: document.getElementById('tabs-ribbon'),
         tabsRibbonTabs: document.getElementById('tabs-ribbon-tabs'),
@@ -573,6 +578,9 @@
         worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
         worldEditGmcpPackages: document.getElementById('world-edit-gmcp-packages'),
         worldEditAutoReconnect: document.getElementById('world-edit-auto-reconnect'),
+        worldEditInitiateNegotiationToggle: document.getElementById('world-edit-initiate-negotiation-toggle'),
+        worldEditMspEnabledToggle: document.getElementById('world-edit-msp-enabled-toggle'),
+        worldEditMcpEnabledToggle: document.getElementById('world-edit-mcp-enabled-toggle'),
         worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
         worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
@@ -755,6 +763,11 @@
             noteMode = { world_index: noteWorldIndex };
         }
     }
+    // MCP simpleedit session (plan Job 15): unlike noteMode above, this is never a
+    // separate window/tab and is never set at page load - it is entered in place
+    // whenever a McpEditOpen push arrives (see enterMcpEditMode), reusing the exact
+    // same #note-editor-view DOM/CSS. { world_index, reference, edit_type }.
+    var mcpEditState = null;
     let pendingReconnectCommand = null;  // Command to resend after reconnect
     let pendingReconnectWorldIndex = null;  // World index to switch to after reconnect
     let commandHistory = [];
@@ -1287,6 +1300,22 @@
     // Menu state
     let menuOpen = false;
 
+    // Status/vitals panel (mud-status-display.md Job 3): a client-only collapse
+    // toggle (plan D6-style override, but deliberately NOT synced from server
+    // settings - the plan is explicit that this stays purely client-side, unlike
+    // tabsMode/iconBarMode below). One row of DOM per stat key is kept across
+    // renders in statsPanelRows so ordinary vitals updates only touch text/width,
+    // never the DOM subtree - see updateStatsPanel()'s doc comment further down.
+    let statsPanelCollapsed = (function() {
+        try {
+            return localStorage.getItem('clay-stats-panel-collapsed') === '1';
+        } catch (e) {
+            return false;
+        }
+    })();
+    let statsPanelRows = new Map(); // stat key -> {row, fillEl, valueEl, isGauge}
+    let statsPanelSignature = null; // last-rendered "key:kind|..." shape, or null when hidden
+
     // World-tabs ribbon mode, synced from server settings ('none', 'top', 'bottom')
     let tabsMode = 'none';
     // Icon bar visibility mode, synced from server settings ('none', 'app_tablet', 'all')
@@ -1459,7 +1488,7 @@
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'import',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
-        'testmusic', 'dump', 'notify', 'addworld', 'note', 'tag', 'tags',
+        'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'notify', 'addworld', 'note', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font', 'window', 'url', 'say',
         'log', 'unworld',
         'cd', 'pwd', 'runtime', 'ismacro', 'isvar', 'features', 'restrict', 'sys',
@@ -3477,8 +3506,12 @@
                         world_index: currentWorldIndex,
                         command: pendingReconnectCommand
                     });
-                    // Add to history
-                    if (pendingReconnectCommand.length > 0) {
+                    // Add to history - unless the world this was headed for is echo-masked
+                    // (plan Phase 3, step 3.4): a password submitted right as the socket
+                    // dropped must not land in arrow-key recall once the reconnect
+                    // resends it, same guard sendCommand() applies on the normal path.
+                    const maskedOnReconnect = worlds[currentWorldIndex] && worlds[currentWorldIndex].echo_masked;
+                    if (pendingReconnectCommand.length > 0 && !maskedOnReconnect) {
                         commandHistory.push(pendingReconnectCommand);
                         if (commandHistory.length > 1000) {
                             commandHistory.shift();
@@ -4235,6 +4268,13 @@
                 document.title = 'Clay - Notes: ' + msg.world_name;
                 break;
 
+            case 'McpEditOpen':
+                // Server-initiated (plan Job 15): the MUD pushed text to edit
+                // (dns-org-mud-moo-simpleedit-content), unprompted - unlike
+                // NoteEditorState above there is no matching Request* message.
+                enterMcpEditMode(msg);
+                break;
+
             case 'UnseenCleared':
                 // Another client (console, web, or GUI) has viewed this world
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
@@ -4307,6 +4347,21 @@
                 if (msg.world_index !== undefined && worlds[msg.world_index] && worlds[msg.world_index].settings) {
                     worlds[msg.world_index].settings.has_notes = !!msg.has_notes;
                     updateStatusBar();
+                }
+                break;
+
+            case 'StatsUpdate':
+                // Coalesced GMCP/MSDP vitals (plan D4, ~150ms server-side). Always the
+                // world's full current set (never a delta - see the field's own doc
+                // comment in websocket.rs), so this replaces outright rather than
+                // merging; an empty array is how a disconnect clears the panel (D1).
+                // Calls the targeted renderer directly instead of updateStatusBar() -
+                // this can fire several times a second in combat and must stay cheap.
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    worlds[msg.world_index].stats = Array.isArray(msg.stats) ? msg.stats : [];
+                    if (msg.world_index === currentWorldIndex) {
+                        updateStatsPanel();
+                    }
                 }
                 break;
 
@@ -4419,6 +4474,19 @@
                     if (!msg.enabled && msg.world_index === currentWorldIndex) {
                         mcmpStopAll();
                     }
+                    updateStatusBar();
+                }
+                break;
+
+            case 'EchoMaskChanged':
+                // Plan Phase 3, step 3.4 (finding 7): server-authoritative, never
+                // client-initiated (unlike GmcpUserToggled, there is no toggle command
+                // to send back) - just mirror the flag. updateStatusBar() is the single
+                // choke point that applies world.echo_masked to #input's masking class,
+                // so no extra work is needed here beyond keeping the per-world state and
+                // asking for a repaint.
+                if (worlds[msg.world_index]) {
+                    worlds[msg.world_index].echo_masked = msg.masked;
                     updateStatusBar();
                 }
                 break;
@@ -5852,7 +5920,13 @@
             return;
         }
 
-        if (cmd.length > 0) {
+        // ECHO masking (plan Phase 3, step 3.4 / finding 7): a password typed at a
+        // masked prompt must never land in arrow-key recall, where a later Up-arrow
+        // would display it in the clear. The server independently gates its own
+        // history/log/scrollback/broadcast copy in App::record_user_input - this only
+        // covers this client's own in-memory commandHistory.
+        const maskedWorld = worlds[currentWorldIndex] && worlds[currentWorldIndex].echo_masked;
+        if (cmd.length > 0 && !maskedWorld) {
             commandHistory.push(cmd);
             if (commandHistory.length > 1000) {
                 commandHistory.shift();
@@ -6575,6 +6649,47 @@
     // of containers.
     function exitNoteMode() {
         noteMode = null;
+        if (elements.noteEditorView) elements.noteEditorView.style.display = 'none';
+        if (elements.statusBar) elements.statusBar.style.display = '';
+        if (elements.inputContainer) elements.inputContainer.style.display = '';
+        if (elements.navBar) elements.navBar.style.display = '';
+        if (elements.outputContainer) elements.outputContainer.style.display = '';
+        document.title = 'Clay MUD Client';
+        setupToolbars(deviceMode);
+        renderOutput();
+        updateStatusBar();
+        elements.input.focus();
+    }
+
+    // MCP simpleedit (plan Job 15, `dns-org-mud-moo-simpleedit`): switches the
+    // CURRENT page into the same note-editor view enterNoteMode() uses, but
+    // pre-populated from a server push (McpEditOpen) rather than a
+    // RequestNoteEditorState round trip, and ALWAYS in place - never a genuine
+    // separate window/tab the way openNoteEditor() prefers on desktop. Two
+    // independent reasons, not just Android parity: this fires from a message
+    // handler with no user click behind it, so window.open() risks a popup
+    // blocker; and it can arrive while the viewer is looking at a different world
+    // than world_index, so there is no "the user just clicked this world's icon"
+    // moment to hang a new-window decision on either.
+    function enterMcpEditMode(payload) {
+        mcpEditState = { world_index: payload.world_index, reference: payload.reference, edit_type: payload.edit_type };
+        if (elements.statusBar) elements.statusBar.style.display = 'none';
+        if (elements.inputContainer) elements.inputContainer.style.display = 'none';
+        if (elements.navBar) elements.navBar.style.display = 'none';
+        if (elements.outputContainer) elements.outputContainer.style.display = 'none';
+        if (elements.tabsRibbon) elements.tabsRibbon.style.display = 'none';
+        if (elements.iconBar) elements.iconBar.style.display = 'none';
+        if (elements.noteEditorView) elements.noteEditorView.style.display = 'flex';
+        if (elements.noteEditorTextarea) elements.noteEditorTextarea.value = payload.content || '';
+        if (elements.noteEditorTitle) elements.noteEditorTitle.textContent = 'Edit: ' + payload.name;
+        document.title = 'Clay - Edit: ' + payload.name;
+    }
+
+    // Reverses enterMcpEditMode(). Always the "switch back in place" restore
+    // (never a window/tab close) since enterMcpEditMode() never opens one - see
+    // its own comment for why.
+    function exitMcpEditMode() {
+        mcpEditState = null;
         if (elements.noteEditorView) elements.noteEditorView.style.display = 'none';
         if (elements.statusBar) elements.statusBar.style.display = '';
         if (elements.inputContainer) elements.inputContainer.style.display = '';
@@ -8588,6 +8703,222 @@
     }
 
     // Update status bar
+    // --- Status/vitals panel (mud-status-display.md Job 3) --------------------------------
+    //
+    // Renders World.stats for whichever world is currently focused - populated straight off
+    // the wire (InitialState.worlds[i].stats and StatsUpdate.stats are both already the
+    // server's full, ordered, paired view; see stats.rs's WorldStats::entries doc comment
+    // for the D2 pairing/ordering rules this client trusts verbatim rather than
+    // re-deriving). Visibility is derived from data alone (plan D1): an empty array hides
+    // the whole panel and there is no setting that overrides that. Never drop an
+    // unrecognized key (D2) - every entry the server sends renders as either a gauge or a
+    // plain row, whatever its name.
+    //
+    // SCROLL SAFETY: #stats-panel is a flex sibling of #output-container in index.html,
+    // never a child of #output, so showing/resizing/hiding it only ever changes
+    // #output-container's flex-computed clientHeight - exactly the class of change the
+    // Android keyboard-open fix (project_keyboard_scroll_jump_fix) already had to handle
+    // for the visualViewport resize case. The existing window/visualViewport resize
+    // handlers below prove the fix: capture `isAtBottom() || lastScrollAtBottom` (see that
+    // variable's own doc comment for why the OR is required) BEFORE the height changes,
+    // mutate, then call scrollToBottom() iff that was true. If the user was mid-history,
+    // scrollTop is left completely alone - a shrinking container only ever *increases* the
+    // max scrollTop, so the browser has no reason to clamp the existing value, and the same
+    // top line stays exactly where it was. withOutputScrollGuard() below is that idiom,
+    // factored out so every mutation that can change the panel's rendered height goes
+    // through it. Plain value/width updates that don't change any row's height (the common
+    // case - see below) skip the guard entirely, since there is nothing for it to protect
+    // against.
+    //
+    // CHEAP UPDATES: Char.Vitals can arrive several times a second (plan D4 coalesces it to
+    // ~150ms server-side, but that's still 6-7 renders/sec in combat). updateStatsPanel()
+    // never rebuilds the DOM subtree - statsPanelRows keeps one DOM row per stat key across
+    // calls, and statsEntrySignature() captures only what can change the panel's *height*
+    // (which keys exist, in what order, and Plain-vs-Gauge per key - NOT the current/max
+    // text, which only ever changes a text node or a bar's width, never a row's box size).
+    // A call whose signature matches the last render only patches existing rows in place and
+    // skips the scroll guard; only a real shape change (world switch, a field appearing or
+    // disappearing, first data arriving, or the collapse toggle) pays for it.
+
+    function statsEntrySignature(entries) {
+        return entries.map(function(e) {
+            return e.key + ':' + (e.value && e.value.Gauge ? 'G' : 'P');
+        }).join('|');
+    }
+
+    function withOutputScrollGuard(mutate) {
+        const wasBottom = isAtBottom() || lastScrollAtBottom;
+        mutate();
+        if (wasBottom) {
+            scrollToBottom();
+        }
+        // else: scrollTop is left exactly as it was - see the doc comment above.
+    }
+
+    // A small set of MUD abbreviations that read better upper-cased than title-cased.
+    const STAT_LABEL_ABBR = new Set(['hp', 'mp', 'mv', 'xp', 'lvl', 'lv']);
+
+    function formatStatLabel(key) {
+        const lower = key.toLowerCase();
+        if (STAT_LABEL_ABBR.has(lower)) return key.toUpperCase();
+        return key
+            .replace(/[._]+/g, ' ')
+            .split(' ')
+            .filter(function(w) { return w.length > 0; })
+            .map(function(w) { return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase(); })
+            .join(' ');
+    }
+
+    // Text for a StatValue. Falls back to an empty string for a shape this build doesn't
+    // know about (a future wire variant) rather than throwing - same "never hide it, but
+    // never crash on it either" spirit as D2's unrecognized-key handling.
+    function statValueText(value) {
+        if (!value) return '';
+        if (typeof value.Plain === 'string') return value.Plain;
+        if (value.Gauge) return (value.Gauge.current || '') + ' / ' + (value.Gauge.maximum || '');
+        return '';
+    }
+
+    function gaugeFillPercent(gauge) {
+        const cur = parseFloat(gauge.current);
+        const max = parseFloat(gauge.maximum);
+        if (!isFinite(cur) || !isFinite(max) || max <= 0) return 0;
+        return Math.max(0, Math.min(100, (cur / max) * 100));
+    }
+
+    // Update an existing row's text/bar-width in place. Never touches row structure, so
+    // this alone can never change the panel's height.
+    function applyStatRowValue(refs, entry) {
+        refs.valueEl.textContent = statValueText(entry.value);
+        if (refs.fillEl && entry.value && entry.value.Gauge) {
+            refs.fillEl.style.width = gaugeFillPercent(entry.value.Gauge) + '%';
+        }
+    }
+
+    // Build a fresh row's DOM for `entry` - only called for a key this render hasn't seen
+    // before, or whose Plain/Gauge kind just changed (see renderStatsPanelBody()).
+    function buildStatRow(entry) {
+        const isGauge = !!(entry.value && entry.value.Gauge);
+        const row = document.createElement('div');
+        row.className = 'stat-row ' + (isGauge ? 'stat-gauge' : 'stat-plain');
+        row.dataset.key = entry.key;
+
+        const label = document.createElement('span');
+        label.className = 'stat-label';
+        label.textContent = formatStatLabel(entry.key);
+        row.appendChild(label);
+
+        const refs = { row: row, fillEl: null, valueEl: null, isGauge: isGauge };
+
+        if (isGauge) {
+            const track = document.createElement('div');
+            track.className = 'stat-bar-track';
+            const fill = document.createElement('div');
+            fill.className = 'stat-bar-fill';
+            track.appendChild(fill);
+            row.appendChild(track);
+            refs.fillEl = fill;
+        }
+
+        const value = document.createElement('span');
+        value.className = 'stat-value';
+        row.appendChild(value);
+        refs.valueEl = value;
+
+        applyStatRowValue(refs, entry);
+        return refs;
+    }
+
+    // Diff `entries` against statsPanelRows and reconcile #stats-panel-body to match, in
+    // array order (already server-sorted per D2 - never re-sorted here). Reuses a row
+    // whenever the same key keeps the same Plain/Gauge kind (the overwhelmingly common
+    // case - an ordinary vitals tick just changes numbers), so a ordinary update touches
+    // only text content and a style.width, nothing that affects layout height.
+    function renderStatsPanelBody(entries) {
+        const body = elements.statsPanelBody;
+        const seen = new Set();
+        let prevNode = null;
+        entries.forEach(function(entry) {
+            const isGauge = !!(entry.value && entry.value.Gauge);
+            const existing = statsPanelRows.get(entry.key);
+            let refs;
+            if (existing && existing.isGauge === isGauge) {
+                refs = existing;
+                applyStatRowValue(refs, entry);
+            } else {
+                if (existing) existing.row.remove();
+                refs = buildStatRow(entry);
+                statsPanelRows.set(entry.key, refs);
+            }
+            if (prevNode === null) {
+                if (body.firstChild !== refs.row) body.insertBefore(refs.row, body.firstChild);
+            } else if (prevNode.nextSibling !== refs.row) {
+                body.insertBefore(refs.row, prevNode.nextSibling);
+            }
+            prevNode = refs.row;
+            seen.add(entry.key);
+        });
+        // Drop rows for keys no longer present (a field the MUD stopped sending, or a
+        // world switch away from a world that had them).
+        statsPanelRows.forEach(function(refs, key) {
+            if (!seen.has(key)) {
+                refs.row.remove();
+                statsPanelRows.delete(key);
+            }
+        });
+    }
+
+    // Render worlds[currentWorldIndex].stats. The single call site for every path that can
+    // change what should be visible - the StatsUpdate handler (targeted, current world
+    // only) and updateStatusBar() (world switch, connect/disconnect, InitialState, and
+    // everything else that already calls it) both route through here, so there is exactly
+    // one place that decides show/hide and exactly one scroll-guard idiom to keep correct.
+    function updateStatsPanel() {
+        if (!elements.statsPanel) return;
+        const world = worlds[currentWorldIndex];
+        const entries = (world && Array.isArray(world.stats)) ? world.stats : [];
+        const showNow = entries.length > 0;
+        const wasShown = elements.statsPanel.style.display !== 'none';
+        const sig = statsEntrySignature(entries);
+        const shapeChanged = sig !== statsPanelSignature;
+
+        if (!showNow) {
+            if (wasShown) {
+                withOutputScrollGuard(function() {
+                    elements.statsPanel.style.display = 'none';
+                    elements.statsPanelBody.innerHTML = '';
+                    statsPanelRows.clear();
+                });
+            }
+            statsPanelSignature = null;
+            return;
+        }
+
+        if (!wasShown || shapeChanged) {
+            withOutputScrollGuard(function() {
+                elements.statsPanel.style.display = '';
+                renderStatsPanelBody(entries);
+            });
+        } else {
+            // Same keys, same kinds as last render - just numbers/widths changing.
+            // No scroll guard: this cannot change the panel's height.
+            renderStatsPanelBody(entries);
+        }
+        statsPanelSignature = sig;
+    }
+
+    function setStatsPanelCollapsed(collapsed) {
+        statsPanelCollapsed = collapsed;
+        try { localStorage.setItem('clay-stats-panel-collapsed', collapsed ? '1' : '0'); } catch (e) {}
+        if (!elements.statsPanel) return;
+        withOutputScrollGuard(function() {
+            elements.statsPanel.classList.toggle('collapsed', collapsed);
+        });
+        if (elements.statsPanelHeader) {
+            elements.statsPanelHeader.title = collapsed ? 'Expand status panel' : 'Collapse status panel';
+        }
+    }
+
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
 
@@ -8597,6 +8928,14 @@
         // WorldSwitchResult, WorldRemoved, InitialState itself), so no other call
         // site needs to persist separately. Cheap no-op unless the name changed.
         persistLastActiveWorld();
+
+        // ECHO masking (plan Phase 3, step 3.4): keep #input's masked-typing state in
+        // sync with the current world's server-reported echo_masked flag. This function
+        // is the single choke point called after every real focus change (see the
+        // comment above), so no other call site (world switch, InitialState,
+        // EchoMaskChanged) needs to set this separately. Display-only - #input.value
+        // still holds the real typed text; see style.css's .echo-masked rule.
+        elements.input.classList.toggle('echo-masked', !!(world && world.echo_masked));
 
         // Connection dot and world name
         if (world && world.name && world.was_connected) {
@@ -8648,6 +8987,13 @@
 
         // Note icon: only shown when the current world actually has notes.
         elements.statusNoteBtn.style.display = (world && world.settings && world.settings.has_notes) ? '' : 'none';
+
+        // Status/vitals panel (mud-status-display.md Job 3): re-render for whichever
+        // world is now current. Also called directly (and more cheaply) from the
+        // StatsUpdate handler for the high-frequency in-combat case - this call here is
+        // what covers every other transition (world switch, connect/disconnect,
+        // InitialState, WorldRemoved, ...) without each of those needing its own call site.
+        updateStatsPanel();
 
         updateScrollbackProgress();
         renderTabsRibbon();
@@ -10220,6 +10566,28 @@
         } else {
             elements.worldEditLoggingToggle.classList.remove('active');
         }
+        // Job 11 (plan Phase 3, step 3.5): default on, so an older/absent field (or a
+        // server predating this) must resolve to true, not the usual `|| false`.
+        const initiateNegotiation = world.settings?.initiate_negotiation !== false;
+        if (initiateNegotiation) {
+            elements.worldEditInitiateNegotiationToggle.classList.add('active');
+        } else {
+            elements.worldEditInitiateNegotiationToggle.classList.remove('active');
+        }
+        // Job 14 (plan Phase 4): same default-on reasoning as initiate_negotiation above.
+        const mspEnabled = world.settings?.msp_enabled !== false;
+        if (mspEnabled) {
+            elements.worldEditMspEnabledToggle.classList.add('active');
+        } else {
+            elements.worldEditMspEnabledToggle.classList.remove('active');
+        }
+        // Job 15 (plan Phase 4): same default-on reasoning as msp_enabled above.
+        const mcpEnabled = world.settings?.mcp_enabled !== false;
+        if (mcpEnabled) {
+            elements.worldEditMcpEnabledToggle.classList.add('active');
+        } else {
+            elements.worldEditMcpEnabledToggle.classList.remove('active');
+        }
         elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
         if (elements.worldEditGmcpPackages) {
             elements.worldEditGmcpPackages.value = world.settings?.gmcp_packages || '';
@@ -10289,7 +10657,10 @@
             keep_alive_type: elements.worldEditKeepAliveSelect.value,
             keep_alive_cmd: elements.worldEditKeepAliveCmd.value,
             gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : '',
-            auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0'
+            auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0',
+            initiate_negotiation: elements.worldEditInitiateNegotiationToggle.classList.contains('active'),
+            msp_enabled: elements.worldEditMspEnabledToggle.classList.contains('active'),
+            mcp_enabled: elements.worldEditMcpEnabledToggle.classList.contains('active')
         });
 
         // Update local state
@@ -10312,6 +10683,9 @@
         if (elements.worldEditAutoReconnect) {
             world.settings.auto_reconnect_secs = elements.worldEditAutoReconnect.value.trim();
         }
+        world.settings.initiate_negotiation = elements.worldEditInitiateNegotiationToggle.classList.contains('active');
+        world.settings.msp_enabled = elements.worldEditMspEnabledToggle.classList.contains('active');
+        world.settings.mcp_enabled = elements.worldEditMcpEnabledToggle.classList.contains('active');
 
         closeWorldEditorPopup();
     }
@@ -12421,6 +12795,22 @@
             openNoteEditor();
         });
 
+        // Status/vitals panel collapse toggle (mud-status-display.md Job 3) - purely
+        // client-side, persisted via statsPanelCollapsed's own localStorage read at
+        // startup. Apply the restored state now, before the first updateStatsPanel()
+        // call, so a returning user doesn't see one guarded (scroll-affecting) frame of
+        // "expanded" before it collapses back.
+        if (elements.statsPanel && statsPanelCollapsed) {
+            elements.statsPanel.classList.add('collapsed');
+        }
+        if (elements.statsPanelHeader) {
+            elements.statsPanelHeader.title = statsPanelCollapsed ? 'Expand status panel' : 'Collapse status panel';
+            elements.statsPanelHeader.addEventListener('click', guard('statsPanelToggle', function(e) {
+                e.stopPropagation();
+                setStatsPanelCollapsed(!statsPanelCollapsed);
+            }));
+        }
+
         // Click on the world name to open the world-switch dropdown
         if (elements.statusItem) {
             elements.statusItem.addEventListener('click', function(e) {
@@ -12577,6 +12967,7 @@
                 !importDialogOpen &&
                 !importInsecureDialogOpen &&
                 !e.target.closest('#status-bar') &&
+                !e.target.closest('#stats-panel') &&
                 !e.target.closest('#nav-bar') &&
                 !e.target.closest('.menu-dropdown') &&
                 !e.target.closest('select')) {
@@ -13337,6 +13728,15 @@
         elements.worldEditLoggingToggle.onclick = function() {
             this.classList.toggle('active');
         };
+        elements.worldEditInitiateNegotiationToggle.onclick = function() {
+            this.classList.toggle('active');
+        };
+        elements.worldEditMspEnabledToggle.onclick = function() {
+            this.classList.toggle('active');
+        };
+        elements.worldEditMcpEnabledToggle.onclick = function() {
+            this.classList.toggle('active');
+        };
         elements.worldEditKeepAliveSelect.onchange = function() {
             updateKeepAliveCmdVisibility(this.value);
         };
@@ -13483,6 +13883,25 @@
         // (below) is the deliberate way to back out, whether or not you saved.
         if (elements.noteEditorSaveBtn) {
             elements.noteEditorSaveBtn.onclick = function() {
+                // MCP simpleedit (plan Job 15) takes priority: it's never the
+                // NOTE_MODE window, so noteMode is never set at the same time.
+                if (mcpEditState) {
+                    send({
+                        type: 'McpEditSet',
+                        world_index: mcpEditState.world_index,
+                        reference: mcpEditState.reference,
+                        edit_type: mcpEditState.edit_type,
+                        content: elements.noteEditorTextarea.value
+                    });
+                    if (elements.noteEditorStatus) {
+                        elements.noteEditorStatus.textContent = 'Sent';
+                        elements.noteEditorStatus.classList.add('visible');
+                        setTimeout(function() {
+                            elements.noteEditorStatus.classList.remove('visible');
+                        }, 1500);
+                    }
+                    return;
+                }
                 if (!noteMode) return;
                 send({
                     type: 'UpdateNote',
@@ -13506,7 +13925,12 @@
         // IPC-vs-window.close() split as /quit).
         if (elements.noteEditorCancelBtn) {
             elements.noteEditorCancelBtn.onclick = function() {
-                if (window.Android) {
+                // MCP simpleedit is always the in-place overlay, regardless of
+                // platform - see enterMcpEditMode()'s own comment for why it never
+                // opens a real window/tab to begin with.
+                if (mcpEditState) {
+                    exitMcpEditMode();
+                } else if (window.Android) {
                     exitNoteMode();
                 } else if (window.WEBVIEW_MODE) {
                     sendIpc('close-window');

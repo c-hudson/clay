@@ -114,6 +114,26 @@ Access via hamburger menu or `/actions`:
 - Same interface as console
 - Create, edit, delete actions
 
+### Status Panel
+
+A collapsible panel below the output area shows the current world's GMCP `Char.*`/MSDP
+data — the same data as the console's status line and `/stats` (see the **Interface
+Overview** and **Commands** chapters), shared by the web interface, the native WebView GUI,
+and the Android app since all three run the same interface code.
+
+- **Appears only when there's data**, and disappears again on disconnect — there is no
+  setting to show or hide it, only to collapse it. A world that never sends GMCP `Char.*` or
+  MSDP data (most MOO and MUSH servers, for instance) simply never shows a panel.
+- **Click the header to collapse or expand it.** The collapsed state is remembered per
+  browser (`localStorage`), not synced between clients — collapsing it on your phone doesn't
+  collapse it in a browser tab open to the same instance.
+- A value paired with a maximum by name (e.g. `hp`/`maxhp`) renders as a gauge with a fill
+  bar; everything else renders as a plain labelled row, unrecognized fields included. Field
+  labels are cosmetically cleaned up for display (`race.name` shows as "Race Name"; common
+  abbreviations like `hp`/`mp` stay upper-case) — the console's status line shows the raw
+  field name instead.
+- Switches with the current world along with the rest of the interface.
+
 ## Keyboard Shortcuts
 
 | Keys | Action |
@@ -213,6 +233,7 @@ The web interface stays synchronized with console and GUI:
 | World switched | All clients notified |
 | Unseen cleared | Broadcast to all clients |
 | Activity count | Broadcast when changed |
+| Status data updates | Broadcast to all clients, coalesced to roughly one update per 150ms so a busy combat round doesn't flood the connection |
 
 Each client can independently:
 - View different worlds

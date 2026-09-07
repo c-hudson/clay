@@ -74,10 +74,12 @@ pub(crate) fn message_world_index(msg: &WsMessage) -> Option<usize> {
         | WsMessage::WorldFlushed { world_index, .. }
         | WsMessage::ServerSpeak { world_index, .. }
         | WsMessage::AnsiMusic { world_index, .. }
+        | WsMessage::StatsUpdate { world_index, .. }
         | WsMessage::GmcpData { world_index, .. }
         | WsMessage::MsdpData { world_index, .. }
         | WsMessage::McmpMedia { world_index, .. }
         | WsMessage::GmcpUserToggled { world_index, .. }
+        | WsMessage::EchoMaskChanged { world_index, .. }
         | WsMessage::CertMismatch { world_index, .. }
         | WsMessage::WorldSettingsUpdated { world_index, .. }
         | WsMessage::PendingCountUpdate { world_index, .. }
@@ -455,6 +457,20 @@ pub enum WsMessage {
     /// ANSI Music sequence to play (server -> client)
     AnsiMusic { world_index: usize, notes: Vec<MusicNote> },
 
+    /// Per-world status display update (server -> client), mud-status-display.md Job 2.
+    /// Coalesced by `App::flush_dirty_stats` to roughly one broadcast per ~150ms per world
+    /// (plan D4) rather than one per underlying GMCP/MSDP update - `stats` is always the
+    /// full, freshly recomputed `WorldStats::entries()` for `world_index`, not a delta, so a
+    /// client just replaces whatever it was showing for that world. An empty `Vec` is a
+    /// real, meaningful value (the world has no status data, or its connection just closed -
+    /// see `World::clear_connection_state`), not "nothing changed" - visibility is derived
+    /// from data being present at all (plan D1), so this is how a client is told to stop
+    /// showing a display it had. `#[serde(default)]` on `stats` isn't needed here (the field
+    /// isn't optional on this brand-new variant), but see `WorldStateMsg::stats` for the
+    /// same data's `#[serde(default)]` initial-state counterpart, which does need it for an
+    /// older server.
+    StatsUpdate { world_index: usize, stats: Vec<crate::stats::StatEntry> },
+
     /// GMCP data received from MUD server (server -> client)
     GmcpData { world_index: usize, package: String, data: String },
     /// MSDP variable update from MUD server (server -> client)
@@ -463,6 +479,13 @@ pub enum WsMessage {
     McmpMedia { world_index: usize, action: String, data: String, default_url: String },
     /// GMCP user toggle state changed (server -> client broadcast)
     GmcpUserToggled { world_index: usize, enabled: bool },
+    /// ECHO masking state changed (server -> client broadcast; plan Phase 3, step 3.4 /
+    /// finding 7): the MUD sent `IAC WILL ECHO` (`masked: true`) or `IAC WONT ECHO`
+    /// (`masked: false`). Server-authoritative and never client-initiated, unlike
+    /// `GmcpUserToggled` — there is no `ToggleWorldEcho` counterpart. See
+    /// `App::handle_echo_mask_changed` and `WorldStateMsg::echo_masked` (the initial
+    /// value a freshly connecting/resyncing client gets).
+    EchoMaskChanged { world_index: usize, masked: bool },
 
     // Commands (client -> server)
     /// Toggle GMCP user-enabled for a world (client -> server)
@@ -553,6 +576,24 @@ pub enum WsMessage {
         gmcp_packages: String,
         #[serde(default)]
         auto_reconnect_secs: String,
+        /// Job 11 (plan Phase 3, step 3.5): per-world escape hatch for Clay's opening
+        /// telnet negotiation offer. `serde(default)` (to `false`) would silently turn
+        /// negotiation off for an older client that omits this field, so instead this
+        /// defaults to the feature's own default-on posture via a dedicated function -
+        /// see `default_initiate_negotiation`.
+        #[serde(default = "default_initiate_negotiation")]
+        initiate_negotiation: bool,
+        /// Job 14 (plan Phase 4): per-world MSP (`!!SOUND(...)`/`!!MUSIC(...)`)
+        /// enable toggle. Same `serde(default)` reasoning as
+        /// `initiate_negotiation` above - an older client omitting this field
+        /// must resolve to the feature's own default-on posture, not `false`.
+        #[serde(default = "default_msp_enabled")]
+        msp_enabled: bool,
+        /// Job 15 (plan Phase 4): per-world MCP (`#$#`-prefixed in-band protocol,
+        /// `dns-org-mud-moo-simpleedit`) enable toggle. Same `serde(default)`
+        /// reasoning as `msp_enabled` above.
+        #[serde(default = "default_mcp_enabled")]
+        mcp_enabled: bool,
     },
     UpdateGlobalSettings {
         more_mode_enabled: bool,
@@ -872,6 +913,23 @@ pub enum WsMessage {
     // world editor's locally-cached plaintext password.
     NotesChanged { world_index: usize, has_notes: bool },
 
+    // MCP simpleedit (plan Job 15, `dns-org-mud-moo-simpleedit`): unlike the note
+    // editor above, this is server-initiated — the MUD decides when an edit session
+    // opens, so there is no matching Request* message. Reuses the note editor's own
+    // DOM/CSS (the same #note-editor-view) but as an in-place overlay in the current
+    // window rather than a separate window/tab (see app.js's enterMcpEditMode):
+    // auto-opening a real new tab/window from a message handler with no user gesture
+    // risks a popup blocker, and Android's WebView can't multi-window at all anyway
+    // (see enterNoteMode's own doc comment for that constraint).
+    // (server -> client)
+    McpEditOpen { world_index: usize, reference: String, name: String, edit_type: String, content: String },
+    // (client -> server) — reference and edit_type must be echoed back exactly as
+    // received in McpEditOpen (kept stateless server-side rather than tracked per
+    // open session); content is the user's edited text, untrusted and never
+    // interpreted, only framed back into an MCP `-set` message (see
+    // mcp::McpState::build_simpleedit_set).
+    McpEditSet { world_index: usize, reference: String, edit_type: String, content: String },
+
     // Keepalive
     Ping,
     Pong,
@@ -1155,6 +1213,13 @@ pub struct WorldStateMsg {
     // Whether GMCP user processing is enabled (F9 toggle)
     #[serde(default)]
     pub gmcp_user_enabled: bool,
+    /// ECHO masking state (plan Phase 3, step 3.4 / finding 7): the MUD sent `IAC WILL
+    /// ECHO` and this world's input should render masked. Initial value for a
+    /// connecting/resyncing client; live changes arrive via `WsMessage::EchoMaskChanged`.
+    /// `#[serde(default)]` so an older cached/serialized `WorldStateMsg` (or a peer that
+    /// predates this field) deserializes to `false`, never a hard error.
+    #[serde(default)]
+    pub echo_masked: bool,
     // Total number of output lines on the server (for lazy backfill)
     #[serde(default)]
     pub total_output_lines: usize,
@@ -1196,6 +1261,17 @@ pub struct WorldStateMsg {
     /// exactly that against a server predating this field.
     #[serde(default)]
     pub seq_epoch: u64,
+    /// Status display data for this world at connect/resync time (mud-status-display.md
+    /// Job 2), so a client shows stats immediately instead of waiting for the next
+    /// `WsMessage::StatsUpdate` - which, coalesced to ~150ms (plan D4), could otherwise
+    /// leave a freshly (re)connected client showing nothing for a world that already has
+    /// data. Always the world's full current `WorldStats::entries()` (or empty, per plan
+    /// D1 - a world with no status data at all). `#[serde(default)]` so a peer predating
+    /// this field (or a message built before it, e.g. `create_world`'s brand-new-world
+    /// literal) deserializes to an empty `Vec` rather than failing to parse - "no stats",
+    /// same as every other field this pattern covers.
+    #[serde(default)]
+    pub stats: Vec<crate::stats::StatEntry>,
 }
 
 /// World settings for WebSocket protocol
@@ -1225,6 +1301,24 @@ pub struct WorldSettingsMsg {
     /// NoteEditorState, fetched on demand when the note editor opens).
     #[serde(default)]
     pub has_notes: bool,
+    /// Job 11 (plan Phase 3, step 3.5, finding 5): mirrors
+    /// `WorldSettings::initiate_negotiation` so the web/GUI world editor shows the real
+    /// per-world value instead of always defaulting on. See `default_initiate_negotiation`
+    /// for why an older peer's omitted field resolves to `true`, not `serde(default)`'s `false`.
+    #[serde(default = "default_initiate_negotiation")]
+    pub initiate_negotiation: bool,
+    /// Job 14 (plan Phase 4, finding-parallel to `initiate_negotiation`
+    /// above): mirrors `WorldSettings::msp_enabled` so the web/GUI world
+    /// editor shows the real per-world value instead of always defaulting
+    /// on. See `default_msp_enabled` for why an older peer's omitted field
+    /// resolves to `true`, not `serde(default)`'s `false`.
+    #[serde(default = "default_msp_enabled")]
+    pub msp_enabled: bool,
+    /// Job 15 (plan Phase 4, finding-parallel to `msp_enabled` above): mirrors
+    /// `WorldSettings::mcp_enabled` so the web/GUI world editor shows the real
+    /// per-world value instead of always defaulting on.
+    #[serde(default = "default_mcp_enabled")]
+    pub mcp_enabled: bool,
 }
 
 /// Global settings for WebSocket protocol
@@ -1348,6 +1442,30 @@ fn default_web_path() -> String {
 
 fn default_remote_initial_lines() -> u16 {
     100
+}
+
+/// Job 11 (plan Phase 3, step 3.5): default for `UpdateWorldSettings::initiate_negotiation`
+/// and `WorldSettingsMsg::initiate_negotiation` when an older peer's message omits the
+/// field — matches `WorldSettings::initiate_negotiation`'s own default-on posture
+/// (`TelnetConfig::default()`), rather than `serde(default)`'s implicit `false`.
+fn default_initiate_negotiation() -> bool {
+    true
+}
+
+/// Job 14 (plan Phase 4): default for `UpdateWorldSettings::msp_enabled` and
+/// `WorldSettingsMsg::msp_enabled` when an older peer's message omits the
+/// field — matches `WorldSettings::msp_enabled`'s own default-on posture
+/// (`TelnetConfig::default()`), same reasoning as `default_initiate_negotiation`.
+fn default_msp_enabled() -> bool {
+    true
+}
+
+/// Job 15 (plan Phase 4): default for `UpdateWorldSettings::mcp_enabled` and
+/// `WorldSettingsMsg::mcp_enabled` when an older peer's message omits the field —
+/// matches `WorldSettings::mcp_enabled`'s own default-on posture, same reasoning as
+/// `default_msp_enabled`.
+fn default_mcp_enabled() -> bool {
+    true
 }
 
 fn default_web_font_size_phone() -> f32 {

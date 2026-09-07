@@ -505,7 +505,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if !world.settings.keep_alive_cmd.is_empty() {
             writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
         }
-        if world.settings.gmcp_packages != "Client.Media 1" {
+        if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
         }
         let ar = world.settings.auto_reconnect_display();
@@ -514,6 +514,19 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         }
         if world.settings.log_enabled {
             writeln!(file, "log_enabled=true")?;
+        }
+        // Job 11 (plan Phase 3, step 3.5): default is `true`, so only record the
+        // non-default value - same convention as gmcp_packages/auto_reconnect_secs above.
+        if !world.settings.initiate_negotiation {
+            writeln!(file, "initiate_negotiation=false")?;
+        }
+        // Job 14 (plan Phase 4): same convention - default is `true`.
+        if !world.settings.msp_enabled {
+            writeln!(file, "msp_enabled=false")?;
+        }
+        // Job 15 (plan Phase 4): same convention - default is `true`.
+        if !world.settings.mcp_enabled {
+            writeln!(file, "mcp_enabled=false")?;
         }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
@@ -738,6 +751,30 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
 /// One asymmetry worth knowing: a key `content` omits entirely (e.g. `write_settings_dat`
 /// skips `websocket_password=` when it's empty) leaves `app`'s existing value alone rather
 /// than clearing it — an absent remote value can't "win" a conflict it never entered.
+/// mud-status-display.md Job 6: migrate a `gmcp_packages` value loaded from disk when it
+/// is *exactly* the pre-Job-6 default (`crate::LEGACY_DEFAULT_GMCP_PACKAGES`) to the
+/// current default (`crate::DEFAULT_GMCP_PACKAGES`, which additionally requests the
+/// `Char` package family) — so an *existing* world starts asking for character data too,
+/// not just a freshly created one (`WorldSettings::default()` already picks up the new
+/// default on its own).
+///
+/// Any other stored value — including a user who customised the field to something else
+/// entirely, or one who happened to type the identical legacy string back in by hand — is
+/// left completely untouched. Those two cases are indistinguishable from the stored string
+/// alone; this migration deliberately accepts that rather than risk silently overwriting a
+/// real edit. Called from every load path that assigns `gmcp_packages` (the main
+/// settings.dat loader, `--multiuser`'s settings, and hot-reload state restore — the last
+/// of these matters too: without it, a `/reload` triggered mid-upgrade from a pre-Job-6
+/// build would restore the old process's still-unmigrated in-memory value over the freshly
+/// migrated one the new process just loaded from settings.dat).
+fn migrate_gmcp_packages(value: &str) -> String {
+    if value == crate::LEGACY_DEFAULT_GMCP_PACKAGES {
+        crate::DEFAULT_GMCP_PACKAGES.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 pub fn load_settings_from_str(app: &mut App, content: &str) {
     let mut current_world: Option<String> = None;
     let mut current_action: Option<usize> = None;
@@ -1169,6 +1206,12 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "use_ssl" => world.settings.use_ssl = value == "true",
                         "log_enabled" => world.settings.log_enabled = value == "true",
                         "log_file" => world.settings.log_enabled = true, // Backward compat: old log_file setting enables logging
+                        // Job 11 (plan Phase 3, step 3.5): absent key = default `true`
+                        // (WorldSettings::default()), matching the writer only recording
+                        // the non-default `false`.
+                        "initiate_negotiation" => world.settings.initiate_negotiation = value == "true",
+                        "msp_enabled" => world.settings.msp_enabled = value == "true",
+                        "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -1186,7 +1229,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                             world.settings.keep_alive_cmd = value.to_string();
                         }
                         "gmcp_packages" => {
-                            world.settings.gmcp_packages = value.to_string();
+                            world.settings.gmcp_packages = migrate_gmcp_packages(value);
                         }
                         "auto_reconnect_secs" => {
                             let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
@@ -1538,6 +1581,10 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "password" => world.settings.password = decrypt_password(value),
                         "use_ssl" => world.settings.use_ssl = value == "true",
                         "log_enabled" => world.settings.log_enabled = value == "true",
+                        // Job 11 (plan Phase 3, step 3.5): absent key = default `true`.
+                        "initiate_negotiation" => world.settings.initiate_negotiation = value == "true",
+                        "msp_enabled" => world.settings.msp_enabled = value == "true",
+                        "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -1555,7 +1602,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                             world.settings.keep_alive_cmd = value.to_string();
                         }
                         "gmcp_packages" => {
-                            world.settings.gmcp_packages = value.to_string();
+                            world.settings.gmcp_packages = migrate_gmcp_packages(value);
                         }
                         "auto_reconnect_secs" => {
                             let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
@@ -1688,13 +1735,19 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             }
             writeln!(file, "use_ssl={}", world.settings.use_ssl)?;
             writeln!(file, "log_enabled={}", world.settings.log_enabled)?;
+            // Job 11 (plan Phase 3, step 3.5).
+            writeln!(file, "initiate_negotiation={}", world.settings.initiate_negotiation)?;
+            // Job 14 (plan Phase 4).
+            writeln!(file, "msp_enabled={}", world.settings.msp_enabled)?;
+            // Job 15 (plan Phase 4).
+            writeln!(file, "mcp_enabled={}", world.settings.mcp_enabled)?;
             writeln!(file, "encoding={}", world.settings.encoding.name())?;
             writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
             writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
             if !world.settings.keep_alive_cmd.is_empty() {
                 writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
             }
-            if world.settings.gmcp_packages != "Client.Media 1" {
+            if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
                 writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
             }
             let ar = world.settings.auto_reconnect_display();
@@ -1925,6 +1978,11 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         writeln!(file, "lines_since_pause={}", world.lines_since_pause)?;
         writeln!(file, "visual_line_offset={}", world.visual_line_offset)?;
         writeln!(file, "is_tls={}", world.is_tls)?;
+        // Job 10a (plan Phase 3, step 3.3): a compressed MCCP2 stream's decompressor
+        // lives only in the old process's reader task and cannot survive the reload
+        // exec, same as a TLS connection - see the `mccp2_active` restore-time
+        // disconnect this flag drives, mirroring the `is_tls` one right above it.
+        writeln!(file, "mccp2_active={}", world.mccp2_active)?;
         writeln!(file, "was_connected={}", world.was_connected)?;
         writeln!(file, "showing_splash={}", world.showing_splash)?;
         writeln!(file, "telnet_mode={}", world.telnet_mode)?;
@@ -1976,7 +2034,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         if !world.settings.keep_alive_cmd.is_empty() {
             writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd.replace('=', "\\e"))?;
         }
-        if world.settings.gmcp_packages != "Client.Media 1" {
+        if world.settings.gmcp_packages != crate::DEFAULT_GMCP_PACKAGES {
             writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages.replace('=', "\\e"))?;
         }
         let ar = world.settings.auto_reconnect_display();
@@ -1998,6 +2056,21 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         }
         if world.settings.log_enabled {
             writeln!(file, "log_enabled=true")?;
+        }
+        // Job 11 (plan Phase 3, step 3.5): a world's connection settings, including this
+        // one, must survive a hot reload the same way every other WorldSettings field
+        // does (CLAUDE.md's "new world/settings fields" rule) - only the non-default
+        // `false` is recorded, same convention as log_enabled above.
+        if !world.settings.initiate_negotiation {
+            writeln!(file, "initiate_negotiation=false")?;
+        }
+        // Job 14 (plan Phase 4): same convention as initiate_negotiation above.
+        if !world.settings.msp_enabled {
+            writeln!(file, "msp_enabled=false")?;
+        }
+        // Job 15 (plan Phase 4): same convention as initiate_negotiation above.
+        if !world.settings.mcp_enabled {
+            writeln!(file, "mcp_enabled=false")?;
         }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
@@ -2213,6 +2286,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         lines_since_pause: usize,
         visual_line_offset: usize,
         is_tls: bool,
+        mccp2_active: bool,
         was_connected: bool,
         showing_splash: bool,
         telnet_mode: bool,
@@ -2346,6 +2420,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         lines_since_pause: 0,
                         visual_line_offset: 0,
                         is_tls: false,
+                        mccp2_active: false,
                         was_connected: false,
                         showing_splash: false,
                         telnet_mode: false,
@@ -2734,6 +2809,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "lines_since_pause" => tw.lines_since_pause = value.parse().unwrap_or(0),
                             "visual_line_offset" => tw.visual_line_offset = value.parse().unwrap_or(0),
                             "is_tls" => tw.is_tls = value == "true",
+                            "mccp2_active" => tw.mccp2_active = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
                             "showing_splash" => tw.showing_splash = value == "true",
                             "telnet_mode" => tw.telnet_mode = value == "true",
@@ -2762,6 +2838,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "use_ssl" => tw.settings.use_ssl = value == "true",
                             "log_enabled" => tw.settings.log_enabled = value == "true",
                             "log_file" => tw.settings.log_enabled = true, // Backward compat
+                            // Job 11 (plan Phase 3, step 3.5): absent key = default `true`.
+                            "initiate_negotiation" => tw.settings.initiate_negotiation = value == "true",
+                            "msp_enabled" => tw.settings.msp_enabled = value == "true",
+                            "mcp_enabled" => tw.settings.mcp_enabled = value == "true",
                             "encoding" => {
                                 tw.settings.encoding = match value {
                                     "latin1" => Encoding::Latin1,
@@ -2779,7 +2859,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                                 tw.settings.keep_alive_cmd = value.replace("\\e", "=");
                             }
                             "gmcp_packages" => {
-                                tw.settings.gmcp_packages = unescape_string(value);
+                                tw.settings.gmcp_packages = migrate_gmcp_packages(&unescape_string(value));
                             }
                             "auto_reconnect_secs" => {
                                 let (secs, on_web) = crate::WorldSettings::parse_auto_reconnect(value);
@@ -2875,6 +2955,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.lines_since_pause = tw.lines_since_pause;
         world.visual_line_offset = tw.visual_line_offset;
         world.is_tls = tw.is_tls;
+        world.mccp2_active = tw.mccp2_active;
         world.was_connected = tw.was_connected;
         world.showing_splash = tw.showing_splash;
         world.telnet_mode = tw.telnet_mode;
@@ -3124,9 +3205,12 @@ mod tests {
             discord_channel: "disc_chan".to_string(),
             discord_dm_user: "disc_dm".to_string(),
             notes: "test notes\nline two".to_string(),
-            gmcp_packages: "Custom.Package 1".to_string(), // default: "Client.Media 1"
+            gmcp_packages: "Custom.Package 1".to_string(), // default: "Client.Media 1, Char 1"
             auto_reconnect_secs: 30,                       // default: 0
             auto_reconnect_on_web: true,                   // default: false
+            initiate_negotiation: false,                   // default: true
+            msp_enabled: false,                            // default: true
+            mcp_enabled: false,                            // default: true
         }
     }
 
@@ -3221,6 +3305,9 @@ mod tests {
         assert_eq!(a.gmcp_packages, b.gmcp_packages, "{context}: gmcp_packages");
         assert_eq!(a.auto_reconnect_secs, b.auto_reconnect_secs, "{context}: auto_reconnect_secs");
         assert_eq!(a.auto_reconnect_on_web, b.auto_reconnect_on_web, "{context}: auto_reconnect_on_web");
+        assert_eq!(a.initiate_negotiation, b.initiate_negotiation, "{context}: initiate_negotiation");
+        assert_eq!(a.msp_enabled, b.msp_enabled, "{context}: msp_enabled");
+        assert_eq!(a.mcp_enabled, b.mcp_enabled, "{context}: mcp_enabled");
     }
 
     /// The hot-reload hand-edit check: settings.dat is only re-applied over the restored
@@ -3342,6 +3429,105 @@ mod tests {
             reloaded.settings.url_shorteners, app.settings.url_shorteners,
             "url_shorteners must survive a hot reload"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // gmcp_packages default migration (mud-status-display.md Job 6). See
+    // migrate_gmcp_packages's own doc comment for the exact rule: a stored value is
+    // upgraded only when it is byte-identical to the pre-Job-6 default: any other
+    // value, including one a user retyped by hand, is left completely alone.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn migrate_gmcp_packages_upgrades_the_untouched_legacy_default() {
+        assert_eq!(
+            migrate_gmcp_packages(crate::LEGACY_DEFAULT_GMCP_PACKAGES),
+            crate::DEFAULT_GMCP_PACKAGES,
+        );
+    }
+
+    #[test]
+    fn migrate_gmcp_packages_never_touches_a_customised_value() {
+        // The load-bearing case this migration must get right: anything other than
+        // the exact legacy default string survives completely unchanged, even a
+        // value that differs from it only by case, whitespace, or an appended
+        // package - none of those are "the same string" the migration is allowed to
+        // recognize.
+        for customized in [
+            "Client.Media 1, Room.Info 1",
+            "Char.Vitals 1",
+            "",
+            "client.media 1",
+            "Client.Media 1 ",
+            crate::DEFAULT_GMCP_PACKAGES,
+        ] {
+            assert_eq!(
+                migrate_gmcp_packages(customized), customized,
+                "a value that is not byte-identical to the legacy default must be left alone: {customized:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_settings_from_str_migrates_an_untouched_legacy_gmcp_default() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "[world:Legacy]\nhostname=mud.example.com\nport=4000\ngmcp_packages=Client.Media 1\n";
+        load_settings_from_str(&mut app, content);
+        let w = app.worlds.iter().find(|w| w.name == "Legacy").expect("world loaded");
+        assert_eq!(
+            w.settings.gmcp_packages, crate::DEFAULT_GMCP_PACKAGES,
+            "an untouched legacy default must be upgraded on load, so an existing world starts asking for Char data too"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_from_str_leaves_a_customised_gmcp_value_alone() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "[world:Customized]\nhostname=mud.example.com\nport=4000\ngmcp_packages=Client.Media 1, Room.Info 1\n";
+        load_settings_from_str(&mut app, content);
+        let w = app.worlds.iter().find(|w| w.name == "Customized").expect("world loaded");
+        assert_eq!(
+            w.settings.gmcp_packages, "Client.Media 1, Room.Info 1",
+            "a customised gmcp_packages value must never be overwritten by the migration"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_from_str_missing_key_gets_current_default() {
+        // A world with no stored gmcp_packages line at all (never saved under any
+        // version that wrote it) must get the *current* default via
+        // WorldSettings::default(), not silently end up on the legacy one.
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "[world:Fresh]\nhostname=mud.example.com\nport=4000\n";
+        load_settings_from_str(&mut app, content);
+        let w = app.worlds.iter().find(|w| w.name == "Fresh").expect("world loaded");
+        assert_eq!(w.settings.gmcp_packages, crate::DEFAULT_GMCP_PACKAGES);
+    }
+
+    #[test]
+    fn test_load_reload_state_migrates_an_untouched_legacy_gmcp_default() {
+        // The hot-reload restore path (a separate load site from settings.dat) must
+        // apply the same migration - otherwise a `/reload` triggered mid-upgrade from
+        // a pre-Job-6 build would restore the old process's still-unmigrated
+        // in-memory value straight over whatever settings.dat's own loader already
+        // migrated moments earlier in the new process.
+        let mut app = App::new();
+        let content = "[world_state:0]\nname=Legacy\ngmcp_packages=Client.Media 1\n";
+        load_reload_state_from_str(&mut app, content).expect("load_reload_state_from_str");
+        let w = app.worlds.iter().find(|w| w.name == "Legacy").expect("world restored");
+        assert_eq!(w.settings.gmcp_packages, crate::DEFAULT_GMCP_PACKAGES);
+    }
+
+    #[test]
+    fn test_load_reload_state_leaves_a_customised_gmcp_value_alone() {
+        let mut app = App::new();
+        let content = "[world_state:0]\nname=Customized\ngmcp_packages=Client.Media 1, Room.Info 1\n";
+        load_reload_state_from_str(&mut app, content).expect("load_reload_state_from_str");
+        let w = app.worlds.iter().find(|w| w.name == "Customized").expect("world restored");
+        assert_eq!(w.settings.gmcp_packages, "Client.Media 1, Room.Info 1");
     }
 
     #[test]
@@ -3872,6 +4058,9 @@ pattern=foo
         assert_ne!(non_default.gmcp_packages, default.gmcp_packages, "gmcp_packages should differ");
         assert_ne!(non_default.auto_reconnect_secs, default.auto_reconnect_secs, "auto_reconnect_secs should differ");
         assert_ne!(non_default.auto_reconnect_on_web, default.auto_reconnect_on_web, "auto_reconnect_on_web should differ");
+        assert_ne!(non_default.initiate_negotiation, default.initiate_negotiation, "initiate_negotiation should differ");
+        assert_ne!(non_default.msp_enabled, default.msp_enabled, "msp_enabled should differ");
+        assert_ne!(non_default.mcp_enabled, default.mcp_enabled, "mcp_enabled should differ");
     }
 
     #[test]

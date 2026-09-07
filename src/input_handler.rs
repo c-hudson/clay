@@ -19,9 +19,30 @@ use crate::{
     web_settings_from_custom_data, apply_web_settings,
 };
 
-/// Save editor content (to file or world notes) and close editor
+/// Save editor content (to file, world notes, or an MCP simpleedit reply) and close
+/// editor.
 pub(crate) fn save_editor_content(app: &mut App) -> KeyAction {
-    if let Some(ref path) = app.editor.file_path {
+    if let Some(ctx) = app.editor.mcp_edit.clone() {
+        // MCP simpleedit (plan Job 15): send a `-set` reply down the world's
+        // connection rather than writing world notes or a file. `content` is the
+        // user's own edited text - untrusted server-supplied text never reaches this
+        // path at all except as the starting buffer, and `reference` is echoed back
+        // verbatim, never interpreted.
+        if ctx.world_index < app.worlds.len() {
+            let content = app.editor.buffer.clone();
+            match app.worlds[ctx.world_index].mcp.build_simpleedit_set(&ctx.reference, ctx.edit_type, &content) {
+                Some(lines) => {
+                    for line in lines {
+                        app.send_to_world(ctx.world_index, line);
+                    }
+                    app.add_output("Sent.");
+                }
+                None => {
+                    app.add_output("Could not send the edited text: the MCP session is no longer available (reconnect and ask the server to resend).");
+                }
+            }
+        }
+    } else if let Some(ref path) = app.editor.file_path {
         // Save to file
         match std::fs::write(path, &app.editor.buffer) {
             Ok(()) => {
@@ -894,6 +915,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.password = settings.password;
                     app.worlds[idx].settings.use_ssl = settings.use_ssl;
                     app.worlds[idx].settings.log_enabled = settings.log_enabled;
+                    app.worlds[idx].settings.initiate_negotiation = settings.initiate_negotiation;
+                    app.worlds[idx].settings.msp_enabled = settings.msp_enabled;
+                    app.worlds[idx].settings.mcp_enabled = settings.mcp_enabled;
 
                     // Update encoding
                     app.worlds[idx].settings.encoding = Encoding::from_name(&settings.encoding);
@@ -1244,7 +1268,10 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
     // Enter key (not bound by default via action system - always active)
     if key.code == KeyCode::Enter {
-        let input = app.input.take_input();
+        // ECHO masking (plan Phase 3, step 3.4): a masked line must never enter
+        // arrow-key recall history - see InputArea::take_input's doc comment.
+        let record_history = !app.current_world().echo_masked;
+        let input = app.input.take_input(record_history);
         if !input.is_empty() || app.current_world().connected {
             // /dump is passive — don't reset more-mode state
             let is_dump = input.trim().eq_ignore_ascii_case("/dump");

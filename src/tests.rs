@@ -2170,6 +2170,326 @@
         assert_eq!(app.worlds[0].output_lines.iter().filter(|l| l.is_input).count(), 2);
     }
 
+    // ==================================================================
+    // Plan Phase 3, step 3.4 (Job 10b) — ECHO masking's security half: a
+    // password/login line typed while `World::echo_masked` is set must leave
+    // NO trace in command history, the per-world log, output_lines
+    // (scrollback/`/recall`), or a broadcast to other clients. Each property
+    // gets its own test, per the plan, so a future change to
+    // `record_user_input` can't quietly re-open just one of them.
+    // ==================================================================
+
+    #[test]
+    fn test_record_user_input_masked_leaves_output_buffer_untouched() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0; // isolate the echo_masked gate specifically
+        app.worlds[0].echo_masked = true;
+
+        app.record_user_input(0, "hunter2");
+
+        assert!(
+            app.worlds[0].output_lines.is_empty(),
+            "a masked line must not land in output_lines at all - not even gagged/is_input \
+             - or it would still be reachable via /recall -i: {:?}",
+            app.worlds[0].output_lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_record_user_input_masked_leaves_log_untouched() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        app.worlds[0].echo_masked = true;
+        app.settings.log_input_enabled = true; // the gate this would otherwise pass through
+        app.worlds[0].settings.log_enabled = true;
+        app.worlds[0].log_date = Some(World::get_current_date_string());
+
+        let tmp_path = std::env::temp_dir().join(format!("clay_test_echo_masked_log_{}.log", std::process::id()));
+        let file = std::fs::File::create(&tmp_path).unwrap();
+        app.worlds[0].log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+
+        app.record_user_input(0, "hunter2");
+
+        // Drop the world (releasing the Arc<Mutex<File>>) before reading, so the write - if
+        // there is one - is flushed and closed first.
+        app.worlds.clear();
+        let contents = std::fs::read_to_string(&tmp_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&tmp_path);
+
+        assert!(!contents.contains("hunter2"), "a masked line must never reach the per-world \
+            log file, even with log_input_enabled/log_enabled both on: {contents:?}");
+    }
+
+    #[test]
+    fn test_record_user_input_masked_does_not_broadcast() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        app.worlds[0].echo_masked = true;
+
+        app.record_user_input(0, "hunter2");
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(
+            log.iter().all(|m| !matches!(m, WsMessage::ServerData { data, .. } if data.contains("hunter2"))),
+            "a masked line must never be broadcast as echoed input to other clients: {:?}",
+            *log
+        );
+    }
+
+    /// Control: with echo_masked left false (the default), the same input IS captured -
+    /// proves the three tests above are actually exercising the echo_masked gate and not
+    /// some other reason record_user_input might have been a no-op (e.g. the world index
+    /// being wrong, or a different guard firing first).
+    #[test]
+    fn test_record_user_input_unmasked_is_captured_normally() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        assert!(!app.worlds[0].echo_masked);
+
+        app.record_user_input(0, "look");
+
+        assert_eq!(app.worlds[0].output_lines.len(), 1);
+        assert_eq!(app.worlds[0].output_lines[0].text, "look");
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("look"))));
+    }
+
+    /// Console rendering: `render_input` must substitute a fixed mask glyph for every
+    /// input character when `World::echo_masked` is set, and must not leak the real text
+    /// through any span.
+    #[test]
+    fn test_render_input_masks_characters_when_echo_masked() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].echo_masked = true;
+        app.input.buffer = "hunter2".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        let text = rendering::render_input(&mut app, 80, "");
+        let rendered: String = text.lines.iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .concat();
+
+        assert_eq!(rendered, "*******", "every character must render as the fixed mask glyph");
+        assert!(!rendered.contains("hunter2"), "the real text must never appear in a rendered span");
+    }
+
+    #[test]
+    fn test_render_input_shows_real_text_when_not_masked() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        assert!(!app.worlds[0].echo_masked);
+        app.input.buffer = "look".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        let text = rendering::render_input(&mut app, 80, "");
+        let rendered: String = text.lines.iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .concat();
+
+        assert_eq!(rendered, "look", "unmasked input must render as typed");
+    }
+
+    /// This is the exact scenario `rendering.rs`'s two independent cursor-column
+    /// computations (`render_input_area`'s ratatui path and `render_output_crossterm`'s
+    /// crossterm replica) can disagree on if only one of them learns about masking: a
+    /// CJK character is 2 real display columns wide, but a masked prompt draws it as a
+    /// single 1-column mask glyph (`INPUT_MASK_CHAR`) - so the cursor must land at column
+    /// 3 (three mask glyphs), not column 4 (1 + 2 + 1, the real characters' widths).
+    #[test]
+    fn test_render_input_area_masked_cursor_column_uses_mask_width_not_real_width() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].echo_masked = true;
+        app.worlds[0].prompt = String::new();
+        app.input_height = 3;
+        app.input.buffer = "a中b".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 40, 3);
+        terminal.draw(|f| { rendering::render_input_area(f, &mut app, area); }).unwrap();
+
+        let (cx, cy) = terminal.get_cursor().unwrap();
+        assert_eq!(cy, 0);
+        assert_eq!(cx, 3, "masked cursor column must count each character as the mask \
+            glyph's width (1), not the real character's display width (中 is 2 columns \
+            wide) - this is exactly what render_output_crossterm's replica of this \
+            arithmetic must also get right");
+    }
+
+    /// Control: with the same multi-byte buffer but NOT masked, the cursor uses the real
+    /// display width (中 = 2 columns), landing at column 4, not 3 - proves the masked test
+    /// above is actually exercising the masked-width path, not some unrelated off-by-one.
+    #[test]
+    fn test_render_input_area_unmasked_cursor_column_uses_real_display_width() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        assert!(!app.worlds[0].echo_masked);
+        app.worlds[0].prompt = String::new();
+        app.input_height = 3;
+        app.input.buffer = "a中b".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 40, 3);
+        terminal.draw(|f| { rendering::render_input_area(f, &mut app, area); }).unwrap();
+
+        let (cx, cy) = terminal.get_cursor().unwrap();
+        assert_eq!(cy, 0);
+        assert_eq!(cx, 4, "unmasked cursor column must count 中's real display width (2)");
+    }
+
+    /// Reads one full row of a `TestBackend` buffer back out as a plain `String`
+    /// (concatenated cell symbols), for asserting on rendered content in the tests
+    /// below.
+    fn render_row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width).map(|x| buffer.get(x, y).symbol().to_string()).collect()
+    }
+
+    /// Plan Job 4 (mud-status-display.md) security requirement: a hostile GMCP value
+    /// carrying a C1 byte, a real ESC sequence, and an embedded newline must never
+    /// reach the console status line's rendered buffer unsanitized - the exact hazard
+    /// CLAUDE.md documents (an unstripped C1 byte is read by the terminal as APC and
+    /// swallows everything until a String Terminator, corrupting the display on every
+    /// subsequent repaint).
+    #[test]
+    fn test_render_stats_line_sanitizes_hostile_value() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.current_world_index = 0;
+        let hostile = "80\u{9f}\x1b[2J\nmore\rtext";
+        let payload = serde_json::json!({"hp": hostile}).to_string();
+        app.worlds[0].stats.update_from_gmcp("Char.Vitals", &payload);
+
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 40, 1);
+        terminal.draw(|f| { rendering::render_stats_line(f, &app, area); }).unwrap();
+
+        let row = render_row_text(terminal.backend().buffer(), 0, 40);
+        assert!(row.contains("hp"), "expected the hp entry to still render, got {row:?}");
+        for c in row.chars() {
+            assert!(!c.is_ascii_control(), "ASCII control character reached the rendered buffer: {row:?}");
+            assert!(!crate::encoding::is_c1_control(c), "C1 control character reached the rendered buffer: {row:?}");
+        }
+    }
+
+    /// Plan Job 4 security requirement: an oversized value must not be able to crowd
+    /// every other entry off the one shared status-line row.
+    #[test]
+    fn test_render_stats_line_caps_oversized_value_width() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.current_world_index = 0;
+        let huge = "x".repeat(500);
+        let payload = serde_json::json!({"name": huge, "hp": "80"}).to_string();
+        app.worlds[0].stats.update_from_gmcp("Char.Status", &payload);
+
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 40, 1);
+        terminal.draw(|f| { rendering::render_stats_line(f, &app, area); }).unwrap();
+
+        let row = render_row_text(terminal.backend().buffer(), 0, 40);
+        assert!(!row.contains(&"x".repeat(100)), "a single value must never be allowed to fill the whole row: {row:?}");
+    }
+
+    /// Plan Job 4 / D3: the console status line must go from 0 rows to 1 row exactly
+    /// once, on the frame data first arrives, and then stay fixed - never tracking the
+    /// live payload - even as the underlying values or field set change. This is what
+    /// stops `output_height` (and the `dimensions_changed` resize storm it triggers:
+    /// full redraw, `reset_visual_truncation` on every world, NAWS to every server) from
+    /// firing on every combat-round GMCP update.
+    #[test]
+    fn test_stats_line_latches_on_and_stays_fixed_height_across_value_changes() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("Alpha"));
+        app.current_world_index = 0;
+        app.input_height = 1;
+
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // No stats yet: the line must not exist at all.
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        assert!(!app.worlds[0].stats_line_shown, "must not latch before any data arrives");
+        let height_before = app.output_height;
+
+        // First data arrives: the line appears, output_height drops by exactly 1 row.
+        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        assert!(app.worlds[0].stats_line_shown, "must latch on once data arrives");
+        assert_eq!(app.output_height, height_before - 1,
+            "output_height must shrink by exactly the one reserved status-line row");
+        let height_after_latch = app.output_height;
+
+        // A value-only update (same fields) must not move output_height again.
+        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"75","maxhp":"100"}"#);
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        assert_eq!(app.output_height, height_after_latch,
+            "output_height must stay fixed across a value-only update");
+
+        // A NEW field appearing mid-connection (the exact "every combat round" hazard
+        // D3 names) must also not move it.
+        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"75","maxhp":"100","mp":"30","mpmax":"50"}"#);
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        assert_eq!(app.output_height, height_after_latch,
+            "output_height must stay fixed even when a new field appears mid-connection");
+
+        // A field disappearing mid-connection must not move it either.
+        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"70","maxhp":"100"}"#);
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        assert_eq!(app.output_height, height_after_latch,
+            "output_height must stay fixed even when a field disappears mid-connection");
+
+        // Only a real disconnect may take it back to 0.
+        app.worlds[0].clear_connection_state(false, false);
+        terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
+        assert!(!app.worlds[0].stats_line_shown, "disconnect must reset the latch");
+        assert_eq!(app.output_height, height_before,
+            "output_height must return to its original value after disconnect");
+    }
+
     #[test]
     fn test_a_packet_split_line_is_archived_exactly_once() {
         // Before this fix, a line arriving in two TCP reads was completed in place
@@ -3766,6 +4086,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -3811,6 +4132,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -3826,7 +4148,10 @@
 
         // Should still get all 30 lines
         let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
-        assert_eq!(text_count, 30, "Expected 30 TextReceived events, got {}", text_count);
+        // 30 lines + the unified "Connection closed by server." line spawn_telnet_reader
+        // always emits on EOF now (plan Job 4) - see the close-message unification note
+        // in src/telnet_reader.rs.
+        assert_eq!(text_count, 31, "Expected 31 TextReceived events, got {}", text_count);
 
         let _ = server.await;
     }
@@ -3855,6 +4180,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -3864,6 +4190,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world3".to_string(),
@@ -3873,6 +4200,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -3919,6 +4247,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -3928,6 +4257,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -3988,6 +4318,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: "testuser".to_string(),
                 password: "testpass".to_string(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4021,6 +4352,7 @@
                 auto_login_type: AutoConnectType::Prompt,
                 username: "testuser".to_string(),
                 password: "testpass".to_string(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4058,6 +4390,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4099,6 +4432,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4127,7 +4461,10 @@
 
         // Should have received all 500 lines
         let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
-        assert_eq!(text_count, 500, "Expected 500 TextReceived events, got {}", text_count);
+        // 500 lines + the unified "Connection closed by server." line spawn_telnet_reader
+        // always emits on EOF now (plan Job 4) - see the close-message unification note
+        // in src/telnet_reader.rs.
+        assert_eq!(text_count, 501, "Expected 501 TextReceived events, got {}", text_count);
 
         // Should have MoreReleased at least once (final release)
         assert!(events.iter().any(|e| matches!(e, TestEvent::MoreReleased(_))),
@@ -4153,6 +4490,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4176,7 +4514,10 @@
 
         // Should have received all 500 lines
         let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
-        assert_eq!(text_count, 500, "Expected 500 TextReceived events, got {}", text_count);
+        // 500 lines + the unified "Connection closed by server." line spawn_telnet_reader
+        // always emits on EOF now (plan Job 4) - see the close-message unification note
+        // in src/telnet_reader.rs.
+        assert_eq!(text_count, 501, "Expected 501 TextReceived events, got {}", text_count);
 
         // Should have MoreReleased
         assert!(events.iter().any(|e| matches!(e, TestEvent::MoreReleased(_))),
@@ -4207,6 +4548,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4216,6 +4558,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4257,6 +4600,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4295,6 +4639,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4340,6 +4685,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4392,6 +4738,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4401,6 +4748,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4453,6 +4801,7 @@
                 auto_login_type: AutoConnectType::Connect,
                 username: String::new(),
                 password: String::new(),
+                telnet_config: TelnetConfig::default(),
             }],
             output_height: 24,
             output_width: 80,
@@ -4481,7 +4830,10 @@
 
         // All 500 lines should have been received
         let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
-        assert_eq!(text_count, 500, "Expected 500 TextReceived events, got {}", text_count);
+        // 500 lines + the unified "Connection closed by server." line spawn_telnet_reader
+        // always emits on EOF now (plan Job 4) - see the close-message unification note
+        // in src/telnet_reader.rs.
+        assert_eq!(text_count, 501, "Expected 501 TextReceived events, got {}", text_count);
 
         let _ = server.await;
     }
@@ -4508,6 +4860,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4517,6 +4870,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world3".to_string(),
@@ -4526,6 +4880,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4566,6 +4921,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4575,6 +4931,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4621,6 +4978,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4630,6 +4988,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4687,6 +5046,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4696,6 +5056,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4752,6 +5113,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4761,6 +5123,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4814,6 +5177,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4823,6 +5187,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4877,6 +5242,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world2".to_string(),
@@ -4886,6 +5252,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "world3".to_string(),
@@ -4895,6 +5262,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -4952,6 +5320,7 @@
                     auto_login_type: AutoConnectType::Connect,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 24,
@@ -5918,6 +6287,7 @@ if you're more curious.\"";
                     auto_login_type: AutoConnectType::NoLogin,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
                 TestWorldConfig {
                     name: "flood".to_string(),
@@ -5927,6 +6297,7 @@ if you're more curious.\"";
                     auto_login_type: AutoConnectType::NoLogin,
                     username: String::new(),
                     password: String::new(),
+                    telnet_config: TelnetConfig::default(),
                 },
             ],
             output_height: 21,
@@ -8302,7 +8673,7 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(),
+            String::new(), "0".to_string(), true, true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -8320,7 +8691,7 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), "ENC:whatever".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(),
+            String::new(), "0".to_string(), true, true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -8338,7 +8709,7 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), "newpassword".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(),
+            String::new(), "0".to_string(), true, true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -9852,6 +10223,85 @@ third
 
         let log = app.ws_broadcast_log.lock().unwrap();
         assert!(log.is_empty(), "the gagged line must not be broadcast while deferred to pending: {log:?}");
+    }
+
+    // ======================================================================
+    // MCP (plan Job 15) integration through the real App::process_server_data
+    // pipeline - mcp.rs's own tests cover the framing/parsing/auth contract in
+    // isolation; these prove the pipeline actually calls into it correctly.
+    // ======================================================================
+
+    #[test]
+    fn test_mcp_line_is_filtered_from_output_and_reply_is_returned() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        let commands = app.process_server_data(
+            0, b"You see a sword here.\r\n#$#mcp version: 2.1 to: 2.1\r\nA rat scurries by.\r\n",
+            24, 80, false,
+        );
+
+        let visible: Vec<&str> = app.worlds[0].output_lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(visible, vec!["You see a sword here.", "A rat scurries by."],
+            "the #$#mcp line must never reach output_lines at all: {visible:?}");
+
+        // The handshake reply batch comes back through process_server_data's normal
+        // "commands to send to the MUD" channel (the same one action-trigger sends
+        // use) - not a '/' Clay command, so the real dispatch loops route it straight
+        // to the wire via App::send_to_world.
+        assert_eq!(commands.len(), 4, "handshake reply + 2 negotiate-can + negotiate-end: {commands:?}");
+        assert!(commands.iter().all(|c| c.starts_with("#$#")), "{commands:?}");
+        assert!(app.worlds[0].mcp.has_key(), "a session key must have been established");
+    }
+
+    #[test]
+    fn test_mcp_enabled_false_passes_mcp_lines_through_as_plain_text() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut world = World::new("test");
+        world.settings.mcp_enabled = false;
+        app.worlds.push(world);
+        app.current_world_index = 0;
+
+        let commands = app.process_server_data(0, b"#$#mcp version: 2.1 to: 2.1\r\n", 24, 80, false);
+
+        assert!(commands.is_empty(), "no reply should be generated with mcp_enabled off: {commands:?}");
+        let visible: Vec<&str> = app.worlds[0].output_lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(visible, vec!["#$#mcp version: 2.1 to: 2.1"],
+            "with mcp_enabled off, a #$# line must display exactly like any other server text");
+        assert!(!app.worlds[0].mcp.has_key());
+    }
+
+    #[test]
+    fn test_mcp_message_split_across_two_reads() {
+        // Mirrors how the existing telnet split-invariance tests are written: the
+        // same bytes, fed in one call vs. split into two process_server_data calls
+        // (simulating two TCP reads), must reach the same end state. Real MUD
+        // servers commonly split at arbitrary byte boundaries mid-line.
+        let whole: &[u8] = b"#$#mcp version: 2.1 to: 2.1\r\n";
+        let split_at = whole.iter().position(|&b| b == b'v').unwrap(); // mid "version"
+
+        let mut one_shot = App::new();
+        one_shot.worlds.clear();
+        one_shot.worlds.push(World::new("test"));
+        one_shot.current_world_index = 0;
+        let commands_one_shot = one_shot.process_server_data(0, whole, 24, 80, false);
+
+        let mut split = App::new();
+        split.worlds.clear();
+        split.worlds.push(World::new("test"));
+        split.current_world_index = 0;
+        let commands_first = split.process_server_data(0, &whole[..split_at], 24, 80, false);
+        assert!(commands_first.is_empty(), "an incomplete #$# line must produce no reply yet");
+        assert!(split.worlds[0].output_lines.is_empty(), "and must not display early either");
+        let commands_second = split.process_server_data(0, &whole[split_at..], 24, 80, false);
+
+        assert_eq!(commands_second.len(), commands_one_shot.len());
+        assert_eq!(commands_second.len(), 4);
+        assert!(split.worlds[0].output_lines.is_empty(), "the reassembled line is still MCP, never displayed");
+        assert_eq!(one_shot.worlds[0].output_lines.len(), 0);
     }
 
     #[test]
@@ -11865,6 +12315,138 @@ third
         assert_eq!(w.next_seq, 500);
     }
 
+    /// Job 10a (plan Phase 3, step 3.3, the MCCP2 hot-reload guard): `mccp2_active` must
+    /// survive a reload round trip the same way `is_tls` already does, right alongside it in
+    /// both the writer and the parser - a compressed world's decompressor cannot survive the
+    /// reload exec, so the restore path needs this flag to know to disconnect it rather than
+    /// handing a dead zlib stream to a fresh plaintext parser. Drives the real serializer
+    /// and the real parser against each other, not a hand-rolled copy of either.
+    #[test]
+    fn test_mccp2_active_survives_a_reload_round_trip() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].mccp2_active = true;
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+        assert!(text.contains("mccp2_active=true"),
+            "the reload state must emit the flag; without this a compressed world's \
+             reload-time bail-out can never fire");
+
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
+        let w = restored.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
+        assert!(w.mccp2_active, "the flag must survive a full save/load round trip");
+    }
+
+    /// The false/absent case: a plain-text world (or a state file predating this field) must
+    /// not come back marked compressed, or every ordinary reload would spuriously disconnect
+    /// worlds that were never running MCCP2.
+    #[test]
+    fn test_mccp2_active_defaults_to_false_when_absent() {
+        let state = "[world_state:0]\nname=alpha\nconnected=true\n";
+        let mut app = App::new();
+        crate::persistence::load_reload_state_from_str(&mut app, state).expect("parses");
+        let w = app.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
+        assert!(!w.mccp2_active);
+    }
+
+    /// Job 10a (plan Phase 3, step 3.3): the actual restore-time bail-out. `run_app` and
+    /// `run_app_headless` are large `async fn`s that need live sockets/exec/tty machinery to
+    /// run at all - not reachable from this suite (same limitation the plan already notes for
+    /// the reload/reconnect loops in general) - so this drives the extracted
+    /// `App::apply_mccp2_reload_bailout` those two functions both call, which carries every
+    /// bit of the real disconnect logic (nothing is left behind in the un-testable callers
+    /// beyond the call itself). Not covered by any test: that `run_app`/`run_app_headless`
+    /// actually invoke this at the right point in their restore sequence, and the live
+    /// exec/fd-preservation path end to end.
+    #[test]
+    fn apply_mccp2_reload_bailout_disconnects_a_compressed_world_with_a_message() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].mccp2_active = true;
+        app.worlds[0].socket_fd = Some(7);
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        app.apply_mccp2_reload_bailout(false);
+
+        let w = &app.worlds[0];
+        assert!(!w.connected, "a compressed world's decompressor cannot survive the exec");
+        assert!(w.command_tx.is_none());
+        assert!(w.socket_fd.is_none());
+        let last = w.output_lines.last().expect("bail-out message pushed");
+        assert!(last.text.contains("MCCP2"), "message must name the reason: {:?}", last.text);
+        assert!(last.text.contains("reload"), "must use reload wording, not crash: {:?}", last.text);
+        assert!(last.text.contains("Use /worlds to reconnect"),
+            "must match the TLS bail-out's call to action: {:?}", last.text);
+    }
+
+    #[test]
+    fn apply_mccp2_reload_bailout_uses_crash_wording_when_recovering_from_a_crash() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].mccp2_active = true;
+
+        app.apply_mccp2_reload_bailout(true);
+
+        let last = app.worlds[0].output_lines.last().expect("bail-out message pushed");
+        assert!(last.text.contains("crash recovery"), "got: {:?}", last.text);
+    }
+
+    #[test]
+    fn apply_mccp2_reload_bailout_leaves_uncompressed_worlds_connected() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("plain"), World::new("disconnected-but-compressed")];
+        app.worlds[0].connected = true; // no mccp2_active - must survive untouched
+        app.worlds[1].mccp2_active = true; // not connected - nothing to disconnect
+
+        app.apply_mccp2_reload_bailout(false);
+
+        assert!(app.worlds[0].connected);
+        assert!(app.worlds[0].output_lines.is_empty());
+        assert!(app.worlds[1].output_lines.is_empty());
+    }
+
+    /// A TLS world *with* a live proxy survives the separate TLS-without-proxy bail-out (it
+    /// reconnects via the proxy instead) - this guard must still catch it if MCCP2 was also
+    /// active, or the reconnect hands the proxy's byte stream to a fresh plaintext parser
+    /// that thinks it's still looking at zlib-decompressed text. Independent of `is_tls`.
+    #[test]
+    fn apply_mccp2_reload_bailout_catches_a_tls_world_with_a_live_proxy() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].is_tls = true;
+        app.worlds[0].proxy_pid = Some(1234);
+        app.worlds[0].mccp2_active = true;
+
+        app.apply_mccp2_reload_bailout(false);
+
+        assert!(!app.worlds[0].connected,
+            "MCCP2 state is dead regardless of TLS/proxy status - a TLS-with-proxy world must \
+             not be left connected to reconnect and receive a plaintext-decoded zlib stream");
+    }
+
+    #[test]
+    fn apply_mccp2_reload_bailout_marks_unseen_for_a_background_world() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("current"), World::new("background")];
+        app.current_world_index = 0;
+        app.worlds[1].connected = true;
+        app.worlds[1].mccp2_active = true;
+        assert_eq!(app.worlds[1].unseen_lines, 0);
+
+        app.apply_mccp2_reload_bailout(false);
+
+        assert_eq!(app.worlds[1].unseen_lines, 1);
+        assert!(app.worlds[1].first_unseen_at.is_some());
+    }
+
     // ---- TinyFugue keybinding parity (plan Phase 0 P0.6) ----
     //
     // Coverage for `investigate-differences-between-tinyfugu-fluffy-stallman.md`, finding A
@@ -13600,6 +14182,359 @@ third
         assert!(found, "expected a world-not-found message, got: {:?}", *log);
     }
 
+    // ---- Plan Job 12 (4.2/4.3): /mssp, /msdp command parsing + dispatch ----
+
+    #[test]
+    fn test_parse_mssp_command() {
+        assert!(matches!(parse_command("/mssp"), Command::Mssp));
+    }
+
+    #[test]
+    fn test_parse_msdp_command_verbs_and_target() {
+        match parse_command("/msdp LIST COMMANDS") {
+            Command::Msdp { verb, target } => {
+                assert_eq!(verb, "LIST");
+                assert_eq!(target, Some("COMMANDS".to_string()));
+            }
+            other => panic!("expected Msdp, got {:?}", other),
+        }
+        // Lowercase input is normalized to uppercase.
+        match parse_command("/msdp report health") {
+            Command::Msdp { verb, target } => {
+                assert_eq!(verb, "REPORT");
+                assert_eq!(target, Some("health".to_string()));
+            }
+            other => panic!("expected Msdp, got {:?}", other),
+        }
+        // A bare verb with no target is still valid (None target).
+        match parse_command("/msdp SEND") {
+            Command::Msdp { verb, target } => {
+                assert_eq!(verb, "SEND");
+                assert_eq!(target, None);
+            }
+            other => panic!("expected Msdp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_msdp_command_usage_errors() {
+        assert!(matches!(parse_command("/msdp"), Command::MsdpUsage), "no verb at all");
+        assert!(matches!(parse_command("/msdp BOGUS"), Command::MsdpUsage), "unrecognized verb");
+    }
+
+    #[test]
+    fn test_execute_mssp_command_shows_no_data_message_when_never_negotiated() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+
+        execute_mssp_command(&mut app, 0, false);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("No MSSP data")));
+        assert!(found, "expected a 'no MSSP data' message, got: {:?}", *log);
+    }
+
+    #[test]
+    fn test_execute_mssp_command_shows_current_data() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        app.worlds[0].mssp_data = vec![
+            ("NAME".to_string(), "Test MUD".to_string()),
+            ("PLAYERS".to_string(), "3".to_string()),
+        ];
+
+        execute_mssp_command(&mut app, 0, false);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(
+            m,
+            WsMessage::ServerData { data, .. } if data.contains("Test MUD") && data.contains("PLAYERS")
+        ));
+        assert!(found, "expected MSSP data in the output, got: {:?}", *log);
+    }
+
+    // ---- Plan Job 4 (mud-status-display.md): /stats command ----
+
+    #[test]
+    fn test_parse_stats_command() {
+        assert!(matches!(parse_command("/stats"), Command::Stats));
+    }
+
+    #[test]
+    fn test_execute_stats_command_shows_no_data_message_when_none_received() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+
+        execute_stats_command(&mut app, 0, false);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("No status data")));
+        assert!(found, "expected a 'no status data' message, got: {:?}", *log);
+    }
+
+    #[test]
+    fn test_execute_stats_command_shows_current_data() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
+
+        execute_stats_command(&mut app, 0, false);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(
+            m,
+            WsMessage::ServerData { data, .. } if data.contains("hp") && data.contains("80/100")
+        ));
+        assert!(found, "expected stats data in the output, got: {:?}", *log);
+    }
+
+    /// Plan Job 4 security requirement: a hostile GMCP value carrying a C1 byte, a real
+    /// ESC sequence, and an embedded newline must never reach `/stats`' output
+    /// unsanitized - the exact hazard CLAUDE.md documents (a C1 control read by the
+    /// terminal as APC swallows everything until a String Terminator, corrupting the
+    /// display on every subsequent repaint).
+    #[test]
+    fn test_execute_stats_command_sanitizes_hostile_value() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        let hostile = "80\u{9f}\x1b[2J\nmore text\rand more";
+        let payload = serde_json::json!({"hp": hostile}).to_string();
+        app.worlds[0].stats.update_from_gmcp("Char.Vitals", &payload);
+
+        execute_stats_command(&mut app, 0, false);
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let mut saw_hp_line = false;
+        for m in log.iter() {
+            if let WsMessage::ServerData { data, .. } = m {
+                // `data` legitimately contains "\n" as the delimiter between this
+                // command's own output lines (header, separator bar, the hp row) -
+                // that's not MUD text, so check control characters per rendered LINE,
+                // never across the whole multi-line blob.
+                for line in data.lines() {
+                    if !line.contains("hp") {
+                        continue;
+                    }
+                    saw_hp_line = true;
+                    for c in line.chars() {
+                        assert!(!c.is_ascii_control(), "ASCII control character leaked into a /stats line: {:?}", line);
+                        assert!(!crate::encoding::is_c1_control(c), "C1 control character leaked into a /stats line: {:?}", line);
+                    }
+                }
+                // The embedded newline/CR in the hostile value must have been
+                // stripped, not passed through as a literal line break - otherwise
+                // the injected "\n" would have split the hp entry into extra lines
+                // (header + separator + exactly one hp row = 3).
+                if data.contains("hp") {
+                    assert_eq!(data.lines().count(), 3,
+                        "an embedded newline/CR in the hostile value must not create extra output lines: {:?}", data);
+                }
+            }
+        }
+        assert!(saw_hp_line, "expected the hp entry to still appear (sanitized), got: {:?}", *log);
+    }
+
+    #[test]
+    fn test_execute_msdp_command_refuses_when_not_negotiated() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+        assert!(!app.worlds[0].msdp_enabled, "sanity: MSDP not negotiated in this test");
+
+        execute_msdp_command(&mut app, 0, "LIST", Some("COMMANDS"), false);
+
+        assert!(cmd_rx.try_recv().is_err(), "nothing must be sent when MSDP was never negotiated");
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(m, WsMessage::ServerData { data, .. } if data.contains("not been negotiated")));
+        assert!(found, "expected a clear refusal message, got: {:?}", *log);
+    }
+
+    #[test]
+    fn test_execute_msdp_command_sends_two_part_message_with_target() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        app.worlds[0].msdp_enabled = true;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        execute_msdp_command(&mut app, 0, "REPORT", Some("HEALTH"), false);
+
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => {
+                assert_eq!(bytes, crate::telnet::build_msdp_set("REPORT", "HEALTH"));
+            }
+            other => panic!("expected a Raw MSDP wire write, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execute_msdp_command_sends_bare_verb_without_target() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        app.worlds[0].msdp_enabled = true;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        execute_msdp_command(&mut app, 0, "LIST", None, false);
+
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => {
+                assert_eq!(bytes, crate::telnet::build_msdp_request("LIST"));
+            }
+            other => panic!("expected a Raw MSDP wire write, got {:?}", other),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // mud-status-display.md Job 6: making the data actually arrive (GMCP Char
+    // request, MSDP self-configuring REPORT flow).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_handle_gmcp_negotiated_declares_char_package_by_default() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        assert_eq!(app.worlds[0].settings.gmcp_packages, crate::DEFAULT_GMCP_PACKAGES,
+            "sanity: a freshly created world must carry the current default");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        app.handle_gmcp_negotiated(0);
+
+        // First message is Core.Hello - skip it and inspect Core.Supports.Set.
+        let _hello = cmd_rx.try_recv().expect("Core.Hello expected");
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => {
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("Core.Supports.Set"), "got: {text}");
+                assert!(text.contains("Client.Media 1"), "media package must still be requested: {text}");
+                assert!(text.contains("Char 1"), "the Char package family must now be requested by default: {text}");
+            }
+            other => panic!("expected a Raw Core.Supports.Set wire write, got {:?}", other),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "exactly two GMCP messages expected on negotiation");
+    }
+
+    #[test]
+    fn test_handle_msdp_negotiated_requests_reportable_variables() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        assert!(!app.worlds[0].msdp_enabled, "sanity: not yet negotiated");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        app.handle_msdp_negotiated(0);
+
+        assert!(app.worlds[0].msdp_enabled, "negotiation must still flip the flag");
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => {
+                assert_eq!(bytes, crate::telnet::build_msdp_set("LIST", "REPORTABLE_VARIABLES"),
+                    "MSDP negotiation must ask the server what it can report, or nothing is ever REPORTed");
+            }
+            other => panic!("expected a Raw MSDP LIST wire write, got {:?}", other),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "exactly one outbound message expected on negotiation");
+    }
+
+    #[test]
+    fn test_reportable_variables_reply_triggers_a_report_per_variable() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        app.worlds[0].msdp_enabled = true;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(8);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        app.handle_msdp_received(0, "REPORTABLE_VARIABLES", r#"["HEALTH","HEALTH_MAX","MANA"]"#);
+
+        for expected in ["HEALTH", "HEALTH_MAX", "MANA"] {
+            match cmd_rx.try_recv() {
+                Ok(WriteCommand::Raw(bytes)) => {
+                    assert_eq!(bytes, crate::telnet::build_msdp_set("REPORT", expected));
+                }
+                other => panic!("expected a Raw REPORT {expected}, got {:?}", other),
+            }
+        }
+        assert!(cmd_rx.try_recv().is_err(), "no more outbound messages expected");
+        // The meta variable itself must never become a stat.
+        assert!(app.worlds[0].stats.is_empty(),
+            "REPORTABLE_VARIABLES must not feed World::stats");
+    }
+
+    #[test]
+    fn test_reportable_variables_reply_skips_meta_names_in_its_own_list() {
+        // Defensive: a hostile/broken server listing one of MSDP's own reserved
+        // names as something it can report must not cause Clay to REPORT it back.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        app.worlds[0].msdp_enabled = true;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(8);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        app.handle_msdp_received(0, "REPORTABLE_VARIABLES", r#"["HEALTH","COMMANDS"]"#);
+
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => {
+                assert_eq!(bytes, crate::telnet::build_msdp_set("REPORT", "HEALTH"));
+            }
+            other => panic!("expected HEALTH to still be reported, got {:?}", other),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "COMMANDS must never be REPORTed back");
+    }
+
+    #[test]
+    fn test_reportable_variables_report_cap_holds_for_a_very_long_list() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        app.worlds[0].msdp_enabled = true;
+        // Deliberately far larger than any sane MUD's real variable count, and far
+        // larger than the channel capacity below - the point is the cap, not the
+        // channel, so give the channel generous headroom over the cap itself.
+        let names: Vec<String> = (0..5000).map(|i| format!("VAR{i}")).collect();
+        let json = serde_json::to_string(&names).unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(1000);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        app.handle_msdp_received(0, "REPORTABLE_VARIABLES", &json);
+
+        let mut received = Vec::new();
+        while let Ok(WriteCommand::Raw(bytes)) = cmd_rx.try_recv() {
+            received.push(bytes);
+        }
+        assert_eq!(received.len(), crate::MAX_MSDP_AUTO_REPORT,
+            "a very long reportable-variables list must be capped, not sent in full");
+        // Deterministic: the first N in the order the server listed them.
+        for (i, bytes) in received.iter().enumerate() {
+            assert_eq!(*bytes, crate::telnet::build_msdp_set("REPORT", &format!("VAR{i}")));
+        }
+    }
+
     #[test]
     fn test_parse_addworld_default_form() {
         match parse_command("/addworld DEFAULT hero secret") {
@@ -14004,4 +14939,1085 @@ third
         apply_pending_tf_console_ops(&mut app);
         assert_eq!(app.settings.wrapspace, 5, "on/off has no Clay-side wrap-width equivalent");
         assert_eq!(app.tf_engine.get_var("wrap").map(|v| v.to_string_value()), Some("off".to_string()));
+    }
+
+    // ======================================================================
+    // Plan Job 7 (2.5 of investigate-differences-between-tinyfugu-fluffy-
+    // stallman.md): main.rs's six hand-rolled reader loops were migrated onto
+    // the shared spawn_telnet_reader (telnet_reader.rs). Three of them ("the
+    // blind three", run_app_headless's hot-reload reconstruction at what were
+    // main.rs:16490/16554/16639) did zero telnet processing before this job -
+    // they piped raw socket bytes straight into AppEvent::ServerData with the
+    // write channel captured into an unused `_telnet_tx` binding and never
+    // written to, so after a hot reload every reconstructed world had no
+    // telnet handling at all (no negotiation answers, no GMCP/MSDP, IAC bytes
+    // rendered as text). Those hot-reload paths cannot be driven from a test
+    // (they need a real reload-state file plus a live socket fd), so per the
+    // plan this proves the wiring at the spawn_telnet_reader level instead:
+    // both tests below use the exact `TelnetTarget::World` / `TelnetConfig {
+    // term_type: env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
+    // ..TelnetConfig::default() }` shape all six migrated call sites now
+    // pass, over a `tokio::io::duplex` standing in for the socket.
+    //
+    // The other three loops (main.rs's `run_app` console-reload reconstruction,
+    // the richest in the codebase - the only site with both MCCP2 branches -
+    // gained/lost nothing telnet-wise) already did real process_telnet-based
+    // GA/EOR prompt extraction; the second test below keeps that behaviour
+    // pinned now that it goes through TelnetSession/spawn_telnet_reader
+    // instead, since main.rs is where prompt handling is most visible to
+    // users (auto-login and the console's own prompt line depend on it).
+
+    /// Builds the identical `TelnetConfig` every migrated main.rs call site now
+    /// constructs (see e.g. the plain-TCP block in `run_app_headless`).
+    fn job7_reader_test_cfg() -> crate::telnet::TelnetConfig {
+        crate::telnet::TelnetConfig {
+            term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
+            ..crate::telnet::TelnetConfig::default()
+        }
+    }
+
+    /// Proof (plan Job 7 Part A's required test) that a reader wired up exactly
+    /// the way the three previously-telnet-blind reload loops now are answers
+    /// negotiation and delivers GMCP: before this job those loops forwarded
+    /// `IAC WILL SGA` straight through as literal bytes and never saw GMCP at
+    /// all (the write channel was silenced). Now the same `TelnetTarget::World`
+    /// + `TelnetConfig` shape those sites pass must answer `IAC WILL SGA` with
+    /// `IAC DO SGA` on the wire and surface `Core.Hello` as
+    /// `AppEvent::GmcpReceived`.
+    #[tokio::test]
+    async fn job7_blind_reload_shape_answers_negotiation_and_delivers_gmcp() {
+        use crate::telnet::{
+            TELNET_IAC, TELNET_WILL, TELNET_DO, TELNET_SB, TELNET_SE, TELNET_OPT_SGA,
+            TELNET_OPT_GMCP, TelnetEvent,
+        };
+        use crate::telnet_reader::{spawn_telnet_reader, TelnetTarget};
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (read_half, _write_half) = tokio::io::split(client);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(16);
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+
+        spawn_telnet_reader(
+            StreamReader::Duplex(read_half),
+            cmd_tx,
+            event_tx,
+            TelnetTarget::World("reloadedworld".to_string()),
+            7, // conn_id
+            job7_reader_test_cfg(),
+        );
+
+        // Job 11 (plan Phase 3, step 3.5): `job7_reader_test_cfg()` mirrors production
+        // exactly, which now defaults `initiate_negotiation` on - so the reader's very
+        // first wire write, before any script bytes even arrive, is Clay's own opening
+        // offer (WILL TTYPE, WILL NAWS, DO CHARSET, DO GMCP, DO MSDP, DO MCCP2). Drain it
+        // here rather than let it masquerade as the reply to the script below.
+        let opening = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timed out waiting for the opening negotiation")
+            .expect("cmd channel closed");
+        match opening {
+            WriteCommand::Raw(bytes) => {
+                assert!(
+                    bytes.windows(3).any(|w| w == [TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP]),
+                    "initial_negotiation's DO GMCP should be this reader's first wire write"
+                );
+            }
+            WriteCommand::Text(_) => panic!("expected a Raw wire write, got Text"),
+            WriteCommand::Shutdown => panic!("expected a Raw wire write, got Shutdown"),
+            WriteCommand::SetEncoding(_) => panic!("expected a Raw wire write, got SetEncoding"),
+        }
+
+        // IAC WILL SGA, then IAC WILL GMCP + an immediate Core.Hello message -
+        // exactly the shape a real MUD sends right after connect.
+        let mut script = vec![TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA];
+        script.extend_from_slice(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP]);
+        script.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_GMCP]);
+        script.extend_from_slice(b"Core.Hello {\"foo\":\"bar\"}");
+        script.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+        server.write_all(&script).await.expect("write into duplex");
+
+        let wire = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("timed out waiting for a wire reply")
+            .expect("cmd channel closed");
+        match wire {
+            WriteCommand::Raw(bytes) => {
+                assert!(
+                    bytes.windows(3).any(|w| w == [TELNET_IAC, TELNET_DO, TELNET_OPT_SGA]),
+                    "IAC WILL SGA must be answered with IAC DO SGA on the wire, not passed through as text"
+                );
+                // No second IAC DO GMCP here: Clay already sent it in the opening offer
+                // above, and the Q method (Job 9) suppresses the repeat once the
+                // script's WILL GMCP merely confirms Clay's own request
+                // (WantYes -> Yes) rather than requesting something fresh.
+            }
+            WriteCommand::Text(_) => panic!("expected a Raw wire write, got Text"),
+            WriteCommand::Shutdown => panic!("expected a Raw wire write, got Shutdown"),
+            WriteCommand::SetEncoding(_) => panic!("expected a Raw wire write, got SetEncoding"),
+        }
+
+        let mut saw_negotiated = false;
+        let mut saw_gmcp: Option<(String, String)> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && (!saw_negotiated || saw_gmcp.is_none()) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Some(AppEvent::Telnet(TelnetTarget::World(name), TelnetEvent::OptionEnabled(opt))))
+                    if name == "reloadedworld" && opt == TELNET_OPT_GMCP =>
+                {
+                    saw_negotiated = true;
+                }
+                Ok(Some(AppEvent::Telnet(TelnetTarget::World(name), TelnetEvent::GmcpMessage(pkg, json))))
+                    if name == "reloadedworld" =>
+                {
+                    saw_gmcp = Some((pkg, json));
+                }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(saw_negotiated, "expected AppEvent::Telnet(.., OptionEnabled(TELNET_OPT_GMCP)) - before Job 7 this loop never emitted it");
+        let (pkg, json) = saw_gmcp.expect("expected AppEvent::Telnet(.., GmcpMessage(..)) - before Job 7 this loop never saw GMCP at all");
+        assert_eq!(pkg, "Core.Hello");
+        assert_eq!(json, "{\"foo\":\"bar\"}");
+    }
+
+    /// Plan Job 7's "Tests" section: keep a test that the console path still
+    /// extracts GA-terminated prompts, since main.rs is where prompt handling
+    /// is most visible to users (auto-login and the status line both depend on
+    /// `AppEvent::Prompt` arriving promptly). main.rs's three real reader
+    /// loops (the `run_app` console-reload reconstruction, migrated in this
+    /// same job) now go through this exact spawn_telnet_reader path rather
+    /// than a hand-rolled `process_telnet`/`find_safe_split_point` loop.
+    #[tokio::test]
+    async fn job7_console_reader_shape_still_extracts_ga_terminated_prompts() {
+        use crate::telnet::{TELNET_IAC, TELNET_GA};
+        use crate::telnet_reader::{spawn_telnet_reader, TelnetTarget};
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (read_half, _write_half) = tokio::io::split(client);
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<WriteCommand>(16);
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(16);
+
+        spawn_telnet_reader(
+            StreamReader::Duplex(read_half),
+            cmd_tx,
+            event_tx,
+            TelnetTarget::World("consoleworld".to_string()),
+            1,
+            job7_reader_test_cfg(),
+        );
+
+        let mut script = b"Welcome back!\r\n".to_vec();
+        script.extend_from_slice(b"Login: ");
+        script.extend_from_slice(&[TELNET_IAC, TELNET_GA]);
+        server.write_all(&script).await.expect("write into duplex");
+
+        // The GA-terminated prompt must arrive as AppEvent::Prompt, ahead of the
+        // preceding line's AppEvent::ServerData (prompt-first ordering, matching
+        // every one of main.rs's now-migrated loops).
+        let first = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("timed out waiting for the first event")
+            .expect("event channel closed");
+        assert!(matches!(
+            first,
+            AppEvent::Telnet(TelnetTarget::World(ref n), crate::telnet::TelnetEvent::TelnetDetected) if n == "consoleworld"
+        ));
+
+        let second = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("timed out waiting for the prompt event")
+            .expect("event channel closed");
+        assert!(
+            matches!(second, AppEvent::Prompt(ref n, ref b) if n == "consoleworld" && b == b"Login: "),
+            "GA-terminated prompt must still be extracted as AppEvent::Prompt"
+        );
+
+        let third = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("timed out waiting for the preceding text")
+            .expect("event channel closed");
+        assert!(
+            matches!(third, AppEvent::ServerData(ref n, ref b) if n == "consoleworld" && b == b"Welcome back!\r\n"),
+            "text preceding the prompt must still arrive"
+        );
+    }
+
+    // ======================================================================
+    // Plan Job 8 (2.7 of investigate-differences-between-tinyfugu-fluffy-
+    // stallman.md): App::handle_telnet_event consolidated nine formerly-
+    // separate AppEvent variants (TelnetDetected, WontEchoSeen, NawsRequested,
+    // TtypeRequested, CharsetRequested, GmcpNegotiated, MsdpNegotiated,
+    // GmcpReceived, MsdpReceived) into one AppEvent::Telnet(TelnetTarget,
+    // TelnetEvent), routed through one handler by all five dispatch loops
+    // (three in main.rs, two in daemon.rs). Before this job, no test drove
+    // any of the App-side effects directly at all — job7_migration_tests
+    // above only ever checked what arrived on the AppEvent channel, never
+    // what App/World state changed once a dispatch loop consumed it. These
+    // tests fill that gap: one per TelnetEvent kind the handler reacts to.
+
+    /// Fresh App with a single world named `world_name`, matching how every
+    /// dispatch site's own World is shaped before a telnet event arrives for
+    /// it (not connected, nothing negotiated yet).
+    fn telnet_event_test_app(world_name: &str) -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new(world_name));
+        app.current_world_index = 0;
+        app
+    }
+
+    /// The exact two-line resolution every one of the five `AppEvent::Telnet`
+    /// dispatch arms now performs (see main.rs's run_app_headless, run_app's
+    /// two arms, and daemon.rs's run_daemon_server) — `find_world_index` then
+    /// `handle_telnet_event`. Driving an event through this helper is proof
+    /// for all five sites at once, not just one, since after Job 8 they no
+    /// longer have any behaviour of their own beyond this resolution.
+    fn dispatch_telnet_event(app: &mut App, target: &TelnetTarget, ev: &TelnetEvent) {
+        match target {
+            TelnetTarget::World(world_name) => {
+                if let Some(world_idx) = app.find_world_index(world_name) {
+                    app.handle_telnet_event(world_idx, ev);
+                }
+            }
+            TelnetTarget::Multiuser { .. } => {}
+        }
+    }
+
+    #[test]
+    fn handle_telnet_event_telnet_detected_sets_telnet_mode() {
+        let mut app = telnet_event_test_app("w");
+        assert!(!app.worlds[0].telnet_mode);
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::TelnetDetected);
+        assert!(app.worlds[0].telnet_mode);
+    }
+
+    #[test]
+    fn handle_telnet_event_wont_echo_prompt_hint_sets_uses_wont_echo_prompt() {
+        let mut app = telnet_event_test_app("w");
+        assert!(!app.worlds[0].uses_wont_echo_prompt);
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::WontEchoPromptHint);
+        assert!(app.worlds[0].uses_wont_echo_prompt);
+    }
+
+    #[test]
+    fn handle_telnet_event_naws_requested_sets_naws_enabled() {
+        let mut app = telnet_event_test_app("w");
+        assert!(!app.worlds[0].naws_enabled);
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::NawsRequested);
+        assert!(app.worlds[0].naws_enabled);
+    }
+
+    #[test]
+    fn handle_telnet_event_ttype_requested_sends_nothing_the_session_already_answered() {
+        // Job 12 (plan Phase 4, 4.1 - MTTS cycling): before this job, App answered
+        // TtypeRequested itself with a fixed $TERM value (this test used to assert
+        // exactly that, via build_ttype_response). As of Job 12, TelnetSession
+        // answers a TTYPE SEND directly on the wire the instant it happens (see
+        // TtypeRequested's doc comment in telnet.rs) - only the session can see
+        // ttype_index, which is what picks the MTTS cycle position. If App also
+        // sent a reply here, a server would get two answers per request and the
+        // MTTS cycle would desync from what the session's own counter expects.
+        let mut app = telnet_event_test_app("w");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::TtypeRequested);
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "App must not send a second TTYPE reply - the session already answered on the wire"
+        );
+    }
+
+    #[test]
+    fn handle_telnet_event_charset_request_negotiates_utf8_and_replies_accepted() {
+        let mut app = telnet_event_test_app("w");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+        assert_eq!(app.worlds[0].negotiated_encoding, None);
+
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::CharsetRequest(vec!["UTF-8".to_string()]),
+        );
+
+        assert_eq!(app.worlds[0].negotiated_encoding, Some(Encoding::Utf8));
+        let expected = build_charset_accepted("UTF-8");
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(bytes, expected),
+            Ok(WriteCommand::Text(_)) => panic!("expected a Raw CHARSET ACCEPTED response, got Text"),
+            Ok(WriteCommand::Shutdown) => panic!("expected a Raw CHARSET ACCEPTED response, got Shutdown"),
+            Ok(WriteCommand::SetEncoding(_)) => panic!("expected the Raw CHARSET ACCEPTED response first, got SetEncoding"),
+            Err(_) => panic!("expected a queued CHARSET ACCEPTED response, channel was empty"),
+        }
+        // Job 13 (plan Phase 4, 4.4): accepting now also switches the writer's
+        // encoding, queued right after the wire reply (see spawn_telnet_writer's
+        // module doc comment for why this travels in-band rather than through
+        // shared state) - this is the fix for "accepting now actually changes
+        // both the decode side and the new encode side rather than only
+        // recording it".
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::SetEncoding(enc)) => assert_eq!(enc, Encoding::Utf8),
+            other => panic!("expected a queued SetEncoding(Utf8) after the CHARSET ACCEPTED reply, got {other:?}"),
+        }
+    }
+
+    /// Job 13 (plan Phase 4, 4.4): a world whose encoding the user set
+    /// explicitly (anything but the Utf8 default) must not be silently
+    /// overridden by a CHARSET offer that also includes UTF-8 - Clay used to
+    /// always prefer UTF-8 first, which would have clobbered a deliberate
+    /// Latin1/Fansi choice the instant a server offered both.
+    #[test]
+    fn handle_telnet_event_charset_request_confirms_explicit_non_utf8_choice_when_offered() {
+        let mut app = telnet_event_test_app("w");
+        app.worlds[0].settings.encoding = Encoding::Latin1;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        // The offer includes both UTF-8 (which the old logic would have
+        // preferred unconditionally) and the user's own ISO-8859-1 choice.
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::CharsetRequest(vec!["UTF-8".to_string(), "ISO-8859-1".to_string()]),
+        );
+
+        assert_eq!(
+            app.worlds[0].negotiated_encoding,
+            Some(Encoding::Latin1),
+            "the explicit per-world setting must win over UTF-8, not the other way around"
+        );
+        let expected = build_charset_accepted("ISO-8859-1");
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(bytes, expected, "must confirm the user's own encoding, not UTF-8"),
+            other => panic!("expected a Raw CHARSET ACCEPTED(ISO-8859-1) response, got {other:?}"),
+        }
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::SetEncoding(enc)) => assert_eq!(enc, Encoding::Latin1),
+            other => panic!("expected a queued SetEncoding(Latin1), got {other:?}"),
+        }
+    }
+
+    /// Job 13 (plan Phase 4, 4.4): when the offer does NOT include the user's
+    /// explicit encoding, Clay rejects it outright rather than silently
+    /// accepting something else - accepting-but-not-applying is exactly
+    /// finding 7's bug in the other direction, and applying an encoding the
+    /// user didn't choose is the "silently overridden" case the plan warns
+    /// against.
+    #[test]
+    fn handle_telnet_event_charset_request_rejects_when_explicit_choice_not_offered() {
+        let mut app = telnet_event_test_app("w");
+        app.worlds[0].settings.encoding = Encoding::Fansi;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::CharsetRequest(vec!["UTF-8".to_string(), "ISO-8859-1".to_string()]),
+        );
+
+        assert_eq!(
+            app.worlds[0].negotiated_encoding, None,
+            "must not silently negotiate a different encoding than the user's explicit choice"
+        );
+        let expected = build_charset_rejected();
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(bytes, expected),
+            other => panic!("expected a Raw CHARSET REJECTED response, got {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "must not queue a SetEncoding when the offer was rejected"
+        );
+    }
+
+    #[test]
+    fn handle_telnet_event_gmcp_message_stores_gmcp_data() {
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage("Core.Hello".to_string(), "{}".to_string()),
+        );
+        assert_eq!(app.worlds[0].gmcp_data.get("Core.Hello"), Some(&"{}".to_string()));
+    }
+
+    #[test]
+    fn handle_telnet_event_msdp_variable_stores_msdp_variables() {
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::MsdpVariable("HP".to_string(), "100".to_string()),
+        );
+        assert_eq!(app.worlds[0].msdp_variables.get("HP"), Some(&"100".to_string()));
+    }
+
+    // ======================================================================
+    // mud-status-display.md Job 1: World::stats, fed from the real
+    // handle_gmcp_received/handle_msdp_received dispatch path (not just the
+    // stats::WorldStats unit tests in stats.rs), to prove the wiring itself -
+    // gating on Char.*, case-insensitivity, and per-world isolation - works
+    // the same way a live connection would exercise it.
+    // ======================================================================
+
+    #[test]
+    fn handle_telnet_event_gmcp_char_message_feeds_world_stats() {
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), r#"{"hp":"80","maxhp":"100"}"#.to_string()),
+        );
+        let entries = app.worlds[0].stats.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "hp");
+        assert_eq!(
+            entries[0].value,
+            crate::stats::StatValue::Gauge { current: "80".to_string(), maximum: "100".to_string() }
+        );
+    }
+
+    #[test]
+    fn handle_telnet_event_gmcp_char_package_match_is_case_insensitive() {
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage("cHAR.Vitals".to_string(), r#"{"hp":"80"}"#.to_string()),
+        );
+        assert!(!app.worlds[0].stats.is_empty(), "Char.* must feed World::stats regardless of case");
+    }
+
+    #[test]
+    fn handle_telnet_event_gmcp_non_char_packages_do_not_feed_world_stats() {
+        let mut app = telnet_event_test_app("w");
+        for (pkg, json) in [
+            ("Room.Info", r#"{"name":"The Temple"}"#),
+            ("Comm.Channel", r#"{"name":"gossip"}"#),
+            ("Client.Media.Default", r#"{"url":"https://example.com"}"#),
+        ] {
+            dispatch_telnet_event(
+                &mut app,
+                &TelnetTarget::World("w".to_string()),
+                &TelnetEvent::GmcpMessage(pkg.to_string(), json.to_string()),
+            );
+        }
+        assert!(
+            app.worlds[0].stats.is_empty(),
+            "Room./Comm./Client. packages must never feed World::stats, even though they still \
+            populate gmcp_data/mcmp_default_url as before"
+        );
+        // Confirm those handlers still ran normally (Job 1 must not change existing behaviour).
+        assert!(!app.worlds[0].gmcp_data.is_empty());
+        assert_eq!(app.worlds[0].mcmp_default_url, "https://example.com");
+    }
+
+    #[test]
+    fn handle_telnet_event_client_media_package_match_is_case_insensitive() {
+        // GMCP package names are case-insensitive per spec, but all three
+        // Client.Media comparisons used case-sensitive `==`/`starts_with`, so a
+        // server spelling the package in lower case had its media silently
+        // ignored. `handle_gmcp_media` now matches on a lowercased copy and
+        // derives the Play/Stop/Load action from that normalized name rather
+        // than from the server's spelling (the downstream arms match those
+        // three exactly, so taking the raw suffix would break playback).
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage(
+                "client.media.default".to_string(),
+                r#"{"url":"https://lower.example.com"}"#.to_string(),
+            ),
+        );
+        assert_eq!(
+            app.worlds[0].mcmp_default_url, "https://lower.example.com",
+            "a lower-cased Client.Media.Default must be handled like the canonical spelling"
+        );
+    }
+
+    #[test]
+    fn handle_telnet_event_msdp_variable_feeds_world_stats() {
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::MsdpVariable("HEALTH".to_string(), "\"100\"".to_string()),
+        );
+        let entries = app.worlds[0].stats.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "HEALTH");
+        assert_eq!(entries[0].origin, crate::stats::StatOrigin::Msdp);
+    }
+
+    #[test]
+    fn world_stats_do_not_mix_between_worlds() {
+        let mut app = telnet_event_test_app("alpha");
+        app.worlds.push(World::new("beta"));
+
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("alpha".to_string()),
+            &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), r#"{"hp":"80"}"#.to_string()),
+        );
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("beta".to_string()),
+            &TelnetEvent::MsdpVariable("MANA".to_string(), "\"40\"".to_string()),
+        );
+
+        let alpha_entries = app.worlds[0].stats.entries();
+        let beta_entries = app.worlds[1].stats.entries();
+        assert_eq!(alpha_entries.len(), 1);
+        assert_eq!(alpha_entries[0].key, "hp");
+        assert_eq!(beta_entries.len(), 1);
+        assert_eq!(beta_entries[0].key, "MANA");
+        assert!(
+            app.worlds[0].stats.entries().iter().all(|e| e.key != "MANA"),
+            "beta's MSDP variable must not leak into alpha's stats"
+        );
+        assert!(
+            app.worlds[1].stats.entries().iter().all(|e| e.key != "hp"),
+            "alpha's GMCP data must not leak into beta's stats"
+        );
+    }
+
+    // ======================================================================
+    // mud-status-display.md Job 2: wire protocol and coalescing (plan D4/D5).
+    // ======================================================================
+
+    #[test]
+    fn gmcp_char_update_marks_world_dirty_and_one_flush_broadcasts_it() {
+        let mut app = telnet_event_test_app("w");
+        assert!(!app.worlds[0].stats_dirty, "a fresh world must not start dirty");
+
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), r#"{"hp":"80","maxhp":"100"}"#.to_string()),
+        );
+        assert!(app.worlds[0].stats_dirty, "a Char.* update must mark the world dirty");
+
+        app.flush_dirty_stats();
+        assert!(!app.worlds[0].stats_dirty, "flushing must clear the dirty flag");
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let updates: Vec<_> = log.iter().filter(|m| matches!(m, WsMessage::StatsUpdate { .. })).collect();
+        assert_eq!(updates.len(), 1, "exactly one StatsUpdate must have been broadcast, got {:?}", updates);
+        let WsMessage::StatsUpdate { world_index, stats } = updates[0] else { unreachable!() };
+        assert_eq!(*world_index, 0);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].key, "hp");
+        assert_eq!(
+            stats[0].value,
+            crate::stats::StatValue::Gauge { current: "80".to_string(), maximum: "100".to_string() }
+        );
+    }
+
+    #[test]
+    fn non_char_gmcp_does_not_spuriously_mark_worlds_dirty() {
+        // A world that never gets any Char.*/MSDP data, and one that is never touched at
+        // all, must never be marked dirty - flushing must not broadcast an empty
+        // StatsUpdate for a world that never had anything to say in the first place
+        // (that would defeat D4's whole point: pointless broadcasts on chatty non-vitals
+        // GMCP traffic).
+        let mut app = telnet_event_test_app("w");
+        app.worlds.push(World::new("untouched"));
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage("Room.Info".to_string(), r#"{"name":"The Temple"}"#.to_string()),
+        );
+        assert!(!app.worlds[0].stats_dirty, "a non-Char.* package must not mark the world dirty");
+        assert!(!app.worlds[1].stats_dirty);
+
+        app.flush_dirty_stats();
+        let log = app.ws_broadcast_log.lock().unwrap();
+        assert!(
+            log.iter().all(|m| !matches!(m, WsMessage::StatsUpdate { .. })),
+            "no StatsUpdate should have been broadcast for either world"
+        );
+    }
+
+    #[test]
+    fn burst_of_rapid_updates_produces_one_bounded_flush_not_one_per_update() {
+        // This is the load-bearing test for plan D4: Char.Vitals can arrive several times a
+        // second, and broadcasting every single one is exactly the pattern that has
+        // previously saturated the WebSocket channel in this project.
+        let mut app = telnet_event_test_app("w");
+        for hp in 0..50 {
+            dispatch_telnet_event(
+                &mut app,
+                &TelnetTarget::World("w".to_string()),
+                &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), format!(r#"{{"hp":"{hp}"}}"#)),
+            );
+        }
+        // One flush, no matter how many updates landed since the last one.
+        app.flush_dirty_stats();
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let updates: Vec<_> = log.iter().filter(|m| matches!(m, WsMessage::StatsUpdate { .. })).collect();
+        assert_eq!(
+            updates.len(), 1,
+            "50 rapid updates must coalesce into exactly one broadcast, got {}", updates.len()
+        );
+    }
+
+    #[test]
+    fn trailing_edge_of_a_burst_is_delivered_not_dropped() {
+        // The bug D4 explicitly calls out: a naive "drop if too soon" rate limit never
+        // sends the FINAL state once updates stop, leaving clients stuck on stale values.
+        // Coalescing must instead always deliver the latest state on the next flush.
+        let mut app = telnet_event_test_app("w");
+        for hp in [80, 60, 40, 20, 1] {
+            dispatch_telnet_event(
+                &mut app,
+                &TelnetTarget::World("w".to_string()),
+                &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), format!(r#"{{"hp":"{hp}"}}"#)),
+            );
+        }
+        app.flush_dirty_stats();
+
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let updates: Vec<_> = log.iter().filter_map(|m| match m {
+            WsMessage::StatsUpdate { stats, .. } => Some(stats),
+            _ => None,
+        }).collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0][0].key, "hp");
+        assert_eq!(
+            updates[0][0].value,
+            crate::stats::StatValue::Plain("1".to_string()),
+            "the flush must carry the LAST update's value (hp=1), not an earlier one"
+        );
+
+        // A second flush with nothing new dirty must not re-broadcast.
+        drop(log);
+        app.flush_dirty_stats();
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let updates: Vec<_> = log.iter().filter(|m| matches!(m, WsMessage::StatsUpdate { .. })).collect();
+        assert_eq!(updates.len(), 1, "a flush with nothing dirty must not add another broadcast");
+    }
+
+    #[test]
+    fn initial_state_carries_stats_for_a_world_that_has_them() {
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), r#"{"hp":"80"}"#.to_string()),
+        );
+        let WsMessage::InitialState { worlds, .. } = app.build_initial_state(0) else {
+            panic!("expected InitialState");
+        };
+        assert_eq!(worlds[0].stats.len(), 1);
+        assert_eq!(worlds[0].stats[0].key, "hp");
+    }
+
+    #[test]
+    fn initial_state_carries_empty_stats_for_a_world_without_them() {
+        let app = telnet_event_test_app("w");
+        let WsMessage::InitialState { worlds, .. } = app.build_initial_state(0) else {
+            panic!("expected InitialState");
+        };
+        assert!(worlds[0].stats.is_empty(), "a world with no GMCP/MSDP data must report empty stats, not omit the field");
+    }
+
+    #[test]
+    fn world_state_msg_without_stats_field_still_deserializes_for_backward_compat() {
+        // Simulates an older peer's message (e.g. a server predating this field) - the
+        // `stats` key is simply absent from the JSON, not present-but-empty.
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), r#"{"hp":"80"}"#.to_string()),
+        );
+        let WsMessage::InitialState { worlds, .. } = app.build_initial_state(0) else {
+            panic!("expected InitialState");
+        };
+        let mut json = serde_json::to_value(&worlds[0]).expect("WorldStateMsg must serialize");
+        assert!(json.get("stats").is_some(), "sanity check: the field must exist before we remove it");
+        json.as_object_mut().unwrap().remove("stats");
+
+        let round_tripped: crate::websocket::WorldStateMsg = serde_json::from_value(json)
+            .expect("a WorldStateMsg lacking the stats field must still deserialize (older-peer compat)");
+        assert!(round_tripped.stats.is_empty(), "a missing stats field must default to empty, not fail to parse");
+    }
+
+    #[test]
+    fn disconnect_clears_stats_and_the_next_flush_broadcasts_the_clear() {
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), r#"{"hp":"80"}"#.to_string()),
+        );
+        app.flush_dirty_stats();
+        app.ws_broadcast_log.lock().unwrap().clear();
+        assert!(!app.worlds[0].stats.is_empty(), "sanity check: the world must actually have stats before disconnecting");
+
+        app.handle_disconnected(0);
+        assert!(app.worlds[0].stats.is_empty(), "clear_connection_state must clear World::stats on disconnect");
+        assert!(app.worlds[0].stats_dirty, "the clear itself must mark the world dirty so it propagates");
+
+        app.flush_dirty_stats();
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let found = log.iter().any(|m| matches!(m, WsMessage::StatsUpdate { world_index: 0, stats } if stats.is_empty()));
+        assert!(found, "disconnect must eventually broadcast an EMPTY StatsUpdate, so a client does not \
+            keep showing stats for a dead connection");
+    }
+
+    #[test]
+    fn handle_telnet_event_mssp_data_replaces_world_mssp_data() {
+        // Job 12 (plan Phase 4, 4.2): each MsspData event is a complete snapshot,
+        // so a second event must REPLACE World::mssp_data, not merge/append into it.
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::MsspData(vec![("NAME".to_string(), "Old MUD".to_string())]),
+        );
+        assert_eq!(app.worlds[0].mssp_data, vec![("NAME".to_string(), "Old MUD".to_string())]);
+
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::MsspData(vec![
+                ("NAME".to_string(), "New MUD".to_string()),
+                ("PLAYERS".to_string(), "5".to_string()),
+            ]),
+        );
+        assert_eq!(
+            app.worlds[0].mssp_data,
+            vec![("NAME".to_string(), "New MUD".to_string()), ("PLAYERS".to_string(), "5".to_string())],
+            "second MsspData event must replace, not merge with, the first"
+        );
+    }
+
+    #[test]
+    fn handle_telnet_event_option_enabled_gmcp_sets_gmcp_enabled() {
+        let mut app = telnet_event_test_app("w");
+        assert!(!app.worlds[0].gmcp_enabled);
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::OptionEnabled(TELNET_OPT_GMCP),
+        );
+        assert!(app.worlds[0].gmcp_enabled);
+    }
+
+    #[test]
+    fn handle_telnet_event_option_enabled_msdp_sets_msdp_enabled() {
+        let mut app = telnet_event_test_app("w");
+        assert!(!app.worlds[0].msdp_enabled);
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::OptionEnabled(TELNET_OPT_MSDP),
+        );
+        assert!(app.worlds[0].msdp_enabled);
+    }
+
+    /// `OptionEnabled`/`OptionDisabled` for any option with no `World`
+    /// mirror to set/clear (SGA has neither), and every `TelnetEvent`
+    /// variant `to_app_event` never actually constructs an `AppEvent::Telnet`
+    /// for (`Prompt`, `ProtocolError`), are exhaustive no-op arms in
+    /// `handle_telnet_event` (see its doc comment) rather than a wildcard.
+    /// Pin that they are genuinely inert, not silently wrong.
+    ///
+    /// Before Job 9, `OptionDisabled(TELNET_OPT_GMCP)` was in this same
+    /// list — every option's `OptionDisabled` was unconditionally inert
+    /// (finding 4: "DONT/WONT are ignored entirely and never clear
+    /// anything"). Job 9's RFC 1143 Q method fix makes `OptionDisabled`
+    /// real for GMCP/MSDP/NAWS specifically, so it moved out to its own
+    /// test below (`handle_telnet_event_option_disabled_*`) rather than
+    /// silently staying "pinned inert" here alongside a change that made it
+    /// not inert. `CompressionStarted`/`CompressionEnded` moved out the same
+    /// way in Job 10a (plan Phase 3, step 3.3): they now maintain
+    /// `World::mccp2_active` (see `handle_telnet_event_compression_started_*`
+    /// below) rather than being inert.
+    #[test]
+    fn handle_telnet_event_non_actionable_variants_change_nothing() {
+        let mut app = telnet_event_test_app("w");
+        let before_gmcp = app.worlds[0].gmcp_enabled;
+        let before_msdp = app.worlds[0].msdp_enabled;
+        let before_telnet_mode = app.worlds[0].telnet_mode;
+
+        for ev in [
+            TelnetEvent::OptionEnabled(crate::telnet::TELNET_OPT_SGA),
+            TelnetEvent::OptionDisabled(crate::telnet::TELNET_OPT_SGA),
+            TelnetEvent::ProtocolError("boom".to_string()),
+            TelnetEvent::Prompt(vec![1, 2, 3]),
+        ] {
+            dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &ev);
+        }
+
+        assert_eq!(app.worlds[0].gmcp_enabled, before_gmcp);
+        assert_eq!(app.worlds[0].msdp_enabled, before_msdp);
+        assert_eq!(app.worlds[0].telnet_mode, before_telnet_mode);
+    }
+
+    /// Job 10a (plan Phase 3, step 3.3, the MCCP2 hot-reload guard):
+    /// `CompressionStarted` sets `World::mccp2_active` so the reload restore
+    /// path in `run_app`/`run_app_headless` can disconnect a compressed
+    /// world instead of handing its dead zlib stream to a fresh plaintext
+    /// parser.
+    #[test]
+    fn handle_telnet_event_compression_started_sets_mccp2_active() {
+        let mut app = telnet_event_test_app("w");
+        assert!(!app.worlds[0].mccp2_active);
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::CompressionStarted);
+        assert!(app.worlds[0].mccp2_active);
+    }
+
+    /// The paired clear: the far end turned compression back off
+    /// (`Z_STREAM_END`), so the flag must not keep claiming compression is
+    /// active.
+    #[test]
+    fn handle_telnet_event_compression_ended_clears_mccp2_active() {
+        let mut app = telnet_event_test_app("w");
+        app.worlds[0].mccp2_active = true;
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::CompressionEnded);
+        assert!(!app.worlds[0].mccp2_active);
+    }
+
+    /// Job 9 (finding 4, RFC 1143 Q method): `OptionDisabled` clears the
+    /// matching `World` mirror, the paired fix to `OptionEnabled` setting it.
+    #[test]
+    fn handle_telnet_event_option_disabled_gmcp_clears_gmcp_enabled() {
+        let mut app = telnet_event_test_app("w");
+        app.worlds[0].gmcp_enabled = true;
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::OptionDisabled(TELNET_OPT_GMCP),
+        );
+        assert!(!app.worlds[0].gmcp_enabled);
+    }
+
+    #[test]
+    fn handle_telnet_event_option_disabled_msdp_clears_msdp_enabled() {
+        let mut app = telnet_event_test_app("w");
+        app.worlds[0].msdp_enabled = true;
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::OptionDisabled(TELNET_OPT_MSDP),
+        );
+        assert!(!app.worlds[0].msdp_enabled);
+    }
+
+    #[test]
+    fn handle_telnet_event_option_disabled_naws_clears_naws_enabled() {
+        let mut app = telnet_event_test_app("w");
+        app.worlds[0].naws_enabled = true;
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::OptionDisabled(crate::telnet::TELNET_OPT_NAWS),
+        );
+        assert!(!app.worlds[0].naws_enabled);
+    }
+
+    /// Job 10b (plan Phase 3, step 3.4, finding 7): `EchoOff` (`IAC WILL ECHO`) sets
+    /// `World::echo_masked` so the console/GUI/web/SSH remote console all mask input.
+    #[test]
+    fn handle_telnet_event_echo_off_sets_echo_masked() {
+        let mut app = telnet_event_test_app("w");
+        assert!(!app.worlds[0].echo_masked);
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::EchoOff);
+        assert!(app.worlds[0].echo_masked);
+    }
+
+    /// The paired clear: `EchoOn` (`IAC WONT ECHO`) turns masking back off.
+    #[test]
+    fn handle_telnet_event_echo_on_clears_echo_masked() {
+        let mut app = telnet_event_test_app("w");
+        app.worlds[0].echo_masked = true;
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::EchoOn);
+        assert!(!app.worlds[0].echo_masked);
+    }
+
+    /// `handle_echo_mask_changed` only broadcasts `EchoMaskChanged` on an actual state
+    /// change (repeat `WILL ECHO` on an already-masked world must not spam every client).
+    #[test]
+    fn handle_telnet_event_echo_off_broadcasts_only_on_change() {
+        let mut app = telnet_event_test_app("w");
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::EchoOff);
+        let count_after_first = app.ws_broadcast_log.lock().unwrap()
+            .iter().filter(|m| matches!(m, WsMessage::EchoMaskChanged { .. })).count();
+        assert_eq!(count_after_first, 1);
+
+        // Repeat WILL ECHO on an already-masked world - ECHO answers unconditionally
+        // every time on the wire (no Q-method dedup), but the App-level broadcast must
+        // still only fire once per real transition.
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::EchoOff);
+        let count_after_second = app.ws_broadcast_log.lock().unwrap()
+            .iter().filter(|m| matches!(m, WsMessage::EchoMaskChanged { .. })).count();
+        assert_eq!(count_after_second, 1, "a repeat EchoOff on an already-masked world must not broadcast again");
+
+        dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::EchoOn);
+        let log = app.ws_broadcast_log.lock().unwrap();
+        let masks: Vec<bool> = log.iter().filter_map(|m| match m {
+            WsMessage::EchoMaskChanged { masked, .. } => Some(*masked),
+            _ => None,
+        }).collect();
+        assert_eq!(masks, vec![true, false], "EchoOn after EchoOff must broadcast the real transition");
+    }
+
+    /// Finding 2's specific gap, closed by this job: before Job 8, the
+    /// `run_app_headless` dispatch loop (the "console reload loop" — see
+    /// this file's earlier job7_migration_tests, which cover its reader
+    /// side) had NO arm at all for `AppEvent::CharsetRequested`, so a CHARSET
+    /// REQUEST arriving on that path was silently dropped by its trailing
+    /// `_ => {}` wildcard - the one thing every other dispatch site (except
+    /// daemon.rs's `-D` loop, which had the opposite problem: it had ONLY
+    /// this arm) got right. After Job 8, that dispatch site's entire body is
+    /// the same two-line `find_world_index` + `handle_telnet_event`
+    /// resolution as the other four sites (see `dispatch_telnet_event`
+    /// above, which is that exact resolution) — so this test, run against
+    /// that identical shape, is proof CHARSET now reaches `App` on the
+    /// console-reload path specifically, not just in the abstract.
+    #[test]
+    fn console_reload_dispatch_path_now_handles_charset_requested() {
+        let mut app = telnet_event_test_app("consoleworld");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+        assert_eq!(app.worlds[0].negotiated_encoding, None);
+
+        // The exact AppEvent value run_app_headless's event loop receives on
+        // its channel for a real `IAC SB CHARSET REQUEST ";UTF-8" IAC SE`.
+        let event = AppEvent::Telnet(
+            TelnetTarget::World("consoleworld".to_string()),
+            TelnetEvent::CharsetRequest(vec!["UTF-8".to_string()]),
+        );
+
+        // run_app_headless's own dispatch arm, verbatim.
+        match event {
+            AppEvent::Telnet(ref target, ref ev) => match target {
+                TelnetTarget::World(world_name) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        app.handle_telnet_event(world_idx, ev);
+                    }
+                }
+                TelnetTarget::Multiuser { .. } => {}
+            },
+            _ => panic!("constructed an AppEvent::Telnet above"),
+        }
+
+        assert_eq!(
+            app.worlds[0].negotiated_encoding,
+            Some(Encoding::Utf8),
+            "CharsetRequested must reach handle_charset_requested on the console-reload path"
+        );
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(_)) => {}
+            _ => panic!("expected a queued CHARSET ACCEPTED response on the console-reload path"),
+        }
+    }
+
+    // ======================================================================
+    // Plan Job 9 (3.1 + 3.2 of investigate-differences-between-tinyfugu-
+    // fluffy-stallman.md): RFC 1143 Q method (finding 4) plus the paired
+    // App-side fix to World::clear_connection_state, which used to leave
+    // gmcp_enabled/msdp_enabled/gmcp_data/msdp_variables/mcmp_default_url/
+    // gmcp_supported_packages/uses_wont_echo_prompt set across a reconnect.
+
+    /// End-to-end: a real `TelnetSession` sees `WILL GMCP` then `WONT GMCP`
+    /// on the same connection, and the resulting events - routed through
+    /// the exact same `find_world_index` + `handle_telnet_event` resolution
+    /// every dispatch site uses (see `dispatch_telnet_event`) - both enable
+    /// and then clear `World::gmcp_enabled`. This is the full chain finding
+    /// 4's fix promises: not just that `OptionDisabled` exists, but that a
+    /// live WONT after an enabled WILL actually reaches `App` and clears
+    /// the mirror.
+    #[test]
+    fn wont_gmcp_after_enabled_will_gmcp_clears_gmcp_enabled_end_to_end() {
+        use crate::telnet::{TelnetConfig, TelnetSession, TELNET_IAC, TELNET_WILL, TELNET_WONT, TELNET_OPT_GMCP};
+
+        let mut app = telnet_event_test_app("w");
+        let mut session = TelnetSession::new(TelnetConfig::default());
+
+        let will_outcome = session.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP]);
+        for ev in &will_outcome.events {
+            dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), ev);
+        }
+        assert!(app.worlds[0].gmcp_enabled, "WILL GMCP must have enabled the mirror");
+
+        let wont_outcome = session.feed(&[TELNET_IAC, TELNET_WONT, TELNET_OPT_GMCP]);
+        assert!(
+            wont_outcome.events.contains(&TelnetEvent::OptionDisabled(TELNET_OPT_GMCP)),
+            "WONT GMCP after an enabled WILL GMCP must emit OptionDisabled"
+        );
+        for ev in &wont_outcome.events {
+            dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), ev);
+        }
+        assert!(!app.worlds[0].gmcp_enabled, "WONT GMCP must clear gmcp_enabled");
+    }
+
+    /// `World::clear_connection_state` (finding 4's paired App-side fix): a
+    /// fresh `TelnetSession` per connection already resets the *session's*
+    /// own Q-method state, but before this job the `World`-side mirrors of
+    /// what a *previous* connection had negotiated survived a reconnect.
+    /// Sets every field the plan names, connects, disconnects via
+    /// `clear_connection_state`, and asserts every one comes back to its
+    /// fresh-World default.
+    #[test]
+    fn clear_connection_state_clears_all_telnet_mirrors() {
+        let mut world = World::new("w");
+        world.connected = true;
+        world.telnet_mode = true;
+        world.gmcp_enabled = true;
+        world.msdp_enabled = true;
+        world.gmcp_supported_packages = vec!["Core".to_string(), "Char".to_string()];
+        world.msdp_variables.insert("HP".to_string(), "100".to_string());
+        world.gmcp_data.insert("Core.Hello".to_string(), "{}".to_string());
+        world.mcmp_default_url = "https://example.com/media".to_string();
+        world.uses_wont_echo_prompt = true;
+        world.naws_enabled = true;
+        world.negotiated_encoding = Some(Encoding::Utf8);
+        world.mccp2_active = true;
+        world.echo_masked = true;
+        world.mssp_data = vec![("NAME".to_string(), "Some MUD".to_string())];
+        world.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
+        world.stats_line_shown = true;
+        world.mirrored_stats = vec![crate::stats::StatEntry {
+            key: "hp".to_string(),
+            value: crate::stats::StatValue::Plain("80".to_string()),
+            origin: crate::stats::StatOrigin::Gmcp,
+        }];
+
+        world.clear_connection_state(false, false);
+
+        assert!(!world.connected);
+        assert!(!world.telnet_mode);
+        assert!(!world.naws_enabled);
+        assert_eq!(world.negotiated_encoding, None);
+        assert!(!world.gmcp_enabled, "gmcp_enabled must be cleared on reconnect");
+        assert!(!world.msdp_enabled, "msdp_enabled must be cleared on reconnect");
+        assert!(world.gmcp_supported_packages.is_empty(), "gmcp_supported_packages must be cleared");
+        assert!(world.msdp_variables.is_empty(), "msdp_variables must be cleared");
+        assert!(world.gmcp_data.is_empty(), "gmcp_data must be cleared");
+        assert!(world.mcmp_default_url.is_empty(), "mcmp_default_url must be cleared");
+        assert!(!world.uses_wont_echo_prompt, "uses_wont_echo_prompt must be cleared");
+        assert!(!world.mccp2_active, "mccp2_active must be cleared on reconnect - a fresh \
+            connection has no decompressor, and leaving this set would wrongly disconnect \
+            the world on the next hot reload even though it is no longer compressed");
+        assert!(!world.echo_masked, "echo_masked must be cleared on reconnect - a masked \
+            prompt from the previous connection must not keep hiding ordinary input typed \
+            on the next one");
+        assert!(world.mssp_data.is_empty(), "mssp_data must be cleared on reconnect (Job 12)");
+        assert!(world.stats.is_empty(), "stats must be cleared on reconnect (mud-status-display.md Job 1) - \
+            a status display must not keep showing a previous connection's vitals");
+        assert!(!world.stats_line_shown, "stats_line_shown must be cleared on disconnect (Job 4/D3) - \
+            a real disconnect is the one thing allowed to take the fixed status line back to 0 rows");
+        assert!(world.mirrored_stats.is_empty(), "mirrored_stats must be cleared on disconnect (Job 4)");
     }

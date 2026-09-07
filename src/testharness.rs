@@ -2,16 +2,17 @@
 // Creates an App, connects to test servers, processes events, and captures test outcomes
 
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::{
-    App, World, OutputLine, WriteCommand, AutoConnectType,
-    telnet,
-    find_safe_split_point,
+    App, World, OutputLine, WriteCommand, AutoConnectType, AppEvent,
     build_display_lines,
 };
+use crate::encoding::Encoding;
+use crate::telnet::{StreamReader, StreamWriter, TelnetConfig, TelnetEvent};
+use crate::telnet_reader::{spawn_telnet_reader, TelnetTarget};
+use crate::telnet_writer::spawn_telnet_writer;
 use crate::websocket::WsMessage;
 
 /// The ▶ ownership id used for the harness's single simulated WebSocket client. Distinct
@@ -57,6 +58,16 @@ pub enum TestEvent {
     /// WS send: ClaimedNew - (world_index, number of lines claimed). Per-client, not a
     /// broadcast; see WsMessage::ClaimedNew's doc comment in websocket.rs.
     WsClaimedNew(usize, usize),
+    /// Telnet negotiation/protocol events (plan Job 4,
+    /// investigate-differences-between-tinyfugu-fluffy-stallman.md). Only observable now
+    /// that the harness answers negotiation via `spawn_telnet_reader` instead of
+    /// discarding `result.responses` entirely.
+    TelnetDetected(String),
+    NawsRequested(String),
+    TtypeRequested(String),
+    CharsetRequested(String, Vec<String>),
+    GmcpReceived(String, String, String),
+    MsdpReceived(String, String, String),
 }
 
 /// State checks for AssertState action
@@ -83,6 +94,10 @@ pub struct TestWorldConfig {
     pub auto_login_type: AutoConnectType,
     pub username: String,
     pub password: String,
+    /// `TelnetSession` configuration for this world's connection, threaded through to
+    /// `spawn_telnet_reader` (plan Job 4). Most scenarios just want
+    /// `TelnetConfig::default()`.
+    pub telnet_config: TelnetConfig,
 }
 
 /// Overall test configuration
@@ -158,11 +173,59 @@ struct TestWorldConnection {
     cmd_tx: mpsc::Sender<WriteCommand>,
 }
 
-/// Channel message from reader tasks to the harness
+/// Channel message from reader tasks to the harness. This is deliberately its own
+/// (smaller) type rather than `AppEvent` itself: `spawn_telnet_reader` (plan Job 4) always
+/// speaks `AppEvent` — it's the same reader production code will eventually use — but
+/// `run_test_scenario`'s event loop below only cares about the single-world-target subset
+/// of it, via `app_event_to_reader_event`.
 enum ReaderEvent {
     Data(String, Vec<u8>),    // world_name, cleaned bytes (telnet processed)
     Disconnected(String),      // world_name
     Prompt(String, Vec<u8>),   // world_name, prompt bytes
+    /// Telnet negotiation/protocol events (plan Job 4) - the harness could not observe
+    /// any of these before migrating onto `spawn_telnet_reader`, since its old hand-rolled
+    /// reader loop discarded `result.responses` (and every event besides prompt/data)
+    /// entirely.
+    TelnetDetected(String),
+    NawsRequested(String),
+    TtypeRequested(String),
+    CharsetRequested(String, Vec<String>),
+    Gmcp(String, String, String),   // world_name, package, json_data
+    Msdp(String, String, String),   // world_name, variable, value_json
+}
+
+/// Bridge from `spawn_telnet_reader`'s `AppEvent`s to the harness's own `ReaderEvent`.
+/// `AppEvent` carries every event shape in the whole app (WebSocket, multiuser, media,
+/// ...); the harness only ever spawns `TelnetTarget::World` readers, so only the
+/// single-user world-shaped variants are relevant here - everything else is `None`
+/// deliberately (unlike `telnet_reader::to_app_event`, this is test-only glue code, not
+/// the anti-drift mapper, so a plain wildcard is fine).
+fn app_event_to_reader_event(ev: AppEvent) -> Option<ReaderEvent> {
+    match ev {
+        AppEvent::ServerData(world_name, bytes) => Some(ReaderEvent::Data(world_name, bytes)),
+        AppEvent::Disconnected(world_name, _conn_id) => Some(ReaderEvent::Disconnected(world_name)),
+        AppEvent::Prompt(world_name, bytes) => Some(ReaderEvent::Prompt(world_name, bytes)),
+        // AppEvent::Telnet (plan Phase 2, Step 2.7) replaced the nine formerly-separate
+        // single-user telnet AppEvent variants this bridge used to match directly; unwrap
+        // it here to the same TelnetTarget::World-only subset as before (a plain wildcard
+        // covers the rest below, same as always).
+        AppEvent::Telnet(TelnetTarget::World(world_name), ev) => match ev {
+            TelnetEvent::TelnetDetected => Some(ReaderEvent::TelnetDetected(world_name)),
+            TelnetEvent::NawsRequested => Some(ReaderEvent::NawsRequested(world_name)),
+            TelnetEvent::TtypeRequested => Some(ReaderEvent::TtypeRequested(world_name)),
+            TelnetEvent::CharsetRequest(charsets) => {
+                Some(ReaderEvent::CharsetRequested(world_name, charsets))
+            }
+            TelnetEvent::GmcpMessage(package, json) => {
+                Some(ReaderEvent::Gmcp(world_name, package, json))
+            }
+            TelnetEvent::MsdpVariable(variable, value) => {
+                Some(ReaderEvent::Msdp(world_name, variable, value))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Run a test scenario with the given configuration and actions.
@@ -205,91 +268,43 @@ pub async fn run_test_scenario(
             Ok(tcp_stream) => {
                 let (read_half, write_half) = tcp_stream.into_split();
                 let world_name = wc.name.clone();
-                let tx = reader_tx.clone();
 
-                // Spawn reader task (mirrors the real reader task pattern from main.rs)
-                let reader_handle = tokio::spawn(async move {
-                    let mut reader = read_half;
-                    let mut buf = vec![0u8; 8192];
-                    let mut line_buffer: Vec<u8> = Vec::new();
+                // Writer task. Plan Job 13 (Phase 4, 4.4): migrated onto
+                // spawn_telnet_writer, same as every production writer loop - the
+                // harness gets IAC-escaping and (should a scenario ever need it)
+                // CHARSET-driven encoding switches for free instead of a fourteenth
+                // hand-rolled copy. spawn_telnet_reader needs a clone of the returned
+                // Sender too: telnet negotiation replies (outcome.wire) go out through
+                // the same socket as user-issued commands, via the same writer task.
+                // No scenario here exercises a non-UTF-8 world, so Encoding::Utf8 is
+                // the harness's fixed initial encoding.
+                let cmd_tx = spawn_telnet_writer(StreamWriter::Plain(write_half), Encoding::Utf8);
 
-                    loop {
-                        match reader.read(&mut buf).await {
-                            Ok(0) => {
-                                // Flush remaining buffer
-                                if !line_buffer.is_empty() {
-                                    let result = telnet::process_telnet(&line_buffer);
-                                    if let Some(prompt_bytes) = result.prompt {
-                                        let _ = tx.send(ReaderEvent::Prompt(
-                                            world_name.clone(), prompt_bytes,
-                                        ));
-                                    }
-                                    if !result.cleaned.is_empty() {
-                                        let _ = tx.send(ReaderEvent::Data(
-                                            world_name.clone(), result.cleaned,
-                                        ));
-                                    }
-                                }
-                                let _ = tx.send(ReaderEvent::Disconnected(world_name.clone()));
-                                break;
-                            }
-                            Ok(n) => {
-                                line_buffer.extend_from_slice(&buf[..n]);
-
-                                let split_at = find_safe_split_point(&line_buffer);
-                                let to_send = if split_at > 0 {
-                                    line_buffer.drain(..split_at).collect()
-                                } else if !line_buffer.is_empty() {
-                                    std::mem::take(&mut line_buffer)
-                                } else {
-                                    Vec::new()
-                                };
-
-                                if !to_send.is_empty() {
-                                    let result = telnet::process_telnet(&to_send);
-
-                                    // Send prompt first (like the real reader)
-                                    if let Some(prompt_bytes) = result.prompt {
-                                        let _ = tx.send(ReaderEvent::Prompt(
-                                            world_name.clone(), prompt_bytes,
-                                        ));
-                                    }
-
-                                    // Send cleaned data
-                                    if !result.cleaned.is_empty() {
-                                        let _ = tx.send(ReaderEvent::Data(
-                                            world_name.clone(), result.cleaned,
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                let _ = tx.send(ReaderEvent::Disconnected(world_name.clone()));
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                // Spawn writer task
-                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
-                let mut writer = write_half;
+                // Bridge AppEvents from spawn_telnet_reader (plan Job 4) into the
+                // harness's own ReaderEvent channel - see app_event_to_reader_event's
+                // doc comment for why this indirection exists.
+                let (app_event_tx, mut app_event_rx) = mpsc::channel::<AppEvent>(64);
+                let bridge_tx = reader_tx.clone();
                 tokio::spawn(async move {
-                    while let Some(cmd) = cmd_rx.recv().await {
-                        let bytes = match &cmd {
-                            WriteCommand::Text(text) => {
-                                let mut b = text.as_bytes().to_vec();
-                                b.extend_from_slice(b"\r\n");
-                                b
-                            }
-                            WriteCommand::Raw(raw) => raw.clone(),
-                            WriteCommand::Shutdown => break,
-                        };
-                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await.is_err() {
-                            break;
+                    while let Some(ev) = app_event_rx.recv().await {
+                        if let Some(re) = app_event_to_reader_event(ev) {
+                            let _ = bridge_tx.send(re);
                         }
                     }
                 });
+
+                // Spawn the real reader (plan Job 4). This is what makes the harness
+                // stop discarding telnet negotiation replies (outcome.wire) and every
+                // protocol event besides prompt/data - which its old hand-rolled loop
+                // above did entirely.
+                let reader_handle = spawn_telnet_reader(
+                    StreamReader::Plain(read_half),
+                    cmd_tx.clone(),
+                    app_event_tx,
+                    TelnetTarget::World(world_name.clone()),
+                    1, // conn_id: the harness does not model reconnects today
+                    wc.telnet_config.clone(),
+                );
 
                 // Mark world as connected
                 app.worlds[idx].connected = true;
@@ -671,6 +686,45 @@ pub async fn run_test_scenario(
                                     events.push(TestEvent::AutoLoginSent(world_name, cmd));
                                 }
                             }
+                        }
+                    }
+                    ReaderEvent::TelnetDetected(world_name) => {
+                        if let Some(idx) = app.find_world_index(&world_name) {
+                            app.handle_telnet_detected(idx);
+                            events.push(TestEvent::TelnetDetected(world_name));
+                        }
+                    }
+                    ReaderEvent::NawsRequested(world_name) => {
+                        if let Some(idx) = app.find_world_index(&world_name) {
+                            app.handle_naws_requested(idx);
+                            events.push(TestEvent::NawsRequested(world_name));
+                        }
+                    }
+                    ReaderEvent::TtypeRequested(world_name) => {
+                        // Job 12 (plan Phase 4, 4.1): App no longer answers TTYPE
+                        // itself - the TelnetSession already put the MTTS-cycled
+                        // reply on the wire before this event was even produced
+                        // (see handle_telnet_event's TtypeRequested arm).
+                        if app.find_world_index(&world_name).is_some() {
+                            events.push(TestEvent::TtypeRequested(world_name));
+                        }
+                    }
+                    ReaderEvent::CharsetRequested(world_name, charsets) => {
+                        if let Some(idx) = app.find_world_index(&world_name) {
+                            app.handle_charset_requested(idx, &charsets);
+                            events.push(TestEvent::CharsetRequested(world_name, charsets));
+                        }
+                    }
+                    ReaderEvent::Gmcp(world_name, package, json) => {
+                        if let Some(idx) = app.find_world_index(&world_name) {
+                            app.handle_gmcp_received(idx, &package, &json);
+                            events.push(TestEvent::GmcpReceived(world_name, package, json));
+                        }
+                    }
+                    ReaderEvent::Msdp(world_name, variable, value) => {
+                        if let Some(idx) = app.find_world_index(&world_name) {
+                            app.handle_msdp_received(idx, &variable, &value);
+                            events.push(TestEvent::MsdpReceived(world_name, variable, value));
                         }
                     }
                 }

@@ -2,11 +2,15 @@
 
 ## Screen Layout
 
-Clay's terminal interface is divided into three main areas, stacked vertically:
+Clay's terminal interface is divided into three main areas, stacked vertically, plus an
+optional status line that appears once a world starts reporting data (see **Status Display**
+below):
 
 1. **Output Area** - Takes most of the screen, displays MUD text
-2. **Separator Bar** - Single line with status information
-3. **Input Area** - Bottom section for typing commands (1-15 lines)
+2. **Status Line** *(only once a world has data)* - Single line of MUD-reported stats, sits
+   directly above the separator bar
+3. **Separator Bar** - Single line with status information
+4. **Input Area** - Bottom section for typing commands (1-15 lines)
 
 Example separator bar format:
 
@@ -51,6 +55,31 @@ The input area is where you type commands:
 - **Multi-line support**: Resize with `Alt+Up/Down` (1-15 lines)
 - **Cursor**: Standard text cursor with left/right movement
 - **Spell checking**: Misspelled words highlighted in red
+
+## Status Display
+
+Above the separator bar, Clay can show a single line summarizing the current world's GMCP
+`Char.*` and MSDP data — HP/mana-style vitals and whatever else the MUD reports. `/stats`
+(see the **Commands** chapter) shows the same data in full; the web interface, the native
+WebView GUI, and the Android app show it as a collapsible panel instead (see the **Web
+Interface** chapter).
+
+- **Appears and disappears with data, never with a setting.** There is nothing to turn this
+  on or off: the line appears the moment the world's first stat arrives and disappears again
+  on disconnect. A world that never sends anything relevant — most MOO and MUSH servers,
+  which generally implement neither GMCP `Char.*` nor MSDP — simply never shows a status
+  line. That is correct behavior, not a fault.
+- **Fixed height once shown.** The line goes from 0 to 1 row exactly once per connection and
+  stays 1 row for the rest of it, even as individual fields come and go — a MUD dropping or
+  adding a stat mid-session never resizes the output area or disturbs scroll position.
+- **As many entries fit.** A value paired with its maximum by name (e.g. `hp`/`maxhp`) shows
+  as `key current/maximum`; anything else shows as `key value`. Entries are packed left to
+  right until the line runs out of width, with a trailing `+N more` when some don't fit —
+  `/stats` lists everything regardless of width.
+- **Field names are exactly what the MUD sends**, with no reformatting — there is no fixed
+  schema, so Clay pairs a value with its maximum by name shape rather than by a lookup table
+  of known field names. This is also why an unrecognized field is never hidden: it just shows
+  as a plain `key value` entry.
 
 ## More-Mode Pausing
 

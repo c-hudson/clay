@@ -295,6 +295,82 @@ fn validate_media_url(url_str: &str) -> Result<url::Url, &'static str> {
     Ok(parsed)
 }
 
+/// Job 14 (plan Phase 4, MSP): resolve a MUD-supplied bare filename (from a
+/// `!!SOUND(name ...)`/`!!MUSIC(name ...)` trigger with no `U=`) to a path
+/// inside `base_dir`, or reject it. Unlike GMCP `Client.Media.*` — URL-only,
+/// so every reference already goes through `validate_media_url` — MSP's bare
+/// name means "play this file from the local media directory," which is
+/// path-traversal surface Clay never had on this code path before: a name
+/// like `../../../etc/passwd`, `/etc/passwd`, or `C:\Windows\System32\x` must
+/// never resolve outside `base_dir`.
+///
+/// Two layers, per the plan's explicit requirement that a resolution check
+/// alone is not enough:
+///
+/// 1. Lexical rejection, before anything touches the filesystem: any path
+///    separator (`/` or `\` — both, regardless of host platform, since a
+///    legitimate filename never needs either), any colon (catches a Windows
+///    drive letter like `C:` *and* an NTFS alternate-data-stream suffix like
+///    `name:hidden` in one rule), and `.`/`..` themselves. `name` is also
+///    required to parse as exactly one `Path` component (`Normal`) — this is
+///    what actually rejects `..` as a component in general, the colon/slash
+///    checks above are the common cases spelled out for a clearer rejection
+///    reason and because `Path`'s own component parser is platform-flavoured
+///    in ways a MUD-supplied name shouldn't be trusted to route through
+///    (e.g. `Path::new("C:foo").is_absolute()` is `false` on a Unix build of
+///    Clay, so relying on `is_absolute()` alone would miss it on that host).
+/// 2. Resolution containment: even a lexically clean single-component name
+///    could itself be a symlink planted in `base_dir` pointing outside it
+///    (nothing stops a malicious or compromised sound-pack archive from
+///    shipping one). If the joined path already exists, it is canonicalized
+///    and must still start with `base_dir`'s own canonical form - checked
+///    *after* resolution, not only before, exactly as the plan requires. If
+///    it doesn't exist yet, there is nothing to canonicalize and nothing a
+///    symlink could have redirected (a path can't be hijacked via a dirent
+///    that isn't there), so the lexically-checked, not-yet-existing
+///    candidate is returned as-is; `play_file`'s own `fs::read` simply won't
+///    find it, which is the same "nothing to play" outcome as any other
+///    never-downloaded MSP sound.
+pub fn resolve_msp_local_path(name: &str, base_dir: &Path) -> Result<std::path::PathBuf, &'static str> {
+    if name.is_empty() {
+        return Err("empty filename");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("path separator not allowed");
+    }
+    if name.contains(':') {
+        return Err("drive letter / colon not allowed");
+    }
+    if name == "." || name == ".." {
+        return Err("current/parent directory reference not allowed");
+    }
+    // Exactly one Normal component - rejects any remaining Path oddity
+    // (e.g. a lone ".." that slipped past the literal check above via some
+    // other spelling) without trying to normalise it into something safe.
+    let mut components = std::path::Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return Err("filename must be a single path component"),
+    }
+
+    let _ = std::fs::create_dir_all(base_dir);
+    let canonical_base = std::fs::canonicalize(base_dir).map_err(|_| "media directory unavailable")?;
+    let candidate = base_dir.join(name);
+
+    match std::fs::canonicalize(&candidate) {
+        Ok(canonical_candidate) => {
+            if canonical_candidate.starts_with(&canonical_base) {
+                Ok(canonical_candidate)
+            } else {
+                Err("resolved path escapes the media directory")
+            }
+        }
+        // Doesn't exist (yet) - nothing to resolve away from base_dir; see
+        // the doc comment above.
+        Err(_) => Ok(candidate),
+    }
+}
+
 /// Download a file to the cache directory.
 /// Returns the cache path on success. Uses curl for the download.
 /// Called from background threads.
@@ -378,5 +454,117 @@ mod media_url_tests {
     #[test]
     fn accepts_normal_http_url() {
         assert!(validate_media_url("http://cdn.example.com/media/x.wav").is_ok());
+    }
+}
+
+/// Job 14 (plan Phase 4): path-traversal coverage for `resolve_msp_local_path` -
+/// per the plan, "the most important test in the job." Each `temp_base` call
+/// gets its own fresh, uniquely-named directory (keyed by test name + pid) so
+/// parallel `cargo test` runs never share or race on one directory.
+#[cfg(test)]
+mod msp_path_tests {
+    use super::resolve_msp_local_path;
+    use std::path::PathBuf;
+
+    fn temp_base(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("clay_msp_path_test_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test media dir");
+        dir
+    }
+
+    #[test]
+    fn rejects_forward_slash_separator() {
+        let base = temp_base("fwd_slash");
+        assert!(resolve_msp_local_path("sub/evil.wav", &base).is_err());
+    }
+
+    #[test]
+    fn rejects_backslash_separator() {
+        let base = temp_base("backslash");
+        assert!(resolve_msp_local_path("sub\\evil.wav", &base).is_err());
+    }
+
+    #[test]
+    fn rejects_parent_directory_components() {
+        let base = temp_base("parent");
+        assert!(resolve_msp_local_path("..", &base).is_err());
+        assert!(resolve_msp_local_path("../evil.wav", &base).is_err());
+        assert!(resolve_msp_local_path("a/../../evil.wav", &base).is_err());
+    }
+
+    #[test]
+    fn rejects_leading_root_absolute_path() {
+        let base = temp_base("abs_root");
+        assert!(resolve_msp_local_path("/etc/passwd", &base).is_err());
+    }
+
+    #[test]
+    fn rejects_windows_drive_letter() {
+        let base = temp_base("drive_letter");
+        assert!(resolve_msp_local_path("C:\\Windows\\System32\\cmd.exe", &base).is_err());
+        // No separator at all here - only the colon check catches this one,
+        // and Path::new("C:evil.wav").is_absolute() is false even on a
+        // Windows build (drive-relative, not drive-absolute), which is
+        // exactly the "Path's own component parser is platform-flavoured"
+        // trap the doc comment calls out.
+        assert!(resolve_msp_local_path("C:evil.wav", &base).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let base = temp_base("empty");
+        assert!(resolve_msp_local_path("", &base).is_err());
+    }
+
+    #[test]
+    fn accepts_plain_filename_even_when_not_yet_downloaded() {
+        // Most bare-name MSP triggers reference a sound pack Clay never
+        // pre-populates - this must resolve to a candidate path (so
+        // play_file's own fs::read can try it) rather than being rejected
+        // just because the file isn't there yet.
+        let base = temp_base("plain_absent");
+        let result = resolve_msp_local_path("bell.wav", &base).expect("plain filename should resolve");
+        assert_eq!(result, base.join("bell.wav"));
+    }
+
+    #[test]
+    fn accepts_plain_filename_when_present() {
+        let base = temp_base("plain_present");
+        std::fs::write(base.join("bell.wav"), b"RIFF....").unwrap();
+        let result = resolve_msp_local_path("bell.wav", &base).expect("existing plain filename should resolve");
+        assert_eq!(
+            std::fs::canonicalize(&result).unwrap(),
+            std::fs::canonicalize(base.join("bell.wav")).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_that_escapes_after_resolution() {
+        // The lexical checks alone can't catch this: "evil.wav" is a single,
+        // clean path component with no separator/parent-component/drive
+        // letter in sight. Only resolving it and checking containment
+        // *after* resolution (not just before) catches a symlink planted
+        // inside the media directory that points outside it - exactly the
+        // plan's "symlinks... make the before-check insufficient on its own."
+        let base = temp_base("symlink_escape");
+        let outside = temp_base("symlink_escape_target");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"do not play me").unwrap();
+        std::os::unix::fs::symlink(&secret, base.join("evil.wav")).unwrap();
+        assert!(
+            resolve_msp_local_path("evil.wav", &base).is_err(),
+            "a symlink escaping the media directory must be rejected after resolution"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_symlink_that_stays_inside_the_directory() {
+        let base = temp_base("symlink_inside");
+        std::fs::write(base.join("real.wav"), b"RIFF....").unwrap();
+        std::os::unix::fs::symlink(base.join("real.wav"), base.join("alias.wav")).unwrap();
+        assert!(resolve_msp_local_path("alias.wav", &base).is_ok());
     }
 }

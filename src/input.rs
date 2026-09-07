@@ -326,9 +326,16 @@ impl InputArea {
         self.clear_kbnum();
     }
 
-    pub fn take_input(&mut self) -> String {
+    /// Take the current buffer as a submitted command, clearing it. `record_history`
+    /// must be `false` while the current world's `echo_masked` is set (plan Phase 3,
+    /// step 3.4 / finding 7): a password typed at a masked prompt must never land in
+    /// arrow-key recall, where a later `history_prev()` would display it in the clear.
+    /// This is independent of (and in addition to) `App::record_user_input`'s own
+    /// `echo_masked` gate, which covers the per-world log/scrollback/broadcast side —
+    /// this one only ever affects this `InputArea`'s own in-memory `history`.
+    pub fn take_input(&mut self, record_history: bool) -> String {
         let input = self.buffer.clone();
-        if !input.is_empty() {
+        if !input.is_empty() && record_history {
             self.history.push(input.clone());
         }
         self.clear();
@@ -1086,6 +1093,36 @@ mod tests {
         assert_eq!(input.take_kbnum(), 1, "no pending prefix defaults to 1 (TF's kbnum?:1)");
         input.kbnum_digit(0);
         assert_eq!(input.take_kbnum(), 1, "an entered zero is falsy too, same as unset");
+    }
+
+    /// Plan Phase 3, step 3.4 (Job 10b, ECHO masking): `record_history: false` (passed by
+    /// every caller when the current world's `echo_masked` is set) must not push into
+    /// `history`, so a password never becomes reachable via a later Up-arrow.
+    #[test]
+    fn test_take_input_skips_history_when_record_history_false() {
+        let mut input = InputArea::default();
+        input.insert_str("hunter2");
+        let out = input.take_input(false);
+        assert_eq!(out, "hunter2", "the real typed text must still be returned and sent");
+        assert!(input.history.is_empty(), "history must stay empty when record_history is false");
+        assert!(input.buffer.is_empty(), "the buffer must still be cleared either way");
+    }
+
+    #[test]
+    fn test_take_input_records_history_when_record_history_true() {
+        let mut input = InputArea::default();
+        input.insert_str("look");
+        let out = input.take_input(true);
+        assert_eq!(out, "look");
+        assert_eq!(input.history, vec!["look".to_string()]);
+    }
+
+    #[test]
+    fn test_take_input_never_records_empty_input_regardless_of_flag() {
+        let mut input = InputArea::default(); // buffer already empty
+        let out = input.take_input(true);
+        assert_eq!(out, "");
+        assert!(input.history.is_empty(), "empty input was never recorded before this job either");
     }
 
     #[test]

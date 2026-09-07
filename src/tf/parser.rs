@@ -2263,6 +2263,7 @@ Clay:
   /reload  /version  /quit  /remote  /ban  /unban
   /flush  /dump  /note  /tag  /notify  /import  /window
   /font  /update  /dict  /urban  /translate  /url  /testmusic
+  /mssp  /msdp  /stats
 Variables:
   /set  /unset  /let  /setenv  /listvar  /toggle  /export
 Expressions & Control Flow:
@@ -4339,7 +4340,7 @@ mod tests {
         // (reachable via `main.rs::parse_command`), plus the `/tf<name>` prefix escape.
         const CLAY_NATIVE_ONLY: &[&str] = &[
             "actions", "connect", "dict", "dump", "flush", "font", "import",
-            "menu", "note", "notify", "reload", "remote", "setup", "tag",
+            "menu", "msdp", "mssp", "note", "notify", "reload", "remote", "setup", "stats", "tag",
             "testmusic", "tfgag", "tfhelp", "translate", "unban", "update",
             "urban", "url", "web", "window",
         ];

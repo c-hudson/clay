@@ -75,6 +75,24 @@
             <div id="output"></div>
         </div>
 
+        <!-- Status/vitals panel (mud-status-display.md Job 3): a flex SIBLING of
+             #output-container, never a child of #output. Hidden via inline
+             display:none until updateStatsPanel() (app.js) finds the current
+             world's World.stats non-empty (plan D1 - visibility is derived from
+             data, never a setting). Kept out of #output-container specifically so
+             it cannot become part of the scrollable transcript; see
+             updateStatsPanel()'s doc comment in app.js for how its appearing,
+             updating and collapsing are kept from moving the output scroll
+             position. Collapse state is client-side only (localStorage), no
+             server setting. -->
+        <div id="stats-panel" class="stats-panel" style="display:none">
+            <div class="stats-panel-header" id="stats-panel-header" title="Collapse/expand status panel">
+                <span class="stats-panel-title">Status</span>
+                <span class="stats-panel-toggle" id="stats-panel-toggle">&#9662;</span>
+            </div>
+            <div class="stats-panel-body" id="stats-panel-body"></div>
+        </div>
+
         <!-- Note editor (NOTE_MODE only — a genuine separate window/tab, not an
              in-page modal; see WvEvent::NoteWindow in webview_gui.rs). Hidden
              unless window.NOTE_MODE (or ?note=<world_index> in plain-browser
@@ -579,6 +597,24 @@
                         <span class="setting-label">Reconnect</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-auto-reconnect" class="editor-input" autocomplete="off" placeholder="0, 30, web, web,30">
+                        </div>
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">Negotiate</span>
+                        <div class="setting-value">
+                            <div id="world-edit-initiate-negotiation-toggle" class="toggle"></div>
+                        </div>
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">MSP Sound</span>
+                        <div class="setting-value">
+                            <div id="world-edit-msp-enabled-toggle" class="toggle"></div>
+                        </div>
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">MCP Edit</span>
+                        <div class="setting-value">
+                            <div id="world-edit-mcp-enabled-toggle" class="toggle"></div>
                         </div>
                     </div>
                 </div>

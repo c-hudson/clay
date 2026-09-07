@@ -104,6 +104,16 @@ Auto-login only triggers if BOTH username AND password are configured.
 | Latin1 | ISO-8859-1 for older MUDs |
 | Fansi | CP437-like with box drawing characters |
 
+### Protocol Settings
+
+See the **Telnet Features** chapter for what each of these actually negotiates.
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Negotiate | Send Clay's opening telnet offer (terminal type, window size, CHARSET, GMCP, MSDP, MCCP2, MSSP, and MSP when MSP Sound is also on) at connect time instead of waiting for the server to ask first | On |
+| MSP Sound | Play `!!SOUND(...)`/`!!MUSIC(...)` triggers the MUD sends (MUD Sound Protocol). Off means these triggers are not recognized at all — the option is never requested, and any trigger text that still arrives is left in the output unstripped and unplayed | On |
+| MCP Edit | Support MCP (MUD Client Protocol), mainly used by MOOs — makes `@edit` open a real text editor instead of dumping verb source into the scrollback. Off means `#$#`-prefixed protocol lines display as plain text instead of being parsed | On |
+
 ## Web Settings (/web)
 
 Open with `/web` command:

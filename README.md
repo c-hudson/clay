@@ -15,11 +15,14 @@ scrollback and settings.*
 ## Features
 
 **Core MUD client.** Connect to multiple MUD servers at once, over SSL/TLS, with full ANSI
-color and formatting (256-color, true color) and a complete telnet negotiation suite (SGA,
-TTYPE, EOR, NAWS, MCCP2 compression, GMCP, MSDP). Configurable auto-login, unlimited
-scrollback with more-mode pagination, command history, built-in spell checking, tab
-completion for commands and action names, output search/filtering, an Emacs-style kill ring,
-and per-world file logging round out the day-to-day experience.
+color and formatting (256-color, true color) and a wide telnet negotiation suite — ECHO
+(password masking), SGA, TTYPE (with MTTS terminal-capability reporting), EOR, NAWS,
+CHARSET, MCCP2 compression, GMCP, MSDP, MSSP, MSP (sound-effect triggers), and in-band MCP
+2.1 — negotiated proactively at connect (configurable per world) rather than only in
+response to the server. Configurable auto-login, unlimited scrollback with more-mode
+pagination, command history, built-in spell checking, tab completion for commands and
+action names, output search/filtering, an Emacs-style kill ring, and per-world file logging
+round out the day-to-day experience.
 
 **One server, viewed from anywhere.** The same running Clay instance can be viewed
 simultaneously from the terminal TUI, a native WebView GUI (desktop), a browser over
@@ -49,11 +52,14 @@ browser-based editors for live preview), fonts and hanging-indent wrap spacing a
 adjustable, and mouse support is on by default in the console.
 
 **Extras.** GMCP/MSDP structured data exchange (including server-driven sound/music via
-Client.Media), BBS-style ANSI music playback, dictionary/Urban Dictionary/translation/URL-
-shortening lookups, text-to-speech via local engines or Microsoft Edge neural TTS, a
-per-world notes editor, a long-term SQLite scrollback archive with full-text search
-(`/recall -D`), self-update from GitHub releases, grep-mode output search, and headless
-daemon/multiuser server modes for shared or unattended deployments.
+Client.Media, and a per-world status display — `/stats`, a console status line, and a
+collapsible web/GUI/Android panel — built from whatever GMCP `Char.*`/MSDP data a MUD sends;
+it appears automatically the moment any arrives and stays invisible on MUDs, such as most
+MOOs and MUSHes, that send none), BBS-style ANSI music playback, dictionary/Urban
+Dictionary/translation/URL-shortening lookups, text-to-speech via local engines or Microsoft
+Edge neural TTS, a per-world notes editor, a long-term SQLite scrollback archive with
+full-text search (`/recall -D`), self-update from GitHub releases, grep-mode output search,
+and headless daemon/multiuser server modes for shared or unattended deployments.
 
 ## Installation
 

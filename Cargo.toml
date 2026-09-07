@@ -121,6 +121,15 @@ tao = { version = "0.34", optional = true }
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
+# test-util (Sleep::reset/tokio::time::pause+advance) is only needed for
+# `cargo test` — declaring it here rather than adding it to the main tokio
+# dependency above keeps it out of the production binary. Cargo unifies this
+# into the feature set for test/bench targets only, not `cargo build`'s
+# "clay" bin target. Added for src/telnet_reader.rs's idle-flush test (plan
+# Job 4, investigate-differences-between-tinyfugu-fluffy-stallman.md).
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [features]
 default = ["rustls-backend", "native-audio", "ssh-transport"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]

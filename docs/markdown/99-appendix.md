@@ -257,12 +257,25 @@ ESC[48;2;<r>;<g>;<b>m    # Background
 
 ### Option Codes
 
+See the **Telnet Features** chapter for which direction Clay negotiates each of these in
+(accepted from the server, offered by Clay, or both).
+
 | Value | Name | Description |
 |-------|------|-------------|
+| 1 | ECHO | Echo (drives password masking) |
 | 3 | SGA | Suppress Go Ahead |
 | 24 | TTYPE | Terminal Type |
 | 25 | EOR | End of Record |
 | 31 | NAWS | Window Size |
+| 42 | CHARSET | Character Set (RFC 2066) |
+| 69 | MSDP | MUD Server Data Protocol |
+| 70 | MSSP | MUD Server Status Protocol |
+| 86 | MCCP2 | MUD Client Compression Protocol v2 |
+| 90 | MSP | MUD Sound Protocol |
+| 201 | GMCP | Generic MUD Communication Protocol |
+
+MCP (MUD Client Protocol) 2.1 has no telnet option number — it is an in-band protocol
+detected from `#$#`-prefixed text lines. See the **Telnet Features** chapter.
 
 \newpage
 

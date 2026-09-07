@@ -45,6 +45,16 @@ pub enum Encoding {
     Fansi,
 }
 
+/// Byte substituted by `Encoding::encode` for a character with no
+/// representation in the target single-byte encoding (plan Job 13, Phase 4 /
+/// 4.4). `?` (0x3F): plain ASCII, so it never needs telnet IAC-escaping and
+/// can never itself be misread as a different character; it's also the
+/// conventional fallback for exactly this situation (Python's
+/// `errors='replace'` on single-byte codecs, `iconv//TRANSLIT`'s last
+/// resort) — a human reading the MUD's screen sees "a character was lost
+/// here," not mangled bytes, a silently dropped character, or a panic.
+const ENCODE_SUBSTITUTE: u8 = b'?';
+
 impl Encoding {
     pub fn decode(&self, bytes: &[u8]) -> String {
         let result = match self {
@@ -267,6 +277,66 @@ impl Encoding {
         // Strip any remaining control characters (BEL, carriage returns, etc.)
         // Keep Ctrl-N for ANSI music terminator
         result.chars().filter(|&c| (c >= ' ' && c != '\x7f' && !is_c1_control(c)) || c == '\t' || c == '\n' || c == '\x1b' || c == '\x0e').collect()
+    }
+
+    /// Encode `text` into this encoding's byte representation for the wire —
+    /// the outbound half of `decode` (plan Job 13, Phase 4 / 4.4, finding 7:
+    /// "`Encoding` can decode but cannot encode, so every writer emits UTF-8
+    /// no matter what was negotiated"). Never panics and never emits a
+    /// partial/invalid byte sequence: every `char` in `text` produces exactly
+    /// one byte for `Latin1`/`Fansi`, or its UTF-8 bytes for `Utf8`.
+    ///
+    /// Built as a true inverse of `decode` rather than a hand-transcribed
+    /// second copy of its tables, which is exactly the kind of place the
+    /// Windows-1252-not-strict-ISO-8859-1 distinction documented on
+    /// `decode`'s `Latin1` arm (see CLAUDE.md) could silently be lost: for
+    /// each byte `b` in `0x80..=0xFF`, `decode(&[b])` is asked what character
+    /// it produces, and that pairing is inverted. A byte `decode` filters
+    /// out entirely (a C1 control — see `is_c1_control`) has no inverse and
+    /// is simply absent from the table, which is correct: those bytes were
+    /// never round-trippable through `decode` to begin with.
+    pub fn encode(&self, text: &str) -> Vec<u8> {
+        // Every encoding Clay speaks agrees with ASCII below 0x80, and typed
+        // MUD commands are overwhelmingly plain ASCII — skip building the
+        // reverse table entirely for that common case.
+        if text.is_ascii() {
+            return text.as_bytes().to_vec();
+        }
+        match self {
+            Encoding::Utf8 => text.as_bytes().to_vec(),
+            Encoding::Latin1 | Encoding::Fansi => {
+                let reverse = self.build_encode_reverse_table();
+                text.chars()
+                    .map(|c| {
+                        if (c as u32) < 0x80 {
+                            // Already handled by the is_ascii() fast path above for an
+                            // all-ASCII string, but a *mixed* string (the common real
+                            // case - one accented word in an otherwise plain command)
+                            // still reaches here per-char, so ASCII chars need their own
+                            // identity mapping too.
+                            c as u8
+                        } else {
+                            *reverse.get(&c).unwrap_or(&ENCODE_SUBSTITUTE)
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// The `0x80..=0xFF -> char` inverse of this encoding's `decode`, built by
+    /// calling `decode` itself (see `encode`'s doc comment for why). Only
+    /// meaningful for the two table-based single-byte encodings; `Utf8`
+    /// never calls this.
+    fn build_encode_reverse_table(&self) -> std::collections::HashMap<char, u8> {
+        let mut reverse = std::collections::HashMap::with_capacity(128);
+        for b in 0x80u16..=0xFF {
+            let b = b as u8;
+            if let Some(c) = self.decode(&[b]).chars().next() {
+                reverse.entry(c).or_insert(b);
+            }
+        }
+        reverse
     }
 
     pub fn name(&self) -> &'static str {
@@ -1622,5 +1692,140 @@ mod tests {
         assert_eq!(Encoding::Utf8.iana_name(), "UTF-8");
         assert_eq!(Encoding::Latin1.iana_name(), "ISO-8859-1");
         assert_eq!(Encoding::Fansi.iana_name(), "IBM437");
+    }
+
+    // ======================================================================
+    // Encoding::encode (plan Job 13, Phase 4 / 4.4, finding 7): CHARSET
+    // outbound needs a true inverse of `decode`, including the Windows-1252
+    // 0x80-0x9F band, plus a predictable, panic-free substitution for a
+    // character with no representation in the target encoding.
+    // ======================================================================
+
+    /// Round-trip over the full byte range, for every encoding: whenever
+    /// `decode(&[b])` produces exactly one character (i.e. `b` is
+    /// round-trippable — see `encode`'s doc comment for why some bytes,
+    /// filtered C1 controls, are not), `encode` of that character must
+    /// reproduce `b` exactly.
+    fn assert_encode_is_decode_inverse(enc: Encoding) {
+        let mut round_trippable = 0;
+        for b in 0u16..=255 {
+            let b = b as u8;
+            let decoded = enc.decode(&[b]);
+            let mut chars = decoded.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                // decode(&[b]) produced zero or more-than-one char - a
+                // filtered control. Not round-trippable; nothing to assert.
+                continue;
+            };
+            // U+FFFD is decode's lossy stand-in for a byte with no valid
+            // standalone meaning - only reachable for Utf8, where a lone
+            // byte >= 0x80 is never valid UTF-8 by itself (it's either a
+            // continuation byte with no lead, or a lead byte with no
+            // continuation). Many different invalid bytes all collapse to
+            // this same char, so it is the one case where decode produces
+            // exactly one char yet is still not invertible - encoding
+            // U+FFFD back can reproduce at most one of them, never all.
+            if c == '\u{FFFD}' {
+                continue;
+            }
+            round_trippable += 1;
+            assert_eq!(
+                enc.encode(&c.to_string()),
+                vec![b],
+                "{enc:?}: byte {b:#04x} decoded to {c:?} but didn't encode back to itself"
+            );
+        }
+        // Sanity: this loop must actually be exercising real round trips, not
+        // vacuously passing because every byte got filtered. Utf8 has the
+        // fewest (98: the 95 printable ASCII bytes plus tab/newline/0x0E -
+        // BEL survives decode's first control filter but not its second, and
+        // a lone ESC is dropped entirely by strip_non_sgr_sequences as an
+        // incomplete escape sequence); Latin1/Fansi add most of their
+        // 0x80-0xFF table on top of that.
+        assert!(round_trippable >= 90, "{enc:?}: suspiciously few round-trippable bytes ({round_trippable})");
+    }
+
+    #[test]
+    fn test_encode_utf8_round_trips_full_byte_range() {
+        assert_encode_is_decode_inverse(Encoding::Utf8);
+    }
+
+    #[test]
+    fn test_encode_latin1_round_trips_full_byte_range() {
+        assert_encode_is_decode_inverse(Encoding::Latin1);
+    }
+
+    #[test]
+    fn test_encode_fansi_round_trips_full_byte_range() {
+        assert_encode_is_decode_inverse(Encoding::Fansi);
+    }
+
+    /// The Windows-1252 band specifically (CLAUDE.md: Latin1's 0x80-0x9F
+    /// decodes as Windows-1252, not strict ISO-8859-1) — spelled out byte by
+    /// byte rather than relying only on the generic sweep above, since this
+    /// is exactly the table a hand-transcribed reverse mapping could get
+    /// subtly wrong (e.g. by using strict ISO-8859-1's C1 controls instead).
+    #[test]
+    fn test_encode_latin1_windows_1252_band_round_trips() {
+        let cases: &[(u8, char)] = &[
+            (0x80, '\u{20AC}'), // €
+            (0x82, '\u{201A}'), // ‚
+            (0x83, '\u{0192}'), // ƒ
+            (0x85, '\u{2026}'), // …
+            (0x91, '\u{2018}'), // '
+            (0x92, '\u{2019}'), // '
+            (0x93, '\u{201C}'), // "
+            (0x94, '\u{201D}'), // "
+            (0x96, '\u{2013}'), // –
+            (0x97, '\u{2014}'), // —
+            (0x99, '\u{2122}'), // ™
+            (0x9F, '\u{0178}'), // Ÿ
+        ];
+        for &(byte, ch) in cases {
+            assert_eq!(
+                Encoding::Latin1.decode(&[byte]), ch.to_string(),
+                "fixture out of sync with decode's own Windows-1252 table for {byte:#04x}"
+            );
+            assert_eq!(
+                Encoding::Latin1.encode(&ch.to_string()), vec![byte],
+                "encode didn't invert the Windows-1252 mapping for {byte:#04x} ({ch:?})"
+            );
+        }
+        // The five codepoints CP1252 leaves undefined in this band stay C1
+        // controls (see decode's doc comment) - decode drops them, so they
+        // are not round-trippable and encode has no obligation to reproduce
+        // them from their own literal char.
+        for byte in [0x81u8, 0x8D, 0x8F, 0x90, 0x9D] {
+            assert_eq!(Encoding::Latin1.decode(&[byte]), "", "byte {byte:#04x} should be filtered as a C1 control");
+        }
+    }
+
+    /// A character with no representation in a single-byte encoding
+    /// (Latin1/Fansi) must degrade to the chosen substitute, not panic and
+    /// not silently vanish.
+    #[test]
+    fn test_encode_unrepresentable_character_substitutes_and_does_not_panic() {
+        // CJK, well outside either single-byte table.
+        assert_eq!(Encoding::Latin1.encode("日"), vec![ENCODE_SUBSTITUTE]);
+        assert_eq!(Encoding::Fansi.encode("日"), vec![ENCODE_SUBSTITUTE]);
+        // An emoji (multi-byte in UTF-8, still just "no representation" for a
+        // single-byte encoding - not a panic-inducing edge case, just another
+        // unrepresentable char).
+        assert_eq!(Encoding::Latin1.encode("🎉"), vec![ENCODE_SUBSTITUTE]);
+        // Mixed text: only the unrepresentable character is substituted: the
+        // ASCII stays intact around it.
+        assert_eq!(Encoding::Latin1.encode("HP:100日MP:50"), b"HP:100?MP:50".to_vec());
+        // Utf8 has no "unrepresentable" character - never substitutes.
+        assert_eq!(Encoding::Utf8.encode("日"), "日".as_bytes().to_vec());
+    }
+
+    /// `encode` is the identity for plain ASCII across every encoding - the
+    /// overwhelmingly common case (an ordinary typed MUD command).
+    #[test]
+    fn test_encode_ascii_is_identity_for_every_encoding() {
+        for enc in [Encoding::Utf8, Encoding::Latin1, Encoding::Fansi] {
+            assert_eq!(enc.encode("look north"), b"look north".to_vec());
+            assert_eq!(enc.encode(""), Vec::<u8>::new());
+        }
     }
 }
