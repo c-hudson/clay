@@ -4,8 +4,14 @@
 clay.exe
 clay.sent.exe
 
-# Claude Code local settings
-.claude/
+# Claude Code local settings are ignored, but the /release skill is part of the
+# repo (CLAUDE.md documents both its files). machines.md was already tracked;
+# SKILL.md holds the actual build and shutdown commands, so tracking only one of
+# the pair lets them silently diverge.
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/release/
 
 # Debug/trace files
 trace.txt

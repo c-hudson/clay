@@ -168,7 +168,17 @@ release); `-f` prevents the staleness from being introduced in the first place.
 - SSH command: `ssh adrick@192.168.2.14`
 - **Lifecycle:** VM is kept powered off when not in use. `/release` starts it before building and powers it off after (see SKILL.md Step 6b).
 - Start: `VBoxManage startvm clay-win11 --type headless`
-- Stop: `VBoxManage controlvm clay-win11 poweroff`
+- Stop: `ssh adrick@192.168.2.14 "shutdown /s /t 0"`, then poll
+  `VBoxManage showvminfo clay-win11 --machinereadable | grep '^VMState='` until it reads
+  `poweroff`. **Do not use `VBoxManage controlvm ... poweroff`** except as a last resort when
+  SSH is unreachable (try `acpipowerbutton` first): it is a hard power cut, and Windows
+  discards recent writes on the next boot. Verified 2026-09-06 in both directions — a
+  completed `git checkout -- .` was rolled back after a hard poweroff and survived after a
+  graceful one. This is also what corrupts `.git/index` on that VM (`bad signature
+  0x00000000`), and a corrupt index makes every later `git pull` abort, so a build then
+  proceeds against the **old checkout** and ships a stale binary. Repair is
+  `del .git\index` then `git reset` (the index is a rebuildable cache; no commits or
+  working-tree content are lost).
 - **Disk:** C: is ~70GB (resized from 50GB on 2026-07-29; disk UUID `7effa39a-7122-44d7-a15b-286616b4cd34`, the current differencing/snapshot medium attached at SATA-0-0 — resize `VBoxManage modifymedium disk <uuid> --resize <MB>` targets that medium, not the base `clay-win11.vdi`).
 
 **Resizing this disk again — known gotchas (hit 2026-07-29, corrected 2026-07-30):**
