@@ -96,21 +96,29 @@ Uses Web Audio API:
 - Plays through browser audio
 - May require user interaction to start (browser autoplay policy)
 
-### Remote GUI
+### WebView GUI
 
-Requires `remote-gui-audio` feature:
+The embedded page plays ANSI music the same way the browser does (Web Audio API,
+above). Clay's own `native-audio` feature (rodio) — on by default — separately
+provides native sound-file playback (MSP `!!SOUND`/`!!MUSIC` triggers, ANSI music
+played by a headless/console instance itself) and is what the WebView GUI's build
+command already includes:
 
 ```bash
-# Build with audio support
-sudo apt install libasound2-dev  # Linux only
-cargo build --features remote-gui-audio
+sudo apt install libasound2-dev  # Linux only, alongside the WebView GUI deps
+cargo build --features webview-gui
 ```
 
-Uses rodio library with:
+Uses rodio with:
 - ALSA backend on Linux
 - CoreAudio on macOS
 
 ## Building with Audio
+
+`native-audio` is on by default — a plain `cargo build` or `cargo build --features
+webview-gui` already includes it. You only need to name it explicitly when building
+with `--no-default-features` (for example, to add audio to an otherwise-minimal
+build):
 
 ### Linux
 
@@ -118,8 +126,8 @@ Uses rodio library with:
 # Install ALSA development libraries
 sudo apt install libasound2-dev
 
-# Build with audio
-cargo build --features remote-gui-audio
+# Build with audio (already on by default; shown explicit here)
+cargo build --features native-audio
 ```
 
 ### macOS
@@ -127,10 +135,14 @@ cargo build --features remote-gui-audio
 No extra dependencies needed:
 
 ```bash
-cargo build --features remote-gui-audio
+cargo build --features native-audio
 ```
 
 Audio uses CoreAudio automatically.
+
+The musl/`--no-default-features` build in the **Installation** chapter is TUI-only and
+deliberately excludes `native-audio` — that build never plays sound locally, no matter
+what `/setup`'s ANSI Music toggle says.
 
 ## Troubleshooting
 
@@ -143,7 +155,8 @@ Audio uses CoreAudio automatically.
 
 ### No Sound in GUI
 
-1. Verify built with `remote-gui-audio` feature
+1. Verify the binary was built with the `native-audio` feature (on by default unless
+   `--no-default-features` was used)
 2. Check ANSI Music is enabled in `/setup`
 3. Verify ALSA is working: `aplay /usr/share/sounds/alsa/Front_Center.wav`
 4. Check PulseAudio/PipeWire is running

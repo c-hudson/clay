@@ -10,8 +10,8 @@ Clay includes a remote console client that provides the full terminal interface 
 
 Examples:
 ```bash
-./clay --console=localhost:9002         # Local secure WebSocket
-./clay --console=mud.server.com:9002    # Remote server
+./clay --console=localhost:9000         # Local instance (default port: 9000)
+./clay --console=mud.server.com:9000    # Remote server
 ```
 
 No special build features required - works with the standard musl build.
@@ -21,6 +21,28 @@ No special build features required - works with the standard musl build.
 - Access your MUD sessions from another terminal/SSH
 - Run Clay on a server, connect from anywhere
 - Have multiple terminal views of the same sessions
+
+## What "Master Instance" Means: -D vs --multiuser
+
+A remote console/GUI/web client always connects to some other Clay process's
+WebSocket server. That process is one of two things:
+
+- **`-D` (headless daemon)**: an ordinary Clay instance — the same worlds, settings,
+  and single-user config file (`~/.clay/settings.dat`) as running `./clay` normally —
+  just without a local terminal UI. Every connecting client shares the one account and
+  the one set of worlds.
+- **`--multiuser`**: a genuinely multi-account server with its own config file
+  (`~/.clay/multiuser.dat`, `[user:name]`/`[world:name:owner]`/`[action:name:owner]`
+  sections). Each user authenticates with their own username and password and sees
+  only worlds/actions they own; per-user telnet negotiation, character encoding,
+  GMCP/MSDP/MSSP, and echo-based password masking are all tracked separately per
+  connection, not shared globally. It is not a bare or output-only mode — it runs the
+  same protocol handling as a single-user instance, just scoped per account.
+
+```bash
+./clay -D           # headless daemon, single account
+./clay --multiuser  # headless multiuser server, many accounts
+```
 
 ## Interface
 
@@ -131,12 +153,11 @@ Uses the same authentication as web interface:
 
 ## Building
 
-No special features needed:
+No GUI features needed — the standard build in the **Installation** chapter works:
 
 ```bash
-# Standard musl build works
 cargo build --target x86_64-unknown-linux-musl \
-    --no-default-features --features rustls-backend
+    --no-default-features --features rustls-backend,ssh-transport
 ```
 
 ## Example Setup
@@ -147,33 +168,50 @@ cargo build --target x86_64-unknown-linux-musl \
 # Start Clay normally
 ./clay
 
-# Enable WebSocket in /web settings:
-# - WS enabled: On
-# - WS port: 9002
-# - WS password: your_password
+# Enable the web/WebSocket server in /web settings:
+# - Port: 9000
+# - Password: your_password
 ```
 
 ### Client Side (Remote)
 
 ```bash
 # Connect from anywhere
-./clay --console=your-server.com:9002
+./clay --console=your-server.com:9000
 
 # Enter password when prompted
 ```
 
+## SSH Tunnel (--ssh)
+
+Clay can tunnel `--console=`/`--gui=` over SSH itself instead of relying on a manual
+port-forward — pass `--ssh` and give the target in
+`[user@]host[:clayport[:sshport]]` form:
+
+```bash
+./clay --console=your-server.com --ssh
+```
+
+`clayport` defaults to 9000 (Clay's own WebSocket/HTTP port) and `sshport` to 22; the
+user defaults to the local OS username. Clay tries an SSH agent first, then the
+default `~/.ssh/id_*` key files — console mode may prompt for a passphrase, GUI mode
+fails closed instead of prompting. The tunneled connection is plain `ws://` inside the
+SSH channel (SSH already provides confidentiality/integrity end to end; no TLS cert is
+needed or presented). See `SECURITY-NOTES.md` and `src/ssh.rs` for the full security
+model, and the Android app's SSH tunnel feature for the mobile equivalent.
+
 ## Tips
 
-### SSH Forwarding
+### Manual SSH Forwarding
 
-For secure access without TLS:
+If you'd rather forward the port yourself instead of using `--ssh`:
 
 ```bash
 # On client machine
-ssh -L 9002:localhost:9002 your-server
+ssh -L 9000:localhost:9000 your-server
 
 # Then connect locally
-./clay --console=localhost:9002
+./clay --console=localhost:9000
 ```
 
 ### Multiple Views

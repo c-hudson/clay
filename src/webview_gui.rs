@@ -24,7 +24,7 @@ impl StderrSuppress {
     fn new() -> Self {
         unsafe {
             let saved = libc::dup(2);
-            let devnull = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY);
+            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
             if devnull >= 0 {
                 libc::dup2(devnull, 2);
                 libc::close(devnull);

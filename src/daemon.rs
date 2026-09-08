@@ -250,11 +250,11 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                 app.register_repeat_process(process);
                             }
                             tf::TfCommandResult::NotTfCommand => {
-                                // Plain text command - send to MUD
+                                // Plain text command - send to MUD (captured via
+                                // send_to_world - a /repeat body is exactly the
+                                // "/repeat batches" case /recall -i now covers).
                                 if let Some(idx) = target_idx {
-                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                                    }
+                                    app.send_to_world(idx, cmd.clone());
                                 }
                             }
                             _ => {}
@@ -313,9 +313,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                                     Some(world_idx)
                                                 };
                                                 if let Some(idx) = target_idx {
-                                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                                        let _ = tx.try_send(WriteCommand::Text(text.clone()));
-                                                    }
+                                                    app.send_to_world(idx, text.clone());
                                                 }
                                             } else {
                                                 app.handle_triggered_notify_or_say(parsed, world_idx);
@@ -326,9 +324,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                         }
                                         _ => {}
                                     }
-                                } else if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                    // Plain text - send to MUD
-                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                } else {
+                                    // Plain text - send to MUD (captured via send_to_world)
+                                    app.send_to_world(world_idx, cmd);
                                 }
                             }
                             app.current_world_index = saved_current_world;
@@ -409,9 +407,13 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                     app.handle_telnet_event(world_idx, ev);
                                 }
                             }
-                            TelnetTarget::Multiuser { .. } => {
-                                // Not constructed for this target by to_app_event today
-                                // (see its doc comment) - nothing to route here yet.
+                            // `-D` is single-user (see connect_daemon_world) and never
+                            // constructs a Multiuser target itself, but route it anyway
+                            // (plan Job 9) rather than silently drop it, exactly like
+                            // main.rs's equivalent arms - the correct behaviour if this
+                            // ever changes, not a placeholder.
+                            TelnetTarget::Multiuser { world_index, username } => {
+                                app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
                             }
                         }
                     }
@@ -631,7 +633,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
         // AppEvent::Telnet, or a clear on disconnect) and nothing sooner is already
         // scheduled. Never push the deadline *later* - a steady stream of updates must
         // still flush roughly every 150ms instead of debouncing forever.
-        if app.worlds.iter().any(|w| w.stats_dirty)
+        if app.worlds.iter().any(|w| w.protocol.stats_dirty)
             && stats_flush_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_millis(150)
         {
             stats_flush_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_millis(150));
@@ -755,11 +757,11 @@ async fn handle_daemon_ws_message_impl(
                                             app.emit_tf_error(world_index, &err, true);
                                         }
                                         tf::TfCommandResult::SendToMud(text) => {
-                                            if world_index < app.worlds.len() {
-                                                if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                    let _ = tx.try_send(WriteCommand::Text(text));
-                                                    sent_to_server = true;
-                                                }
+                                            // send_to_world captures via capture_sent_line -
+                                            // an action's command list is the "sent by
+                                            // triggers/actions" case /recall -i now covers.
+                                            if app.send_to_world(world_index, text) {
+                                                sent_to_server = true;
                                             }
                                         }
                                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
@@ -773,10 +775,10 @@ async fn handle_daemon_ws_message_impl(
                                         }
                                         _ => {}
                                     }
-                                } else if world_index < app.worlds.len() {
-                                    // Plain text - send to MUD server
-                                    if let Some(tx) = &app.worlds[world_index].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                                } else {
+                                    // Plain text - send to MUD server (captured via
+                                    // send_to_world too).
+                                    if app.send_to_world(world_index, cmd) {
                                         sent_to_server = true;
                                     }
                                 }
@@ -797,14 +799,11 @@ async fn handle_daemon_ws_message_impl(
                                 app.emit_tf_error(world_index, &err, true);
                             }
                             tf::TfCommandResult::SendToMud(text) => {
-                                // Not send_to_world_and_mark_sent(): that shared helper is
-                                // also used by non-user-typed callers, so recording is done
-                                // here at this specific typed-command site instead - see
-                                // App::record_user_input's doc comment.
-                                let text_for_record = text.clone();
+                                // send_to_world() itself captures this via capture_sent_line -
+                                // no separate record_user_input call needed (it would
+                                // double-record the same command).
                                 if app.send_to_world(world_index, text) {
                                     app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                    app.record_user_input(world_index, &text_for_record);
                                 }
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
@@ -838,14 +837,9 @@ async fn handle_daemon_ws_message_impl(
                     // console loop does in main.rs).
                     if world_index < app.worlds.len() {
                         let suppressed = app.fire_tf_hook(Some(world_index), tf::TfHookEvent::Send, &text, true);
-                        if !suppressed {
-                            let sent = app.worlds[world_index].command_tx.as_ref()
-                                .is_some_and(|tx| tx.try_send(WriteCommand::Text(text.clone())).is_ok());
-                            if sent {
-                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                app.worlds[world_index].prompt.clear();
-                                app.record_user_input(world_index, &text);
-                            }
+                        if !suppressed && app.send_to_world(world_index, text) {
+                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                            app.worlds[world_index].prompt.clear();
                         }
                     }
                 }
@@ -1895,11 +1889,11 @@ async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, initiate_negotiation, msp_enabled, mcp_enabled } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled } => {
             app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
-                initiate_negotiation, msp_enabled, mcp_enabled,
+                msp_enabled, mcp_enabled,
             );
         }
         WsMessage::CalculateNextWorld { current_index } => {
@@ -2151,11 +2145,11 @@ keep_alive_type=Generic
                                 app.register_repeat_process(process);
                             }
                             tf::TfCommandResult::NotTfCommand => {
-                                // Plain text command - send to MUD
+                                // Plain text command - send to MUD (captured via
+                                // send_to_world - a /repeat body is exactly the
+                                // "/repeat batches" case /recall -i now covers).
                                 if let Some(idx) = target_idx {
-                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                                    }
+                                    app.send_to_world(idx, cmd.clone());
                                 }
                             }
                             _ => {}
@@ -2251,11 +2245,15 @@ keep_alive_type=Generic
                     AppEvent::MultiuserServerData(world_index, username, data) => {
                         // Route server data to specific user's connection
                         let key = (world_index, username.clone());
+                        let world_settings = app.worlds.get(world_index).map(|w| w.settings.clone());
                         if let Some(conn) = app.user_connections.get_mut(&key) {
-                            let encoding = if world_index < app.worlds.len() {
-                                app.worlds[world_index].effective_encoding()
-                            } else {
-                                Encoding::Utf8
+                            // Job 9 (T3.2): decode with THIS connection's own negotiated
+                            // CHARSET encoding, not the (never set by multiuser)
+                            // World::negotiated_encoding - see conn.protocol's doc
+                            // comment and CharsetRequest's per-variant table entry.
+                            let encoding = match &world_settings {
+                                Some(settings) => conn.protocol.effective_encoding(settings),
+                                None => Encoding::Utf8,
                             };
                             let decoded = encoding.decode(&data);
 
@@ -2284,20 +2282,7 @@ keep_alive_type=Generic
                         }
                     }
                     AppEvent::MultiuserDisconnected(world_index, username) => {
-                        // Handle disconnect for specific user's connection
-                        let key = (world_index, username.clone());
-                        if let Some(conn) = app.user_connections.get_mut(&key) {
-                            conn.connected = false;
-                            conn.command_tx = None;
-
-                            // Send disconnect to this user only
-                            if let Some(ws) = &app.ws_server {
-                                ws.broadcast_to_owner(
-                                    WsMessage::WorldDisconnected { world_index },
-                                    Some(&username)
-                                );
-                            }
-                        }
+                        handle_multiuser_disconnect(&mut app, world_index, &username);
                     }
                     AppEvent::MultiuserTelnetDetected(world_index, username) => {
                         let key = (world_index, username.clone());
@@ -2307,11 +2292,12 @@ keep_alive_type=Generic
                     }
                     AppEvent::MultiuserPrompt(world_index, username, prompt_bytes) => {
                         let key = (world_index, username.clone());
+                        let world_settings = app.worlds.get(world_index).map(|w| w.settings.clone());
                         if let Some(conn) = app.user_connections.get_mut(&key) {
-                            let encoding = if world_index < app.worlds.len() {
-                                app.worlds[world_index].effective_encoding()
-                            } else {
-                                Encoding::Utf8
+                            // Job 9 (T3.2): same fix as MultiuserServerData above.
+                            let encoding = match &world_settings {
+                                Some(settings) => conn.protocol.effective_encoding(settings),
+                                None => Encoding::Utf8,
                             };
                             let prompt_text = encoding.decode(&prompt_bytes);
                             conn.prompt = prompt_text.trim_end().to_string() + " ";
@@ -2325,13 +2311,16 @@ keep_alive_type=Generic
                             }
                         }
                     }
-                    // AppEvent::Telnet (plan Phase 2, Step 2.7): no arm needed here.
-                    // to_app_event never constructs it for a Multiuser target (every one
-                    // of the nine collapsed event kinds maps to None there - see its doc
-                    // comment), and connect_multiuser_world's reader always uses
-                    // TelnetTarget::Multiuser, so this loop can never actually receive
-                    // one; it falls through to the wildcard below like the old dead
-                    // CharsetRequested(String::new(), ...) arm this replaces did.
+                    // Job 9 (T3.2): this is the fix for the bug this job exists for -
+                    // before it, this loop had no arm for AppEvent::Telnet at all, so
+                    // every telnet event to_app_event now forwards for a Multiuser
+                    // target (NAWS, TTYPE/MTTS, CHARSET, GMCP incl. Core.Hello, MSDP,
+                    // MSSP, MSP, ECHO masking) fell into the wildcard below and was
+                    // silently dropped. Route it exactly like the World-target loops do,
+                    // through the per-user sibling of App::handle_telnet_event.
+                    AppEvent::Telnet(TelnetTarget::Multiuser { world_index, ref username }, ref ev) => {
+                        app.handle_multiuser_telnet_event(world_index, username.clone(), ev);
+                    }
                     AppEvent::WsAuthKeyValidation(client_id, _msg, client_ip, _challenge) => {
                         // Auth-key login is a single per-install device key and doesn't map to
                         // multiuser's per-account model, so it's intentionally unsupported here.
@@ -2376,7 +2365,7 @@ keep_alive_type=Generic
         // mud-status-display.md Job 2 (plan D4): pull stats_flush_sleep's deadline in to
         // ~150ms out if some world went dirty this iteration and nothing sooner is already
         // scheduled. Never push the deadline *later*.
-        if app.worlds.iter().any(|w| w.stats_dirty)
+        if app.worlds.iter().any(|w| w.protocol.stats_dirty)
             && stats_flush_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_millis(150)
         {
             stats_flush_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_millis(150));
@@ -2384,6 +2373,42 @@ keep_alive_type=Generic
     }
 
     Ok(())
+}
+
+/// Handle a per-user multiuser disconnect (`AppEvent::MultiuserDisconnected`). Extracted
+/// as its own function (plan Job 9, T3.2 - mirrors `App::apply_mccp2_reload_bailout`'s
+/// reason for existing as a standalone method) so it has a real unit test:
+/// `run_multiuser_server` is a large `async fn` needing a live event loop to reach at all.
+///
+/// Clears this connection's `ProtocolState` (`ProtocolState::clear`) so a stale mirror -
+/// GMCP/MSDP data, a masked prompt, a negotiated encoding - from THIS connection can never
+/// be mistaken for live state on the next one to the same world, the same class of bug
+/// `World::clear_connection_state` already guards against for the single-user path. If the
+/// connection was echo-masked, also tells the owner's clients to unmask - otherwise a web
+/// client could stay showing a masked input box after the drop, with nothing left to clear
+/// it (the next connection starts unmasked and may never see another `WILL ECHO`).
+fn handle_multiuser_disconnect(app: &mut App, world_index: usize, username: &str) {
+    let key = (world_index, username.to_string());
+    if let Some(conn) = app.user_connections.get_mut(&key) {
+        conn.connected = false;
+        conn.command_tx = None;
+        let was_masked = conn.protocol.echo_masked;
+        conn.protocol.clear();
+
+        // Send disconnect to this user only
+        if let Some(ws) = &app.ws_server {
+            ws.broadcast_to_owner(
+                WsMessage::WorldDisconnected { world_index },
+                Some(username)
+            );
+            if was_masked {
+                ws.broadcast_to_owner(
+                    WsMessage::EchoMaskChanged { world_index, masked: false },
+                    Some(username),
+                );
+            }
+        }
+    }
 }
 
 /// Connect to a world for a specific user in multiuser mode
@@ -2500,19 +2525,17 @@ pub async fn connect_multiuser_world(
             // Plan Job 5, 2.3: migrated onto spawn_telnet_reader. Gains over the old
             // hand-rolled loop: MCCP2 decompression (finding 1 — this path used to accept
             // IAC DO MCCP2 and then render the compressed stream as text) and the unified
-            // "Connection closed by server." message on EOF. CHARSET stays dead on
-            // purpose: the old loop's `AppEvent::CharsetRequested(String::new(), ...)`
-            // was already rejected by `find_world_index("")`, and `to_app_event` maps
-            // `TelnetEvent::CharsetRequest` to `None` on `TelnetTarget::Multiuser` for the
-            // same reason — no `(usize, String)`-shaped `AppEvent` exists for it yet (see
-            // telnet_reader.rs's `to_app_event` doc comment). NAWS/TTYPE/GMCP/MSDP/
-            // WontEchoSeen were never emitted by this loop either and remain unemitted
-            // for the same reason: reproducing "still dead," not inventing new variants.
+            // "Connection closed by server." message on EOF. CHARSET/NAWS/TTYPE/GMCP/MSDP/
+            // MSSP/WontEchoSeen/EchoOff/EchoOn used to be dead here too (the old loop's
+            // `AppEvent::CharsetRequested(String::new(), ...)` was rejected by
+            // `find_world_index("")`, and every other one had no `(usize, String)`-shaped
+            // `AppEvent` at all) — as of Job 9 (T3.2), `to_app_event` forwards all of them
+            // for a `Multiuser` target and `run_multiuser_server`'s `AppEvent::Telnet` arm
+            // routes them through `App::handle_multiuser_telnet_event`, so this reader now
+            // carries the same protocol events for a multiuser connection that it always
+            // has for a single-user `World` one.
             let telnet_cfg = TelnetConfig {
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for Clay's
-                // opening negotiation offer, default on.
-                initiate_negotiation: settings.initiate_negotiation,
                 msp_enabled: settings.msp_enabled,
                 is_tls: use_ssl, // Job 12 (plan Phase 4, 4.1)
                 ..TelnetConfig::default()
@@ -2591,9 +2614,6 @@ pub async fn connect_daemon_world(
                         // and the unified "Connection closed by server." message on EOF.
                         let telnet_cfg = TelnetConfig {
                             term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                            // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for
-                            // Clay's opening negotiation offer, default on.
-                            initiate_negotiation: settings.initiate_negotiation,
                             msp_enabled: settings.msp_enabled,
                             // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path - only
                             // reached when use_ssl is true.
@@ -2659,9 +2679,6 @@ pub async fn connect_daemon_world(
                         // and the unified "Connection closed by server." message on EOF.
                         let telnet_cfg = TelnetConfig {
                             term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                            // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for
-                            // Clay's opening negotiation offer, default on.
-                            initiate_negotiation: settings.initiate_negotiation,
                             msp_enabled: settings.msp_enabled,
                             // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path - only
                             // reached when use_ssl is true.
@@ -2808,9 +2825,6 @@ pub async fn connect_daemon_world(
             // `$TERM`-or-"ANSI" fallback exactly.
             let telnet_cfg = TelnetConfig {
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for Clay's
-                // opening negotiation offer, default on.
-                initiate_negotiation: settings.initiate_negotiation,
                 msp_enabled: settings.msp_enabled,
                 is_tls, // Job 12 (plan Phase 4, 4.1): set above by the TLS/plain match
                 ..TelnetConfig::default()
@@ -2943,7 +2957,6 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     gmcp_packages: if is_owner { world.settings.gmcp_packages.clone() } else { String::new() },
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
                     has_notes: is_owner && !world.settings.notes.is_empty(),
-                    initiate_negotiation: world.settings.initiate_negotiation,
                     msp_enabled: world.settings.msp_enabled,
                     mcp_enabled: world.settings.mcp_enabled,
                 },
@@ -2955,14 +2968,12 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 was_connected: world.was_connected,
                 is_proxy: world.proxy_pid.is_some(),
                 gmcp_user_enabled: world.gmcp_user_enabled,
-                // ECHO masking (plan Phase 3, step 3.4): multiuser per-user telnet
-                // readers never route through App::handle_telnet_event (see finding 2 /
-                // Job 5's dead-CHARSET note and telnet_reader::to_app_event's Multiuser
-                // arms - no per-user-shaped World to mirror onto), so this always reads
-                // false today, same as every other unwired multiuser telnet mirror. Kept
-                // explicit (not hardcoded) so a future per-user wiring job doesn't also
-                // have to remember this site.
-                echo_masked: world.echo_masked,
+                // ECHO masking (Job 9, T3.2 - the cleartext-password fix): now read from
+                // THIS user's own connection, not the shared World (which multiuser never
+                // wrote to, even after this job - see UserConnection::protocol's doc
+                // comment). A user with no connection entry yet is unmasked, matching
+                // user_conn's other "no connection" defaults above.
+                echo_masked: user_conn.map(|c| c.protocol.echo_masked).unwrap_or(false),
                 total_output_lines: world.output_lines.len(),
                 // Matches total_output_lines' existing source (world.output_lines, not the
                 // per-user conn.output_lines) - see the field's doc comment in websocket.rs.
@@ -2988,14 +2999,17 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 // has no epoch to report. 0 tells the client to fall back to the older
                 // heuristic rather than compare this as a concrete value.
                 seq_epoch: 0,
-                // mud-status-display.md Job 2: owner-only, same redaction rule as
-                // hostname/port/user/keep_alive_cmd/gmcp_packages/notes above (CLAUDE.md's
-                // "Multiuser handlers ... must check world.owner == username" - a stat is
-                // per-world game state, no different from the connection details already
-                // redacted here). GMCP/MSDP ingestion isn't wired into multiuser's per-user
-                // connections yet (see connect_multiuser_world's doc comment), so `stats` is
-                // empty in practice today either way - this only matters once that lands.
-                stats: if is_owner { world.stats.entries() } else { Vec::new() },
+                // mud-status-display.md Job 2 / Job 9 (T3.2): owner-only, same redaction
+                // rule as hostname/port/user/keep_alive_cmd/gmcp_packages/notes above
+                // (CLAUDE.md's "Multiuser handlers ... must check world.owner ==
+                // username"). Now read from this user's own UserConnection - GMCP/MSDP
+                // ingestion is wired into multiuser's per-user connections as of this job
+                // (App::handle_multiuser_telnet_event), so this is no longer always empty.
+                stats: if is_owner {
+                    user_conn.map(|c| c.protocol.stats.entries().to_vec()).unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
             }
         }).collect();
 
@@ -3228,20 +3242,14 @@ pub async fn handle_multiuser_ws_message(
             }
         }
         WsMessage::DisconnectWorld { world_index } => {
-            // Disconnect user's own connection
+            // Disconnect user's own connection. Job 9 (T3.2): shares
+            // handle_multiuser_disconnect with AppEvent::MultiuserDisconnected (a real
+            // socket-side drop) so a user-initiated disconnect gets the exact same
+            // ProtocolState::clear() + unmask-if-was-masked treatment - a manually
+            // disconnected, still-masked connection must not leave a web client's input
+            // box stuck masked either.
             if let Some(ref uname) = username {
-                let key = (world_index, uname.clone());
-                if let Some(conn) = app.user_connections.get_mut(&key) {
-                    conn.command_tx = None;
-                    conn.connected = false;
-                    // Notify the user
-                    if let Some(ws) = &app.ws_server {
-                        ws.broadcast_to_owner(
-                            WsMessage::WorldDisconnected { world_index },
-                            Some(uname)
-                        );
-                    }
-                }
+                handle_multiuser_disconnect(app, world_index, uname);
             }
         }
         WsMessage::ChangePassword { old_password_hash, new_password_hash } => {
@@ -3375,6 +3383,33 @@ pub async fn handle_multiuser_ws_message(
                     // Send WorldSwitched message to the client
                     if let Some(ws) = &app.ws_server {
                         ws.send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
+                    }
+                }
+            }
+        }
+        // Job 9 (T3.2): multiuser previously tracked no client dimensions at all - see
+        // App::user_min_dimensions's doc comment. Mirrors the single-user `-D` daemon
+        // handler's UpdateViewState/UpdateDimensions arms (handle_daemon_ws_message
+        // above), owner-gated per CLAUDE.md's rule since world_index is client-supplied.
+        WsMessage::UpdateViewState { world_index, visible_lines, visible_columns } => {
+            let is_owner = app.worlds.get(world_index)
+                .map(|w| w.owner.as_ref() == username.as_ref())
+                .unwrap_or(false);
+            if is_owner {
+                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                let vc = visible_columns.unwrap_or_else(|| app.ws_client_worlds.get(&client_id).map(|v| v.visible_columns).unwrap_or(0));
+                let paused = app.ws_client_worlds.get(&client_id).map(|v| v.paused).unwrap_or(false);
+                let visible = app.ws_client_worlds.get(&client_id).map(|v| v.visible).unwrap_or(true);
+                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, visible_columns: vc, dimensions, paused, visible, disconnected_at: None });
+            }
+        }
+        WsMessage::UpdateDimensions { width, height } => {
+            if let Some(ref uname) = username {
+                if let Some(state) = app.ws_client_worlds.get_mut(&client_id) {
+                    let old_dims = state.dimensions;
+                    state.dimensions = Some((width, height));
+                    if old_dims != Some((width, height)) {
+                        app.send_naws_to_all_multiuser_worlds(uname);
                     }
                 }
             }
@@ -4096,9 +4131,11 @@ mod multiuser_initial_state_tests {
             worlds[1].output_lines_ts.len());
     }
 
-    /// mud-status-display.md Job 2: a non-owner's `WorldStateMsg.stats` must stay empty,
-    /// same redaction rule as hostname/port/user/etc above - a stat is per-world game
-    /// state, no different from a connection detail.
+    /// mud-status-display.md Job 2 / Job 9 (T3.2): a non-owner's `WorldStateMsg.stats`
+    /// must stay empty, same redaction rule as hostname/port/user/etc above - a stat is
+    /// per-world game state, no different from a connection detail. Stats now live on
+    /// the owner's `UserConnection` (Job 9), not the shared `World` - see
+    /// `UserConnection::protocol`'s doc comment.
     #[test]
     fn multiuser_initial_state_redacts_stats_for_non_owner() {
         let mut app = App::new();
@@ -4106,8 +4143,10 @@ mod multiuser_initial_state_tests {
         app.worlds.clear();
         let mut alice_world = World::new("alice-world");
         alice_world.owner = Some("alice".to_string());
-        alice_world.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
         app.worlds.push(alice_world);
+        let mut alice_conn = UserConnection::new();
+        alice_conn.protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
+        app.user_connections.insert((0, "alice".to_string()), alice_conn);
 
         let owner_view = build_multiuser_initial_state(&app, "alice");
         let WsMessage::InitialState { worlds, .. } = owner_view else { panic!("expected InitialState") };
@@ -4185,8 +4224,8 @@ mod multiuser_stats_flush_tests {
         // Multiuser doesn't wire real per-user GMCP ingestion yet (connect_multiuser_world's
         // doc comment), but the broadcast-scoping logic under test doesn't care how a world
         // became dirty - feed the model directly, same as a future per-user wiring job would.
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
-        app.worlds[0].stats_dirty = true;
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
+        app.worlds[0].protocol.stats_dirty = true;
 
         app.flush_dirty_stats();
 
@@ -4210,11 +4249,311 @@ mod multiuser_stats_flush_tests {
         let mut someone_rx = register_client(&server, 1, "someone");
         app.ws_server = Some(server);
 
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
-        app.worlds[0].stats_dirty = true;
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
+        app.worlds[0].protocol.stats_dirty = true;
         app.flush_dirty_stats();
 
         assert!(someone_rx.try_recv().is_err(), "an unowned world's stats must reach no one");
+    }
+}
+
+#[cfg(test)]
+mod multiuser_telnet_tests {
+    // Plan Job 9 (T3.2): "Multiuser drops 15 of 17 telnet events" - NAWS, TTYPE/MTTS,
+    // CHARSET, GMCP (incl. the Core.Hello that makes servers send anything), MSDP, MSSP,
+    // MSP, and ECHO masking (**passwords in cleartext**) were all dead for every
+    // multiuser user. These tests drive App::handle_multiuser_telnet_event directly -
+    // the per-user sibling of App::handle_telnet_event - proving each fix at the same
+    // level tests.rs's handle_telnet_event_* suite proves the World path.
+    use super::*;
+
+    /// Same shape as `multiuser_stats_flush_tests::register_client` (this file already
+    /// has several independent copies of this exact harness - `change_password_tests`,
+    /// `multiuser_stats_flush_tests` - rather than one shared helper reached across
+    /// `#[cfg(test)]` module boundaries).
+    fn register_client(server: &WebSocketServer, client_id: u64, username: &str) -> mpsc::Receiver<crate::websocket::Outbound> {
+        let (tx, rx) = mpsc::channel::<crate::websocket::Outbound>(crate::websocket::WS_CLIENT_CHANNEL_CAPACITY);
+        let mut clients = server.clients.try_write().expect("clients lock should be uncontended in test setup");
+        clients.insert(client_id, WsClientInfo {
+            authenticated: true,
+            tx,
+            current_world: None,
+            username: Some(username.to_string()),
+            received_initial_state: true,
+            client_type: RemoteClientType::Web,
+            viewport_height: 24,
+            ip_address: "127.0.0.1".to_string(),
+            connected_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            paused: false,
+            acked_seq: std::collections::HashMap::new(),
+            audit_prev_acked: std::collections::HashMap::new(),
+            audit_fired_at: std::collections::HashMap::new(),
+            audit_stall_ticks: std::collections::HashMap::new(),
+            push: None,
+            needs_resync: std::collections::HashSet::new(),
+        });
+        rx
+    }
+
+    fn try_recv_msg(rx: &mut mpsc::Receiver<crate::websocket::Outbound>) -> Option<WsMessage> {
+        match rx.try_recv() {
+            Ok(crate::websocket::Outbound::Shared(json)) => {
+                Some(serde_json::from_str(&json).expect("broadcast JSON must parse"))
+            }
+            Ok(crate::websocket::Outbound::Message(msg)) => Some(*msg),
+            _ => None,
+        }
+    }
+
+    /// alice owns world 0 and has a live connection; bob is just another authenticated
+    /// user with no connection of his own to world 0. Returns (app, alice_rx, bob_rx).
+    fn setup_alice_and_bob() -> (App, mpsc::Receiver<crate::websocket::Outbound>, mpsc::Receiver<crate::websocket::Outbound>) {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+        let mut alice_world = World::new("alice-world");
+        alice_world.owner = Some("alice".to_string());
+        app.worlds.push(alice_world);
+        app.user_connections.insert((0, "alice".to_string()), UserConnection::new());
+
+        let server = WebSocketServer::new("", 9000, "", None, true, BanList::new());
+        let alice_rx = register_client(&server, 1, "alice");
+        let bob_rx = register_client(&server, 2, "bob");
+        app.ws_server = Some(server);
+
+        (app, alice_rx, bob_rx)
+    }
+
+    #[test]
+    fn echo_off_masks_only_alices_connection_and_reaches_only_alice() {
+        let (mut app, mut alice_rx, mut bob_rx) = setup_alice_and_bob();
+
+        app.handle_multiuser_telnet_event(0, "alice".to_string(), &TelnetEvent::EchoOff);
+
+        assert!(app.user_connections[&(0, "alice".to_string())].protocol.echo_masked,
+            "alice's own connection must be masked");
+        // The bug this job exists for: masking must never land on the shared World.
+        assert!(!app.worlds[0].protocol.echo_masked,
+            "echo masking must live on UserConnection, not the shared World");
+
+        assert!(matches!(
+            try_recv_msg(&mut alice_rx),
+            Some(WsMessage::EchoMaskChanged { world_index: 0, masked: true })
+        ), "alice must see EchoMaskChanged{{masked: true}}");
+        assert!(bob_rx.try_recv().is_err(), "bob must not see alice's echo-mask change");
+
+        // Change-only: a repeat with no actual transition sends nothing.
+        app.handle_multiuser_telnet_event(0, "alice".to_string(), &TelnetEvent::EchoOff);
+        assert!(alice_rx.try_recv().is_err(), "a repeated EchoOff with no state change must not re-broadcast");
+    }
+
+    #[test]
+    fn option_enabled_gmcp_announces_on_this_connections_command_tx_only() {
+        let (mut app, mut alice_rx, mut bob_rx) = setup_alice_and_bob();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.user_connections.get_mut(&(0, "alice".to_string())).unwrap().command_tx = Some(cmd_tx);
+
+        app.handle_multiuser_telnet_event(0, "alice".to_string(), &TelnetEvent::OptionEnabled(TELNET_OPT_GMCP));
+
+        assert!(app.user_connections[&(0, "alice".to_string())].protocol.gmcp_enabled);
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => {
+                assert!(String::from_utf8_lossy(&bytes).contains("Core.Hello"));
+            }
+            other => panic!("expected a Raw Core.Hello wire write, got {:?}", other),
+        }
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => {
+                assert!(String::from_utf8_lossy(&bytes).contains("Core.Supports.Set"));
+            }
+            other => panic!("expected a Raw Core.Supports.Set wire write, got {:?}", other),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "exactly two GMCP messages expected");
+
+        // The Core.Hello/Core.Supports.Set announcement is wire-only - nothing goes out
+        // over any WebSocket for a bare OptionEnabled.
+        assert!(alice_rx.try_recv().is_err(), "OptionEnabled must not itself broadcast to alice");
+        assert!(bob_rx.try_recv().is_err(), "OptionEnabled must not itself broadcast to bob");
+    }
+
+    #[test]
+    fn char_vitals_dirties_the_connection_and_flush_reaches_alice_only() {
+        let (mut app, mut alice_rx, mut bob_rx) = setup_alice_and_bob();
+
+        app.handle_multiuser_telnet_event(0, "alice".to_string(), &TelnetEvent::GmcpMessage(
+            "Char.Vitals".to_string(), r#"{"hp":"80"}"#.to_string(),
+        ));
+        assert!(app.user_connections[&(0, "alice".to_string())].protocol.stats_dirty,
+            "a Char.* package must dirty this connection's stats");
+
+        // The GmcpData broadcast from the event itself must reach alice only.
+        assert!(matches!(try_recv_msg(&mut alice_rx), Some(WsMessage::GmcpData { world_index: 0, .. })));
+        assert!(bob_rx.try_recv().is_err());
+
+        app.flush_dirty_stats();
+        assert!(!app.user_connections[&(0, "alice".to_string())].protocol.stats_dirty,
+            "flush must clear the dirty flag");
+        match try_recv_msg(&mut alice_rx) {
+            Some(WsMessage::StatsUpdate { world_index: 0, stats }) => {
+                assert_eq!(stats.len(), 1);
+                assert_eq!(stats[0].key, "hp");
+            }
+            other => panic!("expected alice's StatsUpdate, got {:?}", other),
+        }
+        assert!(bob_rx.try_recv().is_err(), "bob must never see alice's stats");
+    }
+
+    #[test]
+    fn event_for_a_world_the_username_does_not_own_is_dropped() {
+        let (mut app, mut alice_rx, mut bob_rx) = setup_alice_and_bob();
+        // Anomalous: a UserConnection keyed under bob's name for alice's world, standing
+        // in for a stale/forged event - proves the owner gate runs before any lookup into
+        // it, not just that bob usually has no entry at all.
+        app.user_connections.insert((0, "bob".to_string()), UserConnection::new());
+
+        app.handle_multiuser_telnet_event(0, "bob".to_string(), &TelnetEvent::EchoOff);
+
+        assert!(!app.user_connections[&(0, "bob".to_string())].protocol.echo_masked,
+            "an event for a world this username does not own must change nothing");
+        assert!(alice_rx.try_recv().is_err());
+        assert!(bob_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn disconnect_clears_protocol_state_and_unmasks() {
+        let (mut app, mut alice_rx, _bob_rx) = setup_alice_and_bob();
+        {
+            let conn = app.user_connections.get_mut(&(0, "alice".to_string())).unwrap();
+            conn.protocol.echo_masked = true;
+            conn.protocol.gmcp_data.insert("Core.Hello".to_string(), "{}".to_string());
+        }
+        let _ = alice_rx.try_recv(); // drain anything setup left behind (none expected)
+
+        handle_multiuser_disconnect(&mut app, 0, "alice");
+
+        let conn = &app.user_connections[&(0, "alice".to_string())];
+        assert!(!conn.protocol.echo_masked, "disconnect must clear echo masking");
+        assert!(conn.protocol.gmcp_data.is_empty(), "disconnect must clear the protocol mirror");
+        assert!(matches!(try_recv_msg(&mut alice_rx), Some(WsMessage::WorldDisconnected { world_index: 0 })));
+        assert!(matches!(
+            try_recv_msg(&mut alice_rx),
+            Some(WsMessage::EchoMaskChanged { world_index: 0, masked: false })
+        ), "a masked connection must be explicitly unmasked on disconnect");
+    }
+
+    #[test]
+    fn initial_state_reports_per_user_echo_masked_and_stats() {
+        let mut app = App::new();
+        app.multiuser_mode = true;
+        app.worlds.clear();
+        let mut alice_world = World::new("alice-world");
+        alice_world.owner = Some("alice".to_string());
+        app.worlds.push(alice_world);
+        let mut conn = UserConnection::new();
+        conn.protocol.echo_masked = true;
+        conn.protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
+        app.user_connections.insert((0, "alice".to_string()), conn);
+
+        let owner_view = build_multiuser_initial_state(&app, "alice");
+        let WsMessage::InitialState { worlds, .. } = owner_view else { panic!("expected InitialState") };
+        assert!(worlds[0].echo_masked, "the owner's own masked state must be reported");
+        assert_eq!(worlds[0].stats.len(), 1);
+
+        let other_view = build_multiuser_initial_state(&app, "bob");
+        let WsMessage::InitialState { worlds, .. } = other_view else { panic!("expected InitialState") };
+        assert!(!worlds[0].echo_masked, "a non-owner must never see another user's masked state");
+        assert!(worlds[0].stats.is_empty(), "a non-owner must never see another user's stats");
+    }
+
+    #[test]
+    fn charset_request_switches_this_connections_decoding_not_the_worlds() {
+        let (mut app, _alice_rx, _bob_rx) = setup_alice_and_bob();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.user_connections.get_mut(&(0, "alice".to_string())).unwrap().command_tx = Some(cmd_tx);
+
+        app.handle_multiuser_telnet_event(0, "alice".to_string(), &TelnetEvent::CharsetRequest(vec!["UTF-8".to_string()]));
+
+        assert_eq!(
+            app.user_connections[&(0, "alice".to_string())].protocol.negotiated_encoding,
+            Some(Encoding::Utf8),
+        );
+        assert_eq!(app.worlds[0].protocol.negotiated_encoding, None,
+            "CHARSET negotiation must never touch the shared World's mirror");
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(bytes, crate::telnet::build_charset_accepted("UTF-8")),
+            other => panic!("expected a Raw CHARSET ACCEPTED response, got {:?}", other),
+        }
+        assert!(matches!(cmd_rx.try_recv(), Ok(WriteCommand::SetEncoding(Encoding::Utf8))));
+    }
+
+    /// Wire-level proof (plan Job 9's required test), mirroring
+    /// `telnet_reader_migration_tests::connect_daemon_world_carries_gmcp_to_the_app_event_
+    /// channel` but for the multiuser connect path: a real fake MUD server negotiates
+    /// GMCP and sends a message, and both `OptionEnabled(GMCP)` and `GmcpMessage` arrive
+    /// on `run_multiuser_server`'s own `AppEvent` channel, carrying a `Multiuser` target -
+    /// the exact stream `run_multiuser_server`'s new `AppEvent::Telnet` arm now routes
+    /// through `App::handle_multiuser_telnet_event`.
+    #[tokio::test]
+    async fn connect_multiuser_world_carries_gmcp_to_the_app_event_channel() {
+        use crate::testserver::{self, ServerAction, PortScenario};
+        use crate::telnet::{TELNET_IAC, TELNET_WILL, TELNET_SB, TELNET_SE};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut raw = vec![TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP];
+        raw.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_GMCP]);
+        raw.extend_from_slice(b"Core.Hello {\"foo\":\"bar\"}");
+        raw.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+        let scenario = PortScenario {
+            actions: vec![
+                ServerAction::SendRaw(raw),
+                ServerAction::Sleep(Duration::from_millis(300)),
+                ServerAction::Disconnect,
+            ],
+            telnet_negotiate: false,
+        };
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let settings = WorldSettings {
+            hostname: "127.0.0.1".to_string(),
+            port: port.to_string(),
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(32);
+        let conn = connect_multiuser_world(0, "alice".to_string(), &settings, event_tx).await;
+        assert!(conn.is_some(), "connect_multiuser_world should have connected to the fake server");
+
+        let mut saw_negotiated = false;
+        let mut saw_gmcp: Option<(String, String)> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && (!saw_negotiated || saw_gmcp.is_none()) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 0, ref username }, TelnetEvent::OptionEnabled(opt))))
+                    if username == "alice" && opt == TELNET_OPT_GMCP =>
+                {
+                    saw_negotiated = true;
+                }
+                Ok(Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 0, ref username }, TelnetEvent::GmcpMessage(pkg, json))))
+                    if username == "alice" =>
+                {
+                    saw_gmcp = Some((pkg, json));
+                }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+
+        assert!(saw_negotiated, "expected Telnet(Multiuser{{0,\"alice\"}}, OptionEnabled(GMCP)) on the multiuser loop's channel");
+        let (pkg, json) = saw_gmcp.expect("expected Telnet(Multiuser{0,\"alice\"}, GmcpMessage(..)) on the multiuser loop's channel");
+        assert_eq!(pkg, "Core.Hello");
+        assert_eq!(json, "{\"foo\":\"bar\"}");
+
+        let _ = server.await;
     }
 }
 

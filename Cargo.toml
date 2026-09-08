@@ -2,7 +2,7 @@
 name = "clay"
 version = "1.6.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.89"
 
 [dependencies]
 ratatui = "0.26"
@@ -76,7 +76,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # default-features = false + "ring": same crypto-backend policy as rustls/tokio-rustls
 # above - russh's default pulls aws-lc-rs, which needs a C toolchain and does not
 # cross-compile to Android/Termux armv7. ring is pure-Rust and matches everything else.
-russh = { version = "0.54", optional = true, default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.63", optional = true, default-features = false, features = ["ring", "rsa"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

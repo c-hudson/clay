@@ -1264,7 +1264,7 @@ impl<'a> Evaluator<'a> {
 
             "pad" => {
                 // pad([s, i]...) - pad strings to specified widths
-                if args.len() % 2 != 0 {
+                if !args.len().is_multiple_of(2) {
                     return Err("pad requires pairs of (string, width) arguments".to_string());
                 }
                 let mut result = String::new();

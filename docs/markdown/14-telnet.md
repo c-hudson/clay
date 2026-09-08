@@ -6,29 +6,17 @@ Clay includes comprehensive telnet protocol support for proper MUD server commun
 
 Clay automatically handles telnet negotiation:
 - Detects telnet mode when IAC sequences are received
-- Sends its own opening offer at connect time (see **Opening Negotiation** below), not just
-  answers to what the server asks
 - Responds appropriately to server requests
 - Strips telnet sequences from displayed output
 
-## Opening Negotiation
-
-Older Clay versions only ever *answered* negotiation the server started — a server that
-never speaks first (the norm on plain MUSH/MOO servers) got no GMCP, MSDP, MSSP, MCCP2, or
-CHARSET at all, because nothing on Clay's side would offer first.
-
-Clay now sends an opening offer immediately on connect, controlled by the per-world
-**Negotiate** setting (World Editor; defaults on). When Negotiate is on, Clay sends, in
-order:
-
-`WILL TTYPE`, `WILL NAWS`, `DO CHARSET`, `DO GMCP`, `DO MSDP`, `DO MCCP2`, `DO MSSP`, and —
-only if the world's **MSP Sound** setting is also on — `DO MSP`.
-
-SGA and EOR are never offered this way: Clay behaves identically whether either is on or
-not, so there's nothing to gain by asking first.
-
-Turn Negotiate off if a server reacts badly to being spoken to before it speaks first. With
-it off, Clay falls back to answering only what the server itself offers — the old behavior.
+Clay is **fully reactive**: it never sends an unsolicited `WILL`/`DO` of its own. Every
+option Clay supports — TTYPE, NAWS, CHARSET, GMCP, MSDP, MSSP, MCCP2, MSP — is negotiated
+only after the server offers or requests it first. A server that never speaks first (the
+norm on plain MUSH/MOO servers) simply never gets GMCP/MSDP/MSSP/MCCP2/CHARSET turned on,
+because nothing on Clay's side asks — the same as real telnet clients like TinyFugue. This
+also means Clay never sends any telnet bytes at all on connect or on a hot `/reload` of a
+live socket until the server sends something first; a `/reload` that reconnects the telnet
+reader mid-session produces no "Huh?"-style garbage on a world that isn't telnet-aware.
 
 ## Supported Telnet Options
 
@@ -36,21 +24,20 @@ it off, Clay falls back to answering only what the server itself offers — the 
 |--------|------|-----------|
 | ECHO | 1 | Server-driven only. Clay answers the server's `WILL`/`WONT ECHO` unconditionally, but never asks for it itself. Drives password masking — see below. |
 | SGA | 3 | Server → Clay. Clay accepts `WILL SGA` from the server; it never asks first. |
-| TTYPE | 24 | Clay → Server. Clay offers `WILL TTYPE` (at connect if Negotiate is on, or whenever the server asks with `DO TTYPE`) and answers `SB TTYPE SEND` with a 3-answer cycle — see below. |
-| EOR | 25 | Both directions. Clay accepts `WILL EOR` from the server (the server will send EOR) and answers a `DO EOR` request (Clay will send EOR) — but never asks for it first, same as SGA. |
-| NAWS | 31 | Clay → Server. Clay offers `WILL NAWS` (at connect if Negotiate is on, or whenever asked) and reports window size. |
-| CHARSET | 42 | Both directions. Clay asks `DO CHARSET` at connect (if Negotiate is on) and also accepts `WILL CHARSET` if the server offers first. |
-| MSDP | 69 | Both directions, same pattern as CHARSET. |
-| MSSP | 70 | Both directions, same pattern as CHARSET. |
-| MCCP2 | 86 | Both directions, same pattern as CHARSET. Also see **Compression and Hot Reload** below. |
-| MSP | 90 | Both directions, same pattern as CHARSET — but Clay only asks first (`DO MSP`) when the world's **MSP Sound** setting is on. See **MSP (Sound Effects)** below for what this option actually covers. |
-| GMCP | 201 | Both directions, same pattern as CHARSET. |
+| TTYPE | 24 | Server → Clay. Clay answers `DO TTYPE` with `WILL TTYPE` and then answers `SB TTYPE SEND` with a 3-answer cycle — see below. Clay never offers `WILL TTYPE` unprompted. |
+| EOR | 25 | Both directions, server-initiated only. Clay accepts `WILL EOR` from the server (the server will send EOR) and answers a `DO EOR` request (Clay will send EOR) — but never asks for it first, same as SGA. |
+| NAWS | 31 | Server → Clay. Clay answers `DO NAWS` with `WILL NAWS` and reports window size. Clay never offers `WILL NAWS` unprompted. |
+| CHARSET | 42 | Server → Clay. Clay accepts `WILL CHARSET` if the server offers it; Clay never asks `DO CHARSET` itself. |
+| MSDP | 69 | Server → Clay, same pattern as CHARSET. |
+| MSSP | 70 | Server → Clay, same pattern as CHARSET. |
+| MCCP2 | 86 | Server → Clay, same pattern as CHARSET. Also see **Compression and Hot Reload** below. |
+| MSP | 90 | Server → Clay, same pattern as CHARSET — subject to the world's **MSP Sound** setting; see **MSP (Sound Effects)** below for what this option actually covers. |
+| GMCP | 201 | Server → Clay, same pattern as CHARSET. |
 | MCP 2.1 | in-band, no option number | Not a telnet option at all — detected from ordinary text lines that begin with `#$#`. See **MCP (MUD Client Protocol)** below. |
 
-"Both directions" above means: if the server offers the option first (`WILL x`), Clay
-accepts it (`DO x`); and, independently, if Negotiate is on, Clay also asks for it first
-(`DO x`) at connect time, which the server can then accept (`WILL x`). Either order reaches
-the same negotiated state.
+Every option above is negotiated only when the server offers or requests it first (`WILL x`
+answered with `DO x`, or `DO x` answered with `WILL x`); Clay never sends an unsolicited
+`WILL`/`DO` of its own for any option.
 
 ### ECHO and Password Masking
 
@@ -78,8 +65,8 @@ mode. Clay does not ask for it first.
 
 ### TTYPE (Terminal Type)
 
-Clay offers to report its terminal type (`WILL TTYPE`), either at connect (if Negotiate is
-on) or whenever the server asks with `DO TTYPE`.
+Clay offers to report its terminal type (`WILL TTYPE`) only when the server asks with
+`DO TTYPE` — never unprompted.
 
 When the server sends `SB TTYPE SEND`, Clay answers with a three-answer cycle that repeats
 its last answer forever — the standard MTTS convention servers use to know when the
@@ -373,11 +360,6 @@ Lines without trailing newlines (e.g., prompts) are handled specially:
 1. Check character encoding in World Settings
 2. Try Latin1 for older MUDs
 3. Try Fansi for BBS-style output
-
-### A Server Reacts Badly to Clay's Opening Offer
-
-Some servers are confused by an unsolicited opening offer. Turn off the per-world
-**Negotiate** setting so Clay only answers what the server asks first.
 
 \newpage
 

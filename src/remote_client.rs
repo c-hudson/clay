@@ -1012,7 +1012,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
     loop {
         match ws_read.next().await {
             Some(Ok(Message::Text(text))) => {
-                if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                match serde_json::from_str::<WsMessage>(&text) {
+                    Ok(ws_msg) => {
                     match ws_msg {
                         WsMessage::AuthResponse { success, error, .. } => {
                             if !success {
@@ -1083,6 +1084,18 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             break;
                         }
                         _ => {}
+                    }
+                    }
+                    Err(e) => {
+                        // Invalid JSON / undeserializable message while waiting for
+                        // InitialState - log and keep waiting rather than vanishing it
+                        // with no trace (T2.4; this used to be a bare `if let Ok(..)`).
+                        let type_field = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
+                            .unwrap_or_else(|| "?".to_string());
+                        crate::http::log_remote_event("WS-BAD-MESSAGE", addr,
+                            &format!("type={} err={} len={}", type_field, e, text.len()));
                     }
                 }
             }
@@ -1355,7 +1368,8 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                        match serde_json::from_str::<WsMessage>(&text) {
+                        Ok(ws_msg) => {
                             app.handle_remote_ws_message(ws_msg);
                             // After processing ScrollbackLines, backfill_next may be set
                             if let Some((world_idx, before_seq, count, request_id)) = app.backfill_next.take() {
@@ -1384,6 +1398,18 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                                 }
                             }
                             needs_redraw = true;
+                        }
+                        Err(e) => {
+                            // Invalid JSON / undeserializable message - log and keep the
+                            // connection open rather than vanishing it with no trace
+                            // (T2.4; this used to be a bare `if let Ok(..)`).
+                            let type_field = serde_json::from_str::<serde_json::Value>(&text)
+                                .ok()
+                                .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
+                                .unwrap_or_else(|| "?".to_string());
+                            crate::http::log_remote_event("WS-BAD-MESSAGE", addr,
+                                &format!("type={} err={} len={}", type_field, e, text.len()));
+                        }
                         }
                     }
                     Some(Ok(Message::Ping(_))) => {
@@ -1850,7 +1876,6 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.password = settings.password.clone();
                     app.worlds[idx].settings.use_ssl = settings.use_ssl;
                     app.worlds[idx].settings.log_enabled = settings.log_enabled;
-                    app.worlds[idx].settings.initiate_negotiation = settings.initiate_negotiation;
                     app.worlds[idx].settings.msp_enabled = settings.msp_enabled;
                     app.worlds[idx].settings.mcp_enabled = settings.mcp_enabled;
                     app.worlds[idx].settings.encoding = Encoding::from_name(&settings.encoding);
@@ -1878,7 +1903,6 @@ pub(crate) fn handle_remote_client_key(
                         keep_alive_cmd: settings.keep_alive_cmd,
                         gmcp_packages: settings.gmcp_packages,
                         auto_reconnect_secs: settings.auto_reconnect_secs,
-                        initiate_negotiation: settings.initiate_negotiation,
                         msp_enabled: settings.msp_enabled,
                         mcp_enabled: settings.mcp_enabled,
                     });
@@ -1991,7 +2015,7 @@ pub(crate) fn handle_remote_client_key(
             // the server's own record_user_input gate - so it needs the same guard
             // (World::echo_masked is mirrored here via InitialState/EchoMaskChanged; see
             // InputArea::take_input's doc comment).
-            let record_history = !app.current_world().echo_masked;
+            let record_history = !app.current_world().protocol.echo_masked;
             let cmd = app.input.take_input(record_history);
             if cmd.is_empty() {
                 // Send empty command to server (some MUDs use this for "look")

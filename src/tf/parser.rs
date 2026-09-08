@@ -2604,10 +2604,14 @@ Examples:
 Search output history.
 
 Options:
-  -w[world]   Search specific world (default: current)
-  -l          Search local (TF) output + your typed input
-  -g          Search all worlds + local + your typed input
-  -i          Search your typed input only
+  -w[world]   Which world to search (default: current). Combines with any
+              other option below, including -i (e.g. -i -wmud).
+  -l          Search local (TF) output + input sent to the world
+  -g          Search all worlds + local + input sent to the world
+  -i          Search input sent to the world: everything sent as text, not
+              just what you typed - also triggers/actions, TF hooks, and
+              /repeat/quote batches. Combine with -w<world> to scope to one
+              world (-i alone uses the current world).
   -D          Search long-term archive (~/.clay/scrollback.db)
   -t[format]  Show timestamps
   -v          Invert match (show non-matching)
@@ -2624,10 +2628,11 @@ Options:
 When -A, -B, or -C is used, non-adjacent groups of matched+context lines are
 separated by a "--" line, matching real tf.
 
-Your typed input is captured invisibly - it never appears in normal output.
-Press F2 (show tags) to see it inline, or use /recall -i/-l/-g. Typed input is
-never written to the archive (the "Log Input" setting writes it to the per-world
-log FILE only), so -D reaches it through the in-memory half below.
+Everything sent to a world as text input is captured invisibly - it never
+appears in normal output. Press F2 (show tags) to see it inline, or use
+/recall -i/-l/-g. This input is never written to the archive (the "Log Input"
+setting writes typed input to the per-world log FILE only), so -D reaches it
+through the in-memory half below.
 
 -D searches the offline archive AND the in-memory buffer together, oldest
 first, cut so the overlap between them isn't listed twice. Rows that came out
@@ -2639,8 +2644,9 @@ Range: N (last N), -N (Nth previous), N-M, N-
 
 Examples:
   /recall 20                       - Last 20 lines
-  /recall -i /def                  - Input history matching /def
-  /recall -i *tell*                - Commands you typed containing "tell"
+  /recall -i /def                  - Input sent to the world matching /def
+  /recall -i *tell*                - Anything sent containing "tell"
+  /recall -i -wmud *tell*          - Same, but only for world "mud"
   /recall -mregexp \d{3}-\d{4}     - Regex match
   /recall -D dragon                - Search archive for "dragon"
   /recall -D -wmud.example.com *   - All archived lines for a world"#.to_string()
@@ -3979,7 +3985,7 @@ fn cmd_listvar(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         })
         .filter(|(name, _)| name_pattern.is_empty() || macros::full_match(name, name_pattern, style))
         .filter(|(_, value)| {
-            value_pattern.map_or(true, |p| macros::full_match(&value.to_string_value(), p, style))
+            value_pattern.is_none_or(|p| macros::full_match(&value.to_string_value(), p, style))
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();

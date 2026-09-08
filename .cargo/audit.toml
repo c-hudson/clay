@@ -1,0 +1,8 @@
+[advisories]
+# rsa 0.10.0-rc.18 (pulled in for the "rsa" feature of russh, see Cargo.toml's
+# comment above the russh dependency) carries the Marvin timing-sidechannel
+# advisory. It is medium severity with no upstream fix, and Clay's own
+# exposure is limited to its own signature over the SSH auth challenge, timed
+# by the server the user chose to connect to. Ignored here so `cargo audit`
+# stays clean and a future *new* advisory doesn't get lost in a permanent red.
+ignore = ["RUSTSEC-2023-0071"]

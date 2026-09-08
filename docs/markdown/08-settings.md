@@ -110,7 +110,6 @@ See the **Telnet Features** chapter for what each of these actually negotiates.
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| Negotiate | Send Clay's opening telnet offer (terminal type, window size, CHARSET, GMCP, MSDP, MCCP2, MSSP, and MSP when MSP Sound is also on) at connect time instead of waiting for the server to ask first | On |
 | MSP Sound | Play `!!SOUND(...)`/`!!MUSIC(...)` triggers the MUD sends (MUD Sound Protocol). Off means these triggers are not recognized at all — the option is never requested, and any trigger text that still arrives is left in the output unstripped and unplayed | On |
 | MCP Edit | Support MCP (MUD Client Protocol), mainly used by MOOs — makes `@edit` open a real text editor instead of dumping verb source into the scrollback. Off means `#$#`-prefixed protocol lines display as plain text instead of being parsed | On |
 
@@ -120,24 +119,15 @@ Open with `/web` command:
 
 ![Web Settings](images/tui/web.png)
 
-### WebSocket Server (Secure)
+### WebSocket/Web Server
 
-| Setting | Description | Default |
-|---------|-------------|---------|
-| WS enabled | Enable secure WebSocket server | Off |
-| WS port | Port for wss:// connections | 9002 |
-| WS password | Authentication password | (required) |
-| WS Allow List | CSV of IPs that can be whitelisted | (empty) |
-| TLS Cert File | Path to TLS certificate | (required for TLS) |
-| TLS Key File | Path to TLS private key | (required for TLS) |
-| WS Use TLS | Enable TLS for WebSocket | Off |
-
-### WebSocket Server (Non-Secure)
-
-| Setting | Description | Default |
-|---------|-------------|---------|
-| WS Nonsecure | Enable non-secure WebSocket | Off |
-| WS NS port | Port for ws:// connections | 9003 |
+There's a single server, not separate secure/non-secure WebSocket listeners — it
+serves the web UI and WebSocket connections on one port, and is TLS-capable for
+remote clients while always serving localhost plain (see `SECURITY-NOTES.md`). The
+live settings keys (`persistence.rs`) are `http_port` (default 9000) and `web_path`
+(the stealth URL prefix, default `clay`). Older config files may still contain a
+handful of separate-port/enabled keys from a previous WebSocket layout —
+`persistence.rs` loads and silently ignores all of them; they no longer do anything.
 
 ### HTTP/HTTPS Web Interface
 
@@ -165,8 +155,8 @@ Settings are automatically saved to `~/.clay.dat`:
 more_mode_enabled=true
 spell_check_enabled=true
 world_switch_mode=unseen_first
-websocket_enabled=false
-websocket_port=9002
+http_enabled=false
+http_port=9000
 
 [world:MyMUD]
 hostname=mud.example.com

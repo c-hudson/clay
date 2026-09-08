@@ -235,19 +235,21 @@ Common issues and their solutions.
 
 ### GUI Build Fails
 
-**Symptoms:** remote-gui feature won't compile
+**Symptoms:** `webview-gui` feature won't compile
 
 **Solutions:**
-1. Install X11 libs: `sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev`
+1. Install GTK/WebKit libs (Linux): `sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev`
 2. For audio: `sudo apt install libasound2-dev`
-3. Verify display server is running
+3. Verify a display server is running (X11/Wayland on Linux, Termux:X11 on Android) —
+   not needed on Windows (WebView2) or macOS (WKWebView)
 
 ### Missing Dependencies
 
 **Symptoms:** Link errors
 
 **Solutions:**
-1. Use `--no-default-features --features rustls-backend` for minimal deps
+1. Use `--no-default-features --features rustls-backend,ssh-transport` for minimal
+   deps (add `,ssh-transport` or `--ssh` silently stops working instead of erroring)
 2. Check platform-specific requirements
 3. Update Rust: `rustup update`
 

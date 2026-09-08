@@ -37,7 +37,12 @@ pub fn strip_c1_controls(s: String) -> String {
     s.chars().filter(|&c| !is_c1_control(c)).collect()
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
+/// Job 9 (plan `investigate-differences-between-tinyfugu-fluffy-stallman.md`, T3.2):
+/// `Serialize`/`Deserialize` added so `ProtocolState` (which holds `Option<Encoding>` as
+/// `negotiated_encoding`) can itself derive them, matching `WorldStats`/`McpState`'s
+/// existing serde derives — a plain 3-variant unit enum, so this is a mechanical addition
+/// with no custom (de)serialization logic needed.
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Encoding {
     #[default]
     Utf8,

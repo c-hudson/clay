@@ -187,6 +187,13 @@ pub fn play_file(
     volume: i64,
     loops: i64,
 ) -> Option<PlayHandle> {
+    // T1.7: the External arm below used to spawn `mpv`/`ffplay` unconditionally, even
+    // for a file that was never downloaded (MSP bare-name trigger for a sound pack Clay
+    // doesn't have, or a GMCP media fetch that failed). The Native arm already fails
+    // safely via `fs::read`'s `Err` — this makes both arms agree before either runs.
+    if !path.is_file() {
+        return None;
+    }
     match backend {
         #[cfg(feature = "native-audio")]
         AudioBackend::Native { stream_handle, .. } => {
@@ -409,6 +416,24 @@ pub fn download_to_cache(
         Some(cache_path)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod play_file_tests {
+    use super::{play_file, AudioBackend};
+    use std::path::Path;
+
+    /// T1.7 / Job 4: a nonexistent file must never reach the External arm's
+    /// `Command::spawn()` at all — this is the whole point of the `is_file()`
+    /// guard added to `play_file` above, not just "the spawn happens to fail."
+    /// Using a real player name (`mpv`) rather than something bogus like the
+    /// Job 4 tests elsewhere (`true`) makes sure this returns `None` even when
+    /// the command itself would exist on PATH.
+    #[test]
+    fn returns_none_for_nonexistent_path_without_spawning() {
+        let backend = AudioBackend::External { player_cmd: "mpv".to_string() };
+        assert!(play_file(&backend, Path::new("/nonexistent/x.wav"), 100, 1).is_none());
     }
 }
 

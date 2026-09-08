@@ -35,8 +35,10 @@ Clay is a modern terminal-based MUD (Multi-User Dungeon) client that combines th
 ### Remote Access
 - WebSocket server for remote clients
 - Browser-based web interface
-- Native GUI client (egui)
+- Native WebView GUI client (wry/tao, same interface as the web client)
 - Remote console client
+- SSH-tunneled console/GUI (`--ssh`)
+- Headless daemon (`-D`) and multiuser server (`--multiuser`) modes
 
 ### Advanced Features
 - Telnet protocol negotiation (SGA, TTYPE, NAWS, EOR)
@@ -53,7 +55,7 @@ Clay is a modern terminal-based MUD (Multi-User Dungeon) client that combines th
 | Linux ARM64 | Full | Tested on Raspberry Pi |
 | macOS (Intel) | Full | Native builds |
 | macOS (Apple Silicon) | Full | Native ARM64 builds |
-| Windows (WSL) | Full | Via Windows Subsystem for Linux |
+| Windows x86_64 | Full | Native build (MSVC), no WSL required |
 | Android (Termux) | Partial | Some features unavailable |
 
 ## Architecture Overview

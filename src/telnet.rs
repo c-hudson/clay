@@ -136,6 +136,16 @@ pub enum StreamReader {
     /// one).
     #[cfg(test)]
     Duplex(ReadHalf<tokio::io::DuplexStream>),
+    /// A scripted sequence of socket reads, each either a chunk of bytes or an `io::Error`
+    /// (plan Job 1, T1.15) — used to test `spawn_telnet_reader`'s `Err(e)` arm, which
+    /// `Duplex` above can't reach: dropping the duplex's peer only ever produces a clean
+    /// `Ok(0)` EOF, never a real read error. Each `poll_read` call pops the front of the
+    /// queue; an `Ok` chunk longer than the caller's buffer is split, with the remainder
+    /// pushed back for the next call. An empty queue reads as `Ok(())` with nothing written
+    /// to `buf` — a clean EOF, so a script that doesn't end in an explicit `Err` still
+    /// terminates the reader task instead of hanging it forever.
+    #[cfg(test)]
+    Scripted(std::collections::VecDeque<io::Result<Vec<u8>>>),
 }
 
 pub enum StreamWriter {
@@ -167,6 +177,22 @@ impl AsyncRead for StreamReader {
             StreamReader::NamedPipeProxy(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(test)]
             StreamReader::Duplex(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(test)]
+            StreamReader::Scripted(queue) => match queue.pop_front() {
+                Some(Ok(mut chunk)) => {
+                    let n = chunk.len().min(buf.remaining());
+                    buf.put_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        // Caller's buffer was smaller than this scripted chunk: push the
+                        // remainder back for the next poll_read, same as a real socket
+                        // would just deliver it across two reads.
+                        queue.push_front(Ok(chunk.split_off(n)));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                Some(Err(e)) => Poll::Ready(Err(e)),
+                None => Poll::Ready(Ok(())), // queue exhausted: reads as EOF (0 bytes)
+            },
         }
     }
 }
@@ -796,31 +822,57 @@ pub fn build_charset_rejected() -> Vec<u8> {
 /// loop does today) it must not let that turn into unbounded memory growth.
 const MCCP2_BOMB_LIMIT: usize = 4 * 1024 * 1024; // 4 MiB per feed() call
 
+/// Defence in depth for `run_decompressor`'s `pending_compressed` carry (T1.1, plan Job 1,
+/// step 3). Normal streaming decompression can leave a genuine few-byte carry when a zlib
+/// block boundary doesn't land on a `feed()` call boundary — that's expected and small. If
+/// the unconsumed remainder ever exceeds this, something has gone wrong beyond ordinary
+/// streaming (the decompressor is stuck making no real progress), and it is treated the same
+/// as an outright inflate error: poison the session and disconnect (design decision D1)
+/// rather than let `pending_compressed` become the unbounded retention buffer T1.1 was about.
+const MAX_PENDING_COMPRESSED: usize = 65_536;
+
+/// Outcome of one `mccp2_decompress_inner` call (plan Job 1, T1.1/step 2). Replaces the old
+/// four-element tuple specifically so `run_decompressor` can tell "zlib itself errored" apart
+/// from "needs more input" — the two used to collapse onto the same `consumed`-short-of-
+/// `compressed.len()` shape, which is the root cause of T1.1's leftover-retention bug: every
+/// later byte piled into `pending_compressed` forever because nothing distinguished the two.
+struct InflateStep {
+    /// Decompressed bytes produced this call.
+    output: Vec<u8>,
+    /// How many bytes of `compressed` were actually fed to zlib — the remainder, if any, is
+    /// unconsumed input the caller must carry to the next call rather than discard (unless
+    /// `error` is `Some`, in which case nothing should ever be retried against this
+    /// decompressor again).
+    consumed: usize,
+    /// `Status::StreamEnd` (`Z_STREAM_END`) — the far end turned compression off.
+    stream_end: bool,
+    /// `output.len() >= max_output` (checked at the top of each loop iteration, so the actual
+    /// length can exceed `max_output` by up to one iteration's output — a few kilobytes —
+    /// which is fine for a "few MiB is ample" guard).
+    bomb_hit: bool,
+    /// `Some(reason)` iff zlib itself reported a decompression error — a poisoned stream
+    /// (T1.1). `reason` comes from `flate2::DecompressError`'s `Display`, which never
+    /// includes byte counts or positions (see design decision D1's requirement that a
+    /// `CompressionFailed` message stay split-invariant), so it is safe to surface directly.
+    error: Option<String>,
+}
+
 /// Shared decompression loop behind `mccp2_decompress`/`mccp2_decompress_ex`
 /// and `TelnetSession`'s inline decompression (`mccp2_decompress_capped`).
 /// Feeds `compressed` through `decompressor` until it stops making
-/// progress, the zlib stream ends, or `max_output` decompressed bytes have
-/// been produced.
-///
-/// Returns `(decompressed, consumed, stream_end, bomb_hit)`: `consumed` is
-/// how many bytes of `compressed` were actually fed to zlib — the
-/// remainder, if any, is unconsumed input the caller must carry to the next
-/// call rather than discard; `stream_end` is `Status::StreamEnd`
-/// (`Z_STREAM_END`) — the far end turned compression off; `bomb_hit` is
-/// `decompressed.len() >= max_output` (checked at the top of each loop
-/// iteration, so the actual length can exceed `max_output` by up to one
-/// iteration's output — a few kilobytes — which is fine for a "few MiB is
-/// ample" guard).
+/// progress, the zlib stream ends, `max_output` decompressed bytes have been
+/// produced, or zlib reports an error.
 fn mccp2_decompress_inner(
     decompressor: &mut flate2::Decompress,
     compressed: &[u8],
     max_output: usize,
-) -> (Vec<u8>, usize, bool, bool) {
+) -> InflateStep {
     let mut output = Vec::with_capacity(compressed.len().saturating_mul(4).min(max_output.max(1)));
     let mut buf = [0u8; 8192];
     let mut total_in = 0;
     let mut stream_end = false;
     let mut bomb_hit = false;
+    let mut error = None;
 
     loop {
         if output.len() >= max_output {
@@ -856,12 +908,17 @@ fn mccp2_decompress_inner(
             Ok(flate2::Status::BufError) => {
                 break; // Need more input or output space exhausted
             }
-            Err(_) => {
-                break; // Decompression error
+            Err(e) => {
+                // T1.1: the old code discarded `e` and just broke here, leaving
+                // `run_decompressor` unable to tell this apart from "needs more input" -
+                // that ambiguity is the whole bug. Once `Decompress` is in this state every
+                // later call re-fails the same way, so the caller must poison, not retry.
+                error = Some(e.to_string());
+                break;
             }
         }
     }
-    (output, total_in, stream_end, bomb_hit)
+    InflateStep { output, consumed: total_in, stream_end, bomb_hit, error }
 }
 
 /// Decompress MCCP2 zlib data, returning decompressed bytes, how many bytes
@@ -871,14 +928,16 @@ fn mccp2_decompress_inner(
 /// which is why `Z_STREAM_END` recovery was impossible for any of its
 /// callers. Uncapped (see `mccp2_decompress_capped` for the bomb-guarded
 /// variant `TelnetSession` uses). The decompressor maintains state across
-/// calls for streaming decompression.
+/// calls for streaming decompression. Like `mccp2_decompress` below, this
+/// legacy wrapper still discards the error/bomb information `InflateStep`
+/// now carries — untouched by plan Job 1, which only hardens
+/// `TelnetSession`'s own `run_decompressor` path.
 pub fn mccp2_decompress_ex(
     decompressor: &mut flate2::Decompress,
     compressed: &[u8],
 ) -> (Vec<u8>, usize, bool) {
-    let (output, consumed, stream_end, _bomb_hit) =
-        mccp2_decompress_inner(decompressor, compressed, usize::MAX);
-    (output, consumed, stream_end)
+    let step = mccp2_decompress_inner(decompressor, compressed, usize::MAX);
+    (step.output, step.consumed, step.stream_end)
 }
 
 /// Decompress MCCP2 zlib data. Returns decompressed bytes.
@@ -901,8 +960,54 @@ pub fn mccp2_decompress(decompressor: &mut flate2::Decompress, compressed: &[u8]
 fn mccp2_decompress_capped(
     decompressor: &mut flate2::Decompress,
     compressed: &[u8],
-) -> (Vec<u8>, usize, bool, bool) {
+) -> InflateStep {
     mccp2_decompress_inner(decompressor, compressed, MCCP2_BOMB_LIMIT)
+}
+
+/// Whether `data` ends in an ANSI escape sequence that hasn't reached a
+/// terminating byte yet — a lone trailing ESC, or an `ESC [` (CSI) with no
+/// final byte (0x40-0x7E) after it. Returns the offset of the ESC that opens
+/// it. `None` means whatever escape sequence(s) `data` contains are all
+/// complete (or there is no ESC at all).
+///
+/// Lifted out of `find_safe_split_point` (D2 in the plan): that function's
+/// IAC/subnegotiation branches are wrong for `TelnetSession::pending_text` —
+/// by the time text lands there, an `IAC IAC` escape has already become a
+/// literal `0xFF` byte that must *not* be held back, and there is no
+/// subnegotiation payload in plain text at all — but this ESC/CSI branch is
+/// exactly as correct there as it always was, so `idle_release_len` uses it
+/// directly and `find_safe_split_point` now calls it too rather than
+/// duplicating the logic, keeping the characterization tests below exercising
+/// the real, shared implementation.
+fn unterminated_escape_start(data: &[u8]) -> Option<usize> {
+    let esc_pos = data.iter().rposition(|&b| b == 0x1B)?;
+    let after_esc = &data[esc_pos..];
+
+    if after_esc.len() < 2 {
+        // Just ESC at the end, incomplete.
+        return Some(esc_pos);
+    }
+
+    if after_esc[1] == b'[' {
+        // CSI sequence (ESC [) - look for a terminating byte (0x40-0x7E).
+        let mut found_terminator = false;
+        for &b in &after_esc[2..] {
+            if (0x40..=0x7E).contains(&b) {
+                found_terminator = true;
+                break;
+            }
+            if !((0x30..=0x3F).contains(&b) || b == b';') {
+                found_terminator = true;
+                break;
+            }
+        }
+        if !found_terminator {
+            // Incomplete CSI sequence.
+            return Some(esc_pos);
+        }
+    }
+
+    None
 }
 
 /// Check if there's an incomplete ANSI escape sequence or telnet sequence at the end.
@@ -919,33 +1024,11 @@ fn find_safe_split_point(data: &[u8]) -> usize {
 
     let len = data.len();
 
-    // Check for incomplete ANSI escape sequence at the end
-    if let Some(esc_pos) = data.iter().rposition(|&b| b == 0x1B) {
-        let after_esc = &data[esc_pos..];
-
-        if after_esc.len() < 2 {
-            // Just ESC at the end, incomplete
-            return esc_pos;
-        }
-
-        if after_esc[1] == b'[' {
-            // CSI sequence (ESC [) - look for terminating byte (0x40-0x7E)
-            let mut found_terminator = false;
-            for &b in &after_esc[2..] {
-                if (0x40..=0x7E).contains(&b) {
-                    found_terminator = true;
-                    break;
-                }
-                if !((0x30..=0x3F).contains(&b) || b == b';') {
-                    found_terminator = true;
-                    break;
-                }
-            }
-            if !found_terminator {
-                // Incomplete CSI sequence
-                return esc_pos;
-            }
-        }
+    // Check for incomplete ANSI escape sequence at the end (see
+    // `unterminated_escape_start`'s doc comment for why this is now shared
+    // rather than duplicated here).
+    if let Some(esc_pos) = unterminated_escape_start(data) {
+        return esc_pos;
     }
 
     // Check for incomplete telnet IAC sequences at the end
@@ -1031,37 +1114,23 @@ pub struct TelnetConfig {
     /// The first answer of the MTTS cycle (plan Job 12 / 4.1): the client's
     /// own name, uppercased, e.g. "CLAY".
     pub client_name: String,
-    /// Job 11 (plan Phase 3, step 3.5, finding 5): whether
-    /// `spawn_telnet_reader` should call `TelnetSession::initial_negotiation`
-    /// at task start and send its bytes, versus staying purely reactive like
-    /// every prior job. Mirrors `World::settings.initiate_negotiation`
-    /// (default on) — the per-world escape hatch for a server that reacts
-    /// badly to being spoken to first. Deliberately consulted by the reader,
-    /// not by `TelnetSession` itself: `initial_negotiation` stays an
-    /// unconditional, directly-testable method (design commitment 1 — no
-    /// config-flag branching inside the pure session), and the *decision* of
-    /// whether to call it at all lives in the one async call site that has
-    /// somewhere to send the bytes.
-    pub initiate_negotiation: bool,
     /// Job 12 (plan Phase 4, 4.1): whether the underlying connection this
     /// session is parsing is actually TLS-encrypted — feeds the MTTS `SSL`
     /// bit (see `TelnetSession::mtts_bitmask`). `TelnetSession` has no socket
     /// of its own to inspect (design commitment 1: pure, synchronous, no
     /// I/O), so this has to come in from the call site, which already knows
     /// (it chose `StreamReader::Tls`/`Proxy`/`NamedPipeProxy` vs `Plain`, or
-    /// tracks it on `World::is_tls`) — same reasoning as
-    /// `initiate_negotiation` above.
+    /// tracks it on `World::is_tls`).
     pub is_tls: bool,
     /// Job 14 (plan Phase 4): per-world escape hatch for MSP (`!!SOUND(...)`/
     /// `!!MUSIC(...)`) trigger recognition — mirrors
-    /// `World::settings.msp_enabled` (default on), same posture and same
-    /// reason as `initiate_negotiation`: audio triggered by a remote server
-    /// is something a user must be able to turn off. Unlike
-    /// `initiate_negotiation` this gates *inbound* behaviour, not an
-    /// outbound offer: when `false`, `extract_msp_triggers` is not even
-    /// called (see `feed`), so a `!!SOUND(...)` trigger passes through as
-    /// perfectly ordinary text — off means MSP does not exist as far as this
-    /// session is concerned, not merely "recognised but muted".
+    /// `World::settings.msp_enabled` (default on): audio triggered by a
+    /// remote server is something a user must be able to turn off. This
+    /// gates *inbound* behaviour, not an outbound offer: when `false`,
+    /// `extract_msp_triggers` is not even called (see `feed`), so a
+    /// `!!SOUND(...)` trigger passes through as perfectly ordinary text —
+    /// off means MSP does not exist as far as this session is concerned, not
+    /// merely "recognised but muted".
     pub msp_enabled: bool,
 }
 
@@ -1072,7 +1141,6 @@ impl Default for TelnetConfig {
             // freshly-migrated call site sees the same default it does today.
             term_type: "ANSI".to_string(),
             client_name: "CLAY".to_string(),
-            initiate_negotiation: true,
             is_tls: false,
             msp_enabled: true,
         }
@@ -1140,11 +1208,28 @@ pub enum TelnetEvent {
     /// the decompressor is kept forever and every later byte silently
     /// vanishes.
     CompressionEnded,
-    /// A subnegotiation was abandoned (see `MAX_SUBNEG_BYTES`), the MCCP2
-    /// decompression-bomb guard tripped (see `MCCP2_BOMB_LIMIT`), or
-    /// another recoverable protocol anomaly was seen. Carries a
-    /// human-readable description naming the option/limit, for
-    /// `remote.log`-style diagnostics.
+    /// The MCCP2 zlib stream is unrecoverably broken: either `decompressor.decompress`
+    /// itself reported an error (a corrupt/hostile stream, T1.1), or the decompression-bomb
+    /// guard tripped (`MCCP2_BOMB_LIMIT`, T1.14). Design decision D1: a poisoned zlib stream
+    /// has no resync point — roughly 1 in 256 of its bytes is `0xFF`, so parsing them as
+    /// telnet would flip option state and send wire replies to the server from what is
+    /// really still-compressed noise — so this is fatal, never a fall-back-to-plaintext
+    /// case like `ProtocolError` below. The session sets its `poisoned` flag before pushing
+    /// this event; every `feed()` call after this one returns `TelnetOutcome::default()`
+    /// structurally, and the reader (`telnet_reader::spawn_telnet_reader`) treats this event
+    /// as fatal: forward it, then `flush_eof()`, then a disconnect message, then
+    /// `AppEvent::Disconnected`, the same sequence a clean `Ok(0)` EOF uses. The `String` is
+    /// a human-readable reason with no byte counts or positions (unlike `ProtocolError`
+    /// below, which may) — one is embedded in the disconnect message the reader builds, and
+    /// a value that varied with how the corrupt stream happened to be chunked across reads
+    /// would break the split-invariance property every other event here already has.
+    CompressionFailed(String),
+    /// A subnegotiation was abandoned (see `MAX_SUBNEG_BYTES`), an MCCP2 activation
+    /// subnegotiation was ignored because it wasn't negotiated or a decompressor was
+    /// already active (T1.2), or another recoverable protocol anomaly was seen — the
+    /// session keeps parsing normally afterward, unlike `CompressionFailed` above. Carries a
+    /// human-readable description naming the option/limit, for `remote.log`-style
+    /// diagnostics.
     ProtocolError(String),
     /// A telnet option was just accepted in this direction — `WILL` answered
     /// with `DO`, or `DO` answered with `WILL` — carrying the option code
@@ -1270,40 +1355,34 @@ pub struct MspTrigger {
 /// common Q method implementations (e.g. libtelnet's `telnet_q_t`).
 ///
 /// `No`/`Yes` are reachable purely by *receiving* WILL/WONT/DO/DONT and
-/// replying (see `q_receive_will_wont`/`q_receive_do_dont`). `WantYes` is
-/// also reachable a second way as of Job 11 (finding 5 / Phase 3.5): Clay
-/// itself initiating via `q_send_will`/`q_send_do` (`initial_negotiation`'s
-/// opening offer) puts an option there *before* anything is received, so the
-/// peer's eventual reply resolves it rather than requesting it fresh. The
-/// remaining three `Want*` states — `WantNo`, and both `*Opposite` variants —
-/// arise only once something actively requests a *disable*, or queues a
-/// second request behind one still in flight; implemented here in full, per
-/// RFC 1143's tables, so a future job adding either does not need to touch
-/// this type or its transition functions again, but nothing in this codebase
-/// drives them yet.
+/// replying (see `q_receive_will_wont`/`q_receive_do_dont`) — Clay is fully
+/// reactive and never initiates a negotiation itself. The four `Want*`
+/// states — `WantNo`, `WantYes`, and both `*Opposite` variants — arise only
+/// once something actively initiates a request (a disable, or a second
+/// request queued behind one still in flight); implemented here in full, per
+/// RFC 1143's tables, so a future job adding self-initiated negotiation does
+/// not need to touch this type or its transition functions again, but
+/// nothing in this codebase drives them yet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum OptionState {
     #[default]
     No,
     Yes,
-    // `WantNo` itself is likewise never constructed yet: Job 11's
-    // `q_send_will`/`q_send_do` only initiate the *enable* direction (`WILL`/
-    // `DO`), matching `initial_negotiation`'s offer list — nothing in this
-    // codebase ever decides on its own to send `WONT`/`DONT` for an option it
-    // already has on, so `Yes -> WantNo` (the only way to reach it) never
-    // fires. Kept, like the two below, for RFC 1143 completeness.
+    // Never constructed yet: nothing in this codebase decides on its own to
+    // send `WONT`/`DONT` for an option it already has on, or `WILL`/`DO` to
+    // request one be turned on, so neither `Yes -> WantNo` nor `No -> WantYes`
+    // (via self-initiation) ever fires. Kept for RFC 1143 completeness.
+    #[allow(dead_code)]
     WantNo,
     // `WantNoOpposite`/`WantYesOpposite` are never *constructed* yet (only
     // matched against, in the transition tables below) — reaching either
     // requires Clay to have already sent its own request and had a second,
-    // opposite one queued behind it while waiting. Job 11 added the
-    // self-initiation path (`q_send_will`/`q_send_do`), but only ever calls
-    // it once per option per session (`initial_negotiation`, before any
-    // `feed()`), so nothing yet queues a second, opposite request behind a
-    // first one still in flight. Kept for RFC 1143 completeness (see
-    // `OptionState`'s doc comment) rather than removed and re-added later.
+    // opposite one queued behind it while waiting, which nothing here does.
+    // Kept for RFC 1143 completeness (see `OptionState`'s doc comment)
+    // rather than removed and re-added later.
     #[allow(dead_code)]
     WantNoOpposite,
+    #[allow(dead_code)]
     WantYes,
     #[allow(dead_code)]
     WantYesOpposite,
@@ -1443,6 +1522,66 @@ fn parse_msp_trigger(is_music: bool, params: &[u8]) -> MspTrigger {
     MspTrigger { is_music, off: false, name, volume, loops, priority, media_type, url }
 }
 
+/// Where to start holding `text` back because it might still contain (or end
+/// with the start of) an MSP trigger the caller hasn't seen the whole of.
+/// Checks two things and returns the earlier (more conservative) of whichever
+/// apply:
+///  - the last `!!SOUND(`/`!!MUSIC(` marker in `text` with neither a `)` nor
+///    a `\n` anywhere after it — a marker that fully matched but hasn't been
+///    resolved either way yet (`extract_msp_triggers`'s own loop already
+///    catches this for a single `feed()` call via its `incomplete_from`, so
+///    this branch only matters when `text` is a *carried-over* hold-back —
+///    e.g. `idle_release_len` calling this directly on `pending_text` — that
+///    was never re-scanned by that loop). Checking for `\n` too (not just
+///    `)`) matters here: a marker the loop already resolved as malformed (no
+///    `)` before end-of-line) leaves that `\n` sitting right there in `text`,
+///    and without this check this branch would mistake that *settled*
+///    malformed trigger for one still waiting on more input and hold it back
+///    forever;
+///  - failing that, a trailing proper prefix of either marker at least
+///    `min_prefix` bytes long — the marker itself is still arriving, e.g.
+///    `text` ending in `!!SOU`.
+///
+/// `min_prefix` lets callers tune how eager this is: `extract_msp_triggers`
+/// passes 1, because `feed()` has a real next call coming that might supply
+/// the rest of the marker and — per T2.1 — a bare trailing `!` must not be
+/// flushed and lost if that next call turns it into `!!SOUND(`. The idle
+/// flush passes 2 instead: after `IDLE_FLUSH_INTERVAL` of silence there is no
+/// "next call" about to arrive, so a lone trailing `!` is far more likely to
+/// be the end of an ordinary prompt (`"Hello!"`) than the start of a marker,
+/// and holding it would mean never showing it until more output happens to
+/// follow.
+fn msp_holdback_start(text: &[u8], min_prefix: usize) -> Option<usize> {
+    let markers: [&[u8]; 2] = [MSP_SOUND_MARKER, MSP_MUSIC_MARKER];
+
+    let open = markers
+        .iter()
+        .filter_map(|marker| {
+            text.windows(marker.len()).rposition(|w| w == *marker).filter(|&pos| {
+                let after = &text[pos + marker.len()..];
+                !after.contains(&b')') && !after.contains(&b'\n')
+            })
+        })
+        .max();
+
+    let max_len = (MSP_MARKER_LEN - 1).min(text.len());
+    let prefix = (min_prefix..=max_len).rev().find_map(|len| {
+        let tail = &text[text.len() - len..];
+        if markers.iter().any(|m| m.starts_with(tail)) {
+            Some(text.len() - len)
+        } else {
+            None
+        }
+    });
+
+    match (open, prefix) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 /// Scan `text` for complete `!!SOUND(...)`/`!!MUSIC(...)` triggers, strip
 /// each one out and push an equivalent `TelnetEvent::MspTrigger`. Returns
 /// `Some(offset)` when `text` ends with a marker that opened but has not yet
@@ -1511,8 +1650,86 @@ fn extract_msp_triggers(text: &mut Vec<u8>, events: &mut Vec<TelnetEvent>) -> Op
             i += 1;
         }
     }
+    // T2.1: the loop above only recognises an in-progress trigger once the
+    // full 8-byte marker has matched. A read boundary landing *inside* the
+    // marker itself (`out` ending in `!!SOU`) is invisible to it — those
+    // bytes went through the `else` arm one at a time as ordinary text,
+    // since `rest.starts_with(marker)` can't match a `rest` shorter than the
+    // marker. Catch that here: a trailing proper prefix of either marker
+    // (or, from `msp_holdback_start`'s other branch, a still-open marker —
+    // structurally unreachable in *this* caller, since the loop already
+    // claims that case via `incomplete_from`, but the same helper also
+    // serves `idle_release_len` where it isn't) is exactly as "not yet known
+    // to be complete" as the closer-to-the-end case the loop already
+    // handles.
+    if incomplete_from.is_none() {
+        incomplete_from = msp_holdback_start(&out, 1);
+    }
     *text = out;
     incomplete_from
+}
+
+/// How many bytes at the very end of `text` form an incomplete UTF-8 code
+/// point (0..=3 — a full sequence is at most 4 bytes, so at most 3 of them
+/// can ever be "still waiting on more"). Walks backwards from the end: a
+/// continuation byte (`10xxxxxx`) just means keep walking; the first
+/// non-continuation byte found is either a lead byte that needed more
+/// continuation bytes than it got (incomplete — return how many bytes back
+/// that lead byte was) or anything else (ASCII, a lead byte that already got
+/// enough continuation bytes, or a byte that was never valid UTF-8 at all,
+/// e.g. a literal `0xFF` telnet escape already unescaped to a plain byte by
+/// `feed` — complete, nothing to hold, return 0).
+fn incomplete_utf8_tail_len(text: &[u8]) -> usize {
+    let len = text.len();
+    let max_back = 3.min(len);
+    for back in 1..=max_back {
+        let b = text[len - back];
+        if b & 0xC0 == 0x80 {
+            // Continuation byte - the lead byte (if any) is further back.
+            continue;
+        }
+        let needed = if b < 0x80 {
+            1
+        } else if b & 0xE0 == 0xC0 {
+            2
+        } else if b & 0xF0 == 0xE0 {
+            3
+        } else if b & 0xF8 == 0xF0 {
+            4
+        } else {
+            // Not a valid UTF-8 lead byte at all - nothing to hold on its
+            // account.
+            return 0;
+        };
+        return if needed > back { back } else { 0 };
+    }
+    // Every one of the (at most 3) trailing bytes examined was a
+    // continuation byte with no lead byte found in range - a real 4-byte
+    // sequence has only 3 continuation bytes total, so this can't be
+    // completed by holding back any of them either.
+    0
+}
+
+/// How many bytes at the front of `text` are safe to release right now
+/// without risking showing a truncated MSP trigger marker, ANSI CSI
+/// sequence, or UTF-8 code point. Used only by the idle flush
+/// (`TelnetSession::take_idle_flushable_text`) — `feed()`'s own hold-back
+/// (see the struct doc comment's "Text hold-back" section) makes a coarser
+/// "hold the whole tail, or don't" call because it still has a next `feed()`
+/// call coming that might complete things; the idle flush doesn't, so it
+/// needs the precise boundary instead of an all-or-nothing choice.
+///
+/// Applies, in order, each rule narrowing what the previous one already
+/// allowed: an open-or-prefix MSP marker (`msp_holdback_start` with a
+/// minimum prefix of 2, so a lone trailing `!` from an ordinary prompt like
+/// `"Hello!"` is released rather than mistaken for the start of a trigger —
+/// `feed()` itself uses 1, since unlike the idle flush it does have a next
+/// read that might turn that `!` into a real marker), then an unterminated
+/// ANSI escape, then an incomplete trailing UTF-8 code point.
+fn idle_release_len(text: &[u8]) -> usize {
+    let after_msp = msp_holdback_start(text, 2).unwrap_or(text.len());
+    let after_escape = unterminated_escape_start(&text[..after_msp]).unwrap_or(after_msp);
+    after_escape - incomplete_utf8_tail_len(&text[..after_escape])
 }
 
 /// A pure, synchronous, stateful telnet parser with real carry-over across
@@ -1558,6 +1775,28 @@ fn extract_msp_triggers(text: &mut Vec<u8>, events: &mut Vec<TelnetEvent>) -> Op
 /// front of it just loses that text — so there is no fixture pinning that
 /// behaviour to preserve; this is new, correct behaviour, not a divergence
 /// from anything the characterization table asserts.
+///
+/// T2.1 folds an in-progress MSP trigger into the same tail (see
+/// `extract_msp_triggers`/`msp_holdback_start`): a trailing proper prefix of
+/// `!!SOUND(`/`!!MUSIC(`, or a fully-matched marker with no closing `)` yet,
+/// is held from `pos` under the larger `MAX_MSP_TRIGGER_HOLDBACK` cap instead
+/// of `MAX_TEXT_HOLDBACK` whenever the ordinary rule above wouldn't already
+/// cover it — never *instead* of the ordinary rule, only in addition to it,
+/// since holding only from `pos` would flush an ordinary short line ending in
+/// `!` (a name prompt, say) as far as `pos` and hand GA/EOR a truncated
+/// prompt. See `feed`'s hold-decision code comment for the exact rule.
+///
+/// # Idle-flush release (`take_idle_flushable_text`)
+///
+/// `feed`'s hold-back above is deliberately all-or-nothing per call — it
+/// always has another `feed` call that might complete things. The 150ms idle
+/// timer (`spawn_telnet_reader`, T2.2) has no such call coming, so draining
+/// `pending_text` wholesale there could show a truncated MSP trigger marker,
+/// UTF-8 code point, or CSI sequence — exactly what `MAX_MSP_TRIGGER_HOLDBACK`
+/// and the ordinary hold-back exist to prevent. `take_idle_flushable_text`
+/// uses `idle_release_len` instead: release only the prefix that helper
+/// certifies as safe, and leave the remainder — if any — in `pending_text`
+/// for the next `feed` call or a later idle flush to finish.
 pub struct TelnetSession {
     /// Read by `mtts_answer`/`mtts_bitmask` (Job 12, plan Phase 4, 4.1). Still
     /// unread by anything else - CHARSET-outbound (Job 13's `Encoding::encode`
@@ -1591,6 +1830,16 @@ pub struct TelnetSession {
     /// `run_decompressor` — at the start of the next call that has one.
     /// Always empty while `decomp` is `None`.
     pending_compressed: Vec<u8>,
+    /// Set once, permanently, when the MCCP2 zlib stream is found unrecoverably corrupt
+    /// (an inflate error or a bomb-guard trip — see `TelnetEvent::CompressionFailed`,
+    /// design decision D1). Every `feed()` call checks this first and returns
+    /// `TelnetOutcome::default()` structurally once set — there is no reset, and no code
+    /// path re-parses anything as telnet after this, by construction: the whole point is
+    /// that a poisoned zlib stream has no resync point, so nothing after it can be trusted.
+    /// `flush_eof()` deliberately does NOT check this — whatever text was already safely
+    /// held back in `pending_text` before poisoning is still real, undecoded plaintext and
+    /// must still reach the caller when the reader's fatal sequence flushes it.
+    poisoned: bool,
     /// True from the moment a GA/EOR/WONT-ECHO prompt extraction fires until
     /// the next literal `\n` is scanned. Suppresses a *second* WONT-ECHO
     /// extraction for the same still-open line. `process_telnet` has the
@@ -1625,72 +1874,12 @@ impl TelnetSession {
             ttype_index: 0,
             decomp: None,
             pending_compressed: Vec::new(),
+            poisoned: false,
             prompt_open: false,
             telnet_seen: false,
             options_him: Box::new([OptionState::default(); 256]),
             options_us: Box::new([OptionState::default(); 256]),
         }
-    }
-
-    /// Job 11 (plan Phase 3, step 3.5, finding 5): Clay's opening offer, sent
-    /// unprompted at connect time instead of waiting to be asked. Before this,
-    /// every `WILL`/`DO` Clay ever sent was a *reply* — a server that never
-    /// initiates (the MUSH/MOO norm the user actually plays) got no GMCP,
-    /// MSDP, MCCP2, or CHARSET at all, ever, because nothing on Clay's side
-    /// would speak first.
-    ///
-    /// Offers seven options unconditionally, in this order: `WILL TTYPE`,
-    /// `WILL NAWS` (Clay volunteering to do something about itself — the
-    /// `options_us` track), then `DO CHARSET`, `DO GMCP`, `DO MSDP`,
-    /// `DO MCCP2`, `DO MSSP` (Clay asking the peer to do something about
-    /// itself — the `options_him` track; MSSP added by Job 12, plan Phase 4,
-    /// 4.2 — exactly the one-line addition this comment used to predict).
-    /// Not offered: SGA/EOR (nothing Clay does differently once they're on,
-    /// so there is nothing to gain by asking first).
-    ///
-    /// An eighth, `DO MSP` (Job 14, plan Phase 4), is offered conditionally
-    /// on `cfg.msp_enabled` — unlike the seven above, asking for it when the
-    /// per-world MSP setting is off would invite a compliant server to start
-    /// sending `!!SOUND(...)`/`!!MUSIC(...)` triggers that `feed` then has to
-    /// pass through as raw visible text (see `msp_enabled`'s doc comment: off
-    /// means "does not exist," not "recognised but muted"), which is a worse
-    /// outcome than just not asking. This is the same shape as
-    /// `mtts_bitmask` consulting `cfg.is_tls` — reading a config value to
-    /// shape emitted bytes, not branching on whether to run the method at
-    /// all (design commitment 1's actual target, see the note above on why
-    /// `initiate_negotiation` itself is a caller-side decision).
-    ///
-    /// Goes through `q_send_will`/`q_send_do`, exactly like every other wire
-    /// byte this module ever emits (design commitment 3: only the session
-    /// emits WILL/WONT/DO/DONT) — never raw `wire.extend_from_slice` — so
-    /// each option's Q-method state actually advances to `WantYes` and the
-    /// peer's eventual reply lands on `q_receive_will_wont`/
-    /// `q_receive_do_dont`'s already-tested `WantYes` arms instead of `No`.
-    /// That's what makes the reply terminate the exchange rather than loop:
-    /// a server answering `WILL TTYPE` with `DO TTYPE` hits `WantYes -> Yes`
-    /// (no wire), not `No -> Yes` (which would itself reply `WILL TTYPE`
-    /// again).
-    ///
-    /// Must be called at most once per session, before any `feed()` call —
-    /// every option starts at its `Default` `No`, so only the `No -> WantYes`
-    /// arm of `q_send_will`/`q_send_do` is ever reached from here. Calling it
-    /// again would hit the `Yes`/`WantYes` no-op arms and produce nothing,
-    /// which is harmless but pointless; `spawn_telnet_reader` (the only
-    /// caller) enforces "at most once" structurally by calling it a single
-    /// time at task start, not from inside the read loop.
-    pub fn initial_negotiation(&mut self) -> Vec<u8> {
-        let mut wire = Vec::new();
-        self.q_send_will(TELNET_OPT_TTYPE, &mut wire);
-        self.q_send_will(TELNET_OPT_NAWS, &mut wire);
-        self.q_send_do(TELNET_OPT_CHARSET, &mut wire);
-        self.q_send_do(TELNET_OPT_GMCP, &mut wire);
-        self.q_send_do(TELNET_OPT_MSDP, &mut wire);
-        self.q_send_do(TELNET_OPT_MCCP2, &mut wire);
-        self.q_send_do(TELNET_OPT_MSSP, &mut wire);
-        if self.cfg.msp_enabled {
-            self.q_send_do(TELNET_OPT_MSP, &mut wire);
-        }
-        wire
     }
 
     /// Interpret one complete subnegotiation payload (the bytes strictly
@@ -1700,12 +1889,27 @@ impl TelnetSession {
     /// slice; the payload *past* those framing bytes is un-doubled via
     /// `unescape_iac` before it reaches `parse_msdp_pairs`, the GMCP
     /// package/JSON split, or `parse_charset_request` (finding 6 / Phase
-    /// 3.1). Returns `true` iff this was the MCCP2 activation
+    /// 3.1). Returns `true` iff this was a genuine MCCP2 activation
     /// subnegotiation, telling the caller (`feed`) to create the
     /// decompressor and decompress the rest of this call's buffer in place
     /// before continuing to parse the same buffer (Job 3) — that offset is
     /// computed by the caller from the raw buffer, not from anything
     /// unescaped here.
+    ///
+    /// T1.2 (plan Job 1, step 1): activation requires `options_him[MCCP2] ==
+    /// Yes` (the peer's `WILL MCCP2` was actually negotiated — Clay having
+    /// replied `DO MCCP2` to the server's own offer) *and* no decompressor
+    /// already active. Without the first check, a server could turn on compression
+    /// without ever offering the option; without the second, the four
+    /// activation bytes appearing again *inside* an already-live compressed
+    /// stream — Trigger B, entirely plausible as ordinary decompressed
+    /// content that happens to contain this exact byte sequence — would
+    /// silently replace `self.decomp`, discarding the live zlib window and
+    /// feeding already-decompressed plaintext to a fresh decompressor as if
+    /// it were still compressed. Design decision D1: an unrequested or
+    /// duplicate activation is not itself a failure (no `poisoned`, no
+    /// disconnect) — it's ignored with a `ProtocolError` and whatever
+    /// decompressor is already live (if any) keeps running untouched.
     fn handle_subnegotiation(
         &mut self,
         sb_data: &[u8],
@@ -1716,8 +1920,17 @@ impl TelnetSession {
             return false;
         }
         if sb_data[0] == TELNET_OPT_MCCP2 {
-            events.push(TelnetEvent::CompressionStarted);
-            return true;
+            let negotiated = self.options_him[TELNET_OPT_MCCP2 as usize] == OptionState::Yes;
+            if negotiated && self.decomp.is_none() {
+                events.push(TelnetEvent::CompressionStarted);
+                return true;
+            }
+            events.push(TelnetEvent::ProtocolError(
+                "IAC SB MCCP2 IAC SE ignored: MCCP2 was not negotiated, or a decompressor is \
+                 already active"
+                    .to_string(),
+            ));
+            return false;
         }
         if sb_data.len() >= 2 && sb_data[0] == TELNET_OPT_TTYPE && sb_data[1] == TTYPE_SEND {
             // MTTS cycling (plan Job 12 / 4.1): answer directly here, in
@@ -1837,13 +2050,12 @@ impl TelnetSession {
     /// finding 4's actual fix: a reply and an event go out only on a real
     /// `No <-> Yes` state change, never on a repeat.
     ///
-    /// `No`/`Yes`/`WantYes` are reachable today: `No`/`Yes` from ordinary
-    /// receive-only traffic (see `OptionState`'s doc comment), and `WantYes`
-    /// since Job 11 gave `q_send_do` a way to put `options_him` there before
-    /// anything is received. `WantNo`/`WantNoOpposite`/`WantYesOpposite`
-    /// remain RFC 1143's tables in full, not dead guesses, but still nothing
-    /// Clay does today ever sends a `DONT` it initiated, so those three stay
-    /// unreached.
+    /// Only `No`/`Yes` are reachable today, from ordinary receive-only
+    /// traffic (see `OptionState`'s doc comment) — Clay is fully reactive
+    /// and never initiates a negotiation of its own, so `options_him` never
+    /// starts out anywhere but `No`. `WantNo`/`WantNoOpposite`/`WantYes`/
+    /// `WantYesOpposite` remain RFC 1143's tables in full, not dead guesses,
+    /// against the day something in this codebase does initiate.
     fn q_receive_will_wont(
         &mut self,
         opt: u8,
@@ -1868,14 +2080,11 @@ impl TelnetSession {
                 OptionState::Yes => {}
                 OptionState::WantNo => *st = OptionState::No, // error: DONT answered by WILL
                 OptionState::WantNoOpposite => *st = OptionState::Yes,
-                // Job 11: the peer confirming an option *Clay* initiated
-                // (`q_send_do` moved this to `WantYes`, sending `DO opt`) —
-                // reachable for real now, not just RFC 1143 paperwork. This is
-                // the actual "just turned on" transition for that case, so it
-                // fires `OptionEnabled` exactly like the `No -> Yes` arm above
-                // (e.g. `handle_gmcp_negotiated` — Core.Hello/Core.Supports.Set
-                // — must run whether the server volunteered WILL GMCP first or
-                // only confirmed Clay's own `DO GMCP`).
+                // Unreachable today (nothing puts `options_him` into
+                // `WantYes` since Clay never initiates), kept per RFC 1143's
+                // full table: if something ever does initiate a `DO opt`,
+                // this is the "just turned on" confirm transition, firing
+                // `OptionEnabled` exactly like the `No -> Yes` arm above.
                 OptionState::WantYes => {
                     *st = OptionState::Yes;
                     events.push(TelnetEvent::OptionEnabled(opt));
@@ -1909,18 +2118,15 @@ impl TelnetSession {
     /// asks *Clay itself* to do. Mirror image of `q_receive_will_wont`; see
     /// its doc comment for the shared rationale.
     ///
-    /// Returns `true` exactly when this call just turned the option on:
-    /// the `No -> Yes` accept transition (peer asked first), or, since Job
-    /// 11 gave `q_send_will` a way to reach `WantYes` before anything is
-    /// received, the `WantYes -> Yes` confirm transition too (Clay asked
-    /// first, e.g. `WILL NAWS` in `initial_negotiation`, and the peer's `DO`
-    /// is a confirmation rather than a fresh request). Both are the same
-    /// real-world event from every caller's point of view — the option just
-    /// went from off to on — which is why `NawsRequested` (fired alongside
-    /// `OptionEnabled(NAWS)` only on `became_enabled`, see `feed`'s
-    /// `TELNET_DO` arm) must fire on either, not only on the first: without
-    /// this, offering `WILL NAWS` up front and having the server merely
-    /// confirm it would mean Clay never actually sends its window size.
+    /// Returns `true` exactly when this call just turned the option on: the
+    /// `No -> Yes` accept transition (peer asked first — the only path Clay
+    /// takes today, since it never initiates a negotiation of its own). The
+    /// `WantYes -> Yes` confirm transition is kept for RFC 1143 completeness
+    /// against a future self-initiating call site; `NawsRequested` (fired
+    /// alongside `OptionEnabled(NAWS)` on `became_enabled`, see `feed`'s
+    /// `TELNET_DO` arm) firing on `became_enabled` rather than only on the
+    /// `No -> Yes` arm keeps both paths correct without extra plumbing if
+    /// that day comes.
     fn q_receive_do_dont(
         &mut self,
         opt: u8,
@@ -1945,8 +2151,9 @@ impl TelnetSession {
                 OptionState::Yes => {}
                 OptionState::WantNo => *st = OptionState::No,
                 OptionState::WantNoOpposite => *st = OptionState::Yes,
-                // Job 11: see the doc comment above — Clay's own `WILL`/`DO`
-                // request just got confirmed, which is a real enable, not a
+                // Unreachable today — see the doc comment above — kept for
+                // RFC 1143 completeness: if Clay's own `WILL`/`DO` request
+                // ever gets confirmed here, that's a real enable, not a
                 // repeat.
                 OptionState::WantYes => {
                     *st = OptionState::Yes;
@@ -1978,62 +2185,6 @@ impl TelnetSession {
         became_enabled
     }
 
-    /// RFC 1143 Q method, the "request" side (Job 11 / finding 5 / plan
-    /// Phase 3, step 3.5): Clay decides, on its own initiative and not in
-    /// response to anything received, to announce `WILL opt` — volunteering
-    /// to perform `opt` about itself. Moves `options_us[opt]` through the
-    /// mirror image of `q_receive_do_dont`'s table: where that function
-    /// reacts to a `DO`/`DONT` that already arrived, this one is what
-    /// produces the *unprompted* `WILL` in the first place, so that a later
-    /// `DO` from the peer lands on `q_receive_do_dont`'s `WantYes` arm
-    /// (confirm) instead of its `No` arm (fresh request) — the distinction
-    /// that stops Clay re-sending `WILL opt` every time the peer's confirming
-    /// `DO` shows up.
-    ///
-    /// Only the `No -> WantYes` arm is reachable today: `initial_negotiation`
-    /// is this function's only caller, runs once per session before any
-    /// `feed()`, and every option starts `No`. The rest is RFC 1143's table
-    /// in full anyway — same posture as `OptionState`'s own doc comment on
-    /// `WantNoOpposite`/`WantYesOpposite` — rather than a partial table this
-    /// job's one call site happens to need, since a partial table would need
-    /// re-deriving (and re-justifying) the day a second initiator call site
-    /// shows up.
-    fn q_send_will(&mut self, opt: u8, wire: &mut Vec<u8>) {
-        let st = &mut self.options_us[opt as usize];
-        match *st {
-            OptionState::No => {
-                *st = OptionState::WantYes;
-                wire.extend_from_slice(&[TELNET_IAC, TELNET_WILL, opt]);
-            }
-            OptionState::Yes => {} // already enabled; nothing to request
-            OptionState::WantNo => *st = OptionState::WantNoOpposite,
-            OptionState::WantNoOpposite => {} // already queued
-            OptionState::WantYes => {} // already negotiating
-            OptionState::WantYesOpposite => *st = OptionState::WantYes, // cancel the queued disable
-        }
-    }
-
-    /// Mirror of `q_send_will` for `options_him`: Clay asks the peer to
-    /// perform `opt` about *itself* by announcing `DO opt` unprompted, so a
-    /// later `WILL` from the peer lands on `q_receive_will_wont`'s `WantYes`
-    /// arm (confirm) rather than its `No` arm (fresh offer). See
-    /// `q_send_will`'s doc comment for reachability and rationale — identical
-    /// here, just on the other track.
-    fn q_send_do(&mut self, opt: u8, wire: &mut Vec<u8>) {
-        let st = &mut self.options_him[opt as usize];
-        match *st {
-            OptionState::No => {
-                *st = OptionState::WantYes;
-                wire.extend_from_slice(&[TELNET_IAC, TELNET_DO, opt]);
-            }
-            OptionState::Yes => {}
-            OptionState::WantNo => *st = OptionState::WantNoOpposite,
-            OptionState::WantNoOpposite => {}
-            OptionState::WantYes => {}
-            OptionState::WantYesOpposite => *st = OptionState::WantYes,
-        }
-    }
-
     /// Run `raw` (freshly-arrived MCCP2 bytes, prefixed by any carry left in
     /// `self.pending_compressed`) through `self.decomp`, and return the
     /// bytes that are now safe to treat as telnet plaintext. This is the
@@ -2049,43 +2200,78 @@ impl TelnetSession {
     /// than kept as compressed carry — so they get parsed in this same
     /// call wherever possible instead of waiting on another `feed`.
     ///
-    /// If `MCCP2_BOMB_LIMIT` trips, a `TelnetEvent::ProtocolError` is
-    /// pushed and the decompressor is dropped along with any unconsumed
-    /// remainder of `raw`: a stream that has already expanded past the cap
-    /// once cannot be trusted to behave any better if decompression
-    /// continued, so compression is abandoned outright for the rest of the
-    /// session rather than merely throttled call-by-call.
+    /// T1.1/T1.14 (plan Job 1, step 3, design decision D1): an inflate error, a
+    /// `MCCP2_BOMB_LIMIT` trip, or an unconsumed remainder past
+    /// `MAX_PENDING_COMPRESSED` (defence in depth — real streaming carry is a few bytes,
+    /// never tens of thousands) all poison the session identically: drop `decomp`, clear
+    /// `pending_compressed` (the fix for T1.1's leftover-retention bug — before this,
+    /// an inflate error left `consumed == 0`-ish and the *entire* raw buffer piled into
+    /// `pending_compressed` forever, re-failing the same way on every later `feed()`
+    /// while producing no output), set `self.poisoned`, and push a single
+    /// `TelnetEvent::CompressionFailed(reason)` instead of `ProtocolError`. Whatever
+    /// plaintext was already legitimately decompressed *before* the failure point is
+    /// still returned and parsed normally in this same call (it came from real inflate
+    /// output, not raw compressed noise) — `poisoned` only takes effect starting with the
+    /// *next* `feed()` call, via its own top-of-function check.
     fn run_decompressor(&mut self, raw: Vec<u8>, events: &mut Vec<TelnetEvent>) -> Vec<u8> {
         let decomp = self
             .decomp
             .as_mut()
             .expect("run_decompressor requires an active decompressor");
-        let (decompressed, consumed, stream_end, bomb_hit) = mccp2_decompress_capped(decomp, &raw);
-        if bomb_hit {
-            events.push(TelnetEvent::ProtocolError(format!(
-                "MCCP2 decompression exceeded {MCCP2_BOMB_LIMIT} bytes in a \
-                 single feed() call; compression aborted"
-            )));
+        let step = mccp2_decompress_capped(decomp, &raw);
+
+        if let Some(reason) = step.error {
             self.decomp = None;
             self.pending_compressed.clear();
-            return decompressed;
+            self.poisoned = true;
+            events.push(TelnetEvent::CompressionFailed(reason));
+            return step.output;
         }
-        let leftover = raw[consumed..].to_vec();
-        if stream_end {
+        if step.bomb_hit {
+            self.decomp = None;
+            self.pending_compressed.clear();
+            self.poisoned = true;
+            events.push(TelnetEvent::CompressionFailed(format!(
+                "MCCP2 decompression exceeded {MCCP2_BOMB_LIMIT} bytes in a single feed() call"
+            )));
+            return step.output;
+        }
+        let leftover = raw[step.consumed..].to_vec();
+        if step.stream_end {
             self.decomp = None;
             events.push(TelnetEvent::CompressionEnded);
-            let mut out = decompressed;
+            let mut out = step.output;
             out.extend_from_slice(&leftover);
             out
+        } else if leftover.len() > MAX_PENDING_COMPRESSED {
+            self.decomp = None;
+            self.pending_compressed.clear();
+            self.poisoned = true;
+            events.push(TelnetEvent::CompressionFailed(format!(
+                "MCCP2 decompressor made no progress on more than {MAX_PENDING_COMPRESSED} \
+                 unconsumed bytes"
+            )));
+            step.output
         } else {
             self.pending_compressed = leftover;
-            decompressed
+            step.output
         }
     }
 
     /// Feed newly-received bytes into the session. May be called with any
     /// chunking whatsoever — see the split-invariance tests below.
+    ///
+    /// Design decision D1 / plan Job 1 step 4: once `self.poisoned` (a corrupted MCCP2
+    /// stream, see `TelnetEvent::CompressionFailed`), every subsequent call returns
+    /// `TelnetOutcome::default()` structurally — no text, no wire, no events — regardless
+    /// of `data`. There is no resync point in a broken zlib stream, so nothing arriving
+    /// after the failure is ever safe to parse as telnet; the reader is expected to have
+    /// already disconnected by the time anything would call `feed()` again, but this is
+    /// the structural guarantee, not just reader discipline.
     pub fn feed(&mut self, data: &[u8]) -> TelnetOutcome {
+        if self.poisoned {
+            return TelnetOutcome::default();
+        }
         let mut wire = Vec::new();
         let mut events = Vec::new();
 
@@ -2305,32 +2491,48 @@ impl TelnetSession {
 
         // Final text hold-back decision on whatever's left in `text` — see
         // the struct doc comment's "Text hold-back" section. An in-progress
-        // MSP trigger at the very tail (no closing ')' seen yet) needs to
-        // survive a chunk boundary the same way an incomplete ANSI CSI/UTF-8
-        // sequence does, but real triggers routinely exceed
-        // MAX_TEXT_HOLDBACK's 32 bytes (a filename, a full U= URL) - so it
-        // gets its own, larger cap (MAX_MSP_TRIGGER_HOLDBACK) instead of
-        // raising the general one for every session. `extract_msp_triggers`
-        // only ever returns a position with no '\n' in `[pos, text.len())`,
-        // so that position is always at or after `last_newline` - the
-        // ordinary computation below never needs to hold back *more* than
-        // this picks.
+        // MSP trigger at the very tail (no closing ')' seen yet, or — T2.1 —
+        // not even a whole marker yet) needs to survive a chunk boundary the
+        // same way an incomplete ANSI CSI/UTF-8 sequence does, but real
+        // triggers routinely exceed MAX_TEXT_HOLDBACK's 32 bytes (a filename,
+        // a full U= URL) - so it gets its own, larger cap
+        // (MAX_MSP_TRIGGER_HOLDBACK) instead of raising the general one for
+        // every session.
+        //
+        // T2.1 also means `msp_incomplete_from` can now point at something
+        // as short as a single trailing `!` (see `msp_holdback_start`'s
+        // `min_prefix` doc comment), which the *ordinary* rule below must be
+        // allowed to win over: holding only from `pos` (as this used to)
+        // would hold back exactly that `!` and flush everything before it —
+        // fine for a real in-progress marker, but wrong for an ordinary
+        // short line that merely happens to end in `!` (`"Enter your name!"`
+        // followed by `IAC GA` in the next `feed()` call must still produce
+        // `Prompt(b"Enter your name!")`, not `Prompt(b"!")`). So: hold from
+        // the ordinary tail start whenever the ordinary rule applies at all
+        // (a non-empty, no-newline-since tail no longer than
+        // MAX_TEXT_HOLDBACK); only when it doesn't does the MSP hold-back
+        // get to hold from `pos` instead (capped at MAX_MSP_TRIGGER_HOLDBACK).
+        // `extract_msp_triggers` only ever returns a position with no '\n' in
+        // `[pos, text.len())`, so `pos` is always at or after the ordinary
+        // tail start — this can only ever *widen* the hold versus the
+        // ordinary rule alone, never narrow it.
         let last_newline = text.iter().rposition(|&b| b == b'\n');
-        let tail_len = match last_newline {
+        let ordinary_tail_len = match last_newline {
             Some(p) => text.len() - (p + 1),
             None => text.len(),
         };
-        let (tail_len, cap) = match msp_incomplete_from {
-            Some(pos) => (text.len() - pos, MAX_MSP_TRIGGER_HOLDBACK),
-            None => (tail_len, MAX_TEXT_HOLDBACK),
+        let hold_from = if ordinary_tail_len > 0 && ordinary_tail_len <= MAX_TEXT_HOLDBACK {
+            Some(text.len() - ordinary_tail_len)
+        } else {
+            msp_incomplete_from
+                .filter(|&pos| text.len() - pos <= MAX_MSP_TRIGGER_HOLDBACK)
         };
-        if tail_len > 0 && tail_len <= cap {
-            let split_at = text.len() - tail_len;
+        if let Some(split_at) = hold_from {
             self.pending_text = text.split_off(split_at);
         }
         // Otherwise nothing is held: either there's no tail to hold (already
-        // flushed everything below), or the tail is too long and the cap
-        // says to give up and flush it anyway rather than hold forever.
+        // flushed everything below), or the tail is too long and both caps
+        // say to give up and flush it anyway rather than hold forever.
         out_text.append(&mut text);
 
         TelnetOutcome { text: out_text, wire, events }
@@ -2367,15 +2569,27 @@ impl TelnetSession {
         !self.pending_text.is_empty()
     }
 
-    /// Drain and return whatever `feed`'s text hold-back is currently
-    /// sitting on, leaving none behind. Used by the idle-flush timer (see
-    /// `has_pending_text`) to release a held-back prompt after 150ms of no
-    /// further reads. Unlike `flush_eof`, the session is not closing: it
-    /// keeps every other field (`inbuf`, `decomp`, `prompt_open`, ...) exactly
-    /// as `feed` left it and continues parsing normally on the next `feed`
-    /// call.
-    pub fn take_pending_text(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending_text)
+    /// Drain and return whatever prefix of `feed`'s text hold-back is safe to
+    /// show after 150ms of no further reads (T2.2) — see the struct doc
+    /// comment's "Idle-flush release" section for why this is a prefix and
+    /// not the whole thing. Used by the idle-flush timer (see
+    /// `has_pending_text`). Unlike `flush_eof`, the session is not closing:
+    /// it keeps every other field (`inbuf`, `decomp`, `prompt_open`, ...)
+    /// exactly as `feed` left it and continues parsing normally on the next
+    /// `feed` call — including whatever of `pending_text` this call did not
+    /// release, which stays right where it was.
+    pub fn take_idle_flushable_text(&mut self) -> Vec<u8> {
+        let release_len = idle_release_len(&self.pending_text);
+        self.pending_text.drain(..release_len).collect()
+    }
+
+    /// Test-only: current length of `pending_compressed` (T1.1's bound test). Before the
+    /// fix, an inflate error left the entire unconsumed buffer sitting here forever,
+    /// growing on every later `feed()` call while no output was ever produced again; this
+    /// proves it now stays 0 once the session is poisoned, not merely capped.
+    #[cfg(test)]
+    fn pending_compressed_len(&self) -> usize {
+        self.pending_compressed.len()
     }
 }
 
@@ -2958,17 +3172,27 @@ mod tests {
                 assert_eq!(r.cleaned, b"foobar", "case {name}: cleaned");
             }),
             // --- MCCP2 activation splits cleaned/mccp2_offset at IAC SB 86 IAC SE ---
+            // T1.2 (plan Job 1, step 9): TelnetSession now requires a negotiated
+            // options_him[MCCP2] == Yes before activating, so this fixture leads with
+            // IAC WILL MCCP2 - process_telnet (the frozen oracle) has no such gate and
+            // always answers a WILL MCCP2 with IAC DO MCCP2 unconditionally, so its own
+            // `responses`/`mccp2_offset` shift to account for those extra 3 bytes too.
             ("mccp2_activation_splits_at_iac_sb_se", {
                 let mut d = Vec::new();
                 d.extend_from_slice(b"Welcome\n");
+                d.extend_from_slice(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
                 d.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
                 d.extend_from_slice(&[0x78, 0x9c]); // stand-in compressed bytes, never parsed as telnet
                 d
             }, |name, r| {
                 assert!(r.mccp2_activated, "case {name}: mccp2_activated");
-                assert_eq!(r.mccp2_offset, "Welcome\n".len() + 5, "case {name}: mccp2_offset");
+                assert_eq!(r.mccp2_offset, "Welcome\n".len() + 3 + 5, "case {name}: mccp2_offset");
                 assert_eq!(r.cleaned, b"Welcome\n", "case {name}: cleaned");
-                assert!(r.responses.is_empty(), "case {name}: responses (bare SB MCCP2 gets no reply)");
+                assert_eq!(
+                    r.responses,
+                    vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2],
+                    "case {name}: responses (process_telnet answers WILL MCCP2 unconditionally)"
+                );
             }),
         ]
     }
@@ -3156,9 +3380,10 @@ mod tests {
                 // Text and wire before the activation point still match
                 // exactly.
                 assert_eq!(outcome.text, expected.cleaned, "case {name}: text");
-                assert!(
-                    outcome.wire.is_empty(),
-                    "case {name}: wire (bare SB MCCP2 gets no reply)"
+                assert_eq!(
+                    outcome.wire,
+                    vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2],
+                    "case {name}: wire (the fixture's WILL MCCP2 is answered DO; the bare SB itself gets no reply)"
                 );
                 assert!(
                     outcome.events.contains(&TelnetEvent::CompressionStarted),
@@ -3323,7 +3548,7 @@ mod tests {
         // must not stall the world or grow inbuf without bound.
         let mut session = TelnetSession::new(TelnetConfig::default());
         let mut data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MSDP];
-        data.extend(std::iter::repeat(b'x').take(MAX_SUBNEG_BYTES + 100)); // never terminated
+        data.extend(std::iter::repeat_n(b'x', MAX_SUBNEG_BYTES + 100)); // never terminated
         let outcome = session.feed(&data);
         assert!(outcome.text.is_empty());
         assert!(outcome.wire.is_empty());
@@ -3780,6 +4005,9 @@ mod tests {
 
         let mut data = Vec::new();
         data.extend_from_slice(b"pre-activation text\n");
+        // T1.2 (plan Job 1, step 9): activation now requires a negotiated
+        // options_him[MCCP2] == Yes, so every fixture here leads with IAC WILL MCCP2.
+        data.extend_from_slice(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
         data.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
         data.extend_from_slice(&compressed);
 
@@ -3790,7 +4018,11 @@ mod tests {
         let mut expected = b"pre-activation text\n".to_vec();
         expected.extend_from_slice(plaintext);
         assert_eq!(outcome.text, expected);
-        assert!(outcome.wire.is_empty(), "bare SB MCCP2 gets no reply");
+        assert_eq!(
+            outcome.wire,
+            vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2],
+            "WILL MCCP2 is answered DO; the bare SB itself gets no reply"
+        );
     }
 
     #[test]
@@ -3803,6 +4035,10 @@ mod tests {
         let compressed = zlib_compress(plaintext);
 
         let mut session = TelnetSession::new(TelnetConfig::default());
+        // T1.2 (plan Job 1, step 9): negotiate before the (now-gated) activation SB.
+        let negotiate = session.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
+        assert_eq!(negotiate.wire, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2]);
+
         let first = session.feed(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2]);
         assert!(first.text.is_empty());
         assert!(!first.events.contains(&TelnetEvent::CompressionStarted), "SB not terminated yet");
@@ -3830,6 +4066,8 @@ mod tests {
 
         let mut fixture = Vec::new();
         fixture.extend_from_slice(b"before\n");
+        // T1.2 (plan Job 1, step 9): negotiate before the (now-gated) activation SB.
+        fixture.extend_from_slice(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
         fixture.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
         fixture.extend_from_slice(&compressed);
         fixture.extend_from_slice(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA]);
@@ -3840,7 +4078,13 @@ mod tests {
             base_text,
             b"before\nRoom description here.\nExits: north, south.\nafter\n".to_vec()
         );
-        assert_eq!(base_wire, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_SGA]);
+        assert_eq!(
+            base_wire,
+            vec![
+                TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2,
+                TELNET_IAC, TELNET_DO, TELNET_OPT_SGA,
+            ]
+        );
         assert!(base_events.contains(&TelnetEvent::CompressionStarted));
         assert!(base_events.contains(&TelnetEvent::CompressionEnded));
 
@@ -3870,6 +4114,8 @@ mod tests {
         let compressed = zlib_compress(plaintext);
 
         let mut data = Vec::new();
+        // T1.2 (plan Job 1, step 9): negotiate before the (now-gated) activation SB.
+        data.extend_from_slice(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
         data.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
         data.extend_from_slice(&compressed);
         data.extend_from_slice(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA]);
@@ -3882,7 +4128,10 @@ mod tests {
         assert_eq!(outcome.text, plaintext);
         assert_eq!(
             outcome.wire,
-            vec![TELNET_IAC, TELNET_DO, TELNET_OPT_SGA],
+            vec![
+                TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2,
+                TELNET_IAC, TELNET_DO, TELNET_OPT_SGA,
+            ],
             "negotiation arriving right after Z_STREAM_END must still be answered"
         );
 
@@ -3905,7 +4154,9 @@ mod tests {
         inner.extend_from_slice(b"more text after gmcp\n");
         let compressed = zlib_compress(&inner);
 
-        let mut data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE];
+        // T1.2 (plan Job 1, step 9): negotiate before the (now-gated) activation SB.
+        let mut data = vec![TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2];
+        data.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
         data.extend_from_slice(&compressed);
 
         let mut session = TelnetSession::new(TelnetConfig::default());
@@ -3923,9 +4174,23 @@ mod tests {
         // The decompression-bomb guard: a genuinely tiny compressed payload
         // (a long run of zero bytes compresses extremely well) that would
         // decompress to far more than MCCP2_BOMB_LIMIT. The session must
-        // stop growing output, emit a ProtocolError naming MCCP2, and
-        // remain usable afterward rather than trying to hand the caller an
-        // unbounded Vec<u8>.
+        // stop growing output and emit a CompressionFailed event (T1.14 -
+        // NOT CompressionEnded, which means "server turned compression off,
+        // plaintext follows" and is wrong for an abort) rather than trying
+        // to hand the caller an unbounded Vec<u8>.
+        //
+        // T1.14 / design decision D1: unlike the pre-fix behaviour, the session is NOT
+        // usable afterward - a bomb abort poisons the session exactly like an inflate
+        // error, because the still-compressing server's later bytes are not safe to parse
+        // as telnet (see CompressionFailed's doc comment). Note this test is deliberately
+        // NOT part of the split-invariance suite: the bomb check is evaluated per
+        // `run_decompressor` call against that call's own output alone (see
+        // `mccp2_decompress_inner`'s loop), so whether/when it trips depends on how much a
+        // single `feed()` call's chunk decompresses to - splitting the same compressed
+        // bytes across many small `feed()` calls could avoid ever tripping it at all. That
+        // is a known, accepted limitation of a per-call guard, not something this test
+        // (or T1.1's split-invariance test, which uses non-zlib garbage instead) needs to
+        // paper over.
         let huge = vec![0u8; MCCP2_BOMB_LIMIT * 2];
         let compressed = zlib_compress(&huge);
         assert!(
@@ -3934,7 +4199,9 @@ mod tests {
             compressed.len()
         );
 
-        let mut data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE];
+        // T1.2 (plan Job 1, step 9): negotiate before the (now-gated) activation SB.
+        let mut data = vec![TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2];
+        data.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
         data.extend_from_slice(&compressed);
 
         let mut session = TelnetSession::new(TelnetConfig::default());
@@ -3942,11 +4209,16 @@ mod tests {
 
         assert!(outcome.events.contains(&TelnetEvent::CompressionStarted));
         assert!(
+            !outcome.events.contains(&TelnetEvent::CompressionEnded),
+            "T1.14: a bomb abort must not claim a clean stream end, got {:?}",
+            outcome.events
+        );
+        assert!(
             outcome.events.iter().any(|e| matches!(
                 e,
-                TelnetEvent::ProtocolError(msg) if msg.contains("MCCP2")
+                TelnetEvent::CompressionFailed(msg) if msg.contains("MCCP2")
             )),
-            "expected a ProtocolError naming MCCP2, got {:?}",
+            "expected a CompressionFailed naming MCCP2, got {:?}",
             outcome.events
         );
         assert!(
@@ -3960,150 +4232,216 @@ mod tests {
             outcome.text.len()
         );
 
-        // Recovery: compression is abandoned outright after a bomb, so
-        // further bytes are parsed as ordinary (uncompressed) telnet again
-        // rather than being fed to a poisoned decompressor.
+        // T1.14 / D1: the session is poisoned, not merely reset to plaintext parsing -
+        // every later feed() returns an empty outcome structurally.
         let recovered = session.feed(b"plain text again\n");
-        assert_eq!(recovered.text, b"plain text again\n");
+        assert!(recovered.text.is_empty(), "poisoned session parses nothing further (D1)");
+        assert!(recovered.wire.is_empty());
+        assert!(recovered.events.is_empty());
     }
 
     // ==================================================================
-    // Job 11 (plan Phase 3, step 3.5, finding 5) — initiating negotiation.
+    // Plan Job 1 (investigate-differences-between-tinyfugu-fluffy-stallman.md),
+    // T1.1/T1.2/D1 — the negotiation gate, the poisoned-session guarantees, and
+    // the leftover-retention bound.
     // ==================================================================
 
     #[test]
-    fn test_initial_negotiation_exact_bytes_and_resulting_states() {
-        // The plan's required byte-for-byte test: WILL TTYPE, WILL NAWS, DO
-        // CHARSET, DO GMCP, DO MSDP, DO MCCP2, DO MSSP, DO MSP (MSSP appended
-        // by Job 12, plan Phase 4, 4.2; MSP by Job 14, same phase - offered
-        // last, conditional on cfg.msp_enabled, default true), and nothing
-        // else - in particular no SGA/EOR (nothing Clay does differently
-        // once they're on, so there's nothing to gain by asking first).
+    fn test_telnet_session_mccp2_sb_without_negotiation_ignored() {
+        // T1.2: an unrequested activation subnegotiation must not activate
+        // compression - options_him[MCCP2] is still No on a fresh session. Plaintext
+        // parsing continues; what follows is ordinary text, never handed to a
+        // decompressor.
         let mut session = TelnetSession::new(TelnetConfig::default());
-        let wire = session.initial_negotiation();
+        let mut data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE];
+        data.extend_from_slice(b"still plaintext\n");
+        let outcome = session.feed(&data);
+
+        assert!(
+            !outcome.events.contains(&TelnetEvent::CompressionStarted),
+            "unrequested SB must not activate compression, got {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome.events.iter().any(|e| matches!(e, TelnetEvent::ProtocolError(_))),
+            "expected a ProtocolError for the unrequested SB, got {:?}",
+            outcome.events
+        );
+        assert_eq!(outcome.text, b"still plaintext\n".to_vec());
+        assert!(session.decomp.is_none(), "no decompressor should ever have been created");
+    }
+
+    /// Like `zlib_compress` but keeps the zlib stream open (`FlushCompress::Sync` instead
+    /// of `Finish`) — every byte of `input` fed so far is fully recoverable without a
+    /// trailing `Status::StreamEnd`, so `self.decomp` stays live/`Some` after decompressing
+    /// it. Needed to test T1.2 Trigger B (a duplicate activation sequence appearing
+    /// *inside* a still-open compressed stream) — `zlib_compress`'s `Finish`-flushed
+    /// fixtures always end the stream in the same call that decompresses them, which would
+    /// make `self.decomp` already `None` by the time the embedded bytes are scanned,
+    /// masking exactly the bug this is supposed to catch.
+    fn zlib_compress_streaming(input: &[u8]) -> Vec<u8> {
+        use flate2::{Compress, Compression, FlushCompress};
+        let mut compressed = vec![0u8; input.len() + 1024];
+        let mut compressor = Compress::new(Compression::default(), true);
+        let status = compressor
+            .compress(input, &mut compressed, FlushCompress::Sync)
+            .unwrap();
+        assert_ne!(
+            status,
+            flate2::Status::StreamEnd,
+            "fixture must NOT end the zlib stream - decomp must stay live"
+        );
+        let len = compressor.total_out() as usize;
+        compressed.truncate(len);
+        compressed
+    }
+
+    #[test]
+    fn test_telnet_session_mccp2_duplicate_sb_inside_live_stream_ignored() {
+        // T1.2 Trigger B: the four activation bytes appearing again INSIDE an
+        // already-live compressed stream must not reset decomp - that would discard the
+        // live zlib window and try to decompress already-plaintext bytes as if they were
+        // still compressed. Design decision D1: this is not a failure - one ProtocolError,
+        // the live decompressor keeps running, and the surrounding text survives intact.
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"before duplicate SB\n");
+        inner.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
+        inner.extend_from_slice(b"after duplicate SB\n");
+        let compressed = zlib_compress_streaming(&inner);
+
+        let mut session = TelnetSession::new(TelnetConfig::default());
+        let negotiate = session.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
+        assert_eq!(negotiate.wire, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2]);
+
+        let mut data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE];
+        data.extend_from_slice(&compressed);
+        let outcome = session.feed(&data);
+
+        let started = outcome
+            .events
+            .iter()
+            .filter(|e| **e == TelnetEvent::CompressionStarted)
+            .count();
+        assert_eq!(started, 1, "exactly one real activation, got {:?}", outcome.events);
+        let proto_errors = outcome
+            .events
+            .iter()
+            .filter(|e| matches!(e, TelnetEvent::ProtocolError(_)))
+            .count();
         assert_eq!(
-            wire,
-            vec![
-                TELNET_IAC, TELNET_WILL, TELNET_OPT_TTYPE,
-                TELNET_IAC, TELNET_WILL, TELNET_OPT_NAWS,
-                TELNET_IAC, TELNET_DO, TELNET_OPT_CHARSET,
-                TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP,
-                TELNET_IAC, TELNET_DO, TELNET_OPT_MSDP,
-                TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2,
-                TELNET_IAC, TELNET_DO, TELNET_OPT_MSSP,
-                TELNET_IAC, TELNET_DO, TELNET_OPT_MSP,
-            ]
-        );
-
-        // Each offered option actually moved to WantYes via the Q method -
-        // not just "wire bytes happen to look right" but real state, on the
-        // correct track for each (TTYPE/NAWS are "us"; CHARSET/GMCP/MSDP/
-        // MCCP2/MSSP/MSP are "him").
-        assert_eq!(session.options_us[TELNET_OPT_TTYPE as usize], OptionState::WantYes);
-        assert_eq!(session.options_us[TELNET_OPT_NAWS as usize], OptionState::WantYes);
-        assert_eq!(session.options_him[TELNET_OPT_CHARSET as usize], OptionState::WantYes);
-        assert_eq!(session.options_him[TELNET_OPT_GMCP as usize], OptionState::WantYes);
-        assert_eq!(session.options_him[TELNET_OPT_MSDP as usize], OptionState::WantYes);
-        assert_eq!(session.options_him[TELNET_OPT_MCCP2 as usize], OptionState::WantYes);
-        assert_eq!(session.options_him[TELNET_OPT_MSSP as usize], OptionState::WantYes);
-        assert_eq!(session.options_him[TELNET_OPT_MSP as usize], OptionState::WantYes);
-
-        // Untouched tracks: the opposite track of each offered option (e.g.
-        // options_him[TTYPE], options_us[GMCP]) never moves - initial_negotiation
-        // only ever writes to the track it actually offers on.
-        assert_eq!(session.options_him[TELNET_OPT_TTYPE as usize], OptionState::No);
-        assert_eq!(session.options_us[TELNET_OPT_GMCP as usize], OptionState::No);
-    }
-
-    #[test]
-    fn test_initial_negotiation_ttype_confirmed_by_do_produces_no_second_will() {
-        // The plan's required test: a server replying DO TTYPE (confirming
-        // Clay's own unprompted WILL TTYPE) must not trigger a second WILL
-        // TTYPE - proof the Q method is doing its job on the *initiating*
-        // side, which is exactly what would loop if q_send_will's WantYes
-        // transition were skipped and this fell through to the No arm
-        // (which itself sends another WILL every time).
-        let mut session = TelnetSession::new(TelnetConfig::default());
-        let opening = session.initial_negotiation();
-        assert!(opening.windows(3).any(|w| w == [TELNET_IAC, TELNET_WILL, TELNET_OPT_TTYPE]));
-
-        let outcome = session.feed(&[TELNET_IAC, TELNET_DO, TELNET_OPT_TTYPE]);
-        assert!(
-            outcome.wire.is_empty(),
-            "confirming DO TTYPE must produce no wire reply at all, got {:?}",
-            outcome.wire
-        );
-        assert_eq!(session.options_us[TELNET_OPT_TTYPE as usize], OptionState::Yes);
-
-        // A second, independent confirmation (a chatty or confused server
-        // repeating DO TTYPE) must still produce nothing - Yes -> Yes is a
-        // steady state, not a fresh transition.
-        let outcome2 = session.feed(&[TELNET_IAC, TELNET_DO, TELNET_OPT_TTYPE]);
-        assert!(outcome2.wire.is_empty());
-    }
-
-    #[test]
-    fn test_initial_negotiation_naws_confirmed_by_do_fires_naws_requested() {
-        // Job 11's fix to q_receive_do_dont: confirming a self-initiated
-        // WILL NAWS via DO NAWS must fire OptionEnabled(NAWS) - and, at the
-        // reader/App level (see telnet_reader.rs's to_app_event and
-        // App::handle_naws_requested), NawsRequested - exactly like an
-        // unprompted DO NAWS would. Without this, offering WILL NAWS up
-        // front and having the server merely confirm it would mean Clay
-        // never actually sends its window size subnegotiation.
-        let mut session = TelnetSession::new(TelnetConfig::default());
-        session.initial_negotiation();
-        assert_eq!(session.options_us[TELNET_OPT_NAWS as usize], OptionState::WantYes);
-
-        let outcome = session.feed(&[TELNET_IAC, TELNET_DO, TELNET_OPT_NAWS]);
-        assert_eq!(session.options_us[TELNET_OPT_NAWS as usize], OptionState::Yes);
-        assert!(outcome.wire.is_empty(), "confirmation needs no reply, got {:?}", outcome.wire);
-        assert!(
-            outcome.events.contains(&TelnetEvent::OptionEnabled(TELNET_OPT_NAWS)),
-            "expected OptionEnabled(NAWS) on the WantYes -> Yes confirmation, got {:?}",
+            proto_errors, 1,
+            "exactly one ProtocolError for the duplicate SB, got {:?}",
             outcome.events
         );
-    }
-
-    #[test]
-    fn test_initial_negotiation_gmcp_declined_leaves_it_disabled_with_no_spurious_event() {
-        // The plan's required test: a server replying WONT GMCP to Clay's
-        // own DO GMCP must leave GMCP disabled and emit no spurious event -
-        // WantYes -> No on a decline is not the same transition as Yes ->
-        // No on a withdrawal (OptionDisabled), and firing OptionEnabled
-        // would be worse: GMCP was never actually accepted.
-        let mut session = TelnetSession::new(TelnetConfig::default());
-        session.initial_negotiation();
-        assert_eq!(session.options_him[TELNET_OPT_GMCP as usize], OptionState::WantYes);
-
-        let outcome = session.feed(&[TELNET_IAC, TELNET_WONT, TELNET_OPT_GMCP]);
-        assert_eq!(session.options_him[TELNET_OPT_GMCP as usize], OptionState::No);
-        assert!(outcome.wire.is_empty(), "a decline needs no reply, got {:?}", outcome.wire);
         assert!(
-            !outcome.events.iter().any(|e| matches!(
-                e,
-                TelnetEvent::OptionEnabled(TELNET_OPT_GMCP) | TelnetEvent::OptionDisabled(TELNET_OPT_GMCP)
-            )),
-            "declining Clay's own DO GMCP must emit neither OptionEnabled nor \
-             OptionDisabled for GMCP, got {:?}",
+            !outcome.events.iter().any(|e| matches!(e, TelnetEvent::CompressionFailed(_))),
+            "a duplicate activation is not a failure (D1), got {:?}",
             outcome.events
         );
+        assert_eq!(
+            outcome.text,
+            b"before duplicate SB\nafter duplicate SB\n".to_vec(),
+            "text survives the duplicate SB intact"
+        );
+        assert!(session.decomp.is_some(), "the live decompressor must survive the duplicate SB");
     }
 
     #[test]
-    fn test_initial_negotiation_gmcp_confirmed_by_will_fires_option_enabled() {
-        // Mirror of the NAWS confirmation test above, on the "him" track:
-        // a server answering Clay's DO GMCP with WILL GMCP (rather than
-        // announcing GMCP unprompted) must still fire OptionEnabled(GMCP) -
-        // the signal App::handle_gmcp_negotiated needs to send Core.Hello/
-        // Core.Supports.Set - via q_receive_will_wont's WantYes arm.
-        let mut session = TelnetSession::new(TelnetConfig::default());
-        session.initial_negotiation();
+    fn test_telnet_session_mccp2_reactivate_after_stream_end() {
+        // Guards T1.2's gate against over-tightening: once MCCP2 has legitimately
+        // negotiated to Yes and then cleanly ended (Z_STREAM_END / CompressionEnded), a
+        // SECOND activation must still work - no repeat WILL/DO needed, since
+        // options_him[MCCP2] is already Yes and decomp is None again after the first
+        // stream ended.
+        let first_plaintext = b"first burst\n";
+        let first_compressed = zlib_compress(first_plaintext);
+        let second_plaintext = b"second burst\n";
+        let second_compressed = zlib_compress(second_plaintext);
 
-        let outcome = session.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP]);
-        assert_eq!(session.options_him[TELNET_OPT_GMCP as usize], OptionState::Yes);
-        assert!(outcome.wire.is_empty(), "confirmation needs no reply, got {:?}", outcome.wire);
-        assert!(outcome.events.contains(&TelnetEvent::OptionEnabled(TELNET_OPT_GMCP)));
+        let mut session = TelnetSession::new(TelnetConfig::default());
+        let negotiate = session.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
+        assert_eq!(negotiate.wire, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2]);
+
+        let mut first_data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE];
+        first_data.extend_from_slice(&first_compressed);
+        let first_outcome = session.feed(&first_data);
+        assert!(first_outcome.events.contains(&TelnetEvent::CompressionStarted));
+        assert!(first_outcome.events.contains(&TelnetEvent::CompressionEnded));
+        assert_eq!(first_outcome.text, first_plaintext);
+
+        // Second activation, no fresh WILL/DO needed - options_him[MCCP2] is still Yes.
+        let mut second_data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE];
+        second_data.extend_from_slice(&second_compressed);
+        let second_outcome = session.feed(&second_data);
+        assert!(second_outcome.events.contains(&TelnetEvent::CompressionStarted));
+        assert!(second_outcome.events.contains(&TelnetEvent::CompressionEnded));
+        assert_eq!(second_outcome.text, second_plaintext);
+    }
+
+    #[test]
+    fn test_telnet_session_mccp2_error_does_not_retain_pending_compressed_forever() {
+        // T1.1's exact bug: before this fix, an inflate error left `consumed` short of the
+        // whole buffer (sometimes 0), so the ENTIRE unconsumed remainder piled into
+        // `pending_compressed` forever, re-failing the same way on every later feed() call
+        // while producing no output ever again. Feed 1000 chunks of clearly-non-zlib
+        // garbage after a real activation and confirm the leftover never grows past zero.
+        let mut session = TelnetSession::new(TelnetConfig::default());
+        let negotiate = session.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
+        assert_eq!(negotiate.wire, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2]);
+        let activate = session.feed(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
+        assert!(activate.events.contains(&TelnetEvent::CompressionStarted));
+        assert_eq!(session.pending_compressed_len(), 0);
+
+        // 0xAA's low nibble (0xA = 10) is not zlib's deflate method (8), so
+        // Decompress::decompress rejects it as an invalid header on the very first call.
+        let garbage = vec![0xAAu8; 8192];
+        let first = session.feed(&garbage);
+        assert!(
+            first.events.iter().any(|e| matches!(e, TelnetEvent::CompressionFailed(_))),
+            "expected CompressionFailed on the first garbage chunk, got {:?}",
+            first.events
+        );
+        assert_eq!(session.pending_compressed_len(), 0);
+
+        for _ in 0..999 {
+            let outcome = session.feed(&garbage);
+            assert!(outcome.text.is_empty(), "poisoned session parses nothing further (D1)");
+            assert!(outcome.wire.is_empty());
+            assert!(outcome.events.is_empty());
+            assert_eq!(session.pending_compressed_len(), 0, "T1.1: leftover must never grow");
+        }
+    }
+
+    #[test]
+    fn test_telnet_session_mccp2_error_split_invariance() {
+        // T1.1's split-invariance companion: an inflate error must produce the exact same
+        // aggregate text/wire/events no matter where the 64 garbage bytes are chopped up
+        // across feed() calls - the same property test_telnet_session_split_invariance
+        // established for ordinary parsing, now covering the poisoned-stream path. The
+        // CompressionFailed reason string is deliberately never compared for exact
+        // equality across chunkings by anything other than this same aggregate-equality
+        // check (see CompressionFailed's doc comment on why it must be split-invariant).
+        let mut fixture = vec![TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2];
+        fixture.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE]);
+        fixture.extend_from_slice(&[0xAAu8; 64]);
+
+        let (base_text, base_wire, base_events) = run_one_shot(&fixture);
+        assert!(
+            base_events.iter().any(|e| matches!(e, TelnetEvent::CompressionFailed(_))),
+            "fixture must actually poison the session, got {base_events:?}"
+        );
+
+        for k in 0..=fixture.len() {
+            let mut session = TelnetSession::new(TelnetConfig::default());
+            let mut o1 = session.feed(&fixture[..k]);
+            let o2 = session.feed(&fixture[k..]);
+            o1.text.extend_from_slice(&o2.text);
+            o1.wire.extend_from_slice(&o2.wire);
+            o1.events.extend(o2.events);
+            assert_eq!(o1.text, base_text, "split at {k}: text");
+            assert_eq!(o1.wire, base_wire, "split at {k}: wire");
+            assert_eq!(o1.events, base_events, "split at {k}: events");
+        }
     }
 
     // ==================================================================
@@ -4529,7 +4867,7 @@ mod tests {
         // give-up path must flush it as text rather than holding forever.
         let mut session = TelnetSession::new(TelnetConfig::default());
         let mut input = b"!!SOUND(".to_vec();
-        input.extend(std::iter::repeat(b'x').take(MAX_MSP_TRIGGER_HOLDBACK + 100));
+        input.extend(std::iter::repeat_n(b'x', MAX_MSP_TRIGGER_HOLDBACK + 100));
         let outcome = session.feed(&input);
         assert_eq!(outcome.text, input, "runaway trigger must flush as literal text");
         assert!(outcome.events.is_empty());
@@ -4552,26 +4890,151 @@ mod tests {
         // at the closing paren, ...) must still be recognised identically to
         // a one-shot feed, at every possible split point - and it can appear
         // mid-line, unlike a whole-line MCP-style message.
-        let input = b"You see a sign. !!SOUND(bell.wav V=50 L=3 T=ambient)\r\nNext line here.\r\n";
-        let (base_text, base_wire, base_events) = run_one_shot(input);
-        assert!(
-            base_events.iter().any(|e| matches!(e, TelnetEvent::MspTrigger(_))),
-            "sanity: fixture must actually produce an MspTrigger event"
-        );
-        let mut combinations = 0usize;
-        for k in 0..=input.len() {
-            combinations += 1;
-            let mut session = TelnetSession::new(TelnetConfig::default());
-            let mut o1 = session.feed(&input[..k]);
-            let o2 = session.feed(&input[k..]);
-            o1.text.extend_from_slice(&o2.text);
-            o1.wire.extend_from_slice(&o2.wire);
-            o1.events.extend(o2.events);
-            assert_eq!(o1.text, base_text, "split at {k}: text");
-            assert_eq!(o1.wire, base_wire, "split at {k}: wire");
-            assert_eq!(o1.events, base_events, "split at {k}: events");
+        //
+        // T2.1: the second and third fixtures put the marker more than
+        // MAX_TEXT_HOLDBACK (32) bytes into the line, so a split landing
+        // inside the marker itself (e.g. right after "!!SOU") used to flush
+        // that fragment as text once the ordinary by-line hold-back gave up
+        // — extract_msp_triggers's own incomplete-marker-*prefix* detection
+        // (`msp_holdback_start`) is what keeps holding it instead now.
+        let fixtures: &[&[u8]] = &[
+            b"You see a sign. !!SOUND(bell.wav V=50 L=3 T=ambient)\r\nNext line here.\r\n",
+            b"A line comfortably longer than thirty-two bytes before the marker !!SOUND(bell.wav)\r\n",
+            b"A line comfortably longer than thirty-two bytes before the marker !!MUSIC(theme.mp3)\r\n",
+        ];
+        for &input in fixtures {
+            let (base_text, base_wire, base_events) = run_one_shot(input);
+            assert!(
+                base_events.iter().any(|e| matches!(e, TelnetEvent::MspTrigger(_))),
+                "sanity: fixture must actually produce an MspTrigger event: {:?}",
+                String::from_utf8_lossy(input)
+            );
+            let mut combinations = 0usize;
+            for k in 0..=input.len() {
+                combinations += 1;
+                let mut session = TelnetSession::new(TelnetConfig::default());
+                let mut o1 = session.feed(&input[..k]);
+                let o2 = session.feed(&input[k..]);
+                o1.text.extend_from_slice(&o2.text);
+                o1.wire.extend_from_slice(&o2.wire);
+                o1.events.extend(o2.events);
+                assert_eq!(
+                    o1.text, base_text,
+                    "fixture {:?}, split at {k}: text", String::from_utf8_lossy(input)
+                );
+                assert_eq!(
+                    o1.wire, base_wire,
+                    "fixture {:?}, split at {k}: wire", String::from_utf8_lossy(input)
+                );
+                assert_eq!(
+                    o1.events, base_events,
+                    "fixture {:?}, split at {k}: events", String::from_utf8_lossy(input)
+                );
+            }
+            assert!(combinations > 50, "expected many split-point combinations, got {combinations}");
         }
-        assert!(combinations > 50, "expected many split-point combinations, got {combinations}");
+    }
+
+    #[test]
+    fn test_msp_marker_split_mid_marker_across_two_feeds() {
+        // T2.1's direct case: the read boundary falls inside the marker
+        // itself ("!!SOU" | "ND(bell.wav)\r\n"), not merely inside the
+        // parameters. Before the fix, "!!SOU" wasn't recognised as the start
+        // of anything (the loop's `starts_with` check needs the full 8-byte
+        // marker) and got flushed as ordinary text on the first feed, so the
+        // second feed's "ND(bell.wav)\r\n" matched no marker at all.
+        let mut session = TelnetSession::new(TelnetConfig::default());
+        let o1 = session.feed(b"Look !!SOU");
+        let o2 = session.feed(b"ND(bell.wav)\r\n");
+
+        let mut text = o1.text.clone();
+        text.extend_from_slice(&o2.text);
+        assert!(
+            !text.windows(5).any(|w| w == b"!!SOU"),
+            "marker fragment must not leak into displayed text: {:?}",
+            String::from_utf8_lossy(&text)
+        );
+        assert_eq!(text, b"Look \r\n");
+
+        let mut events = o1.events;
+        events.extend(o2.events);
+        assert_eq!(events.len(), 1, "expected exactly one MspTrigger, got {events:?}");
+        assert!(matches!(&events[0], TelnetEvent::MspTrigger(t) if t.name == "bell.wav" && !t.is_music));
+    }
+
+    #[test]
+    fn test_ordinary_prompt_ending_in_bang_split_before_ga_still_yields_whole_prompt() {
+        // T2.1 makes a lone trailing '!' count as a possible MSP marker
+        // prefix (see msp_holdback_start's min_prefix doc comment) so it
+        // survives a chunk boundary. That must not regress the *ordinary*
+        // GA-prompt case: "Enter your name!" arriving in one read, then
+        // IAC GA in the next, must still produce the whole prompt - not just
+        // the trailing "!" that happens to look like a marker's start (see
+        // feed()'s hold-decision comment / D2 in the plan).
+        let mut input = b"Enter your name!".to_vec();
+        input.extend_from_slice(&[TELNET_IAC, TELNET_GA]);
+        let (_, _, base_events) = run_one_shot(&input);
+        assert!(
+            base_events.contains(&TelnetEvent::Prompt(b"Enter your name!".to_vec())),
+            "sanity: one-shot feed must produce the whole prompt: {base_events:?}"
+        );
+
+        for k in 0..=input.len() {
+            let mut session = TelnetSession::new(TelnetConfig::default());
+            let o1 = session.feed(&input[..k]);
+            let o2 = session.feed(&input[k..]);
+            let mut events = o1.events;
+            events.extend(o2.events);
+            assert_eq!(events, base_events, "split at {k}");
+        }
+    }
+
+    // ==================================================================
+    // T2.2 — idle_release_len and its helpers (D2 in the plan).
+    // ==================================================================
+
+    #[test]
+    fn test_incomplete_utf8_tail_len_cases() {
+        assert_eq!(incomplete_utf8_tail_len(b"caf\xc3"), 1, "2-byte lead with 0 continuation bytes");
+        assert_eq!(incomplete_utf8_tail_len(b"caf\xc3\xa9"), 0, "complete 2-byte sequence");
+        assert_eq!(incomplete_utf8_tail_len(b"x \xff y"), 0, "literal 0xFF is never a valid UTF-8 lead byte");
+        assert_eq!(incomplete_utf8_tail_len(b"hello"), 0, "pure ASCII");
+        assert_eq!(incomplete_utf8_tail_len(b""), 0, "empty");
+        assert_eq!(incomplete_utf8_tail_len(&[0xE0]), 1, "3-byte lead with 0 continuation bytes");
+        assert_eq!(incomplete_utf8_tail_len(&[0xE0, 0x80]), 2, "3-byte lead with 1 continuation byte");
+        assert_eq!(incomplete_utf8_tail_len(&[0xE0, 0x80, 0x80]), 0, "complete 3-byte sequence");
+    }
+
+    #[test]
+    fn test_unterminated_escape_start_cases() {
+        assert_eq!(unterminated_escape_start(b"prompt> \x1b[3"), Some(8), "incomplete CSI");
+        assert_eq!(unterminated_escape_start(b"\x1b[0m"), None, "complete CSI");
+        assert_eq!(unterminated_escape_start(b"no escape here"), None);
+        assert_eq!(unterminated_escape_start(b"trailing esc \x1b"), Some(13), "lone trailing ESC");
+    }
+
+    #[test]
+    fn test_msp_holdback_start_cases() {
+        assert_eq!(msp_holdback_start(b"Look !!SOUND(bell", 2), Some(5), "open marker, no ')' yet");
+        assert_eq!(msp_holdback_start(b"x !!SOU", 2), Some(2), "trailing marker prefix");
+        assert_eq!(msp_holdback_start(b"Hello!", 2), None, "lone '!' below min_prefix 2 is not held");
+        assert_eq!(msp_holdback_start(b"Hello!", 1), Some(5), "lone '!' held when min_prefix is 1");
+        assert_eq!(
+            msp_holdback_start(b"broken !!SOUND(bell.wav\r\nmore\r\n", 1), None,
+            "a marker already resolved as malformed (newline, no ')') must not be held forever"
+        );
+    }
+
+    #[test]
+    fn test_idle_release_len_cases() {
+        // Every case named in the plan for T2.2's idle_release_len.
+        assert_eq!(idle_release_len(b"prompt> \x1b[3"), 8, "incomplete CSI held, prompt text released");
+        assert_eq!(idle_release_len(b"caf\xc3"), 3, "incomplete UTF-8 tail held");
+        assert_eq!(idle_release_len(b"x \xff y"), 5, "literal 0xFF never held");
+        assert_eq!(idle_release_len(b"Look !!SOUND(bell"), 5, "open MSP marker held");
+        assert_eq!(idle_release_len(b"Hello!"), 6, "lone trailing '!' after a pause is an ordinary prompt");
+        assert_eq!(idle_release_len(b"x !!SOU"), 2, "MSP marker prefix held");
+        assert_eq!(idle_release_len(b"\x1b[0m"), 4, "complete CSI released in full");
     }
 
     #[test]
@@ -4589,23 +5052,4 @@ mod tests {
         assert_eq!(events, base_events);
     }
 
-    #[test]
-    fn test_initial_negotiation_offers_do_msp_when_enabled() {
-        let mut session = TelnetSession::new(TelnetConfig { msp_enabled: true, ..TelnetConfig::default() });
-        let wire = session.initial_negotiation();
-        assert!(
-            wire.windows(3).any(|w| w == [TELNET_IAC, TELNET_DO, TELNET_OPT_MSP]),
-            "expected IAC DO MSP in {wire:?}"
-        );
-    }
-
-    #[test]
-    fn test_initial_negotiation_omits_do_msp_when_disabled() {
-        let mut session = TelnetSession::new(TelnetConfig { msp_enabled: false, ..TelnetConfig::default() });
-        let wire = session.initial_negotiation();
-        assert!(
-            !wire.windows(3).any(|w| w == [TELNET_IAC, TELNET_DO, TELNET_OPT_MSP]),
-            "did not expect IAC DO MSP in {wire:?}"
-        );
-    }
 }

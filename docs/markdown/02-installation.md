@@ -9,9 +9,9 @@ Pre-built binaries are available for common platforms. Download the appropriate 
 chmod +x clay-linux-x86_64-musl
 ./clay-linux-x86_64-musl
 
-# Linux ARM64 (Termux)
-chmod +x clay-linux-aarch64
-./clay-linux-aarch64
+# Termux ARM64, no GUI (works on any Android device via Termux)
+chmod +x clay-termux-aarch64-nogui
+./clay-termux-aarch64-nogui
 ```
 
 ## Building from Source
@@ -35,7 +35,7 @@ rustup target add x86_64-unknown-linux-musl
 
 # Build
 cargo build --target x86_64-unknown-linux-musl \
-    --no-default-features --features rustls-backend
+    --no-default-features --features rustls-backend,ssh-transport
 
 # Binary location
 ./target/x86_64-unknown-linux-musl/debug/clay
@@ -52,20 +52,17 @@ cargo build --target x86_64-unknown-linux-musl \
 - native-tls requires OpenSSL, which needs cross-compilation setup for musl
 - rustls is pure Rust and works seamlessly with musl builds
 
-### Linux with GUI Support
+### Linux with WebView GUI
 
-To build with the remote GUI client feature:
+To build with the native WebView GUI client feature (`webview-gui` — wry/tao;
+`native-audio` for ANSI music/MSP sound is on by default alongside it):
 
 ```bash
 # Install dependencies (Debian/Ubuntu)
-sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev
 
-# Build with GUI
-cargo build --features remote-gui
-
-# Build with GUI and audio support
-sudo apt install libasound2-dev
-cargo build --features remote-gui-audio
+# Build with GUI (audio included by default)
+cargo build --features webview-gui
 ```
 
 ### macOS
@@ -74,19 +71,17 @@ macOS builds use the native toolchain (no musl needed):
 
 ```bash
 # Terminal client only
-cargo build --no-default-features --features rustls-backend
+cargo build --no-default-features --features rustls-backend,ssh-transport
 
-# With GUI support
-cargo build --features remote-gui
-
-# With GUI and audio
-cargo build --features remote-gui-audio
+# With WebView GUI (audio included by default, no extra deps)
+cargo build --features webview-gui
 
 # Binary location
 ./target/debug/clay
 ```
 
-Works on both Intel (x86_64) and Apple Silicon (aarch64) Macs.
+Works on both Intel (x86_64) and Apple Silicon (aarch64) Macs — the official release
+ships a universal binary combining both via `lipo`.
 
 ### Termux (Android)
 
@@ -94,29 +89,35 @@ Works on both Intel (x86_64) and Apple Silicon (aarch64) Macs.
 # Install Rust in Termux
 pkg install rust
 
-# Build (no GUI features available)
-cargo build --no-default-features --features rustls-backend
+# Build TUI only (no GUI dependencies)
+cargo build --no-default-features --features rustls-backend,ssh-transport
 
 # Binary location
 ./target/debug/clay
 ```
 
-**Termux Limitations:**
+A WebView build is also possible on Termux with
+[Termux:X11](https://github.com/termux/termux-x11) and the patches in
+`./patches/apply-patches.sh` — see the pre-built `clay-termux-aarch64` release binary.
 
-- Hot reload not available (exec() limited on Android)
+**Termux Limitations (regardless of GUI):**
+
+- Hot reload not available (`exec()` limited on Android)
 - TLS proxy not available
 - Process suspension (Ctrl+Z) not available
-- Remote GUI client not available
 
-### Windows (via WSL)
+### Windows
 
-Clay runs in Windows Subsystem for Linux:
+Native build (MSVC) — no WSL required:
 
 ```bash
-# In WSL terminal
-rustup target add x86_64-unknown-linux-musl
-cargo build --target x86_64-unknown-linux-musl \
-    --no-default-features --features rustls-backend
+# Install Rust from https://rustup.rs
+# Install Visual Studio Build Tools (MSVC)
+
+# Build with WebView GUI (uses WebView2). Static CRT linking eliminates a
+# vcruntime140.dll runtime dependency.
+set RUSTFLAGS=-C target-feature=+crt-static
+cargo build --release --features webview-gui
 ```
 
 ## Feature Flags
@@ -125,8 +126,9 @@ cargo build --target x86_64-unknown-linux-musl \
 |---------|-------------|
 | `rustls-backend` | Use rustls for TLS (recommended for musl) |
 | `native-tls-backend` | Use native TLS (requires OpenSSL) |
-| `remote-gui` | Build remote GUI client (requires display) |
-| `remote-gui-audio` | GUI with ANSI music playback |
+| `webview-gui` | Build the native WebView GUI client (requires display; `--gui`) |
+| `native-audio` | ANSI music / MSP sound playback via rodio (on by default) |
+| `ssh-transport` | SSH-tunneled `--console`/`--gui` and Android's SSH proxy (on by default) |
 
 ## Verifying the Installation
 
@@ -148,12 +150,17 @@ On first run, Clay creates a settings file at `~/.clay.dat` and displays a color
 | Option | Description |
 |--------|-------------|
 | `-v`, `--version` | Show version and exit |
-| `--conf=<path>` | Use alternate config file instead of ~/.clay.dat |
-| `--gui` | Start with GUI interface (requires remote-gui feature) |
-| `--console` | Start with console interface (default) |
-| `--remote=host:port` | Connect to remote Clay instance |
-| `--console=host:port` | Console mode connecting to remote instance |
-| `-D` | Daemon mode (background server only) |
+| `--conf=<path>` | Use alternate config file instead of `~/.clay/settings.dat` |
+| `--console[=host[:port]]` | Console (TUI) mode; with an address, connects to a running Clay instance instead of starting a local one (default port: 9000) |
+| `--gui[=host[:port]]` | WebView GUI mode (requires the `webview-gui` feature); same local-vs-remote distinction as `--console` |
+| `--ssh` | Tunnel `--console=`/`--gui=` through SSH instead of connecting directly (requires the `ssh-transport` feature) |
+| `-D` | Run as a headless daemon server |
+| `--multiuser` | Run as a multiuser server (separate config, one process serves several independent accounts) |
+| `--local-server` | Run headless, loopback-only, for an embedding client (e.g. the Android app) |
+| `--port=<N>` | Override the listen port (used with `--local-server`) |
+
+Remote connections always use `--console=host:port` or `--gui=host:port` — there is
+no separate flag for it.
 
 **Example using alternate config:**
 

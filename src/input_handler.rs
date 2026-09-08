@@ -915,7 +915,6 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.password = settings.password;
                     app.worlds[idx].settings.use_ssl = settings.use_ssl;
                     app.worlds[idx].settings.log_enabled = settings.log_enabled;
-                    app.worlds[idx].settings.initiate_negotiation = settings.initiate_negotiation;
                     app.worlds[idx].settings.msp_enabled = settings.msp_enabled;
                     app.worlds[idx].settings.mcp_enabled = settings.mcp_enabled;
 
@@ -1270,7 +1269,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     if key.code == KeyCode::Enter {
         // ECHO masking (plan Phase 3, step 3.4): a masked line must never enter
         // arrow-key recall history - see InputArea::take_input's doc comment.
-        let record_history = !app.current_world().echo_masked;
+        let record_history = !app.current_world().protocol.echo_masked;
         let input = app.input.take_input(record_history);
         if !input.is_empty() || app.current_world().connected {
             // /dump is passive — don't reset more-mode state

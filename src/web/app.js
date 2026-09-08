@@ -578,7 +578,6 @@
         worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
         worldEditGmcpPackages: document.getElementById('world-edit-gmcp-packages'),
         worldEditAutoReconnect: document.getElementById('world-edit-auto-reconnect'),
-        worldEditInitiateNegotiationToggle: document.getElementById('world-edit-initiate-negotiation-toggle'),
         worldEditMspEnabledToggle: document.getElementById('world-edit-msp-enabled-toggle'),
         worldEditMcpEnabledToggle: document.getElementById('world-edit-mcp-enabled-toggle'),
         worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
@@ -769,7 +768,12 @@
     // same #note-editor-view DOM/CSS. { world_index, reference, edit_type }.
     var mcpEditState = null;
     let pendingReconnectCommand = null;  // Command to resend after reconnect
-    let pendingReconnectWorldIndex = null;  // World index to switch to after reconnect
+    // T1.12/D3: the world to resend to is remembered by NAME, not index. Indices
+    // shift across a reconnect exactly like the InitialState focus resolution below
+    // has to account for - resending against the raw pre-disconnect index could hit
+    // a different world entirely (and read its echo_masked for the history guard),
+    // including sending a password to the wrong MUD and into plaintext history.
+    let pendingReconnectWorldName = null;
     let commandHistory = [];
     let historyIndex = -1;
     let connectionFailures = 0;
@@ -982,6 +986,30 @@
 
     // Partial line buffer per world (for handling split lines across reads)
     let partialLines = {};
+
+    // T2.9: partialLines is keyed by world index, but WorldAdded/WorldRemoved splice
+    // `worlds` - every world at or after the change point shifts by one, and this
+    // object must shift with it or a held-back partial line gets silently attributed
+    // to the wrong world (or, on remove, orphaned under an index that now belongs to
+    // someone else / is past the end of the array).
+    function reindexPartialLinesAfterInsert(insertIndex) {
+        const next = {};
+        for (const key of Object.keys(partialLines)) {
+            const idx = Number(key);
+            next[idx >= insertIndex ? idx + 1 : idx] = partialLines[key];
+        }
+        partialLines = next;
+    }
+
+    function reindexPartialLinesAfterRemove(removedIndex) {
+        const next = {};
+        for (const key of Object.keys(partialLines)) {
+            const idx = Number(key);
+            if (idx === removedIndex) continue;
+            next[idx > removedIndex ? idx - 1 : idx] = partialLines[key];
+        }
+        partialLines = next;
+    }
 
     // More-mode state (per world)
     let moreModeEnabled = true;
@@ -2277,6 +2305,11 @@
     function handleSessionDisconnect(code, reason) {
         debugLog('Session disconnect: ' + code + ' ' + reason);
         if (wakePongTimeout) { clearTimeout(wakePongTimeout); wakePongTimeout = null; }
+        // T1.11: forceReconnect() (below) already resets this mutex; without it here too,
+        // a stale socket closing inside the wake-check window leaves wakeStateCleared stuck
+        // true forever - only the Pong handler and this timeout's own callback ever clear
+        // it, and both are gone once the timeout fires this disconnect.
+        wakeStateCleared = false;
         if (ws && !(ws instanceof WebSocket)) ws.readyState = WebSocket.CLOSED;
         authenticated = false;
         winnerAttemptId = null;
@@ -2366,7 +2399,9 @@
                 const decoded = new TextDecoder('utf-8').decode(bytes);
                 msg = JSON.parse(decoded);
             } catch (e) {
-                console.error('Failed to parse Base64 message:', e);
+                // T2.5: console.error is invisible on Android (no console) - route
+                // through the same reporter the handleMessage try below uses.
+                __clayShowError('JSON.parse(native base64 message) threw: ' + __clayErrText(e));
                 return;
             }
             try {
@@ -2402,10 +2437,23 @@
                 const id = pair[0];
                 const data = pair[1];
                 if (id !== winnerAttemptId) continue;
+                // T2.5: this used to run JSON.parse and handleMessage under one try,
+                // so a handleMessage throw was mislabeled "Failed to parse" and, via
+                // console.error, invisible on Android - the one platform that actually
+                // uses this path. Split so each failure is reported for what it is,
+                // in the same shape as the sibling dispatch sites above.
+                let queuedMsg;
                 try {
-                    handleMessage(JSON.parse(data));
+                    queuedMsg = JSON.parse(data);
                 } catch (e) {
-                    console.error('Failed to parse native WS queue message:', e);
+                    __clayShowError('JSON.parse(native WS queue message) threw: ' + __clayErrText(e));
+                    continue;
+                }
+                try {
+                    handleMessage(queuedMsg);
+                } catch (e) {
+                    __clayShowError('handleMessage(' + (queuedMsg && queuedMsg.type ? queuedMsg.type : '?') +
+                        ') threw: ' + __clayErrText(e));
                 }
             }
         };
@@ -3490,38 +3538,50 @@
                     enterNoteMode(noteMode.world_index);
                 }
 
-                // Handle pending reconnect command (resend after reconnection)
+                // Handle pending reconnect command (resend after reconnection). T1.12/D3:
+                // resolved by world NAME, same as the focus resolution above and for the
+                // same reason - indices shift across a reconnect, so trusting the raw
+                // pre-disconnect index here could resend the command (and read the
+                // echo-masking guard) against a completely different, unrelated world.
                 if (pendingReconnectCommand !== null) {
-                    // Switch to the world that was active when the command failed
-                    if (pendingReconnectWorldIndex !== null && pendingReconnectWorldIndex !== currentWorldIndex) {
-                        if (pendingReconnectWorldIndex >= 0 && pendingReconnectWorldIndex < worlds.length) {
-                            currentWorldIndex = pendingReconnectWorldIndex;
+                    const pendingReconnectTargetIdx = worlds.findIndex((w) => w && w.name === pendingReconnectWorldName);
+                    if (pendingReconnectTargetIdx < 0) {
+                        // The world this was headed for no longer exists - drop the
+                        // command rather than guess a destination. Leave it in the
+                        // input so the user can see it was never sent.
+                        debugLog('Dropping queued reconnect command: world "' + pendingReconnectWorldName + '" no longer exists');
+                        recordClientEvent('pendingCommandDropped', String(pendingReconnectWorldName));
+                        elements.input.value = pendingReconnectCommand;
+                    } else {
+                        // Switch to the world that was active when the command failed
+                        if (pendingReconnectTargetIdx !== currentWorldIndex) {
+                            currentWorldIndex = pendingReconnectTargetIdx;
                             renderOutput();
                             updateStatusBar();
                         }
-                    }
-                    // Resend the command
-                    send({
-                        type: 'SendCommand',
-                        world_index: currentWorldIndex,
-                        command: pendingReconnectCommand
-                    });
-                    // Add to history - unless the world this was headed for is echo-masked
-                    // (plan Phase 3, step 3.4): a password submitted right as the socket
-                    // dropped must not land in arrow-key recall once the reconnect
-                    // resends it, same guard sendCommand() applies on the normal path.
-                    const maskedOnReconnect = worlds[currentWorldIndex] && worlds[currentWorldIndex].echo_masked;
-                    if (pendingReconnectCommand.length > 0 && !maskedOnReconnect) {
-                        commandHistory.push(pendingReconnectCommand);
-                        if (commandHistory.length > 1000) {
-                            commandHistory.shift();
+                        // Resend the command
+                        send({
+                            type: 'SendCommand',
+                            world_index: pendingReconnectTargetIdx,
+                            command: pendingReconnectCommand
+                        });
+                        // Add to history - unless the world this was headed for is echo-masked
+                        // (plan Phase 3, step 3.4): a password submitted right as the socket
+                        // dropped must not land in arrow-key recall once the reconnect
+                        // resends it, same guard sendCommand() applies on the normal path.
+                        const maskedOnReconnect = worlds[pendingReconnectTargetIdx] && worlds[pendingReconnectTargetIdx].echo_masked;
+                        if (pendingReconnectCommand.length > 0 && !maskedOnReconnect) {
+                            commandHistory.push(pendingReconnectCommand);
+                            if (commandHistory.length > 1000) {
+                                commandHistory.shift();
+                            }
                         }
+                        elements.input.value = '';
+                        elements.prompt.textContent = '';
                     }
                     // Clear pending state
                     pendingReconnectCommand = null;
-                    pendingReconnectWorldIndex = null;
-                    elements.input.value = '';
-                    elements.prompt.textContent = '';
+                    pendingReconnectWorldName = null;
                 }
                 // Mark the world this InitialState landed us on as seen. Nothing else
                 // does: switchWorldLocal only fires on an actual switch, so the world on
@@ -3867,6 +3927,7 @@
                     // and are released via PgDn/Tab to avoid duplicates
                     // Insert at the correct index
                     const insertIndex = world.index !== undefined ? world.index : worlds.length;
+                    reindexPartialLinesAfterInsert(insertIndex);
                     worlds.splice(insertIndex, 0, world);
                     // Adjust currentWorldIndex if the new world was inserted before it
                     if (currentWorldIndex >= insertIndex) {
@@ -3894,6 +3955,7 @@
 
             case 'WorldRemoved':
                 if (msg.world_index !== undefined && msg.world_index < worlds.length) {
+                    reindexPartialLinesAfterRemove(msg.world_index);
                     worlds.splice(msg.world_index, 1);
                     // Adjust currentWorldIndex if needed
                     if (currentWorldIndex >= worlds.length) {
@@ -3976,9 +4038,13 @@
                     if (themeVarsEl) {
                         themeVarsEl.textContent = ':root { ' + msg.css_vars + ' }';
                     }
-                    // Reset cached ANSI palette so it re-reads from CSS vars
-                    themeAnsiPalette = null;
-                    colorNameToRgb = null;
+                    // themeAnsiPalette/colorNameToRgb are declared inside parseAnsi()
+                    // itself (let, re-initialized to null on every call), so each call
+                    // already re-reads the CSS vars fresh - no cache to reset here.
+                    // (T1.9: this used to assign to those names directly, which under
+                    // 'use strict' threw ReferenceError on every theme change, since
+                    // those identifiers aren't in scope here - renderOutput() below
+                    // never ran and every client showed an error banner.)
                     renderOutput();
                 }
                 break;
@@ -4272,6 +4338,25 @@
                 // Server-initiated (plan Job 15): the MUD pushed text to edit
                 // (dns-org-mud-moo-simpleedit-content), unprompted - unlike
                 // NoteEditorState above there is no matching Request* message.
+                // T2.3: enterMcpEditMode() below overwrites the same shared
+                // textarea/view a /note or ?note=N window (noteMode) uses, and a
+                // second McpEditOpen would overwrite a still-open first session -
+                // either way it's an unprompted push blowing away whatever the
+                // user is actually looking at, unsaved notes included. Refuse
+                // rather than clobber.
+                if (noteMode) {
+                    debugLog('McpEditOpen ignored: a NOTE_MODE window is already showing');
+                    recordClientEvent('mcpEditIgnoredNoteWindow', (msg && msg.name) || '');
+                    break;
+                }
+                if (mcpEditState) {
+                    recordClientEvent('mcpEditIgnoredBusy', (msg && msg.name) || '');
+                    if (elements.noteEditorTitle) {
+                        elements.noteEditorTitle.textContent =
+                            'Edit: ' + mcpEditState.name + ' (another edit request was ignored)';
+                    }
+                    break;
+                }
                 enterMcpEditMode(msg);
                 break;
 
@@ -4936,7 +5021,10 @@
                 break;
 
             default:
-                console.log('Unknown message type:', msg.type);
+                // T2.4: console.log is invisible on WebView/Android, and an unknown/
+                // unhandled message type is exactly the amplifier for a wire-shape bug.
+                debugLog('Unknown message type: ' + msg.type);
+                recordClientEvent('unknownMessage', String(msg.type));
         }
     }
 
@@ -5915,7 +6003,7 @@
         if (!sent) {
             // Connection lost - show reconnect popup
             pendingReconnectCommand = cmd;
-            pendingReconnectWorldIndex = currentWorldIndex;
+            pendingReconnectWorldName = worlds[currentWorldIndex] && worlds[currentWorldIndex].name;
             showReconnectModal();
             return;
         }
@@ -6672,7 +6760,10 @@
     // than world_index, so there is no "the user just clicked this world's icon"
     // moment to hang a new-window decision on either.
     function enterMcpEditMode(payload) {
-        mcpEditState = { world_index: payload.world_index, reference: payload.reference, edit_type: payload.edit_type };
+        // name is kept here (not just used transiently below) so a later ignored
+        // McpEditOpen (T2.3) can rebuild the same title idempotently instead of
+        // piling up "(another edit request was ignored)" suffixes on repeat.
+        mcpEditState = { world_index: payload.world_index, reference: payload.reference, edit_type: payload.edit_type, name: payload.name };
         if (elements.statusBar) elements.statusBar.style.display = 'none';
         if (elements.inputContainer) elements.inputContainer.style.display = 'none';
         if (elements.navBar) elements.navBar.style.display = 'none';
@@ -9056,7 +9147,7 @@
         var row = document.createElement('div');
         row.className = 'conn-attempt pending';
         row.dataset.attemptId = id;
-        row.innerHTML = '<span class="conn-icon">⟳</span><span class="conn-url">' + url + '</span>';
+        row.innerHTML = '<span class="conn-icon">⟳</span><span class="conn-url">' + escapeHtml(url) + '</span>';
         list.appendChild(row);
         list.scrollTop = list.scrollHeight;
     }
@@ -10566,15 +10657,8 @@
         } else {
             elements.worldEditLoggingToggle.classList.remove('active');
         }
-        // Job 11 (plan Phase 3, step 3.5): default on, so an older/absent field (or a
-        // server predating this) must resolve to true, not the usual `|| false`.
-        const initiateNegotiation = world.settings?.initiate_negotiation !== false;
-        if (initiateNegotiation) {
-            elements.worldEditInitiateNegotiationToggle.classList.add('active');
-        } else {
-            elements.worldEditInitiateNegotiationToggle.classList.remove('active');
-        }
-        // Job 14 (plan Phase 4): same default-on reasoning as initiate_negotiation above.
+        // Job 14 (plan Phase 4): default on, so an older/absent field (or a server
+        // predating this) must resolve to true, not the usual `|| false`.
         const mspEnabled = world.settings?.msp_enabled !== false;
         if (mspEnabled) {
             elements.worldEditMspEnabledToggle.classList.add('active');
@@ -10658,7 +10742,6 @@
             keep_alive_cmd: elements.worldEditKeepAliveCmd.value,
             gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : '',
             auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0',
-            initiate_negotiation: elements.worldEditInitiateNegotiationToggle.classList.contains('active'),
             msp_enabled: elements.worldEditMspEnabledToggle.classList.contains('active'),
             mcp_enabled: elements.worldEditMcpEnabledToggle.classList.contains('active')
         });
@@ -10683,7 +10766,6 @@
         if (elements.worldEditAutoReconnect) {
             world.settings.auto_reconnect_secs = elements.worldEditAutoReconnect.value.trim();
         }
-        world.settings.initiate_negotiation = elements.worldEditInitiateNegotiationToggle.classList.contains('active');
         world.settings.msp_enabled = elements.worldEditMspEnabledToggle.classList.contains('active');
         world.settings.mcp_enabled = elements.worldEditMcpEnabledToggle.classList.contains('active');
 
@@ -13626,7 +13708,7 @@
             hideReconnectModal();
             // Clear pending command
             pendingReconnectCommand = null;
-            pendingReconnectWorldIndex = null;
+            pendingReconnectWorldName = null;
         };
 
         // Auth username field Enter key handler (multiuser mode)
@@ -13726,9 +13808,6 @@
             this.classList.toggle('active');
         };
         elements.worldEditLoggingToggle.onclick = function() {
-            this.classList.toggle('active');
-        };
-        elements.worldEditInitiateNegotiationToggle.onclick = function() {
             this.classList.toggle('active');
         };
         elements.worldEditMspEnabledToggle.onclick = function() {
@@ -13883,8 +13962,14 @@
         // (below) is the deliberate way to back out, whether or not you saved.
         if (elements.noteEditorSaveBtn) {
             elements.noteEditorSaveBtn.onclick = function() {
-                // MCP simpleedit (plan Job 15) takes priority: it's never the
-                // NOTE_MODE window, so noteMode is never set at the same time.
+                // MCP simpleedit (plan Job 15) is checked first. This used to claim
+                // "it's never the NOTE_MODE window, so noteMode is never set at the
+                // same time" - false (T2.3): McpEditOpen's handler now refuses to
+                // start a session while noteMode is set, which is what makes that
+                // true from this direction, but the reverse isn't guarded - Android's
+                // /note can still call enterNoteMode() (setting noteMode) while an
+                // MCP edit session is already open, leaving both set. This branch
+                // ordering is what makes MCP simpleedit win if that happens.
                 if (mcpEditState) {
                     send({
                         type: 'McpEditSet',

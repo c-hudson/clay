@@ -140,15 +140,31 @@ pub enum RecallMatchStyle {
     Regexp,   // Regular expression
 }
 
-/// History source for recall
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Line-TYPE filter for recall - which kind of line to return. Decoupled from *which
+/// world* to read from (see `RecallWorld` below): before this split, `-w`/`-w<world>`
+/// and `-i`/`-l`/`-g` all wrote the same field, so `-i -wmud` couldn't mean "input sent
+/// to `mud`" - the second flag silently clobbered the first. Now `-w<world>`/`-w` only
+/// ever touch `RecallOptions::world`, and `-i`/`-l`/`-g` only ever touch this field, so
+/// any combination of one world selector + one source is expressible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecallSource {
     #[default]
-    CurrentWorld,         // -w (default)
-    World(String),        // -wworld
-    Local,                // -l (TF output only)
-    Global,               // -g (all worlds + local)
-    Input,                // -i (input history)
+    Server,                // -w / no source flag (default): MUD server output only
+    Local,                 // -l (TF/client-generated output only)
+    Global,                // -g (server + client + input, all together)
+    Input,                 // -i: everything sent to the world as text input - typed
+                            // AND sent by triggers/actions/hooks/`/repeat` (see
+                            // `App::capture_sent_line`) - combines with `world` below.
+}
+
+/// Which world's buffer a recall reads from - independent of `RecallSource` (see its
+/// doc comment). `-w` alone selects `Current` explicitly (a no-op vs. the default, kept
+/// so `-w -i` round-trips); `-w<name>` selects `Named`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RecallWorld {
+    #[default]
+    Current,
+    Named(String),
 }
 
 /// Range specification for recall
@@ -179,6 +195,7 @@ pub enum RecallRange {
 #[derive(Debug, Clone, Default)]
 pub struct RecallOptions {
     pub source: RecallSource,
+    pub world: RecallWorld,
     pub range: RecallRange,
     pub pattern: Option<String>,
     pub match_style: RecallMatchStyle,

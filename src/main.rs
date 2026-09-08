@@ -29,6 +29,7 @@ pub mod ssh;
 pub mod tts;
 pub mod scrollback;
 pub mod stats;
+pub mod protocol_state;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
 pub mod testserver;
@@ -1607,7 +1608,7 @@ fn generate_wav_from_notes(notes: &[crate::ansi_music::MusicNote]) -> Vec<u8> {
         let num_samples = (sample_rate as f64 * note.duration_ms as f64 / 1000.0) as usize;
         if note.frequency <= 0.0 {
             // Rest/silence
-            samples.extend(std::iter::repeat(0i16).take(num_samples));
+            samples.extend(std::iter::repeat_n(0i16, num_samples));
         } else {
             let period = sample_rate as f64 / note.frequency as f64;
             for i in 0..num_samples {
@@ -1959,25 +1960,19 @@ pub struct WorldSettings {
     pub auto_reconnect_secs: u32,
     // Auto-reconnect when a web/Android client connects
     pub auto_reconnect_on_web: bool,
-    /// Job 11 (plan Phase 3, step 3.5, finding 5): whether Clay sends its opening
-    /// telnet negotiation offer (WILL TTYPE, WILL NAWS, DO CHARSET, DO GMCP, DO MSDP,
-    /// DO MCCP2 — see `TelnetSession::initial_negotiation`) at connect time instead of
-    /// staying purely reactive. Default on; the per-world escape hatch for a server
-    /// that reacts badly to being spoken to first, without needing a rebuild.
-    pub initiate_negotiation: bool,
     /// Job 14 (plan Phase 4): per-world escape hatch for MSP (`!!SOUND(...)`/
     /// `!!MUSIC(...)`) trigger recognition and playback — mirrors
     /// `TelnetConfig::msp_enabled` exactly (see its doc comment; this is the
     /// setting that field is threaded from at connect time). Default on;
     /// audio triggered by a remote server is something a user must be able
-    /// to turn off, same reasoning as `initiate_negotiation` above.
+    /// to turn off.
     pub msp_enabled: bool,
     /// Job 15 (plan Phase 4): per-world escape hatch for MCP (`#$#`-prefixed in-band
     /// protocol traffic — version handshake, `mcp-negotiate`, and
-    /// `dns-org-mud-moo-simpleedit`). Same posture as `msp_enabled`/
-    /// `initiate_negotiation`: default on, off means a `#$#` line passes through and
-    /// displays like any other server text instead of being filtered — see
-    /// `mcp::McpState` and `App::process_server_data`'s call site.
+    /// `dns-org-mud-moo-simpleedit`). Same posture as `msp_enabled`: default on, off
+    /// means a `#$#` line passes through and displays like any other server text
+    /// instead of being filtered — see `mcp::McpState` and
+    /// `App::process_server_data`'s call site.
     pub mcp_enabled: bool,
 }
 
@@ -2006,7 +2001,6 @@ impl Default for WorldSettings {
             gmcp_packages: DEFAULT_GMCP_PACKAGES.to_string(),
             auto_reconnect_secs: 0,
             auto_reconnect_on_web: false,
-            initiate_negotiation: true,
             msp_enabled: true,
             mcp_enabled: true,
         }
@@ -3054,7 +3048,7 @@ const MAX_LINE_LENGTH: usize = 10_000;
 /// and nothing stops one from advertising an enormous or pathological list. Each
 /// entry is a full extra outbound telnet message, so this keeps one MSDP reply from
 /// turning into an unbounded burst of writes.
-const MAX_MSDP_AUTO_REPORT: usize = 100;
+pub(crate) const MAX_MSDP_AUTO_REPORT: usize = 100;
 
 impl OutputLine {
     /// Truncate text if it exceeds MAX_LINE_LENGTH to prevent performance issues
@@ -3207,9 +3201,14 @@ pub struct World {
     log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
     /// TF's `/log <file>` (finding: real tf logs to an arbitrary path, not Clay's normal
     /// auto-computed `logs/<name>.<date>.log`) - when set, `get_log_path` returns this
-    /// instead. Session-only, like `log_handle`/`log_date` themselves: not a `WorldSettings`
-    /// field, so it is intentionally NOT persisted to settings.dat or restored on `/reload` -
-    /// exactly like the open file handle it controls, it starts fresh every process/`/log ON`.
+    /// instead. Not a `WorldSettings` field, so it is intentionally NOT persisted to
+    /// settings.dat: it starts fresh every real process start, exactly like the open
+    /// file handle (`log_handle`) it controls. IS persisted to the hot-reload state
+    /// file (T2.7): `log_handle`/`log_date` are session-only for a different reason
+    /// (they hold a live `File` a reload's `exec` cannot carry across), but the path
+    /// itself is ordinary durable state — without restoring it, a `/reload` silently
+    /// reverted logging to the default auto-computed file for the rest of the
+    /// connection with no user-visible signal that it had changed.
     pub log_custom_path: Option<std::path::PathBuf>,
     pub scrollback_tx: Option<scrollback::ArchiveSender>,
     #[cfg(unix)]
@@ -3222,7 +3221,11 @@ pub struct World {
     proxy_socket_fd: Option<i64>,   // Placeholder on non-Unix (never used)
     is_tls: bool,                // Track if using TLS
     telnet_mode: bool,           // True if telnet negotiation detected
-    pub negotiated_encoding: Option<Encoding>, // Encoding negotiated via TELNET CHARSET (RFC 2066)
+    /// The fifteen telnet protocol mirrors moved off `World` in plan Job 9 (T3.2) -
+    /// see `protocol_state::ProtocolState`'s own doc comment for the full list and why
+    /// multiuser needed this split (`UserConnection` embeds its own `protocol` field the
+    /// same way).
+    pub protocol: protocol_state::ProtocolState,
     pub prompt: String,              // Current prompt detected via telnet GA
     pub prompt_count: usize,         // Number of prompts received since connect (for auto-login)
     last_send_time: Option<std::time::Instant>, // For keepalive timing
@@ -3231,7 +3234,7 @@ pub struct World {
     last_user_command_time: Option<std::time::Instant>, // Last time user sent a command
     pub partial_line: String,        // Buffer for incomplete lines (no trailing newline)
     pub partial_in_pending: bool,    // True if partial_line is in pending_lines (vs output_lines)
-    trigger_partial_line: String, // Buffer for incomplete lines for action trigger checking
+    pub(crate) trigger_partial_line: String, // Buffer for incomplete lines for action trigger checking
     just_filtered_idler: bool,   // True if we just filtered an idler message (for filtering trailing newline)
     /// Blank lines still to be gagged after an action with `suppress_blanks` fired.
     ///
@@ -3239,7 +3242,6 @@ pub struct World {
     /// is: the blanks that follow a match frequently arrive in a later packet than the match.
     suppress_blanks_remaining: u8,
     wont_echo_time: Option<std::time::Instant>, // When WONT ECHO was seen (for timeout-based prompt detection)
-    uses_wont_echo_prompt: bool, // True if this world uses WONT ECHO for prompts (auto-detected)
     pub is_initial_world: bool,      // True for the auto-created world before first connection
     pub was_connected: bool,         // True if world has ever been connected (for world cycling)
     pub skip_auto_login: bool,       // True to skip auto-login on next connect (for /worlds -l)
@@ -3252,8 +3254,6 @@ pub struct World {
     owner: Option<String>,       // Username who owns this world (multiuser mode)
     proxy_pid: Option<u32>,      // PID of TLS proxy process (if using TLS proxy)
     proxy_socket_path: Option<std::path::PathBuf>, // Unix socket path for TLS proxy
-    naws_enabled: bool,          // True if NAWS telnet option was negotiated
-    naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
     pub next_seq: u64,               // Next sequence number for output lines (for debugging)
     /// Identifies this world's *sequence-number space*, so a client can tell whether the seqs
     /// it cached still mean what they used to.
@@ -3330,47 +3330,6 @@ pub struct World {
     /// throwaway worlds (tests, transient lookups) never burn an id. 32 lowercase
     /// hex, no dashes.
     pub world_id: String,
-    pub gmcp_enabled: bool,          // True if GMCP was negotiated with the server
-    pub msdp_enabled: bool,          // True if MSDP was negotiated with the server
-    /// True while an MCCP2 (`IAC SB COMPRESS2 IAC SE`) zlib stream is active on this
-    /// connection — set by `TelnetEvent::CompressionStarted`, cleared by
-    /// `CompressionEnded` and by `clear_connection_state`. The decompressor's sliding
-    /// window lives only in the reader task's `TelnetSession` and cannot survive a hot
-    /// reload's exec, so a world with this flag still set at restore time is disconnected
-    /// with a message rather than handed to a fresh plaintext parser (plan Phase 3, step
-    /// 3.3 — mirrors the existing `is_tls` reload bail-out).
-    pub mccp2_active: bool,
-    /// True from `TelnetEvent::EchoOff` (`IAC WILL ECHO` - the MUD asking Clay to stop
-    /// echoing locally, the standard password/login-prompt signal) until `EchoOn`
-    /// (`IAC WONT ECHO`) or `clear_connection_state` — plan Phase 3, step 3.4 / finding 7.
-    /// Set/cleared by `App::handle_telnet_event`, which also broadcasts
-    /// `WsMessage::EchoMaskChanged` so web/GUI clients mask their own input element; the
-    /// console (`rendering::render_input`/`render_input_area` and its crossterm replica
-    /// in `render_output_crossterm`) and the SSH remote console (which renders through
-    /// those same shared functions on its own locally-mirrored `World`) read this
-    /// directly. Deliberately NOT persisted to `settings.dat` or the hot-reload state
-    /// file (unlike `mccp2_active`): it is a purely local rendering decision, not
-    /// something that must survive process restart or affects wire compatibility with
-    /// the MUD, and a reconnect always gets a fresh, correct value from the next real
-    /// `WILL`/`WONT ECHO`.
-    pub echo_masked: bool,
-    pub gmcp_supported_packages: Vec<String>, // GMCP packages we told the server we support
-    pub msdp_variables: std::collections::HashMap<String, String>, // MSDP var -> JSON value
-    pub gmcp_data: std::collections::HashMap<String, String>, // GMCP package -> last JSON data
-    /// Status display model (plan Job 1 of mud-status-display.md), derived from
-    /// `Char.*` GMCP packages and MSDP variables as they arrive — see
-    /// `stats::WorldStats` for the pairing/ordering rules. Purely a reactive
-    /// protocol mirror, same category as `gmcp_data`/`msdp_variables` above:
-    /// deliberately NOT persisted to settings.dat or the hot-reload state file,
-    /// since the next update after a reconnect re-derives it correctly and a
-    /// stale carried-over value would show data from a connection that's gone.
-    pub stats: stats::WorldStats,
-    /// Set whenever `stats` changes (a new GMCP/MSDP update, or cleared on disconnect) and
-    /// cleared by `App::flush_dirty_stats` once the current state has been broadcast —
-    /// mud-status-display.md Job 2's coalescing (plan D4). `Char.Vitals` can arrive several
-    /// times a second; this flag plus the periodic flush is what turns that into "roughly
-    /// one broadcast per ~150ms with the latest state" instead of one broadcast per update.
-    pub stats_dirty: bool,
     /// Precomputed stat entries as received over the wire (`WorldStateMsg::stats` /
     /// `WsMessage::StatsUpdate`) — plan Job 4. This `World` struct is shared verbatim
     /// by the SSH remote console (`remote_client.rs`), which mirrors the master's
@@ -3405,21 +3364,6 @@ pub struct World {
     /// Latching means the row goes from 0 to 1 exactly once per connection and then
     /// never moves again until that connection actually ends.
     pub stats_line_shown: bool,
-    /// MSSP (option 70, plan Job 12 / 4.2) server status as ordered name/value
-    /// pairs (see `telnet::parse_mssp_pairs` — a name may repeat with more
-    /// than one value, so this is a `Vec`, never a map). Each `MsspData`
-    /// event replaces this wholesale (MSSP's own convention: every
-    /// occurrence is a complete snapshot, not an incremental update) - see
-    /// `App::handle_telnet_event`. Surfaced to the user via `/mssp`.
-    /// Deliberately NOT persisted to settings.dat or the hot-reload state
-    /// file, same category and same reasoning as `gmcp_data`/
-    /// `msdp_variables` above: a purely reactive protocol mirror that the
-    /// next MSSP subnegotiation (or, on a live reload, nothing at all since
-    /// the socket and its negotiated state survive the exec) re-derives
-    /// correctly, unlike `mccp2_active`/`is_tls` which gate a real
-    /// reload-time decision (whether to disconnect).
-    pub mssp_data: Vec<(String, String)>,
-    pub mcmp_default_url: String,    // MCMP default URL from Client.Media.Default
     pub active_media: std::collections::HashMap<String, String>, // key -> Client.Media.Play JSON (for restart on world switch)
     pub gmcp_user_enabled: bool,     // True if user has enabled GMCP processing (F9 toggle)
     pub tts_speaker_whitelist: std::collections::HashSet<String>, // Per-world TTS speaker whitelist
@@ -3450,8 +3394,13 @@ pub struct World {
     fansi_login_pending: Option<String>,             // Deferred login command for FANSI worlds
     pub reconnect_at: Option<std::time::Instant>,   // When to auto-reconnect (None = no reconnect scheduled)
     /// MCP (plan Job 15) per-connection state: session auth key, negotiated packages,
-    /// open multiline accumulations. Reset by `clear_connection_state` — see
-    /// `mcp::McpState`'s doc comment for why it is not persisted across a hot reload.
+    /// open multiline accumulations. Reset by `clear_connection_state` on a real
+    /// disconnect/reconnect (see `mcp::McpState`'s doc comment for why a stale value
+    /// must never survive that). Persisted to the hot-reload state file (T3.4/
+    /// job 5): unlike a reconnect, `/reload` keeps the same socket and the server has
+    /// no reason to resend its one-time "mcp version:" invite, so without this the
+    /// session key was lost and MCP silently and permanently stopped working on that
+    /// connection until the user reconnected by hand.
     pub mcp: mcp::McpState,
 }
 
@@ -3550,7 +3499,7 @@ impl World {
             proxy_socket_fd: None,
             is_tls: false,
             telnet_mode: false,
-            negotiated_encoding: None,
+            protocol: protocol_state::ProtocolState::default(),
             prompt: String::new(),
             prompt_count: 0,
             last_send_time: None,
@@ -3563,7 +3512,6 @@ impl World {
             just_filtered_idler: false,
             suppress_blanks_remaining: 0,
             wont_echo_time: None,
-            uses_wont_echo_prompt: false,
             is_initial_world: false,
             was_connected: false,
             skip_auto_login: false,
@@ -3576,8 +3524,6 @@ impl World {
             owner: None,
             proxy_pid: None,
             proxy_socket_path: None,
-            naws_enabled: false,
-            naws_sent_size: None,
             next_seq,
             seq_epoch: Self::new_seq_epoch(),
             broadcast_ledger: std::sync::Mutex::new(Vec::new()),
@@ -3585,19 +3531,8 @@ impl World {
             login_capture_guard: 6,
             reader_name: None,
             world_id: String::new(),
-            gmcp_enabled: false,
-            msdp_enabled: false,
-            mccp2_active: false,
-            echo_masked: false,
-            gmcp_supported_packages: Vec::new(),
-            msdp_variables: std::collections::HashMap::new(),
-            gmcp_data: std::collections::HashMap::new(),
-            stats: stats::WorldStats::default(),
-            stats_dirty: false,
             mirrored_stats: Vec::new(),
             stats_line_shown: false,
-            mssp_data: Vec::new(),
-            mcmp_default_url: String::new(),
             active_media: std::collections::HashMap::new(),
             gmcp_user_enabled: false,
             tts_speaker_whitelist: std::collections::HashSet::new(),
@@ -3681,8 +3616,8 @@ impl World {
     /// one of the two is ever non-empty for a given `World` in practice, so this never
     /// has to guess which kind of `World` it's looking at.
     pub fn current_stat_entries(&self) -> Vec<stats::StatEntry> {
-        if !self.stats.is_empty() {
-            self.stats.entries()
+        if !self.protocol.stats.is_empty() {
+            self.protocol.stats.entries().to_vec()
         } else {
             self.mirrored_stats.clone()
         }
@@ -3703,43 +3638,15 @@ impl World {
         self.connected = false;
         self.socket_fd = None;
         self.telnet_mode = false;
-        self.negotiated_encoding = None;
-        self.naws_enabled = false;
-        self.naws_sent_size = None;
+        // Job 9 (T3.2): every telnet protocol mirror (negotiated_encoding, naws_enabled/
+        // naws_sent_size, gmcp_enabled/msdp_enabled, mccp2_active, echo_masked, gmcp_data/
+        // msdp_variables/mssp_data, stats/stats_dirty, mcmp_default_url,
+        // gmcp_supported_packages, uses_wont_echo_prompt) now lives on `ProtocolState`,
+        // which owns clearing itself - see `ProtocolState::clear`'s doc comment for the
+        // per-field rationale this used to carry inline here (finding 4's paired App-side
+        // fix, Job 10a/10b, Job 12, mud-status-display.md Jobs 1/2).
+        self.protocol.clear();
         self.reader_name = None;
-        // Job 9 (finding 4's paired App-side fix): a fresh TelnetSession per
-        // connection already resets the session's own Q-method option state
-        // to No/No, but these World-side mirrors of what was negotiated on
-        // the *previous* connection survived a reconnect until now — so a
-        // reconnect to a plain server after a GMCP/MSDP one kept showing
-        // stale gmcp_enabled/msdp_enabled/gmcp_data/etc. as if they were
-        // still live.
-        self.gmcp_enabled = false;
-        self.msdp_enabled = false;
-        // Job 10a (plan Phase 3, step 3.3): a fresh TelnetSession per connection starts
-        // with no decompressor, but this World-side mirror of "was MCCP2 active on the
-        // *previous* connection" survived a reconnect until now, same class of bug as
-        // gmcp_enabled/msdp_enabled above.
-        self.mccp2_active = false;
-        // Job 10b (plan Phase 3, step 3.4): a masked prompt from the *previous*
-        // connection must not keep hiding ordinary input typed on the next one - a
-        // fresh TelnetSession starts with no echo state either, and the next real
-        // WILL/WONT ECHO will set this correctly if the new connection needs it.
-        self.echo_masked = false;
-        self.gmcp_data.clear();
-        self.msdp_variables.clear();
-        self.mssp_data.clear(); // Job 12 (plan Phase 4, 4.2): same class of stale-mirror bug
-        // mud-status-display.md Job 1: same class of stale-mirror bug as
-        // gmcp_data/msdp_variables above - a status display must not keep showing a
-        // previous connection's vitals once this one is gone.
-        // Job 2: mark dirty (only when there was actually something to clear) so the next
-        // flush propagates the now-empty state to remote clients - otherwise a client that
-        // already received a StatsUpdate for the old connection would keep showing stale
-        // vitals for a dead one forever, since nothing else would ever tell it to stop.
-        if !self.stats.is_empty() {
-            self.stats_dirty = true;
-        }
-        self.stats.clear();
         // Job 4 (plan D3): the fixed-height console status line latches on the first
         // time this connection ever showed one, specifically so mid-connection
         // GMCP/MSDP churn can never toggle it (see `stats_line_shown`'s own doc
@@ -3754,9 +3661,6 @@ impl World {
         // above, and the auth-key check makes trusting a stale key actively unsafe,
         // not just cosmetically wrong.
         self.mcp = mcp::McpState::default();
-        self.mcmp_default_url.clear();
-        self.gmcp_supported_packages.clear();
-        self.uses_wont_echo_prompt = false;
         // Reset skip_auto_login so next fresh connection triggers auto-login
         self.skip_auto_login = false;
         self.fansi_detect_until = None;
@@ -3776,7 +3680,7 @@ impl World {
 
     /// Return the effective encoding for this world: negotiated charset if available, otherwise configured encoding.
     pub fn effective_encoding(&self) -> Encoding {
-        self.negotiated_encoding.unwrap_or(self.settings.encoding)
+        self.protocol.effective_encoding(&self.settings)
     }
 
     /// Write a line to the log file with timestamp prefix
@@ -3852,7 +3756,7 @@ impl World {
         self.output_lines
             .iter()
             .rev()
-            .find(|l| floor.map_or(true, |f| l.seq < f))
+            .find(|l| floor.is_none_or(|f| l.seq < f))
             .map(|l| l.seq)
     }
 
@@ -5532,7 +5436,7 @@ impl App {
             Newline => {
                 // ECHO masking (plan Phase 3, step 3.4): see InputArea::take_input's doc
                 // comment - a masked line must never enter arrow-key recall history.
-                let record_history = !self.current_world().echo_masked;
+                let record_history = !self.current_world().protocol.echo_masked;
                 let input = self.input.take_input(record_history);
                 if input.is_empty() && !self.current_world().connected {
                     return None;
@@ -5864,7 +5768,6 @@ impl App {
             keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
             gmcp_packages: world.settings.gmcp_packages.clone(),
             auto_reconnect_secs: world.settings.auto_reconnect_display(),
-            initiate_negotiation: world.settings.initiate_negotiation,
             msp_enabled: world.settings.msp_enabled,
             mcp_enabled: world.settings.mcp_enabled,
             slack_token: world.settings.slack_token.clone(),
@@ -6391,7 +6294,7 @@ impl App {
             // needs_output_redraw is enough to mask/unmask on the next paint.
             WsMessage::EchoMaskChanged { world_index, masked } => {
                 if world_index < self.worlds.len() {
-                    self.worlds[world_index].echo_masked = masked;
+                    self.worlds[world_index].protocol.echo_masked = masked;
                     self.needs_output_redraw = true;
                 }
             }
@@ -6691,6 +6594,77 @@ impl App {
                     });
                 }
             }
+            WsMessage::WorldAdded { world } => {
+                // Mirror of app.js's `case 'WorldAdded'` handler (app.js:3847-3886), the
+                // index-bump rule specifically:
+                //
+                //     const insertIndex = world.index !== undefined ? world.index : worlds.length;
+                //     worlds.splice(insertIndex, 0, world);
+                //     if (currentWorldIndex >= insertIndex) currentWorldIndex++;
+                //     ...
+                //     if (selectedWorldIndex >= insertIndex) selectedWorldIndex++;
+                //
+                // `selectedWorldIndex` is the web world-selector popup's own UI state with
+                // no counterpart here; `previous_world_index` is this client's analogous
+                // "other" index (Alt+w fallback) and gets the same bump instead. `idx` is
+                // clamped against our own length in case a racing/stale peer sends an
+                // index that's since gone out of range.
+                let idx = world.index.min(self.worlds.len());
+                let new_world = self.world_from_state_msg(*world);
+                self.worlds.insert(idx, new_world);
+                if self.current_world_index >= idx {
+                    self.current_world_index += 1;
+                }
+                if let Some(prev) = self.previous_world_index {
+                    if prev >= idx {
+                        self.previous_world_index = Some(prev + 1);
+                    }
+                }
+                self.needs_output_redraw = true;
+            }
+            WsMessage::WorldRemoved { world_index } => {
+                // Mirror of app.js's `case 'WorldRemoved'` handler (app.js:3895-3916).
+                // Same guard as the server's own `delete_world`: never drop the last
+                // remaining world, and ignore an index that's already out of range.
+                if world_index < self.worlds.len() && self.worlds.len() > 1 {
+                    self.worlds.remove(world_index);
+                    self.fixup_indices_after_remove(world_index);
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::WorldSettingsUpdated { world_index, settings, name } => {
+                // No app.js counterpart to mirror — the web client has no handler for
+                // this message either (see the doc comment on `NotesChanged` in
+                // websocket.rs). Hydrate the same World/WorldSettings fields
+                // `world_from_state_msg` hydrates at connect time, so a rename or a
+                // settings save made elsewhere doesn't leave this mirror stale until the
+                // next reconnect. Password is deliberately never touched here, same as
+                // `world_from_state_msg` — this message always carries an empty one.
+                if let Some(w) = self.worlds.get_mut(world_index) {
+                    w.name = name;
+                    w.settings.hostname = settings.hostname;
+                    w.settings.port = settings.port;
+                    w.settings.user = settings.user;
+                    w.settings.use_ssl = settings.use_ssl;
+                    w.settings.log_enabled = settings.log_enabled;
+                    w.settings.encoding = Encoding::from_name(&settings.encoding);
+                    w.settings.auto_connect_type = AutoConnectType::from_name(&settings.auto_connect_type);
+                    w.settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive_type);
+                    w.settings.keep_alive_cmd = settings.keep_alive_cmd;
+                    w.settings.msp_enabled = settings.msp_enabled;
+                    w.settings.mcp_enabled = settings.mcp_enabled;
+                    self.needs_output_redraw = true;
+                }
+            }
+            // No-op (T1.13): this mirrored World holds no notes text — the console's own
+            // `/note` editor fetches/saves notes via a dedicated NoteEditorState
+            // request/response, never from this broadcast — so there is nothing here to
+            // update; `has_notes` alone would have nowhere to go.
+            WsMessage::NotesChanged { .. } => {}
+            // No-op (T1.13): the console draws no PAUSED badge — that status indicator is
+            // web/GUI-only, and `rendering.rs` never reads a paused flag for this client —
+            // so there is nothing to mirror here either.
+            WsMessage::PausedState { .. } => {}
             _ => {}
         }
     }
@@ -6716,6 +6690,100 @@ impl App {
             .collect()
     }
 
+    /// Build a mirrored `World` from a server-sent `WorldStateMsg`, exactly the way
+    /// `init_from_initial_state` hydrates each world at connect time. Extracted (T1.13)
+    /// so `handle_remote_ws_message`'s `WorldAdded` arm can hydrate a world added after
+    /// connect identically instead of leaving it as a bare `World::new` default.
+    fn world_from_state_msg(&self, w: WorldStateMsg) -> World {
+        let mut world = World::new(&w.name);
+        world.scrollback_tx = self.scrollback.as_ref().map(|db| db.sender());
+        world.connected = w.connected;
+        world.was_connected = w.was_connected;
+        // Set proxy_pid sentinel if server reports proxy (actual PID not needed for display)
+        world.proxy_pid = if w.is_proxy { Some(0) } else { None };
+        let output_lines_count = w.output_lines_ts.len();
+        world.output_lines = w.output_lines_ts.into_iter().map(|tl| {
+            OutputLine { archive_seq: None,
+                text: tl.text,
+                timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
+                from_server: tl.from_server,
+                gagged: tl.gagged,
+                is_input: false, // remote-console mirror: see the note above
+                seq: tl.seq,
+                highlight_color: tl.highlight_color,
+                from_archive: tl.from_archive,
+                archive_sourced: tl.archive_sourced,
+                viewed: false,
+                display_id: None,
+            }
+        }).collect();
+        // Update next_seq to continue from highest seq in output_lines
+        world.next_seq = world.output_lines.iter().map(|l| l.seq).max().unwrap_or(0).saturating_add(1);
+        // Set max_received_seq for dedup (highest seq we've received from server)
+        world.max_received_seq = world.next_seq.saturating_sub(1);
+        world.unseen_lines = w.unseen_lines;
+        // Use server's scroll_offset, or set to end of buffer if showing splash
+        world.scroll_offset = if w.showing_splash {
+            output_lines_count.saturating_sub(1)
+        } else {
+            w.scroll_offset
+        };
+        world.pending_lines = w.pending_lines_ts.into_iter().map(|tl| {
+            OutputLine { archive_seq: None,
+                text: tl.text,
+                timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
+                from_server: tl.from_server,
+                gagged: tl.gagged,
+                is_input: false, // remote-console mirror: see the note above
+                seq: tl.seq,
+                highlight_color: tl.highlight_color,
+                from_archive: tl.from_archive,
+                archive_sourced: tl.archive_sourced,
+                viewed: false,
+                display_id: None,
+            }
+        }).collect();
+        // Update next_seq if pending_lines have higher seq values
+        if let Some(max_pending_seq) = world.pending_lines.iter().map(|l| l.seq).max() {
+            world.next_seq = world.next_seq.max(max_pending_seq.saturating_add(1));
+        }
+        world.paused = w.paused;
+        world.prompt = w.prompt;
+        world.showing_splash = w.showing_splash;
+        world.gmcp_user_enabled = w.gmcp_user_enabled;
+        // ECHO masking (plan Phase 3, step 3.4): hydrate this SSH remote console's
+        // own mirrored World so its shared render_input/render_input_area (and the
+        // crossterm replica in render_output_crossterm) mask correctly from the very
+        // first paint, without waiting on a live EchoMaskChanged.
+        world.protocol.echo_masked = w.echo_masked;
+        // Status display (mud-status-display.md Job 4): hydrate this SSH remote
+        // console's own mirrored World the same way echo_masked is hydrated above -
+        // World::current_stat_entries() prefers `stats` (always empty here; this
+        // mirror never sees raw GMCP/MSDP) and falls back to `mirrored_stats`, so
+        // this is what makes the status line/`/stats` show anything at all on a
+        // connecting or resyncing remote console instead of waiting indefinitely for
+        // a live StatsUpdate. `rendering::ui`'s own latch check (run every frame,
+        // shared by both the master and this mirror) sets `stats_line_shown` from
+        // this on the very next paint - no need to set it here too.
+        world.mirrored_stats = w.stats;
+        world.settings = WorldSettings {
+            hostname: w.settings.hostname,
+            port: w.settings.port,
+            user: w.settings.user,
+            password: String::new(), // Don't receive passwords from server
+            use_ssl: w.settings.use_ssl,
+            log_enabled: w.settings.log_enabled,
+            encoding: Encoding::from_name(&w.settings.encoding),
+            auto_connect_type: AutoConnectType::from_name(&w.settings.auto_connect_type),
+            keep_alive_type: KeepAliveType::from_name(&w.settings.keep_alive_type),
+            keep_alive_cmd: w.settings.keep_alive_cmd,
+            msp_enabled: w.settings.msp_enabled,
+            mcp_enabled: w.settings.mcp_enabled,
+            ..WorldSettings::default()
+        };
+        world
+    }
+
     /// Initialize App state from InitialState message (remote client mode)
     fn init_from_initial_state(
         &mut self,
@@ -6725,97 +6793,8 @@ impl App {
         splash_lines: Vec<String>,
         actions: Vec<Action>,
     ) {
-        let scrollback_sender = self.scrollback.as_ref().map(|db| db.sender());
-        self.worlds = worlds.into_iter().map(|w| {
-            let mut world = World::new(&w.name);
-            world.scrollback_tx = scrollback_sender.clone();
-            world.connected = w.connected;
-            world.was_connected = w.was_connected;
-            // Set proxy_pid sentinel if server reports proxy (actual PID not needed for display)
-            world.proxy_pid = if w.is_proxy { Some(0) } else { None };
-            let output_lines_count = w.output_lines_ts.len();
-            world.output_lines = w.output_lines_ts.into_iter().map(|tl| {
-                OutputLine { archive_seq: None,
-                    text: tl.text,
-                    timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
-                    from_server: tl.from_server,
-                    gagged: tl.gagged,
-                    is_input: false, // remote-console mirror: see the note above
-                    seq: tl.seq,
-                    highlight_color: tl.highlight_color,
-                    from_archive: tl.from_archive,
-                    archive_sourced: tl.archive_sourced,
-                    viewed: false,
-                    display_id: None,
-                }
-            }).collect();
-            // Update next_seq to continue from highest seq in output_lines
-            world.next_seq = world.output_lines.iter().map(|l| l.seq).max().unwrap_or(0).saturating_add(1);
-            // Set max_received_seq for dedup (highest seq we've received from server)
-            world.max_received_seq = world.next_seq.saturating_sub(1);
-            world.unseen_lines = w.unseen_lines;
-            // Use server's scroll_offset, or set to end of buffer if showing splash
-            world.scroll_offset = if w.showing_splash {
-                output_lines_count.saturating_sub(1)
-            } else {
-                w.scroll_offset
-            };
-            world.pending_lines = w.pending_lines_ts.into_iter().map(|tl| {
-                OutputLine { archive_seq: None,
-                    text: tl.text,
-                    timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
-                    from_server: tl.from_server,
-                    gagged: tl.gagged,
-                    is_input: false, // remote-console mirror: see the note above
-                    seq: tl.seq,
-                    highlight_color: tl.highlight_color,
-                    from_archive: tl.from_archive,
-                    archive_sourced: tl.archive_sourced,
-                    viewed: false,
-                    display_id: None,
-                }
-            }).collect();
-            // Update next_seq if pending_lines have higher seq values
-            if let Some(max_pending_seq) = world.pending_lines.iter().map(|l| l.seq).max() {
-                world.next_seq = world.next_seq.max(max_pending_seq.saturating_add(1));
-            }
-            world.paused = w.paused;
-            world.prompt = w.prompt;
-            world.showing_splash = w.showing_splash;
-            world.gmcp_user_enabled = w.gmcp_user_enabled;
-            // ECHO masking (plan Phase 3, step 3.4): hydrate this SSH remote console's
-            // own mirrored World so its shared render_input/render_input_area (and the
-            // crossterm replica in render_output_crossterm) mask correctly from the very
-            // first paint, without waiting on a live EchoMaskChanged.
-            world.echo_masked = w.echo_masked;
-            // Status display (mud-status-display.md Job 4): hydrate this SSH remote
-            // console's own mirrored World the same way echo_masked is hydrated above -
-            // World::current_stat_entries() prefers `stats` (always empty here; this
-            // mirror never sees raw GMCP/MSDP) and falls back to `mirrored_stats`, so
-            // this is what makes the status line/`/stats` show anything at all on a
-            // connecting or resyncing remote console instead of waiting indefinitely for
-            // a live StatsUpdate. `rendering::ui`'s own latch check (run every frame,
-            // shared by both the master and this mirror) sets `stats_line_shown` from
-            // this on the very next paint - no need to set it here too.
-            world.mirrored_stats = w.stats;
-            world.settings = WorldSettings {
-                hostname: w.settings.hostname,
-                port: w.settings.port,
-                user: w.settings.user,
-                password: String::new(), // Don't receive passwords from server
-                use_ssl: w.settings.use_ssl,
-                log_enabled: w.settings.log_enabled,
-                encoding: Encoding::from_name(&w.settings.encoding),
-                auto_connect_type: AutoConnectType::from_name(&w.settings.auto_connect_type),
-                keep_alive_type: KeepAliveType::from_name(&w.settings.keep_alive_type),
-                keep_alive_cmd: w.settings.keep_alive_cmd,
-                initiate_negotiation: w.settings.initiate_negotiation,
-                msp_enabled: w.settings.msp_enabled,
-                mcp_enabled: w.settings.mcp_enabled,
-                ..WorldSettings::default()
-            };
-            world
-        }).collect();
+        let new_worlds: Vec<World> = worlds.into_iter().map(|w| self.world_from_state_msg(w)).collect();
+        self.worlds = new_worlds;
         self.current_world_index = current_world_index;
         self.apply_global_settings(&settings);
         self.is_master = false; // Remote client is never master
@@ -6939,11 +6918,13 @@ impl App {
         })
     }
 
-    /// Resolve the output buffer a /recall should read from.
-    /// For `-w<world>`, looks the world up by name (case-insensitive, matches
-    /// reader_name too). For every other source, uses `fallback_idx` (the
-    /// current or arriving world). Returns an error string if the named world
-    /// does not exist.
+    /// Resolve the output buffer a /recall should read from, from `opts.world` -
+    /// independent of `opts.source` (see `RecallWorld`'s doc comment), so `-i -wmud`
+    /// and `-wmud` (no `-i`) both read the same world's buffer and only differ in which
+    /// lines `execute_recall_with_source` keeps from it.
+    /// For `RecallWorld::Named`, looks the world up by name (case-insensitive, matches
+    /// reader_name too). For `RecallWorld::Current`, uses `fallback_idx` (the current or
+    /// arriving world). Returns an error string if the named world does not exist.
     pub fn recall_source_lines(
         &self,
         opts: &tf::RecallOptions,
@@ -6957,11 +6938,11 @@ impl App {
             if !self.settings.scrollback_enabled {
                 return Err("Archive is off — enable \"Archive Input/Output\" in Setup first".to_string());
             }
-            let idx = match &opts.source {
-                tf::RecallSource::World(name) => self
+            let idx = match &opts.world {
+                tf::RecallWorld::Named(name) => self
                     .find_world_index(name)
                     .ok_or_else(|| format!("No world named '{}'", name))?,
-                _ => fallback_idx,
+                tf::RecallWorld::Current => fallback_idx,
             };
             let live: Vec<OutputLine> = self
                 .worlds
@@ -7030,11 +7011,11 @@ impl App {
             return Ok(lines);
         }
 
-        let idx = match &opts.source {
-            tf::RecallSource::World(name) => self
+        let idx = match &opts.world {
+            tf::RecallWorld::Named(name) => self
                 .find_world_index(name)
                 .ok_or_else(|| format!("No world named '{}'", name))?,
-            _ => fallback_idx,
+            tf::RecallWorld::Current => fallback_idx,
         };
         Ok(self.worlds[idx].output_lines.clone())
     }
@@ -7153,23 +7134,13 @@ impl App {
         }
 
         let world = &self.worlds[world_index];
-        if !world.naws_enabled || !world.connected {
+        if !world.protocol.naws_enabled || !world.connected {
             return false;
         }
 
-        if let Some((width, height)) = self.get_minimum_dimensions() {
-            // Check if dimensions changed
-            if self.worlds[world_index].naws_sent_size != Some((width, height)) {
-                // Send NAWS subnegotiation
-                if let Some(ref tx) = self.worlds[world_index].command_tx {
-                    let naws_msg = build_naws_subnegotiation(width, height);
-                    let _ = tx.try_send(WriteCommand::Raw(naws_msg));
-                    self.worlds[world_index].naws_sent_size = Some((width, height));
-                    return true;
-                }
-            }
-        }
-        false
+        let size = self.get_minimum_dimensions();
+        let tx = self.worlds[world_index].command_tx.clone();
+        self.worlds[world_index].protocol.send_naws_if_changed(size, tx.as_ref())
     }
 
     /// Send NAWS updates to all connected worlds that have NAWS enabled
@@ -7177,6 +7148,61 @@ impl App {
         let world_count = self.worlds.len();
         for idx in 0..world_count {
             self.send_naws_if_changed(idx);
+        }
+    }
+
+    /// Per-user NAWS size source (plan Job 9, T3.2): mirrors `get_minimum_dimensions`,
+    /// but scoped to one multiuser user's own WS clients rather than App-wide - one
+    /// user's window size must never leak into another user's NAWS. Falls back to
+    /// `(visible_columns, visible_lines)` (from `WsMessage::UpdateViewState`) when a
+    /// client has reported a view state but never an explicit `UpdateDimensions` - the
+    /// plan's "decision taken": strictly better than the server's old implicit
+    /// 80-column default, and it is what the web client actually reports.
+    pub(crate) fn user_min_dimensions(&self, username: &str) -> Option<(u16, u16)> {
+        let server = self.ws_server.as_ref()?;
+        let mut min_width: Option<u16> = None;
+        let mut min_height: Option<u16> = None;
+        for (client_id, state) in &self.ws_client_worlds {
+            if server.get_client_username(*client_id).as_deref() != Some(username) {
+                continue;
+            }
+            let size = state.dimensions.or({
+                if state.visible_columns > 0 && state.visible_lines > 0 {
+                    Some((state.visible_columns as u16, state.visible_lines as u16))
+                } else {
+                    None
+                }
+            });
+            if let Some((w, h)) = size {
+                if w > 0 && h > 0 {
+                    min_width = Some(min_width.map_or(w, |mw| mw.min(w)));
+                    min_height = Some(min_height.map_or(h, |mh| mh.min(h)));
+                }
+            }
+        }
+        match (min_width, min_height) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        }
+    }
+
+    /// Resend NAWS to every one of `username`'s live multiuser connections whose
+    /// negotiated window size just changed (mirrors `send_naws_to_all_worlds`'s job,
+    /// scoped to one user - `get_minimum_dimensions`/`send_naws_if_changed` are App-wide
+    /// and must not be reused here for the same reason `user_min_dimensions` exists).
+    pub(crate) fn send_naws_to_all_multiuser_worlds(&mut self, username: &str) {
+        let size = self.user_min_dimensions(username);
+        let keys: Vec<(usize, String)> = self.user_connections.keys()
+            .filter(|(_, u)| u == username)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(conn) = self.user_connections.get_mut(&key) {
+                if conn.protocol.naws_enabled {
+                    let tx = conn.command_tx.clone();
+                    conn.protocol.send_naws_if_changed(size, tx.as_ref());
+                }
+            }
         }
     }
 
@@ -7639,7 +7665,7 @@ impl App {
             // seq-drift-fix notes and CLAUDE.md's output_lines-sorted-by-seq invariant.
             let pending_floor = world.pending_floor_seq();
             let eligible: Vec<_> = world.output_lines.iter()
-                .filter(|l| l.seq > seq && pending_floor.map_or(true, |floor| l.seq < floor) && !l.from_archive)
+                .filter(|l| l.seq > seq && pending_floor.is_none_or(|floor| l.seq < floor) && !l.from_archive)
                 .collect();
             // Was the result cut short by the clamp rather than by genuine exhaustion? If so
             // the client is NOT caught up - there is more it is owed, just not deliverable
@@ -8381,9 +8407,9 @@ impl App {
                 self.emit_tf_error(idx, err, is_daemon_mode);
             }
             for cmd in &hook_result.send_commands {
-                if let Some(tx) = self.worlds.get(idx).and_then(|w| w.command_tx.as_ref()) {
-                    let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                }
+                // send_to_world captures via capture_sent_line - this is exactly the
+                // "TF hooks" case /recall -i now covers.
+                self.send_to_world(idx, cmd.clone());
             }
         }
         for cmd in &hook_result.clay_commands {
@@ -8447,7 +8473,6 @@ impl App {
                 gmcp_packages: world.settings.gmcp_packages.clone(),
                 auto_reconnect_secs: world.settings.auto_reconnect_display(),
                 has_notes: !world.settings.notes.is_empty(),
-                initiate_negotiation: world.settings.initiate_negotiation,
                 msp_enabled: world.settings.msp_enabled,
                 mcp_enabled: world.settings.mcp_enabled,
             },
@@ -8459,7 +8484,7 @@ impl App {
             was_connected: false,
             is_proxy: false,
             gmcp_user_enabled: world.gmcp_user_enabled,
-            echo_masked: world.echo_masked,
+            echo_masked: world.protocol.echo_masked,
             total_output_lines: 0,
             total_visible_lines: Some(0),
             pending_count: 0,
@@ -8475,18 +8500,12 @@ impl App {
         self.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
     }
 
-    /// `WsMessage::DeleteWorld` handling — shared by master-WS and daemon (T36). Never deletes
-    /// the last remaining world. No text feedback is sent: `WorldRemoved` is a structural
-    /// broadcast every client already reacts to on its own. A prior master-WS-only
-    /// `add_output()` call here was actually a bug, not a missing feature elsewhere — it
-    /// targeted `current_world_index` (the local console's own view), unrelated to whichever
-    /// world was actually deleted, so it could misattribute the message to the wrong world or
-    /// even the wrong client's session.
-    pub(crate) fn delete_world(&mut self, world_index: usize) {
-        if self.worlds.len() <= 1 || world_index >= self.worlds.len() {
-            return;
-        }
-        self.worlds.remove(world_index);
+    /// Fix up `current_world_index`/`previous_world_index` after a world at `world_index`
+    /// has already been removed from `self.worlds` — shared by `delete_world`'s own
+    /// removal and the SSH remote console's `WorldRemoved` mirror (T1.13), so both stay
+    /// identical instead of drifting the way the mirror used to (it never called this at
+    /// all, see `handle_remote_ws_message`).
+    fn fixup_indices_after_remove(&mut self, world_index: usize) {
         if self.current_world_index >= self.worlds.len() {
             self.current_world_index = self.worlds.len().saturating_sub(1);
         } else if self.current_world_index > world_index {
@@ -8499,6 +8518,24 @@ impl App {
                 self.previous_world_index = Some(prev - 1);
             }
         }
+    }
+
+    /// `WsMessage::DeleteWorld` handling — shared by master-WS and daemon (T36). Never deletes
+    /// the last remaining world. No text feedback is sent, but `WorldRemoved` itself is NOT
+    /// something every client already reacts to on its own — the SSH remote console's
+    /// `handle_remote_ws_message` used to drop it entirely (T1.13), leaving a deleted world
+    /// visible there until restart and desyncing every later index-keyed message for worlds
+    /// after this one; it now mirrors this same removal via `fixup_indices_after_remove`. A
+    /// prior master-WS-only `add_output()` call here was actually a bug, not a missing
+    /// feature elsewhere — it targeted `current_world_index` (the local console's own view),
+    /// unrelated to whichever world was actually deleted, so it could misattribute the
+    /// message to the wrong world or even the wrong client's session.
+    pub(crate) fn delete_world(&mut self, world_index: usize) {
+        if self.worlds.len() <= 1 || world_index >= self.worlds.len() {
+            return;
+        }
+        self.worlds.remove(world_index);
+        self.fixup_indices_after_remove(world_index);
         self.ws_broadcast(WsMessage::WorldRemoved { world_index });
         let _ = persistence::save_settings(self);
     }
@@ -8530,7 +8567,6 @@ impl App {
         keep_alive_cmd: String,
         gmcp_packages: String,
         auto_reconnect_secs: String,
-        initiate_negotiation: bool,
         msp_enabled: bool,
         mcp_enabled: bool,
     ) {
@@ -8548,7 +8584,6 @@ impl App {
         }
         self.worlds[world_index].settings.use_ssl = use_ssl;
         self.worlds[world_index].settings.log_enabled = log_enabled;
-        self.worlds[world_index].settings.initiate_negotiation = initiate_negotiation;
         self.worlds[world_index].settings.msp_enabled = msp_enabled;
         self.worlds[world_index].settings.mcp_enabled = mcp_enabled;
         self.worlds[world_index].settings.encoding = match encoding.as_str() {
@@ -8578,7 +8613,6 @@ impl App {
             keep_alive_type, keep_alive_cmd, gmcp_packages,
             auto_reconnect_secs,
             has_notes,
-            initiate_negotiation,
             msp_enabled,
             mcp_enabled,
         };
@@ -9003,9 +9037,20 @@ impl App {
     /// nothing) rather than panicking the whole process if it's ever wrong. Returns whether the
     /// send was attempted (world existed and had a live `command_tx`), for
     /// `send_to_world_and_mark_sent` below to build on.
+    ///
+    /// This is the single capture chokepoint for `/recall -i` (redefined from "what the
+    /// user typed" to "everything sent to the world as text input"): every successful send
+    /// here also calls `capture_sent_line`, so GMCP/MSDP hook results, action-trigger
+    /// commands, and `/repeat` batches all become recallable, not just typed input. The
+    /// guards inside `capture_sent_line` (ECHO masking, the login-capture window) apply
+    /// here exactly as they do to typed input - a trigger firing during a password prompt
+    /// must never be recorded either.
     pub(crate) fn send_to_world(&mut self, world_idx: usize, text: String) -> bool {
         if let Some(tx) = self.worlds.get(world_idx).and_then(|w| w.command_tx.as_ref()) {
-            let _ = tx.try_send(WriteCommand::Text(text));
+            let sent = tx.try_send(WriteCommand::Text(text.clone())).is_ok();
+            if sent {
+                self.capture_sent_line(world_idx, &text);
+            }
             true
         } else {
             false
@@ -9022,15 +9067,28 @@ impl App {
         }
     }
 
-    /// Record a command the user actually typed (console Enter, web/GUI/Android
-    /// SendCommand, or a typed `/command` that resolved to `TfCommandResult::SendToMud`)
-    /// into `world_idx`'s history. Call AFTER a successful send, so a failed send isn't
-    /// recorded.
-    ///
-    /// Deliberately NOT called from `send_to_world`/`send_to_world_and_mark_sent`
-    /// themselves: those are also used by GMCP/MSDP hook results, action-trigger command
-    /// execution, and `/repeat` batches — not user typing.
+    /// Thin backward-compatible wrapper for callers (`remote_client.rs`, `daemon.rs`) that
+    /// still name the old "typed input" concept explicitly. Delegates entirely to
+    /// `capture_sent_line` - see that method's doc comment for what it actually does and
+    /// why it's no longer typed-input-specific.
     pub(crate) fn record_user_input(&mut self, world_idx: usize, text: &str) {
+        self.capture_sent_line(world_idx, text);
+    }
+
+    /// Record one line of text that was just sent to `world_idx` as world input - the
+    /// single chokepoint for `/recall -i` (redefined: "everything sent to the world as
+    /// text input", not just what the user typed - see `RecallSource::Input`'s doc
+    /// comment). Called from `send_to_world` (so every trigger/hook/`/repeat` send is
+    /// captured automatically) and directly by the handful of typed-command sites that
+    /// send via a raw `tx.try_send`/`tx.send().await` instead of going through
+    /// `send_to_world` (console Enter, web/GUI/Android SendCommand). Call AFTER a
+    /// successful send, so a failed send isn't recorded.
+    ///
+    /// A single logical send must be captured EXACTLY ONCE: a typed-command site that
+    /// already goes through `send_to_world` must NOT also call this directly, or the same
+    /// command shows up twice in `/recall -i` (see
+    /// `test_ws_send_command_typed_plain_text_captured_exactly_once`).
+    pub(crate) fn capture_sent_line(&mut self, world_idx: usize, text: &str) {
         if world_idx >= self.worlds.len() || text.is_empty() {
             return; // matches InputArea::take_input, which also skips empty input
         }
@@ -9038,12 +9096,11 @@ impl App {
         // guards, checked first: the MUD itself told us (IAC WILL ECHO) that this is a
         // password/login prompt, not just the login_capture_guard's post-connect
         // heuristic below. Never write it to history, the per-world log, or
-        // scrollback/broadcast, on ANY interface — this function is the single place
-        // console Enter, web/GUI/Android SendCommand, and the SSH remote console's
-        // forwarded SendCommand all funnel through after a successful send. Checked
-        // before login_capture_guard so a masked line doesn't consume that budget
-        // either.
-        if self.worlds[world_idx].echo_masked {
+        // scrollback/broadcast, on ANY interface, and never for ANY send regardless of
+        // origin (typed, trigger, hook, /repeat) - this function is the single place
+        // every one of those funnels through after a successful send. Checked before
+        // login_capture_guard so a masked line doesn't consume that budget either.
+        if self.worlds[world_idx].protocol.echo_masked {
             return;
         }
         // Login-window guard - see World::login_capture_guard's doc comment. Checked before
@@ -9367,7 +9424,7 @@ impl App {
                 // Store default URL for resolving relative media paths
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
                     if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
-                        self.worlds[world_idx].mcmp_default_url = url.to_string();
+                        self.worlds[world_idx].protocol.mcmp_default_url = url.to_string();
                     }
                 }
             }
@@ -9381,7 +9438,7 @@ impl App {
                     _ => "Play",
                 }
                 .to_string();
-                let default_url = self.worlds[world_idx].mcmp_default_url.clone();
+                let default_url = self.worlds[world_idx].protocol.mcmp_default_url.clone();
                 // Parse JSON unconditionally - we always track state in active_media
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
                     let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -9658,17 +9715,123 @@ impl App {
             // means no playback - nothing else safe to do.
             if let Ok(path) = audio::resolve_msp_local_path(&trigger.name, &self.media_cache_dir) {
                 if let Some(handle) = audio::play_file(&self.audio_backend, &path, volume, loops) {
-                    if is_music {
-                        if let Some((_, prev_key)) = self.media_music_key.take() {
-                            if let Some((_, mut h)) = self.media_processes.remove(&prev_key) {
-                                h.kill();
-                            }
-                        }
-                        self.media_music_key = Some((world_idx, key.clone()));
-                    }
-                    self.media_processes.insert(key, (world_idx, handle));
+                    self.register_media_handle(key, world_idx, handle, is_music);
                 }
             }
+        }
+    }
+
+    /// T1.7 / Job 4: maximum simultaneously-tracked `msp:sound:` entries in
+    /// `media_processes`. `!!MUSIC(...)` needs no cap of its own - it already
+    /// occupies exactly one slot per world via `media_music_key`/the
+    /// pre-kill-previous-track logic below - and GMCP `Client.Media.*` keys
+    /// self-limit because the key is the media name (a second `Play` of the
+    /// same name overwrites, it doesn't grow). Only `!!SOUND(...)` has an
+    /// unbounded, ever-incrementing key (`msp_sound_counter`), so it is the
+    /// one shape that needs an explicit ceiling.
+    const MAX_CONCURRENT_MSP_SOUNDS: usize = 8;
+
+    /// T1.7 / Job 4: drop every `media_processes` entry whose child/sink has
+    /// already finished, and clear `media_music_key` if the key it names is
+    /// one of the entries that just got dropped. `PlayHandle::try_wait` is
+    /// what actually reaps the child process (`Child::try_wait`) - calling it
+    /// here is also what makes an exited `mpv`/`ffplay` stop being a zombie,
+    /// not just stop being tracked.
+    ///
+    /// Called from `register_media_handle` on every insert (MSP sound, MSP
+    /// music, and GMCP media alike), which is also where the
+    /// `MAX_CONCURRENT_MSP_SOUNDS` cap is enforced. The original plan sketch
+    /// considered also reaping on the existing ~150ms `prompt_check_sleep`
+    /// tick (see its other consumers nearby) as defense in depth; that is
+    /// unnecessary once every insert path reaps-then-caps unconditionally
+    /// (there is no way to accumulate live entries between inserts - nothing
+    /// else touches `media_processes`), so it was deliberately left out
+    /// rather than added as a second copy of this same logic.
+    fn reap_finished_media(&mut self) {
+        self.media_processes.retain(|_, (_, handle)| handle.try_wait() != Some(true));
+        if let Some((_, key)) = &self.media_music_key {
+            if !self.media_processes.contains_key(key) {
+                self.media_music_key = None;
+            }
+        }
+    }
+
+    /// T1.7 / Job 4: the single choke point every new `media_processes` entry
+    /// goes through - `handle_msp_trigger`'s local-file branch and
+    /// `on_media_file_ready` (the shared landing point for the async
+    /// URL/GMCP-download path, replacing three copy-pasted `MediaFileReady`
+    /// bodies). Always reaps finished entries first (see
+    /// `reap_finished_media`), then applies the existing "only one MSP music
+    /// track plays at a time" pre-kill/slot logic (lifted here unchanged from
+    /// the old inline `handle_msp_trigger` body), then - for `msp:sound:`
+    /// keys only - enforces `MAX_CONCURRENT_MSP_SOUNDS` by killing and
+    /// removing the lowest-numbered surviving entries. Keys are
+    /// `msp:sound:{world_idx}:{n}` with `n` from the monotonic
+    /// `msp_sound_counter`, so "lowest-numbered" and "oldest" are the same
+    /// ordering; the newly-inserted entry always has the highest `n` seen so
+    /// far and can therefore never be the one evicted here.
+    fn register_media_handle(
+        &mut self,
+        key: String,
+        world_idx: usize,
+        handle: audio::PlayHandle,
+        is_music: bool,
+    ) {
+        self.reap_finished_media();
+
+        if is_music {
+            if let Some((_, prev_key)) = self.media_music_key.take() {
+                if let Some((_, mut h)) = self.media_processes.remove(&prev_key) {
+                    h.kill();
+                }
+            }
+            self.media_music_key = Some((world_idx, key.clone()));
+        }
+        self.media_processes.insert(key, (world_idx, handle));
+
+        if !is_music {
+            let mut sound_keys: Vec<(u64, String)> = self.media_processes.keys()
+                .filter_map(|k| {
+                    k.strip_prefix("msp:sound:")
+                        .and_then(|rest| rest.rsplit(':').next())
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .map(|n| (n, k.clone()))
+                })
+                .collect();
+            if sound_keys.len() > Self::MAX_CONCURRENT_MSP_SOUNDS {
+                sound_keys.sort_unstable_by_key(|(n, _)| *n);
+                let excess = sound_keys.len() - Self::MAX_CONCURRENT_MSP_SOUNDS;
+                for (_, evict_key) in sound_keys.into_iter().take(excess) {
+                    if let Some((_, mut h)) = self.media_processes.remove(&evict_key) {
+                        h.kill();
+                    }
+                }
+            }
+        }
+    }
+
+    /// T1.7 / Job 4: shared landing point for `AppEvent::MediaFileReady`,
+    /// replacing three identical inline bodies in `run_app_headless`,
+    /// `run_app`'s primary select loop, and `run_app`'s batch-drain loop
+    /// (exactly the kind of triplication CLAUDE.md warns drifts apart) -
+    /// none of the three ever reaped or capped before this. Reached from both
+    /// the GMCP `Client.Media.*` download path and MSP's `U=` URL path, so
+    /// both now go through the same `register_media_handle` bound as the MSP
+    /// local-file path. `audio::play_file` itself now refuses a path that
+    /// isn't there (T1.7's other half), so a failed/racing download simply
+    /// results in nothing being registered.
+    fn on_media_file_ready(
+        &mut self,
+        world_idx: usize,
+        key: String,
+        path: std::path::PathBuf,
+        volume: i64,
+        loops: i64,
+        is_music: bool,
+    ) {
+        self.ensure_audio();
+        if let Some(handle) = audio::play_file(&self.audio_backend, &path, volume, loops) {
+            self.register_media_handle(key, world_idx, handle, is_music);
         }
     }
 
@@ -9677,7 +9840,7 @@ impl App {
         if !self.worlds[world_idx].gmcp_user_enabled {
             return;
         }
-        let default_url = self.worlds[world_idx].mcmp_default_url.clone();
+        let default_url = self.worlds[world_idx].protocol.mcmp_default_url.clone();
         let plays: Vec<(String, String)> = self.worlds[world_idx].active_media.iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -9867,7 +10030,7 @@ impl App {
         if world_idx >= self.worlds.len() || !self.worlds[world_idx].gmcp_user_enabled {
             return;
         }
-        let default_url = self.worlds[world_idx].mcmp_default_url.clone();
+        let default_url = self.worlds[world_idx].protocol.mcmp_default_url.clone();
         for json_data in self.worlds[world_idx].active_media.values() {
             self.ws_send_to_client(client_id, WsMessage::McmpMedia {
                 world_index: world_idx,
@@ -10029,11 +10192,11 @@ impl App {
     /// per-user state.
     pub(crate) fn flush_dirty_stats(&mut self) {
         for idx in 0..self.worlds.len() {
-            if !self.worlds[idx].stats_dirty {
+            if !self.worlds[idx].protocol.stats_dirty {
                 continue;
             }
-            self.worlds[idx].stats_dirty = false;
-            let entries = self.worlds[idx].stats.entries();
+            self.worlds[idx].protocol.stats_dirty = false;
+            let entries = self.worlds[idx].protocol.stats.entries().to_vec();
             if self.multiuser_mode {
                 if let Some(ref server) = self.ws_server {
                     let owner = self.worlds[idx].owner.clone();
@@ -10044,6 +10207,29 @@ impl App {
                 }
             } else {
                 self.ws_broadcast(WsMessage::StatsUpdate { world_index: idx, stats: entries });
+            }
+        }
+
+        // Job 9 (T3.2): the per-world loop above is the single-user path (and, in
+        // multiuser mode, a permanently-dormant one - multiuser never writes real
+        // protocol state onto the shared World, see UserConnection's doc comment). This
+        // is multiuser's real path: each per-user connection carries its own `stats`/
+        // `stats_dirty` on `UserConnection::protocol`, fed by GMCP/MSDP events routed
+        // through `App::handle_multiuser_telnet_event`. Owner-scoped via
+        // `broadcast_to_owner`, same as the loop above.
+        if self.multiuser_mode {
+            if let Some(ref server) = self.ws_server {
+                for ((world_index, username), conn) in self.user_connections.iter_mut() {
+                    if !conn.protocol.stats_dirty {
+                        continue;
+                    }
+                    conn.protocol.stats_dirty = false;
+                    let entries = conn.protocol.stats.entries().to_vec();
+                    server.broadcast_to_owner(
+                        WsMessage::StatsUpdate { world_index: *world_index, stats: entries },
+                        Some(username.as_str()),
+                    );
+                }
             }
         }
     }
@@ -10765,7 +10951,7 @@ impl App {
 
         // If we have a partial line and world uses WONT ECHO prompts, start timeout
         if has_partial && self.worlds[world_idx].prompt.is_empty()
-            && self.worlds[world_idx].uses_wont_echo_prompt {
+            && self.worlds[world_idx].protocol.uses_wont_echo_prompt {
             self.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
         }
 
@@ -11013,80 +11199,127 @@ impl App {
         triggered
     }
 
-    /// Handle one `TelnetEvent` for `world_idx` (plan Phase 2, Step 2.7). This is now the
-    /// *only* place `App` reacts to a telnet negotiation/data event — it replaces nine
-    /// separate `AppEvent` variants that five dispatch loops (three in `main.rs`, two in
-    /// `daemon.rs`) used to handle piecemeal, which is finding 2 in the plan: the drift
-    /// this codebase already had on the *producer* side (thirteen hand-copied reader
-    /// loops, fixed in Jobs 5-7) also existed on the *consumer* side, and the console
-    /// reload loop's dispatch had no `CharsetRequested` arm at all as a result. Every
-    /// caller now just resolves a `TelnetTarget::World` to a `world_idx` and calls this.
+    /// Handle one `TelnetEvent` for `world_idx` (plan Phase 2, Step 2.7; rewired onto
+    /// `ProtocolState::apply_telnet_event` in Job 9, T3.2). Every caller resolves a
+    /// `TelnetTarget::World` to a `world_idx` and calls this; `App::handle_multiuser_
+    /// telnet_event` is this function's per-user-connection sibling for
+    /// `TelnetTarget::Multiuser`.
     ///
-    /// Exhaustive over `TelnetEvent` with no wildcard arm, mirroring
-    /// `telnet_reader::to_app_event`'s anti-drift discipline (design commitment 2): a new
-    /// `TelnetEvent` variant will not compile here either until this match says what `App`
-    /// does with it. `Prompt` and `ProtocolError` are never actually constructed for
-    /// `AppEvent::Telnet` by `to_app_event` today — `Prompt` has its own `AppEvent::Prompt`,
-    /// and `ProtocolError` maps to `None` there (the reader logs it directly instead) — but
-    /// the arms are kept explicit here too rather than folded into a catch-all, so the day
-    /// either gains a real behaviour this match doesn't need restructuring, only a body.
-    /// `OptionDisabled` *is* real as of Job 9 (RFC 1143's Q method, finding 4): fired on a
-    /// genuine `Yes -> No` transition, it clears the matching `World` mirror the way
-    /// `OptionEnabled` sets it. `CompressionStarted`/`CompressionEnded` are real as of Job
-    /// 10a (plan Phase 3, step 3.3, the MCCP2 hot-reload guard): they maintain
-    /// `World::mccp2_active`, which `persistence.rs` now saves/restores and the reload
-    /// restore path in `run_app`/`run_app_headless` uses to disconnect a compressed world
-    /// instead of handing its dead zlib stream to a fresh plaintext parser.
+    /// The exhaustive-over-`TelnetEvent`-with-no-wildcard discipline (design commitment
+    /// 2, matching `telnet_reader::to_app_event`) now lives in the core,
+    /// `ProtocolState::apply_telnet_event` — this function computes the two things only
+    /// `App` can (the NAWS size, amendment 2 of Job 9's plan; and this world's
+    /// `command_tx`/`settings`), calls the core exactly once, routes `outcome.broadcasts`
+    /// to every client via `ws_broadcast` (amendment 1: scope is the caller's decision,
+    /// and `ws_broadcast` — fan out to everyone — is the right scope for a single-user
+    /// `World`), and then performs the World-only extras the core deliberately does not:
+    /// host audio (GMCP/MSP), TF hooks, and `needs_output_redraw`.
     fn handle_telnet_event(&mut self, world_idx: usize, ev: &TelnetEvent) {
+        // Amendment 2 (plan Job 9): the `World` path's NAWS size source is App-wide.
+        let naws_size = self.get_minimum_dimensions();
+        let world = &mut self.worlds[world_idx];
+        let command_tx = world.command_tx.clone();
+        let ctx = protocol_state::ProtocolCtx {
+            world_index: world_idx,
+            command_tx: command_tx.as_ref(),
+            settings: &world.settings,
+            naws_size,
+        };
+        let outcome = world.protocol.apply_telnet_event(ev.clone(), &ctx);
+        for msg in outcome.broadcasts {
+            self.ws_broadcast(msg);
+        }
+        if outcome.stats_changed {
+            // Plan Job 4: the console status line is repainted by render_output_crossterm,
+            // gated on this flag (same as every other output change) rather than the
+            // ~150ms WS-broadcast coalescing in flush_dirty_stats (D4).
+            self.needs_output_redraw = true;
+        }
+
+        // World-only extras (plan Job 9's per-variant table): things the core cannot do
+        // itself because they need `App` state `ProtocolState` never holds (audio, the TF
+        // engine) or a `World`-only mirror (`telnet_mode`, which both `World` and
+        // `UserConnection` own separately rather than sharing, and the world's `name` for
+        // a debug-log line).
         match ev {
             TelnetEvent::TelnetDetected => self.handle_telnet_detected(world_idx),
-            TelnetEvent::NawsRequested => self.handle_naws_requested(world_idx),
-            // Job 12 (plan Phase 4, 4.1): the session already answered this on the
-            // wire (see TtypeRequested's doc comment in telnet.rs) - App has nothing
-            // left to do. Kept as its own arm, not folded into the Prompt/ProtocolError
-            // no-op below, so a future real consumer is a one-line change to find.
-            TelnetEvent::TtypeRequested => {}
-            TelnetEvent::CharsetRequest(charsets) => self.handle_charset_requested(world_idx, charsets),
-            TelnetEvent::GmcpMessage(package, json_data) => self.handle_gmcp_received(world_idx, package, json_data),
-            TelnetEvent::MsdpVariable(variable, value_json) => self.handle_msdp_received(world_idx, variable, value_json),
-            // Job 12 (plan Phase 4, 4.2): MSSP is a complete snapshot every time it
-            // arrives (not incremental), so replace rather than merge - see
-            // World::mssp_data's doc comment.
-            TelnetEvent::MsspData(pairs) => self.worlds[world_idx].mssp_data = pairs.clone(),
-            TelnetEvent::OptionEnabled(opt) => match *opt {
-                TELNET_OPT_GMCP => self.handle_gmcp_negotiated(world_idx),
-                // mud-status-display.md Job 6: MSDP now sends an outbound LIST request
-                // on negotiation too (see handle_msdp_negotiated's doc comment) - no
-                // longer just a flag flip.
-                TELNET_OPT_MSDP => self.handle_msdp_negotiated(world_idx),
-                _ => {}
-            },
-            // Job 9 (finding 4): the server withdrew an option it had previously had
-            // accepted - clear the matching World mirror rather than leaving it stale.
-            // Only options with such a mirror do anything here; the rest (SGA, EOR,
-            // TTYPE, CHARSET, MCCP2, MSSP) have no dedicated "enabled" flag to clear
-            // (World::mssp_data is cleared by clear_connection_state on reconnect
-            // instead, same as gmcp_data/msdp_variables).
-            TelnetEvent::OptionDisabled(opt) => match *opt {
-                TELNET_OPT_GMCP => self.worlds[world_idx].gmcp_enabled = false,
-                TELNET_OPT_MSDP => self.worlds[world_idx].msdp_enabled = false,
-                TELNET_OPT_NAWS => self.worlds[world_idx].naws_enabled = false,
-                _ => {}
-            },
-            TelnetEvent::WontEchoPromptHint => self.handle_wont_echo_seen(world_idx),
-            // Job 10b (plan Phase 3, step 3.4, finding 7): real password-masking
-            // state, distinct from the prompt-boundary heuristic above - see
-            // handle_echo_mask_changed and World::echo_masked's doc comment.
-            TelnetEvent::EchoOff => self.handle_echo_mask_changed(world_idx, true),
-            TelnetEvent::EchoOn => self.handle_echo_mask_changed(world_idx, false),
-            // Job 10a: maintain the reload-guard flag. See its doc comment on `World` and
-            // the restore-time disconnect in run_app/run_app_headless.
-            TelnetEvent::CompressionStarted => self.worlds[world_idx].mccp2_active = true,
-            TelnetEvent::CompressionEnded => self.worlds[world_idx].mccp2_active = false,
-            TelnetEvent::Prompt(_) | TelnetEvent::ProtocolError(_) => {}
+            TelnetEvent::GmcpMessage(package, json_data) => {
+                self.handle_gmcp_received_extras(world_idx, package, json_data);
+            }
+            TelnetEvent::MsdpVariable(variable, value_json) => {
+                self.handle_msdp_received_extras(world_idx, variable, value_json);
+            }
+            // T1.14 (plan Job 1, step 8): named here (rather than in the core, which has
+            // no `World::name` to log) so a bomb-abort or inflate error is still
+            // diagnosable from ~/.clay/debug.log.
+            TelnetEvent::CompressionFailed(reason) => {
+                debug_log(true, &format!(
+                    "MCCP2 stream corrupt on world {}: {reason}",
+                    self.worlds[world_idx].name
+                ));
+            }
             // Job 14 (plan Phase 4): resolve the trigger onto the existing
-            // audio::play_file path - see handle_msp_trigger.
+            // audio::play_file path - a host-local decision the core (which multiuser
+            // also uses, and has no host to play audio on) deliberately doesn't make.
             TelnetEvent::MspTrigger(trigger) => self.handle_msp_trigger(world_idx, trigger),
+            _ => {}
+        }
+    }
+
+    /// Handle one `TelnetEvent` for a multiuser per-user connection (plan Job 9, T3.2) -
+    /// `handle_telnet_event`'s sibling for `TelnetTarget::Multiuser`. Fixes the bug this
+    /// job exists for: before it, `telnet_reader::to_app_event` mapped every one of these
+    /// but `TelnetDetected`/`Prompt` to `None` for a `Multiuser` target, and
+    /// `run_multiuser_server` had no `AppEvent::Telnet` arm at all - so NAWS, TTYPE/MTTS,
+    /// CHARSET, GMCP (including the `Core.Hello` that makes servers send anything), MSDP,
+    /// MSSP, MSP, and ECHO masking (**passwords in cleartext**) were all dead for every
+    /// multiuser user.
+    ///
+    /// **Owner-gated** (CLAUDE.md's `world.owner == username` rule): a telnet event only
+    /// ever originates from `username`'s own live connection to `world_index`
+    /// (`connect_multiuser_world` is only ever spawned via `ConnectWorld`, which is
+    /// already owner-checked - see `handle_multiuser_ws_message`), so a mismatch here
+    /// would mean a stale/forged event; dropped with a `MU-TELNET-DROP` log line rather
+    /// than silently trusted.
+    ///
+    /// No audio, no TF hooks, no `needs_output_redraw` - multiuser has no console and no
+    /// per-user host to play a sound on (see the per-variant table in the plan).
+    /// `naws_size` comes from `user_min_dimensions`, not `get_minimum_dimensions` - a
+    /// multiuser user's window size must never leak into another user's NAWS.
+    pub(crate) fn handle_multiuser_telnet_event(&mut self, world_index: usize, username: String, ev: &TelnetEvent) {
+        let is_owner = self.worlds.get(world_index)
+            .map(|w| w.owner.as_deref() == Some(username.as_str()))
+            .unwrap_or(false);
+        if !is_owner {
+            crate::http::log_remote_event(
+                "MU-TELNET-DROP",
+                &username,
+                &format!("telnet event for world {world_index} not owned by this user"),
+            );
+            return;
+        }
+
+        let naws_size = self.user_min_dimensions(&username);
+        let key = (world_index, username.clone());
+        // Disjoint `App` fields (`self.worlds` vs `self.user_connections`), so borrowing
+        // one immutably and the other mutably at once is borrowck-clean (plan Job 9's
+        // handler-shape note).
+        let outcome = {
+            let settings = &self.worlds[world_index].settings;
+            let Some(conn) = self.user_connections.get_mut(&key) else { return };
+            let command_tx = conn.command_tx.clone();
+            let ctx = protocol_state::ProtocolCtx {
+                world_index,
+                command_tx: command_tx.as_ref(),
+                settings,
+                naws_size,
+            };
+            conn.protocol.apply_telnet_event(ev.clone(), &ctx)
+        };
+        if let Some(ref ws) = self.ws_server {
+            for msg in outcome.broadcasts {
+                ws.broadcast_to_owner(msg, Some(username.as_str()));
+            }
         }
     }
 
@@ -11113,7 +11346,7 @@ impl App {
     fn apply_mccp2_reload_bailout(&mut self, is_crash: bool) {
         let mut mccp2_disconnect_worlds: Vec<usize> = Vec::new();
         for (world_idx, world) in self.worlds.iter().enumerate() {
-            if world.connected && world.mccp2_active {
+            if world.connected && world.protocol.mccp2_active {
                 mccp2_disconnect_worlds.push(world_idx);
             }
         }
@@ -11145,127 +11378,29 @@ impl App {
         }
     }
 
-    /// Handle WontEchoSeen event.
-    fn handle_wont_echo_seen(&mut self, world_idx: usize) {
-        if !self.worlds[world_idx].uses_wont_echo_prompt {
-            self.worlds[world_idx].uses_wont_echo_prompt = true;
-        }
-    }
+    // handle_wont_echo_seen removed in Job 9 (T3.2): WontEchoPromptHint's one-line
+    // `uses_wont_echo_prompt = true` now lives directly in
+    // ProtocolState::apply_telnet_event (see its doc comment: "stored in both" World and
+    // multiuser connections), since it needed no World-only extra.
 
-    /// Handle EchoOff/EchoOn (plan Phase 3, step 3.4, finding 7): update the per-world
-    /// password-masking flag and tell every connected web/GUI client so their own input
-    /// element masks (or stops masking) what's typed. The console and the SSH remote
-    /// console need no message — both read `World::echo_masked` directly through the
-    /// shared `rendering::render_input`/`render_input_area` functions (and its crossterm
-    /// replica in `render_output_crossterm`) on their own `App`/`World`. Only broadcasts
-    /// on an actual change: ECHO is answered unconditionally every time it's seen, with
-    /// no Q-method dedup (see `EchoOff`'s doc comment), so a chatty server repeating
-    /// `WILL`/`WONT ECHO` is a real possibility this guards against turning into a
-    /// visible flicker on every client.
-    fn handle_echo_mask_changed(&mut self, world_idx: usize, masked: bool) {
-        if self.worlds[world_idx].echo_masked == masked {
-            return;
-        }
-        self.worlds[world_idx].echo_masked = masked;
-        self.ws_broadcast(WsMessage::EchoMaskChanged { world_index: world_idx, masked });
-    }
+    // handle_echo_mask_changed removed in Job 9 (T3.2): EchoOff/EchoOn's body (the
+    // change-only guard plus building WsMessage::EchoMaskChanged) now lives in
+    // ProtocolState::apply_echo_mask - see this module's handle_telnet_event, which
+    // routes the returned ProtocolOutcome::broadcasts through ws_broadcast.
 
-    /// Handle NawsRequested event.
-    fn handle_naws_requested(&mut self, world_idx: usize) {
-        self.worlds[world_idx].naws_enabled = true;
-        self.send_naws_if_changed(world_idx);
-    }
+    // handle_naws_requested removed in Job 9 (T3.2): its body now lives in
+    // ProtocolState::apply_telnet_event's NawsRequested arm, which calls
+    // ProtocolState::send_naws_if_changed(ctx.naws_size, ctx.command_tx) - see
+    // handle_telnet_event above for how ctx.naws_size is computed for the World path.
 
     // handle_ttype_requested removed in Job 12 (plan Phase 4, 4.1): the
     // TelnetSession itself now answers a TTYPE SEND on the wire (the
     // MTTS-cycled value), before App ever sees TtypeRequested - see that
     // event's doc comment in telnet.rs and handle_telnet_event's arm above.
 
-    /// Handle CharsetRequested event (RFC 2066 TELNET CHARSET).
-    /// Selects the best charset from the offered list that Clay supports.
-    /// Handle a server's CHARSET REQUEST (RFC 2066, option 42): pick a charset
-    /// from `charsets` and reply ACCEPTED/REJECTED.
-    ///
-    /// Job 13 (plan Phase 4, 4.4, finding 7) changed two things here. First,
-    /// accepting now queues `WriteCommand::SetEncoding` right after the wire
-    /// reply, so the writer's outbound encoding actually switches - before
-    /// this job `negotiated_encoding` only steered `effective_encoding()` for
-    /// *decoding* incoming bytes (`handle_prompt`, `process_server_data`),
-    /// while every writer kept emitting UTF-8 regardless (the violation this
-    /// job fixes: an accept that isn't honored is worse than a refusal, per
-    /// the plan, because the server now believes the encoding is agreed).
-    /// Both go through the same `command_tx` channel as every other queued
-    /// command, so the switch is ordered correctly by construction - see
-    /// `spawn_telnet_writer`'s module doc comment.
-    ///
-    /// Second: a world whose encoding the user picked explicitly (anything
-    /// but the `Utf8` default - see `WorldSettings::encoding`) is no longer
-    /// silently overridden by a server offer. UTF-8 needs no such guard: it's
-    /// both the default nobody has to touch *and* the encoding this method
-    /// already prefers whenever it's offered, so treating it as "explicit"
-    /// could never change the outcome - only Latin1/Fansi represent a
-    /// deliberate choice (typically made to get ANSI-art or a legacy
-    /// charset right on one specific MUD), and those are exactly the choices
-    /// a same-session CHARSET offer could otherwise clobber. If the offer
-    /// includes the user's chosen encoding, Clay accepts *that* one (not
-    /// necessarily UTF-8) to confirm what was already asked for; if it
-    /// doesn't, Clay rejects the offer outright rather than silently
-    /// accepting something the user didn't choose - accepting-but-not-
-    /// applying would just be finding 7's bug in the other direction.
-    fn handle_charset_requested(&mut self, world_idx: usize, charsets: &[String]) {
-        let explicit_encoding = self.worlds[world_idx].settings.encoding;
-        if explicit_encoding != Encoding::Utf8 {
-            let offered = charsets.iter().any(|name| Encoding::from_iana_name(name) == Some(explicit_encoding));
-            if let Some(ref tx) = self.worlds[world_idx].command_tx {
-                if offered {
-                    let response = build_charset_accepted(explicit_encoding.iana_name());
-                    let _ = tx.try_send(WriteCommand::Raw(response));
-                    let _ = tx.try_send(WriteCommand::SetEncoding(explicit_encoding));
-                    self.worlds[world_idx].negotiated_encoding = Some(explicit_encoding);
-                } else {
-                    let _ = tx.try_send(WriteCommand::Raw(build_charset_rejected()));
-                }
-            }
-            return;
-        }
-
-        // Priority order: UTF-8 > Latin1 > Fansi
-        // First pass: look for UTF-8 (highest capability)
-        // Second pass: accept first supported charset from offered list
-        let mut best: Option<(Encoding, &str)> = None;
-        for name in charsets {
-            if let Some(enc) = Encoding::from_iana_name(name) {
-                match enc {
-                    Encoding::Utf8 => {
-                        // UTF-8 is always preferred — accept immediately
-                        best = Some((enc, "UTF-8"));
-                        break;
-                    }
-                    _ => {
-                        if best.is_none() {
-                            best = Some((enc, match enc {
-                                Encoding::Latin1 => "ISO-8859-1",
-                                Encoding::Fansi => "IBM437",
-                                Encoding::Utf8 => unreachable!(),
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(ref tx) = self.worlds[world_idx].command_tx {
-            if let Some((enc, iana_name)) = best {
-                let response = build_charset_accepted(iana_name);
-                let _ = tx.try_send(WriteCommand::Raw(response));
-                let _ = tx.try_send(WriteCommand::SetEncoding(enc));
-                self.worlds[world_idx].negotiated_encoding = Some(enc);
-            } else {
-                let response = build_charset_rejected();
-                let _ = tx.try_send(WriteCommand::Raw(response));
-            }
-        }
-    }
+    // handle_charset_requested removed in Job 9 (T3.2): its body now lives in
+    // ProtocolState::apply_charset_request, ported verbatim (see that method's doc
+    // comment for the full priority-order rationale this used to carry here).
 
     /// Handle Prompt event.
     fn handle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8]) {
@@ -11349,110 +11484,21 @@ impl App {
         }
     }
 
-    /// Handle GmcpNegotiated event.
-    fn handle_gmcp_negotiated(&mut self, world_idx: usize) {
-        self.worlds[world_idx].gmcp_enabled = true;
-        let packages_str = self.worlds[world_idx].settings.gmcp_packages.clone();
-        let packages: Vec<String> = packages_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        self.worlds[world_idx].gmcp_supported_packages = packages.clone();
-        if let Some(ref tx) = self.worlds[world_idx].command_tx {
-            let hello = build_gmcp_message("Core.Hello", &format!(
-                "{{\"client\":\"Clay\",\"version\":\"{}\"}}",
-                VERSION
-            ));
-            let _ = tx.try_send(WriteCommand::Raw(hello));
-            let json_list: Vec<String> = packages.iter()
-                .map(|p| format!("\"{}\"", p))
-                .collect();
-            let supports = build_gmcp_message(
-                "Core.Supports.Set",
-                &format!("[{}]", json_list.join(",")),
-            );
-            let _ = tx.try_send(WriteCommand::Raw(supports));
-        }
-    }
+    // handle_gmcp_negotiated removed in Job 9 (T3.2): its body now lives in
+    // ProtocolState::apply_gmcp_negotiated, ported verbatim (Core.Hello +
+    // Core.Supports.Set - the announcement that makes a GMCP server send anything).
 
-    /// Handle MsdpNegotiated event (mud-status-display.md Job 6).
-    ///
-    /// GMCP servers push data on their own once told what they support (see
-    /// `handle_gmcp_negotiated` above), but MSDP is opt-in the other way around: a
-    /// server never reports a variable unprompted, only once the client asks it to
-    /// with `REPORT` (see the MSDP spec, and `/help msdp`). Before this job, nothing
-    /// in Clay ever sent a `REPORT` on its own — only the manual `/msdp` command did
-    /// — so a fully negotiated MSDP connection produced zero data forever, the same
-    /// root shape of bug as GMCP's missing `Char` request.
-    ///
-    /// `LIST REPORTABLE_VARIABLES` is the spec-sanctioned way to ask a server what it
-    /// *can* report, which keeps this self-configuring (plan D2) instead of
-    /// hardcoding variable names that would be wrong for half of all MUD codebases.
-    /// The reply arrives back through the ordinary `MsdpVariable` event as a variable
-    /// literally named `REPORTABLE_VARIABLES` whose value is a JSON array —
-    /// `handle_msdp_received` below reports each one back (capped and filtered, see
-    /// `request_msdp_reports`) once it arrives.
-    fn handle_msdp_negotiated(&mut self, world_idx: usize) {
-        self.worlds[world_idx].msdp_enabled = true;
-        if let Some(ref tx) = self.worlds[world_idx].command_tx {
-            let list_reportable = build_msdp_set("LIST", "REPORTABLE_VARIABLES");
-            let _ = tx.try_send(WriteCommand::Raw(list_reportable));
-        }
-    }
+    // handle_msdp_negotiated removed in Job 9 (T3.2): its body now lives in
+    // ProtocolState::apply_msdp_negotiated, ported verbatim (LIST REPORTABLE_VARIABLES -
+    // see mud-status-display.md Job 6's rationale, preserved on that method's doc comment).
 
-    /// Handle GmcpReceived event.
-    fn handle_gmcp_received(&mut self, world_idx: usize, package: &str, json_data: &str) {
-        // Always store GMCP data
-        self.worlds[world_idx].gmcp_data.insert(package.to_string(), json_data.to_string());
-        // mud-status-display.md Job 1: feed the status model. Gated inside
-        // update_from_gmcp to only Char.* packages (case-insensitively) and safe
-        // against malformed JSON - see stats::WorldStats::update_from_gmcp.
-        self.worlds[world_idx].stats.update_from_gmcp(package, json_data);
-        // Job 2: mark dirty on every Char.* package (same gate update_from_gmcp itself
-        // applies), regardless of whether json_data actually parsed - malformed JSON is a
-        // no-op inside update_from_gmcp, and detecting that here too would mean computing
-        // entries() twice per update just to decide whether to schedule a flush. Gating on
-        // the package prefix (rather than marking dirty for every GMCP package
-        // unconditionally) matters because Room.*/Comm.*/Client.* traffic never touches
-        // stats at all and can be far chattier than Char.* on some MUDs - marking dirty for
-        // those too would schedule pointless flushes of an unchanged (possibly still empty)
-        // stats set, working against the whole point of D4's coalescing.
-        if crate::stats::package_has_prefix(package, "Char.") {
-            self.worlds[world_idx].stats_dirty = true;
-            // Plan Job 4: the console status line is repainted by render_output_crossterm,
-            // gated on this flag (same as every other output change) rather than the
-            // ~150ms WS-broadcast coalescing in flush_dirty_stats (D4) - that coalescing
-            // is specifically about outbound WebSocket traffic to remote clients, not the
-            // local console's own redraw, which plan D4 says marks itself dirty per
-            // message and repaints on its normal cycle.
-            self.needs_output_redraw = true;
-        }
-        // Always store Client.Media.Default URL
-        if package.eq_ignore_ascii_case("Client.Media.Default") {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
-                if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
-                    self.worlds[world_idx].mcmp_default_url = url.to_string();
-                }
-            }
-        }
-        // Always broadcast to remote clients
-        self.ws_broadcast(WsMessage::GmcpData {
-            world_index: world_idx,
-            package: package.to_string(),
-            data: json_data.to_string(),
-        });
-        if crate::stats::package_has_prefix(package, "Client.Media.") {
-            let action = package.rsplit('.').next().unwrap_or("Play").to_string();
-            let default_url = self.worlds[world_idx].mcmp_default_url.clone();
-            self.ws_broadcast(WsMessage::McmpMedia {
-                world_index: world_idx,
-                action,
-                data: json_data.to_string(),
-                default_url,
-            });
-        }
-        // Always track media state; only play audio when enabled + current world
+    /// World-only extras for a `GmcpMessage` event (plan Job 9's per-variant table): host
+    /// audio and the TF `Gmcp` hook. Storing the data, feeding `stats`, and broadcasting
+    /// `GmcpData`/`McmpMedia` all now happen once, in `ProtocolState::apply_gmcp_message`
+    /// (shared by `World` and multiuser) - see `handle_telnet_event`, which calls that
+    /// before this.
+    fn handle_gmcp_received_extras(&mut self, world_idx: usize, package: &str, json_data: &str) {
+        // Always track media state; only play audio when enabled + current world.
         if crate::stats::package_has_prefix(package, "Client.Media.") {
             let play_audio = self.worlds[world_idx].gmcp_user_enabled
                 && world_idx == self.current_world_index;
@@ -11471,36 +11517,12 @@ impl App {
         }
     }
 
-    /// Handle MsdpReceived event.
-    fn handle_msdp_received(&mut self, world_idx: usize, variable: &str, value_json: &str) {
-        self.worlds[world_idx].msdp_variables.insert(variable.to_string(), value_json.to_string());
-        // mud-status-display.md Job 1: feed the status model. Almost all MSDP
-        // variables participate (MSDP has no package concept to gate on) - the one
-        // exception, added in Job 6, is a variable that is itself protocol
-        // bookkeeping (a `LIST` reply such as `REPORTABLE_VARIABLES`) rather than
-        // character state - see stats::is_msdp_meta_variable and
-        // WorldStats::update_from_msdp, which applies the same exclusion internally.
-        self.worlds[world_idx].stats.update_from_msdp(variable, value_json);
-        // Job 2/Job 6: mark dirty only for a variable that could actually have
-        // changed the model - matches update_from_msdp's own scope. A meta variable
-        // never touches `raw`, so redrawing/broadcasting for one would be wasted work
-        // on every LIST reply, most of which arrive in a burst right after connect
-        // (see handle_msdp_negotiated and request_msdp_reports below).
-        if !crate::stats::is_msdp_meta_variable(variable) {
-            self.worlds[world_idx].stats_dirty = true;
-            // Plan Job 4: see the matching comment in handle_gmcp_received - the
-            // console status line is repainted via the same needs_output_redraw path
-            // every other output change uses, independent of the WS-broadcast
-            // coalescing in flush_dirty_stats.
-            self.needs_output_redraw = true;
-        }
-        // Job 6: the server just told us what it can report - ask it to report all of
-        // it (bounded and filtered), so MSDP data actually starts flowing instead of
-        // staying silent until a user types `/msdp REPORT <var>` by hand.
-        if variable.eq_ignore_ascii_case("REPORTABLE_VARIABLES") {
-            self.request_msdp_reports(world_idx, value_json);
-        }
-        // Fire TF MSDP hook
+    /// World-only extra for a `MsdpVariable` event (plan Job 9's per-variant table): the
+    /// TF `Msdp` hook. Storing the data, feeding `stats`, the `REPORTABLE_VARIABLES` ->
+    /// per-variable `REPORT` flow, and broadcasting `MsdpData` all now happen once, in
+    /// `ProtocolState::apply_msdp_variable` (shared by `World` and multiuser) - see
+    /// `handle_telnet_event`, which calls that before this.
+    fn handle_msdp_received_extras(&mut self, world_idx: usize, variable: &str, value_json: &str) {
         self.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.to_string()));
         self.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.to_string()));
         let outcome = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Msdp, variable);
@@ -11509,45 +11531,12 @@ impl App {
                 self.send_to_world(world_idx, text);
             }
         }
-        // Broadcast to WebSocket clients
-        self.ws_broadcast(WsMessage::MsdpData {
-            world_index: world_idx,
-            variable: variable.to_string(),
-            value: value_json.to_string(),
-        });
     }
 
-    /// Job 6: given the raw JSON value of a `REPORTABLE_VARIABLES` reply, send an
-    /// MSDP `REPORT` request for each variable it names, reusing `build_msdp_set`
-    /// exactly as the manual `/msdp REPORT <var>` command does (`execute_msdp_command`
-    /// in commands.rs) - one request per variable rather than a single array-valued
-    /// one, since that is the shape Clay already has a builder for.
-    ///
-    /// Malformed JSON, a non-array value, or a non-string element is skipped rather
-    /// than causing a panic or a garbage request on the wire - a server's MSDP reply
-    /// is untrusted input, same posture as everywhere else this module parses one.
-    /// `MAX_MSDP_AUTO_REPORT` bounds how many outbound `REPORT` messages a single
-    /// reply can trigger, so a server (malicious or just enormous) advertising
-    /// thousands of reportable variables can't turn one MSDP reply into thousands of
-    /// telnet writes. Any name that is itself a meta variable (see
-    /// `stats::is_msdp_meta_variable`) is skipped even if a server lists it as its own
-    /// reportable variable - reporting a variable never means treating its own
-    /// updates as a stat.
-    fn request_msdp_reports(&mut self, world_idx: usize, reportable_json: &str) {
-        let Ok(serde_json::Value::Array(names)) = serde_json::from_str::<serde_json::Value>(reportable_json) else {
-            return;
-        };
-        let Some(tx) = self.worlds[world_idx].command_tx.clone() else {
-            return;
-        };
-        for name in names.iter()
-            .filter_map(|v| v.as_str())
-            .filter(|name| !crate::stats::is_msdp_meta_variable(name))
-            .take(MAX_MSDP_AUTO_REPORT)
-        {
-            let _ = tx.try_send(WriteCommand::Raw(build_msdp_set("REPORT", name)));
-        }
-    }
+    // request_msdp_reports removed in Job 9 (T3.2): its body now lives in
+    // ProtocolState::request_msdp_reports, ported verbatim (still capped at
+    // MAX_MSDP_AUTO_REPORT and still skipping meta variables - see that method's doc
+    // comment).
 
     /// Handle WsClientDisconnected event.
     ///
@@ -11571,7 +11560,7 @@ impl App {
             // Recalculate NAWS for all worlds that might be affected, now that this
             // client's dimensions no longer count.
             for i in 0..self.worlds.len() {
-                if self.worlds[i].naws_enabled && self.worlds[i].connected {
+                if self.worlds[i].protocol.naws_enabled && self.worlds[i].connected {
                     self.send_naws_if_changed(i);
                 }
             }
@@ -12143,11 +12132,11 @@ impl App {
                                         self.emit_tf_error(world_index, &err, false);
                                     }
                                     tf::TfCommandResult::SendToMud(text) => {
-                                        if world_index < self.worlds.len() {
-                                            if let Some(tx) = &self.worlds[world_index].command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                                sent_to_server = true;
-                                            }
+                                        // send_to_world captures this via capture_sent_line -
+                                        // an action's command list is exactly the "sent by
+                                        // triggers/actions" case /recall -i now covers.
+                                        if self.send_to_world(world_index, text) {
+                                            sent_to_server = true;
                                         }
                                     }
                                     tf::TfCommandResult::ClayCommand(clay_cmd) => {
@@ -12167,10 +12156,11 @@ impl App {
                                     }
                                     _ => {}
                                 }
-                            } else if world_index < self.worlds.len() {
-                                // Plain text - send to MUD server
-                                if let Some(tx) = &self.worlds[world_index].command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                            } else {
+                                // Plain text - send to MUD server (an action's command list
+                                // entry with no leading '/' - the common case for a simple
+                                // action). Via send_to_world so it captures too.
+                                if self.send_to_world(world_index, cmd) {
                                     sent_to_server = true;
                                 }
                             }
@@ -12190,14 +12180,11 @@ impl App {
                             self.emit_tf_error(world_index, &err, false);
                         }
                         tf::TfCommandResult::SendToMud(text) => {
-                            // Not send_to_world_and_mark_sent(): that shared helper is also
-                            // used by non-user-typed callers (GMCP/MSDP hooks, /repeat), so
-                            // recording is done here at this specific typed-command site
-                            // instead - see App::record_user_input's doc comment.
-                            let text_for_record = text.clone();
+                            // send_to_world() itself captures this via capture_sent_line -
+                            // no separate record_user_input call needed (it would double-
+                            // record the same command; see send_to_world's doc comment).
                             if self.send_to_world(world_index, text) {
                                 self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                self.record_user_input(world_index, &text_for_record);
                             }
                         }
                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
@@ -12227,15 +12214,12 @@ impl App {
                 }
             }
             Command::NotACommand { text } => {
-                // Regular text - send to MUD
-                if world_index < self.worlds.len() {
-                    let sent = self.worlds[world_index].command_tx.as_ref()
-                        .is_some_and(|tx| tx.try_send(WriteCommand::Text(text.clone())).is_ok());
-                    if sent {
-                        self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                        self.worlds[world_index].prompt.clear();
-                        self.record_user_input(world_index, &text);
-                    }
+                // Regular text - send to MUD. Routed through send_to_world (rather than a
+                // raw tx.try_send) so it captures via capture_sent_line like every other
+                // send - no separate record_user_input call needed.
+                if world_index < self.worlds.len() && self.send_to_world(world_index, text) {
+                    self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                    self.worlds[world_index].prompt.clear();
                 }
             }
             Command::Import { .. } => {
@@ -13035,11 +13019,11 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, initiate_negotiation, msp_enabled, mcp_enabled } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
-                    initiate_negotiation, msp_enabled, mcp_enabled,
+                    msp_enabled, mcp_enabled,
                 );
             }
             WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
@@ -13752,7 +13736,6 @@ impl App {
                     gmcp_packages: world.settings.gmcp_packages.clone(),
                     auto_reconnect_secs: world.settings.auto_reconnect_display(),
                     has_notes: !world.settings.notes.is_empty(),
-                    initiate_negotiation: world.settings.initiate_negotiation,
                     msp_enabled: world.settings.msp_enabled,
                     mcp_enabled: world.settings.mcp_enabled,
                 },
@@ -13767,7 +13750,7 @@ impl App {
                 // ECHO masking (plan Phase 3, step 3.4): initial value for a client
                 // connecting mid-password-prompt (or reconnecting) - live changes
                 // afterward arrive via WsMessage::EchoMaskChanged.
-                echo_masked: world.echo_masked,
+                echo_masked: world.protocol.echo_masked,
                 total_output_lines: world.output_lines.len(),
                 // Visible (non-gagged) total, so the client can know how many VISIBLE lines
                 // still remain to fetch without being able to derive that itself - gagged
@@ -13784,7 +13767,7 @@ impl App {
                 // mud-status-display.md Job 2: send whatever this world already has so a
                 // (re)connecting client shows it immediately rather than waiting for the
                 // next coalesced StatsUpdate (plan D4, up to ~150ms away).
-                stats: world.stats.entries(),
+                stats: world.protocol.stats.entries().to_vec(),
             }
         }).collect();
 
@@ -14539,6 +14522,10 @@ pub struct UserConnection {
     pub last_receive_time: Option<std::time::Instant>,
     pub partial_line: String,
     pub partial_in_pending: bool,
+    /// Job 9 (T3.2): this connection's own telnet protocol mirrors (NAWS, GMCP, MSDP,
+    /// MSSP, ECHO masking, ...) - see `protocol_state::ProtocolState`'s doc comment for
+    /// the full list and why multiuser needed its own copy (`World` embeds one too).
+    pub protocol: protocol_state::ProtocolState,
 }
 
 impl Default for UserConnection {
@@ -14564,6 +14551,7 @@ impl UserConnection {
             last_receive_time: None,
             partial_line: String::new(),
             partial_in_pending: false,
+            protocol: protocol_state::ProtocolState::default(),
         }
     }
 }
@@ -14827,7 +14815,6 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) keep_alive_cmd: String,
     pub(crate) gmcp_packages: String,
     pub(crate) auto_reconnect_secs: String,
-    pub(crate) initiate_negotiation: bool,
     pub(crate) msp_enabled: bool,
     pub(crate) mcp_enabled: bool,
     // Slack fields
@@ -14914,7 +14901,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
-        WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_INITIATE_NEGOTIATION,
+        WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT,
         WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
@@ -16270,7 +16257,6 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     keep_alive_cmd: state.get_text(WORLD_FIELD_KEEP_ALIVE_CMD).unwrap_or("").to_string(),
                     gmcp_packages: state.get_text(WORLD_FIELD_GMCP_PACKAGES).unwrap_or(DEFAULT_GMCP_PACKAGES).to_string(),
                     auto_reconnect_secs: state.get_text(WORLD_FIELD_AUTO_RECONNECT).unwrap_or("0").to_string(),
-                    initiate_negotiation: state.get_bool(WORLD_FIELD_INITIATE_NEGOTIATION).unwrap_or(true),
                     msp_enabled: state.get_bool(WORLD_FIELD_MSP_ENABLED).unwrap_or(true),
                     mcp_enabled: state.get_bool(WORLD_FIELD_MCP_ENABLED).unwrap_or(true),
                     slack_token: state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
@@ -17508,9 +17494,6 @@ pub async fn run_app_headless(
                 let reader_conn_id = app.worlds[world_idx].connection_id;
                 let telnet_cfg = TelnetConfig {
                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                    // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for Clay's
-                    // opening negotiation offer, default on.
-                    initiate_negotiation: app.worlds[world_idx].settings.initiate_negotiation,
                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                     ..TelnetConfig::default()
@@ -17560,9 +17543,6 @@ pub async fn run_app_headless(
                                 let reader_conn_id = app.worlds[world_idx].connection_id;
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    // Job 11 (plan Phase 3, step 3.5): per-world escape hatch
-                                    // for Clay's opening negotiation offer, default on.
-                                    initiate_negotiation: app.worlds[world_idx].settings.initiate_negotiation,
                                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                                     ..TelnetConfig::default()
@@ -17637,9 +17617,6 @@ pub async fn run_app_headless(
                                 let reader_conn_id = app.worlds[world_idx].connection_id;
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    // Job 11 (plan Phase 3, step 3.5): per-world escape hatch
-                                    // for Clay's opening negotiation offer, default on.
-                                    initiate_negotiation: app.worlds[world_idx].settings.initiate_negotiation,
                                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                                     ..TelnetConfig::default()
@@ -17814,6 +17791,16 @@ pub async fn run_app_headless(
     // Auto-reconnect timer — fires when a world is due for reconnection
     let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(reconnect_sleep);
+    // Job 5 (T2.7): a hot reload restores `World::reconnect_at` from the state file,
+    // but this timer always starts at FAR_FUTURE and is only ever re-armed by later
+    // events (a disconnect, a web-triggered reconnect) or by firing once - nothing
+    // else looks at a freshly-restored deadline, so a scheduled auto-reconnect that
+    // survived the reload would otherwise silently never fire. Arm it here, once,
+    // from whatever `load_reload_state` just restored.
+    if let Some(next) = app.next_reconnect_instant() {
+        let dur = next.saturating_duration_since(std::time::Instant::now());
+        reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+    }
 
     // GUI reload check — polls atomic flag set by IPC handler (100ms interval)
     let mut gui_reload_check = tokio::time::interval(Duration::from_millis(100));
@@ -17912,7 +17899,11 @@ pub async fn run_app_headless(
                                                 } else { Some(world_idx) };
                                                 if let Some(idx) = target_idx {
                                                     if let Some(tx) = &app.worlds[idx].command_tx {
-                                                        let _ = tx.send(WriteCommand::Text(text.clone())).await;
+                                                        if tx.send(WriteCommand::Text(text.clone())).await.is_ok() {
+                                                            // async .send().await, not send_to_world's
+                                                            // sync try_send - captured directly.
+                                                            app.capture_sent_line(idx, text);
+                                                        }
                                                     }
                                                 }
                                             } else {
@@ -17924,8 +17915,10 @@ pub async fn run_app_headless(
                                         }
                                         _ => {}
                                     }
-                                } else if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                } else {
+                                    // Plain text - a triggered action/hook's command with no
+                                    // leading '/'. Via send_to_world so it captures too.
+                                    app.send_to_world(world_idx, cmd);
                                 }
                             }
                             app.current_world_index = saved_current_world;
@@ -18047,20 +18040,13 @@ pub async fn run_app_headless(
                                     app.handle_telnet_event(world_idx, ev);
                                 }
                             }
-                            TelnetTarget::Multiuser { .. } => {
-                                // Not constructed for this target by to_app_event today
-                                // (see its doc comment) - nothing to route here yet.
+                            TelnetTarget::Multiuser { world_index, username } => {
+                                app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
                             }
                         }
                     }
                     AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
-                        app.ensure_audio();
-                        if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
-                            if is_music {
-                                app.media_music_key = Some((world_idx, key.clone()));
-                            }
-                            app.media_processes.insert(key, (world_idx, handle));
-                        }
+                        app.on_media_file_ready(world_idx, key, path, volume, loops, is_music);
                     }
                     AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                         match result {
@@ -18373,11 +18359,11 @@ pub async fn run_app_headless(
                                 app.register_repeat_process(process);
                             }
                             tf::TfCommandResult::NotTfCommand => {
-                                // Plain text command - send to MUD
+                                // Plain text command - send to MUD (captured via
+                                // send_to_world - a /repeat body is exactly the
+                                // "/repeat batches" case /recall -i now covers).
                                 if let Some(idx) = target_idx {
-                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                                    }
+                                    app.send_to_world(idx, cmd.clone());
                                 }
                             }
                             _ => {}
@@ -18534,7 +18520,7 @@ pub async fn run_app_headless(
         // the process-tick rearm above covers every way a process could have been added.
         // Never push the deadline *later* - a steady stream of updates must still flush
         // roughly every 150ms instead of debouncing forever.
-        if app.worlds.iter().any(|w| w.stats_dirty)
+        if app.worlds.iter().any(|w| w.protocol.stats_dirty)
             && prompt_check_sleep.deadline() > tokio::time::Instant::now() + Duration::from_millis(150)
         {
             prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
@@ -18770,9 +18756,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let event_tx_read = event_tx.clone();
                 let telnet_cfg = TelnetConfig {
                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                    // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for Clay's
-                    // opening negotiation offer, default on.
-                    initiate_negotiation: app.worlds[world_idx].settings.initiate_negotiation,
                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                     ..TelnetConfig::default()
@@ -18881,9 +18864,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let event_tx_read = event_tx.clone();
                         let telnet_cfg = TelnetConfig {
                             term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                            // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for
-                            // Clay's opening negotiation offer, default on.
-                            initiate_negotiation: app.worlds[world_idx].settings.initiate_negotiation,
                             msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                             is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                             ..TelnetConfig::default()
@@ -18970,9 +18950,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let event_tx_read = event_tx.clone();
                         let telnet_cfg = TelnetConfig {
                             term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                            // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for
-                            // Clay's opening negotiation offer, default on.
-                            initiate_negotiation: app.worlds[world_idx].settings.initiate_negotiation,
                             msp_enabled: app.worlds[world_idx].settings.msp_enabled,
                             is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                             ..TelnetConfig::default()
@@ -19259,6 +19236,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Auto-reconnect timer — fires when a world is due for reconnection
     let reconnect_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(reconnect_sleep);
+    // Job 5 (T2.7): a hot reload restores `World::reconnect_at` from the state file,
+    // but this timer always starts at FAR_FUTURE and is only ever re-armed by later
+    // events (a disconnect, a web-triggered reconnect) or by firing once - nothing
+    // else looks at a freshly-restored deadline, so a scheduled auto-reconnect that
+    // survived the reload would otherwise silently never fire. Arm it here, once,
+    // from whatever `load_reload_state` just restored.
+    if let Some(next) = app.next_reconnect_instant() {
+        let dur = next.saturating_duration_since(std::time::Instant::now());
+        reconnect_sleep.as_mut().reset(tokio::time::Instant::now() + dur);
+    }
 
     // Set the app pointer for crash recovery
     // SAFETY: app lives for the duration of this function and the pointer is only used
@@ -19598,7 +19585,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     tf::QuoteDisposition::Send => {
                                                         if app.worlds[target_idx].connected {
                                                             if let Some(tx) = &app.worlds[target_idx].command_tx {
-                                                                let _ = tx.send(WriteCommand::Text(line)).await;
+                                                                if tx.send(WriteCommand::Text(line.clone())).await.is_ok() {
+                                                                    // async .send().await, not send_to_world's sync
+                                                                    // try_send - captured directly.
+                                                                    app.capture_sent_line(target_idx, &line);
+                                                                }
                                                             }
                                                         } else {
                                                             app.add_output("Not connected");
@@ -19614,7 +19605,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         match result {
                                                             tf::TfCommandResult::SendToMud(text) => {
                                                                 if let Some(tx) = &app.worlds[target_idx].command_tx {
-                                                                    let _ = tx.send(WriteCommand::Text(text)).await;
+                                                                    if tx.send(WriteCommand::Text(text.clone())).await.is_ok() {
+                                                                        app.capture_sent_line(target_idx, &text);
+                                                                    }
                                                                 }
                                                             }
                                                             tf::TfCommandResult::Success(Some(msg)) => {
@@ -19808,9 +19801,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                         _ => {}
                                     }
-                                } else if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                    // Plain text - send to MUD
-                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                } else {
+                                    // Plain text - send to MUD (captured via send_to_world)
+                                    app.send_to_world(world_idx, cmd);
                                 }
                             }
                             app.current_world_index = saved_current_world;
@@ -19835,9 +19828,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.handle_telnet_event(world_idx, ev);
                                 }
                             }
-                            TelnetTarget::Multiuser { .. } => {
-                                // Not constructed for this target by to_app_event today
-                                // (see its doc comment) - nothing to route here yet.
+                            TelnetTarget::Multiuser { world_index, username } => {
+                                app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
                             }
                         }
                     }
@@ -20062,8 +20054,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                         _ => {}
                                     }
-                                } else if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                } else {
+                                    // Plain text - send to MUD (captured via send_to_world)
+                                    app.send_to_world(world_idx, cmd);
                                 }
                             }
                             app.current_world_index = saved_current_world;
@@ -20169,13 +20162,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                     AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
-                        app.ensure_audio();
-                        if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
-                            if is_music {
-                                app.media_music_key = Some((world_idx, key.clone()));
-                            }
-                            app.media_processes.insert(key, (world_idx, handle));
-                        }
+                        app.on_media_file_ready(world_idx, key, path, volume, loops, is_music);
                     }
                     AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                         match result {
@@ -20513,11 +20500,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.register_repeat_process(process);
                             }
                             tf::TfCommandResult::NotTfCommand => {
-                                // Plain text command - send to MUD
+                                // Plain text command - send to MUD (captured via
+                                // send_to_world - a /repeat body is exactly the
+                                // "/repeat batches" case /recall -i now covers).
                                 if let Some(idx) = target_idx {
-                                    if let Some(tx) = &app.worlds[idx].command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                                    }
+                                    app.send_to_world(idx, cmd.clone());
                                 }
                             }
                             _ => {}
@@ -20694,8 +20681,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                     _ => {}
                                 }
-                            } else if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                let _ = tx.try_send(WriteCommand::Text(cmd));
+                            } else {
+                                // Plain text - send to MUD (captured via send_to_world)
+                                app.send_to_world(world_idx, cmd);
                             }
                         }
                         app.current_world_index = saved_current_world;
@@ -20724,9 +20712,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.handle_telnet_event(world_idx, ev);
                             }
                         }
-                        TelnetTarget::Multiuser { .. } => {
-                            // Not constructed for this target by to_app_event today
-                            // (see its doc comment) - nothing to route here yet.
+                        TelnetTarget::Multiuser { world_index, username } => {
+                            app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
                         }
                     }
                 }
@@ -20903,8 +20890,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                     _ => {}
                                 }
-                            } else if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                let _ = tx.try_send(WriteCommand::Text(cmd));
+                            } else {
+                                // Plain text - send to MUD (captured via send_to_world)
+                                app.send_to_world(world_idx, cmd);
                             }
                         }
                         app.current_world_index = saved_current_world;
@@ -21002,13 +20990,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                 }
                 AppEvent::MediaFileReady(world_idx, key, path, volume, loops, is_music) => {
-                    app.ensure_audio();
-                    if let Some(handle) = audio::play_file(&app.audio_backend, &path, volume, loops) {
-                        if is_music {
-                            app.media_music_key = Some((world_idx, key.clone()));
-                        }
-                        app.media_processes.insert(key, (world_idx, handle));
-                    }
+                    app.on_media_file_ready(world_idx, key, path, volume, loops, is_music);
                 }
                 AppEvent::ApiLookupResult(client_id, world_index, result, cursor_start) => {
                     match result {
@@ -21061,7 +21043,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         // clear on disconnect) and nothing sooner is already scheduled. Never push the
         // deadline *later* - a steady stream of updates must still flush roughly every
         // 150ms instead of debouncing forever.
-        if app.worlds.iter().any(|w| w.stats_dirty)
+        if app.worlds.iter().any(|w| w.protocol.stats_dirty)
             && prompt_check_sleep.deadline() > tokio::time::Instant::now() + Duration::from_millis(150)
         {
             prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));

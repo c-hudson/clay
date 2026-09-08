@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
-use super::{TfEngine, TfProcess, TfCommandResult, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
+use super::{TfEngine, TfProcess, TfCommandResult, RecallOptions, RecallSource, RecallWorld, RecallRange, RecallMatchStyle};
 
 /// /beep [number|on|off] - Sound the terminal bell
 pub fn cmd_beep(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
@@ -790,13 +790,15 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
         while i < opt_chars.len() {
             match opt_chars[i] {
                 'w' => {
-                    // -w or -wworld
+                    // -w or -wworld: which world to read from - independent of the
+                    // source (line-type) filter below, so `-i -wmud` and `-wmud` (no
+                    // `-i`) both keep whatever `source` already is.
                     if i + 1 < opt_chars.len() {
                         let world: String = opt_chars[i+1..].iter().collect();
-                        opts.source = RecallSource::World(strip_quotes(&world));
+                        opts.world = RecallWorld::Named(strip_quotes(&world));
                         i = opt_chars.len();
                     } else {
-                        opts.source = RecallSource::CurrentWorld;
+                        opts.world = RecallWorld::Current;
                         i += 1;
                     }
                 }
@@ -809,6 +811,8 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
                     i += 1;
                 }
                 'i' => {
+                    // -i: input sent to the world (typed + trigger/script sends) -
+                    // combines with -w<world> (see RecallWorld) to scope to one world.
                     opts.source = RecallSource::Input;
                     i += 1;
                 }
@@ -2181,8 +2185,8 @@ pub fn cmd_ps(engine: &TfEngine, args: &str) -> TfCommandResult {
     let procs: Vec<&TfProcess> = engine.processes.iter()
         .filter(|p| !repeats_only || p.kind == super::ProcessKind::Repeat)
         .filter(|p| !quotes_only || p.kind == super::ProcessKind::Quote)
-        .filter(|p| world_filter.as_deref().map_or(true, |w| p.world.as_deref().is_some_and(|pw| pw.eq_ignore_ascii_case(w))))
-        .filter(|p| pid_filter.map_or(true, |pid| p.id == pid))
+        .filter(|p| world_filter.as_deref().is_none_or(|w| p.world.as_deref().is_some_and(|pw| pw.eq_ignore_ascii_case(w))))
+        .filter(|p| pid_filter.is_none_or(|pid| p.id == pid))
         .collect();
 
     if short {
@@ -3571,6 +3575,34 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_w_sets_world_not_source() {
+        // Part B: -w<world> must only ever touch RecallOptions::world, never
+        // `source` - this is what makes -i -wmud and -wmud (no -i) both work, since
+        // they're now independent fields instead of one shared one.
+        let opts = recall_opts("-wmud combat");
+        assert_eq!(opts.world, RecallWorld::Named("mud".to_string()));
+        assert_eq!(opts.source, RecallSource::Server);
+
+        let opts = recall_opts("-w combat");
+        assert_eq!(opts.world, RecallWorld::Current);
+        assert_eq!(opts.source, RecallSource::Server);
+    }
+
+    #[test]
+    fn test_recall_i_and_w_combine() {
+        // The specific case that used to be impossible (both flags wrote the same
+        // field): -i -wmud must set source=Input AND world=Named("mud") together,
+        // regardless of option order.
+        let opts = recall_opts("-i -wmud combat");
+        assert_eq!(opts.source, RecallSource::Input);
+        assert_eq!(opts.world, RecallWorld::Named("mud".to_string()));
+
+        let opts = recall_opts("-wmud -i combat");
+        assert_eq!(opts.source, RecallSource::Input);
+        assert_eq!(opts.world, RecallWorld::Named("mud".to_string()));
+    }
+
+    #[test]
     fn test_recall_a_attrs_generalized() {
         // -ag: the one attribute letter with a distinct effect (show gagged lines).
         let opts = recall_opts("-ag combat");
@@ -3775,10 +3807,13 @@ mod tests {
         let result = cmd_lcd(&mut engine, "");
         assert!(matches!(result, TfCommandResult::Success(Some(_))));
 
-        // Change to /tmp (should exist on most systems)
-        let result = cmd_lcd(&mut engine, "/tmp");
+        // Change to the platform temp dir (portable: `/tmp` does not exist on
+        // Termux/Android, which uses $PREFIX/tmp).
+        let tmp = std::env::temp_dir();
+        let tmp_str = tmp.to_string_lossy().to_string();
+        let result = cmd_lcd(&mut engine, &tmp_str);
         assert!(matches!(result, TfCommandResult::Success(_)));
-        assert_eq!(engine.current_dir, Some("/tmp".to_string()));
+        assert_eq!(engine.current_dir, Some(tmp_str));
 
         // Try non-existent directory
         let result = cmd_lcd(&mut engine, "/nonexistent_dir_12345");

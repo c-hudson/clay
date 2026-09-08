@@ -311,8 +311,12 @@ struct TofuHandler {
 impl client::Handler for TofuHandler {
     type Error = SshError;
 
-    async fn check_server_key(&mut self, server_public_key: &keys::ssh_key::PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(&mut self, server_public_key: &keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        // A host may present the same key wrapped in a certificate rather than
+        // bare; pin on the underlying public key either way, so both forms
+        // match the same TOFU pin.
         let blob = server_public_key
+            .public_key()
             .to_bytes()
             .map_err(|e| SshError::Handshake(format!("could not encode host key: {e}")))?;
         let fingerprint = platform::danger::sha256_hex(&blob);
@@ -462,7 +466,13 @@ async fn authenticate(
     if creds.use_agent {
         if let Ok(mut agent) = keys::agent::client::AgentClient::connect_env().await {
             if let Ok(identities) = agent.request_identities().await {
-                for public_key in identities {
+                // Each identity (plain key or certificate) is tried independently.
+                // On 0.54, request_identities() returned Vec<PublicKey> and an
+                // agent holding any certificate identity made the whole call
+                // fail, skipping agent auth entirely; 0.63's Vec<AgentIdentity>
+                // fixes that.
+                for identity in identities {
+                    let public_key = identity.public_key().into_owned();
                     let hash_alg = if public_key.algorithm().is_rsa() {
                         handle.best_supported_rsa_hash().await.ok().flatten().flatten()
                     } else {

@@ -1419,7 +1419,7 @@ pub(crate) fn render_output_crossterm(app: &App) {
 
     if viewport_line < app.input_height as usize {
         // Calculate cursor column accounting for newlines in the buffer
-        let masked = app.current_world().echo_masked;
+        let masked = app.current_world().protocol.echo_masked;
         let first_line_capacity = input_area_width.saturating_sub(prompt_len);
         let text_before_cursor = &app.input.buffer[..app.input.cursor_position];
 
@@ -1789,7 +1789,7 @@ pub(crate) fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
 
             // If cursor is at end of line and line length is exact multiple of width,
             // we need an extra visual line for the cursor
-            if is_cursor_line && show_cursor && cursor_col == chars.len() && chars.len() % content_width == 0 && !chars.is_empty() {
+            if is_cursor_line && show_cursor && cursor_col == chars.len() && chars.len().is_multiple_of(content_width) && !chars.is_empty() {
                 visual_lines.push((String::new(), Some(0)));
             }
         }
@@ -2273,7 +2273,7 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
     let viewport_line = cursor_line.saturating_sub(app.input.viewport_start_line);
 
     if viewport_line < app.input_height as usize {
-        let masked = app.current_world().echo_masked;
+        let masked = app.current_world().protocol.echo_masked;
         let inner_width = area.width.max(1) as usize;
         let first_line_capacity = inner_width.saturating_sub(prompt_len);
         let text_before_cursor = &app.input.buffer[..app.input.cursor_position];
@@ -2337,7 +2337,7 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
     // operate on the raw buffer directly and need input_cursor_char_width instead.
     // Spell-checking a masked line would be pointless and would still leak word
     // boundaries via the misspelling highlight below, so it's skipped entirely.
-    let masked = app.current_world().echo_masked;
+    let masked = app.current_world().protocol.echo_masked;
     let misspelled: Vec<(usize, usize)> = if masked { Vec::new() } else { app.find_misspelled_words() };
     let chars: Vec<char> = if masked {
         app.input.buffer.chars().map(|c| if c == '\n' { '\n' } else { INPUT_MASK_CHAR }).collect()

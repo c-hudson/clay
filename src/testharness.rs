@@ -696,7 +696,11 @@ pub async fn run_test_scenario(
                     }
                     ReaderEvent::NawsRequested(world_name) => {
                         if let Some(idx) = app.find_world_index(&world_name) {
-                            app.handle_naws_requested(idx);
+                            // Job 9 (T3.2): handle_naws_requested was deleted - its body
+                            // now lives in ProtocolState::apply_telnet_event, reached via
+                            // the unified handle_telnet_event dispatch, same as every
+                            // production caller.
+                            app.handle_telnet_event(idx, &TelnetEvent::NawsRequested);
                             events.push(TestEvent::NawsRequested(world_name));
                         }
                     }
@@ -711,19 +715,27 @@ pub async fn run_test_scenario(
                     }
                     ReaderEvent::CharsetRequested(world_name, charsets) => {
                         if let Some(idx) = app.find_world_index(&world_name) {
-                            app.handle_charset_requested(idx, &charsets);
+                            // Job 9: handle_charset_requested was deleted - see the
+                            // NawsRequested arm above.
+                            app.handle_telnet_event(idx, &TelnetEvent::CharsetRequest(charsets.clone()));
                             events.push(TestEvent::CharsetRequested(world_name, charsets));
                         }
                     }
                     ReaderEvent::Gmcp(world_name, package, json) => {
                         if let Some(idx) = app.find_world_index(&world_name) {
-                            app.handle_gmcp_received(idx, &package, &json);
+                            // Job 9: handle_gmcp_received's store+broadcast body moved
+                            // into ProtocolState::apply_gmcp_message - see the
+                            // NawsRequested arm above.
+                            app.handle_telnet_event(idx, &TelnetEvent::GmcpMessage(package.clone(), json.clone()));
                             events.push(TestEvent::GmcpReceived(world_name, package, json));
                         }
                     }
                     ReaderEvent::Msdp(world_name, variable, value) => {
                         if let Some(idx) = app.find_world_index(&world_name) {
-                            app.handle_msdp_received(idx, &variable, &value);
+                            // Job 9: handle_msdp_received's store+broadcast body moved
+                            // into ProtocolState::apply_msdp_variable - see the
+                            // NawsRequested arm above.
+                            app.handle_telnet_event(idx, &TelnetEvent::MsdpVariable(variable.clone(), value.clone()));
                             events.push(TestEvent::MsdpReceived(world_name, variable, value));
                         }
                     }

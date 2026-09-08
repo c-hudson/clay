@@ -506,7 +506,7 @@ pub enum WsMessage {
     /// `key_<name>` macro) and executes the result in this client's own context — output
     /// comes back like any typed command. A `key` with no such binding (stale client-side
     /// cache, race with an `/unbind`) is ignored silently, never an error.
-    RunKeyBinding { key: String, kbnum: Option<i64> },
+    RunKeyBinding { key: String, #[serde(default)] kbnum: Option<i64> },
     SwitchWorld { world_index: usize },
     ConnectWorld { world_index: usize },
     /// Server -> client: a MUD world's TLS certificate no longer matches the
@@ -576,17 +576,11 @@ pub enum WsMessage {
         gmcp_packages: String,
         #[serde(default)]
         auto_reconnect_secs: String,
-        /// Job 11 (plan Phase 3, step 3.5): per-world escape hatch for Clay's opening
-        /// telnet negotiation offer. `serde(default)` (to `false`) would silently turn
-        /// negotiation off for an older client that omits this field, so instead this
-        /// defaults to the feature's own default-on posture via a dedicated function -
-        /// see `default_initiate_negotiation`.
-        #[serde(default = "default_initiate_negotiation")]
-        initiate_negotiation: bool,
         /// Job 14 (plan Phase 4): per-world MSP (`!!SOUND(...)`/`!!MUSIC(...)`)
-        /// enable toggle. Same `serde(default)` reasoning as
-        /// `initiate_negotiation` above - an older client omitting this field
-        /// must resolve to the feature's own default-on posture, not `false`.
+        /// enable toggle. `serde(default)` (to `false`) would silently turn MSP off
+        /// for an older client that omits this field, so instead this defaults to
+        /// the feature's own default-on posture via a dedicated function - an older
+        /// client omitting this field must resolve to that, not `false`.
         #[serde(default = "default_msp_enabled")]
         msp_enabled: bool,
         /// Job 15 (plan Phase 4): per-world MCP (`#$#`-prefixed in-band protocol,
@@ -940,15 +934,17 @@ pub enum WsMessage {
     /// (world_index, last_contiguous_seq) for each world the client has received
     /// `ServerData` for, i.e. the highest seq such that every seq up to and including
     /// it has been seen with no gap. Lets the server replay exactly the missing range
-    /// on reconnect instead of the client guessing. See PROTOCOL-ROADMAP.md (not yet
-    /// wired up — Step 1 is schema only).
+    /// on reconnect instead of the client guessing. Live: `App::audit_client_acks`
+    /// feeds this into `WebSocketServer::evaluate_ack_audit` on every keepalive and
+    /// fires `ResyncRequired` below when a client is stalled (PROTOCOL-ROADMAP.md).
     PongCheck { nonce: u64, #[serde(default)] acked: Vec<(usize, u64)> },
 
     /// Server -> client: this world's stream has a gap the server can't (or won't)
     /// silently patch — e.g. the client's outbound queue overflowed and messages were
     /// dropped (see PROTOCOL-ROADMAP.md Step 3). `from_seq` is the seq the client
     /// should request via `RequestScrollback { after_seq: Some(from_seq), .. }` to
-    /// resync. Not yet sent by anything — Step 1 is schema only.
+    /// resync. Live: sent by `App::audit_client_acks` above and handled by both the
+    /// web client and the SSH remote console (`App::handle_remote_ws_message`).
     ResyncRequired { world_index: usize, from_seq: u64 },
 
     // ---- Server-push scrollback download (PROTOCOL-ROADMAP.md Phase J) ----
@@ -1301,17 +1297,11 @@ pub struct WorldSettingsMsg {
     /// NoteEditorState, fetched on demand when the note editor opens).
     #[serde(default)]
     pub has_notes: bool,
-    /// Job 11 (plan Phase 3, step 3.5, finding 5): mirrors
-    /// `WorldSettings::initiate_negotiation` so the web/GUI world editor shows the real
-    /// per-world value instead of always defaulting on. See `default_initiate_negotiation`
-    /// for why an older peer's omitted field resolves to `true`, not `serde(default)`'s `false`.
-    #[serde(default = "default_initiate_negotiation")]
-    pub initiate_negotiation: bool,
-    /// Job 14 (plan Phase 4, finding-parallel to `initiate_negotiation`
-    /// above): mirrors `WorldSettings::msp_enabled` so the web/GUI world
-    /// editor shows the real per-world value instead of always defaulting
-    /// on. See `default_msp_enabled` for why an older peer's omitted field
-    /// resolves to `true`, not `serde(default)`'s `false`.
+    /// Job 14 (plan Phase 4): mirrors `WorldSettings::msp_enabled` so the
+    /// web/GUI world editor shows the real per-world value instead of
+    /// always defaulting on. See `default_msp_enabled` for why an older
+    /// peer's omitted field resolves to `true`, not `serde(default)`'s
+    /// `false`.
     #[serde(default = "default_msp_enabled")]
     pub msp_enabled: bool,
     /// Job 15 (plan Phase 4, finding-parallel to `msp_enabled` above): mirrors
@@ -1444,18 +1434,10 @@ fn default_remote_initial_lines() -> u16 {
     100
 }
 
-/// Job 11 (plan Phase 3, step 3.5): default for `UpdateWorldSettings::initiate_negotiation`
-/// and `WorldSettingsMsg::initiate_negotiation` when an older peer's message omits the
-/// field — matches `WorldSettings::initiate_negotiation`'s own default-on posture
-/// (`TelnetConfig::default()`), rather than `serde(default)`'s implicit `false`.
-fn default_initiate_negotiation() -> bool {
-    true
-}
-
 /// Job 14 (plan Phase 4): default for `UpdateWorldSettings::msp_enabled` and
 /// `WorldSettingsMsg::msp_enabled` when an older peer's message omits the
 /// field — matches `WorldSettings::msp_enabled`'s own default-on posture
-/// (`TelnetConfig::default()`), same reasoning as `default_initiate_negotiation`.
+/// (`TelnetConfig::default()`), rather than `serde(default)`'s implicit `false`.
 fn default_msp_enabled() -> bool {
     true
 }
@@ -3034,7 +3016,8 @@ where
             msg_result = ws_source.next() => {
             match msg_result {
             Some(Ok(WsRawMessage::Text(text))) => {
-                if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                match serde_json::from_str::<WsMessage>(&text) {
+                    Ok(ws_msg) => {
                     match &ws_msg {
                         WsMessage::AuthRequest { username, password_hash: client_hash, auth_key, request_key, challenge_response: uses_challenge, ref client_version, .. } => {
                             let has_key = auth_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
@@ -3225,9 +3208,21 @@ where
                             }
                         }
                     }
-                } else {
-                    // Invalid JSON - disconnect but don't ban
-                    break;
+                    }
+                    Err(e) => {
+                        // Invalid JSON / undeserializable message - disconnect but don't
+                        // ban (T2.4: this used to be a bare `if let Ok(..)` with no else,
+                        // so an unparseable message - e.g. a RunKeyBinding without kbnum
+                        // before T2.6's `#[serde(default)]` fix - vanished with no trace
+                        // in remote.log).
+                        let type_field = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
+                            .unwrap_or_else(|| "?".to_string());
+                        crate::http::log_remote_event("WS-BAD-MESSAGE", &client_ip,
+                            &format!("type={} err={} len={}", type_field, e, text.len()));
+                        break;
+                    }
                 }
             }
             Some(Ok(WsRawMessage::Pong(_))) => {

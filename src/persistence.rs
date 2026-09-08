@@ -515,12 +515,8 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if world.settings.log_enabled {
             writeln!(file, "log_enabled=true")?;
         }
-        // Job 11 (plan Phase 3, step 3.5): default is `true`, so only record the
-        // non-default value - same convention as gmcp_packages/auto_reconnect_secs above.
-        if !world.settings.initiate_negotiation {
-            writeln!(file, "initiate_negotiation=false")?;
-        }
-        // Job 14 (plan Phase 4): same convention - default is `true`.
+        // Job 14 (plan Phase 4): default is `true`, so only record the non-default
+        // value - same convention as gmcp_packages/auto_reconnect_secs above.
         if !world.settings.msp_enabled {
             writeln!(file, "msp_enabled=false")?;
         }
@@ -1206,10 +1202,10 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "use_ssl" => world.settings.use_ssl = value == "true",
                         "log_enabled" => world.settings.log_enabled = value == "true",
                         "log_file" => world.settings.log_enabled = true, // Backward compat: old log_file setting enables logging
-                        // Job 11 (plan Phase 3, step 3.5): absent key = default `true`
-                        // (WorldSettings::default()), matching the writer only recording
-                        // the non-default `false`.
-                        "initiate_negotiation" => world.settings.initiate_negotiation = value == "true",
+                        // "initiate_negotiation" was removed (Clay is now fully reactive and
+                        // never initiates telnet negotiation) - an old settings.dat carrying
+                        // this key falls through to the `_ => {}` wildcard below and is
+                        // silently ignored, per CLAUDE.md's backward-compat contract.
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "encoding" => {
@@ -1581,8 +1577,9 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "password" => world.settings.password = decrypt_password(value),
                         "use_ssl" => world.settings.use_ssl = value == "true",
                         "log_enabled" => world.settings.log_enabled = value == "true",
-                        // Job 11 (plan Phase 3, step 3.5): absent key = default `true`.
-                        "initiate_negotiation" => world.settings.initiate_negotiation = value == "true",
+                        // "initiate_negotiation" was removed (Clay is now fully reactive) -
+                        // an old state file carrying this key falls through to the
+                        // `_ => {}` wildcard below and is silently ignored.
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "encoding" => {
@@ -1735,8 +1732,6 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             }
             writeln!(file, "use_ssl={}", world.settings.use_ssl)?;
             writeln!(file, "log_enabled={}", world.settings.log_enabled)?;
-            // Job 11 (plan Phase 3, step 3.5).
-            writeln!(file, "initiate_negotiation={}", world.settings.initiate_negotiation)?;
             // Job 14 (plan Phase 4).
             writeln!(file, "msp_enabled={}", world.settings.msp_enabled)?;
             // Job 15 (plan Phase 4).
@@ -1982,14 +1977,48 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         // lives only in the old process's reader task and cannot survive the reload
         // exec, same as a TLS connection - see the `mccp2_active` restore-time
         // disconnect this flag drives, mirroring the `is_tls` one right above it.
-        writeln!(file, "mccp2_active={}", world.mccp2_active)?;
+        writeln!(file, "mccp2_active={}", world.protocol.mccp2_active)?;
         writeln!(file, "was_connected={}", world.was_connected)?;
         writeln!(file, "showing_splash={}", world.showing_splash)?;
         writeln!(file, "telnet_mode={}", world.telnet_mode)?;
-        if let Some(enc) = world.negotiated_encoding {
+        if let Some(enc) = world.protocol.negotiated_encoding {
             writeln!(file, "negotiated_encoding={}", enc.iana_name())?;
         }
-        writeln!(file, "uses_wont_echo_prompt={}", world.uses_wont_echo_prompt)?;
+        writeln!(file, "uses_wont_echo_prompt={}", world.protocol.uses_wont_echo_prompt)?;
+        // Job 5 (T1.8): a reload keeps the same socket, so unlike a real reconnect
+        // the MUD will not resend `WILL ECHO` - see `World::echo_masked`'s doc
+        // comment. Without this, `/reload` at a password prompt unmasked the input
+        // on every interface for the rest of the connection.
+        writeln!(file, "echo_masked={}", world.protocol.echo_masked)?;
+        // Job 5 (T2.7): same "socket survives, telnet state does not resend itself"
+        // reasoning as echo_masked above - without these, window-resize updates
+        // silently stopped being sent to the MUD for the rest of the connection.
+        writeln!(file, "naws_enabled={}", world.protocol.naws_enabled)?;
+        if let Some((w, h)) = world.protocol.naws_sent_size {
+            writeln!(file, "naws_sent_size={},{}", w, h)?;
+        }
+        // Job 5 (T2.7): `reconnect_at` is an `Instant`, which has no meaning across
+        // a process restart - persist the remaining time instead and re-derive a
+        // fresh `Instant` at load time (`now + ms`). Omitting this entirely
+        // silently cancelled a scheduled auto-reconnect on every hot reload.
+        if let Some(at) = world.reconnect_at {
+            let ms = at.saturating_duration_since(std::time::Instant::now()).as_millis();
+            writeln!(file, "reconnect_in_ms={}", ms)?;
+        }
+        // Job 5 (T2.7): TF's `/log <file>` target - see `World::log_custom_path`'s
+        // doc comment. Without this, logging silently reverted to the default
+        // auto-computed file after every hot reload.
+        if let Some(ref p) = world.log_custom_path {
+            let escaped = p.to_string_lossy().replace('=', "\\e");
+            writeln!(file, "log_custom_path={}", escaped)?;
+        }
+        // Job 5 (T2.7): buffer for an incomplete line still being watched for a
+        // trigger match - see `World::trigger_partial_line`. Without this, a
+        // trigger on a line split exactly across the reload's exec never fires.
+        if !world.trigger_partial_line.is_empty() {
+            let escaped = world.trigger_partial_line.replace('=', "\\e");
+            writeln!(file, "trigger_partial_line={}", escaped)?;
+        }
         writeln!(file, "next_seq={}", world.next_seq)?;
         // The stable archive identity must survive a reload, or the rebuilt World
         // mints a fresh one and stops matching its own archived history.
@@ -2042,33 +2071,67 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
             writeln!(file, "auto_reconnect_secs={}", ar)?;
         }
         // Save GMCP/MSDP runtime state
-        if world.gmcp_enabled {
+        if world.protocol.gmcp_enabled {
             writeln!(file, "gmcp_enabled=true")?;
         }
-        if world.msdp_enabled {
+        if world.protocol.msdp_enabled {
             writeln!(file, "msdp_enabled=true")?;
         }
-        if !world.mcmp_default_url.is_empty() {
-            writeln!(file, "mcmp_default_url={}", world.mcmp_default_url.replace('=', "\\e"))?;
+        if !world.protocol.mcmp_default_url.is_empty() {
+            writeln!(file, "mcmp_default_url={}", world.protocol.mcmp_default_url.replace('=', "\\e"))?;
         }
         if world.gmcp_user_enabled {
             writeln!(file, "gmcp_user_enabled=true")?;
         }
+        // Job 5 (T3.4): MSSP is sent exactly once per connection, so unlike
+        // gmcp_data/msdp_variables there is no "next subnegotiation" after a
+        // reload to re-derive this from - see `World::mssp_data`'s doc comment.
+        // Name and value go on separate indexed lines (rather than joined by a
+        // delimiter on one line) because these are raw, unsanitized server bytes
+        // (T1.5's sanitize_and_cap runs only at `/mssp` display time, never here) -
+        // a hostile value could contain any byte including the delimiter itself.
+        // Each is escaped exactly like `notes`/`partial_line` above (backslash,
+        // newline, `=`) and read back with the same `unescape_string`.
+        if !world.protocol.mssp_data.is_empty() {
+            writeln!(file, "mssp_count={}", world.protocol.mssp_data.len())?;
+            for (i, (name, value)) in world.protocol.mssp_data.iter().enumerate() {
+                let en = name.replace('\\', "\\\\").replace('\n', "\\n").replace('=', "\\e");
+                let ev = value.replace('\\', "\\\\").replace('\n', "\\n").replace('=', "\\e");
+                writeln!(file, "mssp_name_{}={}", i, en)?;
+                writeln!(file, "mssp_value_{}={}", i, ev)?;
+            }
+        }
+        // Job 5 (T3.4): the status-display model (`World::stats`) and MCP session
+        // state (`World::mcp`) are both serde-ready structs - persisted whole as a
+        // single compact JSON line each. `serde_json::to_string` never emits a raw
+        // newline (control characters are escaped within the JSON string), so this
+        // is always exactly one line despite carrying arbitrary MUD-supplied text.
+        // Without this, `stats` went blank until the next GMCP/MSDP update (usually
+        // seconds), and `mcp` went blank *permanently* for the connection, since a
+        // real MUD sends its "mcp version:" invite only once.
+        if !world.protocol.stats.is_empty() {
+            if let Ok(json) = serde_json::to_string(&world.protocol.stats) {
+                writeln!(file, "stats_json={}", json)?;
+            }
+        }
+        if let Ok(json) = serde_json::to_string(&world.mcp) {
+            // Always written (even for a fresh, all-default McpState) rather than
+            // gated on "has data": unlike stats/mssp_data there's no cheap
+            // is_empty() check on private fields from here, and a default McpState
+            // serializes to a tiny, harmless `{...}` literal.
+            writeln!(file, "mcp_json={}", json)?;
+        }
         if world.settings.log_enabled {
             writeln!(file, "log_enabled=true")?;
         }
-        // Job 11 (plan Phase 3, step 3.5): a world's connection settings, including this
-        // one, must survive a hot reload the same way every other WorldSettings field
-        // does (CLAUDE.md's "new world/settings fields" rule) - only the non-default
-        // `false` is recorded, same convention as log_enabled above.
-        if !world.settings.initiate_negotiation {
-            writeln!(file, "initiate_negotiation=false")?;
-        }
-        // Job 14 (plan Phase 4): same convention as initiate_negotiation above.
+        // Job 14 (plan Phase 4): a world's connection settings, including this one, must
+        // survive a hot reload the same way every other WorldSettings field does
+        // (CLAUDE.md's "new world/settings fields" rule) - only the non-default `false`
+        // is recorded, same convention as log_enabled above.
         if !world.settings.msp_enabled {
             writeln!(file, "msp_enabled=false")?;
         }
-        // Job 15 (plan Phase 4): same convention as initiate_negotiation above.
+        // Job 15 (plan Phase 4): same convention as msp_enabled above.
         if !world.settings.mcp_enabled {
             writeln!(file, "mcp_enabled=false")?;
         }
@@ -2302,6 +2365,27 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         msdp_enabled: bool,
         mcmp_default_url: String,
         gmcp_user_enabled: bool,
+        // Job 5 (T1.8/T2.7/T3.4): see save_reload_state_to/the `match key` loader.
+        echo_masked: bool,
+        naws_enabled: bool,
+        naws_sent_size: Option<(u16, u16)>,
+        /// Remaining time until auto-reconnect, as saved - converted to a real
+        /// `Instant` (`now + ms`) only once, at push time below, since `Instant`
+        /// itself cannot be parsed from a saved value.
+        reconnect_in_ms: Option<u64>,
+        log_custom_path: Option<PathBuf>,
+        trigger_partial_line: String,
+        /// Keyed by index (see `mssp_name_N`/`mssp_value_N` in save_reload_state_to)
+        /// rather than accumulated straight into a `Vec` because name and value are
+        /// two separate lines - reassembled into an ordered `Vec<(String, String)>`
+        /// by index once parsing is done, in the "Convert temp worlds" loop below.
+        mssp_names: std::collections::HashMap<usize, String>,
+        mssp_values: std::collections::HashMap<usize, String>,
+        /// `None` means the state file predates this field (or the connection had
+        /// no stats yet) - leave the freshly-constructed `World`'s default rather
+        /// than overwrite it with an empty one.
+        stats: Option<stats::WorldStats>,
+        mcp: Option<mcp::McpState>,
     }
 
     // Parse a saved output/pending line with timestamp
@@ -2436,6 +2520,16 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         msdp_enabled: false,
                         mcmp_default_url: String::new(),
                         gmcp_user_enabled: false,
+                        echo_masked: false,
+                        naws_enabled: false,
+                        naws_sent_size: None,
+                        reconnect_in_ms: None,
+                        log_custom_path: None,
+                        trigger_partial_line: String::new(),
+                        mssp_names: std::collections::HashMap::new(),
+                        mssp_values: std::collections::HashMap::new(),
+                        stats: None,
+                        mcp: None,
                     });
                 }
             } else if let Some(suffix) = section.strip_prefix("output:") {
@@ -2815,6 +2909,22 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "telnet_mode" => tw.telnet_mode = value == "true",
                             "negotiated_encoding" => tw.negotiated_encoding = Encoding::from_iana_name(value),
                             "uses_wont_echo_prompt" => tw.uses_wont_echo_prompt = value == "true",
+                            // Job 5 (T1.8/T2.7): see the matching writes in save_reload_state_to.
+                            "echo_masked" => tw.echo_masked = value == "true",
+                            "naws_enabled" => tw.naws_enabled = value == "true",
+                            "naws_sent_size" => {
+                                let parts: Vec<&str> = value.splitn(2, ',').collect();
+                                if let [w, h] = parts[..] {
+                                    if let (Ok(w), Ok(h)) = (w.parse::<u16>(), h.parse::<u16>()) {
+                                        tw.naws_sent_size = Some((w, h));
+                                    }
+                                }
+                            }
+                            // Converted to a real `Instant` (now + ms) at push time, once
+                            // "now" means "when this process actually started".
+                            "reconnect_in_ms" => tw.reconnect_in_ms = value.parse().ok(),
+                            "log_custom_path" => tw.log_custom_path = Some(PathBuf::from(unescape_string(value))),
+                            "trigger_partial_line" => tw.trigger_partial_line = unescape_string(value),
                             "prompt" => {
                                 // Prompts always end with a single trailing space (normalized on receive)
                                 // but trailing spaces are trimmed during file parsing, so add it back
@@ -2838,8 +2948,9 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "use_ssl" => tw.settings.use_ssl = value == "true",
                             "log_enabled" => tw.settings.log_enabled = value == "true",
                             "log_file" => tw.settings.log_enabled = true, // Backward compat
-                            // Job 11 (plan Phase 3, step 3.5): absent key = default `true`.
-                            "initiate_negotiation" => tw.settings.initiate_negotiation = value == "true",
+                            // "initiate_negotiation" was removed (Clay is now fully
+                            // reactive) - an old state file carrying this key falls
+                            // through to the `_ => {}` wildcard below and is ignored.
                             "msp_enabled" => tw.settings.msp_enabled = value == "true",
                             "mcp_enabled" => tw.settings.mcp_enabled = value == "true",
                             "encoding" => {
@@ -2877,6 +2988,32 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             }
                             "gmcp_user_enabled" => {
                                 tw.gmcp_user_enabled = value == "true";
+                            }
+                            // Job 5 (T3.4): see the matching writes in save_reload_state_to.
+                            // "mssp_count" is informational only, like the other *_count
+                            // keys above; name/value are reassembled by index into
+                            // `tw.mssp_data` once parsing finishes (see the "Convert temp
+                            // worlds" loop) since they arrive on two separate lines.
+                            "mssp_count" => {}
+                            k if k.starts_with("mssp_name_") => {
+                                if let Ok(i) = k["mssp_name_".len()..].parse::<usize>() {
+                                    tw.mssp_names.insert(i, unescape_string(value));
+                                }
+                            }
+                            k if k.starts_with("mssp_value_") => {
+                                if let Ok(i) = k["mssp_value_".len()..].parse::<usize>() {
+                                    tw.mssp_values.insert(i, unescape_string(value));
+                                }
+                            }
+                            "stats_json" => {
+                                if let Ok(s) = serde_json::from_str::<stats::WorldStats>(value) {
+                                    tw.stats = Some(s);
+                                }
+                            }
+                            "mcp_json" => {
+                                if let Ok(m) = serde_json::from_str::<mcp::McpState>(value) {
+                                    tw.mcp = Some(m);
+                                }
                             }
                             // Slack settings
                             "slack_token" => tw.settings.slack_token = unescape_string(value),
@@ -2944,7 +3081,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
 
     // Convert temp worlds to real worlds
     app.worlds.clear();
-    for tw in temp_worlds {
+    for mut tw in temp_worlds {
         let mut world = World::new(&tw.name);
         world.output_lines = tw.output_lines;
         world.scroll_offset = tw.scroll_offset;
@@ -2955,12 +3092,12 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.lines_since_pause = tw.lines_since_pause;
         world.visual_line_offset = tw.visual_line_offset;
         world.is_tls = tw.is_tls;
-        world.mccp2_active = tw.mccp2_active;
+        world.protocol.mccp2_active = tw.mccp2_active;
         world.was_connected = tw.was_connected;
         world.showing_splash = tw.showing_splash;
         world.telnet_mode = tw.telnet_mode;
-        world.negotiated_encoding = tw.negotiated_encoding;
-        world.uses_wont_echo_prompt = tw.uses_wont_echo_prompt;
+        world.protocol.negotiated_encoding = tw.negotiated_encoding;
+        world.protocol.uses_wont_echo_prompt = tw.uses_wont_echo_prompt;
         world.prompt = tw.prompt;
         world.socket_fd = tw.socket_fd;
         world.proxy_pid = tw.proxy_pid;
@@ -3021,10 +3158,44 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         // is simply re-claimable by whoever displays it first.
         world.partial_line = tw.partial_line;
         world.partial_in_pending = tw.partial_in_pending;
-        world.gmcp_enabled = tw.gmcp_enabled;
-        world.msdp_enabled = tw.msdp_enabled;
-        world.mcmp_default_url = tw.mcmp_default_url;
+        world.protocol.gmcp_enabled = tw.gmcp_enabled;
+        world.protocol.msdp_enabled = tw.msdp_enabled;
+        world.protocol.mcmp_default_url = tw.mcmp_default_url;
         world.gmcp_user_enabled = tw.gmcp_user_enabled;
+        // Job 5 (T1.8/T2.7): see save_reload_state_to's matching writes.
+        world.protocol.echo_masked = tw.echo_masked;
+        world.protocol.naws_enabled = tw.naws_enabled;
+        world.protocol.naws_sent_size = tw.naws_sent_size;
+        // "now" here means "when this restore actually runs" - as close as possible
+        // to the moment the reloaded process comes back up, so the remaining time
+        // saved before the exec is honored rather than restarted from scratch.
+        world.reconnect_at = tw.reconnect_in_ms
+            .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
+        world.log_custom_path = tw.log_custom_path;
+        world.trigger_partial_line = tw.trigger_partial_line;
+        // Job 5 (T3.4): `None`/empty means the state file predates these fields (or
+        // there was nothing to restore) - leave the freshly-constructed `World`'s
+        // own empty defaults rather than overwrite them. Reassemble name/value by
+        // index, in order - a value missing its name (or vice versa), from a
+        // truncated/corrupt file, is dropped rather than paired with an empty string.
+        if !tw.mssp_names.is_empty() || !tw.mssp_values.is_empty() {
+            let max_idx = tw.mssp_names.keys().chain(tw.mssp_values.keys()).max().copied();
+            if let Some(max_idx) = max_idx {
+                world.protocol.mssp_data = (0..=max_idx)
+                    .filter_map(|i| Some((tw.mssp_names.remove(&i)?, tw.mssp_values.remove(&i)?)))
+                    .collect();
+            }
+        }
+        if let Some(stats) = tw.stats {
+            world.protocol.stats = stats;
+            // The restored state has never been broadcast by this process - flag it
+            // dirty so the next flush sends it to clients instead of silently
+            // sitting on data nobody but the console has seen yet.
+            world.protocol.stats_dirty = true;
+        }
+        if let Some(mcp) = tw.mcp {
+            world.mcp = mcp;
+        }
         // Leave timing fields as None for connected worlds after reload
         // This triggers immediate keepalive since we don't know how long connection was idle
         app.worlds.push(world);
@@ -3208,7 +3379,6 @@ mod tests {
             gmcp_packages: "Custom.Package 1".to_string(), // default: "Client.Media 1, Char 1"
             auto_reconnect_secs: 30,                       // default: 0
             auto_reconnect_on_web: true,                   // default: false
-            initiate_negotiation: false,                   // default: true
             msp_enabled: false,                            // default: true
             mcp_enabled: false,                            // default: true
         }
@@ -3305,7 +3475,6 @@ mod tests {
         assert_eq!(a.gmcp_packages, b.gmcp_packages, "{context}: gmcp_packages");
         assert_eq!(a.auto_reconnect_secs, b.auto_reconnect_secs, "{context}: auto_reconnect_secs");
         assert_eq!(a.auto_reconnect_on_web, b.auto_reconnect_on_web, "{context}: auto_reconnect_on_web");
-        assert_eq!(a.initiate_negotiation, b.initiate_negotiation, "{context}: initiate_negotiation");
         assert_eq!(a.msp_enabled, b.msp_enabled, "{context}: msp_enabled");
         assert_eq!(a.mcp_enabled, b.mcp_enabled, "{context}: mcp_enabled");
     }
@@ -3432,6 +3601,166 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Job 5 (T1.8/T2.7/T3.4): connection state the socket survives but the old
+    // allowlist dropped on the floor at every hot reload.
+    // ------------------------------------------------------------------
+
+    /// The nine fields job 5 adds to the reload allowlist all survive one
+    /// save/load roundtrip together, on the same world.
+    #[test]
+    fn test_connection_state_survives_reload_roundtrip() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("NineFields"));
+        {
+            let w = &mut app.worlds[0];
+            // T1.8
+            w.protocol.echo_masked = true;
+            // T2.7
+            w.protocol.naws_enabled = true;
+            w.protocol.naws_sent_size = Some((120, 40));
+            w.reconnect_at = Some(std::time::Instant::now() + Duration::from_secs(30));
+            // '=' in the path exercises the escaping, same as the prompt/notes fields do.
+            w.log_custom_path = Some(std::path::PathBuf::from("/tmp/custom=path.log"));
+            w.trigger_partial_line = "Enter your na".to_string();
+            // T3.4
+            w.protocol.mssp_data = vec![
+                ("NAME".to_string(), "Discworld".to_string()),
+                ("PLAYERS".to_string(), "42".to_string()),
+            ];
+            w.protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp": "100", "maxhp": "150"}"#);
+            let outcome = w.mcp.process_line(&format!("{}mcp version: 2.1 to: 2.1", mcp::MCP_PREFIX));
+            assert!(matches!(outcome, mcp::LineOutcome::Consumed { .. }), "handshake must be consumed");
+            assert!(w.mcp.has_key(), "handshake must establish a key");
+        }
+
+        let orig_reconnect_at = app.worlds[0].reconnect_at.expect("set above");
+        let orig_stats = app.worlds[0].protocol.stats.clone();
+        let orig_mcp_key = app.worlds[0].mcp.key_for_test().expect("set above");
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).expect("reload state is valid UTF-8");
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load_reload_state_from_str failed");
+        let rw = reloaded.worlds.iter().find(|w| w.name == "NineFields").expect("world restored");
+
+        assert!(rw.protocol.echo_masked, "echo_masked (T1.8) must survive a reload");
+        assert!(rw.protocol.naws_enabled, "naws_enabled (T2.7) must survive a reload");
+        assert_eq!(rw.protocol.naws_sent_size, Some((120, 40)), "naws_sent_size (T2.7) must survive a reload");
+
+        let restored_at = rw.reconnect_at.expect("reconnect_at (T2.7) must survive a reload");
+        let drift = restored_at.max(orig_reconnect_at) - restored_at.min(orig_reconnect_at);
+        // The plan's own bar is "within 100ms", which this comfortably clears in
+        // isolation (sub-millisecond, verified with --test-threads=1) - widened here
+        // to absorb ordinary scheduler jitter when the full suite runs in parallel
+        // under load (observed up to ~160ms), while still catching a real bug (a
+        // units mixup would drift by seconds, not milliseconds).
+        assert!(drift < Duration::from_secs(2), "reconnect_at drifted by {drift:?}");
+
+        assert_eq!(
+            rw.log_custom_path,
+            Some(std::path::PathBuf::from("/tmp/custom=path.log")),
+            "log_custom_path (T2.7) must survive a reload, '=' included"
+        );
+        assert_eq!(rw.trigger_partial_line, "Enter your na", "trigger_partial_line (T2.7) must survive a reload");
+        assert_eq!(
+            rw.protocol.mssp_data,
+            vec![("NAME".to_string(), "Discworld".to_string()), ("PLAYERS".to_string(), "42".to_string())],
+            "mssp_data (T3.4) must survive a reload, in order"
+        );
+        assert_eq!(rw.protocol.stats, orig_stats, "stats (T3.4) must survive a reload");
+        assert!(rw.protocol.stats_dirty, "a restored non-empty stats must be flagged dirty so it gets re-broadcast");
+        assert_eq!(
+            rw.mcp.key_for_test().as_deref(), Some(orig_mcp_key.as_str()),
+            "the mcp session key (T3.4) must survive a reload"
+        );
+    }
+
+    /// A state file written before job 5 (no `echo_masked`/`naws_enabled`/
+    /// `reconnect_in_ms`/`log_custom_path`/`trigger_partial_line`/`mssp_*`/
+    /// `stats_json`/`mcp_json` keys at all) must still load, with every new field
+    /// left at its ordinary default.
+    #[test]
+    fn test_load_reload_state_without_new_connection_state_keys_leaves_defaults() {
+        let mut app = App::new();
+        let content = "[world_state:0]\nname=OldFormat\nconnected=false\n";
+        load_reload_state_from_str(&mut app, content).expect("load_reload_state_from_str failed");
+        let w = app.worlds.iter().find(|w| w.name == "OldFormat").expect("world restored");
+
+        assert!(!w.protocol.echo_masked);
+        assert!(!w.protocol.naws_enabled);
+        assert_eq!(w.protocol.naws_sent_size, None);
+        assert_eq!(w.reconnect_at, None);
+        assert_eq!(w.log_custom_path, None);
+        assert!(w.trigger_partial_line.is_empty());
+        assert!(w.protocol.mssp_data.is_empty());
+        assert!(w.protocol.stats.is_empty());
+        assert!(!w.protocol.stats_dirty, "nothing to flag dirty when there is no stats_json line");
+        assert!(!w.mcp.has_key(), "no mcp_json line means an ordinary fresh McpState");
+    }
+
+    /// T3.4/T1.3: an `McpState` with an established key AND one still-open
+    /// multiline datatag both survive a reload, and the tag can still be finished
+    /// (dispatches its event) and the key still authenticates a fresh message,
+    /// after restore.
+    #[test]
+    fn test_mcp_key_and_open_multiline_survive_reload_and_still_dispatch() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("McpWorld"));
+        let key = {
+            let w = &mut app.worlds[0];
+            let outcome = w.mcp.process_line(&format!("{}mcp version: 2.1 to: 2.1", mcp::MCP_PREFIX));
+            assert!(matches!(outcome, mcp::LineOutcome::Consumed { .. }));
+            let key = w.mcp.key_for_test().expect("key negotiated");
+
+            let start = w.mcp.process_line(&format!(
+                "{}dns-org-mud-moo-simpleedit-content {key} reference: \"#1.desc\" name: \"Room\" type: string content*: \"\" _data-tag: t1",
+                mcp::MCP_PREFIX
+            ));
+            assert!(matches!(start, mcp::LineOutcome::Consumed { .. }), "message-start must be consumed: {start:?}");
+            let c1 = w.mcp.process_line(&format!("{}* t1 content: hello", mcp::MCP_PREFIX));
+            assert!(matches!(c1, mcp::LineOutcome::Consumed { .. }));
+            assert_eq!(w.mcp.pending_count(), 1, "tag t1 must be open before saving");
+            key
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).expect("reload state is valid UTF-8");
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load_reload_state_from_str failed");
+        let rw = reloaded.worlds.iter_mut().find(|w| w.name == "McpWorld").expect("world restored");
+
+        assert_eq!(rw.mcp.pending_count(), 1, "the open multiline tag must survive the reload");
+        assert_eq!(rw.mcp.key_for_test().as_deref(), Some(key.as_str()), "the session key must survive the reload");
+
+        // Finish the multiline value that was already open before the reload.
+        let c2 = rw.mcp.process_line(&format!("{}* t1 content: world", mcp::MCP_PREFIX));
+        assert!(matches!(c2, mcp::LineOutcome::Consumed { .. }));
+        let end = rw.mcp.process_line(&format!("{}: t1", mcp::MCP_PREFIX));
+        let mcp::LineOutcome::Consumed { events, .. } = end else { panic!("expected Consumed, got {end:?}") };
+        assert_eq!(events.len(), 1, "the accumulated multiline value must dispatch after restore");
+        match &events[0] {
+            mcp::McpEvent::SimpleEditContent { content, .. } => assert_eq!(content, "hello\nworld"),
+            other => panic!("expected SimpleEditContent, got {other:?}"),
+        }
+
+        // A brand new message signed with the restored key must also still
+        // authenticate and dispatch - proves the key survived intact, not just
+        // the pending multiline map.
+        let another = rw.mcp.process_line(&format!(
+            "{}dns-org-mud-moo-simpleedit-content {key} reference: r2 name: r2 type: moo-code content: \"one liner\"",
+            mcp::MCP_PREFIX
+        ));
+        let mcp::LineOutcome::Consumed { events, .. } = another else { panic!("expected Consumed, got {another:?}") };
+        assert_eq!(events.len(), 1, "a message signed with the restored key must still dispatch");
+    }
+
+    // ------------------------------------------------------------------
     // gmcp_packages default migration (mud-status-display.md Job 6). See
     // migrate_gmcp_packages's own doc comment for the exact rule: a stored value is
     // upgraded only when it is byte-identical to the pre-Job-6 default: any other
@@ -3505,6 +3834,24 @@ mod tests {
         load_settings_from_str(&mut app, content);
         let w = app.worlds.iter().find(|w| w.name == "Fresh").expect("world loaded");
         assert_eq!(w.settings.gmcp_packages, crate::DEFAULT_GMCP_PACKAGES);
+    }
+
+    /// Backward compat: `initiate_negotiation` was removed from `WorldSettings` (Clay is
+    /// now fully reactive and never sends an unsolicited telnet negotiation offer), but
+    /// an old settings.dat written by a pre-removal build may still carry the key in a
+    /// `[world:...]` section. Loading it must not error or panic — the key simply falls
+    /// through to the loader's `_ => {}` wildcard arm and every other field still loads
+    /// normally.
+    #[test]
+    fn test_load_settings_from_str_ignores_stale_initiate_negotiation_key() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "[world:Old]\nhostname=mud.example.com\nport=4000\ninitiate_negotiation=false\nmsp_enabled=true\n";
+        load_settings_from_str(&mut app, content);
+        let w = app.worlds.iter().find(|w| w.name == "Old").expect("world loaded despite the stale key");
+        assert_eq!(w.settings.hostname, "mud.example.com");
+        assert_eq!(w.settings.port, "4000");
+        assert!(w.settings.msp_enabled, "keys after the stale one must still load normally");
     }
 
     #[test]
@@ -4058,7 +4405,6 @@ pattern=foo
         assert_ne!(non_default.gmcp_packages, default.gmcp_packages, "gmcp_packages should differ");
         assert_ne!(non_default.auto_reconnect_secs, default.auto_reconnect_secs, "auto_reconnect_secs should differ");
         assert_ne!(non_default.auto_reconnect_on_web, default.auto_reconnect_on_web, "auto_reconnect_on_web should differ");
-        assert_ne!(non_default.initiate_negotiation, default.initiate_negotiation, "initiate_negotiation should differ");
         assert_ne!(non_default.msp_enabled, default.msp_enabled, "msp_enabled should differ");
         assert_ne!(non_default.mcp_enabled, default.mcp_enabled, "mcp_enabled should differ");
     }

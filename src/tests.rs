@@ -1961,6 +1961,193 @@
             "-g must include server output + client notices + captured input, all together");
     }
 
+    // ========== /recall -i redefinition: capture chokepoint, guards, -w combination ==========
+    // Coverage for the -i redefinition ("everything sent to the world as text input",
+    // not just what the user typed - see App::capture_sent_line and
+    // RecallSource::Input's doc comments) and for RecallSource/RecallWorld being
+    // independent fields (see tf/mod.rs), which is what lets -i and -w<world> combine.
+
+    #[test]
+    fn test_capture_sent_line_skips_when_echo_masked() {
+        // Security, load-bearing: the ECHO-masking guard must apply to EVERY send
+        // through the capture chokepoint, not just typed input. A trigger/hook firing
+        // (or an auto-login script's own command) while the MUD has ECHO off (a
+        // password/PIN prompt) must never become /recall -i-able.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        app.worlds[0].protocol.echo_masked = true;
+        let (tx, _rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(tx);
+
+        assert!(app.send_to_world(0, "hunter2".to_string()), "the send itself must still succeed");
+
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::Input,
+            ..tf::RecallOptions::default()
+        };
+        let matches = app.recall_matches(&opts, 0).unwrap();
+        assert!(matches.is_empty(), "a send made while echo_masked must not be recallable: {:?}", matches);
+    }
+
+    #[test]
+    fn test_capture_sent_line_skips_during_login_capture_guard_window() {
+        // Security, load-bearing: the other guard - the post-connect login-capture
+        // window (World::login_capture_guard) - must also gate every send through the
+        // chokepoint, covering an auto-login script's commands exactly like a
+        // manually typed password.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 2;
+        let (tx, _rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(tx);
+
+        assert!(app.send_to_world(0, "myusername".to_string()));
+        assert!(app.send_to_world(0, "mypassword".to_string()));
+        assert_eq!(app.worlds[0].login_capture_guard, 0, "the guard must still count down on every send");
+
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::Input,
+            ..tf::RecallOptions::default()
+        };
+        let matches = app.recall_matches(&opts, 0).unwrap();
+        assert!(matches.is_empty(), "sends inside the login-capture window must not be recallable: {:?}", matches);
+    }
+
+    #[test]
+    fn test_ws_send_command_typed_plain_text_captured_exactly_once() {
+        // Regression guard for the send_to_world capture-chokepoint refactor: a typed
+        // command sent through the REAL WS dispatch path (handle_ws_client_msg ->
+        // handle_ws_send_command -> Command::NotACommand, one of the sites that used
+        // to ALSO call record_user_input explicitly right after a raw try_send) must
+        // show up in /recall -i exactly once. Two would mean the redundant explicit
+        // capture call crept back in; zero would mean the site stopped capturing.
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        app.worlds[0].connected = true;
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(tx);
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let action = app.handle_ws_client_msg(1, WsMessage::SendCommand {
+            world_index: 0,
+            command: "north".to_string(),
+        }, &event_tx);
+        assert!(matches!(action, WsAsyncAction::Done));
+
+        // The wire write itself must also happen exactly once.
+        match rx.try_recv() {
+            Ok(WriteCommand::Text(t)) => assert_eq!(t, "north"),
+            other => panic!("expected the command to reach the MUD once: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "the command must be written to the MUD exactly once");
+
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::Input,
+            pattern: Some("north".to_string()),
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        };
+        let matches = app.recall_matches(&opts, 0).unwrap();
+        assert_eq!(matches.len(), 1, "one typed command must appear in /recall -i exactly once: {:?}", matches);
+    }
+
+    #[test]
+    fn test_send_to_world_trigger_send_appears_in_recall_i() {
+        // The redefinition itself: a send that was never typed at all - the
+        // trigger/action/hook/`/repeat` path, via App::send_to_world - must now be
+        // recallable too (it used to be invisible: send_to_world "recorded NOTHING").
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        let (tx, mut rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(tx);
+
+        // Simulates a GMCP/MSDP hook result or an action's command list entry - never
+        // typed by a human, dispatched purely by App::send_to_world.
+        assert!(app.send_to_world(0, "cast fireball".to_string()));
+        match rx.try_recv() {
+            Ok(WriteCommand::Text(t)) => assert_eq!(t, "cast fireball"),
+            other => panic!("expected the text to reach the wire: {other:?}"),
+        }
+
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::Input,
+            pattern: Some("fireball".to_string()),
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        };
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
+        assert_eq!(matches, vec!["\u{00BB} cast fireball".to_string()],
+            "a trigger/hook send (never typed) must now be recallable via -i");
+    }
+
+    #[test]
+    fn test_recall_i_combines_with_world_selector() {
+        // Part B: -i and -w<world> must combine - RecallSource (line TYPE) and
+        // RecallWorld (which world) are independent fields, so neither flag can
+        // clobber the other regardless of order (see tf/mod.rs's doc comments).
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds.push(World::new("beta"));
+        app.current_world_index = 0;
+        app.worlds[0].login_capture_guard = 0;
+        app.worlds[1].login_capture_guard = 0;
+
+        let seq = app.worlds[0].next_seq; app.worlds[0].next_seq += 1;
+        app.worlds[0].output_lines.push(OutputLine::new("alpha server line".to_string(), seq));
+        app.record_user_input(0, "alpha command");
+
+        let seq = app.worlds[1].next_seq; app.worlds[1].next_seq += 1;
+        app.worlds[1].output_lines.push(OutputLine::new("beta server line".to_string(), seq));
+        app.record_user_input(1, "beta command");
+
+        // /recall -i -wbeta, issued from world 0 (current) - only beta's input.
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::Input,
+            world: tf::RecallWorld::Named("beta".to_string()),
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        };
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
+        assert_eq!(matches, vec!["\u{00BB} beta command".to_string()],
+            "-i -wbeta must return only beta's captured input, not the current world's (alpha)");
+
+        // /recall -i (no -w) - the current world's (alpha) own input only.
+        let opts = tf::RecallOptions {
+            source: tf::RecallSource::Input,
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        };
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
+        assert_eq!(matches, vec!["\u{00BB} alpha command".to_string()],
+            "-i alone must default to the current world");
+
+        // /recall -wbeta (no -i) - beta's SERVER output only, never its captured input.
+        let opts = tf::RecallOptions {
+            world: tf::RecallWorld::Named("beta".to_string()),
+            match_style: tf::RecallMatchStyle::Simple,
+            ..tf::RecallOptions::default()
+        };
+        let matches: Vec<String> = app.recall_matches(&opts, 0).unwrap()
+            .into_iter().map(|(text, _archived)| text).collect();
+        assert_eq!(matches, vec!["beta server line".to_string()],
+            "-wbeta alone must stay server-output-only, excluding beta's own captured input");
+    }
+
     // ========== /recall -A/-B/-C: context lines ==========
 
     #[test]
@@ -2186,7 +2373,7 @@
         app.worlds.push(World::new("test"));
         app.current_world_index = 0;
         app.worlds[0].login_capture_guard = 0; // isolate the echo_masked gate specifically
-        app.worlds[0].echo_masked = true;
+        app.worlds[0].protocol.echo_masked = true;
 
         app.record_user_input(0, "hunter2");
 
@@ -2205,7 +2392,7 @@
         app.worlds.push(World::new("test"));
         app.current_world_index = 0;
         app.worlds[0].login_capture_guard = 0;
-        app.worlds[0].echo_masked = true;
+        app.worlds[0].protocol.echo_masked = true;
         app.settings.log_input_enabled = true; // the gate this would otherwise pass through
         app.worlds[0].settings.log_enabled = true;
         app.worlds[0].log_date = Some(World::get_current_date_string());
@@ -2233,7 +2420,7 @@
         app.worlds.push(World::new("test"));
         app.current_world_index = 0;
         app.worlds[0].login_capture_guard = 0;
-        app.worlds[0].echo_masked = true;
+        app.worlds[0].protocol.echo_masked = true;
 
         app.record_user_input(0, "hunter2");
 
@@ -2256,7 +2443,7 @@
         app.worlds.push(World::new("test"));
         app.current_world_index = 0;
         app.worlds[0].login_capture_guard = 0;
-        assert!(!app.worlds[0].echo_masked);
+        assert!(!app.worlds[0].protocol.echo_masked);
 
         app.record_user_input(0, "look");
 
@@ -2275,7 +2462,7 @@
         app.worlds.clear();
         app.worlds.push(World::new("test"));
         app.current_world_index = 0;
-        app.worlds[0].echo_masked = true;
+        app.worlds[0].protocol.echo_masked = true;
         app.input.buffer = "hunter2".to_string();
         app.input.cursor_position = app.input.buffer.len();
 
@@ -2296,7 +2483,7 @@
         app.worlds.clear();
         app.worlds.push(World::new("test"));
         app.current_world_index = 0;
-        assert!(!app.worlds[0].echo_masked);
+        assert!(!app.worlds[0].protocol.echo_masked);
         app.input.buffer = "look".to_string();
         app.input.cursor_position = app.input.buffer.len();
 
@@ -2324,7 +2511,7 @@
         app.worlds.clear();
         app.worlds.push(World::new("test"));
         app.current_world_index = 0;
-        app.worlds[0].echo_masked = true;
+        app.worlds[0].protocol.echo_masked = true;
         app.worlds[0].prompt = String::new();
         app.input_height = 3;
         app.input.buffer = "a中b".to_string();
@@ -2354,7 +2541,7 @@
         app.worlds.clear();
         app.worlds.push(World::new("test"));
         app.current_world_index = 0;
-        assert!(!app.worlds[0].echo_masked);
+        assert!(!app.worlds[0].protocol.echo_masked);
         app.worlds[0].prompt = String::new();
         app.input_height = 3;
         app.input.buffer = "a中b".to_string();
@@ -2393,7 +2580,7 @@
         app.current_world_index = 0;
         let hostile = "80\u{9f}\x1b[2J\nmore\rtext";
         let payload = serde_json::json!({"hp": hostile}).to_string();
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", &payload);
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", &payload);
 
         let backend = TestBackend::new(40, 3);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2420,7 +2607,7 @@
         app.current_world_index = 0;
         let huge = "x".repeat(500);
         let payload = serde_json::json!({"name": huge, "hp": "80"}).to_string();
-        app.worlds[0].stats.update_from_gmcp("Char.Status", &payload);
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Status", &payload);
 
         let backend = TestBackend::new(40, 3);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2456,7 +2643,7 @@
         let height_before = app.output_height;
 
         // First data arrives: the line appears, output_height drops by exactly 1 row.
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
         terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
         assert!(app.worlds[0].stats_line_shown, "must latch on once data arrives");
         assert_eq!(app.output_height, height_before - 1,
@@ -2464,20 +2651,20 @@
         let height_after_latch = app.output_height;
 
         // A value-only update (same fields) must not move output_height again.
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"75","maxhp":"100"}"#);
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"75","maxhp":"100"}"#);
         terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
         assert_eq!(app.output_height, height_after_latch,
             "output_height must stay fixed across a value-only update");
 
         // A NEW field appearing mid-connection (the exact "every combat round" hazard
         // D3 names) must also not move it.
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"75","maxhp":"100","mp":"30","mpmax":"50"}"#);
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"75","maxhp":"100","mp":"30","mpmax":"50"}"#);
         terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
         assert_eq!(app.output_height, height_after_latch,
             "output_height must stay fixed even when a new field appears mid-connection");
 
         // A field disappearing mid-connection must not move it either.
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"70","maxhp":"100"}"#);
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"70","maxhp":"100"}"#);
         terminal.draw(|f| rendering::ui(f, &mut app)).unwrap();
         assert_eq!(app.output_height, height_after_latch,
             "output_height must stay fixed even when a field disappears mid-connection");
@@ -2869,7 +3056,7 @@
 
         app.emit_client_text(0, "plain message", false);
         let opts = tf::RecallOptions {
-            source: tf::RecallSource::World("does-not-exist".to_string()),
+            world: tf::RecallWorld::Named("does-not-exist".to_string()),
             ..tf::RecallOptions::default()
         };
         app.emit_recall(&opts, 0, false); // exercises emit_recall's error path
@@ -3279,9 +3466,9 @@
         world.connected = true;
         world.socket_fd = Some(6);
         world.telnet_mode = true;
-        world.negotiated_encoding = Some(Encoding::Utf8);
-        world.naws_enabled = true;
-        world.naws_sent_size = Some((80, 24));
+        world.protocol.negotiated_encoding = Some(Encoding::Utf8);
+        world.protocol.naws_enabled = true;
+        world.protocol.naws_sent_size = Some((80, 24));
         world.reader_name = Some("test-reader".to_string());
         world.skip_auto_login = true;
         world.fansi_detect_until = Some(std::time::Instant::now());
@@ -3301,9 +3488,9 @@
         assert!(!world.connected);
         assert_eq!(world.socket_fd, None);
         assert!(!world.telnet_mode);
-        assert_eq!(world.negotiated_encoding, None);
-        assert!(!world.naws_enabled);
-        assert_eq!(world.naws_sent_size, None);
+        assert_eq!(world.protocol.negotiated_encoding, None);
+        assert!(!world.protocol.naws_enabled);
+        assert_eq!(world.protocol.naws_sent_size, None);
         assert_eq!(world.reader_name, None);
         assert!(!world.skip_auto_login, "skip_auto_login must reset so the next connect auto-logs in");
         assert_eq!(world.fansi_detect_until, None);
@@ -8574,6 +8761,160 @@ third
         }
     }
 
+    // --- T1.13: SSH remote console mirrors WorldAdded/WorldRemoved/WorldSettingsUpdated ---
+    // Before this fix, `handle_remote_ws_message`'s `_ => {}` catch-all silently dropped all
+    // three, so the mirror's `self.worlds` diverged from the server's the moment a world was
+    // added or removed elsewhere, and every later index-keyed message (ServerData,
+    // PromptUpdate, StatsUpdate, ClaimedNew, ...) landed on the wrong world from then on.
+
+    /// A `WorldStateMsg` for a single world named `name`, built via the real
+    /// `build_initial_state` path rather than a hand-typed literal, so these tests can't
+    /// silently drift from the actual wire format.
+    fn make_world_state_msg(name: &str) -> WorldStateMsg {
+        let mut src = App::new();
+        src.worlds = vec![World::new(name)];
+        match src.build_initial_state(0) {
+            WsMessage::InitialState { mut worlds, .. } => worlds.remove(0),
+            other => panic!("expected InitialState, got {other:?}"),
+        }
+    }
+
+    /// Mirrors app.js's `case 'WorldAdded'` index-bump rule (app.js:3869-3878):
+    ///
+    ///     const insertIndex = world.index !== undefined ? world.index : worlds.length;
+    ///     worlds.splice(insertIndex, 0, world);
+    ///     if (currentWorldIndex >= insertIndex) currentWorldIndex++;
+    ///
+    /// Inserting a world before the current one must shift `current_world_index` so it keeps
+    /// pointing at the same world, and every later index-keyed message must land on the
+    /// shifted index - not on whatever now happens to sit at the old one.
+    #[test]
+    fn test_console_mirror_world_added_shifts_names_and_bumps_current_index() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha"), World::new("beta")];
+        app.current_world_index = 0; // viewing "alpha"
+
+        let new_world = make_world_state_msg("new");
+        assert_eq!(new_world.index, 0, "sanity: single-world source app reports index 0");
+        app.handle_remote_ws_message(WsMessage::WorldAdded { world: Box::new(new_world) });
+
+        let names: Vec<&str> = app.worlds.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["new", "alpha", "beta"],
+            "inserting at index 0 must shift the existing worlds right, not overwrite one");
+        assert_eq!(app.current_world_index, 1,
+            "current_world_index (0) was >= the insertion index (0), so it must bump to keep \
+             pointing at 'alpha'");
+
+        // A ServerData for world_index 1 must now land on "alpha" - the world the user was
+        // actually looking at before the insertion - not on "new" at the stale index 0.
+        app.handle_remote_ws_message(console_server_data(1, 1, &["hello"]));
+        assert_eq!(app.worlds[1].name, "alpha");
+        assert_eq!(app.worlds[1].output_lines.last().map(|l| l.text.as_str()), Some("hello"),
+            "the line must land on the originally-current world, not wherever index 1 used to \
+             point before WorldAdded shifted everything");
+        assert!(app.worlds[0].output_lines.is_empty(), "'new' must not receive alpha's line");
+    }
+
+    /// `WorldRemoved` must reverse the same bookkeeping `WorldAdded` performs (mirror of
+    /// app.js's `case 'WorldRemoved'`, app.js:3895-3916), and the removed world must actually
+    /// be gone from the mirror, not just index-adjusted around.
+    #[test]
+    fn test_console_mirror_world_removed_reverses_indices_and_drops_the_world() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha"), World::new("beta")];
+        app.current_world_index = 0;
+
+        let new_world = make_world_state_msg("new");
+        app.handle_remote_ws_message(WsMessage::WorldAdded { world: Box::new(new_world) });
+        assert_eq!(app.worlds.len(), 3);
+        assert_eq!(app.current_world_index, 1);
+
+        app.handle_remote_ws_message(WsMessage::WorldRemoved { world_index: 0 });
+
+        let names: Vec<&str> = app.worlds.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"], "'new' must be gone, not just hidden");
+        assert_eq!(app.current_world_index, 0,
+            "removing the world before the current one must shift current_world_index back \
+             down, reversing WorldAdded's bump");
+    }
+
+    /// `WorldRemoved` for an out-of-range index, or for the last remaining world, must be
+    /// ignored - mirrors `delete_world`'s own guard, so server and mirror can never disagree
+    /// about whether a removal was legal.
+    #[test]
+    fn test_console_mirror_world_removed_ignores_out_of_range_and_last_world() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.current_world_index = 0;
+
+        app.handle_remote_ws_message(WsMessage::WorldRemoved { world_index: 0 });
+        assert_eq!(app.worlds.len(), 1, "must never drop the last remaining world");
+
+        app.worlds.push(World::new("beta"));
+        app.handle_remote_ws_message(WsMessage::WorldRemoved { world_index: 5 });
+        assert_eq!(app.worlds.len(), 2, "an out-of-range index must be ignored");
+    }
+
+    /// `WorldSettingsUpdated` must rename the mirrored world and hydrate the same
+    /// `WorldSettings` fields `world_from_state_msg` hydrates at connect time - never the
+    /// password, which this message always carries empty.
+    #[test]
+    fn test_console_mirror_world_settings_updated_renames_and_hydrates_settings() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.current_world_index = 0;
+
+        let settings = WorldSettingsMsg {
+            hostname: "example.org".to_string(),
+            port: "4000".to_string(),
+            user: "bob".to_string(),
+            password: String::new(),
+            has_password: false,
+            use_ssl: true,
+            log_enabled: true,
+            encoding: "latin1".to_string(),
+            auto_connect_type: "none".to_string(),
+            keep_alive_type: "none".to_string(),
+            keep_alive_cmd: String::new(),
+            gmcp_packages: String::new(),
+            auto_reconnect_secs: "0".to_string(),
+            has_notes: false,
+            msp_enabled: true,
+            mcp_enabled: true,
+        };
+        app.handle_remote_ws_message(WsMessage::WorldSettingsUpdated {
+            world_index: 0,
+            settings,
+            name: "renamed".to_string(),
+        });
+
+        assert_eq!(app.worlds[0].name, "renamed");
+        assert_eq!(app.worlds[0].settings.hostname, "example.org");
+        assert_eq!(app.worlds[0].settings.port, "4000");
+        assert_eq!(app.worlds[0].settings.user, "bob");
+        assert!(app.worlds[0].settings.use_ssl);
+        assert!(app.worlds[0].settings.log_enabled);
+        assert_eq!(app.worlds[0].settings.encoding, Encoding::Latin1);
+        assert!(app.worlds[0].settings.password.is_empty(),
+            "password must never be touched by this message");
+    }
+
+    /// `NotesChanged`/`PausedState` are explicit no-ops for this mirror (T1.13): it holds no
+    /// notes text and the console draws no PAUSED badge. They must not panic or otherwise
+    /// disturb the world.
+    #[test]
+    fn test_console_mirror_notes_changed_and_paused_state_are_explicit_no_ops() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.current_world_index = 0;
+        let before = app.worlds[0].name.clone();
+
+        app.handle_remote_ws_message(WsMessage::NotesChanged { world_index: 0, has_notes: true });
+        app.handle_remote_ws_message(WsMessage::PausedState { paused: true });
+
+        assert_eq!(app.worlds[0].name, before, "must be true no-ops");
+    }
+
     // --- App::resolve_quote_lines ---
     // Pins the shared /quote helper's behavior, including the world-targeting/delay-scheduling
     // support console's two call sites used to silently drop entirely (T32).
@@ -8673,7 +9014,7 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(), true, true, true,
+            String::new(), "0".to_string(), true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -8691,7 +9032,7 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), "ENC:whatever".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(), true, true, true,
+            String::new(), "0".to_string(), true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -8709,7 +9050,7 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), "newpassword".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(), true, true, true,
+            String::new(), "0".to_string(), true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -12326,7 +12667,7 @@ third
         let mut app = App::new();
         app.worlds = vec![World::new("alpha")];
         app.worlds[0].connected = true;
-        app.worlds[0].mccp2_active = true;
+        app.worlds[0].protocol.mccp2_active = true;
 
         let mut buf: Vec<u8> = Vec::new();
         crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
@@ -12338,7 +12679,7 @@ third
         let mut restored = App::new();
         crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
         let w = restored.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
-        assert!(w.mccp2_active, "the flag must survive a full save/load round trip");
+        assert!(w.protocol.mccp2_active, "the flag must survive a full save/load round trip");
     }
 
     /// The false/absent case: a plain-text world (or a state file predating this field) must
@@ -12350,7 +12691,7 @@ third
         let mut app = App::new();
         crate::persistence::load_reload_state_from_str(&mut app, state).expect("parses");
         let w = app.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
-        assert!(!w.mccp2_active);
+        assert!(!w.protocol.mccp2_active);
     }
 
     /// Job 10a (plan Phase 3, step 3.3): the actual restore-time bail-out. `run_app` and
@@ -12367,7 +12708,7 @@ third
         let mut app = App::new();
         app.worlds = vec![World::new("alpha")];
         app.worlds[0].connected = true;
-        app.worlds[0].mccp2_active = true;
+        app.worlds[0].protocol.mccp2_active = true;
         app.worlds[0].socket_fd = Some(7);
         let (cmd_tx, _cmd_rx) = mpsc::channel::<WriteCommand>(4);
         app.worlds[0].command_tx = Some(cmd_tx);
@@ -12390,7 +12731,7 @@ third
         let mut app = App::new();
         app.worlds = vec![World::new("alpha")];
         app.worlds[0].connected = true;
-        app.worlds[0].mccp2_active = true;
+        app.worlds[0].protocol.mccp2_active = true;
 
         app.apply_mccp2_reload_bailout(true);
 
@@ -12403,7 +12744,7 @@ third
         let mut app = App::new();
         app.worlds = vec![World::new("plain"), World::new("disconnected-but-compressed")];
         app.worlds[0].connected = true; // no mccp2_active - must survive untouched
-        app.worlds[1].mccp2_active = true; // not connected - nothing to disconnect
+        app.worlds[1].protocol.mccp2_active = true; // not connected - nothing to disconnect
 
         app.apply_mccp2_reload_bailout(false);
 
@@ -12423,7 +12764,7 @@ third
         app.worlds[0].connected = true;
         app.worlds[0].is_tls = true;
         app.worlds[0].proxy_pid = Some(1234);
-        app.worlds[0].mccp2_active = true;
+        app.worlds[0].protocol.mccp2_active = true;
 
         app.apply_mccp2_reload_bailout(false);
 
@@ -12438,7 +12779,7 @@ third
         app.worlds = vec![World::new("current"), World::new("background")];
         app.current_world_index = 0;
         app.worlds[1].connected = true;
-        app.worlds[1].mccp2_active = true;
+        app.worlds[1].protocol.mccp2_active = true;
         assert_eq!(app.worlds[1].unseen_lines, 0);
 
         app.apply_mccp2_reload_bailout(false);
@@ -12450,11 +12791,12 @@ third
     // ---- TinyFugue keybinding parity (plan Phase 0 P0.6) ----
     //
     // Coverage for `investigate-differences-between-tinyfugu-fluffy-stallman.md`, finding A
-    // (keybindings) and Phase 0 step P0.6. Three tests below are `#[ignore]`d: they pin bugs
-    // that Phase 1/2 fix deliberately (the `/bind Esc-<letter>` case-fold, missing `Esc-<arrow>`
-    // names, and incomplete `/dokey` name coverage). The rest are regression guards for
-    // behaviour that already works today, so Phase 2's key-grammar rewrite can't silently break
-    // one of these while adding TF's missing chords.
+    // (keybindings) and Phase 0 step P0.6. Three tests below used to be `#[ignore]`d: they
+    // pinned bugs (the `/bind Esc-<letter>` case-fold, missing `Esc-<arrow>` names, and
+    // incomplete `/dokey` name coverage) that Phase 1/2 have since fixed, so they were
+    // un-ignored — none of the tests below are `#[ignore]`d now. The rest are regression
+    // guards for behaviour that already works today, so Phase 2's key-grammar rewrite can't
+    // silently break one of these while adding TF's missing chords.
 
     fn make_key_test_app() -> App {
         let mut app = App::new();
@@ -13797,6 +14139,26 @@ third
             "Esc,x must no longer fire the unbound command; got {}", describe_key_action(&action));
     }
 
+    // ---- T2.6: RunKeyBinding.kbnum needs #[serde(default)] ----
+
+    /// Every sibling `Option` field on `WsMessage` has `#[serde(default)]`; `kbnum` didn't,
+    /// so a peer omitting it (a plain `{"type":"RunKeyBinding","key":".."}`, valid per this
+    /// field's own doc comment - "kbnum: the client's own pending numeric prefix, if any")
+    /// failed to deserialize the WHOLE message and it was silently dropped by every `if let
+    /// Ok(..)`/bare `match` receive site.
+    #[test]
+    fn test_run_key_binding_deserializes_without_kbnum() {
+        let parsed = serde_json::from_str::<WsMessage>(r#"{"type":"RunKeyBinding","key":"^X"}"#);
+        assert!(parsed.is_ok(), "kbnum must default to None when the peer omits it: {parsed:?}");
+        match parsed.unwrap() {
+            WsMessage::RunKeyBinding { key, kbnum } => {
+                assert_eq!(key, "^X");
+                assert_eq!(kbnum, None);
+            }
+            other => panic!("expected RunKeyBinding, got {other:?}"),
+        }
+    }
+
     // ---- Plan Job 22a (P2.6/P2.7): new default table + WsMessage::RunKeyBinding ----
 
     #[test]
@@ -14242,7 +14604,7 @@ third
         app.worlds.clear();
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
-        app.worlds[0].mssp_data = vec![
+        app.worlds[0].protocol.mssp_data = vec![
             ("NAME".to_string(), "Test MUD".to_string()),
             ("PLAYERS".to_string(), "3".to_string()),
         ];
@@ -14255,6 +14617,35 @@ third
             WsMessage::ServerData { data, .. } if data.contains("Test MUD") && data.contains("PLAYERS")
         ));
         assert!(found, "expected MSSP data in the output, got: {:?}", *log);
+    }
+
+    /// T1.5: `execute_mssp_command` formatted `name`/`value` straight from raw
+    /// subnegotiation bytes (`from_utf8_lossy`, never `Encoding::decode`), and the
+    /// console draw path strips only C1 controls — a raw ESC (screen clear, cursor
+    /// move, terminal-title rewrite) or BEL survived all the way to the terminal.
+    /// Same sanitize-and-cap treatment as `/stats` (see
+    /// `test_execute_stats_command_sanitizes_hostile_value` above) now applies here.
+    #[test]
+    fn test_execute_mssp_command_sanitizes_hostile_value() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(send_test_world("Alpha", true));
+        app.current_world_index = 0;
+        app.worlds[0].protocol.mssp_data = vec![
+            ("NAME".to_string(), "\x1b[2J\x1b]0;pwned\x07x".to_string()),
+        ];
+
+        execute_mssp_command(&mut app, 0, false);
+
+        let mut saw_name_line = false;
+        for line in &app.worlds[0].output_lines {
+            if line.text.contains("NAME") {
+                saw_name_line = true;
+                assert!(!line.text.contains('\x1b'), "ESC leaked into an /mssp line: {:?}", line.text);
+                assert!(!line.text.contains('\x07'), "BEL leaked into an /mssp line: {:?}", line.text);
+            }
+        }
+        assert!(saw_name_line, "expected the NAME entry to still appear (sanitized)");
     }
 
     // ---- Plan Job 4 (mud-status-display.md): /stats command ----
@@ -14284,7 +14675,7 @@ third
         app.worlds.clear();
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
 
         execute_stats_command(&mut app, 0, false);
 
@@ -14309,7 +14700,7 @@ third
         app.current_world_index = 0;
         let hostile = "80\u{9f}\x1b[2J\nmore text\rand more";
         let payload = serde_json::json!({"hp": hostile}).to_string();
-        app.worlds[0].stats.update_from_gmcp("Char.Vitals", &payload);
+        app.worlds[0].protocol.stats.update_from_gmcp("Char.Vitals", &payload);
 
         execute_stats_command(&mut app, 0, false);
 
@@ -14352,7 +14743,7 @@ third
         app.current_world_index = 0;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
         app.worlds[0].command_tx = Some(cmd_tx);
-        assert!(!app.worlds[0].msdp_enabled, "sanity: MSDP not negotiated in this test");
+        assert!(!app.worlds[0].protocol.msdp_enabled, "sanity: MSDP not negotiated in this test");
 
         execute_msdp_command(&mut app, 0, "LIST", Some("COMMANDS"), false);
 
@@ -14368,7 +14759,7 @@ third
         app.worlds.clear();
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
-        app.worlds[0].msdp_enabled = true;
+        app.worlds[0].protocol.msdp_enabled = true;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
         app.worlds[0].command_tx = Some(cmd_tx);
 
@@ -14388,7 +14779,7 @@ third
         app.worlds.clear();
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
-        app.worlds[0].msdp_enabled = true;
+        app.worlds[0].protocol.msdp_enabled = true;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
         app.worlds[0].command_tx = Some(cmd_tx);
 
@@ -14418,7 +14809,7 @@ third
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
         app.worlds[0].command_tx = Some(cmd_tx);
 
-        app.handle_gmcp_negotiated(0);
+        app.handle_telnet_event(0, &TelnetEvent::OptionEnabled(TELNET_OPT_GMCP));
 
         // First message is Core.Hello - skip it and inspect Core.Supports.Set.
         let _hello = cmd_rx.try_recv().expect("Core.Hello expected");
@@ -14440,13 +14831,13 @@ third
         app.worlds.clear();
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
-        assert!(!app.worlds[0].msdp_enabled, "sanity: not yet negotiated");
+        assert!(!app.worlds[0].protocol.msdp_enabled, "sanity: not yet negotiated");
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
         app.worlds[0].command_tx = Some(cmd_tx);
 
-        app.handle_msdp_negotiated(0);
+        app.handle_telnet_event(0, &TelnetEvent::OptionEnabled(TELNET_OPT_MSDP));
 
-        assert!(app.worlds[0].msdp_enabled, "negotiation must still flip the flag");
+        assert!(app.worlds[0].protocol.msdp_enabled, "negotiation must still flip the flag");
         match cmd_rx.try_recv() {
             Ok(WriteCommand::Raw(bytes)) => {
                 assert_eq!(bytes, crate::telnet::build_msdp_set("LIST", "REPORTABLE_VARIABLES"),
@@ -14463,11 +14854,11 @@ third
         app.worlds.clear();
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
-        app.worlds[0].msdp_enabled = true;
+        app.worlds[0].protocol.msdp_enabled = true;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(8);
         app.worlds[0].command_tx = Some(cmd_tx);
 
-        app.handle_msdp_received(0, "REPORTABLE_VARIABLES", r#"["HEALTH","HEALTH_MAX","MANA"]"#);
+        app.handle_telnet_event(0, &TelnetEvent::MsdpVariable("REPORTABLE_VARIABLES".to_string(), r#"["HEALTH","HEALTH_MAX","MANA"]"#.to_string()));
 
         for expected in ["HEALTH", "HEALTH_MAX", "MANA"] {
             match cmd_rx.try_recv() {
@@ -14479,7 +14870,7 @@ third
         }
         assert!(cmd_rx.try_recv().is_err(), "no more outbound messages expected");
         // The meta variable itself must never become a stat.
-        assert!(app.worlds[0].stats.is_empty(),
+        assert!(app.worlds[0].protocol.stats.is_empty(),
             "REPORTABLE_VARIABLES must not feed World::stats");
     }
 
@@ -14491,11 +14882,11 @@ third
         app.worlds.clear();
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
-        app.worlds[0].msdp_enabled = true;
+        app.worlds[0].protocol.msdp_enabled = true;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(8);
         app.worlds[0].command_tx = Some(cmd_tx);
 
-        app.handle_msdp_received(0, "REPORTABLE_VARIABLES", r#"["HEALTH","COMMANDS"]"#);
+        app.handle_telnet_event(0, &TelnetEvent::MsdpVariable("REPORTABLE_VARIABLES".to_string(), r#"["HEALTH","COMMANDS"]"#.to_string()));
 
         match cmd_rx.try_recv() {
             Ok(WriteCommand::Raw(bytes)) => {
@@ -14512,7 +14903,7 @@ third
         app.worlds.clear();
         app.worlds.push(send_test_world("Alpha", true));
         app.current_world_index = 0;
-        app.worlds[0].msdp_enabled = true;
+        app.worlds[0].protocol.msdp_enabled = true;
         // Deliberately far larger than any sane MUD's real variable count, and far
         // larger than the channel capacity below - the point is the cap, not the
         // channel, so give the channel generous headroom over the cap itself.
@@ -14521,7 +14912,7 @@ third
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(1000);
         app.worlds[0].command_tx = Some(cmd_tx);
 
-        app.handle_msdp_received(0, "REPORTABLE_VARIABLES", &json);
+        app.handle_telnet_event(0, &TelnetEvent::MsdpVariable("REPORTABLE_VARIABLES".to_string(), json.clone()));
 
         let mut received = Vec::new();
         while let Ok(WriteCommand::Raw(bytes)) = cmd_rx.try_recv() {
@@ -15007,29 +15398,9 @@ third
             job7_reader_test_cfg(),
         );
 
-        // Job 11 (plan Phase 3, step 3.5): `job7_reader_test_cfg()` mirrors production
-        // exactly, which now defaults `initiate_negotiation` on - so the reader's very
-        // first wire write, before any script bytes even arrive, is Clay's own opening
-        // offer (WILL TTYPE, WILL NAWS, DO CHARSET, DO GMCP, DO MSDP, DO MCCP2). Drain it
-        // here rather than let it masquerade as the reply to the script below.
-        let opening = tokio::time::timeout(Duration::from_secs(5), cmd_rx.recv())
-            .await
-            .expect("timed out waiting for the opening negotiation")
-            .expect("cmd channel closed");
-        match opening {
-            WriteCommand::Raw(bytes) => {
-                assert!(
-                    bytes.windows(3).any(|w| w == [TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP]),
-                    "initial_negotiation's DO GMCP should be this reader's first wire write"
-                );
-            }
-            WriteCommand::Text(_) => panic!("expected a Raw wire write, got Text"),
-            WriteCommand::Shutdown => panic!("expected a Raw wire write, got Shutdown"),
-            WriteCommand::SetEncoding(_) => panic!("expected a Raw wire write, got SetEncoding"),
-        }
-
-        // IAC WILL SGA, then IAC WILL GMCP + an immediate Core.Hello message -
-        // exactly the shape a real MUD sends right after connect.
+        // Clay is fully reactive: the reader must send nothing at all until the server
+        // speaks first. IAC WILL SGA, then IAC WILL GMCP + an immediate Core.Hello
+        // message - exactly the shape a real MUD sends right after connect.
         let mut script = vec![TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA];
         script.extend_from_slice(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP]);
         script.extend_from_slice(&[TELNET_IAC, TELNET_SB, TELNET_OPT_GMCP]);
@@ -15047,10 +15418,14 @@ third
                     bytes.windows(3).any(|w| w == [TELNET_IAC, TELNET_DO, TELNET_OPT_SGA]),
                     "IAC WILL SGA must be answered with IAC DO SGA on the wire, not passed through as text"
                 );
-                // No second IAC DO GMCP here: Clay already sent it in the opening offer
-                // above, and the Q method (Job 9) suppresses the repeat once the
-                // script's WILL GMCP merely confirms Clay's own request
-                // (WantYes -> Yes) rather than requesting something fresh.
+                // Since Clay never initiates, this is a fresh No -> Yes acceptance of
+                // the server's own WILL GMCP, so IAC DO GMCP is a real reply here too -
+                // both replies land in the same wire write since the whole script above
+                // arrives in a single read/feed.
+                assert!(
+                    bytes.windows(3).any(|w| w == [TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP]),
+                    "IAC WILL GMCP must be answered with IAC DO GMCP on the wire, got {bytes:?}"
+                );
             }
             WriteCommand::Text(_) => panic!("expected a Raw wire write, got Text"),
             WriteCommand::Shutdown => panic!("expected a Raw wire write, got Shutdown"),
@@ -15183,7 +15558,15 @@ third
                     app.handle_telnet_event(world_idx, ev);
                 }
             }
-            TelnetTarget::Multiuser { .. } => {}
+            // Job 9 (T3.2): route through the per-user sibling, same as every
+            // production AppEvent::Telnet dispatch site now does - this suite itself
+            // only ever drives World targets (see daemon.rs's multiuser_telnet_tests
+            // for the Multiuser-target regression net), but this helper claims to be
+            // "the exact resolution every dispatch arm performs," so it must not still
+            // silently drop a Multiuser target the way production code used to.
+            TelnetTarget::Multiuser { world_index, username } => {
+                app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
+            }
         }
     }
 
@@ -15198,17 +15581,17 @@ third
     #[test]
     fn handle_telnet_event_wont_echo_prompt_hint_sets_uses_wont_echo_prompt() {
         let mut app = telnet_event_test_app("w");
-        assert!(!app.worlds[0].uses_wont_echo_prompt);
+        assert!(!app.worlds[0].protocol.uses_wont_echo_prompt);
         dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::WontEchoPromptHint);
-        assert!(app.worlds[0].uses_wont_echo_prompt);
+        assert!(app.worlds[0].protocol.uses_wont_echo_prompt);
     }
 
     #[test]
     fn handle_telnet_event_naws_requested_sets_naws_enabled() {
         let mut app = telnet_event_test_app("w");
-        assert!(!app.worlds[0].naws_enabled);
+        assert!(!app.worlds[0].protocol.naws_enabled);
         dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::NawsRequested);
-        assert!(app.worlds[0].naws_enabled);
+        assert!(app.worlds[0].protocol.naws_enabled);
     }
 
     #[test]
@@ -15238,7 +15621,7 @@ third
         let mut app = telnet_event_test_app("w");
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
         app.worlds[0].command_tx = Some(cmd_tx);
-        assert_eq!(app.worlds[0].negotiated_encoding, None);
+        assert_eq!(app.worlds[0].protocol.negotiated_encoding, None);
 
         dispatch_telnet_event(
             &mut app,
@@ -15246,7 +15629,7 @@ third
             &TelnetEvent::CharsetRequest(vec!["UTF-8".to_string()]),
         );
 
-        assert_eq!(app.worlds[0].negotiated_encoding, Some(Encoding::Utf8));
+        assert_eq!(app.worlds[0].protocol.negotiated_encoding, Some(Encoding::Utf8));
         let expected = build_charset_accepted("UTF-8");
         match cmd_rx.try_recv() {
             Ok(WriteCommand::Raw(bytes)) => assert_eq!(bytes, expected),
@@ -15288,7 +15671,7 @@ third
         );
 
         assert_eq!(
-            app.worlds[0].negotiated_encoding,
+            app.worlds[0].protocol.negotiated_encoding,
             Some(Encoding::Latin1),
             "the explicit per-world setting must win over UTF-8, not the other way around"
         );
@@ -15323,7 +15706,7 @@ third
         );
 
         assert_eq!(
-            app.worlds[0].negotiated_encoding, None,
+            app.worlds[0].protocol.negotiated_encoding, None,
             "must not silently negotiate a different encoding than the user's explicit choice"
         );
         let expected = build_charset_rejected();
@@ -15345,7 +15728,7 @@ third
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::GmcpMessage("Core.Hello".to_string(), "{}".to_string()),
         );
-        assert_eq!(app.worlds[0].gmcp_data.get("Core.Hello"), Some(&"{}".to_string()));
+        assert_eq!(app.worlds[0].protocol.gmcp_data.get("Core.Hello"), Some(&"{}".to_string()));
     }
 
     #[test]
@@ -15356,7 +15739,7 @@ third
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::MsdpVariable("HP".to_string(), "100".to_string()),
         );
-        assert_eq!(app.worlds[0].msdp_variables.get("HP"), Some(&"100".to_string()));
+        assert_eq!(app.worlds[0].protocol.msdp_variables.get("HP"), Some(&"100".to_string()));
     }
 
     // ======================================================================
@@ -15375,7 +15758,7 @@ third
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), r#"{"hp":"80","maxhp":"100"}"#.to_string()),
         );
-        let entries = app.worlds[0].stats.entries();
+        let entries = app.worlds[0].protocol.stats.entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "hp");
         assert_eq!(
@@ -15392,7 +15775,7 @@ third
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::GmcpMessage("cHAR.Vitals".to_string(), r#"{"hp":"80"}"#.to_string()),
         );
-        assert!(!app.worlds[0].stats.is_empty(), "Char.* must feed World::stats regardless of case");
+        assert!(!app.worlds[0].protocol.stats.is_empty(), "Char.* must feed World::stats regardless of case");
     }
 
     #[test]
@@ -15410,13 +15793,13 @@ third
             );
         }
         assert!(
-            app.worlds[0].stats.is_empty(),
+            app.worlds[0].protocol.stats.is_empty(),
             "Room./Comm./Client. packages must never feed World::stats, even though they still \
             populate gmcp_data/mcmp_default_url as before"
         );
         // Confirm those handlers still ran normally (Job 1 must not change existing behaviour).
-        assert!(!app.worlds[0].gmcp_data.is_empty());
-        assert_eq!(app.worlds[0].mcmp_default_url, "https://example.com");
+        assert!(!app.worlds[0].protocol.gmcp_data.is_empty());
+        assert_eq!(app.worlds[0].protocol.mcmp_default_url, "https://example.com");
     }
 
     #[test]
@@ -15438,7 +15821,7 @@ third
             ),
         );
         assert_eq!(
-            app.worlds[0].mcmp_default_url, "https://lower.example.com",
+            app.worlds[0].protocol.mcmp_default_url, "https://lower.example.com",
             "a lower-cased Client.Media.Default must be handled like the canonical spelling"
         );
     }
@@ -15451,7 +15834,7 @@ third
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::MsdpVariable("HEALTH".to_string(), "\"100\"".to_string()),
         );
-        let entries = app.worlds[0].stats.entries();
+        let entries = app.worlds[0].protocol.stats.entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "HEALTH");
         assert_eq!(entries[0].origin, crate::stats::StatOrigin::Msdp);
@@ -15473,18 +15856,18 @@ third
             &TelnetEvent::MsdpVariable("MANA".to_string(), "\"40\"".to_string()),
         );
 
-        let alpha_entries = app.worlds[0].stats.entries();
-        let beta_entries = app.worlds[1].stats.entries();
+        let alpha_entries = app.worlds[0].protocol.stats.entries();
+        let beta_entries = app.worlds[1].protocol.stats.entries();
         assert_eq!(alpha_entries.len(), 1);
         assert_eq!(alpha_entries[0].key, "hp");
         assert_eq!(beta_entries.len(), 1);
         assert_eq!(beta_entries[0].key, "MANA");
         assert!(
-            app.worlds[0].stats.entries().iter().all(|e| e.key != "MANA"),
+            app.worlds[0].protocol.stats.entries().iter().all(|e| e.key != "MANA"),
             "beta's MSDP variable must not leak into alpha's stats"
         );
         assert!(
-            app.worlds[1].stats.entries().iter().all(|e| e.key != "hp"),
+            app.worlds[1].protocol.stats.entries().iter().all(|e| e.key != "hp"),
             "alpha's GMCP data must not leak into beta's stats"
         );
     }
@@ -15496,17 +15879,17 @@ third
     #[test]
     fn gmcp_char_update_marks_world_dirty_and_one_flush_broadcasts_it() {
         let mut app = telnet_event_test_app("w");
-        assert!(!app.worlds[0].stats_dirty, "a fresh world must not start dirty");
+        assert!(!app.worlds[0].protocol.stats_dirty, "a fresh world must not start dirty");
 
         dispatch_telnet_event(
             &mut app,
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::GmcpMessage("Char.Vitals".to_string(), r#"{"hp":"80","maxhp":"100"}"#.to_string()),
         );
-        assert!(app.worlds[0].stats_dirty, "a Char.* update must mark the world dirty");
+        assert!(app.worlds[0].protocol.stats_dirty, "a Char.* update must mark the world dirty");
 
         app.flush_dirty_stats();
-        assert!(!app.worlds[0].stats_dirty, "flushing must clear the dirty flag");
+        assert!(!app.worlds[0].protocol.stats_dirty, "flushing must clear the dirty flag");
 
         let log = app.ws_broadcast_log.lock().unwrap();
         let updates: Vec<_> = log.iter().filter(|m| matches!(m, WsMessage::StatsUpdate { .. })).collect();
@@ -15535,8 +15918,8 @@ third
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::GmcpMessage("Room.Info".to_string(), r#"{"name":"The Temple"}"#.to_string()),
         );
-        assert!(!app.worlds[0].stats_dirty, "a non-Char.* package must not mark the world dirty");
-        assert!(!app.worlds[1].stats_dirty);
+        assert!(!app.worlds[0].protocol.stats_dirty, "a non-Char.* package must not mark the world dirty");
+        assert!(!app.worlds[1].protocol.stats_dirty);
 
         app.flush_dirty_stats();
         let log = app.ws_broadcast_log.lock().unwrap();
@@ -15662,11 +16045,11 @@ third
         );
         app.flush_dirty_stats();
         app.ws_broadcast_log.lock().unwrap().clear();
-        assert!(!app.worlds[0].stats.is_empty(), "sanity check: the world must actually have stats before disconnecting");
+        assert!(!app.worlds[0].protocol.stats.is_empty(), "sanity check: the world must actually have stats before disconnecting");
 
         app.handle_disconnected(0);
-        assert!(app.worlds[0].stats.is_empty(), "clear_connection_state must clear World::stats on disconnect");
-        assert!(app.worlds[0].stats_dirty, "the clear itself must mark the world dirty so it propagates");
+        assert!(app.worlds[0].protocol.stats.is_empty(), "clear_connection_state must clear World::stats on disconnect");
+        assert!(app.worlds[0].protocol.stats_dirty, "the clear itself must mark the world dirty so it propagates");
 
         app.flush_dirty_stats();
         let log = app.ws_broadcast_log.lock().unwrap();
@@ -15685,7 +16068,7 @@ third
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::MsspData(vec![("NAME".to_string(), "Old MUD".to_string())]),
         );
-        assert_eq!(app.worlds[0].mssp_data, vec![("NAME".to_string(), "Old MUD".to_string())]);
+        assert_eq!(app.worlds[0].protocol.mssp_data, vec![("NAME".to_string(), "Old MUD".to_string())]);
 
         dispatch_telnet_event(
             &mut app,
@@ -15696,7 +16079,7 @@ third
             ]),
         );
         assert_eq!(
-            app.worlds[0].mssp_data,
+            app.worlds[0].protocol.mssp_data,
             vec![("NAME".to_string(), "New MUD".to_string()), ("PLAYERS".to_string(), "5".to_string())],
             "second MsspData event must replace, not merge with, the first"
         );
@@ -15705,25 +16088,25 @@ third
     #[test]
     fn handle_telnet_event_option_enabled_gmcp_sets_gmcp_enabled() {
         let mut app = telnet_event_test_app("w");
-        assert!(!app.worlds[0].gmcp_enabled);
+        assert!(!app.worlds[0].protocol.gmcp_enabled);
         dispatch_telnet_event(
             &mut app,
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::OptionEnabled(TELNET_OPT_GMCP),
         );
-        assert!(app.worlds[0].gmcp_enabled);
+        assert!(app.worlds[0].protocol.gmcp_enabled);
     }
 
     #[test]
     fn handle_telnet_event_option_enabled_msdp_sets_msdp_enabled() {
         let mut app = telnet_event_test_app("w");
-        assert!(!app.worlds[0].msdp_enabled);
+        assert!(!app.worlds[0].protocol.msdp_enabled);
         dispatch_telnet_event(
             &mut app,
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::OptionEnabled(TELNET_OPT_MSDP),
         );
-        assert!(app.worlds[0].msdp_enabled);
+        assert!(app.worlds[0].protocol.msdp_enabled);
     }
 
     /// `OptionEnabled`/`OptionDisabled` for any option with no `World`
@@ -15747,8 +16130,8 @@ third
     #[test]
     fn handle_telnet_event_non_actionable_variants_change_nothing() {
         let mut app = telnet_event_test_app("w");
-        let before_gmcp = app.worlds[0].gmcp_enabled;
-        let before_msdp = app.worlds[0].msdp_enabled;
+        let before_gmcp = app.worlds[0].protocol.gmcp_enabled;
+        let before_msdp = app.worlds[0].protocol.msdp_enabled;
         let before_telnet_mode = app.worlds[0].telnet_mode;
 
         for ev in [
@@ -15760,8 +16143,8 @@ third
             dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &ev);
         }
 
-        assert_eq!(app.worlds[0].gmcp_enabled, before_gmcp);
-        assert_eq!(app.worlds[0].msdp_enabled, before_msdp);
+        assert_eq!(app.worlds[0].protocol.gmcp_enabled, before_gmcp);
+        assert_eq!(app.worlds[0].protocol.msdp_enabled, before_msdp);
         assert_eq!(app.worlds[0].telnet_mode, before_telnet_mode);
     }
 
@@ -15773,9 +16156,9 @@ third
     #[test]
     fn handle_telnet_event_compression_started_sets_mccp2_active() {
         let mut app = telnet_event_test_app("w");
-        assert!(!app.worlds[0].mccp2_active);
+        assert!(!app.worlds[0].protocol.mccp2_active);
         dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::CompressionStarted);
-        assert!(app.worlds[0].mccp2_active);
+        assert!(app.worlds[0].protocol.mccp2_active);
     }
 
     /// The paired clear: the far end turned compression back off
@@ -15784,9 +16167,26 @@ third
     #[test]
     fn handle_telnet_event_compression_ended_clears_mccp2_active() {
         let mut app = telnet_event_test_app("w");
-        app.worlds[0].mccp2_active = true;
+        app.worlds[0].protocol.mccp2_active = true;
         dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::CompressionEnded);
-        assert!(!app.worlds[0].mccp2_active);
+        assert!(!app.worlds[0].protocol.mccp2_active);
+    }
+
+    /// T1.14 (plan Job 1 of investigate-differences-between-tinyfugu-fluffy-stallman.md):
+    /// a bomb-abort or inflate error used to drop the decompressor with no event at all,
+    /// leaving `mccp2_active` stuck `true` - a later reload would then bail out a
+    /// connection whose zlib stream was already gone. `CompressionFailed` must clear the
+    /// mirror exactly like `CompressionEnded` does.
+    #[test]
+    fn handle_telnet_event_compression_failed_clears_mccp2_active() {
+        let mut app = telnet_event_test_app("w");
+        app.worlds[0].protocol.mccp2_active = true;
+        dispatch_telnet_event(
+            &mut app,
+            &TelnetTarget::World("w".to_string()),
+            &TelnetEvent::CompressionFailed("corrupt".to_string()),
+        );
+        assert!(!app.worlds[0].protocol.mccp2_active);
     }
 
     /// Job 9 (finding 4, RFC 1143 Q method): `OptionDisabled` clears the
@@ -15794,37 +16194,37 @@ third
     #[test]
     fn handle_telnet_event_option_disabled_gmcp_clears_gmcp_enabled() {
         let mut app = telnet_event_test_app("w");
-        app.worlds[0].gmcp_enabled = true;
+        app.worlds[0].protocol.gmcp_enabled = true;
         dispatch_telnet_event(
             &mut app,
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::OptionDisabled(TELNET_OPT_GMCP),
         );
-        assert!(!app.worlds[0].gmcp_enabled);
+        assert!(!app.worlds[0].protocol.gmcp_enabled);
     }
 
     #[test]
     fn handle_telnet_event_option_disabled_msdp_clears_msdp_enabled() {
         let mut app = telnet_event_test_app("w");
-        app.worlds[0].msdp_enabled = true;
+        app.worlds[0].protocol.msdp_enabled = true;
         dispatch_telnet_event(
             &mut app,
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::OptionDisabled(TELNET_OPT_MSDP),
         );
-        assert!(!app.worlds[0].msdp_enabled);
+        assert!(!app.worlds[0].protocol.msdp_enabled);
     }
 
     #[test]
     fn handle_telnet_event_option_disabled_naws_clears_naws_enabled() {
         let mut app = telnet_event_test_app("w");
-        app.worlds[0].naws_enabled = true;
+        app.worlds[0].protocol.naws_enabled = true;
         dispatch_telnet_event(
             &mut app,
             &TelnetTarget::World("w".to_string()),
             &TelnetEvent::OptionDisabled(crate::telnet::TELNET_OPT_NAWS),
         );
-        assert!(!app.worlds[0].naws_enabled);
+        assert!(!app.worlds[0].protocol.naws_enabled);
     }
 
     /// Job 10b (plan Phase 3, step 3.4, finding 7): `EchoOff` (`IAC WILL ECHO`) sets
@@ -15832,18 +16232,18 @@ third
     #[test]
     fn handle_telnet_event_echo_off_sets_echo_masked() {
         let mut app = telnet_event_test_app("w");
-        assert!(!app.worlds[0].echo_masked);
+        assert!(!app.worlds[0].protocol.echo_masked);
         dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::EchoOff);
-        assert!(app.worlds[0].echo_masked);
+        assert!(app.worlds[0].protocol.echo_masked);
     }
 
     /// The paired clear: `EchoOn` (`IAC WONT ECHO`) turns masking back off.
     #[test]
     fn handle_telnet_event_echo_on_clears_echo_masked() {
         let mut app = telnet_event_test_app("w");
-        app.worlds[0].echo_masked = true;
+        app.worlds[0].protocol.echo_masked = true;
         dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), &TelnetEvent::EchoOn);
-        assert!(!app.worlds[0].echo_masked);
+        assert!(!app.worlds[0].protocol.echo_masked);
     }
 
     /// `handle_echo_mask_changed` only broadcasts `EchoMaskChanged` on an actual state
@@ -15891,7 +16291,7 @@ third
         let mut app = telnet_event_test_app("consoleworld");
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
         app.worlds[0].command_tx = Some(cmd_tx);
-        assert_eq!(app.worlds[0].negotiated_encoding, None);
+        assert_eq!(app.worlds[0].protocol.negotiated_encoding, None);
 
         // The exact AppEvent value run_app_headless's event loop receives on
         // its channel for a real `IAC SB CHARSET REQUEST ";UTF-8" IAC SE`.
@@ -15908,13 +16308,15 @@ third
                         app.handle_telnet_event(world_idx, ev);
                     }
                 }
-                TelnetTarget::Multiuser { .. } => {}
+                TelnetTarget::Multiuser { world_index, username } => {
+                    app.handle_multiuser_telnet_event(*world_index, username.clone(), ev);
+                }
             },
             _ => panic!("constructed an AppEvent::Telnet above"),
         }
 
         assert_eq!(
-            app.worlds[0].negotiated_encoding,
+            app.worlds[0].protocol.negotiated_encoding,
             Some(Encoding::Utf8),
             "CharsetRequested must reach handle_charset_requested on the console-reload path"
         );
@@ -15950,7 +16352,7 @@ third
         for ev in &will_outcome.events {
             dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), ev);
         }
-        assert!(app.worlds[0].gmcp_enabled, "WILL GMCP must have enabled the mirror");
+        assert!(app.worlds[0].protocol.gmcp_enabled, "WILL GMCP must have enabled the mirror");
 
         let wont_outcome = session.feed(&[TELNET_IAC, TELNET_WONT, TELNET_OPT_GMCP]);
         assert!(
@@ -15960,7 +16362,7 @@ third
         for ev in &wont_outcome.events {
             dispatch_telnet_event(&mut app, &TelnetTarget::World("w".to_string()), ev);
         }
-        assert!(!app.worlds[0].gmcp_enabled, "WONT GMCP must clear gmcp_enabled");
+        assert!(!app.worlds[0].protocol.gmcp_enabled, "WONT GMCP must clear gmcp_enabled");
     }
 
     /// `World::clear_connection_state` (finding 4's paired App-side fix): a
@@ -15975,19 +16377,19 @@ third
         let mut world = World::new("w");
         world.connected = true;
         world.telnet_mode = true;
-        world.gmcp_enabled = true;
-        world.msdp_enabled = true;
-        world.gmcp_supported_packages = vec!["Core".to_string(), "Char".to_string()];
-        world.msdp_variables.insert("HP".to_string(), "100".to_string());
-        world.gmcp_data.insert("Core.Hello".to_string(), "{}".to_string());
-        world.mcmp_default_url = "https://example.com/media".to_string();
-        world.uses_wont_echo_prompt = true;
-        world.naws_enabled = true;
-        world.negotiated_encoding = Some(Encoding::Utf8);
-        world.mccp2_active = true;
-        world.echo_masked = true;
-        world.mssp_data = vec![("NAME".to_string(), "Some MUD".to_string())];
-        world.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
+        world.protocol.gmcp_enabled = true;
+        world.protocol.msdp_enabled = true;
+        world.protocol.gmcp_supported_packages = vec!["Core".to_string(), "Char".to_string()];
+        world.protocol.msdp_variables.insert("HP".to_string(), "100".to_string());
+        world.protocol.gmcp_data.insert("Core.Hello".to_string(), "{}".to_string());
+        world.protocol.mcmp_default_url = "https://example.com/media".to_string();
+        world.protocol.uses_wont_echo_prompt = true;
+        world.protocol.naws_enabled = true;
+        world.protocol.negotiated_encoding = Some(Encoding::Utf8);
+        world.protocol.mccp2_active = true;
+        world.protocol.echo_masked = true;
+        world.protocol.mssp_data = vec![("NAME".to_string(), "Some MUD".to_string())];
+        world.protocol.stats.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
         world.stats_line_shown = true;
         world.mirrored_stats = vec![crate::stats::StatEntry {
             key: "hp".to_string(),
@@ -15999,25 +16401,129 @@ third
 
         assert!(!world.connected);
         assert!(!world.telnet_mode);
-        assert!(!world.naws_enabled);
-        assert_eq!(world.negotiated_encoding, None);
-        assert!(!world.gmcp_enabled, "gmcp_enabled must be cleared on reconnect");
-        assert!(!world.msdp_enabled, "msdp_enabled must be cleared on reconnect");
-        assert!(world.gmcp_supported_packages.is_empty(), "gmcp_supported_packages must be cleared");
-        assert!(world.msdp_variables.is_empty(), "msdp_variables must be cleared");
-        assert!(world.gmcp_data.is_empty(), "gmcp_data must be cleared");
-        assert!(world.mcmp_default_url.is_empty(), "mcmp_default_url must be cleared");
-        assert!(!world.uses_wont_echo_prompt, "uses_wont_echo_prompt must be cleared");
-        assert!(!world.mccp2_active, "mccp2_active must be cleared on reconnect - a fresh \
+        assert!(!world.protocol.naws_enabled);
+        assert_eq!(world.protocol.negotiated_encoding, None);
+        assert!(!world.protocol.gmcp_enabled, "gmcp_enabled must be cleared on reconnect");
+        assert!(!world.protocol.msdp_enabled, "msdp_enabled must be cleared on reconnect");
+        assert!(world.protocol.gmcp_supported_packages.is_empty(), "gmcp_supported_packages must be cleared");
+        assert!(world.protocol.msdp_variables.is_empty(), "msdp_variables must be cleared");
+        assert!(world.protocol.gmcp_data.is_empty(), "gmcp_data must be cleared");
+        assert!(world.protocol.mcmp_default_url.is_empty(), "mcmp_default_url must be cleared");
+        assert!(!world.protocol.uses_wont_echo_prompt, "uses_wont_echo_prompt must be cleared");
+        assert!(!world.protocol.mccp2_active, "mccp2_active must be cleared on reconnect - a fresh \
             connection has no decompressor, and leaving this set would wrongly disconnect \
             the world on the next hot reload even though it is no longer compressed");
-        assert!(!world.echo_masked, "echo_masked must be cleared on reconnect - a masked \
+        assert!(!world.protocol.echo_masked, "echo_masked must be cleared on reconnect - a masked \
             prompt from the previous connection must not keep hiding ordinary input typed \
             on the next one");
-        assert!(world.mssp_data.is_empty(), "mssp_data must be cleared on reconnect (Job 12)");
-        assert!(world.stats.is_empty(), "stats must be cleared on reconnect (mud-status-display.md Job 1) - \
+        assert!(world.protocol.mssp_data.is_empty(), "mssp_data must be cleared on reconnect (Job 12)");
+        assert!(world.protocol.stats.is_empty(), "stats must be cleared on reconnect (mud-status-display.md Job 1) - \
             a status display must not keep showing a previous connection's vitals");
         assert!(!world.stats_line_shown, "stats_line_shown must be cleared on disconnect (Job 4/D3) - \
             a real disconnect is the one thing allowed to take the fixed status line back to 0 rows");
         assert!(world.mirrored_stats.is_empty(), "mirrored_stats must be cleared on disconnect (Job 4)");
+    }
+
+    /// T1.7 / Job 4: 20 rapid `!!SOUND(...)` triggers for a file that exists must never
+    /// accumulate more than `App::MAX_CONCURRENT_MSP_SOUNDS` (8) live `media_processes`
+    /// entries, and once the spawned children have actually exited, one more trigger
+    /// must reap them all away, leaving only the newest. `player_cmd: "true"` is a real
+    /// command (exits immediately, success) rather than a fake name, so this exercises
+    /// the real `Child::spawn`/`try_wait` path `PlayHandle::ExternalProcess` wraps.
+    #[cfg(unix)]
+    #[test]
+    fn msp_sound_triggers_are_bounded_and_reaped() {
+        let mut app = App::new();
+        app.audio_backend = crate::audio::AudioBackend::External { player_cmd: "true".to_string() };
+        let dir = std::env::temp_dir().join(format!("clay_msp_bounds_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test media dir");
+        std::fs::write(dir.join("bell.wav"), b"RIFF....").expect("write test media file");
+        app.media_cache_dir = dir.clone();
+        app.current_world_index = 0;
+
+        let trigger = crate::telnet::MspTrigger {
+            is_music: false,
+            off: false,
+            name: "bell.wav".to_string(),
+            volume: 100,
+            loops: 1,
+            priority: 50,
+            media_type: None,
+            url: None,
+        };
+
+        for _ in 0..20 {
+            app.handle_msp_trigger(0, &trigger);
+        }
+
+        let sound_count = app.media_processes.keys().filter(|k| k.starts_with("msp:sound:")).count();
+        assert!(
+            sound_count <= App::MAX_CONCURRENT_MSP_SOUNDS,
+            "expected at most {} concurrent MSP sounds, got {sound_count}",
+            App::MAX_CONCURRENT_MSP_SOUNDS
+        );
+
+        // Give the spawned `true` children time to actually exit before the next
+        // trigger's reap runs, so this proves reaping (not just capping).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        app.handle_msp_trigger(0, &trigger);
+        let sound_count_after = app.media_processes.keys().filter(|k| k.starts_with("msp:sound:")).count();
+        assert_eq!(
+            sound_count_after, 1,
+            "expected reaping to drop every finished entry, leaving only the newest trigger"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1.7 / Job 4: the URL/GMCP-download landing point (`App::on_media_file_ready`,
+    /// shared by all three previously-inline `AppEvent::MediaFileReady` bodies) must
+    /// enforce the same `MAX_CONCURRENT_MSP_SOUNDS` cap as the MSP local-file path -
+    /// otherwise consolidating the three loops into one function would have quietly
+    /// dropped the bound for exactly the path (`U=` triggers) the plan calls out as
+    /// missed by the original T1.7 finding.
+    #[cfg(unix)]
+    #[test]
+    fn on_media_file_ready_enforces_the_same_sound_cap() {
+        let mut app = App::new();
+        app.audio_backend = crate::audio::AudioBackend::External { player_cmd: "true".to_string() };
+        let dir = std::env::temp_dir().join(format!("clay_msp_url_bounds_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test media dir");
+        let file_path = dir.join("bell.wav");
+        std::fs::write(&file_path, b"RIFF....").expect("write test media file");
+
+        for n in 0..20u64 {
+            app.on_media_file_ready(0, format!("msp:sound:0:{n}"), file_path.clone(), 100, 1, false);
+        }
+
+        let sound_count = app.media_processes.keys().filter(|k| k.starts_with("msp:sound:")).count();
+        assert!(
+            sound_count <= App::MAX_CONCURRENT_MSP_SOUNDS,
+            "on_media_file_ready must enforce the same cap as handle_msp_trigger, got {sound_count}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1.7 / Job 4: `on_media_file_ready` (and therefore `audio::play_file`, which it
+    /// always calls) must not register anything for a path that doesn't exist - this is
+    /// the "N triggers for a missing file = N live child processes" half of T1.7. No
+    /// `media_processes` entry should appear at all.
+    #[test]
+    fn on_media_file_ready_ignores_nonexistent_file() {
+        let mut app = App::new();
+        app.audio_backend = crate::audio::AudioBackend::External { player_cmd: "true".to_string() };
+        let before = app.media_processes.len();
+        app.on_media_file_ready(
+            0,
+            "msp:sound:0:1".to_string(),
+            std::path::PathBuf::from("/nonexistent/clay_msp_test_missing.wav"),
+            100,
+            1,
+            false,
+        );
+        assert_eq!(app.media_processes.len(), before, "a missing file must never be registered");
     }

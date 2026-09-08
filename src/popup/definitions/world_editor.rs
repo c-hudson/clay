@@ -23,7 +23,6 @@ pub const WORLD_FIELD_KEEP_ALIVE: FieldId = FieldId(18);
 pub const WORLD_FIELD_KEEP_ALIVE_CMD: FieldId = FieldId(19);
 pub const WORLD_FIELD_GMCP_PACKAGES: FieldId = FieldId(20);
 pub const WORLD_FIELD_AUTO_RECONNECT: FieldId = FieldId(21);
-pub const WORLD_FIELD_INITIATE_NEGOTIATION: FieldId = FieldId(22);
 pub const WORLD_FIELD_MSP_ENABLED: FieldId = FieldId(23);
 pub const WORLD_FIELD_MCP_ENABLED: FieldId = FieldId(24);
 // Field IDs - Slack
@@ -124,7 +123,6 @@ pub struct WorldSettings {
     pub keep_alive_cmd: String,
     pub gmcp_packages: String,
     pub auto_reconnect_secs: String,
-    pub initiate_negotiation: bool,
     pub msp_enabled: bool,
     pub mcp_enabled: bool,
     // Slack
@@ -240,11 +238,6 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             WORLD_FIELD_AUTO_RECONNECT,
             "Reconnect",
             FieldKind::text(&settings.auto_reconnect_secs),
-        ))
-        .with_field(Field::new(
-            WORLD_FIELD_INITIATE_NEGOTIATION,
-            "Negotiate",
-            FieldKind::toggle(settings.initiate_negotiation),
         ))
         .with_field(Field::new(
             WORLD_FIELD_MSP_ENABLED,
@@ -374,13 +367,6 @@ fn world_editor_help_text() -> Vec<String> {
         "  web,30 = both. Only reconnects if the world had",
         "  been connected at least once.",
         "",
-        "Negotiate: Send Clay's opening telnet offer (terminal",
-        "  type, window size, CHARSET, GMCP, MSDP, MCCP2,",
-        "  MSSP, and MSP if MSP Sound is on) at connect time",
-        "  instead of waiting for the server to ask first.",
-        "  Turn off if a server reacts badly to being spoken",
-        "  to before it speaks.",
-        "",
         "MSP Sound: Play !!SOUND(...)/!!MUSIC(...) triggers the",
         "  MUD sends in its output (MUD Sound Protocol). Turn",
         "  off to ignore them completely - no sound is played",
@@ -401,7 +387,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT, WORLD_FIELD_USER, WORLD_FIELD_PASSWORD,
         WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_ENCODING,
         WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
-        WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_INITIATE_NEGOTIATION, WORLD_FIELD_MSP_ENABLED,
+        WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_MSP_ENABLED,
         WORLD_FIELD_MCP_ENABLED,
     ];
 
@@ -471,11 +457,8 @@ mod tests {
         assert!(state.field(WORLD_FIELD_HOSTNAME).unwrap().visible);
         // Slack fields should be hidden
         assert!(!state.field(WORLD_FIELD_SLACK_TOKEN).unwrap().visible);
-        // Job 11 (plan Phase 3, step 3.5): the negotiation toggle is a telnet-only
-        // concept, so it's visible for MUD like WORLD_FIELD_USE_SSL, not
-        // universally like WORLD_FIELD_LOG_ENABLED.
-        assert!(state.field(WORLD_FIELD_INITIATE_NEGOTIATION).unwrap().visible);
-        // Job 14 (plan Phase 4): same reasoning - MSP is a telnet-only concept.
+        // Job 14 (plan Phase 4): MSP is a telnet-only concept, so it's visible for
+        // MUD like WORLD_FIELD_USE_SSL, not universally like WORLD_FIELD_LOG_ENABLED.
         assert!(state.field(WORLD_FIELD_MSP_ENABLED).unwrap().visible);
         // Job 15 (plan Phase 4): same reasoning - MCP is a telnet-only concept.
         assert!(state.field(WORLD_FIELD_MCP_ENABLED).unwrap().visible);
@@ -498,7 +481,6 @@ mod tests {
         assert!(state.field(WORLD_FIELD_SLACK_CHANNEL).unwrap().visible);
         // MUD fields should be hidden
         assert!(!state.field(WORLD_FIELD_HOSTNAME).unwrap().visible);
-        assert!(!state.field(WORLD_FIELD_INITIATE_NEGOTIATION).unwrap().visible);
         assert!(!state.field(WORLD_FIELD_MSP_ENABLED).unwrap().visible);
         assert!(!state.field(WORLD_FIELD_MCP_ENABLED).unwrap().visible);
     }

@@ -1647,9 +1647,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 // `eof_emits_unified_close_message_then_disconnected` test).
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for
-                                    // Clay's opening negotiation offer, default on.
-                                    initiate_negotiation: app.current_world().settings.initiate_negotiation,
                                     msp_enabled: app.current_world().settings.msp_enabled,
                                     // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path -
                                     // only reached when use_ssl is true.
@@ -1771,9 +1768,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 // note; re-checked on the Windows VM after Job 7).
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    // Job 11 (plan Phase 3, step 3.5): per-world escape hatch for
-                                    // Clay's opening negotiation offer, default on.
-                                    initiate_negotiation: app.current_world().settings.initiate_negotiation,
                                     msp_enabled: app.current_world().settings.msp_enabled,
                                     // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path -
                                     // only reached when use_ssl is true.
@@ -1814,10 +1808,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             let connect_port = port.clone();
             let connect_use_ssl = use_ssl;
             let event_tx_connect = event_tx.clone();
-            // Job 11 (plan Phase 3, step 3.5): captured before the spawn since this task has
-            // no `app` access - see the other two commands.rs sites for the direct-access form.
-            let initiate_negotiation = app.current_world().settings.initiate_negotiation;
-            // Job 14 (plan Phase 4): same reasoning, for TelnetConfig::msp_enabled.
+            // Job 14 (plan Phase 4): captured before the spawn since this task has no
+            // `app` access - for TelnetConfig::msp_enabled.
             let msp_enabled = app.current_world().settings.msp_enabled;
             // Job 13 (plan Phase 4, 4.4): same reasoning, for spawn_telnet_writer's
             // initial encoding.
@@ -1994,9 +1986,6 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 // decompressed MCCP2) gained.
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
-                                    // Job 11 (plan Phase 3, step 3.5): captured above the spawn -
-                                    // no `app` access inside this task.
-                                    initiate_negotiation,
                                     msp_enabled,
                                     // Job 12 (plan Phase 4, 4.1): `is_tls` here is the bool the
                                     // connection_result match just destructured (true for the TLS
@@ -2449,8 +2438,12 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 app.emit_tf_error(world_idx, &err, false);
                             }
                             tf::TfCommandResult::SendToMud(text) => {
-                                if let Some(tx) = &app.current_world().command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(text));
+                                // send_to_world captures via capture_sent_line - an
+                                // action's command list is the "sent by triggers/actions"
+                                // case /recall -i now covers.
+                                let world_idx = app.current_world_index;
+                                if app.worlds[world_idx].command_tx.is_some() {
+                                    app.send_to_world(world_idx, text);
                                     sent_to_server = true;
                                 } else {
                                     app.add_output("Not connected. Use /worlds to connect.");
@@ -2472,9 +2465,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                         tf::QuoteDisposition::Send => {
                                             if target_idx < app.worlds.len() && app.worlds[target_idx].command_tx.is_some() {
                                                 for line in resolved_lines {
-                                                    if let Some(tx) = &app.worlds[target_idx].command_tx {
-                                                        let _ = tx.try_send(WriteCommand::Text(line));
-                                                    }
+                                                    app.send_to_world(target_idx, line);
                                                 }
                                                 sent_to_server = true;
                                             } else {
@@ -2497,9 +2488,12 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                             _ => {}
                         }
                     } else {
-                        // Plain text - send to server if connected
-                        if let Some(tx) = &app.current_world().command_tx {
-                            let _ = tx.try_send(WriteCommand::Text(cmd_str.clone()));
+                        // Plain text - send to server if connected (captured via
+                        // send_to_world too - an action's command list entry with no
+                        // leading '/' is the common case for a simple action).
+                        let world_idx = app.current_world_index;
+                        if app.worlds[world_idx].command_tx.is_some() {
+                            app.send_to_world(world_idx, cmd_str);
                             sent_to_server = true;
                         } else {
                             app.add_output(&format!("Not connected. Cannot send: {}", cmd_str));
@@ -2573,10 +2567,13 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             }
         }
         Command::NotACommand { text } => {
-            // Not a command - send to MUD as regular input
-            if let Some(tx) = &app.current_world().command_tx {
-                let _ = tx.try_send(WriteCommand::Text(text));
-                app.current_world_mut().last_send_time = Some(std::time::Instant::now());
+            // Not a command - send to MUD as regular input. Via send_to_world (captures
+            // via capture_sent_line) rather than a raw tx.try_send: this arm is reached
+            // both by genuinely typed input and by TF's dokey()/kbgoto()-driven
+            // SendCommand simulation, so it must capture like every other send site.
+            let world_idx = app.current_world_index;
+            if app.send_to_world(world_idx, text) {
+                app.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
             }
         }
         Command::Unknown { cmd } => {
@@ -2641,12 +2638,11 @@ pub(crate) fn process_pending_tf_commands(app: &mut App) {
             app.current_world_index
         };
 
-        // Send command to the world
+        // Send command to the world. via send_to_world_and_mark_sent so it captures
+        // via capture_sent_line - a TF macro's queued send is exactly the "TF hooks"/
+        // macro-body case /recall -i now covers.
         if world_idx < app.worlds.len() && app.worlds[world_idx].connected {
-            if let Some(tx) = &app.worlds[world_idx].command_tx {
-                let _ = tx.try_send(WriteCommand::Text(cmd.command.clone()));
-                app.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
-            }
+            app.send_to_world_and_mark_sent(world_idx, cmd.command.clone());
         }
     }
 }
@@ -2883,6 +2879,11 @@ pub(crate) fn execute_send_command(
         if let Some(tx) = &app.worlds[idx].command_tx {
             if tx.try_send(make_write_cmd(text)).is_ok() {
                 app.worlds[idx].last_send_time = Some(std::time::Instant::now());
+                // Capture directly (not send_to_world: that always frames a
+                // WriteCommand::Text, but -n/no_newline above sends Raw bytes instead) -
+                // /send is the single shared implementation for all three interfaces, so
+                // this one call covers typed AND trigger-issued /send alike.
+                app.capture_sent_line(idx, text);
                 sent_count += 1;
             }
         }
@@ -3090,7 +3091,7 @@ pub(crate) fn execute_mssp_command(app: &mut App, world_idx: usize, is_daemon_mo
     if world_idx >= app.worlds.len() {
         return;
     }
-    let pairs = app.worlds[world_idx].mssp_data.clone();
+    let pairs = app.worlds[world_idx].protocol.mssp_data.clone();
     if pairs.is_empty() {
         app.emit_client_text(
             world_idx,
@@ -3103,6 +3104,13 @@ pub(crate) fn execute_mssp_command(app: &mut App, world_idx: usize, is_daemon_mo
     lines.push("MSSP Server Status:".to_string());
     lines.push("\u{2500}".repeat(50));
     for (name, value) in &pairs {
+        // T1.5: `name`/`value` are raw subnegotiation bytes (`from_utf8_lossy`, never
+        // through `Encoding::decode`), and the console draw path strips only C1 — a
+        // raw ESC would otherwise reach the terminal (clear screen, move the cursor,
+        // rewrite the title). Same treatment as `execute_stats_command` above, for the
+        // same reason.
+        let name = stats::sanitize_and_cap(name, stats::MAX_STAT_FIELD_WIDTH);
+        let value = stats::sanitize_and_cap(value, stats::MAX_STAT_FIELD_WIDTH);
         lines.push(format!("{:<24} {}", name, value));
     }
     app.emit_client_lines(world_idx, &lines, is_daemon_mode);
@@ -3185,7 +3193,7 @@ pub(crate) fn execute_msdp_command(
     if world_idx >= app.worlds.len() {
         return;
     }
-    if !app.worlds[world_idx].msdp_enabled {
+    if !app.worlds[world_idx].protocol.msdp_enabled {
         app.emit_client_text(
             world_idx,
             "MSDP has not been negotiated on this connection - nothing sent.",

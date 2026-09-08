@@ -17,13 +17,31 @@
 #   --mssp   answer DO MSSP with WILL MSSP and send one MSSP block on connect
 #   --quiet  suppress the numbered filler lines (structured data only)
 #
+# Bug-hunt scenario flags (plan: bug hunt after v1.6.1, Verification section). Each is a
+# one-shot hostile or awkward behaviour a real server could exhibit; default off.
+#   --mccp2-garbage      answer DO MCCP2 with WILL, send IAC SB MCCP2 IAC SE, then stream
+#                        non-zlib bytes forever (T1.1: Clay must disconnect, not retain)
+#   --mccp2-bomb         same activation, then a real zlib stream inflating to 16 MiB of
+#                        zeros (T1.14: bomb guard must disconnect, not desync)
+#   --mccp2-unrequested  answer DO MCCP2 with WONT, then send IAC SB MCCP2 IAC SE anyway
+#                        followed by plaintext (T1.2: Clay must ignore it and stay up)
+#   --mssp-hostile       MSSP NAME value carrying ESC sequences (T1.5: /mssp must not
+#                        reach the terminal unsanitized)
+#   --msp-split=MS       send "Hello !!SOU", sleep MS ms, send "ND(bell.wav)\r\n"
+#                        (T2.1/T2.2: the trigger must still be recognised, never shown)
+#   --csi-split=MS       send "prompt> \x1b[3", sleep MS ms, send "1m" (T2.2: no stray "[3")
+#   --prompt-bang        send "Enter your name!" with no newline and no GA (T2.2: the "!"
+#                        must be displayed after the idle flush, not held as an MSP prefix)
+#   --will-echo          send IAC WILL ECHO before the prompt (T1.8: masking survives
+#                        /reload)
+#
 # Note: payload bytes are not IAC-doubled here. A real server must double a 0xFF inside a
 # subnegotiation; none of the fixtures below contain one, so this stays correct for its purpose.
-import socket, threading, time, sys, json, argparse
+import socket, threading, time, sys, json, argparse, zlib
 
 IAC, SE, SB, WILL, WONT, DO, DONT = 255, 240, 250, 251, 252, 253, 254
 OPT_TTYPE, OPT_NAWS, OPT_CHARSET, OPT_MSDP, OPT_MSSP = 24, 31, 42, 69, 70
-OPT_MCCP2, OPT_MSP, OPT_GMCP, OPT_EOR, OPT_SGA = 86, 90, 201, 25, 3
+OPT_MCCP2, OPT_MSP, OPT_GMCP, OPT_EOR, OPT_SGA, OPT_ECHO = 86, 90, 201, 25, 3, 1
 MSDP_VAR, MSDP_VAL, MSDP_TABLE_OPEN, MSDP_TABLE_CLOSE, MSDP_ARRAY_OPEN, MSDP_ARRAY_CLOSE = 1, 2, 3, 4, 5, 6
 
 # The variables this fake server is willing to report if asked - answered verbatim to a
@@ -37,6 +55,16 @@ ap.add_argument("--gmcp", action="store_true")
 ap.add_argument("--msdp", action="store_true")
 ap.add_argument("--mssp", action="store_true")
 ap.add_argument("--quiet", action="store_true")
+ap.add_argument("--mccp2-garbage", action="store_true")
+ap.add_argument("--mccp2-bomb", action="store_true")
+ap.add_argument("--mccp2-unrequested", action="store_true")
+ap.add_argument("--mssp-hostile", action="store_true")
+ap.add_argument("--msp-split", type=int, default=None, metavar="MS")
+ap.add_argument("--csi-split", type=int, default=None, metavar="MS")
+ap.add_argument("--prompt-bang", action="store_true")
+ap.add_argument("--will-echo", action="store_true")
+ap.add_argument("--offer", action="store_true", help="server-INITIATED negotiation: send WILL/DO offers on connect (models a real MUD; lets a fully-reactive client respond)")
+ap.add_argument("--rxlog", default=None, metavar="PATH", help="append hex of every byte received from the client to PATH (to prove a reactive client sends nothing unsolicited)")
 args = ap.parse_args()
 
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -165,9 +193,16 @@ def negotiate(c, data, state):
         if cmd in (WILL, WONT, DO, DONT) and i + 2 < len(data):
             opt = data[i + 2]
             if cmd == DO:                  # peer asks us to enable `opt`
+                # A DO for something WE already offered via WILL (e.g. ECHO in the
+                # --will-echo scenario) is the client confirming, not requesting -
+                # replying WONT here would tear the option straight back down.
+                if opt in state.get("offered_will", set()):
+                    i += 3
+                    continue
                 enabled = ((opt == OPT_GMCP and args.gmcp)
                            or (opt == OPT_MSDP and args.msdp)
-                           or (opt == OPT_MSSP and args.mssp))
+                           or (opt == OPT_MSSP and args.mssp)
+                           or (opt == OPT_MCCP2 and (args.mccp2_garbage or args.mccp2_bomb)))
                 out += bytes([IAC, WILL if enabled else WONT, opt])
                 if enabled:
                     state.setdefault("on", set()).add(opt)
@@ -180,15 +215,35 @@ def negotiate(c, data, state):
     return out
 
 
+def rxlog(data):
+    if args.rxlog and data:
+        with open(args.rxlog, "ab") as f:
+            f.write(data)
+
+def server_offer():
+    """Server-INITIATED negotiation (the standard MUD model): the server announces
+    its options; a reactive client responds. TTYPE/NAWS are asked via DO; GMCP/MSDP/
+    MSSP/MCCP2/MSP are announced via WILL."""
+    out = bytes([IAC, DO, OPT_TTYPE, IAC, DO, OPT_NAWS])
+    if args.gmcp: out += bytes([IAC, WILL, OPT_GMCP])
+    if args.msdp: out += bytes([IAC, WILL, OPT_MSDP])
+    if args.mssp: out += bytes([IAC, WILL, OPT_MSSP])
+    return out
+
 def handle(c):
     state = {}
     try:
         c.settimeout(0.2)
         n, hp, sent_mssp = 0, 1000, False
+        if args.offer:
+            # Give a reactive client a beat to prove it stays silent first, then offer.
+            time.sleep(0.5)
+            c.sendall(server_offer())
         for burst in range(400):
             try:
                 data = c.recv(4096)
                 if data:
+                    rxlog(data)
                     reply = negotiate(c, data, state)
                     if reply:
                         c.sendall(reply)
@@ -201,9 +256,52 @@ def handle(c):
             chunk = b""
 
             if args.mssp and OPT_MSSP in on and not sent_mssp:
-                chunk += mssp([("NAME", "Fake Test MUD"), ("PLAYERS", 3),
+                name = "Fake Test MUD"
+                if args.mssp_hostile:
+                    # Screen clear + cursor home + title rewrite: if any of this reaches the
+                    # terminal from /mssp, the sanitizer is missing.
+                    name = "\x1b[2J\x1b[1;1H\x1b]0;pwned\x07Fake Test MUD"
+                chunk += mssp([("NAME", name), ("PLAYERS", 3),
                                ("UPTIME", int(time.time())), ("CODEBASE", "fake-mud-server.py")])
                 sent_mssp = True
+
+            # ---- one-shot bug-hunt scenarios, fired on the second burst so Clay's
+            # opening negotiation has been answered first ----
+            if burst == 1 and not state.get("scenario_done"):
+                state["scenario_done"] = True
+                if args.will_echo:
+                    state.setdefault("offered_will", set()).add(OPT_ECHO)
+                    c.sendall(bytes([IAC, WILL, OPT_ECHO]) + b"Password: ")
+                if args.prompt_bang:
+                    c.sendall(b"Enter your name!")          # no newline, no GA
+                if args.msp_split is not None:
+                    c.sendall(b"Hello !!SOU")
+                    time.sleep(args.msp_split / 1000.0)
+                    c.sendall(b"ND(bell.wav)\r\n")
+                if args.csi_split is not None:
+                    c.sendall(b"prompt> \x1b[3")
+                    time.sleep(args.csi_split / 1000.0)
+                    c.sendall(b"1m")
+                if args.mccp2_unrequested:
+                    # WONT was already answered above (flag not in the enabled set), so
+                    # this SB is unrequested. Clay must ignore it and keep showing text.
+                    c.sendall(sb(OPT_MCCP2, b"") + b"STILL PLAINTEXT after unrequested SB\r\n")
+
+            # ---- compression takeover: after this, nothing plaintext is sent again ----
+            if (args.mccp2_garbage or args.mccp2_bomb) and OPT_MCCP2 in on \
+                    and not state.get("compressing"):
+                state["compressing"] = True
+                c.sendall(chunk + sb(OPT_MCCP2, b""))
+                if args.mccp2_bomb:
+                    # ~16 KiB on the wire, 16 MiB inflated: trips Clay's 4 MiB bomb guard.
+                    c.sendall(zlib.compress(b"\0" * (16 * 1024 * 1024), 9))
+                else:
+                    # Not zlib. A real inflate error on the very first bytes.
+                    import os
+                    while True:
+                        c.sendall(os.urandom(65536))
+                        time.sleep(1.0)
+                return
 
             if not args.quiet:
                 for _ in range(5):

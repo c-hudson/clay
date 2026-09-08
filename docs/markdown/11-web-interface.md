@@ -16,7 +16,7 @@ Set up either secure (recommended) or non-secure WebSocket:
 
 **Secure WebSocket (wss://):**
 - Enable "WS enabled"
-- Set "WS port" (default: 9002)
+- Set "WS port" (default: 9000)
 - Set "WS password" (required)
 - Optionally configure TLS certificate/key
 

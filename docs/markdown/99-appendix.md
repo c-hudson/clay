@@ -93,7 +93,6 @@ gui_theme=dark
 tls_proxy_enabled=false
 ansi_music_enabled=false
 websocket_enabled=false
-websocket_port=9002
 websocket_password_hash=<sha256>
 websocket_use_tls=false
 websocket_cert_file=/path/to/cert.pem

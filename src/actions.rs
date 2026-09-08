@@ -549,7 +549,7 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
 
         // Filter by source: -w (default) = server only, -l = local only, -g = all
         match &opts.source {
-            tf::RecallSource::CurrentWorld | tf::RecallSource::World(_) => {
+            tf::RecallSource::Server => {
                 // Default (no source flag): MUD server output only. Captured input is
                 // from_server:false so it's already excluded via the from_server check;
                 // the explicit is_input check is belt-and-braces so this stays correct if
@@ -559,18 +559,22 @@ pub fn execute_recall_with_source(opts: &tf::RecallOptions, output_lines: &[Outp
                 }
             }
             tf::RecallSource::Local => {
-                // -l: client-generated output (TF output, system messages) AND the user's
-                // own typed input - both are from_server:false, so no extra check needed.
+                // -l: client-generated output (TF output, system messages) AND everything
+                // captured as input - both are from_server:false, so no extra check needed.
                 if line.from_server {
                     continue;
                 }
             }
             tf::RecallSource::Global => {
-                // -g: server output + client-generated output + the user's typed input.
+                // -g: server output + client-generated output + captured input.
             }
             tf::RecallSource::Input => {
-                // -i: the user's typed input only. Was an unconditional `continue` (dead
-                // code - always skipped every line, so /recall -i never matched anything).
+                // -i: everything sent to the world as text input - typed commands PLUS
+                // anything sent by triggers/actions, TF hooks, and /repeat batches (see
+                // App::capture_sent_line, the single chokepoint that records all of
+                // these). Was once "only what the user literally typed" and, before
+                // that, an unconditional `continue` (dead code - /recall -i never
+                // matched anything at all).
                 if !line.is_input {
                     continue;
                 }

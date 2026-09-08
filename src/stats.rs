@@ -89,7 +89,7 @@ pub struct StatEntry {
 }
 
 /// One raw flattened `(key, value)` pair as stored before pairing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RawStat {
     value: String,
     origin: StatOrigin,
@@ -112,15 +112,33 @@ const VITAL_GROUPS: &[&[&str]] = &[
 /// see that function's own comment for why this is not persisted to settings.dat or
 /// the hot-reload state file.
 ///
-/// Backed by a flat map of raw values rather than a pre-computed ordered/paired
-/// list: a single incoming GMCP message or MSDP variable only ever touches one or a
-/// few keys, but pairing and ordering depend on the *whole* current set (a maximum
-/// arriving after its current value, or vice versa, must still pair correctly), so
-/// [`entries`](Self::entries) recomputes the derived view on demand from this map
-/// rather than trying to maintain it incrementally.
-#[derive(Debug, Clone, Default)]
+/// Backed by a flat map of raw values, with [`entries`](Self::entries) lazily
+/// recomputed and cached (T1.4 — see `entries_cache` below): a single incoming
+/// GMCP message or MSDP variable only ever touches one or a few keys, but pairing
+/// and ordering depend on the *whole* current set (a maximum arriving after its
+/// current value, or vice versa, must still pair correctly), so there is no way to
+/// maintain the derived view incrementally — it must be recomputed from this map
+/// whenever the map has actually changed since the last computation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorldStats {
     raw: HashMap<String, RawStat>,
+    /// Cache of the last computed [`entries`](Self::entries) view (T1.4).
+    /// `entries()` clones, lowercases and sorts the whole map on every call, and
+    /// `rendering.rs` calls it up to three times per frame — this makes every call
+    /// in between two real mutations free. Invalidated with `.take()` by every
+    /// method that can change `raw` (`update_from_gmcp`, `update_from_msdp`,
+    /// `clear`) so the next `entries()` call after a genuine change always
+    /// recomputes rather than returning stale data.
+    ///
+    /// Skipped by serde (job 5, hot-reload persistence): a `OnceLock` has no
+    /// `Serialize`/`Deserialize` impl, and there is no need for one — it is exactly
+    /// as stale as `raw` was at save time, so restoring it verbatim would either
+    /// require re-validating it against `raw` anyway or risk serving a cache that
+    /// silently disagrees with the map it is supposed to be derived from. Left
+    /// empty (`OnceLock`'s `Default`), it simply recomputes itself from `raw` on
+    /// the first post-restore call, same as any other mutation.
+    #[serde(skip)]
+    entries_cache: std::sync::OnceLock<Vec<StatEntry>>,
 }
 
 impl WorldStats {
@@ -133,12 +151,18 @@ impl WorldStats {
     /// Drop every stat. Called by `World::clear_connection_state` on disconnect.
     pub fn clear(&mut self) {
         self.raw.clear();
+        self.entries_cache.take();
     }
 
     /// Ingest one GMCP message. Only `Char.*` packages (matched case-insensitively)
     /// feed the model; anything else is a no-op. A payload that fails to parse as
     /// JSON is also a no-op — existing entries are left exactly as they were.
     pub fn update_from_gmcp(&mut self, package: &str, json_data: &str) {
+        // T1.4: invalidate unconditionally, up front — simpler and safer than
+        // tracking whether this particular call actually changed `raw`, and a
+        // spurious recompute on a no-op call is cheap next to the cost of ever
+        // serving a stale cache.
+        self.entries_cache.take();
         if !is_char_package(package) {
             return;
         }
@@ -163,6 +187,7 @@ impl WorldStats {
     /// [`is_msdp_meta_variable`]. A value that fails to parse as JSON is a no-op,
     /// same as the GMCP path.
     pub fn update_from_msdp(&mut self, variable: &str, value_json: &str) {
+        self.entries_cache.take(); // T1.4 — see update_from_gmcp's comment
         if is_msdp_meta_variable(variable) {
             return;
         }
@@ -184,77 +209,95 @@ impl WorldStats {
     }
 
     /// The ordered, paired view a status display renders (plan D2). Recomputed from
-    /// the raw map every call rather than cached — see the struct doc comment.
+    /// the raw map lazily and cached (T1.4 — see `entries_cache`'s doc comment):
+    /// the first call after a mutation recomputes and fills the cache, every call
+    /// after that until the next mutation just returns the cached slice.
     ///
     /// Nothing is ever dropped for being unrecognized: every raw key ends up in the
     /// result as either the current side of a gauge or a plain entry, except a key
     /// that was consumed as *someone else's* maximum, which is folded into that
     /// gauge instead of also appearing on its own.
-    pub fn entries(&self) -> Vec<StatEntry> {
-        // Deterministic processing order regardless of the HashMap's own iteration
-        // order, so pairing and the final sort never depend on hash iteration
-        // order varying between runs.
-        let mut keys: Vec<String> = self.raw.keys().cloned().collect();
-        keys.sort_by_key(|a| a.to_lowercase());
+    pub fn entries(&self) -> &[StatEntry] {
+        self.entries_cache.get_or_init(|| {
+            // Deterministic processing order regardless of the HashMap's own
+            // iteration order, so pairing and the final sort never depend on hash
+            // iteration order varying between runs.
+            let mut keys: Vec<String> = self.raw.keys().cloned().collect();
+            keys.sort_by_key(|a| a.to_lowercase());
 
-        // Lowercase -> original spelling, first occurrence wins. Two keys that
-        // collide only by case is a pathological input this doesn't try to be
-        // clever about beyond not panicking.
-        let mut lower_to_orig: HashMap<String, String> = HashMap::new();
-        for k in &keys {
-            lower_to_orig.entry(k.to_lowercase()).or_insert_with(|| k.clone());
-        }
-
-        // Once a key is claimed as either side of a pairing it is fully spoken
-        // for and cannot be reused - stops a maximum from also being treated as
-        // a base looking for its own maximum, and stops the same key pairing
-        // twice.
-        let mut assigned: HashSet<String> = HashSet::new(); // lowercased
-        let mut gauge_of: HashMap<String, String> = HashMap::new(); // base(orig) -> maximum(orig)
-        let mut consumed_max: HashSet<String> = HashSet::new(); // maximum(orig), exact case
-
-        for k in &keys {
-            let k_lower = k.to_lowercase();
-            if assigned.contains(&k_lower) {
-                continue;
+            // Lowercase -> original spelling, first occurrence wins. Two keys that
+            // collide only by case is a pathological input this doesn't try to be
+            // clever about beyond not panicking.
+            let mut lower_to_orig: HashMap<String, String> = HashMap::new();
+            for k in &keys {
+                lower_to_orig.entry(k.to_lowercase()).or_insert_with(|| k.clone());
             }
-            for shape in Self::max_shapes(&k_lower) {
-                let Some(max_orig) = lower_to_orig.get(&shape) else {
-                    continue;
-                };
-                if max_orig == k || assigned.contains(&shape) {
+
+            // Once a key is claimed as either side of a pairing it is fully spoken
+            // for and cannot be reused - stops a maximum from also being treated as
+            // a base looking for its own maximum, and stops the same key pairing
+            // twice.
+            let mut assigned: HashSet<String> = HashSet::new(); // lowercased
+            let mut gauge_of: HashMap<String, String> = HashMap::new(); // base(orig) -> maximum(orig)
+            let mut consumed_max: HashSet<String> = HashSet::new(); // maximum(orig), exact case
+
+            for k in &keys {
+                let k_lower = k.to_lowercase();
+                if assigned.contains(&k_lower) {
                     continue;
                 }
-                assigned.insert(k_lower.clone());
-                assigned.insert(shape.clone());
-                gauge_of.insert(k.clone(), max_orig.clone());
-                consumed_max.insert(max_orig.clone());
-                break;
+                for shape in Self::max_shapes(&k_lower) {
+                    let Some(max_orig) = lower_to_orig.get(&shape) else {
+                        continue;
+                    };
+                    if max_orig == k || assigned.contains(&shape) {
+                        continue;
+                    }
+                    assigned.insert(k_lower.clone());
+                    assigned.insert(shape.clone());
+                    gauge_of.insert(k.clone(), max_orig.clone());
+                    consumed_max.insert(max_orig.clone());
+                    break;
+                }
             }
-        }
 
-        let mut result: Vec<StatEntry> = Vec::with_capacity(keys.len());
-        for k in &keys {
-            if consumed_max.contains(k) {
-                continue; // folded into another entry's gauge - never shown twice
+            let mut result: Vec<StatEntry> = Vec::with_capacity(keys.len());
+            for k in &keys {
+                if consumed_max.contains(k) {
+                    continue; // folded into another entry's gauge - never shown twice
+                }
+                let raw = &self.raw[k];
+                let value = match gauge_of.get(k) {
+                    Some(max_key) => StatValue::Gauge {
+                        current: raw.value.clone(),
+                        maximum: self.raw[max_key].value.clone(),
+                    },
+                    None => StatValue::Plain(raw.value.clone()),
+                };
+                result.push(StatEntry { key: k.clone(), value, origin: raw.origin });
             }
-            let raw = &self.raw[k];
-            let value = match gauge_of.get(k) {
-                Some(max_key) => StatValue::Gauge {
-                    current: raw.value.clone(),
-                    maximum: self.raw[max_key].value.clone(),
-                },
-                None => StatValue::Plain(raw.value.clone()),
-            };
-            result.push(StatEntry { key: k.clone(), value, origin: raw.origin });
-        }
 
-        result.sort_by(|a, b| {
-            vital_priority(&a.key)
-                .cmp(&vital_priority(&b.key))
-                .then_with(|| a.key.to_lowercase().cmp(&b.key.to_lowercase()))
-        });
-        result
+            result.sort_by(|a, b| {
+                vital_priority(&a.key)
+                    .cmp(&vital_priority(&b.key))
+                    .then_with(|| a.key.to_lowercase().cmp(&b.key.to_lowercase()))
+            });
+            result
+        })
+    }
+
+    /// Test-only: number of distinct raw keys currently stored (T1.4) — lets a test
+    /// observe `MAX_STAT_KEYS` capping without reaching into the private `raw` map.
+    #[cfg(test)]
+    pub(crate) fn key_count(&self) -> usize {
+        self.raw.len()
+    }
+
+    /// Test-only: whether `entries()` has been called since the last mutation
+    /// (T1.4) — observes the cache from outside without exposing its contents.
+    #[cfg(test)]
+    pub(crate) fn entries_cache_is_populated(&self) -> bool {
+        self.entries_cache.get().is_some()
     }
 }
 
@@ -309,6 +352,27 @@ fn vital_priority(key: &str) -> usize {
         .unwrap_or(VITAL_GROUPS.len())
 }
 
+/// Cap on the number of distinct keys [`WorldStats::raw`](WorldStats) may hold
+/// (T1.4). Nothing previously bounded this: a server that varies its GMCP/MSDP key
+/// names across messages (deliberately, or via a buggy per-message-unique field
+/// name) grows the map without bound, and [`WorldStats::entries`] clones,
+/// lowercases and sorts the *whole* map on every call — a redraw-path cost that
+/// scales with attacker-controlled input. Real MUDs report tens of distinct
+/// fields; 256 is generous headroom above that while still being a hard limit.
+pub const MAX_STAT_KEYS: usize = 256;
+
+/// Insert `key -> value` into `out`, refusing a **new** key once `out` already
+/// holds [`MAX_STAT_KEYS`] distinct keys (T1.4). An update to a key that is
+/// already present always succeeds, capped or not — it never grows the map, and a
+/// server that is actively reporting real state (as opposed to spamming new key
+/// names) must keep working normally even once the cap is reached.
+fn insert_capped(out: &mut HashMap<String, RawStat>, key: String, value: RawStat) {
+    if out.len() >= MAX_STAT_KEYS && !out.contains_key(&key) {
+        return;
+    }
+    out.insert(key, value);
+}
+
 /// Flatten one JSON value under `key` into `out`, applying the plan's normalization
 /// rule: a scalar (string/number/bool) becomes `key -> value` directly; a nested
 /// object is unwrapped exactly one level, each of *its* scalar fields becoming
@@ -316,30 +380,31 @@ fn vital_priority(key: &str) -> usize {
 /// than one level deep and is skipped); an array or null at the top level is
 /// skipped entirely. Shared by both the GMCP (per top-level field) and MSDP (per
 /// variable) ingestion paths — see their doc comments for how `key` differs between
-/// the two callers.
+/// the two callers. Every insertion goes through [`insert_capped`] so this can
+/// never grow [`WorldStats::raw`] past [`MAX_STAT_KEYS`] distinct keys.
 fn flatten_into(key: &str, v: &serde_json::Value, origin: StatOrigin, out: &mut HashMap<String, RawStat>) {
     match v {
         serde_json::Value::String(s) => {
-            out.insert(key.to_string(), RawStat { value: s.clone(), origin });
+            insert_capped(out, key.to_string(), RawStat { value: s.clone(), origin });
         }
         serde_json::Value::Number(n) => {
-            out.insert(key.to_string(), RawStat { value: n.to_string(), origin });
+            insert_capped(out, key.to_string(), RawStat { value: n.to_string(), origin });
         }
         serde_json::Value::Bool(b) => {
-            out.insert(key.to_string(), RawStat { value: b.to_string(), origin });
+            insert_capped(out, key.to_string(), RawStat { value: b.to_string(), origin });
         }
         serde_json::Value::Object(nested) => {
             for (nk, nv) in nested {
                 let dotted = format!("{key}.{nk}");
                 match nv {
                     serde_json::Value::String(s) => {
-                        out.insert(dotted, RawStat { value: s.clone(), origin });
+                        insert_capped(out, dotted, RawStat { value: s.clone(), origin });
                     }
                     serde_json::Value::Number(n) => {
-                        out.insert(dotted, RawStat { value: n.to_string(), origin });
+                        insert_capped(out, dotted, RawStat { value: n.to_string(), origin });
                     }
                     serde_json::Value::Bool(b) => {
-                        out.insert(dotted, RawStat { value: b.to_string(), origin });
+                        insert_capped(out, dotted, RawStat { value: b.to_string(), origin });
                     }
                     // Array or a further-nested object: more than one level deep,
                     // skip per the flatten-one-level rule.
@@ -426,10 +491,10 @@ mod tests {
         s.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
         let entries = s.entries();
         assert_eq!(
-            entry(&entries, "hp").unwrap().value,
+            entry(entries, "hp").unwrap().value,
             StatValue::Gauge { current: "80".to_string(), maximum: "100".to_string() }
         );
-        assert!(entry(&entries, "maxhp").is_none(), "maxhp must not also appear as its own entry");
+        assert!(entry(entries, "maxhp").is_none(), "maxhp must not also appear as its own entry");
     }
 
     #[test]
@@ -438,10 +503,10 @@ mod tests {
         s.update_from_gmcp("Char.Vitals", r#"{"mp":"30","mpmax":"50"}"#);
         let entries = s.entries();
         assert_eq!(
-            entry(&entries, "mp").unwrap().value,
+            entry(entries, "mp").unwrap().value,
             StatValue::Gauge { current: "30".to_string(), maximum: "50".to_string() }
         );
-        assert!(entry(&entries, "mpmax").is_none());
+        assert!(entry(entries, "mpmax").is_none());
     }
 
     #[test]
@@ -450,10 +515,10 @@ mod tests {
         s.update_from_gmcp("Char.Vitals", r#"{"mv":"12","mv_max":"20"}"#);
         let entries = s.entries();
         assert_eq!(
-            entry(&entries, "mv").unwrap().value,
+            entry(entries, "mv").unwrap().value,
             StatValue::Gauge { current: "12".to_string(), maximum: "20".to_string() }
         );
-        assert!(entry(&entries, "mv_max").is_none());
+        assert!(entry(entries, "mv_max").is_none());
     }
 
     #[test]
@@ -463,10 +528,10 @@ mod tests {
         s.update_from_msdp("HEALTH_MAX", "\"150\"");
         let entries = s.entries();
         assert_eq!(
-            entry(&entries, "HEALTH").unwrap().value,
+            entry(entries, "HEALTH").unwrap().value,
             StatValue::Gauge { current: "100".to_string(), maximum: "150".to_string() }
         );
-        assert!(entry(&entries, "HEALTH_MAX").is_none());
+        assert!(entry(entries, "HEALTH_MAX").is_none());
     }
 
     #[test]
@@ -479,7 +544,7 @@ mod tests {
         let entries = s.entries();
         assert_eq!(entries.len(), 1, "Hp/MAXHP must pair despite mismatched case");
         assert_eq!(
-            entry(&entries, "Hp").unwrap().value,
+            entry(entries, "Hp").unwrap().value,
             StatValue::Gauge { current: "80".to_string(), maximum: "100".to_string() }
         );
     }
@@ -511,7 +576,7 @@ mod tests {
         s.update_from_gmcp("Char.Status", r#"{"favorite_toad_count":"3"}"#);
         let entries = s.entries();
         assert_eq!(
-            entry(&entries, "favorite_toad_count").unwrap().value,
+            entry(entries, "favorite_toad_count").unwrap().value,
             StatValue::Plain("3".to_string()),
             "an unrecognized field must still show up plainly, never be dropped"
         );
@@ -545,11 +610,11 @@ mod tests {
             r#"{"name":"Bob","race":{"name":"Human","id":3,"tags":["a","b"]}}"#,
         );
         let entries = s.entries();
-        assert_eq!(entry(&entries, "name").unwrap().value, StatValue::Plain("Bob".to_string()));
-        assert_eq!(entry(&entries, "race.name").unwrap().value, StatValue::Plain("Human".to_string()));
-        assert_eq!(entry(&entries, "race.id").unwrap().value, StatValue::Plain("3".to_string()));
-        assert!(entry(&entries, "race.tags").is_none(), "an array nested inside the flattened object must be skipped");
-        assert!(entry(&entries, "race").is_none(), "the intermediate object key itself is not an entry");
+        assert_eq!(entry(entries, "name").unwrap().value, StatValue::Plain("Bob".to_string()));
+        assert_eq!(entry(entries, "race.name").unwrap().value, StatValue::Plain("Human".to_string()));
+        assert_eq!(entry(entries, "race.id").unwrap().value, StatValue::Plain("3".to_string()));
+        assert!(entry(entries, "race.tags").is_none(), "an array nested inside the flattened object must be skipped");
+        assert!(entry(entries, "race").is_none(), "the intermediate object key itself is not an entry");
     }
 
     #[test]
@@ -558,7 +623,7 @@ mod tests {
         s.update_from_gmcp("Char.Status", r#"{"name":"Bob","tags":["a","b"]}"#);
         let entries = s.entries();
         assert_eq!(entries.len(), 1);
-        assert!(entry(&entries, "tags").is_none());
+        assert!(entry(entries, "tags").is_none());
     }
 
     #[test]
@@ -572,7 +637,7 @@ mod tests {
         s.update_from_gmcp("Char.Vitals", "42");
         let entries = s.entries();
         assert_eq!(entries.len(), 1, "malformed/non-object payloads must add nothing");
-        assert_eq!(entry(&entries, "name").unwrap().value, StatValue::Plain("Bob".to_string()));
+        assert_eq!(entry(entries, "name").unwrap().value, StatValue::Plain("Bob".to_string()));
     }
 
     #[test]
@@ -582,7 +647,7 @@ mod tests {
         s.update_from_msdp("MANA", "not valid json at all {{{");
         let entries = s.entries();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entry(&entries, "HEALTH").unwrap().value, StatValue::Plain("100".to_string()));
+        assert_eq!(entry(entries, "HEALTH").unwrap().value, StatValue::Plain("100".to_string()));
     }
 
     // ------------------------------------------------------------------
@@ -623,7 +688,7 @@ mod tests {
         s.update_from_msdp("HEALTH", "\"100\"");
         let entries = s.entries();
         assert_eq!(entries.len(), 1);
-        let e = entry(&entries, "HEALTH").unwrap();
+        let e = entry(entries, "HEALTH").unwrap();
         assert_eq!(e.value, StatValue::Plain("100".to_string()));
         assert_eq!(e.origin, StatOrigin::Msdp);
     }
@@ -634,11 +699,11 @@ mod tests {
         s.update_from_msdp("ROOM", r#"{"VNUM":"1001","NAME":"The Temple"}"#);
         let entries = s.entries();
         assert_eq!(
-            entry(&entries, "ROOM.VNUM").unwrap().value,
+            entry(entries, "ROOM.VNUM").unwrap().value,
             StatValue::Plain("1001".to_string())
         );
         assert_eq!(
-            entry(&entries, "ROOM.NAME").unwrap().value,
+            entry(entries, "ROOM.NAME").unwrap().value,
             StatValue::Plain("The Temple".to_string())
         );
     }
@@ -721,10 +786,46 @@ mod tests {
         let mut s = WorldStats::default();
         s.update_from_gmcp("Char.Vitals", r#"{"hp":"80","maxhp":"100"}"#);
         s.update_from_gmcp("Char.Status", r#"{"name":"Bob"}"#);
-        let entries = s.entries();
+        let entries = s.entries().to_vec();
         let json = serde_json::to_string(&entries).expect("StatEntry must serialize");
         let round_tripped: Vec<StatEntry> = serde_json::from_str(&json).expect("StatEntry must deserialize");
         assert_eq!(entries, round_tripped);
+    }
+
+    // ------------------------------------------------------------------
+    // T1.4: bounding the number of distinct keys, and the entries() cache.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn distinct_key_count_is_capped_but_existing_keys_still_update() {
+        let mut s = WorldStats::default();
+        // 300 distinct MSDP variables, each its own key - well past MAX_STAT_KEYS.
+        for i in 0..300 {
+            s.update_from_msdp(&format!("VAR{i}"), &format!("\"{i}\""));
+        }
+        assert_eq!(s.key_count(), MAX_STAT_KEYS, "must never hold more than the cap");
+
+        // A key that was already stored before the cap was reached must keep
+        // updating normally - the cap only refuses brand-new keys.
+        s.update_from_msdp("VAR0", "\"updated\"");
+        assert_eq!(s.key_count(), MAX_STAT_KEYS, "updating an existing key must not change the count");
+        let entries = s.entries();
+        let var0 = entries.iter().find(|e| e.key == "VAR0").expect("VAR0 must still be present");
+        assert_eq!(var0.value, StatValue::Plain("updated".to_string()));
+    }
+
+    #[test]
+    fn entries_cache_is_populated_by_a_call_and_cleared_by_an_update() {
+        let mut s = WorldStats::default();
+        s.update_from_gmcp("Char.Vitals", r#"{"hp":"80"}"#);
+        assert!(!s.entries_cache_is_populated(), "must start uncached after a mutation");
+        let _ = s.entries();
+        assert!(s.entries_cache_is_populated(), "a call to entries() must populate the cache");
+        s.update_from_gmcp("Char.Vitals", r#"{"hp":"90"}"#);
+        assert!(!s.entries_cache_is_populated(), "a later update must invalidate the cache");
+        // And the recomputed value reflects the update, not stale cached data.
+        let entries = s.entries();
+        assert_eq!(entries.iter().find(|e| e.key == "hp").unwrap().value, StatValue::Plain("90".to_string()));
     }
 
     // ------------------------------------------------------------------

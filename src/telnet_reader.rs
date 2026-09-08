@@ -95,6 +95,15 @@ fn make_disconnected_event(target: &TelnetTarget, conn_id: u64) -> AppEvent {
     }
 }
 
+/// Wrap `ev` as an `AppEvent::Telnet(target.clone(), ev)` - the "just forward it,
+/// `App`/`ProtocolState` will decide what to do" case both `to_app_event` match arms
+/// below use for the majority of `TelnetEvent` variants (plan Job 9, T3.2). Extracted so
+/// the `World` and `Multiuser` arms are provably identical wherever they both forward,
+/// rather than two hand-copied literals that could drift.
+fn forward_via_telnet(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> {
+    Some(AppEvent::Telnet(target.clone(), ev))
+}
+
 /// The event mapper — design commitment 2's anti-drift mechanism. Maps one
 /// `TelnetEvent` (from `TelnetSession::feed`/`flush_eof`) to the `AppEvent`
 /// `spawn_telnet_reader` should send for it, for the given `target` shape.
@@ -105,131 +114,68 @@ fn make_disconnected_event(target: &TelnetTarget, conn_id: u64) -> AppEvent {
 /// exhaustive match on it) says what each target shape does with it. See
 /// design commitment 2 and Phase 2's introduction in the plan.
 ///
-/// Two classes of `None`, both deliberate — never a placeholder for future
-/// work landing in *this* job:
+/// Job 9 (T3.2) closed the gap this doc comment used to describe at length: before it,
+/// every `Multiuser` arm below `TelnetDetected`/`Prompt` mapped to `None`, because
+/// `App::handle_telnet_event`'s `world_idx`-shaped signature had nowhere to route a
+/// multiuser per-user connection's protocol events, and `run_multiuser_server` had no
+/// `AppEvent::Telnet` arm at all — NAWS, TTYPE/MTTS, CHARSET, GMCP (including the
+/// `Core.Hello` that makes servers send anything), MSDP, MSSP, MSP, and ECHO masking
+/// (**passwords shown in cleartext**) were all dead for every multiuser user. Both
+/// targets now forward every variant they don't have a more specific `AppEvent` for
+/// through `forward_via_telnet` above, with the identical `OptionEnabled`/
+/// `OptionDisabled` option-code filter (see below) — the *only* difference between the
+/// two branches is which `AppEvent` shape `TelnetDetected`/`Prompt` produce
+/// (`AppEvent::Telnet`/`AppEvent::Prompt` for `World`; `AppEvent::MultiuserTelnetDetected`/
+/// `AppEvent::MultiuserPrompt`, carrying `world_index`+`username` instead of a world
+/// name, for `Multiuser`). `App::handle_telnet_event` (`World`) and
+/// `App::handle_multiuser_telnet_event` (`Multiuser`) both resolve their target to a
+/// `ProtocolState` (`World::protocol` / `UserConnection::protocol`) and call the same
+/// `ProtocolState::apply_telnet_event` core - see that function's doc comment for the
+/// full per-event behaviour, which this mapper no longer needs to describe since it is
+/// now identical on both targets.
 ///
-/// - `ProtocolError` is informational on every target: nothing downstream
-///   needs an `AppEvent` for it. It is still surfaced — `spawn_telnet_reader`
-///   logs it via `debug_log` directly, since there is no `AppEvent::Telnet`-
-///   carried payload built for it here. `CompressionStarted`/
-///   `CompressionEnded` used to be in this same informational bucket, but
-///   Job 10a (plan Phase 3, step 3.3, the MCCP2 hot-reload guard) gave `World`
-///   a real consumer — `App::handle_telnet_event` maintains
-///   `World::mccp2_active` from them, which the reload restore path needs to
-///   disconnect a compressed world instead of handing its dead zlib stream to
-///   a fresh plaintext parser — so they now forward through `AppEvent::Telnet`
-///   on `World` like `OptionEnabled`/`OptionDisabled`. `Multiuser` still maps
-///   both to `None`: it has no per-user reload-restore path this guards.
-/// - Every `Multiuser` arm below `TelnetDetected`/`Prompt` has no
-///   corresponding `AppEvent` at all: `NawsRequested`, `TtypeRequested`,
-///   `GmcpMessage`, `MsdpVariable`, `MsspData` (Job 12) only ever reach `App`
-///   through `AppEvent::Telnet(TelnetTarget::World(name), ev)` (Phase 2,
-///   Step 2.7), which `App::handle_telnet_event` resolves via a plain
-///   `world_idx` — multiuser's per-user connection state lives in
-///   `user_connections`, keyed by `(world_index, username)`, not in
-///   `App::worlds`, so there is no `world_idx`-shaped home for these on a
-///   `Multiuser` target yet. Finding 2 in the plan already names today's
-///   multiuser reader loops as calling the old `CharsetRequested` with an
-///   empty world-name string that `find_world_index("")` always rejects,
-///   i.e. already-dead code; this mapper does not resurrect that by
-///   reproducing it. Giving multiuser connections real NAWS/TTYPE/GMCP/MSDP/
-///   MSSP support needs a per-user-shaped event, not this job's to invent.
-///
-/// Job 4.5 added `OptionEnabled`/`OptionDisabled`/`WontEchoPromptHint`.
-/// `OptionEnabled`/`OptionDisabled` carry a `u8` option code rather than
-/// being one `TelnetEvent` variant per option, so the inner match on that
-/// code can't itself be exhaustive over every possible `u8` the way the
-/// outer match is over `TelnetEvent` — but `TelnetSession` only ever emits
-/// these two for the fixed set of options Clay accepts (SGA, EOR, NAWS,
-/// TTYPE, CHARSET, MCCP2, GMCP, MSDP, and — as of Job 12 — MSSP; see the
-/// `OptionEnabled` doc comment in telnet.rs), so every one of those is
-/// spelled out by name below with a
-/// trailing wildcard only for option codes the session cannot actually
-/// produce. On `World`: GMCP and MSDP are the two `process_telnet` already
-/// reported as `gmcp_negotiated`/`msdp_negotiated` and that
-/// `App::handle_telnet_event` still consumes (`OptionEnabled(TELNET_OPT_GMCP)`
-/// triggers `Core.Hello`+`Core.Supports.Set` — see `App::handle_gmcp_negotiated`);
-/// the other seven (added MSSP, Job 12) map to `None` because nothing
-/// downstream reads an "option enabled" signal for them today
-/// (`NawsRequested`/`TtypeRequested`/`CharsetRequest`/`MsspData` already
-/// cover the actions those options unlock, independently of this variant).
-/// `OptionDisabled` is Job 9's fix for
-/// finding 4 ("DONT/WONT are ignored entirely and never clear anything"):
-/// GMCP, MSDP and NAWS — the three options with a `World` mirror to clear
-/// (`gmcp_enabled`/`msdp_enabled`/`naws_enabled`; see
-/// `App::handle_telnet_event`'s `OptionDisabled` arm) — map through to
-/// `AppEvent::Telnet` on `World`, same as their `OptionEnabled`
-/// counterparts; the rest map to `None` for the same reason `OptionEnabled`
-/// does. Multiuser still maps every option to `None` on both variants —
-/// this job doesn't invent a per-user-shaped mirror any more than Job 4.5
-/// did. `WontEchoPromptHint` maps through `AppEvent::Telnet` on `World`
-/// (drives `World::uses_wont_echo_prompt` via `App::handle_wont_echo_seen`,
-/// the 150ms timeout-prompt path) and to `None` on `Multiuser`, which has no
-/// per-user equivalent — consistent with every other Multiuser gap above.
-///
-/// Job 10b (plan Phase 3, step 3.4, finding 7) adds `EchoOff`/`EchoOn`: real
-/// password-masking state, distinct from `WontEchoPromptHint`'s prompt-boundary
-/// heuristic above. Both map through `AppEvent::Telnet` on `World`
-/// (`App::handle_telnet_event` maintains `World::echo_masked` from them and
-/// broadcasts the change to web/GUI clients) and to `None` on `Multiuser`, same
-/// gap as every other per-user-shaped signal here.
+/// One remaining class of `None`, on both targets: `ProtocolError` is informational
+/// only — nothing downstream needs an `AppEvent` for it. It is still surfaced —
+/// `spawn_telnet_reader` logs it via `debug_log` directly, since there is no
+/// `AppEvent::Telnet`-carried payload built for it here.
 pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> {
     match target {
         TelnetTarget::World(name) => match ev {
-            TelnetEvent::TelnetDetected => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::TelnetDetected))
-            }
+            TelnetEvent::TelnetDetected => forward_via_telnet(target, TelnetEvent::TelnetDetected),
             TelnetEvent::Prompt(bytes) => Some(AppEvent::Prompt(name.clone(), bytes)),
-            TelnetEvent::NawsRequested => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::NawsRequested))
-            }
-            TelnetEvent::TtypeRequested => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::TtypeRequested))
-            }
+            TelnetEvent::NawsRequested => forward_via_telnet(target, TelnetEvent::NawsRequested),
+            TelnetEvent::TtypeRequested => forward_via_telnet(target, TelnetEvent::TtypeRequested),
             TelnetEvent::CharsetRequest(charsets) => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::CharsetRequest(charsets)))
+                forward_via_telnet(target, TelnetEvent::CharsetRequest(charsets))
             }
             TelnetEvent::GmcpMessage(package, json) => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::GmcpMessage(package, json)))
+                forward_via_telnet(target, TelnetEvent::GmcpMessage(package, json))
             }
             TelnetEvent::MsdpVariable(variable, value) => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::MsdpVariable(variable, value)))
+                forward_via_telnet(target, TelnetEvent::MsdpVariable(variable, value))
             }
-            // Job 12 (plan Phase 4, 4.2): App::handle_telnet_event replaces
-            // World::mssp_data with this - same shape as MsdpVariable above.
-            TelnetEvent::MsspData(pairs) => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::MsspData(pairs)))
-            }
-            // Job 10a: App::handle_telnet_event maintains World::mccp2_active from
-            // these, which the reload restore path needs (see this function's doc
-            // comment).
-            TelnetEvent::CompressionStarted => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::CompressionStarted))
-            }
-            TelnetEvent::CompressionEnded => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::CompressionEnded))
+            TelnetEvent::MsspData(pairs) => forward_via_telnet(target, TelnetEvent::MsspData(pairs)),
+            TelnetEvent::CompressionStarted => forward_via_telnet(target, TelnetEvent::CompressionStarted),
+            TelnetEvent::CompressionEnded => forward_via_telnet(target, TelnetEvent::CompressionEnded),
+            TelnetEvent::CompressionFailed(reason) => {
+                forward_via_telnet(target, TelnetEvent::CompressionFailed(reason))
             }
             // No AppEvent::Telnet payload built for this — the reader logs
             // it directly instead of mapping it.
             TelnetEvent::ProtocolError(_) => None,
             TelnetEvent::OptionEnabled(opt) => match opt {
-                // The two option codes App::handle_telnet_event consumes
-                // today (see this function's doc comment) — losing either
-                // silently breaks GMCP announcement or the
+                // The two option codes the core consumes today (Core.Hello/
+                // Core.Supports.Set announcement, LIST REPORTABLE_VARIABLES) — losing
+                // either silently breaks GMCP announcement or the
                 // gmcp_enabled/msdp_enabled mirrors.
                 TELNET_OPT_GMCP | TELNET_OPT_MSDP => {
-                    Some(AppEvent::Telnet(target.clone(), TelnetEvent::OptionEnabled(opt)))
+                    forward_via_telnet(target, TelnetEvent::OptionEnabled(opt))
                 }
-                // Negotiating successfully has no AppEvent of its own for
-                // these — NawsRequested/TtypeRequested/CharsetRequest/MsspData
-                // already cover the actions they unlock (MSSP added Job 12,
-                // plan Phase 4, 4.2 - the MsspData event carries the payload
-                // itself, so OptionEnabled(MSSP) needs no action of its own,
-                // same as CHARSET/MCCP2/TTYPE above). MSP (Job 14) is the same
-                // shape again: the in-band `!!SOUND(...)`/`!!MUSIC(...)` text
-                // triggers work whether or not option 90 ever negotiates (see
-                // `msp_enabled`'s doc comment), so confirming the option
-                // itself unlocks nothing `MspTrigger` doesn't already cover.
+                // Negotiating successfully has no action of its own for these —
+                // NawsRequested/TtypeRequested/CharsetRequest/MsspData already cover
+                // the actions they unlock, and MSP's in-band `!!SOUND(...)`/
+                // `!!MUSIC(...)` triggers work whether or not option 90 ever
+                // negotiates (see `msp_enabled`'s doc comment).
                 TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_NAWS | TELNET_OPT_TTYPE
                 | TELNET_OPT_CHARSET | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP | TELNET_OPT_MSP => None,
                 // TelnetSession never actually emits OptionEnabled for any
@@ -237,36 +183,24 @@ pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> 
                 // practice, but the u8 payload still needs a catch-all.
                 _ => None,
             },
-            // Job 9 / finding 4: the three options with a World mirror to
-            // clear (see this function's doc comment) forward through;
+            // Finding 4: the three options with a mirror to clear forward through;
             // everything else nothing reacts to, same as OptionEnabled.
             TelnetEvent::OptionDisabled(opt) => match opt {
                 TELNET_OPT_GMCP | TELNET_OPT_MSDP | TELNET_OPT_NAWS => {
-                    Some(AppEvent::Telnet(target.clone(), TelnetEvent::OptionDisabled(opt)))
+                    forward_via_telnet(target, TelnetEvent::OptionDisabled(opt))
                 }
-                // MSSP (Job 12) has no World mirror to clear on disable beyond
-                // World::mssp_data itself, which clear_connection_state already
-                // handles independently of this event - see its doc comment.
-                // MSP (Job 14) has no mirror at all to clear - msp_enabled is a
-                // TelnetConfig/WorldSettings toggle, not a negotiated-state flag.
+                // MSSP has no mirror to clear on disable beyond mssp_data itself, which
+                // ProtocolState::clear handles independently of this event. MSP has no
+                // mirror at all to clear - msp_enabled is a TelnetConfig/WorldSettings
+                // toggle, not a negotiated-state flag.
                 TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_TTYPE | TELNET_OPT_CHARSET
                 | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP | TELNET_OPT_MSP => None,
                 _ => None,
             },
-            TelnetEvent::WontEchoPromptHint => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::WontEchoPromptHint))
-            }
-            // Job 10b (plan Phase 3, step 3.4, finding 7): App::handle_telnet_event
-            // maintains World::echo_masked from these (and broadcasts it to
-            // web/GUI clients) - the reader must forward both or password masking
-            // never reaches App at all.
-            TelnetEvent::EchoOff => Some(AppEvent::Telnet(target.clone(), TelnetEvent::EchoOff)),
-            TelnetEvent::EchoOn => Some(AppEvent::Telnet(target.clone(), TelnetEvent::EchoOn)),
-            // Job 14 (plan Phase 4): App::handle_telnet_event resolves this
-            // into an actual audio::play_file call - see its doc comment.
-            TelnetEvent::MspTrigger(trigger) => {
-                Some(AppEvent::Telnet(target.clone(), TelnetEvent::MspTrigger(trigger)))
-            }
+            TelnetEvent::WontEchoPromptHint => forward_via_telnet(target, TelnetEvent::WontEchoPromptHint),
+            TelnetEvent::EchoOff => forward_via_telnet(target, TelnetEvent::EchoOff),
+            TelnetEvent::EchoOn => forward_via_telnet(target, TelnetEvent::EchoOn),
+            TelnetEvent::MspTrigger(trigger) => forward_via_telnet(target, TelnetEvent::MspTrigger(trigger)),
         },
         TelnetTarget::Multiuser { world_index, username } => match ev {
             TelnetEvent::TelnetDetected => {
@@ -275,38 +209,52 @@ pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> 
             TelnetEvent::Prompt(bytes) => {
                 Some(AppEvent::MultiuserPrompt(*world_index, username.clone(), bytes))
             }
-            // No per-user-shaped AppEvent exists for any of these today (see
-            // the doc comment above) — a future job needs to add one, or
-            // accept the gap, before multiuser connections get NAWS/TTYPE/
-            // GMCP/MSDP support through this reader.
-            TelnetEvent::NawsRequested => None,
-            TelnetEvent::TtypeRequested => None,
-            TelnetEvent::CharsetRequest(_) => None,
-            TelnetEvent::GmcpMessage(_, _) => None,
-            TelnetEvent::MsdpVariable(_, _) => None,
-            TelnetEvent::MsspData(_) => None,
-            TelnetEvent::CompressionStarted => None,
-            TelnetEvent::CompressionEnded => None,
+            // Job 9 (T3.2): every variant below now forwards exactly like the World arm
+            // above (identical OptionEnabled/OptionDisabled code filter included) -
+            // App::handle_multiuser_telnet_event resolves target into a
+            // UserConnection::protocol and calls the same ProtocolState core.
+            TelnetEvent::NawsRequested => forward_via_telnet(target, TelnetEvent::NawsRequested),
+            TelnetEvent::TtypeRequested => forward_via_telnet(target, TelnetEvent::TtypeRequested),
+            TelnetEvent::CharsetRequest(charsets) => {
+                forward_via_telnet(target, TelnetEvent::CharsetRequest(charsets))
+            }
+            TelnetEvent::GmcpMessage(package, json) => {
+                forward_via_telnet(target, TelnetEvent::GmcpMessage(package, json))
+            }
+            TelnetEvent::MsdpVariable(variable, value) => {
+                forward_via_telnet(target, TelnetEvent::MsdpVariable(variable, value))
+            }
+            TelnetEvent::MsspData(pairs) => forward_via_telnet(target, TelnetEvent::MsspData(pairs)),
+            TelnetEvent::CompressionStarted => forward_via_telnet(target, TelnetEvent::CompressionStarted),
+            TelnetEvent::CompressionEnded => forward_via_telnet(target, TelnetEvent::CompressionEnded),
+            TelnetEvent::CompressionFailed(reason) => {
+                forward_via_telnet(target, TelnetEvent::CompressionFailed(reason))
+            }
             TelnetEvent::ProtocolError(_) => None,
-            // No per-user-shaped AppEvent::Telnet OptionEnabled equivalent
-            // exists, and today's multiuser dispatch loop
-            // (run_multiuser_server in daemon.rs) has no arm for
-            // AppEvent::Telnet at all (it's never constructed for this
-            // target) - so mapping every option to None here reproduces
-            // that existing (already dead) behaviour rather than silently
-            // fixing or worsening it.
-            TelnetEvent::OptionEnabled(_) => None,
-            TelnetEvent::OptionDisabled(_) => None,
-            TelnetEvent::WontEchoPromptHint => None,
-            // No per-user-shaped World to mirror echo_masked onto - same gap as
-            // every other Multiuser arm above.
-            TelnetEvent::EchoOff => None,
-            TelnetEvent::EchoOn => None,
-            // No per-user audio path exists for multiuser connections (the
-            // server process has no single "current user" to play a sound
-            // for) - same gap as GmcpMessage/MsdpVariable above, not this
-            // job's to invent.
-            TelnetEvent::MspTrigger(_) => None,
+            TelnetEvent::OptionEnabled(opt) => match opt {
+                TELNET_OPT_GMCP | TELNET_OPT_MSDP => {
+                    forward_via_telnet(target, TelnetEvent::OptionEnabled(opt))
+                }
+                TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_NAWS | TELNET_OPT_TTYPE
+                | TELNET_OPT_CHARSET | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP | TELNET_OPT_MSP => None,
+                _ => None,
+            },
+            TelnetEvent::OptionDisabled(opt) => match opt {
+                TELNET_OPT_GMCP | TELNET_OPT_MSDP | TELNET_OPT_NAWS => {
+                    forward_via_telnet(target, TelnetEvent::OptionDisabled(opt))
+                }
+                TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_TTYPE | TELNET_OPT_CHARSET
+                | TELNET_OPT_MCCP2 | TELNET_OPT_MSSP | TELNET_OPT_MSP => None,
+                _ => None,
+            },
+            TelnetEvent::WontEchoPromptHint => forward_via_telnet(target, TelnetEvent::WontEchoPromptHint),
+            TelnetEvent::EchoOff => forward_via_telnet(target, TelnetEvent::EchoOff),
+            TelnetEvent::EchoOn => forward_via_telnet(target, TelnetEvent::EchoOn),
+            // MspTrigger still forwards (the handler, not the reader, must own the
+            // "no per-connection host to play audio on" decision - plan Job 9's
+            // per-variant table) even though App::handle_multiuser_telnet_event's
+            // core call is followed by an explicit no-op for it.
+            TelnetEvent::MspTrigger(trigger) => forward_via_telnet(target, TelnetEvent::MspTrigger(trigger)),
         },
     }
 }
@@ -325,10 +273,15 @@ pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> 
 ///
 /// Runs the mandatory idle flush described on `IDLE_FLUSH_INTERVAL`: a
 /// `tokio::select!` between the socket read and a resettable timer, reset on
-/// every read, that releases `TelnetSession::take_pending_text()` after
-/// `IDLE_FLUSH_INTERVAL` of silence. Without this, a prompt on a server that
-/// never sends GA/EOR (MUSH/MOO) would sit invisibly in `pending_text` until
-/// more output happened to arrive.
+/// every read, that releases `TelnetSession::take_idle_flushable_text()`
+/// after `IDLE_FLUSH_INTERVAL` of silence. Without this, a prompt on a server
+/// that never sends GA/EOR (MUSH/MOO) would sit invisibly in `pending_text`
+/// until more output happened to arrive. T2.2: unlike the old
+/// `take_pending_text`, this does not necessarily drain everything — an
+/// in-progress MSP trigger, an unterminated ANSI escape, or a truncated UTF-8
+/// code point stays held (see `idle_release_len`), so a following read or a
+/// later idle flush can still complete it correctly instead of it having
+/// already been shown broken.
 pub fn spawn_telnet_reader(
     mut read_half: StreamReader,
     cmd_tx: mpsc::Sender<WriteCommand>,
@@ -338,22 +291,8 @@ pub fn spawn_telnet_reader(
     cfg: TelnetConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let initiate_negotiation = cfg.initiate_negotiation;
         let mut session = TelnetSession::new(cfg);
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
-
-        // Job 11 (plan Phase 3, step 3.5, finding 5): send Clay's opening
-        // offer before the read loop starts, once per connection, gated on
-        // the per-world setting (default on) so a server that reacts badly
-        // to being spoken to first can be worked around without a rebuild.
-        // Every one of the thirteen migrated call sites gets this for free
-        // by going through this one function.
-        if initiate_negotiation {
-            let opening = session.initial_negotiation();
-            if !opening.is_empty() {
-                let _ = cmd_tx.send(WriteCommand::Raw(opening)).await;
-            }
-        }
 
         let idle_timer = tokio::time::sleep(FAR_FUTURE);
         tokio::pin!(idle_timer);
@@ -385,6 +324,11 @@ pub fn spawn_telnet_reader(
                                 let _ = cmd_tx.send(WriteCommand::Raw(outcome.wire)).await;
                             }
 
+                            // T1.1/T1.14/D1: a poisoned MCCP2 stream is fatal - noted here
+                            // (rather than acted on inline) so the ordinary per-event
+                            // forwarding below still runs first, exactly like every other
+                            // event this call produced.
+                            let mut compression_failed: Option<String> = None;
                             for ev in outcome.events {
                                 if let TelnetEvent::ProtocolError(ref msg) = ev {
                                     // No AppEvent to carry this; log it directly
@@ -397,6 +341,12 @@ pub fn spawn_telnet_reader(
                                         "telnet_reader ({target:?}): {msg}"
                                     ));
                                 }
+                                if let TelnetEvent::CompressionFailed(ref reason) = ev {
+                                    crate::debug_log(true, &format!(
+                                        "telnet_reader ({target:?}): MCCP2 stream corrupt: {reason}"
+                                    ));
+                                    compression_failed = Some(reason.clone());
+                                }
                                 if let Some(app_ev) = to_app_event(&target, ev) {
                                     let _ = event_tx.send(app_ev).await;
                                 }
@@ -406,12 +356,36 @@ pub fn spawn_telnet_reader(
                                 let _ = event_tx.send(make_server_data_event(&target, outcome.text)).await;
                             }
 
+                            if let Some(reason) = compression_failed {
+                                // D1: never fall back to parsing a poisoned stream as
+                                // plaintext - disconnect with one clear message, the same
+                                // fatal sequence the Ok(0)/clean-EOF arm above uses: flush
+                                // whatever text was still held back, then the message,
+                                // then Disconnected, then return.
+                                let eof = session.flush_eof();
+                                if !eof.text.is_empty() {
+                                    let _ = event_tx.send(make_server_data_event(&target, eof.text)).await;
+                                }
+                                let msg = format!("MCCP2 stream corrupt ({reason}); disconnecting.\n");
+                                let _ = event_tx.send(make_server_data_event(&target, msg.into_bytes())).await;
+                                let _ = event_tx.send(make_disconnected_event(&target, conn_id)).await;
+                                return;
+                            }
+
                             // Mandatory idle flush: reset on every read (see
                             // IDLE_FLUSH_INTERVAL's doc comment / the plan's
                             // "Hard requirement discovered in Job 2").
                             idle_timer.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH_INTERVAL);
                         }
                         Err(e) => {
+                            // T1.15: flush whatever text was still held back before
+                            // reporting the error, exactly like the Ok(0) clean-EOF arm
+                            // above already does - otherwise the last prompt/line is lost
+                            // on any read error.
+                            let eof = session.flush_eof();
+                            if !eof.text.is_empty() {
+                                let _ = event_tx.send(make_server_data_event(&target, eof.text)).await;
+                            }
                             let msg = format!("Read error: {}", e);
                             let _ = event_tx.send(make_server_data_event(&target, msg.into_bytes())).await;
                             let _ = event_tx.send(make_disconnected_event(&target, conn_id)).await;
@@ -420,7 +394,7 @@ pub fn spawn_telnet_reader(
                     }
                 }
                 _ = &mut idle_timer => {
-                    let text = session.take_pending_text();
+                    let text = session.take_idle_flushable_text();
                     if !text.is_empty() {
                         let _ = event_tx.send(make_server_data_event(&target, text)).await;
                     }
@@ -442,16 +416,11 @@ mod tests {
     };
     use tokio::io::AsyncWriteExt;
 
-    /// Default test config with Job 11's opening negotiation turned OFF. Every existing
-    /// test in this module predates `initial_negotiation` and asserts on the exact first
-    /// `WriteCommand`/reply sequence a canned script produces; leaving the feature's own
-    /// default-on posture here would make each of them race the unprompted six-option
-    /// opening block sent at task start (see `spawn_telnet_reader`), landing it as an
-    /// unexpected `next_cmd()`. The dedicated `initial_negotiation_*` tests below use
-    /// `TelnetConfig::default()` (or an explicit `true`) instead, to prove the *on*
-    /// behavior at the production default.
+    /// Default test config. `spawn_telnet_reader` is fully reactive — it never sends
+    /// anything unprompted — so every test in this module can safely use
+    /// `TelnetConfig::default()` without racing an opening offer.
     fn test_cfg() -> TelnetConfig {
-        TelnetConfig { initiate_negotiation: false, ..TelnetConfig::default() }
+        TelnetConfig::default()
     }
 
     /// Drives `spawn_telnet_reader` end-to-end over an in-process
@@ -478,10 +447,8 @@ mod tests {
             Self::spawn_with_cfg(target, conn_id, test_cfg())
         }
 
-        /// Like `spawn_with_conn_id`, but with an explicit `TelnetConfig` — used by the
-        /// `initial_negotiation_*` tests below, which need to flip
-        /// `initiate_negotiation` independently of every other test's `test_cfg()`
-        /// default (off).
+        /// Like `spawn_with_conn_id`, but with an explicit `TelnetConfig` — used by
+        /// tests that need a non-default config (e.g. `msp_enabled`, `is_tls`).
         fn spawn_with_cfg(target: TelnetTarget, conn_id: u64, cfg: TelnetConfig) -> Self {
             let (client, server) = tokio::io::duplex(4096);
             let (read_half, _write_half) = tokio::io::split(client);
@@ -583,6 +550,13 @@ mod tests {
             to_app_event(&t, TelnetEvent::CompressionEnded),
             Some(AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::CompressionEnded)) if n == "w"
         ));
+        // Plan Job 1, T1.1/T1.14/D1: forwards the same way, so
+        // App::handle_telnet_event can clear World::mccp2_active.
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::CompressionFailed("corrupt".to_string())),
+            Some(AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::CompressionFailed(r)))
+                if n == "w" && r == "corrupt"
+        ));
         // No AppEvent::Telnet payload built for ProtocolError.
         assert!(to_app_event(&t, TelnetEvent::ProtocolError("boom".to_string())).is_none());
 
@@ -646,6 +620,11 @@ mod tests {
         ));
     }
 
+    /// Job 9 (T3.2): rewritten from a "drops everything" table into a "forwards
+    /// everything" table — every variant below `TelnetDetected`/`Prompt` (which keep
+    /// their own `(usize, String)`-shaped `AppEvent`s) now maps to
+    /// `Some(Telnet(Multiuser{3,"bob"}, ev))`, exactly like the `World` target above,
+    /// including the identical `OptionEnabled`/`OptionDisabled` option-code filter.
     #[test]
     fn to_app_event_multiuser_target_mapping() {
         let t = TelnetTarget::Multiuser { world_index: 3, username: "bob".to_string() };
@@ -658,27 +637,98 @@ mod tests {
             to_app_event(&t, TelnetEvent::Prompt(vec![9])),
             Some(AppEvent::MultiuserPrompt(3, u, b)) if u == "bob" && b == vec![9]
         ));
-        // No (usize, String)-shaped AppEvent exists for any of these yet
-        // (see to_app_event's doc comment) — this is finding 2's dead-code
-        // gap, not reproduced here, plus the further gap Job 4 discovered.
-        assert!(to_app_event(&t, TelnetEvent::NawsRequested).is_none());
-        assert!(to_app_event(&t, TelnetEvent::TtypeRequested).is_none());
-        assert!(to_app_event(&t, TelnetEvent::CharsetRequest(vec!["UTF-8".to_string()])).is_none());
-        assert!(to_app_event(&t, TelnetEvent::GmcpMessage("Core.Hello".to_string(), "{}".to_string())).is_none());
-        assert!(to_app_event(&t, TelnetEvent::MsdpVariable("HP".to_string(), "100".to_string())).is_none());
-        assert!(to_app_event(&t, TelnetEvent::MsspData(vec![("NAME".to_string(), "Test MUD".to_string())])).is_none());
-        assert!(to_app_event(&t, TelnetEvent::CompressionStarted).is_none());
-        assert!(to_app_event(&t, TelnetEvent::CompressionEnded).is_none());
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::NawsRequested),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, ref username }, TelnetEvent::NawsRequested)) if username == "bob"
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::TtypeRequested),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::TtypeRequested))
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::CharsetRequest(vec!["UTF-8".to_string()])),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::CharsetRequest(cs)))
+                if cs == vec!["UTF-8".to_string()]
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::GmcpMessage("Core.Hello".to_string(), "{}".to_string())),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::GmcpMessage(p, j)))
+                if p == "Core.Hello" && j == "{}"
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::MsdpVariable("HP".to_string(), "100".to_string())),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::MsdpVariable(v, val)))
+                if v == "HP" && val == "100"
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::MsspData(vec![("NAME".to_string(), "Test MUD".to_string())])),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::MsspData(pairs)))
+                if pairs == vec![("NAME".to_string(), "Test MUD".to_string())]
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::CompressionStarted),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::CompressionStarted))
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::CompressionEnded),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::CompressionEnded))
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::CompressionFailed("corrupt".to_string())),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::CompressionFailed(r)))
+                if r == "corrupt"
+        ));
+        // No AppEvent::Telnet payload built for ProtocolError, same as World.
         assert!(to_app_event(&t, TelnetEvent::ProtocolError("boom".to_string())).is_none());
-        // Job 4.5: Multiuser has no (usize, String)-shaped GmcpNegotiated/
-        // MsdpNegotiated/WontEchoSeen equivalent, and today's multiuser
-        // dispatch loop wildcards these away even when a reader loop does
-        // emit them - so every option (and the echo hint) maps to None here,
-        // same as every other gap on this target.
-        assert!(to_app_event(&t, TelnetEvent::OptionEnabled(TELNET_OPT_GMCP)).is_none());
-        assert!(to_app_event(&t, TelnetEvent::OptionEnabled(TELNET_OPT_MSDP)).is_none());
-        assert!(to_app_event(&t, TelnetEvent::OptionDisabled(TELNET_OPT_GMCP)).is_none());
-        assert!(to_app_event(&t, TelnetEvent::WontEchoPromptHint).is_none());
+
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::OptionEnabled(TELNET_OPT_GMCP)),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionEnabled(opt)))
+                if opt == TELNET_OPT_GMCP
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::OptionEnabled(TELNET_OPT_MSDP)),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionEnabled(opt)))
+                if opt == TELNET_OPT_MSDP
+        ));
+        for opt in [
+            TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_NAWS, TELNET_OPT_TTYPE,
+            TELNET_OPT_CHARSET, TELNET_OPT_MCCP2, TELNET_OPT_MSSP,
+        ] {
+            assert!(to_app_event(&t, TelnetEvent::OptionEnabled(opt)).is_none());
+        }
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::OptionDisabled(TELNET_OPT_GMCP)),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionDisabled(opt)))
+                if opt == TELNET_OPT_GMCP
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::OptionDisabled(TELNET_OPT_MSDP)),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionDisabled(opt)))
+                if opt == TELNET_OPT_MSDP
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::OptionDisabled(TELNET_OPT_NAWS)),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::OptionDisabled(opt)))
+                if opt == TELNET_OPT_NAWS
+        ));
+        for opt in [
+            TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_TTYPE, TELNET_OPT_CHARSET, TELNET_OPT_MCCP2, TELNET_OPT_MSSP,
+        ] {
+            assert!(to_app_event(&t, TelnetEvent::OptionDisabled(opt)).is_none());
+        }
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::WontEchoPromptHint),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::WontEchoPromptHint))
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::EchoOff),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::EchoOff))
+        ));
+        assert!(matches!(
+            to_app_event(&t, TelnetEvent::EchoOn),
+            Some(AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 3, .. }, TelnetEvent::EchoOn))
+        ));
     }
 
     // ==================================================================
@@ -738,7 +788,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiuser_target_drops_unsupported_events_but_keeps_the_rest() {
+    async fn multiuser_target_forwards_events_like_world_does() {
+        // Job 9 (T3.2): inverted from "drops unsupported events" - after this job
+        // NawsRequested (and every other variant below TelnetDetected/Prompt) *is*
+        // forwarded on a Multiuser target, the exact opposite of what this test used to
+        // assert.
         let mut h = Harness::spawn(TelnetTarget::Multiuser {
             world_index: 5,
             username: "alice".to_string(),
@@ -754,13 +808,18 @@ mod tests {
             _ => panic!("expected a Raw wire write"),
         }
 
-        // TelnetDetected survives...
+        // TelnetDetected keeps its own (usize, String)-shaped AppEvent...
         assert!(matches!(
             h.next_event().await,
             AppEvent::MultiuserTelnetDetected(5, ref u) if u == "alice"
         ));
-        // ...but NawsRequested has no AppEvent for Multiuser yet, so the very
-        // next event must be the Prompt, not a NAWS event sitting in between.
+        // ...but NawsRequested now IS forwarded - the next event is
+        // Telnet(Multiuser{5,"alice"}, NawsRequested), not the Prompt.
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 5, ref username }, TelnetEvent::NawsRequested)
+                if username == "alice"
+        ));
         assert!(matches!(
             h.next_event().await,
             AppEvent::MultiuserPrompt(5, ref u, ref b) if u == "alice" && b == b"Login: "
@@ -774,6 +833,34 @@ mod tests {
         assert!(matches!(
             h.next_event().await,
             AppEvent::MultiuserServerData(5, ref u, ref b) if u == "alice" && b == b"MARKER\n"
+        ));
+    }
+
+    /// A `WILL GMCP` clone of `will_gmcp_emits_gmcp_negotiated` below, for the
+    /// `Multiuser` target (plan Job 9's test list): GMCP negotiation now reaches a
+    /// multiuser connection the same way it reaches a `World` one.
+    #[tokio::test]
+    async fn multiuser_will_gmcp_emits_option_enabled() {
+        let mut h = Harness::spawn(TelnetTarget::Multiuser {
+            world_index: 7,
+            username: "carol".to_string(),
+        });
+        h.send(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_GMCP]).await;
+
+        match h.next_cmd().await {
+            WriteCommand::Raw(bytes) => {
+                assert_eq!(bytes, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP]);
+            }
+            _ => panic!("expected a Raw wire write"),
+        }
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::MultiuserTelnetDetected(7, ref u) if u == "carol"
+        ));
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::Telnet(TelnetTarget::Multiuser { world_index: 7, ref username }, TelnetEvent::OptionEnabled(opt))
+                if username == "carol" && opt == TELNET_OPT_GMCP
         ));
     }
 
@@ -868,6 +955,123 @@ mod tests {
         assert!(matches!(
             h.next_event().await,
             AppEvent::ServerData(n, b) if n == "w" && b == b"Login: ".to_vec()
+        ));
+    }
+
+    // ==================================================================
+    // T2.2: the idle flush must not release text the session isn't sure is
+    // safe yet - an in-progress ANSI CSI, an incomplete UTF-8 code point, or
+    // an open MSP trigger marker all stay held past the idle flush and get
+    // completed by whatever arrives next, rather than being shown broken (or,
+    // for MSP, losing the trigger) after 150ms of silence.
+    // ==================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_flush_holds_back_incomplete_csi_across_two_sends() {
+        let mut h = Harness::spawn(TelnetTarget::World("w".to_string()));
+
+        h.send(b"prompt> \x1b[3").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(h.event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "nothing should be released before the idle flush fires"
+        );
+        tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::ServerData(n, b) if n == "w" && b == b"prompt> ".to_vec()
+        ), "the incomplete CSI must stay held while the prompt text in front of it is released");
+
+        // The rest of the escape arrives on the next read; the idle timer was
+        // re-armed by that read, so a second idle period completes it.
+        h.send(b"1m").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::ServerData(n, b) if n == "w" && b == b"\x1b[31m".to_vec()
+        ), "no stray '[3' - the completed escape sequence must come out as one whole unit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_flush_holds_back_incomplete_utf8_across_two_sends() {
+        let mut h = Harness::spawn(TelnetTarget::World("w".to_string()));
+
+        h.send(b"caf\xc3").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(h.event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::ServerData(n, b) if n == "w" && b == b"caf".to_vec()
+        ), "the truncated UTF-8 lead byte must stay held while 'caf' is released");
+
+        h.send(b"\xa9").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::ServerData(n, b) if n == "w" && b == b"\xc3\xa9".to_vec()
+        ), "the completed code point must come out as one whole unit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_flush_holds_back_open_msp_marker_across_two_sends() {
+        let mut h = Harness::spawn(TelnetTarget::World("w".to_string()));
+
+        h.send(b"Look !!SOUND(bell").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(h.event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::ServerData(n, b) if n == "w" && b == b"Look ".to_vec()
+        ), "the open marker (and 'bell', its in-progress filename) must stay held");
+
+        // The rest of the trigger arrives on the next read: the marker
+        // resolves into an MspTrigger event, and the trailing "\r\n" (with
+        // nothing left to hold back) is emitted immediately - no idle wait
+        // needed for it.
+        h.send(b".wav)\r\n").await;
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::MspTrigger(t))
+                if n == "w" && t.name == "bell.wav" && !t.is_music
+        ));
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::ServerData(n, b) if n == "w" && b == b"\r\n".to_vec()
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_flush_releases_ordinary_prompt_ending_in_bang_whole() {
+        // A lone trailing '!' is only held back by feed() itself (which has
+        // a next read that might still turn it into "!!SOUND("); after an
+        // idle period with no such read coming, msp_holdback_start's
+        // min_prefix of 2 lets it through so an ordinary prompt like this
+        // isn't withheld forever.
+        let mut h = Harness::spawn(TelnetTarget::World("w".to_string()));
+
+        h.send(b"Hello!").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(h.event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::ServerData(n, b) if n == "w" && b == b"Hello!".to_vec()
         ));
     }
 
@@ -1006,86 +1210,143 @@ mod tests {
     }
 
     // ==================================================================
-    // Job 11 (plan Phase 3, step 3.5, finding 5): spawn_telnet_reader sends
-    // TelnetSession::initial_negotiation()'s bytes at task start, gated on
-    // TelnetConfig::initiate_negotiation (the per-world setting).
+    // Plan Job 1 (investigate-differences-between-tinyfugu-fluffy-stallman.md),
+    // T1.1/T1.2/T1.14/D1 — the reader's fatal disconnect sequence for a poisoned
+    // MCCP2 stream.
     // ==================================================================
 
-    #[test]
-    fn test_cfg_disables_initiate_negotiation_by_default() {
-        // Every other test in this module relies on this: if it ever flips back to
-        // TelnetConfig::default()'s `true`, those tests would start racing the
-        // unprompted opening block against their own canned-script assertions.
-        assert!(!test_cfg().initiate_negotiation);
+    #[tokio::test]
+    async fn world_target_disconnects_on_mccp2_garbage_after_activation() {
+        // D1: a poisoned zlib stream disconnects with one clear message - it never falls
+        // back to parsing raw compressed bytes as telnet.
+        let mut h = Harness::spawn(TelnetTarget::World("corruptworld".to_string()));
+
+        h.send(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]).await;
+        match h.next_cmd().await {
+            WriteCommand::Raw(bytes) => assert_eq!(bytes, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2]),
+            _ => panic!("expected a Raw wire write"),
+        }
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::TelnetDetected) if n == "corruptworld"
+        ));
+
+        let mut activation = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MCCP2, TELNET_IAC, TELNET_SE];
+        activation.extend_from_slice(&[0xAAu8; 64]); // not a valid zlib header
+        h.send(&activation).await;
+
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::CompressionStarted) if n == "corruptworld"
+        ));
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::CompressionFailed(_)) if n == "corruptworld"
+        ));
+        match h.next_event().await {
+            AppEvent::ServerData(n, b) => {
+                assert_eq!(n, "corruptworld");
+                let text = String::from_utf8_lossy(&b);
+                assert!(text.contains("MCCP2 stream corrupt"), "got: {text}");
+                assert!(text.contains("disconnecting"), "got: {text}");
+            }
+            _ => panic!("expected ServerData with the corruption message"),
+        }
+        assert!(matches!(h.next_event().await, AppEvent::Disconnected(n, _) if n == "corruptworld"));
+
+        // The reader task returned: the channel closes, nothing more is ever sent.
+        assert!(h.event_rx.recv().await.is_none(), "reader task must have returned");
     }
 
     #[tokio::test]
-    async fn spawn_telnet_reader_sends_opening_negotiation_before_any_data_arrives() {
-        // Production's own default (TelnetConfig::default(), not test_cfg()): the
-        // reader's very first wire write, with nothing sent from the "server" side at
-        // all yet, must be Clay's opening offer (MSSP added Job 12, plan Phase 4, 4.2;
-        // MSP added Job 14, same phase - offered last, conditional on msp_enabled,
-        // default true).
+    async fn err_arm_flushes_pending_text_before_reporting_the_read_error() {
+        // T1.15: the Err(e) arm must flush_eof() before reporting the error, exactly like
+        // the Ok(0) clean-EOF arm already does - otherwise a held-back prompt/line is lost
+        // on any read error. "Login: " has no trailing newline and no GA/EOR/WONT-ECHO
+        // boundary, so it sits in pending_text (not emitted as ServerData yet) until the
+        // Err arm's flush_eof() releases it.
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(Ok(b"Login: ".to_vec()));
+        queue.push_back(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        )));
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let _handle = spawn_telnet_reader(
+            StreamReader::Scripted(queue),
+            cmd_tx,
+            event_tx,
+            TelnetTarget::World("w".to_string()),
+            1,
+            test_cfg(),
+        );
+
+        async fn next(rx: &mut mpsc::Receiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for AppEvent")
+                .expect("event channel closed")
+        }
+
+        assert!(matches!(
+            next(&mut event_rx).await,
+            AppEvent::ServerData(n, b) if n == "w" && b == b"Login: ".to_vec()
+        ));
+        match next(&mut event_rx).await {
+            AppEvent::ServerData(n, b) => {
+                assert_eq!(n, "w");
+                assert_eq!(String::from_utf8_lossy(&b), "Read error: connection reset");
+            }
+            _ => panic!("expected the read-error ServerData"),
+        }
+        assert!(matches!(next(&mut event_rx).await, AppEvent::Disconnected(n, _) if n == "w"));
+    }
+
+    // ==================================================================
+    // Clay is fully reactive: spawn_telnet_reader must never send anything
+    // unprompted, only in response to what the server sends first.
+    // ==================================================================
+
+    #[tokio::test]
+    async fn spawn_telnet_reader_sends_nothing_unprompted() {
+        // With nothing sent from the "server" side yet, the reader must not write
+        // anything to the wire on its own - no opening offer, no unsolicited bytes at
+        // all. Confirm this by having the server speak first and checking that the
+        // reply to *that* is the very first (and only) wire write.
         let mut h = Harness::spawn_with_cfg(
-            TelnetTarget::World("negotiateworld".to_string()),
+            TelnetTarget::World("reactiveworld".to_string()),
             1,
             TelnetConfig::default(),
         );
 
-        match h.next_cmd().await {
-            WriteCommand::Raw(bytes) => {
-                assert_eq!(
-                    bytes,
-                    vec![
-                        TELNET_IAC, TELNET_WILL, TELNET_OPT_TTYPE,
-                        TELNET_IAC, TELNET_WILL, TELNET_OPT_NAWS,
-                        TELNET_IAC, TELNET_DO, TELNET_OPT_CHARSET,
-                        TELNET_IAC, TELNET_DO, TELNET_OPT_GMCP,
-                        TELNET_IAC, TELNET_DO, TELNET_OPT_MSDP,
-                        TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2,
-                        TELNET_IAC, TELNET_DO, TELNET_OPT_MSSP,
-                        TELNET_IAC, TELNET_DO, TELNET_OPT_MSP,
-                    ]
-                );
-            }
-            other => panic!("expected the opening negotiation as a Raw wire write, got {other:?}"),
-        }
-
-        // The reader still works normally afterward - the opening offer doesn't
-        // interfere with parsing whatever the server sends next. Plain text with no
-        // IAC byte at all correctly does not fire TelnetDetected (that only fires once
-        // an actual IAC arrives *from the peer* - initial_negotiation is purely
-        // outbound and doesn't touch that flag).
-        h.send(b"Welcome\r\n").await;
-        assert!(matches!(
-            h.next_event().await,
-            AppEvent::ServerData(n, b) if n == "negotiateworld" && b == b"Welcome\r\n".to_vec()
-        ));
-    }
-
-    #[tokio::test]
-    async fn initiate_negotiation_false_suppresses_the_opening_bytes() {
-        // The plan's required test: the per-world setting actually suppresses the
-        // opening offer when off, rather than merely defaulting off in tests.
-        let mut h = Harness::spawn_with_cfg(
-            TelnetTarget::World("quietworld".to_string()),
-            1,
-            TelnetConfig { initiate_negotiation: false, ..TelnetConfig::default() },
-        );
-
-        // Nothing to drain: the very first thing to arrive must be the reply to the
-        // server's own script, not an unprompted offer from Clay.
         h.send(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA]).await;
         match h.next_cmd().await {
             WriteCommand::Raw(bytes) => {
                 assert_eq!(
                     bytes,
                     vec![TELNET_IAC, TELNET_DO, TELNET_OPT_SGA],
-                    "with initiate_negotiation off, the only wire write should be the \
-                     reply to the server's own WILL SGA - no opening offer preceding it"
+                    "the reader's first wire write must be the reply to the server's own \
+                     WILL SGA, not an unprompted offer preceding it"
                 );
             }
             other => panic!("expected a Raw wire write, got {other:?}"),
         }
+
+        // The IAC byte just seen also fires TelnetDetected - drain it before checking
+        // for the plain text below.
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::TelnetDetected) if n == "reactiveworld"
+        ));
+
+        // The reader still works normally afterward - plain text with no IAC byte at
+        // all is passed through untouched.
+        h.send(b"Welcome\r\n").await;
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::ServerData(n, b) if n == "reactiveworld" && b == b"Welcome\r\n".to_vec()
+        ));
     }
 }

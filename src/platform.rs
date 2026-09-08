@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 #[cfg(any(unix, windows))]
 use std::sync::Arc;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 use std::os::unix::io::RawFd;
 #[cfg(not(target_os = "android"))]
 use std::path::Path;
@@ -237,7 +237,7 @@ pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(60))
         .with_interval(std::time::Duration::from_secs(10));
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     let keepalive = keepalive.with_retries(6);
     let sock_ref = SockRef::from(tcp_stream);
     let _ = sock_ref.set_tcp_keepalive(&keepalive);
@@ -1516,7 +1516,7 @@ pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, Str
     {
         use std::io::Write as _;
         let mut file = {
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_os = "android")))]
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 std::fs::OpenOptions::new()
@@ -2066,6 +2066,7 @@ mod tests {
         dir
     }
 
+    #[cfg(not(target_os = "android"))]  // self-update fns are not(android); test must match (pre-existing gap, enables `cargo test` on Termux)
     #[test]
     fn test_update_staging_path_same_dir_as_exe() {
         // The regression guard: staging must share a filesystem with the
@@ -2079,6 +2080,7 @@ mod tests {
             "staging name should be dot-hidden");
     }
 
+    #[cfg(not(target_os = "android"))]  // self-update fns are not(android); test must match (pre-existing gap, enables `cargo test` on Termux)
     #[test]
     fn test_install_update_at_replaces_target() {
         let dir = install_test_dir("replace");
@@ -2093,7 +2095,7 @@ mod tests {
         assert!(!staged.exists(), "staged file must be gone after a successful install");
         assert!(!old_exe_path(&exe).exists(), "no .old file should remain after success");
 
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "android")))]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
@@ -2101,7 +2103,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn test_install_update_at_rolls_back_on_failure() {
         // Force the second rename (temp -> exe) to fail by making the
@@ -2133,6 +2135,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(not(target_os = "android"))]  // self-update fns are not(android); test must match (pre-existing gap, enables `cargo test` on Termux)
     #[test]
     fn test_old_exe_path_appends_not_replaces_extension() {
         // Regression guard for the with_extension() footgun: with_extension

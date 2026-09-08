@@ -59,6 +59,15 @@
 //! don't grow forever, don't corrupt state either" contract for telnet
 //! subnegotiations.
 //!
+//! That per-tag byte cap does nothing about the *number* of simultaneously open
+//! tags (T1.3): a server that opens N datatags and never closes any of them grows
+//! `McpState::pending` without bound regardless of how small each one stays.
+//! `MAX_MCP_OPEN_MULTILINE` bounds the map itself — opening one past the cap
+//! evicts the oldest open tag (by insertion order) with a `ProtocolError` naming
+//! it, rather than growing further. A later continuation or end line for an
+//! evicted tag falls into the ordinary "unknown datatag" path (silently consumed,
+//! nothing to dispatch) — there is nothing left to abandon a second time.
+//!
 //! # Scope
 //!
 //! Core MCP 2.1 framing (handshake, per-session key, quoted/unquoted values, multiline
@@ -79,6 +88,8 @@
 //! character.
 
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 /// Every MCP message line begins with this.
 pub const MCP_PREFIX: &str = "#$#";
@@ -194,6 +205,7 @@ struct Field {
 /// place of the authentication key" for continuation/end lines (spec section 2.2.3):
 /// only reachable at all by first authenticating the message-start line that declared
 /// it, so no separate per-line auth check is needed here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct PendingMultiline {
     message_name: String,
     /// Every non-multiline field from the original message-start line, `_data-tag`
@@ -206,22 +218,29 @@ struct PendingMultiline {
     /// but keep the entry so continuation/end lines for this tag keep being silently
     /// consumed (never fall through to display) until the sender's own `:` closes it.
     abandoned: bool,
+    /// T1.3: insertion order, from `McpState::next_open_seq`. `MAX_MCP_MULTILINE_BYTES`
+    /// caps bytes *per open tag*, but nothing capped how many tags could be open at
+    /// once — a server opening tags and never closing them grows `McpState::pending`
+    /// without bound. This is what lets `finish_message_start` find "the oldest still
+    /// open" in O(n) over the (small, capped) map to evict when a new tag would push
+    /// past `MAX_MCP_OPEN_MULTILINE`.
+    opened_seq: u64,
 }
 
 /// Per-world, per-connection MCP state. Lives on `World` (see `World::mcp`), reset by
 /// `clear_connection_state` on every disconnect/reconnect — a stale key or half-open
 /// multiline value from a previous connection must never be trusted against a new one.
 ///
-/// Deliberately not persisted across a hot reload (unlike `mccp2_active`/`is_tls`):
-/// the socket survives an `exec`, but nothing here does, and — unlike MCCP2 — that
-/// does not corrupt the byte stream, it just means MCP silently stops working for that
-/// world's connection until it reconnects (the server has no reason to resend its
-/// one-time "mcp version:" invite mid-session, so there is no natural
-/// resend-on-every-reader-spawn recovery the way telnet option negotiation gets from
-/// `initial_negotiation()`). Documented here as a known, deliberate scope limit rather
-/// than an oversight — fixing it would mean the server-side half of MCP re-inviting
-/// itself, which is not something Clay controls.
-#[derive(Default)]
+/// Persisted across a hot reload (T3.4/job 5), `#[derive(Serialize, Deserialize)]`
+/// as one `mcp_json=` line in the reload state file: the socket survives an `exec`,
+/// and unlike a real reconnect the server has no reason to resend its one-time "mcp
+/// version:" invite mid-session, so there is no natural recovery path at all — Clay
+/// is purely reactive and never prompts the server side of MCP (or any other telnet
+/// option) to redo its own negotiation. Left unpersisted, MCP silently and
+/// permanently stopped working on that connection — unlike MCCP2, this does not
+/// corrupt the byte stream, it just went quiet with no way back short of a real
+/// reconnect.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpState {
     /// `None` until a satisfiable version handshake completes. `Some(_)` is
     /// "authenticated": every subsequent message must carry this exact key.
@@ -238,7 +257,19 @@ pub struct McpState {
     /// protecting anything on Clay's outbound side, it only has to be unique for the
     /// life of this connection so multiple saves can't collide.
     next_out_tag: u64,
+    /// Monotonic counter stamped onto each `PendingMultiline::opened_seq` as it's
+    /// inserted (T1.3) — an incoming-datatag analogue of `next_out_tag`, used purely
+    /// to find "the oldest open tag" for eviction, never sent on the wire.
+    next_open_seq: u64,
 }
+
+/// Cap on the number of simultaneously open multiline values (T1.3; see the module
+/// doc comment's "Multiline accumulation is unbounded on the wire" section, and
+/// `MAX_MCP_MULTILINE_BYTES` just above, which only bounds bytes *per tag*). A real
+/// `@edit` session opens one tag at a time; 16 leaves generous headroom for a client
+/// with several edit windows in flight while still bounding a server that opens tags
+/// and never closes them.
+pub const MAX_MCP_OPEN_MULTILINE: usize = 16;
 
 impl McpState {
     /// Feed one complete, already-decoded server line. Must be a full line (no
@@ -352,6 +383,23 @@ impl McpState {
                     // was still authenticated real MCP syntax, so still hidden.
                     None => LineOutcome::consumed(),
                     Some(tag) => {
+                        // T1.3: only an actually-new tag grows the map — re-using an
+                        // already-open tag (overwriting its entry, same as before)
+                        // must not trigger an eviction of something else.
+                        let mut events = Vec::new();
+                        if !self.pending.contains_key(&tag) && self.pending.len() >= MAX_MCP_OPEN_MULTILINE {
+                            if let Some(oldest_tag) = self.pending.iter()
+                                .min_by_key(|(_, pm)| pm.opened_seq)
+                                .map(|(k, _)| k.clone())
+                            {
+                                self.pending.remove(&oldest_tag);
+                                events.push(McpEvent::ProtocolError(format!(
+                                    "mcp: too many open multiline values (limit {MAX_MCP_OPEN_MULTILINE}), abandoned oldest datatag '{oldest_tag}'",
+                                )));
+                            }
+                        }
+                        let opened_seq = self.next_open_seq;
+                        self.next_open_seq += 1;
                         self.pending.insert(tag, PendingMultiline {
                             message_name: name.to_string(),
                             fields: simple_fields.into_iter().filter(|(k, _)| k != "_data-tag").collect(),
@@ -359,8 +407,9 @@ impl McpState {
                             lines: Vec::new(),
                             byte_len: 0,
                             abandoned: false,
+                            opened_seq,
                         });
-                        LineOutcome::consumed()
+                        LineOutcome::Consumed { replies: Vec::new(), events }
                     }
                 }
             }
@@ -374,7 +423,21 @@ impl McpState {
     /// batch advertising `mcp-negotiate` and `dns-org-mud-moo-simpleedit` (spec:
     /// implementations need not wait for the peer's own `mcp-negotiate-end` before
     /// advertising their own capabilities).
+    ///
+    /// T1.6: a bootstrap is only ever legitimate once, at the start of the
+    /// connection. Because this is the one message exempt from `check_auth`, nothing
+    /// else stops a replay — from the server itself, or echoed in-band from another
+    /// player's text at start-of-line — from regenerating the session key. Every
+    /// later genuine message is signed with the *old* key and would then fail
+    /// `check_auth` and be silently consumed and hidden (the same fate as any
+    /// wrong-key message — see the module doc comment's security section), killing
+    /// MCP for the rest of the connection with no diagnostic. Once a key exists, a
+    /// second bootstrap is ignored outright: same posture as a wrong/missing key
+    /// elsewhere in this module — well-formed MCP, but inert and hidden.
     fn handle_mcp_bootstrap(&mut self, fields: &[Field]) -> LineOutcome {
+        if self.key.is_some() {
+            return LineOutcome::consumed();
+        }
         let version = fields.iter().find(|f| f.key == "version").and_then(|f| parse_version(&f.value));
         let to = fields.iter().find(|f| f.key == "to").and_then(|f| parse_version(&f.value));
         let (Some(v), Some(t)) = (version, to) else {
@@ -544,6 +607,22 @@ impl McpState {
     #[cfg(test)]
     pub(crate) fn has_key(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// Test-only: the session key itself, for a test outside this module (job 5's
+    /// hot-reload roundtrip in `persistence.rs`) that needs to sign a follow-up
+    /// message after restoring a serialized `McpState` it never negotiated by hand.
+    #[cfg(test)]
+    pub(crate) fn key_for_test(&self) -> Option<String> {
+        self.key.clone()
+    }
+
+    /// Test-only: number of currently-open multiline datatags (T1.3). Lets a test
+    /// observe `MAX_MCP_OPEN_MULTILINE` eviction without reaching into the private
+    /// `pending` map directly.
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     /// Build the wire lines for a `dns-org-mud-moo-simpleedit-set` reply: the
@@ -810,6 +889,29 @@ mod tests {
         assert!(state.key.is_none());
     }
 
+    // T1.6: a replayed bootstrap must not reset the session key - either the server
+    // resends its own invite mid-session, or another player's in-band text happens
+    // to echo one back verbatim.
+    #[test]
+    fn bootstrap_replay_does_not_reset_key() {
+        let (mut state, original_key) = authenticated_state();
+
+        let replay = handshake(&mut state, "2.1", "2.1");
+        assert_eq!(replay, LineOutcome::Consumed { replies: Vec::new(), events: Vec::new() },
+            "a replayed bootstrap must be consumed with no reply, not renegotiate");
+        assert_eq!(state.key.as_deref(), Some(original_key.as_str()), "the key must not change");
+
+        // A message signed with the ORIGINAL key must still authenticate and
+        // dispatch - proves the replay didn't quietly invalidate every later
+        // genuine message (the bug: a regenerated key made every subsequent real
+        // message fail check_auth and vanish with no diagnostic).
+        let outcome = state.process_line(&format!(
+            "{MCP_PREFIX}dns-org-mud-moo-simpleedit-content {original_key} reference: r name: n type: string content: \"hi\""
+        ));
+        let LineOutcome::Consumed { events, .. } = outcome else { panic!("expected Consumed") };
+        assert_eq!(events.len(), 1, "message signed with the original key must still dispatch after a replayed bootstrap");
+    }
+
     // ==================================================================
     // Argument parsing: quoted, unquoted, malformed
     // ==================================================================
@@ -967,6 +1069,39 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], McpEvent::ProtocolError(msg) if msg.contains("abandoned")),
             "expected a ProtocolError, got {events:?}");
+    }
+
+    // ==================================================================
+    // T1.3: capping the number of simultaneously open multiline datatags.
+    // ==================================================================
+
+    #[test]
+    fn open_multiline_count_is_capped() {
+        let (mut state, key) = authenticated_state();
+        // Open MAX_MCP_OPEN_MULTILINE + 1 tags ("tag0".."tag16"), each declaring the
+        // multiline field but never closing it - the unbounded-entry-count DoS.
+        for i in 0..(MAX_MCP_OPEN_MULTILINE + 1) {
+            let tag = format!("tag{i}");
+            let outcome = state.process_line(&format!(
+                "{MCP_PREFIX}dns-org-mud-moo-simpleedit-content {key} reference: r name: n type: string content*: \"\" _data-tag: {tag}"
+            ));
+            if i < MAX_MCP_OPEN_MULTILINE {
+                assert_hidden_no_events(&outcome);
+            } else {
+                // The 17th open evicts the oldest ("tag0") with a ProtocolError
+                // naming it, rather than growing the map past the cap.
+                let LineOutcome::Consumed { events, .. } = outcome else { panic!("expected Consumed") };
+                assert_eq!(events.len(), 1);
+                assert!(matches!(&events[0], McpEvent::ProtocolError(msg) if msg.contains("tag0")),
+                    "expected a ProtocolError naming the evicted tag0, got {events:?}");
+            }
+        }
+        assert_eq!(state.pending_count(), MAX_MCP_OPEN_MULTILINE, "must never hold more than the cap");
+
+        // A later continuation/end line for the evicted tag falls into the ordinary
+        // "unknown tag" path: consumed, hidden, no dispatch - not a second error.
+        let closed = state.process_line(&format!("{MCP_PREFIX}: tag0"));
+        assert_eq!(closed, LineOutcome::Consumed { replies: Vec::new(), events: Vec::new() });
     }
 
     // ==================================================================
