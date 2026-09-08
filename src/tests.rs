@@ -10049,6 +10049,104 @@ third
             "a prompt shown as output on a disconnected world must reach clients too. Got: {sent:?}");
     }
 
+    /// `App::emit_reconnect_status` is the quiet retry-chatter path for auto-reconnect
+    /// ("Connecting to...", "Connected!", "Connection failed..."): unlike
+    /// `add_output_to_world`/`emit_client_text`, it must never bump `unseen_lines` or make
+    /// `has_activity()` true for a world nobody is currently viewing - that's the whole point
+    /// of routing retry chatter through it instead - while the line still lands in
+    /// `output_lines` and still reaches WebSocket clients. "Visible but silent".
+    #[test]
+    fn test_emit_reconnect_status_is_silent_but_visible() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("current"));
+        let mut other = World::new("other");
+        other.connected = false;
+        other.was_connected = true;
+        app.worlds.push(other);
+        app.current_world_index = 0; // viewing "current", NOT "other"
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+
+        app.emit_reconnect_status(1, "Connecting to example.com:4000...");
+
+        assert_eq!(app.worlds[1].unseen_lines, 0,
+            "retry-timer chatter must not bump unseen_lines on a background world");
+        assert!(!app.worlds[1].has_activity(),
+            "retry-timer chatter must not count as activity");
+        assert!(app.worlds[1].output_lines.iter().any(|l| l.text.contains("Connecting to example.com:4000...")),
+            "the line must still be visible in output_lines");
+
+        let sent = drain_server_data(&mut rx);
+        assert!(sent.iter().any(|(_, _, d)| d.contains("Connecting to example.com:4000...")),
+            "the line must still reach WebSocket clients viewing the world. Got: {sent:?}");
+    }
+
+    /// `World::is_reconnecting()` truth table (plan Requirement 2/3): keyed on the
+    /// `auto_reconnect_secs` SETTING, not the flickering per-attempt `reconnect_at` timer, so
+    /// it is stable across retries and flips false the instant auto-reconnect is turned off.
+    #[test]
+    fn test_is_reconnecting_truth_table() {
+        let mut world = World::new("w");
+        // Never connected at all: never reconnecting, even with auto-reconnect configured.
+        world.settings.auto_reconnect_secs = 30;
+        assert!(!world.is_reconnecting(), "a world that never connected is not 'reconnecting'");
+
+        // Disconnected after having connected, with auto-reconnect on -> reconnecting.
+        world.was_connected = true;
+        world.connected = false;
+        assert!(world.is_reconnecting());
+
+        // Currently connected -> never reconnecting, regardless of the setting.
+        world.connected = true;
+        assert!(!world.is_reconnecting(), "a connected world is not reconnecting");
+
+        // Disconnected again, but auto-reconnect turned off -> not reconnecting.
+        world.connected = false;
+        world.settings.auto_reconnect_secs = 0;
+        assert!(!world.is_reconnecting(), "auto_reconnect_secs == 0 must never read as reconnecting");
+    }
+
+    /// Requirement 3 (reconnect-off lifecycle): a reconnecting world with a genuine pending
+    /// backlog stays cycleable purely because of that backlog after auto-reconnect is turned
+    /// off - `is_reconnecting()` goes false immediately, but `world_should_cycle` still holds
+    /// via `pending_lines > 0` - and only drops out once the backlog actually drains, at
+    /// which point it becomes an ordinary (non-cycleable) disconnected world.
+    #[test]
+    fn test_reconnect_off_lifecycle_drops_after_pending_drains() {
+        let mut world = World::new("w");
+        world.was_connected = true;
+        world.connected = false;
+        world.settings.auto_reconnect_secs = 30;
+        world.pending_lines.push(OutputLine::new_client("held while paused".to_string(), 0));
+
+        let info = |w: &World| crate::util::WorldSwitchInfo {
+            name: w.name.clone(),
+            connected: w.connected,
+            unseen_lines: w.unseen_lines,
+            pending_lines: w.pending_lines.len(),
+            is_reconnecting: w.is_reconnecting(),
+            first_unseen_at: w.first_unseen_at,
+        };
+
+        assert!(world.is_reconnecting());
+        assert!(crate::util::world_should_cycle(&info(&world)),
+            "reconnecting with a pending backlog must cycle");
+
+        // Auto-reconnect turned off (mirrors the `auto_reconnect_secs = 0` sites in
+        // main.rs:8598 / input_handler.rs:941, which also clear reconnect_at - irrelevant to
+        // is_reconnecting() itself, which is keyed on the setting, not that timer).
+        world.settings.auto_reconnect_secs = 0;
+        assert!(!world.is_reconnecting(), "turning auto-reconnect off must flip this immediately");
+        assert!(crate::util::world_should_cycle(&info(&world)),
+            "must still cycle while its pending backlog has not been shown yet");
+
+        // Pending backlog shown/drained (e.g. via release_pending) -> now an ordinary
+        // disconnected world with nothing left to justify staying in the cycle.
+        world.pending_lines.clear();
+        assert!(!crate::util::world_should_cycle(&info(&world)),
+            "once pending drains and reconnect is off, the world must drop out of the cycle");
+    }
+
     /// A batch must never carry `end_seq < first_seq`. That happened when more-mode was
     /// toggled off while a world was paused: the drained pending lines (higher seqs) were
     /// appended AFTER the loop's newly-allocated lines, leaving `output_lines` unsorted. The
@@ -11676,6 +11774,37 @@ third
 
         match serde_json::from_value::<WsMessage>(encoded).expect("parses without the flag") {
             WsMessage::InitialState { scrollback_push, .. } => assert!(!scrollback_push),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_initial_state_carries_android_app_version_and_defaults_when_absent() {
+        // android_app_version lets Android nag to reinstall only when the Android app
+        // itself changed (crate::ANDROID_APP_VERSION), rather than on every server-only
+        // version bump. Built from a real build_initial_state() so this exercises the
+        // message the server actually emits, then the field is stripped to simulate an
+        // older server that predates it (must still deserialize - #[serde(default)]).
+        let app = App::new();
+        let state = app.build_initial_state(0);
+        let mut encoded = serde_json::to_value(&state).expect("serializes");
+
+        match &state {
+            WsMessage::InitialState { android_app_version, .. } => assert_eq!(
+                android_app_version, crate::ANDROID_APP_VERSION,
+                "build_initial_state must populate android_app_version from the crate constant"
+            ),
+            other => panic!("wrong variant: {:?}", other),
+        }
+
+        assert!(encoded.get("android_app_version").is_some(), "field is present on the wire");
+        encoded.as_object_mut().unwrap().remove("android_app_version");
+
+        match serde_json::from_value::<WsMessage>(encoded).expect("parses without the field") {
+            WsMessage::InitialState { android_app_version, .. } => assert_eq!(
+                android_app_version, "",
+                "an old peer's InitialState (no android_app_version) must default to empty, not fail to parse"
+            ),
             other => panic!("wrong variant: {:?}", other),
         }
     }
@@ -16526,4 +16655,50 @@ third
             false,
         );
         assert_eq!(app.media_processes.len(), before, "a missing file must never be registered");
+    }
+
+    #[test]
+    fn test_bamf_portal_login_routes_through_standard_autologin_not_send_connect() {
+        // Hardening: a BAMF portal with the login flag must log into the new world via that
+        // world's OWN auto-login (a raw send that bypasses /recall capture), NOT via a
+        // deferred `/send connect <user> <pass>` (which flows through the capture chokepoint
+        // and was kept out of recall only by the login guard's budget). So: the portal world
+        // is created with the current world's credentials + AutoConnectType::Connect, and NO
+        // `/send connect` command is queued.
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("Home");
+        w.settings.user = "Bob".to_string();
+        w.settings.password = "hunter2".to_string();
+        w.connected = true;
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        app.tf_engine.set_global("bamf", tf::TfValue::String("1".to_string()));
+        app.tf_engine.set_global("login", tf::TfValue::String("1".to_string()));
+
+        let cmds = app.process_server_data(
+            0,
+            b"#### Please reconnect to NewMud@1.2.3.4 (newmud.example.com) port 4000 ####\r\n",
+            24, 80, false,
+        );
+
+        // No capture-routed login command was queued.
+        assert!(
+            !cmds.iter().any(|c| c.to_ascii_lowercase().starts_with("/send connect")),
+            "portal login must not queue a `/send connect` (that path is /recall-captured); got {cmds:?}"
+        );
+        // The connect for the new world IS queued.
+        assert!(
+            cmds.iter().any(|c| c.eq_ignore_ascii_case("/worlds NewMud")),
+            "expected a `/worlds NewMud` connect command; got {cmds:?}"
+        );
+        // The portal world was created with the current world's credentials + Connect, so
+        // standard auto-login (the bypassing raw send) will fire on that connect.
+        let idx = app.find_world_index("NewMud").expect("portal world should have been created");
+        assert_eq!(app.worlds[idx].settings.hostname, "newmud.example.com");
+        assert_eq!(app.worlds[idx].settings.port, "4000");
+        assert_eq!(app.worlds[idx].settings.user, "Bob");
+        assert_eq!(app.worlds[idx].settings.password, "hunter2");
+        assert!(app.worlds[idx].settings.auto_connect_type == AutoConnectType::Connect,
+            "portal world must be set to auto-login (Connect) so standard auto-login fires");
     }

@@ -580,7 +580,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             app.worlds[idx].connection_id += 1;
                             let connection_id = app.worlds[idx].connection_id;
                             let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                            app.emit_client_text(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg), true);
+                            app.emit_reconnect_status(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
                             // skip_auto_login=true: handle_connection_success sends auto-login itself.
                             match connect_daemon_world(
                                 idx, world_name.clone(), &settings, event_tx.clone(), connection_id, true,
@@ -591,7 +591,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                     if let Some(new_idx) = app.find_world_index(&world_name) {
                                         app.worlds[new_idx].proxy_pid = proxy_pid;
                                         app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
-                                        app.emit_client_text(new_idx, "Connected!", true);
+                                        app.emit_reconnect_status(new_idx, "Connected!");
                                     }
                                 }
                                 None => {
@@ -601,9 +601,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                             app.worlds[current_idx].reconnect_at = Some(
                                                 std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
                                             );
-                                            app.emit_client_text(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs), true);
+                                            app.emit_reconnect_status(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
                                         } else {
-                                            app.emit_client_text(current_idx, "Connection failed.", true);
+                                            app.emit_reconnect_status(current_idx, "Connection failed.");
                                         }
                                     }
                                 }
@@ -3043,6 +3043,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         actions,
         splash_lines,
         server_version: crate::VERSION.to_string(),
+        android_app_version: crate::ANDROID_APP_VERSION.to_string(),
         // Multiuser stays on the legacy pull download permanently (PROTOCOL-ROADMAP.md
         // Phase J). The push protocol is driven entirely by per-world sequence numbers and
         // multiuser has none - it emits `seq: 0, end_seq: None` on every line and skips the

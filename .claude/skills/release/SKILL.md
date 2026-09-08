@@ -83,6 +83,8 @@ Then update the version string (without the `v` prefix) in these three files:
 
 Also increment `versionCode` in `android/app/build.gradle` line 13 by 1 from its current value.
 
+If the Android app changed this release (anything under `android/`, `src/web/`, or the bundled server), also set `ANDROID_APP_VERSION` in `src/main.rs` to the new version. If the release is server-only, leave it — that's what stops phones being nagged to reinstall unnecessarily.
+
 **Regenerate `Cargo.lock`** so the bump is committed together with its lock file:
 ```bash
 cargo update -p clay --precise X.Y.Z 2>/dev/null || cargo check --quiet

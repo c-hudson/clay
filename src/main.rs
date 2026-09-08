@@ -38,6 +38,12 @@ pub mod testharness;
 
 // Version information
 pub(crate) const VERSION: &str = "1.6.2";
+/// The last release whose Android app actually changed (bundled app.js/index.html,
+/// the `android/` native shell, or the bundled libclay server). Bump to the current
+/// `VERSION` ONLY when one of those changes. A phone whose installed APK version is
+/// at or above this is functionally current and is not nagged to reinstall, even
+/// against a newer server. Set to 1.6.2 because the Android app changed this release.
+pub(crate) const ANDROID_APP_VERSION: &str = "1.6.2";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
@@ -4414,6 +4420,17 @@ impl World {
         self.unseen_lines > 0 || !self.pending_lines.is_empty()
     }
 
+    /// True while this world is disconnected but auto-reconnect is actively retrying it.
+    /// Keyed on the `auto_reconnect_secs` SETTING, not the flickering `reconnect_at` (which is
+    /// briefly `None` between "timer fired" and "next attempt scheduled" on every single retry,
+    /// see `handle_disconnected` and the reconnect-timer sites), so this is stable across
+    /// attempts and flips to `false` the instant the user turns auto-reconnect off, rather than
+    /// toggling on every retry cycle. Drives both the cycle tier (`WorldSwitchInfo::is_reconnecting`)
+    /// and the amber separator dot (`render_separator_bar`).
+    pub(crate) fn is_reconnecting(&self) -> bool {
+        !self.connected && self.was_connected && self.settings.auto_reconnect_secs > 0
+    }
+
     /// Release pending lines, counting by VISUAL lines (wrapped line count) to fill
     /// approximately one screenful. Always releases at least one logical line.
     /// Releases up to `visual_budget` visual rows worth of pending lines into `output_lines`
@@ -6766,6 +6783,14 @@ impl App {
         // shared by both the master and this mirror) sets `stats_line_shown` from
         // this on the very next paint - no need to set it here too.
         world.mirrored_stats = w.stats;
+        // auto_reconnect_secs/on_web: without this, World::is_reconnecting() (and the
+        // amber separator dot it drives) could never fire on the SSH remote console mirror
+        // - auto_reconnect_secs would silently sit at WorldSettings::default()'s 0 until the
+        // user happened to open this world's own World Editor locally (see
+        // NewPopupAction::WorldEditorSaved's optimistic update in remote_client.rs, the only
+        // other place that ever set this field on the mirror).
+        let (auto_reconnect_secs, auto_reconnect_on_web) =
+            WorldSettings::parse_auto_reconnect(&w.settings.auto_reconnect_secs);
         world.settings = WorldSettings {
             hostname: w.settings.hostname,
             port: w.settings.port,
@@ -6779,6 +6804,8 @@ impl App {
             keep_alive_cmd: w.settings.keep_alive_cmd,
             msp_enabled: w.settings.msp_enabled,
             mcp_enabled: w.settings.mcp_enabled,
+            auto_reconnect_secs,
+            auto_reconnect_on_web,
             ..WorldSettings::default()
         };
         world
@@ -7214,6 +7241,7 @@ impl App {
                 connected: w.connected,
                 unseen_lines: w.unseen_lines,
                 pending_lines: w.pending_lines.len(),
+                is_reconnecting: w.is_reconnecting(),
                 first_unseen_at: w.first_unseen_at,
             })
             .collect();
@@ -7235,6 +7263,7 @@ impl App {
                 connected: w.connected,
                 unseen_lines: w.unseen_lines,
                 pending_lines: w.pending_lines.len(),
+                is_reconnecting: w.is_reconnecting(),
                 first_unseen_at: w.first_unseen_at,
             })
             .collect();
@@ -7305,6 +7334,7 @@ impl App {
                 connected: w.connected,
                 unseen_lines: w.unseen_lines,
                 pending_lines: w.pending_lines.len(),
+                is_reconnecting: w.is_reconnecting(),
                 first_unseen_at: w.first_unseen_at,
             })
             .collect();
@@ -7319,6 +7349,7 @@ impl App {
                 connected: w.connected,
                 unseen_lines: w.unseen_lines,
                 pending_lines: w.pending_lines.len(),
+                is_reconnecting: w.is_reconnecting(),
                 first_unseen_at: w.first_unseen_at,
             })
             .collect();
@@ -8208,6 +8239,36 @@ impl App {
             });
         }
         displayed
+    }
+
+    /// Emit one line of auto-reconnect retry-timer chatter ("Connecting to …", "Connected!",
+    /// "Connection failed. Reconnecting in N seconds…") to `world_idx` WITHOUT marking
+    /// activity. Routes through `push_and_broadcast_line` (append + broadcast, never bumps
+    /// `unseen_lines`, never auto-pauses) instead of `add_output_to_world`/`emit_client_text`
+    /// (which do both), so the activity indicator no longer lights up on every retry of a
+    /// world nobody is currently viewing. The line is still visible in `output_lines` and
+    /// still reaches WebSocket clients viewing the world - it just never *announces* itself.
+    ///
+    /// A world already paused with a real backlog still shows activity from that backlog -
+    /// this only silences the retry-timer's OWN chatter, not genuine MUD output after a
+    /// successful reconnect (that still goes through `add_output_to_world` as normal).
+    ///
+    /// Deliberately the one shared helper for all four retry-timer call sites (headless
+    /// select loop, console select loop, console batch-drain, daemon loop) - see CLAUDE.md's
+    /// "prefer one shared helper over patching a copy".
+    ///
+    /// Note: unlike `add_output_to_world`, this does not write to the per-world session log
+    /// (`World::add_output` does that; the silent push path does not) - acceptable since this
+    /// is transient retry-timer status, not MUD content.
+    pub(crate) fn emit_reconnect_status(&mut self, world_idx: usize, text: &str) {
+        if world_idx >= self.worlds.len() {
+            return;
+        }
+        let seq = self.worlds[world_idx].next_seq;
+        self.worlds[world_idx].next_seq += 1;
+        let line = OutputLine::new_client(text.to_string(), seq);
+        let more_mode = self.settings.more_mode_enabled;
+        self.push_and_broadcast_line(world_idx, line, more_mode);
     }
 
     fn broadcast_output_range(&mut self, world_idx: usize, skip: usize, count: usize, is_viewed: bool, from_server: bool, flush: bool) {
@@ -10932,14 +10993,43 @@ impl App {
                         // Disconnect current world first
                         commands_to_execute.push(format!("/disconnect {}", world_name));
                     }
-                    // Create/update the world and connect
-                    commands_to_execute.push(format!("/addworld {} {} {}", portal.name, portal.host, portal.port));
-                    commands_to_execute.push(format!("/worlds {}", portal.name));
-                    // If login flag is set, auto-login with current world's credentials
+                    // If the login flag is set, log into the portal world with the current
+                    // world's credentials - but route it through the target world's OWN
+                    // auto-login (a raw send that bypasses /recall capture), not a deferred
+                    // `/send connect <user> <pass>`. That `/send` form flows through the
+                    // capture chokepoint and was kept out of recall only by the login-capture
+                    // guard's send budget; storing the credentials on the world and letting
+                    // standard auto-login fire keeps the password structurally out of recall,
+                    // like every other auto-login path. Create/update the world directly here
+                    // (with credentials + AutoConnectType::Connect) so they are in place before
+                    // the deferred `/worlds` connects it - the in-memory settings drive this
+                    // connect; the save persists them for future sessions.
                     let login_val = self.tf_engine.get_var("login").map(|v| v.to_string_value()).unwrap_or_default();
-                    if (login_val == "1" || login_val == "on") && !user.is_empty() && !password.is_empty() {
-                        commands_to_execute.push(format!("/send connect {} {}", user, password));
+                    let do_login = (login_val == "1" || login_val == "on") && !user.is_empty() && !password.is_empty();
+                    let (cred_user, cred_pass) = if do_login {
+                        (Some(user.clone()), Some(password.clone()))
+                    } else {
+                        (None, None)
+                    };
+                    commands::execute_add_world_command(
+                        self,
+                        portal.name.clone(),
+                        Some(portal.host.clone()),
+                        Some(portal.port.clone()),
+                        cred_user,
+                        cred_pass,
+                        false,
+                        None,
+                        world_idx,
+                        is_daemon_mode,
+                    );
+                    if do_login {
+                        if let Some(idx) = self.find_world_index(&portal.name) {
+                            self.worlds[idx].settings.auto_connect_type = AutoConnectType::Connect;
+                        }
+                        let _ = persistence::save_settings(self);
                     }
+                    commands_to_execute.push(format!("/worlds {}", portal.name));
                     break; // Only handle first portal per chunk
                 }
             }
@@ -13781,6 +13871,7 @@ impl App {
             actions: self.settings.actions.clone(),
             splash_lines: generate_splash_strings(),
             server_version: crate::VERSION.to_string(),
+            android_app_version: crate::ANDROID_APP_VERSION.to_string(),
             // Stays false until the ScrollbackSyncRequest handler actually exists
             // (PROTOCOL-ROADMAP.md Phase J, step 9). Advertising the capability before we
             // can answer it would strand a new client waiting on a batch that never comes,
@@ -18463,7 +18554,7 @@ pub async fn run_app_headless(
                             app.worlds[idx].connection_id += 1;
                             let connection_id = app.worlds[idx].connection_id;
                             let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                            app.add_output_to_world(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
+                            app.emit_reconnect_status(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
                             // Pass skip_auto_login=true to connect_daemon_world so it doesn't
                             // send auto-login; handle_connection_success handles that instead.
                             match daemon::connect_daemon_world(
@@ -18475,7 +18566,7 @@ pub async fn run_app_headless(
                                     if let Some(new_idx) = app.find_world_index(&world_name) {
                                         app.worlds[new_idx].proxy_pid = proxy_pid;
                                         app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
-                                        app.add_output_to_world(new_idx, "Connected!");
+                                        app.emit_reconnect_status(new_idx, "Connected!");
                                     }
                                 }
                                 None => {
@@ -18485,9 +18576,9 @@ pub async fn run_app_headless(
                                             app.worlds[current_idx].reconnect_at = Some(
                                                 std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
                                             );
-                                            app.add_output_to_world(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
+                                            app.emit_reconnect_status(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
                                         } else {
-                                            app.add_output_to_world(current_idx, "Connection failed.");
+                                            app.emit_reconnect_status(current_idx, "Connection failed.");
                                         }
                                     }
                                 }
@@ -20585,7 +20676,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[idx].connection_id += 1;
                             let connection_id = app.worlds[idx].connection_id;
                             let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                            app.add_output_to_world(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
+                            app.emit_reconnect_status(idx, &format!("Connecting to {}:{}{}...", settings.hostname, settings.port, ssl_msg));
                             // Pass skip_auto_login=true to connect_daemon_world so it doesn't
                             // send auto-login; handle_connection_success handles that instead.
                             match daemon::connect_daemon_world(
@@ -20597,7 +20688,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     if let Some(new_idx) = app.find_world_index(&world_name) {
                                         app.worlds[new_idx].proxy_pid = proxy_pid;
                                         app.worlds[new_idx].proxy_socket_path = proxy_socket_path;
-                                        app.add_output_to_world(new_idx, "Connected!");
+                                        app.emit_reconnect_status(new_idx, "Connected!");
                                     }
                                 }
                                 None => {
@@ -20607,9 +20698,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             app.worlds[current_idx].reconnect_at = Some(
                                                 std::time::Instant::now() + std::time::Duration::from_secs(secs as u64)
                                             );
-                                            app.add_output_to_world(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
+                                            app.emit_reconnect_status(current_idx, &format!("Connection failed. Reconnecting in {} seconds...", secs));
                                         } else {
-                                            app.add_output_to_world(current_idx, "Connection failed.");
+                                            app.emit_reconnect_status(current_idx, "Connection failed.");
                                         }
                                     }
                                 }
@@ -20973,7 +21064,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
                     // Batch drain shows "Connected!" message (primary select loop doesn't)
                     if let Some(world_idx) = app.find_world_index(&world_name) {
-                        app.add_output_to_world(world_idx, "Connected!");
+                        app.emit_reconnect_status(world_idx, "Connected!");
                     }
                 }
                 // Background connection failed
@@ -20981,7 +21072,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if let Some(world_idx) = app.find_world_index(&world_name) {
                         // CONFAIL hook - see /help hooks: "CONFAIL world, reason".
                         app.fire_tf_hook(Some(world_idx), tf::TfHookEvent::Confail, &format!("{} {}", world_name, error), false);
-                        app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
+                        app.emit_reconnect_status(world_idx, &format!("Connection failed: {}", error));
                         if let Some(mismatch) = app.check_and_broadcast_cert_mismatch(world_idx) {
                             if app.popup_manager.current().is_none() {
                                 app.open_cert_mismatch_confirm(world_idx, &mismatch);

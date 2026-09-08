@@ -651,13 +651,20 @@ pub struct WorldSwitchInfo {
     pub connected: bool,
     pub unseen_lines: usize,
     pub pending_lines: usize,
+    /// Mirrors `World::is_reconnecting()`: disconnected, was connected before, and
+    /// auto-reconnect is actively retrying it. Keeps a reconnecting world in the cycle list
+    /// even though quiet retry-timer chatter (`App::emit_reconnect_status`) never bumps
+    /// `unseen_lines`/`pending_lines` any more - without this a reconnecting world would
+    /// otherwise vanish from Next/Prev entirely. See `world_should_cycle` and
+    /// `calculate_world_switch`'s tiered fallback sort.
+    pub is_reconnecting: bool,
     pub first_unseen_at: Option<std::time::Instant>,
 }
 
 /// Determine if a world should be included in the cycle list
-/// (connected OR has unseen output OR has pending lines from more-mode)
+/// (connected OR has unseen output OR has pending lines from more-mode OR is reconnecting)
 pub fn world_should_cycle(info: &WorldSwitchInfo) -> bool {
-    info.connected || info.unseen_lines > 0 || info.pending_lines > 0
+    info.connected || info.unseen_lines > 0 || info.pending_lines > 0 || info.is_reconnecting
 }
 
 /// Check if a world has pending/unseen output (including more-mode pending lines)
@@ -712,10 +719,21 @@ pub fn calculate_world_switch(
         }
     }
 
-    // Fall back to alphabetical cycling
+    // Fall back to alphabetical cycling, tiered so worlds with genuine activity (connected,
+    // unseen output, or a real pending backlog) are visited before reconnecting-only worlds
+    // that have none of those - quiet retry-timer chatter (App::emit_reconnect_status) never
+    // sets unseen/pending, so a merely-retrying world would otherwise sort in among active
+    // worlds with nothing to show. A reconnecting world that ALSO has a real pending backlog
+    // still lands in tier 0 (reconnecting_tier is false): it has actual content, not just
+    // retry-timer noise, same as any other world with pending output.
     let mut sorted = cycleable.clone();
     sorted.sort_by(|&a, &b| {
-        worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase())
+        let reconnecting_tier = |i: usize| -> bool {
+            let w = &worlds[i];
+            !(w.connected || w.unseen_lines > 0 || w.pending_lines > 0)
+        };
+        reconnecting_tier(a).cmp(&reconnecting_tier(b))
+            .then_with(|| worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase()))
     });
 
     // Find current position in the sorted cycleable list
@@ -1373,15 +1391,15 @@ mod tests {
     fn test_world_should_cycle() {
         let connected = WorldSwitchInfo {
             name: "a".into(), connected: true, unseen_lines: 0,
-            pending_lines: 0, first_unseen_at: None,
+            pending_lines: 0, is_reconnecting: false, first_unseen_at: None,
         };
         let unseen = WorldSwitchInfo {
             name: "b".into(), connected: false, unseen_lines: 5,
-            pending_lines: 0, first_unseen_at: None,
+            pending_lines: 0, is_reconnecting: false, first_unseen_at: None,
         };
         let idle = WorldSwitchInfo {
             name: "c".into(), connected: false, unseen_lines: 0,
-            pending_lines: 0, first_unseen_at: None,
+            pending_lines: 0, is_reconnecting: false, first_unseen_at: None,
         };
         assert!(world_should_cycle(&connected));
         assert!(world_should_cycle(&unseen));
@@ -1391,9 +1409,9 @@ mod tests {
     #[test]
     fn test_world_switch_alphabetical() {
         let worlds = vec![
-            WorldSwitchInfo { name: "Charlie".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
-            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
-            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+            WorldSwitchInfo { name: "Charlie".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
+            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
         ];
         // Sorted: Alpha(1), Bravo(2), Charlie(0)
         assert_eq!(calculate_next_world(&worlds, 1, WorldSwitchMode::Alphabetical), Some(2)); // Alpha -> Bravo
@@ -1404,8 +1422,8 @@ mod tests {
     #[test]
     fn test_world_switch_previous() {
         let worlds = vec![
-            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
-            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
+            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
         ];
         assert_eq!(calculate_prev_world(&worlds, 1, WorldSwitchMode::Alphabetical), Some(0));
         assert_eq!(calculate_prev_world(&worlds, 0, WorldSwitchMode::Alphabetical), Some(1)); // wrap
@@ -1416,9 +1434,9 @@ mod tests {
         let t1 = std::time::Instant::now();
         let t2 = t1 + std::time::Duration::from_secs(1);
         let worlds = vec![
-            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
-            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 3, pending_lines: 0, first_unseen_at: Some(t2) },
-            WorldSwitchInfo { name: "Charlie".into(), connected: true, unseen_lines: 1, pending_lines: 0, first_unseen_at: Some(t1) },
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
+            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 3, pending_lines: 0, is_reconnecting: false, first_unseen_at: Some(t2) },
+            WorldSwitchInfo { name: "Charlie".into(), connected: true, unseen_lines: 1, pending_lines: 0, is_reconnecting: false, first_unseen_at: Some(t1) },
         ];
         // From Alpha, should go to Charlie (oldest unseen)
         assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::UnseenFirst), Some(2));
@@ -1427,7 +1445,7 @@ mod tests {
     #[test]
     fn test_world_switch_single_world() {
         let worlds = vec![
-            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
         ];
         assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::Alphabetical), None);
     }
@@ -1435,9 +1453,68 @@ mod tests {
     #[test]
     fn test_world_switch_no_cycleable() {
         let worlds = vec![
-            WorldSwitchInfo { name: "Alpha".into(), connected: false, unseen_lines: 0, pending_lines: 0, first_unseen_at: None },
+            WorldSwitchInfo { name: "Alpha".into(), connected: false, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
         ];
         assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::Alphabetical), None);
+    }
+
+    // --- reconnecting worlds: quiet retries, cycle tier, amber marker ---
+
+    #[test]
+    fn test_world_should_cycle_reconnecting() {
+        // A world actively being retried by auto-reconnect: disconnected, no unseen/pending
+        // (retry-timer chatter is silent - App::emit_reconnect_status never bumps either),
+        // but still cycleable because it's reconnecting.
+        let reconnecting = WorldSwitchInfo {
+            name: "a".into(), connected: false, unseen_lines: 0,
+            pending_lines: 0, is_reconnecting: true, first_unseen_at: None,
+        };
+        // A plain disconnected world: no reconnect scheduled, no activity - must NOT cycle,
+        // or a normal dead world would clutter Next/Prev forever.
+        let plain_disconnected = WorldSwitchInfo {
+            name: "b".into(), connected: false, unseen_lines: 0,
+            pending_lines: 0, is_reconnecting: false, first_unseen_at: None,
+        };
+        assert!(world_should_cycle(&reconnecting), "a reconnecting world must stay cycleable");
+        assert!(!world_should_cycle(&plain_disconnected), "a plain disconnected world must not cycle");
+    }
+
+    #[test]
+    fn test_world_switch_tiers_active_before_reconnecting() {
+        // Alpha/Bravo are active (connected); Charlie/Delta are reconnecting-only (no
+        // connection, no unseen/pending - just retrying). Alphabetical fallback must visit
+        // every active world before any reconnecting-only world, in name order within each
+        // tier - see calculate_world_switch's reconnecting_tier sort key.
+        let worlds = vec![
+            WorldSwitchInfo { name: "Delta".into(), connected: false, unseen_lines: 0, pending_lines: 0, is_reconnecting: true, first_unseen_at: None },
+            WorldSwitchInfo { name: "Bravo".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
+            WorldSwitchInfo { name: "Charlie".into(), connected: false, unseen_lines: 0, pending_lines: 0, is_reconnecting: true, first_unseen_at: None },
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
+        ];
+        // Indices: 0=Delta(reconnecting), 1=Bravo(active), 2=Charlie(reconnecting), 3=Alpha(active)
+        // Tiered order should be: Alpha(3), Bravo(1), Charlie(2), Delta(0).
+        assert_eq!(calculate_next_world(&worlds, 3, WorldSwitchMode::Alphabetical), Some(1), "Alpha -> Bravo (still tier 0)");
+        assert_eq!(calculate_next_world(&worlds, 1, WorldSwitchMode::Alphabetical), Some(2), "from the last active world, Next lands on the first reconnecting world");
+        assert_eq!(calculate_next_world(&worlds, 2, WorldSwitchMode::Alphabetical), Some(0), "Charlie -> Delta (both tier 1)");
+        assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::Alphabetical), Some(3), "wraps back to Alpha");
+        // And Previous from the first active world (Alpha) wraps to the last reconnecting
+        // world (Delta), confirming the tiering (not just insertion order) drives the wrap.
+        assert_eq!(calculate_prev_world(&worlds, 3, WorldSwitchMode::Alphabetical), Some(0));
+    }
+
+    #[test]
+    fn test_world_switch_reconnecting_with_pending_counts_as_active_tier() {
+        // A reconnecting world that ALSO has a genuine pending backlog (e.g. it was paused
+        // with real content when it dropped) is NOT just retry-timer noise - it belongs in
+        // tier 0 with the other active worlds, same as any other world with pending output.
+        let worlds = vec![
+            WorldSwitchInfo { name: "Alpha".into(), connected: true, unseen_lines: 0, pending_lines: 0, is_reconnecting: false, first_unseen_at: None },
+            WorldSwitchInfo { name: "Bravo".into(), connected: false, unseen_lines: 0, pending_lines: 5, is_reconnecting: true, first_unseen_at: None },
+            WorldSwitchInfo { name: "Charlie".into(), connected: false, unseen_lines: 0, pending_lines: 0, is_reconnecting: true, first_unseen_at: None },
+        ];
+        // Alphabetical tiered order: Alpha(0, tier 0), Bravo(1, tier 0 via pending), Charlie(2, tier 1).
+        assert_eq!(calculate_next_world(&worlds, 0, WorldSwitchMode::Alphabetical), Some(1));
+        assert_eq!(calculate_next_world(&worlds, 1, WorldSwitchMode::Alphabetical), Some(2));
     }
 
     // --- format_worlds_list ---

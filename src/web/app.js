@@ -925,6 +925,28 @@
         return (typeof window.CLAY_VERSION === 'string') ? window.CLAY_VERSION : '';
     }
 
+    // Numeric dotted-version compare: "1.5.5" < "1.6.3" -> true. Used only for the
+    // Android reinstall nag (below) - a plain string compare is wrong the moment either
+    // side reaches double digits in a segment (e.g. "1.9.0" < "1.10.0" as strings). An
+    // empty value or an unreplaced "{{...}}" template placeholder - the same case
+    // clientVersion()/the version-mismatch check already guard against - is "unknown":
+    // always returns false for it, so a missing/unbuilt value never manufactures a nag.
+    // Unparsable segments are treated as 0 rather than aborting the whole compare.
+    function versionLessThan(a, b) {
+        if (!a || !b || a.indexOf('{{') !== -1 || b.indexOf('{{') !== -1) return false;
+        var pa = a.split('.');
+        var pb = b.split('.');
+        var len = Math.max(pa.length, pb.length);
+        for (var i = 0; i < len; i++) {
+            var na = parseInt(pa[i], 10);
+            var nb = parseInt(pb[i], 10);
+            na = isNaN(na) ? 0 : na;
+            nb = isNaN(nb) ? 0 : nb;
+            if (na !== nb) return na < nb;
+        }
+        return false;
+    }
+
     function buildResumeEpochList() {
         const list = [];
         worlds.forEach((world, idx) => {
@@ -3471,17 +3493,38 @@
                 // version (that has escaped once before); the same guard is applied inline to
                 // the server-supplied value. Wrapped in its own try/catch so a
                 // malformed/missing field can never break InitialState processing.
+                //
+                // Android is a special case: the APK bundles this file, so server_version
+                // differs from it on EVERY server release, not just ones that touched the
+                // Android app. Nagging on that would mean reinstalling (slow) on every bump.
+                // msg.android_app_version is the last release that actually changed the
+                // Android app (bundled app.js/index.html, android/, or the bundled server -
+                // see ANDROID_APP_VERSION's doc comment in main.rs); Android nags only when
+                // its installed version is older than that. Non-Android clients, and Android
+                // talking to an older server that never sent the field, keep the original
+                // always-on server_version comparison.
                 try {
                     var localVersion = clientVersion();
                     var remoteVersion = msg.server_version;
+                    var androidAppVersion = msg.android_app_version;
+                    var androidAppVersionKnown = !!androidAppVersion && androidAppVersion.indexOf('{{') === -1;
                     if (!versionMismatchShown && localVersion && remoteVersion &&
-                        remoteVersion.indexOf('{{') === -1 &&
-                        localVersion !== remoteVersion) {
-                        appendClientLine(
-                            `Version mismatch: ${localVersion} (local) ≠ ${remoteVersion} (remote).`,
-                            currentWorldIndex, 'system'
-                        );
-                        versionMismatchShown = true;
+                        remoteVersion.indexOf('{{') === -1) {
+                        if (window.Android && androidAppVersionKnown) {
+                            if (versionLessThan(localVersion, androidAppVersion)) {
+                                appendClientLine(
+                                    `A newer Clay Android app is available (${androidAppVersion}) - reinstall to update.`,
+                                    currentWorldIndex, 'system'
+                                );
+                                versionMismatchShown = true;
+                            }
+                        } else if (localVersion !== remoteVersion) {
+                            appendClientLine(
+                                `Version mismatch: ${localVersion} (local) ≠ ${remoteVersion} (remote).`,
+                                currentWorldIndex, 'system'
+                            );
+                            versionMismatchShown = true;
+                        }
                     }
                 } catch (e) {
                     console.error('Clay: error checking client/server version mismatch', e);
@@ -8793,6 +8836,33 @@
         return ((w.unseen_lines || 0) > 0) || ((w.pending_count || 0) > 0);
     }
 
+    // Mirrors main.rs's WorldSettings::parse_auto_reconnect: extracts the numeric retry
+    // delay out of a "30" / "web" / "web,30" / "30,web" auto-reconnect string. Only the
+    // digit-only parts count (matches Rust's strict u32::parse - "30abc" is NOT a match),
+    // and later valid parts win, same as the Rust loop. Returns 0 (disabled) for anything
+    // unrecognized rather than throwing, since this only ever gates a cosmetic dot color.
+    function parseAutoReconnectSecs(raw) {
+        if (raw === undefined || raw === null) return 0;
+        let secs = 0;
+        String(raw).split(',').forEach(part => {
+            const p = part.trim();
+            if (/^\d+$/.test(p)) secs = parseInt(p, 10);
+        });
+        return secs;
+    }
+
+    // Mirrors main.rs's World::is_reconnecting(): true while a world is disconnected but
+    // auto-reconnect is actively retrying it (keyed on the auto_reconnect_secs SETTING, not
+    // any flickering per-attempt timer state - stable across retries, flips false the instant
+    // reconnect is turned off). Computed client-side from fields already synced via
+    // WorldStateMsg (connected/was_connected/settings.auto_reconnect_secs) rather than adding
+    // a wire bit - drives the amber "still trying" dot everywhere a connected/disconnected
+    // indicator is drawn, matching the console's separator-bar amber dot (rendering.rs).
+    function isWorldReconnecting(world) {
+        return !!(world && !world.connected && world.was_connected
+            && parseAutoReconnectSecs(world.settings?.auto_reconnect_secs) > 0);
+    }
+
     // Update status bar
     // --- Status/vitals panel (mud-status-display.md Job 3) --------------------------------
     //
@@ -9030,7 +9100,8 @@
 
         // Connection dot and world name
         if (world && world.name && world.was_connected) {
-            elements.statusDot.className = 'status-dot' + (world.connected ? '' : ' off');
+            elements.statusDot.className = 'status-dot' +
+                (world.connected ? '' : (isWorldReconnecting(world) ? ' reconnecting' : ' off'));
             const gmcpInd = (world && world.gmcp_user_enabled) ? ' [g]' : '';
             // TF-parity plan Job 22b/P2.7: show a pending numeric prefix next to the
             // world name, mirroring the console's own separator-bar "[N]" (rendering.rs).
@@ -10482,7 +10553,12 @@
             // Status indicator column
             const tdStatus = document.createElement('td');
             const statusSpan = document.createElement('span');
-            statusSpan.className = world.connected ? 'status-connected' : 'status-disconnected';
+            const reconnecting = !world.connected && isWorldReconnecting(world);
+            statusSpan.className = world.connected ? 'status-connected'
+                : (reconnecting ? 'status-reconnecting' : 'status-disconnected');
+            // Same glyphs as the plain connected/disconnected case (●/○) - color alone
+            // carries "still retrying" here, matching the console's separator-bar dot
+            // (rendering.rs), which also only ever recolors the same ball.
             statusSpan.textContent = world.connected ? '●' : '○';
             tdStatus.appendChild(statusSpan);
             tr.appendChild(tdStatus);
@@ -12292,11 +12368,12 @@
             item.className = 'menu-item' + (index === currentWorldIndex ? ' selected' : '');
             item.dataset.index = index;
 
-            // Status bubble: same green/red connected convention as the
+            // Status bubble: same green/amber/red connected convention as the
             // status bar's own dot (updateStatusBar()) - meaningful here
             // since this list can include disconnected-with-unseen worlds.
             const dot = document.createElement('span');
-            dot.className = 'status-dot' + (world.connected ? '' : ' off');
+            dot.className = 'status-dot' +
+                (world.connected ? '' : (isWorldReconnecting(world) ? ' reconnecting' : ' off'));
             item.appendChild(dot);
 
             item.appendChild(document.createTextNode(world.name));

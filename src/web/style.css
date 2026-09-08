@@ -325,6 +325,14 @@ body.device-phone .stat-gauge .stat-bar-track { width: 44px; }
     box-shadow: 0 0 5px rgba(232, 112, 112, 0.35);
 }
 
+/* Amber "still trying" dot for a world auto-reconnect is actively retrying - distinct from
+   the plain red "gave up" dot above. Mirrors the console's separator-bar amber ball
+   (rendering.rs, Theme::fg_highlight()). */
+.status-dot.reconnecting {
+    background: var(--warning-color);
+    box-shadow: 0 0 5px rgba(205, 205, 0, 0.35);
+}
+
 .status-world {
     font-family: var(--sans);
     font-weight: 700;
@@ -1878,6 +1886,10 @@ body.device-phone #output-container { padding: 6px 10px; }
     color: #444;
 }
 
+#world-selector-table tr.selected-row .status-reconnecting {
+    color: #665c00;
+}
+
 #world-selector-table tr:hover {
     background-color: var(--theme-bg-hover, #333);
     cursor: pointer;
@@ -1893,6 +1905,12 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 #world-selector-table .status-disconnected {
     color: #666;
+}
+
+/* Amber "still trying" status for a reconnecting-but-currently-disconnected world - see
+   .status-dot.reconnecting above for the same distinction on the status-bar dot. */
+#world-selector-table .status-reconnecting {
+    color: var(--warning-color);
 }
 
 /* Modal footer with toggle on left and buttons on right */

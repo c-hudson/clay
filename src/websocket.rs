@@ -346,6 +346,18 @@ pub enum WsMessage {
         splash_lines: Vec<String>,
         #[serde(default)]
         server_version: String,
+        /// The last version at which the Android app itself (bundled app.js/index.html,
+        /// the `android/` native shell, or the bundled libclay server) actually changed
+        /// (`crate::ANDROID_APP_VERSION`). Android nags to reinstall only when its
+        /// installed APK version is older than this - NOT simply whenever it differs
+        /// from `server_version`, since a server-only release bumps `server_version` on
+        /// every Android phone without the app itself having changed at all. Non-Android
+        /// clients ignore this field and keep comparing against `server_version` as
+        /// before. `serde(default)` = empty string against an older server, which the
+        /// client treats as "unknown" (same placeholder-guard as `server_version`) and
+        /// falls back to the old always-on comparison.
+        #[serde(default)]
+        android_app_version: String,
         /// The ▶ ownership id this client's markers are recorded under
         /// (`OutputLine::display_id`). A line renders ▶ iff its `display_id` equals this.
         /// Sent here rather than in `ServerHello` because it is derived from

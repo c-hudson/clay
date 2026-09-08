@@ -2142,10 +2142,21 @@ pub(crate) fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let was_connected = world.was_connected;
 
     let current_pos = if was_connected {
-        // Connection status ball (green when connected, red when disconnected)
+        // Connection status ball: green when connected, amber while auto-reconnect is
+        // actively retrying (World::is_reconnecting - distinct from a plain disconnect so
+        // "still trying" reads differently from "gave up"), red when disconnected outright.
+        // Reused for the SSH remote console for free - it renders through this same
+        // function on its mirrored worlds.
+        let dot_color = if is_connected {
+            theme.fg_success()
+        } else if world.is_reconnecting() {
+            theme.fg_highlight()
+        } else {
+            theme.fg_error()
+        };
         spans.push(Span::styled(
             "● ",
-            Style::default().fg(if is_connected { theme.fg_success() } else { theme.fg_error() }),
+            Style::default().fg(dot_color),
         ));
 
         // World name
