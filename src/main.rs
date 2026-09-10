@@ -37,13 +37,13 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-pub(crate) const VERSION: &str = "1.6.3";
+pub(crate) const VERSION: &str = "1.6.4";
 /// The last release whose Android app actually changed (bundled app.js/index.html,
 /// the `android/` native shell, or the bundled libclay server). Bump to the current
 /// `VERSION` ONLY when one of those changes. A phone whose installed APK version is
 /// at or above this is functionally current and is not nagged to reinstall, even
 /// against a newer server. Set to 1.6.2 because the Android app changed this release.
-pub(crate) const ANDROID_APP_VERSION: &str = "1.6.3";
+pub(crate) const ANDROID_APP_VERSION: &str = "1.6.4";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
