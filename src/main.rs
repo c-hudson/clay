@@ -37,7 +37,7 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-pub(crate) const VERSION: &str = "1.6.4";
+pub(crate) const VERSION: &str = "1.6.5";
 /// The last release whose Android app actually changed (bundled app.js/index.html,
 /// the `android/` native shell, or the bundled libclay server). Bump to the current
 /// `VERSION` ONLY when one of those changes. A phone whose installed APK version is
