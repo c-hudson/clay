@@ -597,6 +597,8 @@
         webKeyFile: document.getElementById('web-key-file'),
         tlsCertField: document.getElementById('tls-cert-field'),
         tlsKeyField: document.getElementById('tls-key-field'),
+        webValidationRow: document.getElementById('web-validation-row'),
+        webValidationMessage: document.getElementById('web-validation-message'),
         // Combined settings popup (/setup + /web)
         settingsModal: document.getElementById('settings-modal'),
         settingsCloseBtn: document.getElementById('settings-close-btn'),
@@ -10168,6 +10170,17 @@
             return;
         }
 
+        // Validate web settings before anything is applied or sent — a blocked
+        // Save must not touch general/font settings either, since this is one
+        // combined Save button (see saveWebSettings note below). Skipped in
+        // multiuser mode, same as the web-settings-apply block further down.
+        // If the user is looking at a different tab, switch to Web so the red
+        // line (already updated by updateWebValidationMessage) is on screen.
+        if (!multiuserMode && updateWebValidationMessage()) {
+            switchSettingsTab('web');
+            return;
+        }
+
         // Save general settings
         if (setupInputHeightValue < 1) setupInputHeightValue = 1;
         if (setupInputHeightValue > 15) setupInputHeightValue = 15;
@@ -10266,6 +10279,100 @@
         if (elements.webAuthKey) {
             elements.webAuthKey.value = serverAuthKey || '';
         }
+
+        updateWebValidationMessage();
+    }
+
+    // Pure validator for the Web Settings form — JS cannot call into Rust, so
+    // this mirrors popup::definitions::web::validate_web_settings in
+    // src/popup/definitions/web.rs field-for-field, message strings included
+    // verbatim (see CLAUDE.md's Critical Rule: a UI change must land in the
+    // console TUI, web, and webview-GUI alike). Keep the two in sync.
+    //
+    // All checks apply only when the web server is enabled (portMode !==
+    // 'disabled'). Blocking errors are checked in priority order — the first
+    // applicable one wins:
+    //   1. Empty password (an empty password means WebSocket password auth is
+    //      rejected outright, not "open access" — see websocket.rs).
+    //   2. portMode === 'custom' with customPort not an integer 1..65535.
+    //   3. customCert with an empty certFile or keyFile — presence check
+    //      only, never stats the filesystem; resolve_web_cert_files (main.rs)
+    //      silently falls back to the auto-generated cert unless BOTH are
+    //      non-empty, so a half-filled pair looks configured but isn't.
+    //   4. remoteLines that doesn't parse as an integer.
+    // If none apply, a non-empty allowList produces a non-blocking warning.
+    function validateWebSettings(portMode, customPort, password, customCert, certFile, keyFile, allowList, remoteLines) {
+        if (portMode === 'disabled') {
+            return { message: null, blocksSave: false };
+        }
+
+        if (!password) {
+            return { message: 'A password is required for web access.', blocksSave: true };
+        }
+
+        if (portMode === 'custom') {
+            var portTrimmed = String(customPort).trim();
+            var portOk = /^[0-9]+$/.test(portTrimmed) && Number(portTrimmed) >= 1 && Number(portTrimmed) <= 65535;
+            if (!portOk) {
+                return { message: 'Custom port must be a number from 1 to 65535.', blocksSave: true };
+            }
+        }
+
+        // Presence-only, deliberately not trimmed — matches resolve_web_cert_files'
+        // own truthiness check exactly.
+        if (customCert && (!certFile || !keyFile)) {
+            return { message: 'Custom certificate requires both a cert file and a key file.', blocksSave: true };
+        }
+
+        if (!/^-?[0-9]+$/.test(String(remoteLines).trim())) {
+            return { message: 'Remote lines must be a number.', blocksSave: true };
+        }
+
+        if (String(allowList).trim() !== '') {
+            return { message: 'Allow list is set — addresses not listed are silently dropped.', blocksSave: false };
+        }
+
+        return { message: null, blocksSave: false };
+    }
+
+    // Recompute the validation/warning line from the form's current values and
+    // reflect it in the DOM. Returns whether Save should currently be blocked
+    // — mirrors popup::definitions::web::update_web_visibility's return value.
+    function updateWebValidationMessage() {
+        // A custom cert the server already has, but whose paths it did not send to this
+        // client, renders as an EMPTY input showing a "Configured" placeholder (same
+        // condition as in updateWebPopupUI). That state is configured, not missing - without
+        // this the user could open Settings, touch nothing, and be blocked from saving by
+        // "Custom certificate requires both a cert file and a key file" about a cert that
+        // is present. Adapt the inputs here rather than relaxing the shared rule, so the
+        // JS validator stays byte-identical to the Rust one.
+        var certVal = elements.webCertFile ? elements.webCertFile.value : '';
+        var keyVal = elements.webKeyFile ? elements.webKeyFile.value : '';
+        if (!certVal && tlsConfigured && !wsCertFile) certVal = '(configured)';
+        if (!keyVal && tlsConfigured && !wsKeyFile) keyVal = '(configured)';
+
+        var result = validateWebSettings(
+            editPortMode,
+            elements.webCustomPort ? elements.webCustomPort.value : '',
+            elements.webWsPassword ? elements.webWsPassword.value : '',
+            editCustomCert,
+            certVal,
+            keyVal,
+            elements.webAllowList ? elements.webAllowList.value : '',
+            elements.setupRemoteLinesInput ? elements.setupRemoteLinesInput.value : ''
+        );
+
+        if (elements.webValidationRow && elements.webValidationMessage) {
+            if (result.message) {
+                elements.webValidationMessage.textContent = result.message;
+                elements.webValidationRow.style.display = 'flex';
+            } else {
+                elements.webValidationMessage.textContent = '';
+                elements.webValidationRow.style.display = 'none';
+            }
+        }
+
+        return result.blocksSave;
     }
 
     // saveWebSettings removed — merged into saveSettingsAll
@@ -14130,6 +14237,13 @@
             editCustomCert = this.value === 'yes';
             updateWebPopupUI();
         };
+        // Live validation refresh as the user edits any field the validator
+        // reads — Port/Custom Cert File selects already refresh it via
+        // updateWebPopupUI() above; these are the remaining text inputs.
+        [elements.webCustomPort, elements.webWsPassword, elements.webCertFile,
+         elements.webKeyFile, elements.webAllowList, elements.setupRemoteLinesInput].forEach(function(el) {
+            if (el) el.oninput = updateWebValidationMessage;
+        });
         // Modify Key button — opens the copy/regen/delete dialog
         if (elements.webModifyKeyBtn) {
             elements.webModifyKeyBtn.onclick = function() {

@@ -21,6 +21,10 @@ pub const WEB_FIELD_WS_KEY_FILE: FieldId = FieldId(9);
 pub const WEB_FIELD_AUTH_KEY: FieldId = FieldId(10);
 pub const WEB_FIELD_WEB_PATH: FieldId = FieldId(11);
 pub const WEB_FIELD_REMOTE_LINES: FieldId = FieldId(12);
+/// Save-blocking validation error / non-blocking warning line. Sits immediately
+/// before Auth Key (the last field) and above the button row. Hidden when there
+/// is nothing to say. See `validate_web_settings` below.
+pub const WEB_FIELD_VALIDATION_MSG: FieldId = FieldId(13);
 
 // Button IDs
 pub const WEB_BTN_SAVE: ButtonId = ButtonId(1);
@@ -115,6 +119,11 @@ pub fn create_web_popup(
             WEB_FIELD_WS_KEY_FILE,
             "Key File",
             FieldKind::text(ws_key_file),
+        ))
+        .with_field(Field::new(
+            WEB_FIELD_VALIDATION_MSG,
+            "",
+            FieldKind::error_text(""),
         ))
         .with_field(
             Field::new(
@@ -231,8 +240,12 @@ fn web_help_text() -> Vec<String> {
 }
 
 /// Update visibility of the Custom Port and cert/key fields based on the
-/// current Port / Custom Cert File selections.
-pub fn update_web_visibility(state: &mut crate::popup::PopupState) {
+/// current Port / Custom Cert File selections, and recompute the validation
+/// message (see `validate_web_settings`). Returns whether Save should
+/// currently be blocked — callers at the Save button/hotkey sites use this to
+/// decide whether to close the popup, instead of re-deriving field values
+/// themselves.
+pub fn update_web_visibility(state: &mut crate::popup::PopupState) -> bool {
     let show_custom_port = state.get_selected(WEB_FIELD_PORT) == Some("custom");
     if let Some(field) = state.field_mut(WEB_FIELD_CUSTOM_PORT) {
         field.visible = show_custom_port;
@@ -245,6 +258,8 @@ pub fn update_web_visibility(state: &mut crate::popup::PopupState) {
     if let Some(field) = state.field_mut(WEB_FIELD_WS_KEY_FILE) {
         field.visible = show_cert_fields;
     }
+
+    apply_validation(&mut state.definition)
 }
 
 /// Same as `update_web_visibility` but operates directly on a `PopupDefinition`
@@ -270,6 +285,142 @@ fn update_web_visibility_def(def: &mut PopupDefinition) {
     if let Some(field) = def.get_field_mut(WEB_FIELD_WS_KEY_FILE) {
         field.visible = show_cert_fields;
     }
+
+    apply_validation(def);
+}
+
+/// Pull the current field values out of the definition, run
+/// `validate_web_settings`, and write the result into the
+/// `WEB_FIELD_VALIDATION_MSG` field (text + visibility). Returns
+/// `blocks_save` so the two visibility-updater entry points above can hand
+/// it straight to their own callers.
+fn apply_validation(def: &mut PopupDefinition) -> bool {
+    let text_of = |def: &PopupDefinition, id: FieldId| -> String {
+        def.get_field(id).and_then(|f| f.kind.get_text()).unwrap_or("").to_string()
+    };
+    let selected_of = |def: &PopupDefinition, id: FieldId| -> String {
+        def.get_field(id).and_then(|f| f.kind.get_selected()).unwrap_or("").to_string()
+    };
+
+    let port_mode = selected_of(def, WEB_FIELD_PORT);
+    let custom_port = text_of(def, WEB_FIELD_CUSTOM_PORT);
+    let password = text_of(def, WEB_FIELD_WS_PASSWORD);
+    let custom_cert = selected_of(def, WEB_FIELD_CUSTOM_CERT) == "yes";
+    let cert_file = text_of(def, WEB_FIELD_WS_CERT_FILE);
+    let key_file = text_of(def, WEB_FIELD_WS_KEY_FILE);
+    let allow_list = text_of(def, WEB_FIELD_WS_ALLOW_LIST);
+    let remote_lines = text_of(def, WEB_FIELD_REMOTE_LINES);
+
+    let validation = validate_web_settings(
+        &port_mode, &custom_port, &password, custom_cert,
+        &cert_file, &key_file, &allow_list, &remote_lines,
+    );
+
+    if let Some(field) = def.get_field_mut(WEB_FIELD_VALIDATION_MSG) {
+        field.visible = validation.message.is_some();
+        if let FieldKind::ErrorText { text } = &mut field.kind {
+            *text = validation.message.clone().unwrap_or_default();
+        }
+    }
+
+    validation.blocks_save
+}
+
+/// Result of validating the Web Settings form. Same red styling is used for
+/// both a blocking error and a non-blocking warning (`blocks_save` is what
+/// distinguishes them) — see CLAUDE.md's Critical Rule that a UI change must
+/// land in the console TUI, web, and webview-GUI alike: this struct/function
+/// is mirrored (message strings included, verbatim) by `validateWebSettings`
+/// in `src/web/app.js`, since JS cannot call into Rust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebValidation {
+    /// The message to show, if any. `None` means nothing to show (either the
+    /// form is clean, or the web server is disabled).
+    pub message: Option<String>,
+    /// Whether `message` should prevent Save. `false` for the allow-list
+    /// warning, which is intentionally not an error.
+    pub blocks_save: bool,
+}
+
+impl WebValidation {
+    fn ok() -> Self {
+        Self { message: None, blocks_save: false }
+    }
+
+    fn error(msg: impl Into<String>) -> Self {
+        Self { message: Some(msg.into()), blocks_save: true }
+    }
+
+    fn warning(msg: impl Into<String>) -> Self {
+        Self { message: Some(msg.into()), blocks_save: false }
+    }
+}
+
+/// Pure validator for the Web Settings form — no `App`, no I/O, so it can be
+/// unit-tested directly (see the `tests` module below) and its logic mirrored
+/// exactly in JS. All checks apply only when the web server is enabled
+/// (`port_mode != "disabled"`); when disabled, nothing is checked and nothing
+/// is shown, regardless of what garbage is sitting in the other fields.
+///
+/// Blocking errors are checked in priority order and the first applicable one
+/// wins — only one message is ever shown at a time:
+///   1. Empty password — an empty password does not mean "open access"; it
+///      means WebSocket password auth is rejected outright (websocket.rs:
+///      "Password auth not available. Use an auth key."), so a browser could
+///      never log in.
+///   2. Port = Custom with a Custom Port value that isn't an integer 1..=65535.
+///   3. Custom Cert File = Yes with an empty Cert File or Key File. Presence
+///      check only (never stats the filesystem) — `resolve_web_cert_files`
+///      (main.rs) requires BOTH to be non-empty or it silently falls back to
+///      the auto-generated cert, so a half-filled pair looks configured but
+///      isn't.
+///   4. Remote Lines that doesn't parse as a number.
+///
+/// If none of those apply, a non-empty WS Allow List produces a warning
+/// (legitimate config — must never block Save).
+#[allow(clippy::too_many_arguments)]
+pub fn validate_web_settings(
+    port_mode: &str,
+    custom_port: &str,
+    password: &str,
+    custom_cert: bool,
+    cert_file: &str,
+    key_file: &str,
+    allow_list: &str,
+    remote_lines: &str,
+) -> WebValidation {
+    if port_mode == "disabled" {
+        return WebValidation::ok();
+    }
+
+    if password.is_empty() {
+        return WebValidation::error("A password is required for web access.");
+    }
+
+    if port_mode == "custom" {
+        let port_ok = custom_port.trim().parse::<u32>()
+            .map(|p| (1..=65535).contains(&p))
+            .unwrap_or(false);
+        if !port_ok {
+            return WebValidation::error("Custom port must be a number from 1 to 65535.");
+        }
+    }
+
+    // Presence-only, deliberately not stat'd — matches resolve_web_cert_files'
+    // own `!is_empty()` check exactly (no trimming there either).
+    if custom_cert && (cert_file.is_empty() || key_file.is_empty()) {
+        return WebValidation::error("Custom certificate requires both a cert file and a key file.");
+    }
+
+    if remote_lines.trim().parse::<i64>().is_err() {
+        return WebValidation::error("Remote lines must be a number.");
+    }
+
+    if !allow_list.trim().is_empty() {
+        return WebValidation::warning("Allow list is set — addresses not listed are silently dropped.");
+    }
+
+    WebValidation::ok()
 }
 
 #[cfg(test)]
@@ -289,7 +440,7 @@ mod tests {
 
         assert_eq!(state.definition.id, PopupId("web"));
         assert_eq!(state.definition.title, "Web Settings");
-        assert_eq!(state.definition.fields.len(), 10);
+        assert_eq!(state.definition.fields.len(), 11);
     }
 
     #[test]
@@ -340,5 +491,206 @@ mod tests {
         let def = create_web_popup(true, 9000, "clay", "", "", "", "", "testkey", 100);
         let field = def.get_field(WEB_FIELD_AUTH_KEY).unwrap();
         assert!(!field.is_focusable(), "Auth Key must be read-only (not focusable)");
+    }
+
+    #[test]
+    fn test_validation_field_not_focusable() {
+        // The message line is display-only, never a stop on the tab cycle.
+        let def = create_web_popup(true, 9000, "clay", "secret", "", "", "", "testkey", 100);
+        let field = def.get_field(WEB_FIELD_VALIDATION_MSG).unwrap();
+        assert!(!field.is_focusable());
+    }
+
+    #[test]
+    fn test_validation_field_hidden_when_clean() {
+        let def = create_web_popup(true, 9000, "clay", "secret", "", "", "", "testkey", 100);
+        assert!(!def.get_field(WEB_FIELD_VALIDATION_MSG).unwrap().visible);
+    }
+
+    #[test]
+    fn test_validation_field_visible_when_password_empty() {
+        let def = create_web_popup(true, 9000, "clay", "", "", "", "", "testkey", 100);
+        let field = def.get_field(WEB_FIELD_VALIDATION_MSG).unwrap();
+        assert!(field.visible);
+        assert_eq!(field.kind.get_text(), Some("A password is required for web access."));
+    }
+
+    #[test]
+    fn test_validation_field_hidden_when_disabled_even_with_bad_data() {
+        // Port disabled: garbage everywhere else must not surface a message.
+        let def = create_web_popup(false, 65535, "clay", "", "notanumber", "", "/only-cert", "", -5);
+        assert!(!def.get_field(WEB_FIELD_VALIDATION_MSG).unwrap().visible);
+    }
+
+    #[test]
+    fn test_update_web_visibility_recomputes_message_and_blocks() {
+        let def = create_web_popup(true, 9000, "clay", "secret", "", "", "", "testkey", 100);
+        let mut state = PopupState::new(def);
+        assert!(!state.field(WEB_FIELD_VALIDATION_MSG).unwrap().visible);
+
+        state.set_text(WEB_FIELD_WS_PASSWORD, String::new());
+        let blocks = update_web_visibility(&mut state);
+        assert!(blocks);
+        assert!(state.field(WEB_FIELD_VALIDATION_MSG).unwrap().visible);
+        assert_eq!(
+            state.get_text(WEB_FIELD_VALIDATION_MSG),
+            Some("A password is required for web access.")
+        );
+
+        state.set_text(WEB_FIELD_WS_PASSWORD, "secret".to_string());
+        let blocks = update_web_visibility(&mut state);
+        assert!(!blocks);
+        assert!(!state.field(WEB_FIELD_VALIDATION_MSG).unwrap().visible);
+    }
+
+    // ------------------------------------------------------------------
+    // validate_web_settings — pure logic
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_disabled_never_blocks_regardless_of_garbage() {
+        let v = validate_web_settings("disabled", "not-a-number", "", true, "", "", "*", "nope");
+        assert_eq!(v, WebValidation { message: None, blocks_save: false });
+    }
+
+    #[test]
+    fn test_validate_empty_password_blocks() {
+        let v = validate_web_settings("9000", "9000", "", false, "", "", "", "100");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("A password is required for web access."));
+    }
+
+    #[test]
+    fn test_validate_custom_port_empty_blocks() {
+        let v = validate_web_settings("custom", "", "secret", false, "", "", "", "100");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("Custom port must be a number from 1 to 65535."));
+    }
+
+    #[test]
+    fn test_validate_custom_port_non_numeric_blocks() {
+        let v = validate_web_settings("custom", "abc", "secret", false, "", "", "", "100");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("Custom port must be a number from 1 to 65535."));
+    }
+
+    #[test]
+    fn test_validate_custom_port_zero_blocks() {
+        let v = validate_web_settings("custom", "0", "secret", false, "", "", "", "100");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("Custom port must be a number from 1 to 65535."));
+    }
+
+    #[test]
+    fn test_validate_custom_port_too_large_blocks() {
+        let v = validate_web_settings("custom", "65536", "secret", false, "", "", "", "100");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("Custom port must be a number from 1 to 65535."));
+    }
+
+    #[test]
+    fn test_validate_custom_port_valid_passes() {
+        let v = validate_web_settings("custom", "65535", "secret", false, "", "", "", "100");
+        assert_eq!(v, WebValidation { message: None, blocks_save: false });
+        let v = validate_web_settings("custom", "1", "secret", false, "", "", "", "100");
+        assert_eq!(v, WebValidation { message: None, blocks_save: false });
+    }
+
+    #[test]
+    fn test_validate_custom_port_not_checked_when_port_not_custom() {
+        // Port = 9000 (fixed): the Custom Port field is hidden and its
+        // (irrelevant) contents must never block.
+        let v = validate_web_settings("9000", "garbage", "secret", false, "", "", "", "100");
+        assert_eq!(v, WebValidation { message: None, blocks_save: false });
+    }
+
+    #[test]
+    fn test_validate_half_filled_cert_pair_blocks_cert_only() {
+        let v = validate_web_settings("9000", "9000", "secret", true, "", "/key.pem", "", "100");
+        assert!(v.blocks_save);
+        assert_eq!(
+            v.message.as_deref(),
+            Some("Custom certificate requires both a cert file and a key file.")
+        );
+
+        let v = validate_web_settings("9000", "9000", "secret", true, "/cert.pem", "", "", "100");
+        assert!(v.blocks_save);
+        assert_eq!(
+            v.message.as_deref(),
+            Some("Custom certificate requires both a cert file and a key file.")
+        );
+    }
+
+    #[test]
+    fn test_validate_both_filled_cert_pair_passes() {
+        let v = validate_web_settings("9000", "9000", "secret", true, "/cert.pem", "/key.pem", "", "100");
+        assert_eq!(v, WebValidation { message: None, blocks_save: false });
+    }
+
+    #[test]
+    fn test_validate_custom_cert_no_ignores_empty_paths() {
+        // Custom Cert File = No: cert/key fields are hidden and irrelevant.
+        let v = validate_web_settings("9000", "9000", "secret", false, "", "", "", "100");
+        assert_eq!(v, WebValidation { message: None, blocks_save: false });
+    }
+
+    #[test]
+    fn test_validate_bad_remote_lines_blocks() {
+        let v = validate_web_settings("9000", "9000", "secret", false, "", "", "", "not-a-number");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("Remote lines must be a number."));
+
+        let v = validate_web_settings("9000", "9000", "secret", false, "", "", "", "");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("Remote lines must be a number."));
+    }
+
+    #[test]
+    fn test_validate_nonempty_allow_list_warns_but_does_not_block() {
+        let v = validate_web_settings("9000", "9000", "secret", false, "", "", "192.168.1.*", "100");
+        assert!(!v.blocks_save);
+        assert_eq!(
+            v.message.as_deref(),
+            Some("Allow list is set — addresses not listed are silently dropped.")
+        );
+    }
+
+    #[test]
+    fn test_validate_clean_form_has_no_message() {
+        let v = validate_web_settings("9000", "9000", "secret", false, "", "", "", "100");
+        assert_eq!(v, WebValidation { message: None, blocks_save: false });
+    }
+
+    #[test]
+    fn test_validate_priority_order_password_before_everything() {
+        // Empty password + bad custom port + half-filled cert + bad remote
+        // lines + non-empty allow list, all at once: password wins.
+        let v = validate_web_settings("custom", "-1", "", true, "", "", "*", "nope");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("A password is required for web access."));
+    }
+
+    #[test]
+    fn test_validate_priority_order_port_before_cert_and_lines() {
+        let v = validate_web_settings("custom", "0", "secret", true, "", "", "*", "nope");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("Custom port must be a number from 1 to 65535."));
+    }
+
+    #[test]
+    fn test_validate_priority_order_cert_before_lines_and_allowlist() {
+        let v = validate_web_settings("9000", "9000", "secret", true, "", "", "*", "nope");
+        assert!(v.blocks_save);
+        assert_eq!(
+            v.message.as_deref(),
+            Some("Custom certificate requires both a cert file and a key file.")
+        );
+    }
+
+    #[test]
+    fn test_validate_priority_order_lines_before_allowlist() {
+        let v = validate_web_settings("9000", "9000", "secret", false, "", "", "*", "nope");
+        assert!(v.blocks_save);
+        assert_eq!(v.message.as_deref(), Some("Remote lines must be a number."));
     }
 }

@@ -2096,12 +2096,11 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 // Notify connected web/GUI clients to reconnect after reload
                 app.ws_broadcast(WsMessage::ServerReloading);
 
-                // Disable raw mode before exec (the new process will re-enable it)
-                let _ = crossterm::terminal::disable_raw_mode();
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::LeaveAlternateScreen
-                );
+                // Hand the terminal back before exec. Must disable mouse tracking and
+                // bracketed paste *before* raw mode goes away — see
+                // platform::restore_terminal_for_exec.
+                crate::platform::restore_terminal_for_exec();
+                app.mouse_capture_active = false;
 
                 match exec_reload(app) {
                     Ok(()) => {

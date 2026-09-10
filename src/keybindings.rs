@@ -189,7 +189,7 @@ impl KeyBindings {
     /// below since it's referenced throughout the codebase (daemon.rs, main.rs, tests);
     /// `defaults()` is the name to use in new code.
     pub fn defaults() -> Self {
-        let mut b = HashMap::new();
+        let mut b: HashMap<String, String> = HashMap::new();
 
         // Cursor Movement (TF defaults: ^B/^F = char, Esc-b/Esc-f = word)
         b.insert("^A".into(), "cursor_home".into());
@@ -331,6 +331,47 @@ impl KeyBindings {
         b.insert("F9".into(), "toggle_gmcp_media".into());
         b.insert("Alt-Up".into(), "input_grow".into());
         b.insert("Alt-Down".into(), "input_shrink".into());
+
+        // TF's `;; make meta_<namedkey> act like esc_<namedkey>` block (tf-lib/kbbind.tf)
+        // defines every `key_meta_<x>` as an alias of `key_esc_<x>`. TF keeps its own
+        // defaults in that same macro layer, so the alias covers them for free; Clay keeps
+        // its defaults one level further down, in THIS table, which the level-2
+        // `key_meta_<x>` -> `key_esc_<x>` fallback (TINYFUGUE-COMPAT.md's dispatch order)
+        // never reaches. That layer mismatch is why Alt-Left did nothing while Esc-Left
+        // cycled worlds.
+        //
+        // Materialised here rather than as a lookup-time fallback in `get_action`, for two
+        // reasons: it stays one rule instead of a hand-copied pair per key, and it rides
+        // out to every remote client inside `keybindings_json` untouched. A dispatch-time
+        // fallback would need a mirrored copy in app.js's own resolver - precisely the
+        // two-implementations-drifting failure this file has been bitten by before.
+        //
+        // Only *named* keys need it: `Alt-<letter>` and `Esc-<letter>` are the same bytes
+        // on the wire and already canonicalise to one name. An explicit `Alt-<x>` binding
+        // always wins (Clay's own Alt-Up/Alt-Down above), since we only fill empty slots.
+        let meta_aliases: Vec<(String, String)> = b
+            .iter()
+            .filter_map(|(key, action)| {
+                let seq = crate::keynames::parse_key_name(key).ok()?;
+                match seq.0.as_slice() {
+                    [crate::keynames::KeyToken::Esc(inner)] => match inner.as_ref() {
+                        crate::keynames::KeyToken::Named(n) => Some((
+                            crate::keynames::KeyToken::Modified(
+                                crate::keynames::Modifier::Alt,
+                                *n,
+                            )
+                            .canonical(),
+                            action.clone(),
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect();
+        for (key, action) in meta_aliases {
+            b.entry(key).or_insert(action);
+        }
 
         Self { bindings: b }
     }
@@ -738,6 +779,62 @@ mod tests {
     /// rewrite to touch this test explicitly instead of silently drifting the defaults out
     /// from under `to_dat_string`'s diff-against-defaults logic and every saved
     /// `keybindings.dat` on disk.
+    /// TF's `;; make meta_<namedkey> act like esc_<namedkey>` rule (tf-lib/kbbind.tf).
+    /// Real TF reaches Clay's equivalent of these through `key_meta_<x>` -> `key_esc_<x>`;
+    /// Clay materialises them into the defaults table instead (see `defaults()`), so this
+    /// pins the *rule*, not just today's four outputs: every `Esc-<named>` default must
+    /// have an `Alt-<named>` twin bound to the same action.
+    #[test]
+    fn meta_aliases_mirror_every_esc_named_default() {
+        let d = KeyBindings::defaults();
+        let mut checked = 0;
+        for (key, action) in d.bindings.iter() {
+            let Ok(seq) = crate::keynames::parse_key_name(key) else { continue };
+            let [crate::keynames::KeyToken::Esc(inner)] = seq.0.as_slice() else { continue };
+            let crate::keynames::KeyToken::Named(n) = inner.as_ref() else { continue };
+            let alt = crate::keynames::KeyToken::Modified(
+                crate::keynames::Modifier::Alt,
+                *n,
+            )
+            .canonical();
+            assert_eq!(
+                d.get_action(&alt),
+                Some(action.as_str()),
+                "{alt} should mirror {key} -> {action}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 4, "expected at least the 4 known Esc-<named> defaults, saw {checked}");
+    }
+
+    /// The reported bug: TF cycles worlds on Alt-Left/Alt-Right (meta_left -> esc_left ->
+    /// dokey_socketb). A terminal sending the CSI form `^[[1;3D` canonicalises to `Alt-Left`
+    /// and used to hit nothing; only the metaSendsEscape spelling (`^[` `^[[D` -> `Esc-Left`)
+    /// worked.
+    #[test]
+    fn alt_arrows_switch_worlds_like_tf() {
+        let d = KeyBindings::defaults();
+        assert_eq!(d.get_action("Alt-Left"), Some("world_socket_prev"));
+        assert_eq!(d.get_action("Alt-Right"), Some("world_socket_next"));
+        assert_eq!(d.get_action("^[[1;3D"), Some("world_socket_prev"));
+        assert_eq!(d.get_action("^[[1;3C"), Some("world_socket_next"));
+        // to_json ships the whole effective table (not just non-default overrides), which
+        // is how the aliases reach web/GUI/Android via `keybindings_json` with no JS-side
+        // mirror. If that ever narrows to overrides-only, the remote UIs silently lose
+        // these bindings while the console keeps them.
+        let json = d.to_json();
+        assert!(json.contains("\"Alt-Left\":\"world_socket_prev\""), "{json}");
+        assert!(json.contains("\"Alt-Right\":\"world_socket_next\""), "{json}");
+    }
+
+    /// An explicit `Alt-<x>` default must not be overwritten by the alias pass.
+    #[test]
+    fn explicit_alt_binding_wins_over_meta_alias() {
+        let d = KeyBindings::defaults();
+        assert_eq!(d.get_action("Alt-Up"), Some("input_grow"));
+        assert_eq!(d.get_action("Alt-Down"), Some("input_shrink"));
+    }
+
     const PINNED_DEFAULTS: &[(&str, &str)] = &[
         // Cursor Movement
         ("^A", "cursor_home"),
@@ -845,6 +942,14 @@ mod tests {
         ("F9", "toggle_gmcp_media"),
         ("Alt-Up", "input_grow"),
         ("Alt-Down", "input_shrink"),
+        // TF's meta_<namedkey> == esc_<namedkey> aliases, generated in `defaults()` from
+        // every `Esc-<named>` binding above. Adding an `Esc-<named>` default therefore adds
+        // its `Alt-` twin here too.
+        ("Alt-Left", "world_socket_prev"),
+        ("Alt-Right", "world_socket_next"),
+        ("Alt-Backspace", "delete_word_backward_punct"),
+        ("Alt-Space", "collapse_spaces"),
+        ("Alt-Tab", "completion"),
     ];
 
     #[test]

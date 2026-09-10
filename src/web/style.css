@@ -2451,6 +2451,17 @@ body.device-phone .settings-content {
     flex: 1;
 }
 
+/* Web Settings validation/warning line — same color for a blocking error and
+   the non-blocking allow-list warning (see validateWebSettings in app.js and
+   validate_web_settings in src/popup/definitions/web.rs, which this mirrors).
+   Row is hidden via inline style when there's nothing to say. */
+.web-validation-message {
+    flex: 1;
+    color: var(--error-color);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
 /* Toggle switch (mockup style) */
 .toggle {
     position: relative;

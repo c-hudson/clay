@@ -477,13 +477,27 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     writeln!(file, "tabs={}", app.settings.tabs.name())?;
     writeln!(file, "icon_bar={}", app.settings.icon_bar.name())?;
 
-    // Save each world's settings (skip unconfigured worlds that have no connection info)
+    // Save each world's settings.
+    //
+    // The ONLY world skipped is the auto-created placeholder from `App::ensure_has_world`
+    // while it is still unconfigured - it is named after the binary and exists purely so
+    // there is something to draw before the user sets anything up, so persisting it would
+    // resurrect a phantom world on every start.
+    //
+    // This used to skip *every* world with no connection info, which silently dropped
+    // worlds the user deliberately created: `/addworld <name>` with no host is a supported
+    // form (Clay reports it as "(connectionless)"), as is the web client's "add world"
+    // (`App::create_world`) and `find_or_create_world`. Such a world showed up in /worlds,
+    // survived a `/reload` (the reload-state file saves every world unconditionally), and
+    // then vanished on the next cold start - the settings file had never contained it.
+    // `is_initial_world` is false for anything loaded from disk or created by those paths,
+    // and is cleared once the placeholder is configured, so it is the precise test here.
     for world in &app.worlds {
         let has_mud_config = !world.settings.hostname.is_empty();
         let has_slack_config = !world.settings.slack_token.is_empty();
         let has_discord_config = !world.settings.discord_token.is_empty();
-        if !has_mud_config && !has_slack_config && !has_discord_config {
-            continue; // Don't persist unconfigured worlds
+        if !has_mud_config && !has_slack_config && !has_discord_config && world.is_initial_world {
+            continue; // unconfigured auto-created placeholder only
         }
         writeln!(file)?;
         writeln!(file, "[world:{}]", world.name)?;
@@ -3477,6 +3491,46 @@ mod tests {
         assert_eq!(a.auto_reconnect_on_web, b.auto_reconnect_on_web, "{context}: auto_reconnect_on_web");
         assert_eq!(a.msp_enabled, b.msp_enabled, "{context}: msp_enabled");
         assert_eq!(a.mcp_enabled, b.mcp_enabled, "{context}: mcp_enabled");
+    }
+
+    /// A connectionless world (`/addworld <name>` with no host, the web client's "add
+    /// world", `find_or_create_world`) must persist. It used to be dropped by the
+    /// "skip unconfigured worlds" rule: it appeared in /worlds, survived a `/reload`
+    /// (the reload-state file saves every world unconditionally), and then vanished on
+    /// the next cold start because settings.dat had never contained it.
+    #[test]
+    fn test_connectionless_world_is_persisted_but_placeholder_is_not() {
+        let tmp = std::env::temp_dir().join("clay_test_connectionless_world.dat");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut app = App::new();
+        app.worlds.clear();
+
+        // The auto-created placeholder: unconfigured AND is_initial_world -> not persisted,
+        // or it would come back as a phantom world on every start.
+        let mut placeholder = crate::World::new("clay");
+        placeholder.is_initial_world = true;
+        app.worlds.push(placeholder);
+
+        // Deliberately created, no connection info -> must persist.
+        app.worlds.push(crate::World::new("Notes"));
+
+        // Ordinary configured world, as a control.
+        let mut configured = crate::World::new("Mud");
+        configured.settings.hostname = "example.com".to_string();
+        configured.settings.port = "4000".to_string();
+        app.worlds.push(configured);
+
+        save_settings_to_path(&app, &tmp).expect("save failed");
+        let out = std::fs::read_to_string(&tmp).expect("read failed");
+
+        assert!(out.contains("[world:Notes]"),
+            "a deliberately-created connectionless world must be saved:\n{out}");
+        assert!(out.contains("[world:Mud]"), "configured world must be saved:\n{out}");
+        assert!(!out.contains("[world:clay]"),
+            "the unconfigured auto-created placeholder must NOT be saved:\n{out}");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The hot-reload hand-edit check: settings.dat is only re-applied over the restored

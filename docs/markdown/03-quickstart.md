@@ -87,7 +87,7 @@ Commands are sent to the currently selected world.
 |------|--------|
 | `Up/Down` | Move the cursor within a multi-line input |
 | `Esc-{` / `Esc-}` | Switch between active worlds |
-| `Esc-Left` / `Esc-Right` | Switch between connected worlds |
+| `Esc-Left` / `Esc-Right` (or `Alt-Left` / `Alt-Right`) | Switch between connected worlds |
 | `PageUp/PageDown` | Scroll output history |
 | `Tab` | Release one screenful when paused |
 | `Ctrl+P/N` | Navigate command history |

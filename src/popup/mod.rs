@@ -80,6 +80,10 @@ pub enum FieldKind {
     },
     /// Static label (read-only)
     Label { text: String },
+    /// Static validation error/warning message (read-only, no "Label: " prefix,
+    /// drawn in the theme's error color). Used for e.g. the Web Settings popup's
+    /// Save-blocking validation line — see `popup::definitions::web::validate_web_settings`.
+    ErrorText { text: String },
     /// Visual separator line
     Separator,
     /// Multi-line text editor with scrolling viewport
@@ -198,6 +202,11 @@ impl FieldKind {
         Self::Label { text: text.into() }
     }
 
+    /// Create a validation error/warning text field (see `FieldKind::ErrorText`)
+    pub fn error_text(text: impl Into<String>) -> Self {
+        Self::ErrorText { text: text.into() }
+    }
+
     /// Create a separator
     pub fn separator() -> Self {
         Self::Separator
@@ -278,6 +287,9 @@ impl FieldKind {
 
     /// Get the string value for text-like fields.
     /// For EditableList, returns the currently selected item's text.
+    /// Also readable (but never editable — see `is_text`) for `ErrorText`, so
+    /// callers can inspect the current validation message the same way they'd
+    /// read any other field.
     pub fn get_text(&self) -> Option<&str> {
         match self {
             Self::Text { value, .. } => Some(value),
@@ -285,6 +297,7 @@ impl FieldKind {
             Self::EditableList { items, selected_index, .. } => {
                 items.get(*selected_index).map(|s| s.as_str())
             }
+            Self::ErrorText { text } => Some(text),
             _ => None,
         }
     }
@@ -402,7 +415,7 @@ impl FieldKind {
 
     /// Check if this field kind is interactive (can be edited/toggled)
     pub fn is_interactive(&self) -> bool {
-        !matches!(self, Self::Label { .. } | Self::Separator)
+        !matches!(self, Self::Label { .. } | Self::Separator | Self::ErrorText { .. })
     }
 
     /// Check if this is a text-editable field

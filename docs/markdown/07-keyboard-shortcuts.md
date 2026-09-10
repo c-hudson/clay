@@ -32,14 +32,20 @@ sequences like `^[[1;5A`) — see `/help bind`.
 
 | Key | Action |
 |---|---|
-| `Esc-Left` | Previous connected world (TF SOCKETB) |
-| `Esc-Right` | Next connected world (TF SOCKETF) |
+| `Esc-Left` / `Alt-Left` | Previous connected world (TF SOCKETB) |
+| `Esc-Right` / `Alt-Right` | Next connected world (TF SOCKETF) |
 | `Esc-{` | Previous active world (Clay's unseen-first cycling) |
 | `Esc-}` | Next active world (Clay's unseen-first cycling) |
 | `Shift-Up` | Next world, cycling through all worlds (including disconnected) |
 | `Shift-Down` | Previous world, cycling through all worlds |
 | `Esc-w` | Switch to the world with activity (oldest pending → unseen output → previous world) |
 | `^]` | Background all worlds (TF `/bg`) — a no-op in Clay's single-pane console, kept for scripting parity |
+
+`Alt-<key>` is a synonym for `Esc-<key>` on every named key, matching TF's own
+`key_meta_<x>` = `key_esc_<x>` aliases. Which one your terminal actually sends
+depends on its meta handling: "meta sends escape" produces the `Esc-` form, while
+`modifyOtherKeys`-style terminals send a real Alt modifier — both now land on the
+same action, so `Alt-Left`/`Alt-Right` switch worlds either way.
 
 Two cycling styles, two key pairs. `Esc-Left`/`Esc-Right` are TF's own
 SOCKETB/SOCKETF and step through *connected* worlds in list order.
@@ -262,7 +268,12 @@ you change a default, update both.
 <!-- BEGIN DEFAULT KEY TABLE -->
 | Key | Action id |
 |---|---|
+| `Alt-Backspace` | `delete_word_backward_punct` |
 | `Alt-Down` | `input_shrink` |
+| `Alt-Left` | `world_socket_prev` |
+| `Alt-Right` | `world_socket_next` |
+| `Alt-Space` | `collapse_spaces` |
+| `Alt-Tab` | `completion` |
 | `Alt-Up` | `input_grow` |
 | `Backspace` | `delete_backward` |
 | `Ctrl-Down` | `history_next` |

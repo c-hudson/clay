@@ -149,6 +149,9 @@ fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
                 // Find the longest line in the label
                 text.lines().map(|l| l.len()).max().unwrap_or(0) + 2
             }
+            FieldKind::ErrorText { text } => {
+                text.lines().map(|l| l.len()).max().unwrap_or(0) + 2
+            }
             FieldKind::List { items, .. } => {
                 items.iter()
                     .flat_map(|i| &i.columns)
@@ -195,6 +198,7 @@ fn calculate_content_height(state: &PopupState) -> usize {
         height += match &field.kind {
             FieldKind::Separator => 1,
             FieldKind::Label { text } => text.lines().count().max(1),
+            FieldKind::ErrorText { text } => text.lines().count().max(1),
             FieldKind::MultilineText { visible_lines, .. } => *visible_lines,
             FieldKind::List { visible_height, headers, .. } => {
                 // Use visible_height (set at popup creation) to maintain consistent size
@@ -280,6 +284,7 @@ fn compute_field_layout(
         let available_for_field = remaining_height.saturating_sub(button_space);
         let field_height = match &field.kind {
             FieldKind::Label { text } => text.lines().count().max(1),
+            FieldKind::ErrorText { text } => text.lines().count().max(1),
             FieldKind::MultilineText { visible_lines, .. } => *visible_lines,
             FieldKind::List { visible_height, headers, .. } => {
                 // Use visible_height to maintain consistent size (don't shrink when filtering)
@@ -473,6 +478,17 @@ fn render_field(
             let lines: Vec<Line> = text
                 .lines()
                 .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg()))))
+                .collect();
+            f.render_widget(Paragraph::new(lines), area);
+        }
+
+        FieldKind::ErrorText { text } => {
+            // Same as Label, but drawn in the theme's error color (no "Label: "
+            // prefix, spans the full popup width) — used for Save-blocking
+            // validation/warning lines. See CLAUDE.md popup FieldKind rule.
+            let lines: Vec<Line> = text
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg_error()))))
                 .collect();
             f.render_widget(Paragraph::new(lines), area);
         }

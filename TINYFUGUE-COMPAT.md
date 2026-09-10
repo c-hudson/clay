@@ -219,6 +219,14 @@ pre-parity behavior:
   governed by the "World Switching" setting), and `Shift-Up`/`Shift-Down` cycle
   *all* worlds (unchanged). TF binds `Esc-{`/`Esc-}` to socket cycling as well;
   Clay gives that redundant pair to its own cycling so both styles keep a key.
+- **`Alt-<named key>`** is now a synonym for `Esc-<named key>`, reproducing TF's
+  `;; make meta_<namedkey> act like esc_<namedkey>` block (tf-lib/kbbind.tf). Most
+  visibly, **`Alt-Left`/`Alt-Right` now switch worlds** (TF SOCKETB/SOCKETF) where they
+  previously did nothing on terminals that send a real Alt modifier (`^[[1;3D`) rather
+  than an Esc prefix. Also newly bound by the same rule: `Alt-Backspace`
+  (delete-word-backward), `Alt-Space` (collapse-spaces) and `Alt-Tab` (completion, though
+  window managers normally intercept it). An explicit `Alt-` binding still wins, so
+  Clay's own `Alt-Up`/`Alt-Down` (grow/shrink input) are unaffected.
 - **`^U`** now kills to the start of the line (kill ring kept) instead of clearing the
   whole line. The old behavior is the separate `clear_line` action (TF's own `/dokey
   DLINE`), unbound by default.
@@ -255,7 +263,12 @@ only checked on a machine that has it. Changing a default means changing all thr
 <!-- BEGIN DEFAULT KEY TABLE -->
 | Key | Action id |
 |---|---|
+| `Alt-Backspace` | `delete_word_backward_punct` |
 | `Alt-Down` | `input_shrink` |
+| `Alt-Left` | `world_socket_prev` |
+| `Alt-Right` | `world_socket_next` |
+| `Alt-Space` | `collapse_spaces` |
+| `Alt-Tab` | `completion` |
 | `Alt-Up` | `input_grow` |
 | `Backspace` | `delete_backward` |
 | `Ctrl-Down` | `history_next` |

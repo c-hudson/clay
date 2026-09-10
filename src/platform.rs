@@ -1638,6 +1638,40 @@ fn install_update_at(_temp_path: &Path, _exe_path: &Path) -> Result<(), String> 
     Err("self-update is not supported on this platform".to_string())
 }
 
+/// Hand the terminal back before an `exec`/spawn that replaces this process.
+///
+/// Order matters. `disable_raw_mode` restores the tty's ECHO flag, so from that point on
+/// anything the *terminal* sends is echoed onto the normal screen as literal text. Mouse
+/// tracking and bracketed paste therefore have to be switched off first, while echo is
+/// still suppressed. crossterm's `EnableMouseCapture` turns on `?1003h` — any-event
+/// reporting, where a bare pointer motion is enough to emit a report — so leaving it on
+/// paints escape-sequence garbage across the window between leaving the alternate screen
+/// and the new process entering it again. Reports already queued before the disable landed
+/// are dropped by flushing the input buffer, which is the only way to catch those.
+///
+/// Console sessions only: a GUI/headless process never touches the terminal.
+pub fn restore_terminal_for_exec() {
+    let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = disable_raw_mode();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    flush_terminal_input();
+}
+
+/// Discard input the terminal already queued (stale mouse reports, query responses) so the
+/// next process can't echo it.
+#[cfg(unix)]
+fn flush_terminal_input() {
+    // SAFETY: tcflush on stdin with a valid queue selector. A failure here (stdin not a
+    // tty, e.g. piped) is not actionable and is deliberately ignored.
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+#[cfg(not(unix))]
+fn flush_terminal_input() {}
+
 #[cfg(all(unix, not(target_os = "android")))]
 pub fn exec_reload(app: &mut App) -> io::Result<()> {
     // Always log reload (not gated by debug flag) so we can trace issues
@@ -1899,10 +1933,7 @@ fn exec_relaunch_with_args(args: Vec<String>, use_gui: bool) -> io::Result<()> {
     // Console sessions own the terminal directly; restore it before handing off so the new
     // process starts from a clean screen (GUI/headless processes don't touch the terminal).
     if !use_gui {
-        let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
-        let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-        let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        restore_terminal_for_exec();
     }
 
     debug_log(is_debug_enabled(), &format!("RELAUNCH: About to exec {} with args={:?}", exe.display(), args));

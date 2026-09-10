@@ -15360,8 +15360,12 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
 
         // Web popup handling
         if is_web {
-            // Helper to extract settings before closing
-            let extract_settings = || -> WebSettings {
+            // Helper to extract settings before closing. Takes `state` as an
+            // explicit parameter (rather than capturing it) so it doesn't hold
+            // a live borrow across the match — that would conflict with the
+            // `update_web_visibility(state)` validation gate called just
+            // before it at each Save site.
+            let extract_settings = |state: &popup::PopupState| -> WebSettings {
                 let port_selected = state.get_selected(WEB_FIELD_PORT).unwrap_or("disabled");
                 let (http_enabled, http_port) = match port_selected {
                     "disabled" => (false, "9000".to_string()),
@@ -15396,6 +15400,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 Esc => {
                     if state.editing {
                         state.commit_edit();
+                        update_web_visibility(state);
                     } else {
                         app.popup_manager.close();
                     }
@@ -15403,11 +15408,19 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 Enter => {
                     if state.editing {
                         state.commit_edit();
+                        update_web_visibility(state);
                     } else if state.is_on_button() {
                         if state.is_button_focused(WEB_BTN_SAVE) {
-                            let settings = extract_settings();
-                            app.popup_manager.close();
-                            return NewPopupAction::WebSaved(settings);
+                            // Save iff validate_web_settings doesn't block (also
+                            // refreshes the red validation-message field, in case
+                            // it went stale). A blocked Save neither closes the
+                            // popup nor emits WebSaved — the message is already
+                            // visible live, so that's the feedback; no stdout.
+                            if !update_web_visibility(state) {
+                                let settings = extract_settings(state);
+                                app.popup_manager.close();
+                                return NewPopupAction::WebSaved(settings);
+                            }
                         } else if state.is_button_focused(WEB_BTN_MODIFY_KEY) {
                             open_modify_key(app);
                         } else if state.is_button_focused(WEB_BTN_CANCEL) {
@@ -15433,6 +15446,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 Up => {
                     if state.editing {
                         state.commit_edit();
+                        update_web_visibility(state);
                     }
                     // Full order-of-moving cycle: fields -> buttons -> wrap.
                     // Highlighting a field never auto-enters edit mode.
@@ -15441,6 +15455,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 Down => {
                     if state.editing {
                         state.commit_edit();
+                        update_web_visibility(state);
                     }
                     state.next_item();
                 }
@@ -15465,12 +15480,14 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 Tab => {
                     if state.editing {
                         state.commit_edit();
+                        update_web_visibility(state);
                     }
                     state.cycle_field_buttons();
                 }
                 BackTab => {
                     if state.editing {
                         state.commit_edit();
+                        update_web_visibility(state);
                     }
                     state.cycle_field_buttons_rev();
                 }
@@ -15500,9 +15517,13 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     } else if let Some(btn_id) = state.find_button_by_shortcut(c) {
                         // Not editing: bare letters are button hotkeys only.
                         if btn_id == WEB_BTN_SAVE {
-                            let settings = extract_settings();
-                            app.popup_manager.close();
-                            return NewPopupAction::WebSaved(settings);
+                            // See the Enter/WEB_BTN_SAVE branch above: same
+                            // validate-before-save gate.
+                            if !update_web_visibility(state) {
+                                let settings = extract_settings(state);
+                                app.popup_manager.close();
+                                return NewPopupAction::WebSaved(settings);
+                            }
                         } else if btn_id == WEB_BTN_MODIFY_KEY {
                             open_modify_key(app);
                         } else if btn_id == WEB_BTN_CANCEL {
@@ -20217,8 +20238,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             WsAsyncAction::Reload => {
                                 #[cfg(not(target_os = "android"))]
                                 {
-                                    debug_log(is_debug_enabled(), "HEADLESS: WS client requested reload");
+                                    debug_log(is_debug_enabled(), "CONSOLE: WS client requested reload");
                                     app.ws_broadcast(WsMessage::ServerReloading);
+                                    // run_app owns the terminal, so it must be handed back
+                                    // before exec — this path used to skip that entirely.
+                                    restore_terminal_for_exec();
+                                    app.mouse_capture_active = false;
                                     exec_reload(&mut app)?;
                                     return Ok(());
                                 }
@@ -20297,11 +20322,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     Ok(()) => {
                                         app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
                                         app.ws_broadcast(WsMessage::ServerReloading);
-                                        let _ = crossterm::terminal::disable_raw_mode();
-                                        let _ = crossterm::execute!(
-                                            std::io::stdout(),
-                                            crossterm::terminal::LeaveAlternateScreen
-                                        );
+                                        restore_terminal_for_exec();
+                                        app.mouse_capture_active = false;
                                         exec_reload(&mut app)?;
                                         return Ok(());
                                     }
