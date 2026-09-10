@@ -11530,6 +11530,17 @@ impl App {
             prompt: prompt_normalized,
         });
 
+        self.advance_auto_login(world_idx);
+    }
+
+    /// Count one prompt against this world and send the next auto-login step if one is
+    /// due. Split out of `handle_prompt` so the idle-flush fallback
+    /// (`handle_idle_prompt`) can drive the identical sequencing without also performing
+    /// `handle_prompt`'s display side effects.
+    ///
+    /// `prompt_count` is the sequence position, so both callers must funnel through here
+    /// or the name/password ordering drifts apart between the two paths.
+    fn advance_auto_login(&mut self, world_idx: usize) {
         let world = &mut self.worlds[world_idx];
         world.prompt_count += 1;
 
@@ -11572,6 +11583,47 @@ impl App {
                 }
             }
         }
+    }
+
+    /// A prompt inferred from the idle flush rather than a telnet marker.
+    ///
+    /// Some MUDs never send GA/EOR/WONT-ECHO at a prompt — Aardwolf's login prompt is the
+    /// reference case, and it *cannot* send one, because the per-character option that
+    /// would enable it belongs to a character that does not exist until after login. On
+    /// those worlds `prompt_count` never advanced, so `AutoConnectType::Prompt` never sent
+    /// the username and the connection sat at "What be thy name" forever.
+    ///
+    /// The reader already releases such a trailing partial line after
+    /// `IDLE_FLUSH_INTERVAL` of silence (that is what makes the prompt visible at all);
+    /// this turns that same release into an auto-login step.
+    ///
+    /// Deliberately does NOT touch `World::prompt` or broadcast a `PromptUpdate`: the text
+    /// has already been emitted as ordinary output by the idle flush, so claiming it as
+    /// the prompt line too would show it twice. Display behaviour is unchanged; only
+    /// auto-login gains a trigger.
+    ///
+    /// Gated so it can only ever fire during login: the world must be connected, want
+    /// prompt-driven auto-login, have both credentials, not have opted out via
+    /// `/worlds -l`, and still be short of the last prompt its login type consumes. Once
+    /// login is done this is inert for the rest of the session, which is what keeps a
+    /// mid-stream network stall from being mistaken for a prompt during play.
+    fn handle_idle_prompt(&mut self, world_idx: usize) {
+        let world = &self.worlds[world_idx];
+        if !world.connected || world.skip_auto_login {
+            return;
+        }
+        let last_login_prompt = match world.settings.auto_connect_type {
+            AutoConnectType::Prompt => 2,
+            AutoConnectType::MooPrompt => 3,
+            AutoConnectType::Connect | AutoConnectType::NoLogin => return,
+        };
+        if world.prompt_count >= last_login_prompt {
+            return;
+        }
+        if world.settings.user.is_empty() || world.settings.password.is_empty() {
+            return;
+        }
+        self.advance_auto_login(world_idx);
     }
 
     // handle_gmcp_negotiated removed in Job 9 (T3.2): its body now lives in
@@ -14540,6 +14592,12 @@ pub enum AppEvent {
     ServerData(String, Vec<u8>),  // world_name, raw bytes
     Disconnected(String, u64),     // world_name, connection_id
     Prompt(String, Vec<u8>),      // world_name, prompt bytes (from telnet GA)
+    /// world_name, trailing-partial-line bytes. A prompt *inferred* from the reader's
+    /// idle flush on a MUD that sends no GA/EOR/WONT-ECHO marker (Aardwolf's login
+    /// prompt is the reference case). Drives auto-login only — the text itself has
+    /// already been emitted as ordinary output, so `handle_idle_prompt` deliberately
+    /// leaves the prompt line alone. See `App::handle_idle_prompt`.
+    IdlePrompt(String, Vec<u8>),
     /// One telnet negotiation/data event for a single-user world (plan Phase 2, Step 2.7).
     /// Replaces the nine formerly-separate variants (`TelnetDetected`, `WontEchoSeen`,
     /// `NawsRequested`, `TtypeRequested`, `CharsetRequested`, `GmcpNegotiated`,
@@ -18227,6 +18285,11 @@ pub async fn run_app_headless(
                             app.handle_prompt(world_idx, prompt_bytes);
                         }
                     }
+                    AppEvent::IdlePrompt(ref world_name, _) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_idle_prompt(world_idx);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -19950,6 +20013,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.handle_prompt(world_idx, &prompt_bytes);
                         }
                     }
+                    AppEvent::IdlePrompt(ref world_name, _) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_idle_prompt(world_idx);
+                        }
+                    }
                     AppEvent::SystemMessage(message) => {
                         // Display system message in current world's output
                         app.add_output(&message);
@@ -20833,6 +20901,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::Prompt(ref world_name, prompt_bytes) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         app.handle_prompt(world_idx, &prompt_bytes);
+                    }
+                }
+                AppEvent::IdlePrompt(ref world_name, _) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        app.handle_idle_prompt(world_idx);
                     }
                 }
                 AppEvent::SystemMessage(message) => {

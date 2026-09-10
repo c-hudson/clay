@@ -37,6 +37,10 @@ use crate::AppEvent;
 /// missing, unless something flushes it after a period of silence.
 const IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 
+/// How many idle-flush prompts one connection may report (see `idle_prompt_event`).
+/// Auto-login uses at most three; the rest is slack for a re-prompt.
+const IDLE_PROMPT_BUDGET: u32 = 6;
+
 /// A `tokio::time::sleep` this far out never fires in practice; used to
 /// "park" the idle timer between reads exactly like `main.rs`'s
 /// `prompt_check_sleep`/`FAR_FUTURE` pattern.
@@ -138,6 +142,40 @@ fn forward_via_telnet(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent
 /// only — nothing downstream needs an `AppEvent` for it. It is still surfaced —
 /// `spawn_telnet_reader` logs it via `debug_log` directly, since there is no
 /// `AppEvent::Telnet`-carried payload built for it here.
+/// Build an `AppEvent::IdlePrompt` for a trailing partial line released by the idle
+/// flush, or `None` if this release is not prompt-shaped or the budget is spent.
+///
+/// Prompt-shaped means the release does not end in a newline: the server sent text and
+/// then stopped mid-line. Only the part after the last newline is the prompt — an idle
+/// flush can release several complete lines plus a trailing fragment in one go, and it is
+/// only the fragment that is the prompt (this mirrors `extract_prompt`'s "text from the
+/// last newline" rule in telnet.rs, so both prompt paths carve the same text).
+///
+/// A leading `\r` is trimmed: Aardwolf terminates lines with `\n\r` rather than `\r\n`,
+/// so the fragment after the last `\n` would otherwise start with a stray carriage return.
+///
+/// Only `TelnetTarget::World` reports these. The multiuser path has its own auto-login
+/// flow and is deliberately left alone here.
+fn idle_prompt_event(
+    target: &TelnetTarget,
+    text: &[u8],
+    budget: &mut u32,
+) -> Option<AppEvent> {
+    if *budget == 0 || text.last() == Some(&b'\n') {
+        return None;
+    }
+    let TelnetTarget::World(name) = target else { return None };
+    let start = text.iter().rposition(|&b| b == b'\n').map(|p| p + 1).unwrap_or(0);
+    let fragment: &[u8] = text[start..]
+        .strip_prefix(b"\r")
+        .unwrap_or(&text[start..]);
+    if fragment.iter().all(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    *budget -= 1;
+    Some(AppEvent::IdlePrompt(name.clone(), fragment.to_vec()))
+}
+
 pub fn to_app_event(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent> {
     match target {
         TelnetTarget::World(name) => match ev {
@@ -291,11 +329,17 @@ pub fn spawn_telnet_reader(
     cfg: TelnetConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let wants_idle_prompt = cfg.wants_prompt_auto_login;
         let mut session = TelnetSession::new(cfg);
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
 
         let idle_timer = tokio::time::sleep(FAR_FUTURE);
         tokio::pin!(idle_timer);
+        // Bounds how many idle-flush prompts this connection will ever report. Auto-login
+        // consumes at most three (MooPrompt), and a couple spare covers a mistyped
+        // password being re-prompted; after that the reader stops reporting entirely, so a
+        // long session cannot keep paying for events App would only discard.
+        let mut idle_prompt_budget: u32 = IDLE_PROMPT_BUDGET;
 
         loop {
             tokio::select! {
@@ -396,7 +440,25 @@ pub fn spawn_telnet_reader(
                 _ = &mut idle_timer => {
                     let text = session.take_idle_flushable_text();
                     if !text.is_empty() {
+                        // A release that does NOT end in a newline is a trailing partial
+                        // line the server stopped mid-way through — i.e. a prompt on a MUD
+                        // that never sends GA/EOR (see IDLE_FLUSH_INTERVAL's doc comment,
+                        // which is why this flush exists at all). Report it so auto-login
+                        // can advance; App applies the real gating and ignores it outside
+                        // the login window. The text is still emitted below exactly as
+                        // before, so display is untouched.
+                        let prompt_ev = if wants_idle_prompt {
+                            idle_prompt_event(&target, &text, &mut idle_prompt_budget)
+                        } else {
+                            None
+                        };
                         let _ = event_tx.send(make_server_data_event(&target, text)).await;
+                        // Emitted *after* the text, so the existing event ordering every
+                        // other consumer already relies on is untouched; this only adds a
+                        // trailing trigger.
+                        if let Some(ev) = prompt_ev {
+                            let _ = event_tx.send(ev).await;
+                        }
                     }
                     // Nothing more to flush until the next read arms it again.
                     idle_timer.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
@@ -927,6 +989,80 @@ mod tests {
     // in Job 2"): a prompt with no trailing newline and no GA/EOR must not
     // be emitted until IDLE_FLUSH_INTERVAL of silence has passed.
     // ==================================================================
+
+    /// A MUD that never sends GA/EOR (Aardwolf's login prompt is the reference case)
+    /// must still drive auto-login. The idle flush already released the text so the
+    /// prompt is visible; this asserts it now also reports an `IdlePrompt` so
+    /// `prompt_count` can advance. The ServerData still follows — display is unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn idle_flush_reports_unmarked_prompt_for_auto_login() {
+        // Only a prompt-auto-login world reports these at all.
+        let cfg = TelnetConfig { wants_prompt_auto_login: true, ..test_cfg() };
+        let mut h = Harness::spawn_with_cfg(TelnetTarget::World("w".to_string()), 1, cfg);
+        h.send(b"What be thy name, adventurer? ").await;
+        tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
+
+        // The text still comes first and unchanged — display behaviour is untouched.
+        let ev = h.next_event().await;
+        assert!(
+            matches!(&ev, AppEvent::ServerData(n, _) if n == "w"),
+            "the idle flush must still emit the text as output, first and unchanged"
+        );
+        assert!(matches!(
+            h.next_event().await,
+            AppEvent::IdlePrompt(n, b)
+                if n == "w" && b == b"What be thy name, adventurer? ".to_vec()
+        ), "an unmarked trailing partial line must then be reported for auto-login");
+    }
+
+    // `idle_prompt_event` is pure, so its rules are tested directly rather than by
+    // driving the reader — the reader emits a complete line the moment it arrives, so
+    // event ordering there depends on how the input happens to be split.
+
+    #[test]
+    fn idle_prompt_event_takes_only_the_trailing_fragment_and_trims_cr() {
+        let t = TelnetTarget::World("w".to_string());
+        let mut budget = 3;
+        // Aardwolf terminates lines with \n\r, so the fragment after the last \n would
+        // otherwise carry a leading carriage return.
+        let ev = idle_prompt_event(&t, b"banner\n\rWhat be thy name? ", &mut budget);
+        assert!(matches!(ev, Some(AppEvent::IdlePrompt(ref n, ref b))
+            if n == "w" && b == b"What be thy name? "), "only the fragment, CR trimmed");
+    }
+
+    #[test]
+    fn idle_prompt_event_ignores_a_newline_terminated_release() {
+        let t = TelnetTarget::World("w".to_string());
+        let mut budget = 3;
+        assert!(idle_prompt_event(&t, b"ordinary output\n", &mut budget).is_none());
+        assert_eq!(budget, 3, "a non-prompt must not spend budget");
+    }
+
+    #[test]
+    fn idle_prompt_event_ignores_whitespace_only_fragment() {
+        let t = TelnetTarget::World("w".to_string());
+        let mut budget = 3;
+        assert!(idle_prompt_event(&t, b"line\n   ", &mut budget).is_none());
+        assert_eq!(budget, 3);
+    }
+
+    #[test]
+    fn idle_prompt_event_is_bounded_by_budget() {
+        let t = TelnetTarget::World("w".to_string());
+        let mut budget = 2;
+        assert!(idle_prompt_event(&t, b"a> ", &mut budget).is_some());
+        assert!(idle_prompt_event(&t, b"b> ", &mut budget).is_some());
+        assert!(idle_prompt_event(&t, b"c> ", &mut budget).is_none(),
+            "reporting stops once the per-connection budget is spent");
+    }
+
+    #[test]
+    fn idle_prompt_event_skips_multiuser_target() {
+        let t = TelnetTarget::Multiuser { world_index: 0, username: "u".to_string() };
+        let mut budget = 3;
+        assert!(idle_prompt_event(&t, b"Login: ", &mut budget).is_none(),
+            "multiuser has its own auto-login flow and is left alone here");
+    }
 
     #[tokio::test(start_paused = true)]
     async fn idle_flush_releases_held_back_prompt_after_150ms() {

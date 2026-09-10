@@ -1122,6 +1122,12 @@ pub struct TelnetConfig {
     /// (it chose `StreamReader::Tls`/`Proxy`/`NamedPipeProxy` vs `Plain`, or
     /// tracks it on `World::is_tls`).
     pub is_tls: bool,
+    /// Whether this world uses prompt-driven auto-login (`AutoConnectType::Prompt` /
+    /// `MooPrompt`) with both credentials set. Only such a world can act on the reader's
+    /// idle-flush prompt fallback (`idle_prompt_event` in telnet_reader.rs), so anything
+    /// else never reports one — a world that cannot use it should not have its event
+    /// stream perturbed at all.
+    pub wants_prompt_auto_login: bool,
     /// Job 14 (plan Phase 4): per-world escape hatch for MSP (`!!SOUND(...)`/
     /// `!!MUSIC(...)`) trigger recognition — mirrors
     /// `World::settings.msp_enabled` (default on): audio triggered by a
@@ -1143,6 +1149,7 @@ impl Default for TelnetConfig {
             client_name: "CLAY".to_string(),
             is_tls: false,
             msp_enabled: true,
+            wants_prompt_auto_login: false,
         }
     }
 }

@@ -1,4 +1,63 @@
 use unicode_width::UnicodeWidthChar;
+use crossterm::event::{KeyCode, KeyModifiers};
+
+/// The character `literal_next` (`^V`, TF's `/dokey lnext`) should insert for a given
+/// keypress — the whole point being to get a *control code* into the input line, which
+/// is otherwise unreachable because every such key is bound to an editing action.
+///
+/// Ctrl-<key> maps by the standard caret rule (`^@`=0x00, `^A`=0x01 … `^_`=0x1F,
+/// `^?`=0x7F), which is what a terminal would have sent had the key not been intercepted.
+/// The named keys map to the byte the terminal itself uses for them. `None` means the key
+/// has no literal form (a function key, a bare modifier), and the keystroke is dropped.
+///
+/// Shared by the console (`input_handler`) and the SSH remote console (`remote_client`),
+/// which previously carried byte-identical copies of this logic — the exact drift this
+/// codebase keeps getting bitten by.
+pub fn literal_char(code: KeyCode, mods: KeyModifiers) -> Option<char> {
+    match code {
+        KeyCode::Char(c) if mods.contains(KeyModifiers::CONTROL) => {
+            // `^A`..`^Z` and `^@ ^[ ^\ ^] ^^ ^_` are the letter's code minus 0x40;
+            // `^?` (0x7F) is the odd one out and is spelled with `?`.
+            let u = c.to_ascii_uppercase();
+            match u {
+                '?' => Some('\u{7f}'),
+                '@'..='_' => char::from_u32(u as u32 - 0x40),
+                // Ctrl with a key that has no control code (e.g. Ctrl-1): insert the
+                // plain character rather than swallowing the keystroke.
+                _ => Some(c),
+            }
+        }
+        KeyCode::Char(c) => Some(c),
+        KeyCode::Esc => Some('\u{1b}'),
+        KeyCode::Tab => Some('\t'),
+        KeyCode::Enter => Some('\r'),
+        KeyCode::Backspace => Some('\u{7f}'),
+        KeyCode::Delete => Some('\u{7f}'),
+        KeyCode::Null => Some('\u{0}'),
+        _ => None,
+    }
+}
+
+/// How a character should be *drawn* in the input area.
+///
+/// A literal control character must never reach the terminal as itself: `0x1B` would open
+/// a real escape sequence and eat the rest of the frame, and the rest are invisible or
+/// destructive (this is the input-side twin of the C1 rule in CLAUDE.md). The Unicode
+/// control-pictures block spells each one as a visible glyph — `0x01` becomes `␁`.
+///
+/// The substitution is deliberately **1:1**. Caret notation (`^A`) would be two cells and
+/// would desynchronise every index that maps display position back to the buffer: the
+/// cursor column math in `render_input_area`/`render_output_crossterm`, and the
+/// misspelled-word char ranges in `render_input`. One char in, one char out, and all of
+/// that keeps working untouched.
+pub fn display_control_char(c: char) -> char {
+    match c {
+        '\n' => c,
+        '\u{7f}' => '\u{2421}',
+        c if (c as u32) < 0x20 => char::from_u32(0x2400 + c as u32).unwrap_or(c),
+        c => c,
+    }
+}
 
 /// Calculate display width of a string (handles zero-width characters and wide chars)
 pub fn display_width(s: &str) -> usize {
@@ -1221,5 +1280,48 @@ mod tests {
         };
         input.history_begin_n(-1);
         assert_eq!(input.buffer, "three", "negative n reverses RECALLBEG to count from the end");
+    }
+
+    /// `^V` (TF's `/dokey lnext`) exists so a control code can be typed at all — every
+    /// such key is otherwise bound to an editing action. The old consumer matched only
+    /// `KeyCode::Char` and dropped the modifier, so `^V ^A` inserted a plain "a".
+    #[test]
+    fn literal_char_maps_control_keys_to_control_codes() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = KeyModifiers::CONTROL;
+        assert_eq!(literal_char(KeyCode::Char('a'), ctrl), Some('\u{1}'), "^A is 0x01");
+        assert_eq!(literal_char(KeyCode::Char('A'), ctrl), Some('\u{1}'), "case-insensitive");
+        assert_eq!(literal_char(KeyCode::Char('z'), ctrl), Some('\u{1a}'), "^Z is 0x1A");
+        assert_eq!(literal_char(KeyCode::Char('@'), ctrl), Some('\u{0}'), "^@ is NUL");
+        assert_eq!(literal_char(KeyCode::Char('['), ctrl), Some('\u{1b}'), "^[ is ESC");
+        assert_eq!(literal_char(KeyCode::Char('?'), ctrl), Some('\u{7f}'), "^? is DEL");
+    }
+
+    #[test]
+    fn literal_char_maps_named_keys_and_plain_chars() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let none = KeyModifiers::NONE;
+        assert_eq!(literal_char(KeyCode::Char('a'), none), Some('a'), "plain char unchanged");
+        assert_eq!(literal_char(KeyCode::Esc, none), Some('\u{1b}'));
+        assert_eq!(literal_char(KeyCode::Tab, none), Some('\t'));
+        assert_eq!(literal_char(KeyCode::Enter, none), Some('\r'));
+        // No literal form: the keystroke is dropped rather than inserting something wrong.
+        assert_eq!(literal_char(KeyCode::F(5), none), None);
+        assert_eq!(literal_char(KeyCode::Left, none), None);
+    }
+
+    /// A raw control character must never reach the terminal: 0x1B would open a real
+    /// escape sequence and eat the rest of the frame.
+    #[test]
+    fn display_control_char_substitutes_visibly_and_one_for_one() {
+        assert_eq!(display_control_char('\u{1}'), '\u{2401}', "0x01 draws as the picture glyph");
+        assert_eq!(display_control_char('\u{1b}'), '\u{241b}', "ESC must never be emitted raw");
+        assert_eq!(display_control_char('\u{7f}'), '\u{2421}', "DEL has its own glyph");
+        assert_eq!(display_control_char('a'), 'a', "ordinary text untouched");
+        assert_eq!(display_control_char('\n'), '\n', "newline stays a real line break");
+        // The 1:1 property is what keeps cursor columns and misspelling char ranges valid.
+        for c in ['\u{1}', '\u{1b}', '\u{7f}', 'a', '\u{4e2d}'] {
+            assert_eq!(display_control_char(c).to_string().chars().count(), 1);
+        }
     }
 }

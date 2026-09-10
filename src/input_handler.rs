@@ -1206,7 +1206,11 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     // Ctrl+V literal next: insert next character literally
     if app.literal_next {
         app.literal_next = false;
-        if let KeyCode::Char(c) = key.code {
+        // Insert the literal character this keypress stands for, including control
+        // codes (^V ^A -> 0x01) and Esc (0x1B) — the reason `^V` exists. Previously
+        // this matched only `KeyCode::Char` and dropped the modifier, so `^V ^A`
+        // inserted a plain "a" and `^V Esc` inserted nothing at all.
+        if let Some(c) = crate::input::literal_char(key.code, key.modifiers) {
             app.input.insert_char(c);
         }
         return KeyAction::None;

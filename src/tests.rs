@@ -10030,6 +10030,85 @@ third
             "end_seq present is what marks the seq as real - seq 0 is a legitimate value");
     }
 
+    /// Aardwolf's login prompt carries no GA/EOR/WONT-ECHO — and cannot, since the
+    /// per-character option that would enable one belongs to a character that does not
+    /// exist until after login. `handle_idle_prompt` is the fallback that lets auto-login
+    /// advance anyway, driven by the reader's idle flush.
+    fn idle_prompt_world(auto: crate::telnet::AutoConnectType) -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = true;
+        w.settings.auto_connect_type = auto;
+        w.settings.user = "myname".to_string();
+        w.settings.password = "secret".to_string();
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        app
+    }
+
+    #[test]
+    fn test_idle_prompt_advances_auto_login_on_unmarked_prompt() {
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        app.handle_idle_prompt(0);
+        assert_eq!(app.worlds[0].prompt_count, 1,
+            "an unmarked prompt must advance auto-login (the Aardwolf case)");
+        app.handle_idle_prompt(0);
+        assert_eq!(app.worlds[0].prompt_count, 2, "second prompt is the password step");
+    }
+
+    /// The whole safety story: once the login steps are consumed the fallback is inert,
+    /// so a mid-stream stall during play can never be mistaken for a prompt.
+    #[test]
+    fn test_idle_prompt_is_inert_after_login_completes() {
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        app.handle_idle_prompt(0);
+        app.handle_idle_prompt(0);
+        assert_eq!(app.worlds[0].prompt_count, 2);
+        for _ in 0..5 {
+            app.handle_idle_prompt(0);
+        }
+        assert_eq!(app.worlds[0].prompt_count, 2,
+            "after the last login prompt the fallback must stop counting entirely");
+    }
+
+    #[test]
+    fn test_idle_prompt_moo_takes_three_steps() {
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::MooPrompt);
+        for _ in 0..5 {
+            app.handle_idle_prompt(0);
+        }
+        assert_eq!(app.worlds[0].prompt_count, 3,
+            "MooPrompt consumes three prompts, then goes inert");
+    }
+
+    #[test]
+    fn test_idle_prompt_ignored_when_not_applicable() {
+        // Connect/NoLogin do not use prompt sequencing at all.
+        for auto in [crate::telnet::AutoConnectType::Connect,
+                     crate::telnet::AutoConnectType::NoLogin] {
+            let mut app = idle_prompt_world(auto);
+            app.handle_idle_prompt(0);
+            assert_eq!(app.worlds[0].prompt_count, 0,
+                "Connect/NoLogin must not be driven by the idle-prompt fallback");
+        }
+        // Disconnected: nothing to log in to.
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        app.worlds[0].connected = false;
+        app.handle_idle_prompt(0);
+        assert_eq!(app.worlds[0].prompt_count, 0);
+        // /worlds -l opted out explicitly.
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        app.worlds[0].skip_auto_login = true;
+        app.handle_idle_prompt(0);
+        assert_eq!(app.worlds[0].prompt_count, 0);
+        // No credentials to send.
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        app.worlds[0].settings.password.clear();
+        app.handle_idle_prompt(0);
+        assert_eq!(app.worlds[0].prompt_count, 0);
+    }
+
     /// `handle_prompt` on a disconnected world renders the prompt as an output line and used
     /// to `return` without broadcasting anything at all.
     #[test]

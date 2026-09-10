@@ -2353,7 +2353,9 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
     let chars: Vec<char> = if masked {
         app.input.buffer.chars().map(|c| if c == '\n' { '\n' } else { INPUT_MASK_CHAR }).collect()
     } else {
-        app.input.buffer.chars().collect()
+        // A literal control character (inserted via `^V`) must be drawn as a visible
+        // stand-in, never emitted raw — see `input::display_control_char`.
+        app.input.buffer.chars().map(crate::input::display_control_char).collect()
     };
 
     // Calculate visible prompt length (without ANSI codes)
