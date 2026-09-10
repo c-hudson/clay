@@ -580,6 +580,7 @@
         worldEditAutoReconnect: document.getElementById('world-edit-auto-reconnect'),
         worldEditMspEnabledToggle: document.getElementById('world-edit-msp-enabled-toggle'),
         worldEditMcpEnabledToggle: document.getElementById('world-edit-mcp-enabled-toggle'),
+        worldEditMccp2EnabledToggle: document.getElementById('world-edit-mccp2-enabled-toggle'),
         worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
         worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
@@ -7062,7 +7063,12 @@
             '  NOP: Sends a telnet NOP (invisible to server).',
             '  Custom: Sends a custom command you specify.', '',
             'Encoding: UTF-8 (modern), Latin-1 (older MUDs), FANSI.', '',
-            'GMCP: Space-separated GMCP packages to request.'
+            'GMCP: Space-separated GMCP packages to request.', '',
+            'MCCP2: Accept the MUD\'s offer to compress output.',
+            '  Turn off to decline compression - the connection',
+            '  still works, just uncompressed. Toggling this on',
+            '  a live connection asks the server to start/stop',
+            '  compressing immediately.'
         ],
         worldSelector: [
             'World Selector - Browse and Connect', '',
@@ -10855,6 +10861,13 @@
         } else {
             elements.worldEditMcpEnabledToggle.classList.remove('active');
         }
+        // Same default-on reasoning as msp_enabled/mcp_enabled above.
+        const mccp2Enabled = world.settings?.mccp2_enabled !== false;
+        if (mccp2Enabled) {
+            elements.worldEditMccp2EnabledToggle.classList.add('active');
+        } else {
+            elements.worldEditMccp2EnabledToggle.classList.remove('active');
+        }
         elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
         if (elements.worldEditGmcpPackages) {
             elements.worldEditGmcpPackages.value = world.settings?.gmcp_packages || '';
@@ -10926,7 +10939,8 @@
             gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : '',
             auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0',
             msp_enabled: elements.worldEditMspEnabledToggle.classList.contains('active'),
-            mcp_enabled: elements.worldEditMcpEnabledToggle.classList.contains('active')
+            mcp_enabled: elements.worldEditMcpEnabledToggle.classList.contains('active'),
+            mccp2_enabled: elements.worldEditMccp2EnabledToggle.classList.contains('active')
         });
 
         // Update local state
@@ -10951,6 +10965,7 @@
         }
         world.settings.msp_enabled = elements.worldEditMspEnabledToggle.classList.contains('active');
         world.settings.mcp_enabled = elements.worldEditMcpEnabledToggle.classList.contains('active');
+        world.settings.mccp2_enabled = elements.worldEditMccp2EnabledToggle.classList.contains('active');
 
         closeWorldEditorPopup();
     }
@@ -13998,6 +14013,9 @@
             this.classList.toggle('active');
         };
         elements.worldEditMcpEnabledToggle.onclick = function() {
+            this.classList.toggle('active');
+        };
+        elements.worldEditMccp2EnabledToggle.onclick = function() {
             this.classList.toggle('active');
         };
         elements.worldEditKeepAliveSelect.onchange = function() {

@@ -1648,13 +1648,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                                     msp_enabled: app.current_world().settings.msp_enabled,
+                                    mccp2_enabled: app.current_world().settings.mccp2_enabled,
                                     // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path -
                                     // only reached when use_ssl is true.
                                     is_tls: use_ssl,
-                                    // Only a prompt-auto-login world can act on the
-                                    // reader's unmarked-prompt fallback; see
-                                    // TelnetConfig::wants_prompt_auto_login.
-                                    wants_prompt_auto_login: wants_prompt_auto_login(app.current_world()),
                                     ..TelnetConfig::default()
                                 };
                                 spawn_telnet_reader(
@@ -1773,13 +1770,10 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                                     msp_enabled: app.current_world().settings.msp_enabled,
+                                    mccp2_enabled: app.current_world().settings.mccp2_enabled,
                                     // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path -
                                     // only reached when use_ssl is true.
                                     is_tls: use_ssl,
-                                    // Only a prompt-auto-login world can act on the
-                                    // reader's unmarked-prompt fallback; see
-                                    // TelnetConfig::wants_prompt_auto_login.
-                                    wants_prompt_auto_login: wants_prompt_auto_login(app.current_world()),
                                     ..TelnetConfig::default()
                                 };
                                 spawn_telnet_reader(
@@ -1819,8 +1813,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             // Job 14 (plan Phase 4): captured before the spawn since this task has no
             // `app` access - for TelnetConfig::msp_enabled.
             let msp_enabled = app.current_world().settings.msp_enabled;
-            // Same reasoning, for TelnetConfig::wants_prompt_auto_login.
-            let wants_prompt_login = wants_prompt_auto_login(app.current_world());
+            let mccp2_enabled = app.current_world().settings.mccp2_enabled;
             // Job 13 (plan Phase 4, 4.4): same reasoning, for spawn_telnet_writer's
             // initial encoding.
             let initial_encoding = app.current_world().effective_encoding();
@@ -1997,14 +1990,11 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                                     msp_enabled,
+                                    mccp2_enabled,
                                     // Job 12 (plan Phase 4, 4.1): `is_tls` here is the bool the
                                     // connection_result match just destructured (true for the TLS
                                     // arm, false for the plain arm).
                                     is_tls,
-                                    // Only a prompt-auto-login world can act on the
-                                    // reader's unmarked-prompt fallback; see
-                                    // TelnetConfig::wants_prompt_auto_login.
-                                    wants_prompt_auto_login: wants_prompt_login,
                                     ..TelnetConfig::default()
                                 };
                                 spawn_telnet_reader(
@@ -2109,6 +2099,18 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
 
                 // Notify connected web/GUI clients to reconnect after reload
                 app.ws_broadcast(WsMessage::ServerReloading);
+
+                // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes):
+                // if any connected world is compressed, defer instead of exec'ing now -
+                // should_defer_reload_for_mccp2 has already sent it IAC DONT MCCP2 and
+                // armed the drain deadline. run_app's own event loop (the only loop that
+                // calls handle_command for /reload) polls mccp2_reload_ready_to_exec once
+                // per pass and performs the terminal-restore + exec_reload below itself
+                // once every drained world's stream ends, or the deadline passes.
+                if app.should_defer_reload_for_mccp2() {
+                    app.add_output("Waiting for compressed (MCCP2) connection(s) to finish before reloading...");
+                    return false;
+                }
 
                 // Hand the terminal back before exec. Must disable mouse tracking and
                 // bracketed paste *before* raw mode goes away — see
@@ -3311,19 +3313,6 @@ fn add_or_update_world(
 /// comment for why this consolidation exists). `file` (finding 31 / plan Job
 /// 14b) is stored in the TF engine's own memory only, keyed by lower-cased
 /// world name - never a persisted setting.
-/// Whether a world can act on the reader's idle-flush prompt fallback: it must use
-/// prompt-driven auto-login and actually have both credentials. Anything else never
-/// reports one, so its event stream is byte-for-byte what it was before the fallback
-/// existed. See `TelnetConfig::wants_prompt_auto_login` and `App::handle_idle_prompt`
-/// (which re-checks this, plus connection and sequence state, before acting).
-pub(crate) fn wants_prompt_auto_login(world: &crate::World) -> bool {
-    matches!(
-        world.settings.auto_connect_type,
-        crate::telnet::AutoConnectType::Prompt | crate::telnet::AutoConnectType::MooPrompt
-    ) && !world.settings.user.is_empty()
-        && !world.settings.password.is_empty()
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_add_world_command(
     app: &mut App,

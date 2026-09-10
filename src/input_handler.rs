@@ -917,6 +917,16 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.log_enabled = settings.log_enabled;
                     app.worlds[idx].settings.msp_enabled = settings.msp_enabled;
                     app.worlds[idx].settings.mcp_enabled = settings.mcp_enabled;
+                    // Toggle a live connection's MCCP2 negotiation before overwriting the
+                    // stored value - the helper needs the old value to know whether the
+                    // setting actually changed (see main.rs's `send_mccp2_toggle_if_changed`).
+                    let old_mccp2_enabled = app.worlds[idx].settings.mccp2_enabled;
+                    app.worlds[idx].settings.mccp2_enabled = settings.mccp2_enabled;
+                    crate::send_mccp2_toggle_if_changed(
+                        app.worlds[idx].command_tx.as_ref(),
+                        old_mccp2_enabled,
+                        settings.mccp2_enabled,
+                    );
 
                     // Update encoding
                     app.worlds[idx].settings.encoding = Encoding::from_name(&settings.encoding);

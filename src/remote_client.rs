@@ -1878,6 +1878,18 @@ pub(crate) fn handle_remote_client_key(
                     app.worlds[idx].settings.log_enabled = settings.log_enabled;
                     app.worlds[idx].settings.msp_enabled = settings.msp_enabled;
                     app.worlds[idx].settings.mcp_enabled = settings.mcp_enabled;
+                    // Toggle a live connection's MCCP2 negotiation before overwriting the
+                    // stored value, same as main.rs's WorldEditorSaved handler - the SSH
+                    // remote console mirrors settings locally but has no real command_tx
+                    // of its own (the real connection lives on the daemon side), so this is
+                    // a no-op here in practice; kept for parity with the other two sites.
+                    let old_mccp2_enabled = app.worlds[idx].settings.mccp2_enabled;
+                    app.worlds[idx].settings.mccp2_enabled = settings.mccp2_enabled;
+                    crate::send_mccp2_toggle_if_changed(
+                        app.worlds[idx].command_tx.as_ref(),
+                        old_mccp2_enabled,
+                        settings.mccp2_enabled,
+                    );
                     app.worlds[idx].settings.encoding = Encoding::from_name(&settings.encoding);
                     app.worlds[idx].settings.auto_connect_type = AutoConnectType::from_name(&settings.auto_connect);
                     app.worlds[idx].settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive);
@@ -1905,6 +1917,7 @@ pub(crate) fn handle_remote_client_key(
                         auto_reconnect_secs: settings.auto_reconnect_secs,
                         msp_enabled: settings.msp_enabled,
                         mcp_enabled: settings.mcp_enabled,
+                        mccp2_enabled: settings.mccp2_enabled,
                     });
                 }
             }

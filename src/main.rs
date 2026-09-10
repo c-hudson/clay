@@ -1980,6 +1980,16 @@ pub struct WorldSettings {
     /// instead of being filtered — see `mcp::McpState` and
     /// `App::process_server_data`'s call site.
     pub mcp_enabled: bool,
+    /// Per-world escape hatch for MCCP2 (telnet option 86) compression. Same
+    /// default-on posture as `msp_enabled`/`mcp_enabled`, but unlike either of
+    /// those this gates an *outbound* negotiation decision, not inbound
+    /// parsing: off means Clay answers a server's `WILL MCCP2` with `DONT`
+    /// instead of `DO` (see `TelnetConfig::mccp2_enabled` and
+    /// `telnet::support_him`), so compression is never turned on at all for a
+    /// fresh connection. Toggling it on a live, already-negotiated connection
+    /// sends the corresponding `DO`/`DONT` mid-session instead (see
+    /// `send_mccp2_toggle_if_changed`).
+    pub mccp2_enabled: bool,
 }
 
 impl Default for WorldSettings {
@@ -2009,6 +2019,7 @@ impl Default for WorldSettings {
             auto_reconnect_on_web: false,
             msp_enabled: true,
             mcp_enabled: true,
+            mccp2_enabled: true,
         }
     }
 }
@@ -2047,6 +2058,43 @@ impl WorldSettings {
             (false, n) if n > 0 => n.to_string(),
             _ => "0".to_string(),
         }
+    }
+}
+
+/// The wire bytes needed to bring a live MCCP2 negotiation from `old_enabled` to
+/// `new_enabled`, or `None` if the value didn't actually change. Turning it on
+/// mid-session asks the server to (re)start compressing (`IAC DO MCCP2`); turning it
+/// off asks it to stop (`IAC DONT MCCP2`) — the server then ends its deflate stream,
+/// which `TelnetSession` already detects via `Z_STREAM_END`
+/// (`TelnetEvent::CompressionEnded` -> `mccp2_active = false`).
+///
+/// This is the one place old-vs-new is compared for this setting — every "world
+/// editor saved" site (`input_handler.rs`, `remote_client.rs`,
+/// `App::update_world_settings`) calls `send_mccp2_toggle_if_changed` below rather
+/// than duplicating the comparison, which is exactly the class of copy that has
+/// drifted apart in this codebase before (see the `output_lines` broadcast history
+/// in CLAUDE.md for a worked example of the same failure mode).
+pub(crate) fn mccp2_toggle_bytes(old_enabled: bool, new_enabled: bool) -> Option<Vec<u8>> {
+    if old_enabled == new_enabled {
+        return None;
+    }
+    Some(if new_enabled {
+        vec![telnet::TELNET_IAC, telnet::TELNET_DO, telnet::TELNET_OPT_MCCP2]
+    } else {
+        vec![telnet::TELNET_IAC, telnet::TELNET_DONT, telnet::TELNET_OPT_MCCP2]
+    })
+}
+
+/// Send `mccp2_toggle_bytes(old_enabled, new_enabled)` on `command_tx`, if it produced
+/// anything and the world is actually connected. A no-op when the value is unchanged
+/// or when `command_tx` is `None` (world not connected) — see the doc comment above.
+pub(crate) fn send_mccp2_toggle_if_changed(
+    command_tx: Option<&mpsc::Sender<WriteCommand>>,
+    old_enabled: bool,
+    new_enabled: bool,
+) {
+    if let (Some(bytes), Some(tx)) = (mccp2_toggle_bytes(old_enabled, new_enabled), command_tx) {
+        let _ = tx.try_send(WriteCommand::Raw(bytes));
     }
 }
 
@@ -3226,6 +3274,16 @@ pub struct World {
     #[cfg(not(unix))]
     proxy_socket_fd: Option<i64>,   // Placeholder on non-Unix (never used)
     is_tls: bool,                // Track if using TLS
+    /// MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): set by
+    /// `App::should_defer_reload_for_mccp2` right before it sends `IAC DONT MCCP2` and
+    /// exec() defers, so the restore path (`World::resume_mccp2_after_reload`) knows to
+    /// re-request compression on this same connection once it comes back. Transient,
+    /// per-reload state - persisted only to the hot-reload state file (`persistence.rs`),
+    /// never to `settings.dat` (see `WorldSettings::mccp2_enabled` for the actual user
+    /// setting this is not). Cleared by `resume_mccp2_after_reload` once consumed, and by
+    /// `clear_connection_state`/`apply_mccp2_reload_bailout` on any path that gives up on
+    /// this connection instead, so it can never survive into an unrelated later one.
+    pub mccp2_resume_after_reload: bool,
     telnet_mode: bool,           // True if telnet negotiation detected
     /// The fifteen telnet protocol mirrors moved off `World` in plan Job 9 (T3.2) -
     /// see `protocol_state::ProtocolState`'s own doc comment for the full list and why
@@ -3504,6 +3562,7 @@ impl World {
             socket_fd: None,
             proxy_socket_fd: None,
             is_tls: false,
+            mccp2_resume_after_reload: false,
             telnet_mode: false,
             protocol: protocol_state::ProtocolState::default(),
             prompt: String::new(),
@@ -3667,6 +3726,12 @@ impl World {
         // above, and the auth-key check makes trusting a stale key actively unsafe,
         // not just cosmetically wrong.
         self.mcp = mcp::McpState::default();
+        // MCCP2 hot-reload drain (job 2 of 2): a marker set for *this* connection must
+        // never survive into a different one - see `mccp2_resume_after_reload`'s own doc
+        // comment. Every path that gives up on a connection (an explicit /disconnect, the
+        // server closing it, a dead proxy during restore) routes through here, so this is
+        // the one place that needs to clear it for all of them.
+        self.mccp2_resume_after_reload = false;
         // Reset skip_auto_login so next fresh connection triggers auto-login
         self.skip_auto_login = false;
         self.fansi_detect_until = None;
@@ -3687,6 +3752,38 @@ impl World {
     /// Return the effective encoding for this world: negotiated charset if available, otherwise configured encoding.
     pub fn effective_encoding(&self) -> Encoding {
         self.protocol.effective_encoding(&self.settings)
+    }
+
+    /// MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes). Called once
+    /// a hot-reload restore has re-established `command_tx` for a world
+    /// `App::should_defer_reload_for_mccp2` marked before the exec: resumes the MCCP2
+    /// compression the server had already agreed to on this very connection by sending
+    /// `IAC DO MCCP2`.
+    ///
+    /// This is a deliberate, narrow exception to Clay's fully-reactive negotiation policy
+    /// (Clay normally never initiates - see the telnet negotiation notes in CLAUDE.md): it
+    /// is safe here specifically because the server already sent `WILL MCCP2` on this
+    /// exact connection before the reload, so this resumes a previously-agreed option
+    /// rather than probing an unknown server.
+    ///
+    /// A no-op - and does NOT clear the marker - if `command_tx` isn't set yet; callers
+    /// must only call this once a connection attempt has actually succeeded (see the
+    /// restore call sites in `run_app_headless`/`run_app`, right after each one sets
+    /// `command_tx`). Once a connection does exist, the marker is always cleared, even if
+    /// `settings.mccp2_enabled` was turned off for this world while the reload was in
+    /// flight - in that case nothing is sent, since the user asked to leave MCCP2 off.
+    fn resume_mccp2_after_reload(&mut self) {
+        if !self.mccp2_resume_after_reload {
+            return;
+        }
+        let Some(tx) = self.command_tx.as_ref() else { return };
+        self.mccp2_resume_after_reload = false;
+        if !self.settings.mccp2_enabled {
+            return;
+        }
+        if let Some(bytes) = mccp2_toggle_bytes(false, true) {
+            let _ = tx.try_send(WriteCommand::Raw(bytes));
+        }
     }
 
     /// Write a line to the log file with timestamp prefix
@@ -4750,6 +4847,14 @@ pub struct App {
     pub pending_update: Option<bool>,
     /// Remote client mode: pending /reload request (re-exec local binary)
     pub pending_reload: bool,
+    /// MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): `Some`
+    /// while a reload has been deferred by `should_defer_reload_for_mccp2` to let
+    /// compressed worlds drain their zlib stream before `exec()`, holding the deadline
+    /// past which `mccp2_reload_ready_to_exec` gives up waiting and lets the reload
+    /// proceed anyway (`apply_mccp2_reload_bailout` disconnects whatever is still
+    /// compressed at that point, exactly as before this job). `None` means no reload is
+    /// currently deferred - true almost all of the time.
+    pub mccp2_reload_deadline: Option<std::time::Instant>,
     /// Master mode: pending /connect confirmation (target addr, requested at). Cleared on
     /// confirm/cancel or when superseded by a different target.
     pub pending_remote_connect: Option<(String, std::time::Instant)>,
@@ -4917,6 +5022,7 @@ impl App {
             ws_client_tx: None, // Set when running as remote client (--console mode)
             pending_update: None,
             pending_reload: false,
+            mccp2_reload_deadline: None,
             pending_remote_connect: None,
             pending_console_import: None,
             pending_remote_detach: false,
@@ -5787,6 +5893,7 @@ impl App {
             auto_reconnect_secs: world.settings.auto_reconnect_display(),
             msp_enabled: world.settings.msp_enabled,
             mcp_enabled: world.settings.mcp_enabled,
+            mccp2_enabled: world.settings.mccp2_enabled,
             slack_token: world.settings.slack_token.clone(),
             slack_channel: world.settings.slack_channel.clone(),
             slack_workspace: world.settings.slack_workspace.clone(),
@@ -6670,6 +6777,7 @@ impl App {
                     w.settings.keep_alive_cmd = settings.keep_alive_cmd;
                     w.settings.msp_enabled = settings.msp_enabled;
                     w.settings.mcp_enabled = settings.mcp_enabled;
+                    w.settings.mccp2_enabled = settings.mccp2_enabled;
                     self.needs_output_redraw = true;
                 }
             }
@@ -6804,6 +6912,7 @@ impl App {
             keep_alive_cmd: w.settings.keep_alive_cmd,
             msp_enabled: w.settings.msp_enabled,
             mcp_enabled: w.settings.mcp_enabled,
+            mccp2_enabled: w.settings.mccp2_enabled,
             auto_reconnect_secs,
             auto_reconnect_on_web,
             ..WorldSettings::default()
@@ -8536,6 +8645,7 @@ impl App {
                 has_notes: !world.settings.notes.is_empty(),
                 msp_enabled: world.settings.msp_enabled,
                 mcp_enabled: world.settings.mcp_enabled,
+                mccp2_enabled: world.settings.mccp2_enabled,
             },
             last_send_secs: None,
             last_recv_secs: None,
@@ -8630,6 +8740,7 @@ impl App {
         auto_reconnect_secs: String,
         msp_enabled: bool,
         mcp_enabled: bool,
+        mccp2_enabled: bool,
     ) {
         if world_index >= self.worlds.len() {
             return;
@@ -8647,6 +8758,11 @@ impl App {
         self.worlds[world_index].settings.log_enabled = log_enabled;
         self.worlds[world_index].settings.msp_enabled = msp_enabled;
         self.worlds[world_index].settings.mcp_enabled = mcp_enabled;
+        // Toggle a live connection's MCCP2 negotiation before overwriting the stored value -
+        // send_mccp2_toggle_if_changed needs the old value to know whether anything changed.
+        let old_mccp2_enabled = self.worlds[world_index].settings.mccp2_enabled;
+        self.worlds[world_index].settings.mccp2_enabled = mccp2_enabled;
+        send_mccp2_toggle_if_changed(self.worlds[world_index].command_tx.as_ref(), old_mccp2_enabled, mccp2_enabled);
         self.worlds[world_index].settings.encoding = match encoding.as_str() {
             "latin1" => Encoding::Latin1,
             "fansi" => Encoding::Fansi,
@@ -8676,6 +8792,7 @@ impl App {
             has_notes,
             msp_enabled,
             mcp_enabled,
+            mccp2_enabled,
         };
         self.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
     }
@@ -9353,6 +9470,11 @@ impl App {
             writeln!(file, "unseen_lines: {}", world.unseen_lines)?;
             writeln!(file, "showing_splash: {}", world.showing_splash)?;
             writeln!(file, "partial_line: {:?}", if world.partial_line.is_empty() { "".to_string() } else { format!("({} chars) {:?}", world.partial_line.len(), &world.partial_line[..world.partial_line.len().min(100)]) })?;
+            // The prompt line (what the input area draws). Worth dumping: a prompt that is
+            // set but not on screen, or on screen but not set, are different bugs and were
+            // previously indistinguishable from outside.
+            writeln!(file, "prompt: {:?}", world.prompt)?;
+            writeln!(file, "trigger_partial_line: {:?}", world.trigger_partial_line)?;
             writeln!(file, "partial_in_pending: {}", world.partial_in_pending)?;
             // Broadcast ledger (PROTOCOL-ROADMAP.md Phase F). Normally exactly one range
             // spanning 0..=next_seq-1; more than one means seqs were consumed by lines that
@@ -11413,6 +11535,92 @@ impl App {
         }
     }
 
+    /// How long a reload deferred by `should_defer_reload_for_mccp2` waits for every
+    /// drained world's MCCP2 stream to actually end before giving up and exec'ing anyway -
+    /// at which point `apply_mccp2_reload_bailout` disconnects whatever is still
+    /// compressed, exactly as it always has. Unconditional: nothing about detecting the
+    /// end of a stream (a hung/dead server, a bug in this job's own logic) may be allowed
+    /// to hang reload forever.
+    const MCCP2_RELOAD_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Reload-trigger decision, MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's
+    /// hot-reload notes; job 1 added `WorldSettings::mccp2_enabled` and wired it through
+    /// negotiation). Called once, in place of an immediate `exec_reload`, at every one of
+    /// the seven reload-trigger sites (commands.rs's typed `/reload`, daemon.rs's `-D`
+    /// SIGUSR1 handler, and five in main.rs: the headless SIGUSR1/update-installed/
+    /// GUI-reload-flag sites, and the console primary select loop's WS-requested-reload/
+    /// update-installed sites). Returns `true` when the caller must NOT exec now - it must
+    /// return/continue instead, letting `mccp2_reload_ready_to_exec` (below), polled once
+    /// per event-loop pass at each of those same loops, fire the real exec later. Returns
+    /// `false` - today's behaviour, completely unchanged - when there is nothing to drain.
+    ///
+    /// Why this exists at all: an active MCCP2 stream's zlib inflate state lives only in
+    /// this process's reader task and cannot survive `exec()` - there is no sliding window
+    /// a fresh process could resume from. Sending `IAC DONT MCCP2` first asks the server to
+    /// finish the stream with `Z_FINISH`; once those trailing bytes are inflated here and
+    /// `TelnetSession` sees `Z_STREAM_END`, it fires `TelnetEvent::CompressionEnded`, which
+    /// `ProtocolState::apply_telnet_event` mirrors onto `mccp2_active = false` (telnet.rs's
+    /// `run_decompressor`, protocol_state.rs's `CompressionEnded` arm). Only then is it
+    /// safe to exec onto a plain socket instead of losing whatever the old process alone
+    /// could still have inflated.
+    ///
+    /// A world is drained (DONT sent, `mccp2_resume_after_reload` set so the restore path
+    /// re-requests compression) only when it is connected, actually compressed, has a live
+    /// `command_tx`, and still wants MCCP2 (`settings.mccp2_enabled`) - a world whose owner
+    /// just disabled MCCP2, or has no live command_tx to send on, is left for
+    /// `apply_mccp2_reload_bailout`'s existing disconnect instead: there is no reason to
+    /// delay reload waiting on a mode nobody will ask to resume.
+    fn should_defer_reload_for_mccp2(&mut self) -> bool {
+        let mut deferred = false;
+        for world in &mut self.worlds {
+            if !(world.connected && world.protocol.mccp2_active && world.settings.mccp2_enabled) {
+                continue;
+            }
+            let Some(tx) = world.command_tx.as_ref() else { continue };
+            // Reuses the exact wire bytes the live world-editor MCCP2 toggle sends (job 1)
+            // - see `mccp2_toggle_bytes`'s doc comment - rather than hand-building
+            // [IAC, DONT, MCCP2] a second time.
+            if let Some(bytes) = mccp2_toggle_bytes(true, false) {
+                let _ = tx.try_send(WriteCommand::Raw(bytes));
+            }
+            world.mccp2_resume_after_reload = true;
+            deferred = true;
+        }
+        if deferred {
+            self.mccp2_reload_deadline = Some(std::time::Instant::now() + Self::MCCP2_RELOAD_DRAIN_DEADLINE);
+        }
+        deferred
+    }
+
+    /// Poll (job 2 of 2): may a reload `should_defer_reload_for_mccp2` deferred now
+    /// actually `exec()`? Safe and cheap to call unconditionally, once per pass, in every
+    /// loop that can trigger a reload - returns `false` immediately whenever no reload is
+    /// currently deferred (`mccp2_reload_deadline` is `None`), which is true the vast
+    /// majority of the time.
+    ///
+    /// Returns `true` once every world `should_defer_reload_for_mccp2` marked
+    /// (`mccp2_resume_after_reload`) is no longer `mccp2_active` (its stream ended, via
+    /// `CompressionEnded`/`CompressionFailed`), or the deadline has passed - whichever
+    /// comes first. A world that was never marked (mccp2_enabled=false, or no command_tx,
+    /// at defer time) cannot block this either way, and neither can one whose connection
+    /// dropped in the meantime (`clear_connection_state` clears the marker on any path
+    /// that gives up on a connection).
+    ///
+    /// Clears the pending deadline before returning `true`: this is a one-shot per
+    /// deferred reload, and the caller is expected to actually exec immediately
+    /// afterward (falling through to `apply_mccp2_reload_bailout` at restore, exactly as
+    /// before this job, for whatever is still compressed when the deadline is what fired).
+    fn mccp2_reload_ready_to_exec(&mut self) -> bool {
+        let Some(deadline) = self.mccp2_reload_deadline else { return false };
+        let still_draining = self.worlds.iter()
+            .any(|w| w.mccp2_resume_after_reload && w.protocol.mccp2_active);
+        if still_draining && std::time::Instant::now() < deadline {
+            return false;
+        }
+        self.mccp2_reload_deadline = None;
+        true
+    }
+
     /// MCCP2 hot-reload guard (plan Phase 3, step 3.3, "the serious one, found by the design
     /// review"'s second bug): disconnect any `connected` world still marked `mccp2_active`
     /// after a reload/crash-recovery restore, with a message naming the reason - mirrors the
@@ -11433,6 +11641,13 @@ impl App {
     /// predates this job) specifically so it has a real unit test - `run_app`/`run_app_headless`
     /// are large `async fn`s that need live sockets/exec/tty machinery to run at all and are
     /// not otherwise reachable from the test suite.
+    ///
+    /// Job 2 (MCCP2 hot-reload drain): also clears `mccp2_resume_after_reload` for every
+    /// world it disconnects here - this is the deadline-expired case (a world
+    /// `should_defer_reload_for_mccp2` marked never finished draining in time), and the
+    /// connection being torn down here means there is nothing left to resume the marker
+    /// would otherwise wrongly resume on some *later*, unrelated connection to this world
+    /// (see the marker's own doc comment).
     fn apply_mccp2_reload_bailout(&mut self, is_crash: bool) {
         let mut mccp2_disconnect_worlds: Vec<usize> = Vec::new();
         for (world_idx, world) in self.worlds.iter().enumerate() {
@@ -11449,6 +11664,7 @@ impl App {
             self.worlds[world_idx].connected = false;
             self.worlds[world_idx].command_tx = None;
             self.worlds[world_idx].socket_fd = None;
+            self.worlds[world_idx].mccp2_resume_after_reload = false;
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
             self.worlds[world_idx].output_lines.push(OutputLine::new_client(mccp2_msg.to_string(), seq));
@@ -11525,6 +11741,15 @@ impl App {
         }
 
         self.worlds[world_idx].prompt = prompt_normalized.clone();
+        // The prompt line lives in the input area, so a new prompt has to repaint even
+        // though no output changed. A marker prompt usually rides in on the same packet as
+        // the text before it and gets a repaint for free; an idle-detected one arrives
+        // IDLE_FLUSH_INTERVAL after that packet, with nothing else to trigger a frame — so
+        // without this it sits in `World::prompt`, correct but invisible, until the next
+        // keypress or line of output.
+        if world_idx == self.current_world_index {
+            self.needs_output_redraw = true;
+        }
         self.ws_broadcast(WsMessage::PromptUpdate {
             world_index: world_idx,
             prompt: prompt_normalized,
@@ -11589,41 +11814,21 @@ impl App {
     ///
     /// Some MUDs never send GA/EOR/WONT-ECHO at a prompt — Aardwolf's login prompt is the
     /// reference case, and it *cannot* send one, because the per-character option that
-    /// would enable it belongs to a character that does not exist until after login. On
-    /// those worlds `prompt_count` never advanced, so `AutoConnectType::Prompt` never sent
-    /// the username and the connection sat at "What be thy name" forever.
+    /// would enable it belongs to a character that does not exist until after login.
     ///
-    /// The reader already releases such a trailing partial line after
-    /// `IDLE_FLUSH_INTERVAL` of silence (that is what makes the prompt visible at all);
-    /// this turns that same release into an auto-login step.
+    /// Handled exactly like a marker prompt, so it shows in the input area and drives
+    /// auto-login identically. The only difference is where the boundary came from: a
+    /// marker says "the prompt ends here", while here the reader observed the server fall
+    /// silent mid-line, which means the completion `process_server_data` parked this text
+    /// waiting for is never coming.
     ///
-    /// Deliberately does NOT touch `World::prompt` or broadcast a `PromptUpdate`: the text
-    /// has already been emitted as ordinary output by the idle flush, so claiming it as
-    /// the prompt line too would show it twice. Display behaviour is unchanged; only
-    /// auto-login gains a trigger.
-    ///
-    /// Gated so it can only ever fire during login: the world must be connected, want
-    /// prompt-driven auto-login, have both credentials, not have opted out via
-    /// `/worlds -l`, and still be short of the last prompt its login type consumes. Once
-    /// login is done this is inert for the rest of the session, which is what keeps a
-    /// mid-stream network stall from being mistaken for a prompt during play.
-    fn handle_idle_prompt(&mut self, world_idx: usize) {
-        let world = &self.worlds[world_idx];
-        if !world.connected || world.skip_auto_login {
-            return;
-        }
-        let last_login_prompt = match world.settings.auto_connect_type {
-            AutoConnectType::Prompt => 2,
-            AutoConnectType::MooPrompt => 3,
-            AutoConnectType::Connect | AutoConnectType::NoLogin => return,
-        };
-        if world.prompt_count >= last_login_prompt {
-            return;
-        }
-        if world.settings.user.is_empty() || world.settings.password.is_empty() {
-            return;
-        }
-        self.advance_auto_login(world_idx);
+    /// Clearing `trigger_partial_line` is what makes the two paths equivalent: a GA/EOR
+    /// prompt never reaches it either, because `extract_prompt` drains the prompt out of
+    /// the text stream before it is ever treated as ordinary output. Leaving the parked
+    /// copy behind would prepend the prompt to whatever the server sends next.
+    fn handle_idle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8]) {
+        self.worlds[world_idx].trigger_partial_line.clear();
+        self.handle_prompt(world_idx, prompt_bytes);
     }
 
     // handle_gmcp_negotiated removed in Job 9 (T3.2): its body now lives in
@@ -13161,11 +13366,11 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
-                    msp_enabled, mcp_enabled,
+                    msp_enabled, mcp_enabled, mccp2_enabled,
                 );
             }
             WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
@@ -13880,6 +14085,7 @@ impl App {
                     has_notes: !world.settings.notes.is_empty(),
                     msp_enabled: world.settings.msp_enabled,
                     mcp_enabled: world.settings.mcp_enabled,
+                    mccp2_enabled: world.settings.mccp2_enabled,
                 },
                 last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
@@ -14966,6 +15172,7 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) auto_reconnect_secs: String,
     pub(crate) msp_enabled: bool,
     pub(crate) mcp_enabled: bool,
+    pub(crate) mccp2_enabled: bool,
     // Slack fields
     pub(crate) slack_token: String,
     pub(crate) slack_channel: String,
@@ -15051,7 +15258,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
         WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT,
-        WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED,
+        WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
         WORLD_BTN_SAVE, WORLD_BTN_CANCEL, WORLD_BTN_DELETE, WORLD_BTN_CONNECT,
@@ -16429,6 +16636,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     auto_reconnect_secs: state.get_text(WORLD_FIELD_AUTO_RECONNECT).unwrap_or("0").to_string(),
                     msp_enabled: state.get_bool(WORLD_FIELD_MSP_ENABLED).unwrap_or(true),
                     mcp_enabled: state.get_bool(WORLD_FIELD_MCP_ENABLED).unwrap_or(true),
+                    mccp2_enabled: state.get_bool(WORLD_FIELD_MCCP2_ENABLED).unwrap_or(true),
                     slack_token: state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
                     slack_channel: state.get_text(WORLD_FIELD_SLACK_CHANNEL).unwrap_or("").to_string(),
                     slack_workspace: state.get_text(WORLD_FIELD_SLACK_WORKSPACE).unwrap_or("").to_string(),
@@ -17642,6 +17850,9 @@ pub async fn run_app_headless(
                 let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
                 app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                 app.worlds[world_idx].skip_auto_login = true;
+                // MCCP2 hot-reload drain (job 2 of 2): resume compression if this world
+                // was marked before the exec - see resume_mccp2_after_reload's doc comment.
+                app.worlds[world_idx].resume_mccp2_after_reload();
                 app.worlds[world_idx].open_log_file();
                 let world_name = app.worlds[world_idx].name.clone();
                 app.worlds[world_idx].connection_id += 1;
@@ -17665,6 +17876,7 @@ pub async fn run_app_headless(
                 let telnet_cfg = TelnetConfig {
                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
+                    mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                     ..TelnetConfig::default()
                 };
@@ -17699,6 +17911,10 @@ pub async fn run_app_headless(
                                 let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
                                 app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                                 app.worlds[world_idx].skip_auto_login = true;
+                                // MCCP2 hot-reload drain (job 2 of 2): resume compression
+                                // if this world was marked before the exec - see
+                                // resume_mccp2_after_reload's doc comment.
+                                app.worlds[world_idx].resume_mccp2_after_reload();
                                 app.worlds[world_idx].open_log_file();
                                 let world_name = app.worlds[world_idx].name.clone();
                                 app.worlds[world_idx].connection_id += 1;
@@ -17714,6 +17930,7 @@ pub async fn run_app_headless(
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
+                                    mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                                     ..TelnetConfig::default()
                                 };
@@ -17768,6 +17985,10 @@ pub async fn run_app_headless(
                                 let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
                                 app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                                 app.worlds[world_idx].skip_auto_login = true;
+                                // MCCP2 hot-reload drain (job 2 of 2): resume compression
+                                // if this world was marked before the exec - see
+                                // resume_mccp2_after_reload's doc comment.
+                                app.worlds[world_idx].resume_mccp2_after_reload();
                                 app.worlds[world_idx].open_log_file();
                                 let world_name = app.worlds[world_idx].name.clone();
                                 app.worlds[world_idx].connection_id += 1;
@@ -17788,6 +18009,7 @@ pub async fn run_app_headless(
                                 let telnet_cfg = TelnetConfig {
                                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
+                                    mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                                     ..TelnetConfig::default()
                                 };
@@ -18171,8 +18393,15 @@ pub async fn run_app_headless(
                                 ));
                             }
                             app.ws_broadcast(WsMessage::ServerReloading);
-                            exec_reload(&mut app)?;
-                            return Ok(());
+                            // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's
+                            // hot-reload notes): defer instead of exec'ing now if any
+                            // connected world is compressed - the bottom-of-loop poll
+                            // fires the real exec once every drained world's stream ends,
+                            // or the drain deadline passes.
+                            if !app.should_defer_reload_for_mccp2() {
+                                exec_reload(&mut app)?;
+                                return Ok(());
+                            }
                         }
                     }
                     AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
@@ -18260,8 +18489,14 @@ pub async fn run_app_headless(
                                     Ok(()) => {
                                         app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
                                         app.ws_broadcast(WsMessage::ServerReloading);
-                                        exec_reload(&mut app)?;
-                                        return Ok(());
+                                        // MCCP2 hot-reload drain (job 2 of 2): defer
+                                        // instead of exec'ing now if any connected world
+                                        // is compressed - see the Sigusr1Received arm
+                                        // above and the bottom-of-loop poll.
+                                        if !app.should_defer_reload_for_mccp2() {
+                                            exec_reload(&mut app)?;
+                                            return Ok(());
+                                        }
                                     }
                                     Err(e) => {
                                         app.add_output(&e);
@@ -18285,9 +18520,9 @@ pub async fn run_app_headless(
                             app.handle_prompt(world_idx, prompt_bytes);
                         }
                     }
-                    AppEvent::IdlePrompt(ref world_name, _) => {
+                    AppEvent::IdlePrompt(ref world_name, ref prompt_bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.handle_idle_prompt(world_idx);
+                            app.handle_idle_prompt(world_idx, prompt_bytes);
                         }
                     }
                     _ => {}
@@ -18577,8 +18812,13 @@ pub async fn run_app_headless(
                             ));
                         }
                         app.ws_broadcast(WsMessage::ServerReloading);
-                        exec_reload(&mut app)?;
-                        return Ok(());
+                        // MCCP2 hot-reload drain (job 2 of 2): defer instead of exec'ing
+                        // now if any connected world is compressed - see the
+                        // Sigusr1Received arm above and the bottom-of-loop poll.
+                        if !app.should_defer_reload_for_mccp2() {
+                            exec_reload(&mut app)?;
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -18699,6 +18939,19 @@ pub async fn run_app_headless(
             && prompt_check_sleep.deadline() > tokio::time::Instant::now() + Duration::from_millis(150)
         {
             prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+        }
+
+        // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): fire a
+        // reload deferred by should_defer_reload_for_mccp2 (any of this loop's three
+        // trigger sites above) once every drained world's stream has ended, or the
+        // deadline passes - see mccp2_reload_ready_to_exec's doc comment. Checked once
+        // per loop pass (a cheap no-op whenever no reload is pending) rather than at each
+        // trigger site, exactly like the process-tick/prompt-check rearms just above.
+        #[cfg(not(target_os = "android"))]
+        if app.mccp2_reload_ready_to_exec() {
+            debug_log(is_debug_enabled(), "HEADLESS: MCCP2 drain complete (or deadline hit), calling exec_reload");
+            exec_reload(&mut app)?;
+            return Ok(());
         }
     }
 }
@@ -18904,6 +19157,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                 // Skip auto-login for restored connections (only fresh connects should auto-login)
                 app.worlds[world_idx].skip_auto_login = true;
+                // MCCP2 hot-reload drain (job 2 of 2): resume compression if this world
+                // was marked before the exec - see resume_mccp2_after_reload's doc comment.
+                app.worlds[world_idx].resume_mccp2_after_reload();
 
                 // Re-open log file if enabled
                 app.worlds[world_idx].open_log_file();
@@ -18932,6 +19188,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 let telnet_cfg = TelnetConfig {
                     term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                     msp_enabled: app.worlds[world_idx].settings.msp_enabled,
+                    mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                     is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                     ..TelnetConfig::default()
                 };
@@ -19017,6 +19274,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
                         app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                         app.worlds[world_idx].skip_auto_login = true;
+                        // MCCP2 hot-reload drain (job 2 of 2): resume compression if this
+                        // world was marked before the exec - see
+                        // resume_mccp2_after_reload's doc comment.
+                        app.worlds[world_idx].resume_mccp2_after_reload();
 
                         // Re-open log file if enabled
                         app.worlds[world_idx].open_log_file();
@@ -19040,6 +19301,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let telnet_cfg = TelnetConfig {
                             term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                             msp_enabled: app.worlds[world_idx].settings.msp_enabled,
+                            mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                             is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                             ..TelnetConfig::default()
                         };
@@ -19107,6 +19369,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let cmd_tx = spawn_telnet_writer(write_half, initial_encoding);
                         app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                         app.worlds[world_idx].skip_auto_login = true;
+                        // MCCP2 hot-reload drain (job 2 of 2): resume compression if this
+                        // world was marked before the exec - see
+                        // resume_mccp2_after_reload's doc comment.
+                        app.worlds[world_idx].resume_mccp2_after_reload();
                         app.worlds[world_idx].open_log_file();
 
                         let world_name = app.worlds[world_idx].name.clone();
@@ -19126,6 +19392,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let telnet_cfg = TelnetConfig {
                             term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                             msp_enabled: app.worlds[world_idx].settings.msp_enabled,
+                            mccp2_enabled: app.worlds[world_idx].settings.mccp2_enabled,
                             is_tls: app.worlds[world_idx].is_tls, // Job 12 (plan Phase 4, 4.1)
                             ..TelnetConfig::default()
                         };
@@ -20013,9 +20280,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.handle_prompt(world_idx, &prompt_bytes);
                         }
                     }
-                    AppEvent::IdlePrompt(ref world_name, _) => {
+                    AppEvent::IdlePrompt(ref world_name, ref prompt_bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.handle_idle_prompt(world_idx);
+                            app.handle_idle_prompt(world_idx, prompt_bytes);
                         }
                     }
                     AppEvent::SystemMessage(message) => {
@@ -20308,12 +20575,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 {
                                     debug_log(is_debug_enabled(), "CONSOLE: WS client requested reload");
                                     app.ws_broadcast(WsMessage::ServerReloading);
-                                    // run_app owns the terminal, so it must be handed back
-                                    // before exec — this path used to skip that entirely.
-                                    restore_terminal_for_exec();
-                                    app.mouse_capture_active = false;
-                                    exec_reload(&mut app)?;
-                                    return Ok(());
+                                    // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's
+                                    // hot-reload notes): defer instead of exec'ing now if
+                                    // any connected world is compressed - the
+                                    // bottom-of-loop poll fires the real exec (with the
+                                    // same terminal-restore step) once every drained
+                                    // world's stream ends, or the drain deadline passes.
+                                    if !app.should_defer_reload_for_mccp2() {
+                                        // run_app owns the terminal, so it must be handed
+                                        // back before exec — this path used to skip that
+                                        // entirely.
+                                        restore_terminal_for_exec();
+                                        app.mouse_capture_active = false;
+                                        exec_reload(&mut app)?;
+                                        return Ok(());
+                                    }
                                 }
                             }
                             WsAsyncAction::Done => {}
@@ -20390,10 +20666,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     Ok(()) => {
                                         app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
                                         app.ws_broadcast(WsMessage::ServerReloading);
-                                        restore_terminal_for_exec();
-                                        app.mouse_capture_active = false;
-                                        exec_reload(&mut app)?;
-                                        return Ok(());
+                                        // MCCP2 hot-reload drain (job 2 of 2): defer
+                                        // instead of exec'ing now if any connected world
+                                        // is compressed - see the WsAsyncAction::Reload
+                                        // arm above and the bottom-of-loop poll.
+                                        if !app.should_defer_reload_for_mccp2() {
+                                            restore_terminal_for_exec();
+                                            app.mouse_capture_active = false;
+                                            exec_reload(&mut app)?;
+                                            return Ok(());
+                                        }
                                     }
                                     Err(e) => {
                                         app.add_output(&e);
@@ -20903,9 +21185,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.handle_prompt(world_idx, &prompt_bytes);
                     }
                 }
-                AppEvent::IdlePrompt(ref world_name, _) => {
+                AppEvent::IdlePrompt(ref world_name, ref prompt_bytes) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        app.handle_idle_prompt(world_idx);
+                        app.handle_idle_prompt(world_idx, prompt_bytes);
                     }
                 }
                 AppEvent::SystemMessage(message) => {
@@ -21233,6 +21515,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             && prompt_check_sleep.deadline() > tokio::time::Instant::now() + Duration::from_millis(150)
         {
             prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+        }
+
+        // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): fire a
+        // reload deferred by should_defer_reload_for_mccp2 (any of this loop's trigger
+        // sites, including commands.rs's typed /reload via handle_command - this is the
+        // only loop that calls handle_command for /reload) once every drained world's
+        // stream has ended, or the deadline passes - see mccp2_reload_ready_to_exec's doc
+        // comment. Checked once per outer-loop pass, after both the main select arm and
+        // the batch-drain loop above have run, exactly like the process-tick/prompt-check
+        // rearms just above.
+        #[cfg(not(target_os = "android"))]
+        if app.mccp2_reload_ready_to_exec() {
+            debug_log(is_debug_enabled(), "CONSOLE: MCCP2 drain complete (or deadline hit), calling exec_reload");
+            restore_terminal_for_exec();
+            app.mouse_capture_active = false;
+            exec_reload(&mut app)?;
+            return Ok(());
         }
 
         // Release orphaned pending lines before drawing so they appear this frame

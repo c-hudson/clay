@@ -600,6 +600,12 @@ pub enum WsMessage {
         /// reasoning as `msp_enabled` above.
         #[serde(default = "default_mcp_enabled")]
         mcp_enabled: bool,
+        /// Per-world MCCP2 (telnet option 86) compression enable toggle. Same
+        /// `serde(default)` reasoning as `msp_enabled` above - an older client
+        /// omitting this field must resolve to `true` (compression accepted),
+        /// not `serde(default)`'s implicit `false`.
+        #[serde(default = "default_mccp2_enabled")]
+        mccp2_enabled: bool,
     },
     UpdateGlobalSettings {
         more_mode_enabled: bool,
@@ -1321,6 +1327,12 @@ pub struct WorldSettingsMsg {
     /// per-world value instead of always defaulting on.
     #[serde(default = "default_mcp_enabled")]
     pub mcp_enabled: bool,
+    /// Mirrors `WorldSettings::mccp2_enabled` so the web/GUI world editor shows
+    /// the real per-world value instead of always defaulting on. See
+    /// `default_mccp2_enabled` for why an older peer's omitted field resolves
+    /// to `true`, not `serde(default)`'s implicit `false`.
+    #[serde(default = "default_mccp2_enabled")]
+    pub mccp2_enabled: bool,
 }
 
 /// Global settings for WebSocket protocol
@@ -1459,6 +1471,14 @@ fn default_msp_enabled() -> bool {
 /// matches `WorldSettings::mcp_enabled`'s own default-on posture, same reasoning as
 /// `default_msp_enabled`.
 fn default_mcp_enabled() -> bool {
+    true
+}
+
+/// Default for `UpdateWorldSettings::mccp2_enabled` and
+/// `WorldSettingsMsg::mccp2_enabled` when an older peer's message omits the
+/// field — matches `WorldSettings::mccp2_enabled`'s own default-on posture
+/// (`TelnetConfig::default()`), rather than `serde(default)`'s implicit `false`.
+fn default_mccp2_enabled() -> bool {
     true
 }
 

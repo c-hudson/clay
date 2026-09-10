@@ -538,6 +538,10 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if !world.settings.mcp_enabled {
             writeln!(file, "mcp_enabled=false")?;
         }
+        // Same convention - default is `true`.
+        if !world.settings.mccp2_enabled {
+            writeln!(file, "mccp2_enabled=false")?;
+        }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
             writeln!(file, "slack_token={}", secret(&world.settings.slack_token))?;
@@ -1222,6 +1226,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         // silently ignored, per CLAUDE.md's backward-compat contract.
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
+                        "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -1596,6 +1601,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         // `_ => {}` wildcard below and is silently ignored.
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
+                        "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -1750,6 +1756,7 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             writeln!(file, "msp_enabled={}", world.settings.msp_enabled)?;
             // Job 15 (plan Phase 4).
             writeln!(file, "mcp_enabled={}", world.settings.mcp_enabled)?;
+            writeln!(file, "mccp2_enabled={}", world.settings.mccp2_enabled)?;
             writeln!(file, "encoding={}", world.settings.encoding.name())?;
             writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
             writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
@@ -1992,6 +1999,17 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         // exec, same as a TLS connection - see the `mccp2_active` restore-time
         // disconnect this flag drives, mirroring the `is_tls` one right above it.
         writeln!(file, "mccp2_active={}", world.protocol.mccp2_active)?;
+        // Job 2 (MCCP2 hot-reload drain): a *successful* drain leaves `mccp2_active ==
+        // false` by the time we get here, so the flag above alone wouldn't tell the new
+        // process to re-request compression. This transient marker is per-reload state,
+        // NOT a user setting (see `WorldSettings::mccp2_enabled` for that) - it belongs
+        // only in this file, never in settings.dat - and is consumed once by the restore
+        // path (`World::resume_mccp2_after_reload`), which sends `IAC DO MCCP2` after the
+        // connection is re-established and then clears it. Written only when true, same
+        // as `input_buffer` above, so an idle reload doesn't grow the state file.
+        if world.mccp2_resume_after_reload {
+            writeln!(file, "mccp2_resume_after_reload=true")?;
+        }
         writeln!(file, "was_connected={}", world.was_connected)?;
         writeln!(file, "showing_splash={}", world.showing_splash)?;
         writeln!(file, "telnet_mode={}", world.telnet_mode)?;
@@ -2148,6 +2166,10 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         // Job 15 (plan Phase 4): same convention as msp_enabled above.
         if !world.settings.mcp_enabled {
             writeln!(file, "mcp_enabled=false")?;
+        }
+        // Same convention as msp_enabled above.
+        if !world.settings.mccp2_enabled {
+            writeln!(file, "mccp2_enabled=false")?;
         }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
@@ -2364,6 +2386,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         visual_line_offset: usize,
         is_tls: bool,
         mccp2_active: bool,
+        /// See `World::mccp2_resume_after_reload`'s doc comment and the matching write in
+        /// `save_reload_state_to`. Absent in an older state file (predating job 2) simply
+        /// stays `false`, the same as any freshly-constructed `World`.
+        mccp2_resume_after_reload: bool,
         was_connected: bool,
         showing_splash: bool,
         telnet_mode: bool,
@@ -2519,6 +2545,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                         visual_line_offset: 0,
                         is_tls: false,
                         mccp2_active: false,
+                        mccp2_resume_after_reload: false,
                         was_connected: false,
                         showing_splash: false,
                         telnet_mode: false,
@@ -2918,6 +2945,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "visual_line_offset" => tw.visual_line_offset = value.parse().unwrap_or(0),
                             "is_tls" => tw.is_tls = value == "true",
                             "mccp2_active" => tw.mccp2_active = value == "true",
+                            "mccp2_resume_after_reload" => tw.mccp2_resume_after_reload = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
                             "showing_splash" => tw.showing_splash = value == "true",
                             "telnet_mode" => tw.telnet_mode = value == "true",
@@ -2967,6 +2995,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             // through to the `_ => {}` wildcard below and is ignored.
                             "msp_enabled" => tw.settings.msp_enabled = value == "true",
                             "mcp_enabled" => tw.settings.mcp_enabled = value == "true",
+                            "mccp2_enabled" => tw.settings.mccp2_enabled = value == "true",
                             "encoding" => {
                                 tw.settings.encoding = match value {
                                     "latin1" => Encoding::Latin1,
@@ -3107,6 +3136,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
         world.visual_line_offset = tw.visual_line_offset;
         world.is_tls = tw.is_tls;
         world.protocol.mccp2_active = tw.mccp2_active;
+        world.mccp2_resume_after_reload = tw.mccp2_resume_after_reload;
         world.was_connected = tw.was_connected;
         world.showing_splash = tw.showing_splash;
         world.telnet_mode = tw.telnet_mode;
@@ -3395,6 +3425,7 @@ mod tests {
             auto_reconnect_on_web: true,                   // default: false
             msp_enabled: false,                            // default: true
             mcp_enabled: false,                            // default: true
+            mccp2_enabled: false,                          // default: true
         }
     }
 
@@ -3491,6 +3522,7 @@ mod tests {
         assert_eq!(a.auto_reconnect_on_web, b.auto_reconnect_on_web, "{context}: auto_reconnect_on_web");
         assert_eq!(a.msp_enabled, b.msp_enabled, "{context}: msp_enabled");
         assert_eq!(a.mcp_enabled, b.mcp_enabled, "{context}: mcp_enabled");
+        assert_eq!(a.mccp2_enabled, b.mccp2_enabled, "{context}: mccp2_enabled");
     }
 
     /// A connectionless world (`/addworld <name>` with no host, the web client's "add
@@ -3906,6 +3938,52 @@ mod tests {
         assert_eq!(w.settings.hostname, "mud.example.com");
         assert_eq!(w.settings.port, "4000");
         assert!(w.settings.msp_enabled, "keys after the stale one must still load normally");
+    }
+
+    /// A settings.dat `[world:...]` section written before `mccp2_enabled` existed (no key at
+    /// all) must load as `true` - the feature's own default-on posture, same contract as
+    /// `msp_enabled`/`mcp_enabled` - not `false` from an absent-key default.
+    #[test]
+    fn test_load_settings_from_str_world_section_without_mccp2_key_loads_as_true() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "[world:NoKey]\nhostname=mud.example.com\nport=4000\n";
+        load_settings_from_str(&mut app, content);
+        let w = app.worlds.iter().find(|w| w.name == "NoKey").expect("world loaded");
+        assert!(w.settings.mccp2_enabled, "a world section without the key must default to true");
+    }
+
+    /// `mccp2_enabled` must round-trip through settings.dat (via the shared
+    /// `assert_world_settings_match`/`make_non_default_world_settings` helpers exercised by
+    /// `test_settings_save_load_roundtrip`) and, separately, through the hot-reload state
+    /// file, which is a distinct save/load pair (`save_reload_state_to`/
+    /// `load_reload_state_from_str`) with its own key-writing logic.
+    #[test]
+    fn test_mccp2_enabled_survives_reload_state_roundtrip() {
+        let mut app = App::new();
+        let mut world = World::new("testworld");
+        world.settings.mccp2_enabled = false;
+        app.worlds = vec![world];
+
+        let mut buf = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).unwrap();
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load_reload_state_from_str failed");
+        let w = reloaded.worlds.iter().find(|w| w.name == "testworld").expect("world restored");
+        assert!(!w.settings.mccp2_enabled, "mccp2_enabled=false must survive a hot reload");
+    }
+
+    /// A hot-reload state file predating `mccp2_enabled` (no key in the `[world_state:...]`
+    /// section) must restore it as `true`, matching settings.dat's own absent-key default.
+    #[test]
+    fn test_load_reload_state_without_mccp2_key_defaults_true() {
+        let mut app = App::new();
+        let content = "[world_state:0]\nname=Legacy\nhostname=mud.example.com\n";
+        load_reload_state_from_str(&mut app, content).expect("load_reload_state_from_str");
+        let w = app.worlds.iter().find(|w| w.name == "Legacy").expect("world restored");
+        assert!(w.settings.mccp2_enabled, "an absent key must default to true");
     }
 
     #[test]
@@ -4461,6 +4539,7 @@ pattern=foo
         assert_ne!(non_default.auto_reconnect_on_web, default.auto_reconnect_on_web, "auto_reconnect_on_web should differ");
         assert_ne!(non_default.msp_enabled, default.msp_enabled, "msp_enabled should differ");
         assert_ne!(non_default.mcp_enabled, default.mcp_enabled, "mcp_enabled should differ");
+        assert_ne!(non_default.mccp2_enabled, default.mccp2_enabled, "mccp2_enabled should differ");
     }
 
     #[test]

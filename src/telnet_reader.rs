@@ -37,9 +37,6 @@ use crate::AppEvent;
 /// missing, unless something flushes it after a period of silence.
 const IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(150);
 
-/// How many idle-flush prompts one connection may report (see `idle_prompt_event`).
-/// Auto-login uses at most three; the rest is slack for a re-prompt.
-const IDLE_PROMPT_BUDGET: u32 = 6;
 
 /// A `tokio::time::sleep` this far out never fires in practice; used to
 /// "park" the idle timer between reads exactly like `main.rs`'s
@@ -143,7 +140,7 @@ fn forward_via_telnet(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent
 /// `spawn_telnet_reader` logs it via `debug_log` directly, since there is no
 /// `AppEvent::Telnet`-carried payload built for it here.
 /// Build an `AppEvent::IdlePrompt` for a trailing partial line released by the idle
-/// flush, or `None` if this release is not prompt-shaped or the budget is spent.
+/// flush, or `None` if this release is not prompt-shaped.
 ///
 /// Prompt-shaped means the release does not end in a newline: the server sent text and
 /// then stopped mid-line. Only the part after the last newline is the prompt — an idle
@@ -156,12 +153,8 @@ fn forward_via_telnet(target: &TelnetTarget, ev: TelnetEvent) -> Option<AppEvent
 ///
 /// Only `TelnetTarget::World` reports these. The multiuser path has its own auto-login
 /// flow and is deliberately left alone here.
-fn idle_prompt_event(
-    target: &TelnetTarget,
-    text: &[u8],
-    budget: &mut u32,
-) -> Option<AppEvent> {
-    if *budget == 0 || text.last() == Some(&b'\n') {
+fn idle_prompt_event(target: &TelnetTarget, text: &[u8]) -> Option<AppEvent> {
+    if text.last() == Some(&b'\n') {
         return None;
     }
     let TelnetTarget::World(name) = target else { return None };
@@ -172,7 +165,6 @@ fn idle_prompt_event(
     if fragment.iter().all(|b| b.is_ascii_whitespace()) {
         return None;
     }
-    *budget -= 1;
     Some(AppEvent::IdlePrompt(name.clone(), fragment.to_vec()))
 }
 
@@ -329,17 +321,11 @@ pub fn spawn_telnet_reader(
     cfg: TelnetConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let wants_idle_prompt = cfg.wants_prompt_auto_login;
         let mut session = TelnetSession::new(cfg);
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
 
         let idle_timer = tokio::time::sleep(FAR_FUTURE);
         tokio::pin!(idle_timer);
-        // Bounds how many idle-flush prompts this connection will ever report. Auto-login
-        // consumes at most three (MooPrompt), and a couple spare covers a mistyped
-        // password being re-prompted; after that the reader stops reporting entirely, so a
-        // long session cannot keep paying for events App would only discard.
-        let mut idle_prompt_budget: u32 = IDLE_PROMPT_BUDGET;
 
         loop {
             tokio::select! {
@@ -362,7 +348,13 @@ pub fn spawn_telnet_reader(
                             return;
                         }
                         Ok(n) => {
+                            let pending_before = session.pending_text_len();
                             let outcome = session.feed(&buffer[..n]);
+                            // Did this read move the *text* stream — either emitting text
+                            // or changing what is held back? A read carrying only protocol
+                            // does not, and must not restart the idle window below.
+                            let text_moved = !outcome.text.is_empty()
+                                || session.pending_text_len() != pending_before;
 
                             if !outcome.wire.is_empty() {
                                 let _ = cmd_tx.send(WriteCommand::Raw(outcome.wire)).await;
@@ -416,10 +408,25 @@ pub fn spawn_telnet_reader(
                                 return;
                             }
 
-                            // Mandatory idle flush: reset on every read (see
-                            // IDLE_FLUSH_INTERVAL's doc comment / the plan's
-                            // "Hard requirement discovered in Job 2").
-                            idle_timer.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH_INTERVAL);
+                            // Mandatory idle flush (see IDLE_FLUSH_INTERVAL's doc
+                            // comment / the plan's "Hard requirement discovered in Job 2"),
+                            // but restarted only by a read that actually moved the text
+                            // stream.
+                            //
+                            // This used to reset on EVERY read, which starved the flush
+                            // outright on any server that chatters faster than the
+                            // interval: GMCP/MSDP updates and keepalives carry no text, yet
+                            // each one pushed the window out another 150ms, so a held-back
+                            // prompt was never released — never displayed, and (since the
+                            // release is what reports it) never able to drive auto-login.
+                            // Measured with a server sending one GMCP subnegotiation every
+                            // 100ms: the prompt never came out at all.
+                            //
+                            // Protocol-only reads leave any already-armed timer running, so
+                            // the window still measures silence-since-the-last-text.
+                            if text_moved {
+                                idle_timer.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH_INTERVAL);
+                            }
                         }
                         Err(e) => {
                             // T1.15: flush whatever text was still held back before
@@ -447,11 +454,7 @@ pub fn spawn_telnet_reader(
                         // can advance; App applies the real gating and ignores it outside
                         // the login window. The text is still emitted below exactly as
                         // before, so display is untouched.
-                        let prompt_ev = if wants_idle_prompt {
-                            idle_prompt_event(&target, &text, &mut idle_prompt_budget)
-                        } else {
-                            None
-                        };
+                        let prompt_ev = idle_prompt_event(&target, &text);
                         let _ = event_tx.send(make_server_data_event(&target, text)).await;
                         // Emitted *after* the text, so the existing event ordering every
                         // other consumer already relies on is untouched; this only adds a
@@ -536,6 +539,18 @@ mod tests {
         /// disconnecting: the reader's next socket read resolves to `Ok(0)`.
         fn close_server(&mut self) {
             self.server = None;
+        }
+
+        /// Next event, skipping `IdlePrompt`. The reader reports one after every idle
+        /// flush that ends mid-line, which is most of them in these tests; a test that
+        /// only cares about the released text says so with this.
+        async fn next_server_data(&mut self) -> AppEvent {
+            loop {
+                match self.next_event().await {
+                    AppEvent::IdlePrompt(_, _) => continue,
+                    other => return other,
+                }
+            }
         }
 
         async fn next_event(&mut self) -> AppEvent {
@@ -997,8 +1012,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_flush_reports_unmarked_prompt_for_auto_login() {
         // Only a prompt-auto-login world reports these at all.
-        let cfg = TelnetConfig { wants_prompt_auto_login: true, ..test_cfg() };
-        let mut h = Harness::spawn_with_cfg(TelnetTarget::World("w".to_string()), 1, cfg);
+        let mut h = Harness::spawn(TelnetTarget::World("w".to_string()));
         h.send(b"What be thy name, adventurer? ").await;
         tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
 
@@ -1022,10 +1036,9 @@ mod tests {
     #[test]
     fn idle_prompt_event_takes_only_the_trailing_fragment_and_trims_cr() {
         let t = TelnetTarget::World("w".to_string());
-        let mut budget = 3;
         // Aardwolf terminates lines with \n\r, so the fragment after the last \n would
         // otherwise carry a leading carriage return.
-        let ev = idle_prompt_event(&t, b"banner\n\rWhat be thy name? ", &mut budget);
+        let ev = idle_prompt_event(&t, b"banner\n\rWhat be thy name? ");
         assert!(matches!(ev, Some(AppEvent::IdlePrompt(ref n, ref b))
             if n == "w" && b == b"What be thy name? "), "only the fragment, CR trimmed");
     }
@@ -1033,35 +1046,59 @@ mod tests {
     #[test]
     fn idle_prompt_event_ignores_a_newline_terminated_release() {
         let t = TelnetTarget::World("w".to_string());
-        let mut budget = 3;
-        assert!(idle_prompt_event(&t, b"ordinary output\n", &mut budget).is_none());
-        assert_eq!(budget, 3, "a non-prompt must not spend budget");
+        assert!(idle_prompt_event(&t, b"ordinary output\n").is_none());
     }
 
     #[test]
     fn idle_prompt_event_ignores_whitespace_only_fragment() {
         let t = TelnetTarget::World("w".to_string());
-        let mut budget = 3;
-        assert!(idle_prompt_event(&t, b"line\n   ", &mut budget).is_none());
-        assert_eq!(budget, 3);
-    }
-
-    #[test]
-    fn idle_prompt_event_is_bounded_by_budget() {
-        let t = TelnetTarget::World("w".to_string());
-        let mut budget = 2;
-        assert!(idle_prompt_event(&t, b"a> ", &mut budget).is_some());
-        assert!(idle_prompt_event(&t, b"b> ", &mut budget).is_some());
-        assert!(idle_prompt_event(&t, b"c> ", &mut budget).is_none(),
-            "reporting stops once the per-connection budget is spent");
+        assert!(idle_prompt_event(&t, b"line\n   ").is_none());
     }
 
     #[test]
     fn idle_prompt_event_skips_multiuser_target() {
         let t = TelnetTarget::Multiuser { world_index: 0, username: "u".to_string() };
-        let mut budget = 3;
-        assert!(idle_prompt_event(&t, b"Login: ", &mut budget).is_none(),
+        assert!(idle_prompt_event(&t, b"Login: ").is_none(),
             "multiuser has its own auto-login flow and is left alone here");
+    }
+
+    /// The idle window must measure silence since the last *text*, not since the last
+    /// read. A server that chatters protocol faster than IDLE_FLUSH_INTERVAL (Aardwolf
+    /// sends GMCP) used to starve the flush completely: each keepalive pushed the window
+    /// out again, so a held-back prompt was never released — never displayed, and never
+    /// able to drive auto-login. Verified against a real server sending one GMCP
+    /// subnegotiation every 100ms.
+    #[tokio::test(start_paused = true)]
+    async fn protocol_only_reads_do_not_starve_the_idle_flush() {
+        let mut h = Harness::spawn(TelnetTarget::World("w".to_string()));
+
+        // Held back: no newline, no GA.
+        h.send(b"What be thy name? ").await;
+        for _ in 0..8 { tokio::task::yield_now().await; }
+
+        // Protocol-only traffic, repeatedly, faster than the flush interval. None of it
+        // carries text, so none of it may restart the window.
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(40)).await;
+            h.send(b"\xff\xfa\xc9Core.Ping {}\xff\xf0").await;
+            for _ in 0..4 { tokio::task::yield_now().await; }
+        }
+
+        // Past 150ms since the text arrived, the prompt must come out regardless of the
+        // chatter in between.
+        tokio::time::advance(IDLE_FLUSH_INTERVAL).await;
+        let mut saw_text = false;
+        for _ in 0..6 {
+            match h.event_rx.try_recv() {
+                Ok(AppEvent::ServerData(n, b)) if n == "w" && b == b"What be thy name? ".to_vec() => {
+                    saw_text = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => { tokio::task::yield_now().await; }
+            }
+        }
+        assert!(saw_text, "protocol chatter must not starve the idle flush of a held prompt");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1116,7 +1153,7 @@ mod tests {
         );
         tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
         assert!(matches!(
-            h.next_event().await,
+            h.next_server_data().await,
             AppEvent::ServerData(n, b) if n == "w" && b == b"prompt> ".to_vec()
         ), "the incomplete CSI must stay held while the prompt text in front of it is released");
 
@@ -1128,7 +1165,7 @@ mod tests {
         }
         tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
         assert!(matches!(
-            h.next_event().await,
+            h.next_server_data().await,
             AppEvent::ServerData(n, b) if n == "w" && b == b"\x1b[31m".to_vec()
         ), "no stray '[3' - the completed escape sequence must come out as one whole unit");
     }
@@ -1144,7 +1181,7 @@ mod tests {
         assert!(matches!(h.event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
         assert!(matches!(
-            h.next_event().await,
+            h.next_server_data().await,
             AppEvent::ServerData(n, b) if n == "w" && b == b"caf".to_vec()
         ), "the truncated UTF-8 lead byte must stay held while 'caf' is released");
 
@@ -1154,7 +1191,7 @@ mod tests {
         }
         tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
         assert!(matches!(
-            h.next_event().await,
+            h.next_server_data().await,
             AppEvent::ServerData(n, b) if n == "w" && b == b"\xc3\xa9".to_vec()
         ), "the completed code point must come out as one whole unit");
     }
@@ -1170,7 +1207,7 @@ mod tests {
         assert!(matches!(h.event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         tokio::time::advance(IDLE_FLUSH_INTERVAL + Duration::from_millis(1)).await;
         assert!(matches!(
-            h.next_event().await,
+            h.next_server_data().await,
             AppEvent::ServerData(n, b) if n == "w" && b == b"Look ".to_vec()
         ), "the open marker (and 'bell', its in-progress filename) must stay held");
 
@@ -1180,12 +1217,12 @@ mod tests {
         // needed for it.
         h.send(b".wav)\r\n").await;
         assert!(matches!(
-            h.next_event().await,
+            h.next_server_data().await,
             AppEvent::Telnet(TelnetTarget::World(n), TelnetEvent::MspTrigger(t))
                 if n == "w" && t.name == "bell.wav" && !t.is_music
         ));
         assert!(matches!(
-            h.next_event().await,
+            h.next_server_data().await,
             AppEvent::ServerData(n, b) if n == "w" && b == b"\r\n".to_vec()
         ));
     }

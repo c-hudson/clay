@@ -1122,12 +1122,6 @@ pub struct TelnetConfig {
     /// (it chose `StreamReader::Tls`/`Proxy`/`NamedPipeProxy` vs `Plain`, or
     /// tracks it on `World::is_tls`).
     pub is_tls: bool,
-    /// Whether this world uses prompt-driven auto-login (`AutoConnectType::Prompt` /
-    /// `MooPrompt`) with both credentials set. Only such a world can act on the reader's
-    /// idle-flush prompt fallback (`idle_prompt_event` in telnet_reader.rs), so anything
-    /// else never reports one — a world that cannot use it should not have its event
-    /// stream perturbed at all.
-    pub wants_prompt_auto_login: bool,
     /// Job 14 (plan Phase 4): per-world escape hatch for MSP (`!!SOUND(...)`/
     /// `!!MUSIC(...)`) trigger recognition — mirrors
     /// `World::settings.msp_enabled` (default on): audio triggered by a
@@ -1138,6 +1132,13 @@ pub struct TelnetConfig {
     /// off means MSP does not exist as far as this session is concerned, not
     /// merely "recognised but muted".
     pub msp_enabled: bool,
+    /// Per-world MCCP2 (telnet option 86, RFC MCCP2) escape hatch — mirrors
+    /// `World::settings.mccp2_enabled` (default on). Unlike `msp_enabled` this
+    /// gates an *outbound* negotiation decision, not inbound parsing: `false`
+    /// makes `support_him` refuse the server's `WILL MCCP2` offer (answered
+    /// `DONT` instead of `DO`), so compression is never turned on for this
+    /// session at all — see `support_him`'s doc comment.
+    pub mccp2_enabled: bool,
 }
 
 impl Default for TelnetConfig {
@@ -1149,7 +1150,7 @@ impl Default for TelnetConfig {
             client_name: "CLAY".to_string(),
             is_tls: false,
             msp_enabled: true,
-            wants_prompt_auto_login: false,
+            mccp2_enabled: true,
         }
     }
 }
@@ -1403,12 +1404,21 @@ enum OptionState {
 /// volunteering data about itself): Job 9 changes *when* Clay replies (once
 /// per state change, via `q_receive_will_wont`, never every time the peer
 /// repeats itself), not *which* options it accepts.
-fn support_him(opt: u8) -> bool {
-    matches!(
-        opt,
-        TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_GMCP | TELNET_OPT_MSDP
-            | TELNET_OPT_MCCP2 | TELNET_OPT_CHARSET | TELNET_OPT_MSSP | TELNET_OPT_MSP
-    )
+///
+/// `mccp2_enabled` (from `TelnetConfig::mccp2_enabled`, per-world, default on)
+/// makes `TELNET_OPT_MCCP2` the one entry in this list that isn't an
+/// unconditional accept: when `false` the server's `WILL MCCP2` is answered
+/// `DONT` instead, so compression is never negotiated on for this session at
+/// all — every other option's acceptance is unaffected.
+fn support_him(opt: u8, mccp2_enabled: bool) -> bool {
+    match opt {
+        TELNET_OPT_MCCP2 => mccp2_enabled,
+        _ => matches!(
+            opt,
+            TELNET_OPT_SGA | TELNET_OPT_EOR | TELNET_OPT_GMCP | TELNET_OPT_MSDP
+                | TELNET_OPT_CHARSET | TELNET_OPT_MSSP | TELNET_OPT_MSP
+        ),
+    }
 }
 
 /// Options Clay accepts a `DO` for — the "us" direction of the Q method:
@@ -2074,7 +2084,7 @@ impl TelnetSession {
         if enable {
             match *st {
                 OptionState::No => {
-                    if support_him(opt) {
+                    if support_him(opt, self.cfg.mccp2_enabled) {
                         *st = OptionState::Yes;
                         wire.extend_from_slice(&[TELNET_IAC, TELNET_DO, opt]);
                         events.push(TelnetEvent::OptionEnabled(opt));
@@ -2574,6 +2584,15 @@ impl TelnetSession {
     /// the private `pending_text` field directly.
     pub fn has_pending_text(&self) -> bool {
         !self.pending_text.is_empty()
+    }
+
+    /// Current length of the text hold-back. Callers use it to tell whether a `feed` moved
+    /// the *text* stream at all, as opposed to carrying only protocol (negotiation, GMCP,
+    /// MSDP, a keepalive). `spawn_telnet_reader` needs that distinction to decide whether
+    /// to restart its idle-flush window — see the reset site there for why resetting on
+    /// protocol traffic starves the flush outright.
+    pub fn pending_text_len(&self) -> usize {
+        self.pending_text.len()
     }
 
     /// Drain and return whatever prefix of `feed`'s text hold-back is safe to
@@ -3745,12 +3764,14 @@ mod tests {
     fn test_support_him_and_support_us_policy_tables() {
         // Exactly today's process_telnet accept lists (finding 4's starting
         // point) — Job 9 changes when Clay replies, never which options it
-        // accepts.
+        // accepts. `mccp2_enabled: true` (the default) reproduces the old
+        // unconditional-accept table exactly; the dedicated
+        // `test_support_him_mccp2_gated_by_config` test below covers `false`.
         for opt in [
             TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_GMCP, TELNET_OPT_MSDP,
             TELNET_OPT_MCCP2, TELNET_OPT_CHARSET,
         ] {
-            assert!(support_him(opt), "support_him({opt}) should accept");
+            assert!(support_him(opt, true), "support_him({opt}, true) should accept");
         }
         for opt in [TELNET_OPT_NAWS, TELNET_OPT_TTYPE, TELNET_OPT_EOR] {
             assert!(support_us(opt), "support_us({opt}) should accept");
@@ -3758,15 +3779,28 @@ mod tests {
         // Cross-checks: NAWS/TTYPE are "us"-only, GMCP/MSDP/MCCP2/CHARSET/SGA
         // are "him"-only (EOR is the one option in both lists).
         for opt in [TELNET_OPT_NAWS, TELNET_OPT_TTYPE] {
-            assert!(!support_him(opt), "support_him({opt}) should refuse");
+            assert!(!support_him(opt, true), "support_him({opt}, true) should refuse");
         }
         for opt in [TELNET_OPT_SGA, TELNET_OPT_GMCP, TELNET_OPT_MSDP, TELNET_OPT_MCCP2, TELNET_OPT_CHARSET] {
             assert!(!support_us(opt), "support_us({opt}) should refuse");
         }
         // Unknown/unlisted option codes: refused by both.
         for opt in [0u8, 1, 2, 5, 99, 200, 255] {
-            assert!(!support_him(opt), "support_him({opt}) should refuse (unlisted)");
+            assert!(!support_him(opt, true), "support_him({opt}, true) should refuse (unlisted)");
             assert!(!support_us(opt), "support_us({opt}) should refuse (unlisted)");
+        }
+    }
+
+    /// `mccp2_enabled: false` is the one thing that can turn `support_him` from
+    /// today's unconditional accept table into a refusal - every other option is
+    /// unaffected by the flag.
+    #[test]
+    fn test_support_him_mccp2_gated_by_config() {
+        assert!(support_him(TELNET_OPT_MCCP2, true), "mccp2_enabled=true must accept MCCP2");
+        assert!(!support_him(TELNET_OPT_MCCP2, false), "mccp2_enabled=false must refuse MCCP2");
+        // Unaffected by the flag either way.
+        for opt in [TELNET_OPT_SGA, TELNET_OPT_EOR, TELNET_OPT_GMCP, TELNET_OPT_MSDP, TELNET_OPT_CHARSET, TELNET_OPT_MSSP, TELNET_OPT_MSP] {
+            assert_eq!(support_him(opt, true), support_him(opt, false), "support_him({opt}) must not depend on mccp2_enabled");
         }
     }
 
@@ -4888,6 +4922,32 @@ mod tests {
         let outcome = session.feed(input);
         assert_eq!(outcome.text, input.to_vec(), "msp_enabled=false must pass the trigger through untouched");
         assert!(outcome.events.is_empty());
+    }
+
+    /// Mirrors `test_mccp2_will_negotiation` (the accept case, via the frozen
+    /// `process_telnet` oracle) but through `TelnetSession` with the setting off:
+    /// a server's `WILL MCCP2` must be answered `DONT`, not `DO`, and compression
+    /// must never activate for this session.
+    #[test]
+    fn test_mccp2_disabled_config_answers_will_with_dont() {
+        let mut session = TelnetSession::new(TelnetConfig { mccp2_enabled: false, ..TelnetConfig::default() });
+        let outcome = session.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
+        assert_eq!(outcome.wire, vec![TELNET_IAC, TELNET_DONT, TELNET_OPT_MCCP2],
+            "mccp2_enabled=false must answer WILL MCCP2 with DONT");
+        // TelnetDetected fires on the first IAC byte ever seen regardless of the option;
+        // the option itself must never be reported enabled.
+        assert_eq!(outcome.events, vec![TelnetEvent::TelnetDetected]);
+    }
+
+    /// Same negotiation with the setting on (the default) — the existing accept
+    /// behaviour (see `test_mccp2_will_negotiation`'s `process_telnet` oracle
+    /// version) must be unchanged through `TelnetSession` with an explicit `true`.
+    #[test]
+    fn test_mccp2_enabled_config_answers_will_with_do() {
+        let mut session = TelnetSession::new(TelnetConfig { mccp2_enabled: true, ..TelnetConfig::default() });
+        let outcome = session.feed(&[TELNET_IAC, TELNET_WILL, TELNET_OPT_MCCP2]);
+        assert_eq!(outcome.wire, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2],
+            "mccp2_enabled=true must answer WILL MCCP2 with DO");
     }
 
     #[test]

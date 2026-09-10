@@ -449,8 +449,15 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         #[cfg(all(unix, not(target_os = "android")))]
                         {
                             app.ws_broadcast(WsMessage::ServerReloading);
-                            crate::exec_reload(&mut app)?;
-                            return Ok(());
+                            // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's
+                            // hot-reload notes): defer instead of exec'ing now if any
+                            // connected world is compressed - the bottom-of-loop poll
+                            // below fires the real exec once every drained world's stream
+                            // ends, or the drain deadline passes.
+                            if !app.should_defer_reload_for_mccp2() {
+                                crate::exec_reload(&mut app)?;
+                                return Ok(());
+                            }
                         }
                     }
                     AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
@@ -644,6 +651,18 @@ pub async fn run_daemon_server() -> io::Result<()> {
             && process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2)
         {
             process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+        }
+
+        // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): fire a
+        // reload deferred by should_defer_reload_for_mccp2 (the Sigusr1Received arm above)
+        // once every drained world's stream has ended, or the deadline passes - see
+        // mccp2_reload_ready_to_exec's doc comment. Checked once per loop pass (a cheap
+        // no-op whenever no reload is pending) rather than at the trigger site itself,
+        // exactly like the process-tick/stats-flush rearms just above.
+        #[cfg(all(unix, not(target_os = "android")))]
+        if app.mccp2_reload_ready_to_exec() {
+            crate::exec_reload(&mut app)?;
+            return Ok(());
         }
     }
 }
@@ -1889,11 +1908,11 @@ async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled } => {
             app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
-                msp_enabled, mcp_enabled,
+                msp_enabled, mcp_enabled, mccp2_enabled,
             );
         }
         WsMessage::CalculateNextWorld { current_index } => {
@@ -2537,6 +2556,7 @@ pub async fn connect_multiuser_world(
             let telnet_cfg = TelnetConfig {
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                 msp_enabled: settings.msp_enabled,
+                mccp2_enabled: settings.mccp2_enabled,
                 is_tls: use_ssl, // Job 12 (plan Phase 4, 4.1)
                 ..TelnetConfig::default()
             };
@@ -2615,10 +2635,11 @@ pub async fn connect_daemon_world(
                         let telnet_cfg = TelnetConfig {
                             term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                             msp_enabled: settings.msp_enabled,
+                            mccp2_enabled: settings.mccp2_enabled,
                             // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path - only
                             // reached when use_ssl is true.
                             is_tls: use_ssl,
-                            ..TelnetConfig::default()
+                ..TelnetConfig::default()
                         };
                         spawn_telnet_reader(
                             read_half,
@@ -2680,10 +2701,11 @@ pub async fn connect_daemon_world(
                         let telnet_cfg = TelnetConfig {
                             term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                             msp_enabled: settings.msp_enabled,
+                            mccp2_enabled: settings.mccp2_enabled,
                             // Job 12 (plan Phase 4, 4.1): this is the TLS-proxy path - only
                             // reached when use_ssl is true.
                             is_tls: use_ssl,
-                            ..TelnetConfig::default()
+                ..TelnetConfig::default()
                         };
                         spawn_telnet_reader(
                             read_half,
@@ -2826,6 +2848,7 @@ pub async fn connect_daemon_world(
             let telnet_cfg = TelnetConfig {
                 term_type: std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string()),
                 msp_enabled: settings.msp_enabled,
+                mccp2_enabled: settings.mccp2_enabled,
                 is_tls, // Job 12 (plan Phase 4, 4.1): set above by the TLS/plain match
                 ..TelnetConfig::default()
             };
@@ -2959,6 +2982,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     has_notes: is_owner && !world.settings.notes.is_empty(),
                     msp_enabled: world.settings.msp_enabled,
                     mcp_enabled: world.settings.mcp_enabled,
+                    mccp2_enabled: world.settings.mccp2_enabled,
                 },
                 last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),

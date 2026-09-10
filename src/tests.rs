@@ -8881,6 +8881,7 @@ third
             has_notes: false,
             msp_enabled: true,
             mcp_enabled: true,
+            mccp2_enabled: true,
         };
         app.handle_remote_ws_message(WsMessage::WorldSettingsUpdated {
             world_index: 0,
@@ -8897,6 +8898,52 @@ third
         assert_eq!(app.worlds[0].settings.encoding, Encoding::Latin1);
         assert!(app.worlds[0].settings.password.is_empty(),
             "password must never be touched by this message");
+    }
+
+    /// Old-peer compat: `WorldSettingsMsg::mccp2_enabled` must default to `true` (compression
+    /// accepted), not `serde(default)`'s implicit `false`, when a peer's serialized message
+    /// predates this field - same contract as `msp_enabled`/`mcp_enabled`.
+    #[test]
+    fn test_world_settings_msg_mccp2_enabled_defaults_true_when_absent() {
+        let json = r#"{
+            "hostname": "mud.example.com",
+            "port": "4000",
+            "user": "",
+            "use_ssl": false,
+            "log_enabled": false,
+            "encoding": "utf8",
+            "auto_connect_type": "connect",
+            "keep_alive_type": "nop",
+            "keep_alive_cmd": ""
+        }"#;
+        let settings: WorldSettingsMsg = serde_json::from_str(json).expect("deserialize WorldSettingsMsg");
+        assert!(settings.mccp2_enabled, "an older peer's omitted mccp2_enabled must resolve to true");
+    }
+
+    /// Same old-peer compat contract for `WsMessage::UpdateWorldSettings` (client -> server).
+    #[test]
+    fn test_update_world_settings_mccp2_enabled_defaults_true_when_absent() {
+        let json = r#"{
+            "type": "UpdateWorldSettings",
+            "world_index": 0,
+            "name": "test",
+            "hostname": "mud.example.com",
+            "port": "4000",
+            "user": "",
+            "password": "",
+            "use_ssl": false,
+            "log_enabled": false,
+            "encoding": "utf8",
+            "auto_login": "connect",
+            "keep_alive_type": "nop",
+            "keep_alive_cmd": ""
+        }"#;
+        match serde_json::from_str::<WsMessage>(json).expect("deserialize UpdateWorldSettings") {
+            WsMessage::UpdateWorldSettings { mccp2_enabled, .. } => {
+                assert!(mccp2_enabled, "an older peer's omitted mccp2_enabled must resolve to true");
+            }
+            other => panic!("expected UpdateWorldSettings, got {other:?}"),
+        }
     }
 
     /// `NotesChanged`/`PausedState` are explicit no-ops for this mirror (T1.13): it holds no
@@ -9014,7 +9061,7 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(), true, true,
+            String::new(), "0".to_string(), true, true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -9032,7 +9079,7 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), "ENC:whatever".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(), true, true,
+            String::new(), "0".to_string(), true, true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -9050,11 +9097,101 @@ third
             0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
             "myuser".to_string(), "newpassword".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
-            String::new(), "0".to_string(), true, true,
+            String::new(), "0".to_string(), true, true, true,
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
             "a real plaintext password must still update normally");
+    }
+
+    // --- MCCP2 live-toggle helper ---
+    // The one place old-vs-new is compared for `WorldSettings::mccp2_enabled` (see the doc
+    // comment on `mccp2_toggle_bytes`) - every "world editor saved" site calls this rather
+    // than duplicating the comparison.
+
+    #[test]
+    fn test_mccp2_toggle_bytes_emits_do_and_dont_on_change_none_otherwise() {
+        assert_eq!(
+            mccp2_toggle_bytes(false, true),
+            Some(vec![crate::telnet::TELNET_IAC, crate::telnet::TELNET_DO, crate::telnet::TELNET_OPT_MCCP2]),
+            "false -> true must emit DO"
+        );
+        assert_eq!(
+            mccp2_toggle_bytes(true, false),
+            Some(vec![crate::telnet::TELNET_IAC, crate::telnet::TELNET_DONT, crate::telnet::TELNET_OPT_MCCP2]),
+            "true -> false must emit DONT"
+        );
+        assert_eq!(mccp2_toggle_bytes(true, true), None, "unchanged (true) must emit nothing");
+        assert_eq!(mccp2_toggle_bytes(false, false), None, "unchanged (false) must emit nothing");
+    }
+
+    #[test]
+    fn test_send_mccp2_toggle_if_changed_sends_only_when_changed_and_connected() {
+        // Connected, value changed: the DO bytes must actually be sent on the channel.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteCommand>(4);
+        send_mccp2_toggle_if_changed(Some(&tx), false, true);
+        match rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(
+                bytes,
+                vec![crate::telnet::TELNET_IAC, crate::telnet::TELNET_DO, crate::telnet::TELNET_OPT_MCCP2]
+            ),
+            other => panic!("expected a Raw DO command, got {other:?}"),
+        }
+
+        // Connected, unchanged: nothing sent.
+        send_mccp2_toggle_if_changed(Some(&tx), true, true);
+        assert!(rx.try_recv().is_err(), "unchanged value must not send anything");
+
+        // Connected, value changed the other way: DONT bytes sent.
+        send_mccp2_toggle_if_changed(Some(&tx), true, false);
+        match rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(
+                bytes,
+                vec![crate::telnet::TELNET_IAC, crate::telnet::TELNET_DONT, crate::telnet::TELNET_OPT_MCCP2]
+            ),
+            other => panic!("expected a Raw DONT command, got {other:?}"),
+        }
+
+        // Disconnected (no command_tx): must not panic, and there is nothing to observe.
+        send_mccp2_toggle_if_changed(None, false, true);
+    }
+
+    /// End-to-end through the real save path: `App::update_world_settings` (the shared
+    /// master-WS/daemon handler) must send the live toggle exactly when the value actually
+    /// changes on a connected world, using its real `command_tx`.
+    #[test]
+    fn test_update_world_settings_sends_live_mccp2_toggle_on_a_connected_world() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].settings.mccp2_enabled = true;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(tx);
+
+        // Flip mccp2_enabled true -> false via the real save path.
+        app.update_world_settings(
+            0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
+            "myuser".to_string(), String::new(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(), true, true, false,
+        );
+        assert!(!app.worlds[0].settings.mccp2_enabled);
+        match rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(
+                bytes,
+                vec![crate::telnet::TELNET_IAC, crate::telnet::TELNET_DONT, crate::telnet::TELNET_OPT_MCCP2]
+            ),
+            other => panic!("expected a Raw DONT command, got {other:?}"),
+        }
+
+        // Saving again with the same value must not re-send anything.
+        app.update_world_settings(
+            0, "alpha".to_string(), "mud.example.com".to_string(), "4000".to_string(),
+            "myuser".to_string(), String::new(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(), true, true, false,
+        );
+        assert!(rx.try_recv().is_err(), "an unchanged save must not re-send the toggle");
     }
 
     // --- App::update_global_settings ---
@@ -10047,66 +10184,45 @@ third
         app
     }
 
+    /// An idle-detected prompt must be indistinguishable from a marker (GA/EOR) one: same
+    /// input-area prompt line, same auto-login sequencing, same absence from the output
+    /// buffer. The only difference is where the boundary came from.
     #[test]
-    fn test_idle_prompt_advances_auto_login_on_unmarked_prompt() {
+    fn test_idle_prompt_matches_marker_prompt_exactly() {
+        let mut idle = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        let mut marker = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+
+        idle.handle_idle_prompt(0, b"What be thy name? ");
+        marker.handle_prompt(0, b"What be thy name? ");
+
+        assert_eq!(idle.worlds[0].prompt, marker.worlds[0].prompt,
+            "the prompt line must match a marker prompt");
+        assert_eq!(idle.worlds[0].prompt_count, marker.worlds[0].prompt_count,
+            "auto-login sequencing must match a marker prompt");
+        assert_eq!(idle.worlds[0].output_lines.len(), marker.worlds[0].output_lines.len(),
+            "neither may leave the prompt sitting in the output buffer");
+    }
+
+    /// The parked copy must be dropped. `process_server_data` holds a trailing partial in
+    /// `trigger_partial_line` waiting for the rest of the line; once it has become a
+    /// prompt, leaving it there would prepend it to whatever the server sends next. A
+    /// marker prompt never reaches that buffer at all (`extract_prompt` drains it).
+    #[test]
+    fn test_idle_prompt_clears_the_parked_partial() {
         let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
-        app.handle_idle_prompt(0);
-        assert_eq!(app.worlds[0].prompt_count, 1,
-            "an unmarked prompt must advance auto-login (the Aardwolf case)");
-        app.handle_idle_prompt(0);
+        app.worlds[0].trigger_partial_line = "What be thy name? ".to_string();
+        app.handle_idle_prompt(0, b"What be thy name? ");
+        assert!(app.worlds[0].trigger_partial_line.is_empty(),
+            "the parked partial must not survive being turned into a prompt");
+    }
+
+    #[test]
+    fn test_idle_prompt_drives_auto_login_sequence() {
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        app.handle_idle_prompt(0, b"name? ");
+        assert_eq!(app.worlds[0].prompt_count, 1, "first prompt is the username step");
+        app.handle_idle_prompt(0, b"password? ");
         assert_eq!(app.worlds[0].prompt_count, 2, "second prompt is the password step");
-    }
-
-    /// The whole safety story: once the login steps are consumed the fallback is inert,
-    /// so a mid-stream stall during play can never be mistaken for a prompt.
-    #[test]
-    fn test_idle_prompt_is_inert_after_login_completes() {
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
-        app.handle_idle_prompt(0);
-        app.handle_idle_prompt(0);
-        assert_eq!(app.worlds[0].prompt_count, 2);
-        for _ in 0..5 {
-            app.handle_idle_prompt(0);
-        }
-        assert_eq!(app.worlds[0].prompt_count, 2,
-            "after the last login prompt the fallback must stop counting entirely");
-    }
-
-    #[test]
-    fn test_idle_prompt_moo_takes_three_steps() {
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::MooPrompt);
-        for _ in 0..5 {
-            app.handle_idle_prompt(0);
-        }
-        assert_eq!(app.worlds[0].prompt_count, 3,
-            "MooPrompt consumes three prompts, then goes inert");
-    }
-
-    #[test]
-    fn test_idle_prompt_ignored_when_not_applicable() {
-        // Connect/NoLogin do not use prompt sequencing at all.
-        for auto in [crate::telnet::AutoConnectType::Connect,
-                     crate::telnet::AutoConnectType::NoLogin] {
-            let mut app = idle_prompt_world(auto);
-            app.handle_idle_prompt(0);
-            assert_eq!(app.worlds[0].prompt_count, 0,
-                "Connect/NoLogin must not be driven by the idle-prompt fallback");
-        }
-        // Disconnected: nothing to log in to.
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
-        app.worlds[0].connected = false;
-        app.handle_idle_prompt(0);
-        assert_eq!(app.worlds[0].prompt_count, 0);
-        // /worlds -l opted out explicitly.
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
-        app.worlds[0].skip_auto_login = true;
-        app.handle_idle_prompt(0);
-        assert_eq!(app.worlds[0].prompt_count, 0);
-        // No credentials to send.
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
-        app.worlds[0].settings.password.clear();
-        app.handle_idle_prompt(0);
-        assert_eq!(app.worlds[0].prompt_count, 0);
     }
 
     /// `handle_prompt` on a disconnected world renders the prompt as an output line and used
@@ -12994,6 +13110,262 @@ third
 
         assert_eq!(app.worlds[1].unseen_lines, 1);
         assert!(app.worlds[1].first_unseen_at.is_some());
+    }
+
+    // ---- MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes) ----
+    //
+    // Job 1 added `WorldSettings::mccp2_enabled` (default true) and wired it through
+    // negotiation/persistence/the three UIs. Job 2 (this section) makes a *compressed*
+    // connection survive a hot reload instead of always being disconnected by
+    // `apply_mccp2_reload_bailout` (tested above): `App::should_defer_reload_for_mccp2`
+    // and `App::mccp2_reload_ready_to_exec` are the one shared pair of decision methods
+    // every reload-trigger site funnels through (main.rs's five sites, commands.rs's
+    // typed /reload, daemon.rs's `-D` SIGUSR1 handler), and `World::resume_mccp2_after_
+    // reload` re-requests compression once the connection comes back.
+
+    /// A connected, compressed, MCCP2-enabled world with a live command_tx must be
+    /// deferred: `IAC DONT MCCP2` sent to ask the server to end its stream, the resume
+    /// marker set, and the drain deadline armed - the actual `exec_reload` call must wait
+    /// for `mccp2_reload_ready_to_exec` instead of firing immediately.
+    #[test]
+    fn test_should_defer_reload_for_mccp2_drains_a_compressed_world() {
+        use crate::telnet::{TELNET_IAC, TELNET_DONT, TELNET_OPT_MCCP2};
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].protocol.mccp2_active = true;
+        assert!(app.worlds[0].settings.mccp2_enabled, "default must be on (job 1)");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        assert!(app.should_defer_reload_for_mccp2(), "a compressed world must defer the reload");
+
+        assert!(app.worlds[0].mccp2_resume_after_reload, "must be marked to resume after restore");
+        assert!(app.mccp2_reload_deadline.is_some(), "a drain deadline must be armed");
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(bytes, vec![TELNET_IAC, TELNET_DONT, TELNET_OPT_MCCP2]),
+            other => panic!("expected IAC DONT MCCP2, got {:?}", other),
+        }
+    }
+
+    /// Today's unchanged immediate path: with no compressed worlds at all, the reload must
+    /// NOT be deferred.
+    #[test]
+    fn test_should_defer_reload_for_mccp2_no_compressed_worlds_not_deferred() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true; // not compressed
+
+        assert!(!app.should_defer_reload_for_mccp2(), "nothing to drain - must not defer");
+        assert!(app.mccp2_reload_deadline.is_none());
+        assert!(!app.worlds[0].mccp2_resume_after_reload);
+    }
+
+    /// A world whose owner disabled MCCP2 (but which is still, for whatever reason,
+    /// mid-stream) must never be waited on - it is left for `apply_mccp2_reload_bailout`'s
+    /// existing disconnect instead of delaying reload on a mode nobody will resume.
+    #[test]
+    fn test_should_defer_reload_for_mccp2_never_waits_on_a_disabled_world() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].protocol.mccp2_active = true;
+        app.worlds[0].settings.mccp2_enabled = false;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+
+        assert!(!app.should_defer_reload_for_mccp2());
+        assert!(!app.worlds[0].mccp2_resume_after_reload);
+        assert!(app.mccp2_reload_deadline.is_none());
+        assert!(cmd_rx.try_recv().is_err(), "must not send DONT to a world nobody will resume");
+    }
+
+    /// A connected, compressed, MCCP2-enabled world with no live `command_tx` (nothing to
+    /// send DONT on) must never be waited on either.
+    #[test]
+    fn test_should_defer_reload_for_mccp2_never_waits_on_a_world_without_command_tx() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].protocol.mccp2_active = true;
+        // command_tx left None
+
+        assert!(!app.should_defer_reload_for_mccp2());
+        assert!(!app.worlds[0].mccp2_resume_after_reload);
+        assert!(app.mccp2_reload_deadline.is_none());
+    }
+
+    /// Once every world the defer marked stops being `mccp2_active` (its stream ended),
+    /// the "may we exec now?" poll must return true - and it is a one-shot: the pending
+    /// deadline is cleared so the caller doesn't keep re-triggering on later passes.
+    #[test]
+    fn test_mccp2_reload_ready_to_exec_true_once_drain_completes() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].protocol.mccp2_active = true;
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+        assert!(app.should_defer_reload_for_mccp2());
+
+        assert!(!app.mccp2_reload_ready_to_exec(), "still compressed - must keep waiting");
+
+        // The stream ends (TelnetEvent::CompressionEnded -> mccp2_active = false).
+        app.worlds[0].protocol.mccp2_active = false;
+        assert!(app.mccp2_reload_ready_to_exec(), "drain complete - may exec now");
+        assert!(app.mccp2_reload_deadline.is_none(), "one-shot: must clear the pending state");
+    }
+
+    /// The deadline is unconditional: even while a marked world is still compressed, the
+    /// poll must return true once the deadline has passed, so a bug in drain detection (or
+    /// a server that never finishes its stream) can never hang reload forever.
+    #[test]
+    fn test_mccp2_reload_ready_to_exec_deadline_expiry_overrides_still_compressed() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].protocol.mccp2_active = true;
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        app.worlds[0].command_tx = Some(cmd_tx);
+        assert!(app.should_defer_reload_for_mccp2());
+
+        // Force the deadline into the past instead of sleeping in a test.
+        app.mccp2_reload_deadline = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+
+        assert!(app.mccp2_reload_ready_to_exec(),
+            "deadline passed - must exec even though the world is still compressed");
+        assert!(app.mccp2_reload_deadline.is_none());
+    }
+
+    /// With no reload currently deferred, the poll must return false (cheap no-op) -
+    /// nothing to fire.
+    #[test]
+    fn test_mccp2_reload_ready_to_exec_false_when_nothing_pending() {
+        let mut app = App::new();
+        assert!(!app.mccp2_reload_ready_to_exec());
+    }
+
+    /// `World::resume_mccp2_after_reload`: a world marked before the exec, once its
+    /// connection is re-established, must send `IAC DO MCCP2` and clear the marker - the
+    /// deliberate, narrow exception to Clay's fully-reactive negotiation policy (see the
+    /// method's own doc comment for why it's safe here).
+    #[test]
+    fn test_resume_mccp2_after_reload_sends_do_and_clears_marker() {
+        use crate::telnet::{TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2};
+        let mut world = World::new("alpha");
+        world.mccp2_resume_after_reload = true;
+        assert!(world.settings.mccp2_enabled);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        world.command_tx = Some(cmd_tx);
+
+        world.resume_mccp2_after_reload();
+
+        assert!(!world.mccp2_resume_after_reload, "must be a one-shot");
+        match cmd_rx.try_recv() {
+            Ok(WriteCommand::Raw(bytes)) => assert_eq!(bytes, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_MCCP2]),
+            other => panic!("expected IAC DO MCCP2, got {:?}", other),
+        }
+    }
+
+    /// A world not actually reconnected yet (`command_tx` still `None`) must not have the
+    /// marker consumed - callers are expected to call this only once a connection attempt
+    /// has actually succeeded, but this guards the case defensively.
+    #[test]
+    fn test_resume_mccp2_after_reload_noop_without_command_tx() {
+        let mut world = World::new("alpha");
+        world.mccp2_resume_after_reload = true;
+
+        world.resume_mccp2_after_reload();
+
+        assert!(world.mccp2_resume_after_reload, "must not be cleared with no connection to resume on");
+    }
+
+    /// If the user disabled MCCP2 for this world while the reload was in flight, the
+    /// marker must still be cleared (it's consumed either way) but nothing must be sent -
+    /// the user asked to leave compression off.
+    #[test]
+    fn test_resume_mccp2_after_reload_respects_disabled_setting() {
+        let mut world = World::new("alpha");
+        world.mccp2_resume_after_reload = true;
+        world.settings.mccp2_enabled = false;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(4);
+        world.command_tx = Some(cmd_tx);
+
+        world.resume_mccp2_after_reload();
+
+        assert!(!world.mccp2_resume_after_reload);
+        assert!(cmd_rx.try_recv().is_err(), "must not resume a mode the user turned off");
+    }
+
+    /// Staleness guard: any path that gives up on a connection must clear the resume
+    /// marker, or it could wrongly fire `IAC DO MCCP2` on a *later*, unrelated connection
+    /// to the same world that never itself agreed to MCCP2.
+    #[test]
+    fn test_clear_connection_state_clears_resume_marker() {
+        let mut world = World::new("alpha");
+        world.mccp2_resume_after_reload = true;
+
+        world.clear_connection_state(false, false);
+
+        assert!(!world.mccp2_resume_after_reload);
+    }
+
+    /// Same staleness guard, the other path that gives up on a connection without going
+    /// through `clear_connection_state`: a world still compressed when the drain deadline
+    /// expires is disconnected by the existing bail-out, which must also clear the marker.
+    #[test]
+    fn test_apply_mccp2_reload_bailout_clears_resume_marker() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].connected = true;
+        app.worlds[0].protocol.mccp2_active = true;
+        app.worlds[0].mccp2_resume_after_reload = true;
+
+        app.apply_mccp2_reload_bailout(false);
+
+        assert!(!app.worlds[0].mccp2_resume_after_reload,
+            "a world abandoned by the bail-out must not resume MCCP2 on some later, unrelated connection");
+    }
+
+    /// The resume marker round-trips through the hot-reload state file, and is absent
+    /// from settings.dat - it is per-reload transient state, not a user setting (see
+    /// `WorldSettings::mccp2_enabled` for that one).
+    #[test]
+    fn test_mccp2_resume_after_reload_roundtrips_reload_state_not_settings() {
+        let mut app = App::new();
+        app.worlds = vec![World::new("alpha")];
+        app.worlds[0].settings.hostname = "example.com".to_string();
+        app.worlds[0].mccp2_resume_after_reload = true;
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::persistence::save_reload_state_to(&app, &mut buf).expect("serializes");
+        let text = String::from_utf8(buf).expect("utf-8");
+        assert!(text.contains("mccp2_resume_after_reload=true"),
+            "the reload state must emit the marker or a restored process can't resume MCCP2");
+
+        let mut restored = App::new();
+        crate::persistence::load_reload_state_from_str(&mut restored, &text).expect("parses");
+        let w = restored.worlds.iter().find(|w| w.name == "alpha").expect("world restored");
+        assert!(w.mccp2_resume_after_reload, "the marker must survive a full save/load round trip");
+
+        let tmp = std::env::temp_dir().join("clay_test_mccp2_resume_after_reload_settings.dat");
+        let _ = std::fs::remove_file(&tmp);
+        crate::persistence::save_settings_to_path(&app, &tmp).expect("save failed");
+        let settings_text = std::fs::read_to_string(&tmp).expect("read failed");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(!settings_text.contains("mccp2_resume_after_reload"),
+            "this is per-reload transient state, not a user setting - it must never reach settings.dat");
+    }
+
+    /// The false/absent case, matching `mccp2_active`'s own equivalent test above: a state
+    /// file predating this field (job 2) must not come back marked for resume.
+    #[test]
+    fn test_mccp2_resume_after_reload_defaults_to_false_when_absent() {
+        let state = "[world_state:0]\nname=alpha\nconnected=true\n";
+        let mut app = App::new();
+        crate::persistence::load_reload_state_from_str(&mut app, state).expect("parses");
+        let w = &app.worlds[0];
+        assert!(!w.mccp2_resume_after_reload);
     }
 
     // ---- TinyFugue keybinding parity (plan Phase 0 P0.6) ----

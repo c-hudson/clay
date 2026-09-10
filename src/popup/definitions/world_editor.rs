@@ -25,6 +25,7 @@ pub const WORLD_FIELD_GMCP_PACKAGES: FieldId = FieldId(20);
 pub const WORLD_FIELD_AUTO_RECONNECT: FieldId = FieldId(21);
 pub const WORLD_FIELD_MSP_ENABLED: FieldId = FieldId(23);
 pub const WORLD_FIELD_MCP_ENABLED: FieldId = FieldId(24);
+pub const WORLD_FIELD_MCCP2_ENABLED: FieldId = FieldId(25);
 // Field IDs - Slack
 pub const WORLD_FIELD_SLACK_TOKEN: FieldId = FieldId(30);
 pub const WORLD_FIELD_SLACK_CHANNEL: FieldId = FieldId(31);
@@ -125,6 +126,7 @@ pub struct WorldSettings {
     pub auto_reconnect_secs: String,
     pub msp_enabled: bool,
     pub mcp_enabled: bool,
+    pub mccp2_enabled: bool,
     // Slack
     pub slack_token: String,
     pub slack_channel: String,
@@ -248,6 +250,11 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             WORLD_FIELD_MCP_ENABLED,
             "MCP Edit",
             FieldKind::toggle(settings.mcp_enabled),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_MCCP2_ENABLED,
+            "MCCP2",
+            FieldKind::toggle(settings.mccp2_enabled),
         ))
         // Slack fields
         .with_field(Field::new(
@@ -377,6 +384,12 @@ fn world_editor_help_text() -> Vec<String> {
         "  dumping a verb into the scrollback. Turn off to ignore",
         "  #$#-prefixed protocol lines completely (they display as",
         "  plain text instead).",
+        "",
+        "MCCP2: Accept the MUD's offer to compress output (MUD",
+        "  Client Compression Protocol v2). Turn off to decline",
+        "  compression - the connection still works, just",
+        "  uncompressed. Toggling this on a live connection asks",
+        "  the server to start/stop compressing immediately.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -388,7 +401,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
         WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_ENCODING,
         WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_GMCP_PACKAGES,
         WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_MSP_ENABLED,
-        WORLD_FIELD_MCP_ENABLED,
+        WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED,
     ];
 
     // Slack fields
@@ -462,6 +475,8 @@ mod tests {
         assert!(state.field(WORLD_FIELD_MSP_ENABLED).unwrap().visible);
         // Job 15 (plan Phase 4): same reasoning - MCP is a telnet-only concept.
         assert!(state.field(WORLD_FIELD_MCP_ENABLED).unwrap().visible);
+        // Same reasoning again - MCCP2 is a telnet-only concept.
+        assert!(state.field(WORLD_FIELD_MCCP2_ENABLED).unwrap().visible);
     }
 
     #[test]
@@ -483,5 +498,6 @@ mod tests {
         assert!(!state.field(WORLD_FIELD_HOSTNAME).unwrap().visible);
         assert!(!state.field(WORLD_FIELD_MSP_ENABLED).unwrap().visible);
         assert!(!state.field(WORLD_FIELD_MCP_ENABLED).unwrap().visible);
+        assert!(!state.field(WORLD_FIELD_MCCP2_ENABLED).unwrap().visible);
     }
 }
