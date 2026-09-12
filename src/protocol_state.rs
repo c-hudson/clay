@@ -59,6 +59,14 @@ pub struct ProtocolState {
     /// True if this connection uses WONT ECHO as its prompt-boundary heuristic
     /// (auto-detected) - see `TelnetEvent::WontEchoPromptHint`'s doc comment.
     pub uses_wont_echo_prompt: bool,
+    /// True once this connection has delivered a prompt via a real telnet marker
+    /// (GA/EOR/WONT-ECHO). On such a world the marker is authoritative and the
+    /// idle-flush prompt inference must stay out of the way: a trailing partial line
+    /// there is ordinary mid-line output, not a prompt, and treating it as one
+    /// overwrites the real prompt with whatever happened to arrive last — a bare
+    /// colour reset after a prompt would replace `> ` with an invisible ANSI-only
+    /// string. The inference exists only for MUDs that never mark their prompts.
+    pub seen_prompt_marker: bool,
     /// True if NAWS was negotiated on this connection.
     pub naws_enabled: bool,
     /// Last window size actually sent via NAWS, to avoid resending an unchanged size.
@@ -196,7 +204,11 @@ impl ProtocolState {
             TelnetEvent::TelnetDetected => ProtocolOutcome::default(),
             // Has its own `AppEvent::Prompt`/`AppEvent::MultiuserPrompt` path entirely
             // outside this event stream - nothing for the core to do.
-            TelnetEvent::Prompt(_) => ProtocolOutcome::default(),
+            TelnetEvent::Prompt(_) => {
+                // Record that this world marks its prompts — see `seen_prompt_marker`.
+                self.seen_prompt_marker = true;
+                ProtocolOutcome::default()
+            }
             TelnetEvent::NawsRequested => {
                 self.naws_enabled = true;
                 self.send_naws_if_changed(ctx.naws_size, ctx.command_tx);

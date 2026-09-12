@@ -10184,6 +10184,43 @@ third
         app
     }
 
+    /// Regression: the idle-flush inference must never overwrite a prompt that arrived
+    /// with a real telnet marker. On a marking world, ANY trailing bytes without a
+    /// newline — a colour reset, the start of the next line — would otherwise be taken
+    /// as a new prompt. A bare `\x1b[0m` after `> ` replaced the prompt with an
+    /// invisible ANSI-only string, which renders as a blank prompt.
+    #[test]
+    fn test_idle_inference_never_overwrites_a_marker_prompt() {
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+
+        // A real marker prompt.
+        app.handle_prompt(0, b"> ");
+        assert_eq!(app.worlds[0].prompt, "> ");
+        assert!(app.worlds[0].protocol.seen_prompt_marker,
+            "a marker prompt must record that this world marks its prompts");
+
+        // Trailing junk the idle flush would otherwise call a prompt.
+        app.handle_idle_prompt(0, b"\x1b[0m");
+        assert_eq!(app.worlds[0].prompt, "> ", "inference must not clobber a marker prompt");
+        app.handle_idle_prompt(0, b"partial");
+        assert_eq!(app.worlds[0].prompt, "> ");
+    }
+
+    /// ...but a world that never marks its prompts (Aardwolf) must keep working, and one
+    /// inferred prompt must not switch inference off for the rest of the connection.
+    #[test]
+    fn test_idle_inference_stays_on_for_a_world_with_no_markers() {
+        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+
+        app.handle_idle_prompt(0, b"What be thy name? ");
+        assert_eq!(app.worlds[0].prompt, "What be thy name? ");
+        assert!(!app.worlds[0].protocol.seen_prompt_marker,
+            "an inferred prompt is not a marker and must not disable further inference");
+
+        app.handle_idle_prompt(0, b"Password: ");
+        assert_eq!(app.worlds[0].prompt, "Password: ", "inference must still be active");
+    }
+
     /// An idle-detected prompt must be indistinguishable from a marker (GA/EOR) one: same
     /// input-area prompt line, same auto-login sequencing, same absence from the output
     /// buffer. The only difference is where the boundary came from.

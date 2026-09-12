@@ -11710,6 +11710,12 @@ impl App {
 
     /// Handle Prompt event.
     fn handle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8]) {
+        // Reaching here means a real telnet marker (GA/EOR/WONT-ECHO) delimited this
+        // prompt — `TelnetEvent::Prompt` is converted straight to `AppEvent::Prompt` by
+        // `to_app_event` and never passes through `ProtocolState`, so this is the only
+        // place that observation can be recorded. `handle_idle_prompt` reads it to stay
+        // out of the way on worlds that mark their prompts.
+        self.worlds[world_idx].protocol.seen_prompt_marker = true;
         self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
         let encoding = self.worlds[world_idx].effective_encoding();
         let prompt_text = encoding.decode(prompt_bytes);
@@ -11827,8 +11833,23 @@ impl App {
     /// the text stream before it is ever treated as ordinary output. Leaving the parked
     /// copy behind would prepend the prompt to whatever the server sends next.
     fn handle_idle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8]) {
+        // A world that marks its prompts needs no inference, and inference there is
+        // actively harmful: after a marked prompt, ANY trailing bytes that arrive without
+        // a newline — a colour reset, a fragment of the next line — would be taken as a
+        // new prompt and overwrite the real one. A bare `\x1b[0m` turns `> ` into an
+        // invisible ANSI-only prompt, which is what this guard was added to stop.
+        //
+        // The parked partial is deliberately left alone in that case: on a marking world
+        // a trailing partial really is mid-line output still waiting for its completion.
+        if self.worlds[world_idx].protocol.seen_prompt_marker {
+            return;
+        }
         self.worlds[world_idx].trigger_partial_line.clear();
         self.handle_prompt(world_idx, prompt_bytes);
+        // handle_prompt sets the marker flag unconditionally; this prompt came from
+        // inference, not a marker, so undo that or the very first inferred prompt would
+        // switch inference off for the rest of the connection.
+        self.worlds[world_idx].protocol.seen_prompt_marker = false;
     }
 
     // handle_gmcp_negotiated removed in Job 9 (T3.2): its body now lives in

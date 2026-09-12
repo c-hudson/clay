@@ -777,6 +777,10 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                     let mut valid_sequence = true;
                     let mut has_private_prefix = false;
                     let mut has_digit = false;
+                    // Whether the loop below ended at a real final byte. It can also end
+                    // because the chunk ran out mid-sequence, and those two cases need
+                    // opposite handling — see the `!reached_final` branch after it.
+                    let mut reached_final = false;
                     while let Some(&sc) = chars.peek() {
                         if is_csi_final_byte(sc) {
                             // End of CSI sequence - but validate it first
@@ -790,6 +794,7 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                             }
                             chars.next();
                             seq.push(sc);
+                            reached_final = true;
                             // Only keep SGR sequences (ending with 'm')
                             if sc == 'm' {
                                 result.push_str(&seq);
@@ -838,8 +843,14 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                             break;
                         }
                     }
-                    // If sequence was invalid, output the collected characters as literal text
-                    if !valid_sequence {
+                    // If sequence was invalid, output the collected characters as literal
+                    // text. Same for a sequence truncated by the end of the chunk: the
+                    // `while let` above also exits when `peek()` runs out, with
+                    // `valid_sequence` still true, so without `reached_final` the whole
+                    // `\x1b[4` fragment was silently dropped and the next chunk's `7m`
+                    // rendered as literal text. `decode` is called once per TCP read with
+                    // no carry-over, so anything dropped here is gone for good.
+                    if !valid_sequence || !reached_final {
                         result.push_str(&seq);
                     }
                 }
@@ -880,8 +891,18 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                     // Simple escape sequence like ESC M (reverse line feed)
                     chars.next(); // consume the letter
                 }
+                None => {
+                    // The chunk ended on a bare ESC. Dropping it is unrecoverable:
+                    // `decode` runs once per TCP read with no carry-over, so the next read
+                    // begins `[47m`, which is by then ordinary text, and the caller's
+                    // partial-line reassembly concatenates the halves into `\x1b[0m[47m`
+                    // — the escape body printed literally in the middle of a line. Emit it
+                    // and let that reassembly put the sequence back together.
+                    result.push('\x1b');
+                }
                 _ => {
-                    // Unknown escape sequence, just skip the ESC
+                    // Unknown but *complete* escape sequence - discarding the ESC is this
+                    // function's actual job.
                 }
             }
         } else {
@@ -1831,6 +1852,34 @@ mod tests {
         for enc in [Encoding::Utf8, Encoding::Latin1, Encoding::Fansi] {
             assert_eq!(enc.encode("look north"), b"look north".to_vec());
             assert_eq!(enc.encode(""), Vec::<u8>::new());
+        }
+    }
+
+    /// A read boundary landing on an ESC must not delete it. `decode` runs once per TCP
+    /// read with no carry-over, so a dropped byte here is unrecoverable: the next read
+    /// begins `[47m`, which is then ordinary text, and the two halves concatenate into
+    /// `\x1b[0m[47m` — the escape body printed literally on screen.
+    #[test]
+    fn decode_preserves_a_truncated_escape_at_end_of_chunk() {
+        assert_eq!(Encoding::Utf8.decode(b"x\x1b"), "x\u{1b}",
+            "a lone trailing ESC must survive decode");
+        assert_eq!(Encoding::Utf8.decode(b"x\x1b["), "x\u{1b}[",
+            "a truncated CSI introducer must survive decode");
+        assert_eq!(Encoding::Utf8.decode(b"x\x1b[4"), "x\u{1b}[4",
+            "a truncated CSI with params must survive decode");
+    }
+
+    /// The invariant the bug violates: splitting a chunk anywhere must not change what
+    /// decode produces overall.
+    #[test]
+    fn decode_is_split_invariant() {
+        let line: &[u8] = b"   \x1b[43m|\x1b[0m\x1b[47m \x1b[0m\x1b[43m|\x1b[0m";
+        let whole = Encoding::Utf8.decode(line);
+        for split in 0..line.len() {
+            let a = Encoding::Utf8.decode(&line[..split]);
+            let b = Encoding::Utf8.decode(&line[split..]);
+            assert_eq!(format!("{a}{b}"), whole,
+                "split at {split} changed the decoded result");
         }
     }
 }

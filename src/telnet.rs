@@ -2544,6 +2544,25 @@ impl TelnetSession {
             msp_incomplete_from
                 .filter(|&pos| text.len() - pos <= MAX_MSP_TRIGGER_HOLDBACK)
         };
+        // An ANSI escape cut in half by a read boundary must be held whole, whatever the
+        // caps above decided. `Encoding::decode` is applied once per read with no
+        // carry-over, so a trailing `\x1b` handed to it is *deleted* rather than carried:
+        // the next read starts `[47m`, which is by then ordinary text, and the two halves
+        // reassemble as `\x1b[0m[47m` with the escape body printed mid-line.
+        //
+        // The newline-tail rule above cannot cover this — it gives up once a line runs
+        // more than MAX_TEXT_HOLDBACK past its last newline, which is true of any long
+        // coloured line, exactly where this bites. `idle_release_len` has always applied
+        // this same rule for the idle path (via the same helper); the ordinary path simply
+        // never did.
+        //
+        // Bounded by construction: `unterminated_escape_start` only reports a sequence
+        // with no terminator yet, the idle flush releases on the same rule, and
+        // `flush_eof` releases everything, so nothing can be held indefinitely.
+        let hold_from = match (hold_from, unterminated_escape_start(&text)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         if let Some(split_at) = hold_from {
             self.pending_text = text.split_off(split_at);
         }
@@ -5119,4 +5138,52 @@ mod tests {
         assert_eq!(events, base_events);
     }
 
+
+    /// The bug this guards: a read boundary landing on an ESC used to delete that byte.
+    /// `Encoding::decode` runs once per read with no carry-over, so the escape body of the
+    /// next read (`[47m`) became ordinary text and the halves reassembled as
+    /// `\x1b[0m[47m` — printed literally mid-line. Feeding a coloured line split at every
+    /// possible point must produce exactly what feeding it whole produces.
+    #[test]
+    fn feed_is_split_invariant_across_ansi_escapes() {
+        let line: &[u8] =
+            b"   \x1b[43m|\x1b[0m\x1b[47m \x1b[0m\x1b[43m|\x1b[0m\x1b[47m \x1b[0m more text here\n";
+
+        let mut whole_session = TelnetSession::new(TelnetConfig::default());
+        let whole = whole_session.feed(line).text;
+
+        for split in 1..line.len() {
+            let mut s = TelnetSession::new(TelnetConfig::default());
+            let mut got = s.feed(&line[..split]).text;
+            got.extend_from_slice(&s.feed(&line[split..]).text);
+            // Anything still held back at the end would arrive on the next read; EOF
+            // releases it, which is what a real connection does too.
+            got.extend_from_slice(&s.flush_eof().text);
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(&whole),
+                "split at byte {split} changed the emitted text"
+            );
+        }
+    }
+
+    /// A truncated escape must be retained rather than flushed, even on a line that is
+    /// already far past MAX_TEXT_HOLDBACK bytes from its last newline — which is the case
+    /// the old newline-tail rule gave up on, and exactly where the bug bit.
+    #[test]
+    fn feed_holds_back_a_truncated_escape_past_the_newline_cap() {
+        let mut s = TelnetSession::new(TelnetConfig::default());
+        let long_tail = b"x".repeat(MAX_TEXT_HOLDBACK + 40);
+        let mut first = long_tail.clone();
+        first.extend_from_slice(b"\x1b");          // chunk ends mid-escape
+
+        let out = s.feed(&first).text;
+        assert!(!out.ends_with(b"\x1b"),
+            "a dangling ESC must not be flushed into decode");
+        assert_eq!(out, long_tail, "everything before the ESC still flushes");
+
+        let rest = s.feed(b"[47m!\n").text;
+        assert_eq!(rest, b"\x1b[47m!\n".to_vec(),
+            "the held ESC must be re-emitted with the rest of its sequence");
+    }
 }
