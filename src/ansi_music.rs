@@ -37,6 +37,23 @@ pub struct AnsiMusicParser {
     style: u8,
 }
 
+/// Characters that can legitimately appear in an ANSI-music (MML) payload: notes,
+/// octave/tempo/length/pause commands, the `M`-prefixed modifiers, durations and
+/// separators. Used only by `find_sequence`'s unterminated-sequence fallback, to tell a
+/// genuine cut-off tune from ordinary text following an `ESC[M` (Delete Lines).
+fn is_mml_char(c: char) -> bool {
+    matches!(c,
+        'A'..='G' | 'a'..='g'          // notes
+        | 'O' | 'o' | 'T' | 't'        // octave, tempo
+        | 'L' | 'l' | 'P' | 'p'        // length, pause
+        | 'M' | 'm' | 'N' | 'n'        // modifiers (MF/MB/ML/MN/MS), note-by-number
+        | 'S' | 's' | 'X' | 'x'        // style, execute
+        // note: the F/B modifier letters are already covered by 'A'..='G' above
+        | '0'..='9'
+        | '.' | '#' | '+' | '-' | '<' | '>' | ' ' | ';' | ','
+    )
+}
+
 impl AnsiMusicParser {
     pub fn new() -> Self {
         Self {
@@ -55,15 +72,30 @@ impl AnsiMusicParser {
         self.style = 0;
     }
 
-    /// Check if data contains an ANSI music sequence
-    /// Returns the (start, end) indices if found, None otherwise
+    /// Locate one ANSI music sequence, or `None` if there isn't one.
     ///
     /// Supported formats:
-    /// - ESC [ M ... Ctrl-N (standard ANSI music)
-    /// - ESC [ MF ... Ctrl-N (foreground music)
-    /// - ESC [ MB ... Ctrl-N (background music)
-    /// - ESC [ N ... Ctrl-N (alternate format)
-    pub fn find_sequence(data: &str) -> Option<(usize, usize)> {
+    ///
+    /// - `ESC [ M ... Ctrl-N` (standard ANSI music)
+    /// - `ESC [ MF ... Ctrl-N` (foreground music)
+    /// - `ESC [ MB ... Ctrl-N` (background music)
+    /// - `ESC [ N ... Ctrl-N` (alternate format)
+    ///
+    /// Returns `(start, content_end, consumed_end)`:
+    ///
+    /// - `start` — index of the `ESC`
+    /// - `content_end` — end of the music payload, i.e. what to hand to `parse`
+    /// - `consumed_end` — end of what to remove from the text stream
+    ///
+    /// The two differ because a `Ctrl-N` terminator is consumed while a newline one is
+    /// left in the stream. The caller used to guess at this with `end - 1`, which both
+    /// dropped the last note of a newline-terminated sequence and panicked whenever
+    /// `end - 1` landed inside a multi-byte character. Returning the payload boundary
+    /// explicitly removes the guess.
+    ///
+    /// Every returned index is a char boundary: they are all positions of ASCII bytes
+    /// (`ESC`, `Ctrl-N`, `\n`, `\r`) or the end of the string.
+    pub fn find_sequence(data: &str) -> Option<(usize, usize, usize)> {
         let bytes = data.as_bytes();
         let mut i = 0;
 
@@ -85,7 +117,8 @@ impl AnsiMusicParser {
                     // Look for Ctrl-N (0x0E) terminator
                     while j < bytes.len() {
                         if bytes[j] == 0x0E {
-                            return Some((start, j + 1));
+                            // Ctrl-N terminates and is itself consumed.
+                            return Some((start, j, j + 1));
                         }
                         j += 1;
                     }
@@ -100,15 +133,25 @@ impl AnsiMusicParser {
                         }
                         while j < bytes.len() {
                             if bytes[j] == b'\n' || bytes[j] == b'\r' {
-                                return Some((start, j));
+                                // The newline terminates but stays in the text stream.
+                                return Some((start, j, j));
                             }
                             j += 1;
                         }
-                        // No terminator at all - take rest of string if it looks like music
-                        // (contains tempo T, length L, or note commands)
+                        // No terminator at all. The chunk may have been cut mid-sequence,
+                        // so the rest can still be music — but `ESC[M` is also an ordinary
+                        // CSI (Delete Lines), and this branch decides whether to DELETE the
+                        // remainder of the packet from the display.
+                        //
+                        // This used to accept the rest if *any* character in it was one of
+                        // T/L/O/A-G/a-g, which is true of essentially all English prose, so
+                        // a single `ESC[M` silently ate everything after it. Require the
+                        // whole remainder to be plausible MML instead: a false negative
+                        // merely means a tune does not play, while a false positive
+                        // destroys the user's text.
                         let rest = &data[i + 2..];
-                        if rest.chars().any(|c| matches!(c, 'T' | 'L' | 'O' | 'A'..='G' | 'a'..='g')) {
-                            return Some((start, bytes.len()));
+                        if !rest.is_empty() && rest.chars().all(is_mml_char) {
+                            return Some((start, bytes.len(), bytes.len()));
                         }
                     }
                 }
@@ -360,18 +403,21 @@ pub fn extract_music(data: &str) -> (String, Vec<Vec<MusicNote>>) {
     let mut parser = AnsiMusicParser::new();
     let mut remaining = data;
 
-    while let Some((start, end)) = AnsiMusicParser::find_sequence(remaining) {
+    while let Some((start, content_end, consumed_end)) =
+        AnsiMusicParser::find_sequence(remaining)
+    {
         // Add text before the sequence
         result.push_str(&remaining[..start]);
 
-        // Parse the music sequence (skip ESC [ at start and Ctrl-N at end)
-        let sequence = &remaining[start + 2..end - 1];
+        // The payload is everything after `ESC [`, up to the boundary find_sequence
+        // reported. Both indices are char boundaries by construction.
+        let sequence = &remaining[start + 2..content_end];
         let notes = parser.parse(sequence);
         if !notes.is_empty() {
             all_notes.push(notes);
         }
 
-        remaining = &remaining[end..];
+        remaining = &remaining[consumed_end..];
     }
 
     // Add any remaining text
@@ -425,7 +471,7 @@ mod tests {
         let data = "Hello\x1b[MCDEFGAB\x0eWorld";
         let result = AnsiMusicParser::find_sequence(data);
         assert!(result.is_some());
-        let (start, end) = result.unwrap();
+        let (start, _content_end, end) = result.unwrap();
         assert_eq!(start, 5);
         assert_eq!(&data[end..], "World");
     }
@@ -437,5 +483,56 @@ mod tests {
         assert_eq!(clean, "BeforeAfter");
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].len(), 3);
+    }
+
+    /// `ESC[M` is also a perfectly ordinary CSI (Delete Lines). The no-terminator
+    /// fallback used to accept the whole rest of the chunk as "music" if *any* character
+    /// in it was one of T/L/O/A-G/a-g — true of essentially all English text — so a
+    /// single `ESC[M` silently deleted everything after it from the display.
+    #[test]
+    fn plain_text_after_esc_bracket_m_is_not_swallowed_as_music() {
+        let data = "\x1b[M and then some ordinary text here";
+        let (text, _notes) = extract_music(data);
+        assert!(text.contains("ordinary text here"),
+            "text after ESC[M must not be consumed as music, got {text:?}");
+    }
+
+    /// The consumed range must land on char boundaries. With a newline terminator the
+    /// caller sliced `..end - 1`, which lands inside a multi-byte character whenever one
+    /// precedes the newline — a panic on ordinary UTF-8 MUD output.
+    #[test]
+    fn multibyte_char_before_terminator_does_not_panic() {
+        let (_text, _notes) = extract_music("\x1b[MT100\u{e9}\n");
+        let (_t2, _n2) = extract_music("\x1b[MT100\u{e9}");
+    }
+
+    /// `..end - 1` also dropped the final character of the sequence for the two
+    /// terminators that are not themselves part of the consumed range.
+    #[test]
+    fn newline_terminated_sequence_keeps_its_last_note() {
+        let with_nl = extract_music("\x1b[MT100CDE\n").1;
+        let with_ctrl_n = extract_music("\x1b[MT100CDE\x0e").1;
+        assert_eq!(with_nl.first().map(|n| n.len()), with_ctrl_n.first().map(|n| n.len()),
+            "a newline-terminated sequence must yield the same notes as a Ctrl-N one");
+    }
+
+    /// Guard the other direction: tightening the fallback must not stop genuine music
+    /// from being recognised, including a sequence cut off by the end of a chunk.
+    #[test]
+    fn genuine_music_still_parses_including_unterminated() {
+        // Ctrl-N terminated
+        let (text, notes) = extract_music("before\x1b[MT120L4CDEFG\x0eafter");
+        assert_eq!(text, "beforeafter", "the sequence must be removed from the text");
+        assert!(!notes.is_empty(), "Ctrl-N terminated music must parse");
+
+        // newline terminated - newline stays in the stream
+        let (text, notes) = extract_music("\x1b[MT120CDE\nrest");
+        assert!(text.starts_with('\n'), "the newline terminator stays: {text:?}");
+        assert!(!notes.is_empty(), "newline terminated music must parse");
+
+        // unterminated but unambiguously music: still accepted
+        let (text, notes) = extract_music("\x1b[MT120L4CDEFGAB");
+        assert_eq!(text, "", "an all-MML remainder is still taken as music");
+        assert!(!notes.is_empty());
     }
 }
