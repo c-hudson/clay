@@ -7439,13 +7439,19 @@
     // top lines may include exactly what a scrolled-up user is reading, and the height they
     // take with them corrupts the scroll compensation. Call this immediately before any
     // preserveScroll rebuild. Each DOM child of #output is one .line span, so
-    // childElementCount is the line count. Capped at RENDER_WINDOW_MAX like every other
-    // window adjustment.
+    // childElementCount is the line count.
+    //
+    // Deliberately NOT clamped to RENDER_WINDOW_MAX. Every other window adjustment is,
+    // because it decides how much history to newly *materialize*; this one only ever
+    // re-covers lines the DOM is already holding, so honouring the cap here costs nothing
+    // in render work and buys a bug: on a long session appendNewLine() can push the DOM
+    // past RENDER_WINDOW_MAX, and a capped "grow" then still leaves the rebuild dropping
+    // the surplus off the top — the exact loss this function exists to prevent.
     function growRenderWindowToDom(world) {
         const domLines = elements.output.childElementCount;
         const current = world._renderWindow || RENDER_WINDOW_INITIAL;
         if (domLines > current) {
-            world._renderWindow = Math.min(RENDER_WINDOW_MAX, domLines);
+            world._renderWindow = domLines;
         }
     }
 
@@ -7466,6 +7472,19 @@
             const ceiling = Math.min(RENDER_WINDOW_MAX, totalHeld);
             if (container.scrollTop < RENDER_WINDOW_GROW_TRIGGER_PX && currentWindow < ceiling) {
                 world._renderWindow = Math.min(currentWindow + RENDER_WINDOW_STEP, ceiling);
+                // Obey the same contract as every other preserveScroll rebuild (both
+                // ScrollbackLines branches already do this; this site was the one that
+                // didn't). appendNewLine() only ever appends, and the at-the-bottom reset
+                // below drops _renderWindow to 500 WITHOUT rebuilding, so by the time a
+                // scrolled-up user trips this trigger the DOM routinely holds thousands of
+                // lines more than the window. Rebuilding at the stepped window clamps that
+                // surplus away, and the lines it drops are the oldest ones — i.e. exactly
+                // what a user scrolling back through history is looking at. Measured on a
+                // real device before this call was added: DOM 2672 -> 1000 in one rebuild,
+                // moving the viewer from MUDLINE 0468 to MUDLINE 1785, 1317 lines from
+                // where they were reading. Grow AFTER the step so the step still widens the
+                // window; this only ever raises it.
+                growRenderWindowToDom(world);
                 renderOutput({ preserveScroll: true });
             } else if (isAtBottom() && currentWindow !== RENDER_WINDOW_INITIAL) {
                 // Back at the bottom: reset so the DOM shrinks back down on the next full
