@@ -4892,6 +4892,7 @@ pub struct App {
     /// proceed anyway (`apply_mccp2_reload_bailout` disconnects whatever is still
     /// compressed at that point, exactly as before this job). `None` means no reload is
     /// currently deferred - true almost all of the time.
+    #[cfg(not(target_os = "android"))]
     pub mccp2_reload_deadline: Option<std::time::Instant>,
     /// Master mode: pending /connect confirmation (target addr, requested at). Cleared on
     /// confirm/cancel or when superseded by a different target.
@@ -5072,6 +5073,7 @@ impl App {
             ws_client_tx: None, // Set when running as remote client (--console mode)
             pending_update: None,
             pending_reload: false,
+            #[cfg(not(target_os = "android"))]
             mccp2_reload_deadline: None,
             pending_remote_connect: None,
             pending_console_import: None,
@@ -11712,6 +11714,12 @@ impl App {
     /// compressed, exactly as it always has. Unconditional: nothing about detecting the
     /// end of a stream (a hung/dead server, a bug in this job's own logic) may be allowed
     /// to hang reload forever.
+    // Android-gated (this const and the two methods below): hot reload is
+    // `#[cfg(not(target_os = "android"))]` at every one of its trigger sites
+    // (commands.rs's `Command::Reload` arm, daemon.rs's SIGUSR1 arm, and main.rs's
+    // five loop sites), so the whole drain mechanism - and `mccp2_reload_deadline`,
+    // the field it owns - has no callers on Android and warns as dead code there.
+    #[cfg(not(target_os = "android"))]
     const MCCP2_RELOAD_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
     /// Reload-trigger decision, MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's
@@ -11741,6 +11749,7 @@ impl App {
     /// just disabled MCCP2, or has no live command_tx to send on, is left for
     /// `apply_mccp2_reload_bailout`'s existing disconnect instead: there is no reason to
     /// delay reload waiting on a mode nobody will ask to resume.
+    #[cfg(not(target_os = "android"))]
     fn should_defer_reload_for_mccp2(&mut self) -> bool {
         let mut deferred = false;
         for world in &mut self.worlds {
@@ -11781,6 +11790,7 @@ impl App {
     /// deferred reload, and the caller is expected to actually exec immediately
     /// afterward (falling through to `apply_mccp2_reload_bailout` at restore, exactly as
     /// before this job, for whatever is still compressed when the deadline is what fired).
+    #[cfg(not(target_os = "android"))]
     fn mccp2_reload_ready_to_exec(&mut self) -> bool {
         let Some(deadline) = self.mccp2_reload_deadline else { return false };
         let still_draining = self.worlds.iter()
