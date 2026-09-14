@@ -1886,6 +1886,11 @@ impl Default for Settings {
 pub enum WorldType {
     #[default]
     Mud,
+    /// Same as `Mud` for connection/config purposes (see `is_mud()`), but the prompt
+    /// inference in `App::promote_due_timed_prompts` only arms for this type: a plain
+    /// `Mud` world never infers a prompt from silence. See
+    /// investigate-differences-between-tinyfugu-fluffy-stallman.md.
+    MudTimedPrompt,
     Slack,
     Discord,
 }
@@ -1894,6 +1899,7 @@ impl WorldType {
     fn name(&self) -> &'static str {
         match self {
             WorldType::Mud => "mud",
+            WorldType::MudTimedPrompt => "mud_timed_prompt",
             WorldType::Slack => "slack",
             WorldType::Discord => "discord",
         }
@@ -1901,12 +1907,19 @@ impl WorldType {
 
     fn from_name(name: &str) -> Self {
         match name.to_lowercase().as_str() {
+            "mud_timed_prompt" => WorldType::MudTimedPrompt,
             "slack" => WorldType::Slack,
             "discord" => WorldType::Discord,
             _ => WorldType::Mud,
         }
     }
 
+    /// True for any MUD-family type (`Mud` and `MudTimedPrompt`). Use this instead of
+    /// `== WorldType::Mud` everywhere connection routing, config detection, editor
+    /// visibility, or `/send -T` fan-out treats the two identically.
+    fn is_mud(&self) -> bool {
+        matches!(self, WorldType::Mud | WorldType::MudTimedPrompt)
+    }
 }
 
 /// `WorldSettings::gmcp_packages` default before mud-status-display.md Job 6. Kept as
@@ -1933,6 +1946,9 @@ pub(crate) const LEGACY_DEFAULT_GMCP_PACKAGES: &str = "Client.Media 1";
 /// default, is left alone — the plan (Job 6) accepts that these two cases are
 /// indistinguishable from the stored string alone.
 pub(crate) const DEFAULT_GMCP_PACKAGES: &str = "Client.Media 1, Char 1";
+
+/// Default for `WorldSettings::prompt_wait_ms` - see that field's doc comment.
+pub(crate) const DEFAULT_PROMPT_WAIT_MS: u64 = 1000;
 
 #[derive(Clone)]
 pub struct WorldSettings {
@@ -1990,6 +2006,14 @@ pub struct WorldSettings {
     /// sends the corresponding `DO`/`DONT` mid-session instead (see
     /// `send_mccp2_toggle_if_changed`).
     pub mccp2_enabled: bool,
+    /// Only relevant for `WorldType::MudTimedPrompt`: how long
+    /// (`App::promote_due_timed_prompts`) waits, after a partial line with no
+    /// terminating newline is parked with nothing else arriving, before promoting it to
+    /// the input-area prompt. A plain `Mud` world never consults this field - it never
+    /// infers a prompt from silence at all (see
+    /// investigate-differences-between-tinyfugu-fluffy-stallman.md). Default
+    /// `DEFAULT_PROMPT_WAIT_MS`.
+    pub prompt_wait_ms: u64,
 }
 
 impl Default for WorldSettings {
@@ -2020,6 +2044,7 @@ impl Default for WorldSettings {
             msp_enabled: true,
             mcp_enabled: true,
             mccp2_enabled: true,
+            prompt_wait_ms: DEFAULT_PROMPT_WAIT_MS,
         }
     }
 }
@@ -2028,7 +2053,7 @@ impl WorldSettings {
     /// Check if this world has enough settings to attempt a connection
     fn has_connection_settings(&self) -> bool {
         match self.world_type {
-            WorldType::Mud => !self.hostname.is_empty() && !self.port.is_empty(),
+            WorldType::Mud | WorldType::MudTimedPrompt => !self.hostname.is_empty() && !self.port.is_empty(),
             WorldType::Slack => !self.slack_token.is_empty(),
             WorldType::Discord => !self.discord_token.is_empty(),
         }
@@ -3306,6 +3331,15 @@ pub struct World {
     /// is: the blanks that follow a match frequently arrive in a later packet than the match.
     suppress_blanks_remaining: u8,
     wont_echo_time: Option<std::time::Instant>, // When WONT ECHO was seen (for timeout-based prompt detection)
+    /// When a partial line with no terminating newline was parked in `trigger_partial_line`
+    /// on a `WorldType::MudTimedPrompt` world with nothing else arriving since - the timed
+    /// counterpart of `wont_echo_time`. `App::promote_due_timed_prompts` promotes it to the
+    /// input-area prompt once `WorldSettings::prompt_wait_ms` has elapsed since this was
+    /// set. `None` on any other world type, and on a Timed world whenever the partial is
+    /// empty, already promoted, or was completed by a later packet - see
+    /// `process_server_data`'s arming site and `handle_prompt_text`'s clearing of
+    /// `trigger_partial_line` for why a continuation cancels this.
+    pub(crate) timed_prompt_since: Option<std::time::Instant>,
     pub is_initial_world: bool,      // True for the auto-created world before first connection
     pub was_connected: bool,         // True if world has ever been connected (for world cycling)
     pub skip_auto_login: bool,       // True to skip auto-login on next connect (for /worlds -l)
@@ -3577,6 +3611,7 @@ impl World {
             just_filtered_idler: false,
             suppress_blanks_remaining: 0,
             wont_echo_time: None,
+            timed_prompt_since: None,
             is_initial_world: false,
             was_connected: false,
             skip_auto_login: false,
@@ -3741,6 +3776,9 @@ impl World {
         self.last_receive_time = None;
         self.last_nop_time = None;
         self.last_user_command_time = None;
+        // A disconnect makes any parked partial's timed-prompt promotion meaningless -
+        // the connection it was waiting on silence from no longer exists.
+        self.timed_prompt_since = None;
         // Clear active media tracking (processes already killed by stop_world_media)
         self.active_media.clear();
         if clear_prompt {
@@ -4963,6 +5001,18 @@ struct LedgerHole {
     from_server: bool,
 }
 
+/// Where a `Prompt` event's boundary came from - see `App::handle_prompt_text`. Only
+/// `Marker` is a real observation of the server's own behavior (a telnet GA/EOR/WONT-ECHO
+/// actually arrived), so only `Marker` sets `ProtocolState::seen_prompt_marker` - see that
+/// field's doc comment. `Timed` is `App::promote_due_timed_prompts` committing a parked
+/// partial line after `WorldSettings::prompt_wait_ms` of silence on a
+/// `WorldType::MudTimedPrompt` world - an inference, not an observation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PromptSource {
+    Marker,
+    Timed,
+}
+
 impl App {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
@@ -5894,6 +5944,7 @@ impl App {
             msp_enabled: world.settings.msp_enabled,
             mcp_enabled: world.settings.mcp_enabled,
             mccp2_enabled: world.settings.mccp2_enabled,
+            prompt_wait_ms: world.settings.prompt_wait_ms,
             slack_token: world.settings.slack_token.clone(),
             slack_channel: world.settings.slack_channel.clone(),
             slack_workspace: world.settings.slack_workspace.clone(),
@@ -6778,6 +6829,26 @@ impl App {
                     w.settings.msp_enabled = settings.msp_enabled;
                     w.settings.mcp_enabled = settings.mcp_enabled;
                     w.settings.mccp2_enabled = settings.mccp2_enabled;
+                    // `WorldSettingsMsg::world_type` here is always the server's real
+                    // post-apply value (update_world_settings reads it back from the
+                    // world rather than echoing a possibly-empty incoming string), so
+                    // this mirror can just take it directly - no "empty means unchanged"
+                    // handling needed on this leg. A type change away from
+                    // MudTimedPrompt clears any parked promotion, mirroring the same
+                    // guard in App::update_world_settings.
+                    let new_type = WorldType::from_name(&settings.world_type);
+                    if w.settings.world_type == WorldType::MudTimedPrompt && new_type != WorldType::MudTimedPrompt {
+                        w.timed_prompt_since = None;
+                    }
+                    w.settings.world_type = new_type;
+                    w.settings.prompt_wait_ms = settings.prompt_wait_ms;
+                    w.settings.slack_token = settings.slack_token;
+                    w.settings.slack_channel = settings.slack_channel;
+                    w.settings.slack_workspace = settings.slack_workspace;
+                    w.settings.discord_token = settings.discord_token;
+                    w.settings.discord_guild = settings.discord_guild;
+                    w.settings.discord_channel = settings.discord_channel;
+                    w.settings.discord_dm_user = settings.discord_dm_user;
                     self.needs_output_redraw = true;
                 }
             }
@@ -6913,6 +6984,20 @@ impl App {
             msp_enabled: w.settings.msp_enabled,
             mcp_enabled: w.settings.mcp_enabled,
             mccp2_enabled: w.settings.mccp2_enabled,
+            // World type (and the Slack/Discord fields below) were never hydrated here
+            // before — a plain `WorldStateMsg` (connect-time InitialState, not the
+            // WorldSettingsUpdated broadcast above) always carries the server's real
+            // current value, so no "empty means unchanged" handling is needed on this
+            // leg either.
+            world_type: WorldType::from_name(&w.settings.world_type),
+            prompt_wait_ms: w.settings.prompt_wait_ms,
+            slack_token: w.settings.slack_token,
+            slack_channel: w.settings.slack_channel,
+            slack_workspace: w.settings.slack_workspace,
+            discord_token: w.settings.discord_token,
+            discord_guild: w.settings.discord_guild,
+            discord_channel: w.settings.discord_channel,
+            discord_dm_user: w.settings.discord_dm_user,
             auto_reconnect_secs,
             auto_reconnect_on_web,
             ..WorldSettings::default()
@@ -8646,6 +8731,15 @@ impl App {
                 msp_enabled: world.settings.msp_enabled,
                 mcp_enabled: world.settings.mcp_enabled,
                 mccp2_enabled: world.settings.mccp2_enabled,
+                world_type: world.settings.world_type.name().to_string(),
+                prompt_wait_ms: world.settings.prompt_wait_ms,
+                slack_token: world.settings.slack_token.clone(),
+                slack_channel: world.settings.slack_channel.clone(),
+                slack_workspace: world.settings.slack_workspace.clone(),
+                discord_token: world.settings.discord_token.clone(),
+                discord_guild: world.settings.discord_guild.clone(),
+                discord_channel: world.settings.discord_channel.clone(),
+                discord_dm_user: world.settings.discord_dm_user.clone(),
             },
             last_send_secs: None,
             last_recv_secs: None,
@@ -8741,6 +8835,15 @@ impl App {
         msp_enabled: bool,
         mcp_enabled: bool,
         mccp2_enabled: bool,
+        world_type: String,
+        prompt_wait_ms: u64,
+        slack_token: String,
+        slack_channel: String,
+        slack_workspace: String,
+        discord_token: String,
+        discord_guild: String,
+        discord_channel: String,
+        discord_dm_user: String,
     ) {
         if world_index >= self.worlds.len() {
             return;
@@ -8778,6 +8881,45 @@ impl App {
         if ar_secs == 0 {
             self.worlds[world_index].reconnect_at = None;
         }
+        // World type: empty means "not sent, leave unchanged" (see UpdateWorldSettings's
+        // doc comment in websocket.rs) - an older client, or a save from an editor that
+        // never showed a Type control, must not silently convert a Slack/Discord world
+        // back to MUD. Moving away from MudTimedPrompt invalidates any parked
+        // timed-prompt promotion, since promote_due_timed_prompts only arms for that type.
+        if !world_type.is_empty() {
+            let new_type = WorldType::from_name(&world_type);
+            if self.worlds[world_index].settings.world_type == WorldType::MudTimedPrompt
+                && new_type != WorldType::MudTimedPrompt {
+                self.worlds[world_index].timed_prompt_since = None;
+            }
+            self.worlds[world_index].settings.world_type = new_type;
+        }
+        self.worlds[world_index].settings.prompt_wait_ms = prompt_wait_ms;
+        // Slack/Discord fields follow the same "leave unchanged when empty" contract as
+        // world_type/password above - a save that never touched these (e.g. a MUD world's
+        // editor, or an older client) must not wipe a configured Slack/Discord world's
+        // credentials.
+        if !slack_token.is_empty() {
+            self.worlds[world_index].settings.slack_token = slack_token;
+        }
+        if !slack_channel.is_empty() {
+            self.worlds[world_index].settings.slack_channel = slack_channel;
+        }
+        if !slack_workspace.is_empty() {
+            self.worlds[world_index].settings.slack_workspace = slack_workspace;
+        }
+        if !discord_token.is_empty() {
+            self.worlds[world_index].settings.discord_token = discord_token;
+        }
+        if !discord_guild.is_empty() {
+            self.worlds[world_index].settings.discord_guild = discord_guild;
+        }
+        if !discord_channel.is_empty() {
+            self.worlds[world_index].settings.discord_channel = discord_channel;
+        }
+        if !discord_dm_user.is_empty() {
+            self.worlds[world_index].settings.discord_dm_user = discord_dm_user;
+        }
         let _ = persistence::save_settings(self);
         let has_password = !self.worlds[world_index].settings.password.is_empty();
         let has_notes = !self.worlds[world_index].settings.notes.is_empty();
@@ -8793,6 +8935,19 @@ impl App {
             msp_enabled,
             mcp_enabled,
             mccp2_enabled,
+            // Read back from the world's own settings rather than the raw incoming
+            // params: world_type and the Slack/Discord fields may have been left
+            // unchanged above (empty incoming value), so the broadcast must reflect
+            // what's actually stored now, not what was (or wasn't) sent.
+            world_type: self.worlds[world_index].settings.world_type.name().to_string(),
+            prompt_wait_ms: self.worlds[world_index].settings.prompt_wait_ms,
+            slack_token: self.worlds[world_index].settings.slack_token.clone(),
+            slack_channel: self.worlds[world_index].settings.slack_channel.clone(),
+            slack_workspace: self.worlds[world_index].settings.slack_workspace.clone(),
+            discord_token: self.worlds[world_index].settings.discord_token.clone(),
+            discord_guild: self.worlds[world_index].settings.discord_guild.clone(),
+            discord_channel: self.worlds[world_index].settings.discord_channel.clone(),
+            discord_dm_user: self.worlds[world_index].settings.discord_dm_user.clone(),
         };
         self.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
     }
@@ -9475,6 +9630,9 @@ impl App {
             // previously indistinguishable from outside.
             writeln!(file, "prompt: {:?}", world.prompt)?;
             writeln!(file, "trigger_partial_line: {:?}", world.trigger_partial_line)?;
+            writeln!(file, "timed_prompt_since: {}", world.timed_prompt_since
+                .map(|t| format!("{}ms ago", t.elapsed().as_millis()))
+                .unwrap_or_else(|| "None".to_string()))?;
             writeln!(file, "partial_in_pending: {}", world.partial_in_pending)?;
             // Broadcast ledger (PROTOCOL-ROADMAP.md Phase F). Normally exactly one range
             // spanning 0..=next_seq-1; more than one means seqs were consumed by lines that
@@ -11167,6 +11325,19 @@ impl App {
             self.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
         }
 
+        // Timed-prompt inference (`WorldType::MudTimedPrompt` only - a plain `Mud` world
+        // never infers a prompt from silence at all). Overwritten unconditionally, unlike
+        // `wont_echo_time` above: a partial that grows must restart its wait from this
+        // packet's arrival, and a packet that completes the line (`has_partial` false)
+        // must disarm promotion immediately rather than leave a stale deadline for text
+        // that already displayed normally.
+        self.worlds[world_idx].timed_prompt_since =
+            if has_partial && self.worlds[world_idx].settings.world_type == WorldType::MudTimedPrompt {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
         // Add the packet's lines in the order the server sent them.
         //
         // This used to partition into "all non-gagged, then all gagged", which made a gagged
@@ -11708,18 +11879,41 @@ impl App {
     // ProtocolState::apply_charset_request, ported verbatim (see that method's doc
     // comment for the full priority-order rationale this used to carry here).
 
-    /// Handle Prompt event.
-    fn handle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8]) {
-        // Reaching here means a real telnet marker (GA/EOR/WONT-ECHO) delimited this
-        // prompt — `TelnetEvent::Prompt` is converted straight to `AppEvent::Prompt` by
-        // `to_app_event` and never passes through `ProtocolState`, so this is the only
-        // place that observation can be recorded. `handle_idle_prompt` reads it to stay
-        // out of the way on worlds that mark their prompts.
-        self.worlds[world_idx].protocol.seen_prompt_marker = true;
-        self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
+    /// Handle a Prompt event's raw bytes: decode with this world's effective encoding,
+    /// then delegate to `handle_prompt_text` for everything that follows. Split this way
+    /// so `App::promote_due_timed_prompts` (which already has a decoded `String` sitting
+    /// in `World::trigger_partial_line`) can drive the identical prompt-commit logic
+    /// without decoding twice or re-deriving it from bytes.
+    fn handle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8], source: PromptSource) {
         let encoding = self.worlds[world_idx].effective_encoding();
         let prompt_text = encoding.decode(prompt_bytes);
-        let prompt_normalized = crate::util::normalize_prompt(&prompt_text);
+        self.handle_prompt_text(world_idx, &prompt_text, source);
+    }
+
+    /// Handle a Prompt event's decoded text, regardless of where the prompt boundary
+    /// came from (`source`).
+    fn handle_prompt_text(&mut self, world_idx: usize, prompt_text: &str, source: PromptSource) {
+        // A real telnet marker (GA/EOR/WONT-ECHO) delimited this prompt —
+        // `TelnetEvent::Prompt` is converted straight to `AppEvent::Prompt` by
+        // `to_app_event` and never passes through `ProtocolState`, so this is the only
+        // place that observation can be recorded. A `Timed` promotion is an inference,
+        // not an observation of the server's own behavior, so it must never set this -
+        // see `ProtocolState::seen_prompt_marker`'s doc comment.
+        if source == PromptSource::Marker {
+            self.worlds[world_idx].protocol.seen_prompt_marker = true;
+        }
+        self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
+        // A marker with nothing visible before it - only whitespace or colour codes,
+        // typically a MUD's trailing `\x1b[0m` + GA after unsolicited output - is not a
+        // prompt. The telnet layer already emits nothing for a bare GA after a newline,
+        // and this is the same case: the current prompt stays, auto-login does not count
+        // it, and no PromptUpdate goes out. Without this the prompt became
+        // `normalize_prompt("\x1b[0m")` = an invisible single space, so a world that
+        // marks its prompts drifted to a one-column empty prompt over time.
+        if !crate::util::prompt_has_visible_text(prompt_text) {
+            return;
+        }
+        let prompt_normalized = crate::util::normalize_prompt(prompt_text);
 
         // If world is not connected, display prompt as output instead of input area
         if !self.worlds[world_idx].connected {
@@ -11765,9 +11959,9 @@ impl App {
     }
 
     /// Count one prompt against this world and send the next auto-login step if one is
-    /// due. Split out of `handle_prompt` so the idle-flush fallback
-    /// (`handle_idle_prompt`) can drive the identical sequencing without also performing
-    /// `handle_prompt`'s display side effects.
+    /// due. Called by `handle_prompt_text` for every `PromptSource`, so a timed
+    /// promotion (`App::promote_due_timed_prompts`) advances auto-login identically to a
+    /// real marker prompt.
     ///
     /// `prompt_count` is the sequence position, so both callers must funnel through here
     /// or the name/password ordering drifts apart between the two paths.
@@ -11816,40 +12010,56 @@ impl App {
         }
     }
 
-    /// A prompt inferred from the idle flush rather than a telnet marker.
-    ///
-    /// Some MUDs never send GA/EOR/WONT-ECHO at a prompt — Aardwolf's login prompt is the
-    /// reference case, and it *cannot* send one, because the per-character option that
-    /// would enable it belongs to a character that does not exist until after login.
-    ///
-    /// Handled exactly like a marker prompt, so it shows in the input area and drives
-    /// auto-login identically. The only difference is where the boundary came from: a
-    /// marker says "the prompt ends here", while here the reader observed the server fall
-    /// silent mid-line, which means the completion `process_server_data` parked this text
-    /// waiting for is never coming.
-    ///
-    /// Clearing `trigger_partial_line` is what makes the two paths equivalent: a GA/EOR
-    /// prompt never reaches it either, because `extract_prompt` drains the prompt out of
-    /// the text stream before it is ever treated as ordinary output. Leaving the parked
-    /// copy behind would prepend the prompt to whatever the server sends next.
-    fn handle_idle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8]) {
-        // A world that marks its prompts needs no inference, and inference there is
-        // actively harmful: after a marked prompt, ANY trailing bytes that arrive without
-        // a newline — a colour reset, a fragment of the next line — would be taken as a
-        // new prompt and overwrite the real one. A bare `\x1b[0m` turns `> ` into an
-        // invisible ANSI-only prompt, which is what this guard was added to stop.
-        //
-        // The parked partial is deliberately left alone in that case: on a marking world
-        // a trailing partial really is mid-line output still waiting for its completion.
-        if self.worlds[world_idx].protocol.seen_prompt_marker {
-            return;
+    /// Promote every `WorldType::MudTimedPrompt` world whose parked partial has waited
+    /// past `WorldSettings::prompt_wait_ms` with nothing else arriving, to the
+    /// input-area prompt. Mirrors the `wont_echo_time` block's "park a partial, promote
+    /// after a delay if nothing else arrived" shape, but goes through the shared
+    /// `handle_prompt_text` path instead of duplicating its inline auto-login a third
+    /// time. Returns `true` iff anything was promoted, so console callers know to repaint.
+    fn promote_due_timed_prompts(&mut self, now: std::time::Instant) -> bool {
+        // Collect first, emit after: `handle_prompt_text` needs `&mut self`, which
+        // `self.worlds.iter_mut()` is still borrowing here - the same borrow-deferral
+        // idiom the wont-echo block above uses.
+        let mut due: Vec<(usize, String)> = Vec::new();
+        for (world_idx, world) in self.worlds.iter_mut().enumerate() {
+            if world.settings.world_type != WorldType::MudTimedPrompt
+                || !world.connected
+                || world.protocol.seen_prompt_marker {
+                continue;
+            }
+            let Some(since) = world.timed_prompt_since else { continue };
+            if world.trigger_partial_line.is_empty() {
+                // The wont-echo block above (same tick, a world that both marks
+                // WONT-ECHO and is Timed) may already have taken the partial - disarm
+                // rather than promote an empty prompt.
+                world.timed_prompt_since = None;
+                continue;
+            }
+            let wait = Duration::from_millis(world.settings.prompt_wait_ms);
+            if now.duration_since(since) >= wait {
+                due.push((world_idx, std::mem::take(&mut world.trigger_partial_line)));
+                world.timed_prompt_since = None;
+            }
         }
-        self.worlds[world_idx].trigger_partial_line.clear();
-        self.handle_prompt(world_idx, prompt_bytes);
-        // handle_prompt sets the marker flag unconditionally; this prompt came from
-        // inference, not a marker, so undo that or the very first inferred prompt would
-        // switch inference off for the rest of the connection.
-        self.worlds[world_idx].protocol.seen_prompt_marker = false;
+        let promoted = !due.is_empty();
+        for (world_idx, text) in due {
+            self.handle_prompt_text(world_idx, &text, PromptSource::Timed);
+        }
+        promoted
+    }
+
+    /// The earliest time any eligible `WorldType::MudTimedPrompt` world's parked partial
+    /// becomes due for promotion - for `pull_in_deadline` to clamp the shared
+    /// `prompt_check_sleep` timer to. `None` means no world is currently waiting.
+    fn next_timed_prompt_deadline(&self) -> Option<std::time::Instant> {
+        self.worlds.iter()
+            .filter(|w| w.settings.world_type == WorldType::MudTimedPrompt
+                && w.connected
+                && !w.protocol.seen_prompt_marker
+                && !w.trigger_partial_line.is_empty())
+            .filter_map(|w| w.timed_prompt_since
+                .map(|since| since + Duration::from_millis(w.settings.prompt_wait_ms)))
+            .min()
     }
 
     // handle_gmcp_negotiated removed in Job 9 (T3.2): its body now lives in
@@ -13387,11 +13597,13 @@ impl App {
             WsMessage::SelectiveFlush { world_index } => {
                 self.selective_flush(world_index);
             }
-            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled } => {
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user } => {
                 self.update_world_settings(
                     world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                     encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                     msp_enabled, mcp_enabled, mccp2_enabled,
+                    world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace,
+                    discord_token, discord_guild, discord_channel, discord_dm_user,
                 );
             }
             WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, wrapspace, remote_initial_lines, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, web_font_line_height, web_font_letter_spacing, web_font_word_spacing, ws_allow_list, web_secure, http_enabled, http_port, web_path, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, ws_password, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, new_line_indicator, tts_mode, tts_speak_mode, scrollback_enabled, log_input_enabled, keyboard_always_visible, tabs, icon_bar } => {
@@ -14107,6 +14319,15 @@ impl App {
                     msp_enabled: world.settings.msp_enabled,
                     mcp_enabled: world.settings.mcp_enabled,
                     mccp2_enabled: world.settings.mccp2_enabled,
+                    world_type: world.settings.world_type.name().to_string(),
+                    prompt_wait_ms: world.settings.prompt_wait_ms,
+                    slack_token: world.settings.slack_token.clone(),
+                    slack_channel: world.settings.slack_channel.clone(),
+                    slack_workspace: world.settings.slack_workspace.clone(),
+                    discord_token: world.settings.discord_token.clone(),
+                    discord_guild: world.settings.discord_guild.clone(),
+                    discord_channel: world.settings.discord_channel.clone(),
+                    discord_dm_user: world.settings.discord_dm_user.clone(),
                 },
                 last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
@@ -14819,12 +15040,6 @@ pub enum AppEvent {
     ServerData(String, Vec<u8>),  // world_name, raw bytes
     Disconnected(String, u64),     // world_name, connection_id
     Prompt(String, Vec<u8>),      // world_name, prompt bytes (from telnet GA)
-    /// world_name, trailing-partial-line bytes. A prompt *inferred* from the reader's
-    /// idle flush on a MUD that sends no GA/EOR/WONT-ECHO marker (Aardwolf's login
-    /// prompt is the reference case). Drives auto-login only — the text itself has
-    /// already been emitted as ordinary output, so `handle_idle_prompt` deliberately
-    /// leaves the prompt line alone. See `App::handle_idle_prompt`.
-    IdlePrompt(String, Vec<u8>),
     /// One telnet negotiation/data event for a single-user world (plan Phase 2, Step 2.7).
     /// Replaces the nine formerly-separate variants (`TelnetDetected`, `WontEchoSeen`,
     /// `NawsRequested`, `TtypeRequested`, `CharsetRequested`, `GmcpNegotiated`,
@@ -15194,6 +15409,9 @@ pub(crate) struct WorldEditorSettings {
     pub(crate) msp_enabled: bool,
     pub(crate) mcp_enabled: bool,
     pub(crate) mccp2_enabled: bool,
+    /// Only meaningful for `world_type == "mud_timed_prompt"` - see
+    /// `WorldSettings::prompt_wait_ms`'s doc comment.
+    pub(crate) prompt_wait_ms: u64,
     // Slack fields
     pub(crate) slack_token: String,
     pub(crate) slack_channel: String,
@@ -15278,7 +15496,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
-        WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT,
+        WORLD_FIELD_GMCP_PACKAGES, WORLD_FIELD_AUTO_RECONNECT, WORLD_FIELD_PROMPT_WAIT_MS,
         WORLD_FIELD_MSP_ENABLED, WORLD_FIELD_MCP_ENABLED, WORLD_FIELD_MCCP2_ENABLED,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
@@ -16658,6 +16876,11 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     msp_enabled: state.get_bool(WORLD_FIELD_MSP_ENABLED).unwrap_or(true),
                     mcp_enabled: state.get_bool(WORLD_FIELD_MCP_ENABLED).unwrap_or(true),
                     mccp2_enabled: state.get_bool(WORLD_FIELD_MCCP2_ENABLED).unwrap_or(true),
+                    // Text field parsed on save (same convention as port/auto-reconnect);
+                    // anything unparsable falls back to the default rather than 0.
+                    prompt_wait_ms: state.get_text(WORLD_FIELD_PROMPT_WAIT_MS)
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(DEFAULT_PROMPT_WAIT_MS),
                     slack_token: state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
                     slack_channel: state.get_text(WORLD_FIELD_SLACK_CHANNEL).unwrap_or("").to_string(),
                     slack_workspace: state.get_text(WORLD_FIELD_SLACK_WORKSPACE).unwrap_or("").to_string(),
@@ -17703,6 +17926,20 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
     }
 }
 
+/// Reset a pinned `tokio::time::Sleep` to `at` iff `at` is sooner than its current
+/// deadline - shared by every `prompt_check_sleep` pull-in site in both event loops
+/// (`run_app_headless`/`run_app`). This timer already serves several independent
+/// reasons to wake up sooner (wont-echo, FANSI-detect, dirty stats, and now the timed-
+/// prompt deadline); none of them may push a nearer deadline that another reason
+/// already scheduled back out, or a world with something due sooner would wait longer
+/// than it should.
+fn pull_in_deadline(mut sleep: std::pin::Pin<&mut tokio::time::Sleep>, at: std::time::Instant) {
+    let at = tokio::time::Instant::from_std(at);
+    if sleep.deadline() > at {
+        sleep.as_mut().reset(at);
+    }
+}
+
 /// Run the App headlessly (no terminal UI) for master GUI mode.
 /// The App communicates with the embedded GUI via channels.
 pub async fn run_app_headless(
@@ -18193,6 +18430,13 @@ pub async fn run_app_headless(
     let prompt_check_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(prompt_check_sleep);
 
+    // Timed-prompt inference: a restored partial from a hot-reload/crash-recovery
+    // Timed Prompt world needs its deadline picked up immediately, or it would sit
+    // parked until some unrelated event happens to rearm this timer.
+    if let Some(deadline) = app.next_timed_prompt_deadline() {
+        pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
+    }
+
     // TF repeat process ticks — only active when processes exist
     let process_tick_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(process_tick_sleep);
@@ -18538,12 +18782,7 @@ pub async fn run_app_headless(
                     }
                     AppEvent::Prompt(ref world_name, ref prompt_bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.handle_prompt(world_idx, prompt_bytes);
-                        }
-                    }
-                    AppEvent::IdlePrompt(ref world_name, ref prompt_bytes) => {
-                        if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.handle_idle_prompt(world_idx, prompt_bytes);
+                            app.handle_prompt(world_idx, prompt_bytes, PromptSource::Marker);
                         }
                     }
                     _ => {}
@@ -18660,6 +18899,13 @@ pub async fn run_app_headless(
                     if let Some(wont_echo_time) = world.wont_echo_time {
                         if now.duration_since(wont_echo_time) >= Duration::from_millis(150) {
                             if !world.trigger_partial_line.is_empty() && world.prompt.is_empty() {
+                                // Same rule as handle_prompt_text: nothing visible before the
+                                // marker is not a prompt. Leave the partial parked for the line
+                                // it belongs to and stop re-checking it.
+                                if !crate::util::prompt_has_visible_text(&world.trigger_partial_line) {
+                                    world.wont_echo_time = None;
+                                    continue;
+                                }
                                 let prompt_text = std::mem::take(&mut world.trigger_partial_line);
                                 let prompt_clean = prompt_text.replace('\r', "").replace('\n', " ");
                                 let normalized = format!("{} ", prompt_clean.trim());
@@ -18742,12 +18988,20 @@ pub async fn run_app_headless(
                         }
                     }
                 }
+                // Timed-prompt inference: promote any WorldType::MudTimedPrompt world
+                // whose parked partial has waited past prompt_wait_ms.
+                app.promote_due_timed_prompts(now);
                 // Re-arm: check again in 150ms if any world still needs it
                 let any_pending = app.worlds.iter().any(|w| w.wont_echo_time.is_some() || w.fansi_detect_until.is_some());
                 if any_pending {
                     prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
                 } else {
                     prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
+                // Clamp to the next timed-prompt deadline if one is sooner than whatever
+                // was just armed above (pull_in_deadline never pushes it later).
+                if let Some(deadline) = app.next_timed_prompt_deadline() {
+                    pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
                 }
             }
 
@@ -18960,6 +19214,13 @@ pub async fn run_app_headless(
             && prompt_check_sleep.deadline() > tokio::time::Instant::now() + Duration::from_millis(150)
         {
             prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+        }
+
+        // Same pull-in, for a timed-prompt deadline that just became sooner than
+        // whatever prompt_check_sleep already had armed (covers this loop's own
+        // batch-drain loop above, same as the stats pull-in just above it).
+        if let Some(deadline) = app.next_timed_prompt_deadline() {
+            pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
         }
 
         // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): fire a
@@ -19688,6 +19949,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     let prompt_check_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(prompt_check_sleep);
 
+    // Timed-prompt inference: a restored partial from a hot-reload/crash-recovery
+    // Timed Prompt world needs its deadline picked up immediately, or it would sit
+    // parked until some unrelated event happens to rearm this timer.
+    if let Some(deadline) = app.next_timed_prompt_deadline() {
+        pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
+    }
+
     // TF repeat process ticks — only active when processes exist
     let process_tick_sleep = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(process_tick_sleep);
@@ -20298,12 +20566,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::Prompt(ref world_name, prompt_bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.handle_prompt(world_idx, &prompt_bytes);
-                        }
-                    }
-                    AppEvent::IdlePrompt(ref world_name, ref prompt_bytes) => {
-                        if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.handle_idle_prompt(world_idx, prompt_bytes);
+                            app.handle_prompt(world_idx, &prompt_bytes, PromptSource::Marker);
                         }
                     }
                     AppEvent::SystemMessage(message) => {
@@ -20845,6 +21108,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if now.duration_since(wont_echo_time) >= Duration::from_millis(150) {
                             // Check if there's a partial line to extract as prompt
                             if !world.trigger_partial_line.is_empty() && world.prompt.is_empty() {
+                                // Same rule as handle_prompt_text: nothing visible before the
+                                // marker is not a prompt. Leave the partial parked for the line
+                                // it belongs to and stop re-checking it.
+                                if !crate::util::prompt_has_visible_text(&world.trigger_partial_line) {
+                                    world.wont_echo_time = None;
+                                    continue;
+                                }
                                 needs_draw = true; // Prompt extracted — redraw input area
                                 // Extract partial line as prompt
                                 let prompt_text = std::mem::take(&mut world.trigger_partial_line);
@@ -20929,12 +21199,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                 }
+                // Timed-prompt inference: promote any WorldType::MudTimedPrompt world
+                // whose parked partial has waited past prompt_wait_ms.
+                if app.promote_due_timed_prompts(now) {
+                    needs_draw = true; // Prompt promoted — redraw input area
+                }
                 // Re-arm: check again in 150ms if any world still needs it
                 let any_pending_prompt = app.worlds.iter().any(|w| w.wont_echo_time.is_some() || w.fansi_detect_until.is_some());
                 if any_pending_prompt {
                     prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
                 } else {
                     prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
+                // Clamp to the next timed-prompt deadline if one is sooner than whatever
+                // was just armed above (pull_in_deadline never pushes it later).
+                if let Some(deadline) = app.next_timed_prompt_deadline() {
+                    pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
                 }
             }
 
@@ -21203,12 +21483,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 AppEvent::Prompt(ref world_name, prompt_bytes) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        app.handle_prompt(world_idx, &prompt_bytes);
-                    }
-                }
-                AppEvent::IdlePrompt(ref world_name, ref prompt_bytes) => {
-                    if let Some(world_idx) = app.find_world_index(world_name) {
-                        app.handle_idle_prompt(world_idx, prompt_bytes);
+                        app.handle_prompt(world_idx, &prompt_bytes, PromptSource::Marker);
                     }
                 }
                 AppEvent::SystemMessage(message) => {
@@ -21536,6 +21811,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             && prompt_check_sleep.deadline() > tokio::time::Instant::now() + Duration::from_millis(150)
         {
             prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+        }
+
+        // Same pull-in, for a timed-prompt deadline that just became sooner than
+        // whatever prompt_check_sleep already had armed (covers this loop's own
+        // batch-drain loop above, same as the stats pull-in just above it).
+        if let Some(deadline) = app.next_timed_prompt_deadline() {
+            pull_in_deadline(prompt_check_sleep.as_mut(), deadline);
         }
 
         // MCCP2 hot-reload drain (job 2 of 2 - see CLAUDE.md's hot-reload notes): fire a

@@ -565,22 +565,52 @@
         worldEditorModal: document.getElementById('world-editor-modal'),
         worldEditorTitle: document.getElementById('world-editor-title'),
         worldEditName: document.getElementById('world-edit-name'),
+        worldEditTypeSelect: document.getElementById('world-edit-type-select'),
+        worldEditHostnameField: document.getElementById('world-edit-hostname-field'),
         worldEditHostname: document.getElementById('world-edit-hostname'),
+        worldEditPortField: document.getElementById('world-edit-port-field'),
         worldEditPort: document.getElementById('world-edit-port'),
+        worldEditUserField: document.getElementById('world-edit-user-field'),
         worldEditUser: document.getElementById('world-edit-user'),
+        worldEditPasswordField: document.getElementById('world-edit-password-field'),
         worldEditPassword: document.getElementById('world-edit-password'),
+        worldEditSslField: document.getElementById('world-edit-ssl-field'),
         worldEditSslToggle: document.getElementById('world-edit-ssl-toggle'),
+        worldEditAutoLoginField: document.getElementById('world-edit-auto-login-field'),
         worldEditAutoLoginSelect: document.getElementById('world-edit-auto-login-select'),
+        worldEditPromptWaitField: document.getElementById('world-edit-prompt-wait-field'),
+        worldEditPromptWaitMs: document.getElementById('world-edit-prompt-wait-ms'),
+        worldEditKeepAliveField: document.getElementById('world-edit-keep-alive-field'),
         worldEditKeepAliveSelect: document.getElementById('world-edit-keep-alive-select'),
         worldEditKeepAliveCmdField: document.getElementById('world-edit-keep-alive-cmd-field'),
         worldEditKeepAliveCmd: document.getElementById('world-edit-keep-alive-cmd'),
+        worldEditEncodingField: document.getElementById('world-edit-encoding-field'),
         worldEditEncodingSelect: document.getElementById('world-edit-encoding-select'),
         worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
+        worldEditGmcpField: document.getElementById('world-edit-gmcp-field'),
         worldEditGmcpPackages: document.getElementById('world-edit-gmcp-packages'),
+        worldEditAutoReconnectField: document.getElementById('world-edit-auto-reconnect-field'),
         worldEditAutoReconnect: document.getElementById('world-edit-auto-reconnect'),
+        worldEditMspEnabledField: document.getElementById('world-edit-msp-enabled-field'),
         worldEditMspEnabledToggle: document.getElementById('world-edit-msp-enabled-toggle'),
+        worldEditMcpEnabledField: document.getElementById('world-edit-mcp-enabled-field'),
         worldEditMcpEnabledToggle: document.getElementById('world-edit-mcp-enabled-toggle'),
+        worldEditMccp2EnabledField: document.getElementById('world-edit-mccp2-enabled-field'),
         worldEditMccp2EnabledToggle: document.getElementById('world-edit-mccp2-enabled-toggle'),
+        worldEditSlackTokenField: document.getElementById('world-edit-slack-token-field'),
+        worldEditSlackToken: document.getElementById('world-edit-slack-token'),
+        worldEditSlackChannelField: document.getElementById('world-edit-slack-channel-field'),
+        worldEditSlackChannel: document.getElementById('world-edit-slack-channel'),
+        worldEditSlackWorkspaceField: document.getElementById('world-edit-slack-workspace-field'),
+        worldEditSlackWorkspace: document.getElementById('world-edit-slack-workspace'),
+        worldEditDiscordTokenField: document.getElementById('world-edit-discord-token-field'),
+        worldEditDiscordToken: document.getElementById('world-edit-discord-token'),
+        worldEditDiscordGuildField: document.getElementById('world-edit-discord-guild-field'),
+        worldEditDiscordGuild: document.getElementById('world-edit-discord-guild'),
+        worldEditDiscordChannelField: document.getElementById('world-edit-discord-channel-field'),
+        worldEditDiscordChannel: document.getElementById('world-edit-discord-channel'),
+        worldEditDiscordDmUserField: document.getElementById('world-edit-discord-dm-user-field'),
+        worldEditDiscordDmUser: document.getElementById('world-edit-discord-dm-user'),
         worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
         worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
@@ -10835,6 +10865,20 @@
         // Populate form fields
         elements.worldEditorTitle.textContent = 'World Editor';
         elements.worldEditName.value = world.name || '';
+        const worldType = world.settings?.world_type || 'mud';
+        elements.worldEditTypeSelect.value = worldType;
+        updateCustomDropdown(elements.worldEditTypeSelect);
+        // Number.isFinite (not `|| 1000`) so an explicit 0 survives - 0 is a real,
+        // valid wait, not "unset".
+        const promptWaitMs = Number(world.settings?.prompt_wait_ms);
+        elements.worldEditPromptWaitMs.value = Number.isFinite(promptWaitMs) ? promptWaitMs : 1000;
+        elements.worldEditSlackToken.value = world.settings?.slack_token || '';
+        elements.worldEditSlackChannel.value = world.settings?.slack_channel || '';
+        elements.worldEditSlackWorkspace.value = world.settings?.slack_workspace || '';
+        elements.worldEditDiscordToken.value = world.settings?.discord_token || '';
+        elements.worldEditDiscordGuild.value = world.settings?.discord_guild || '';
+        elements.worldEditDiscordChannel.value = world.settings?.discord_channel || '';
+        elements.worldEditDiscordDmUser.value = world.settings?.discord_dm_user || '';
         elements.worldEditHostname.value = world.settings?.hostname || '';
         elements.worldEditPort.value = world.settings?.port || '';
         elements.worldEditUser.value = world.settings?.user || '';
@@ -10890,12 +10934,15 @@
 
         const keepAlive = world.settings?.keep_alive_type || 'NOP';
         elements.worldEditKeepAliveSelect.value = keepAlive;
-        updateKeepAliveCmdVisibility(keepAlive);
         updateCustomDropdown(elements.worldEditKeepAliveSelect);
 
         const encoding = world.settings?.encoding || 'UTF-8';
         elements.worldEditEncodingSelect.value = encoding;
         updateCustomDropdown(elements.worldEditEncodingSelect);
+
+        // Must run after both the Type and Keep Alive selects are populated above -
+        // it reads both to decide what's visible.
+        updateWorldEditorTypeVisibility();
 
         elements.worldEditorModal.className = 'modal visible';
         elements.worldEditorModal.style.display = 'flex';
@@ -10910,16 +10957,66 @@
         focusInputWithKeyboard();
     }
 
-    function updateKeepAliveCmdVisibility(keepAliveType) {
-        if (keepAliveType === 'Custom') {
-            elements.worldEditKeepAliveCmdField.classList.add('visible');
-        } else {
-            elements.worldEditKeepAliveCmdField.classList.remove('visible');
-        }
+    // World editor field IDs (into `elements`) gated by World Type - mirrors
+    // popup/definitions/world_editor.rs's `update_field_visibility` (console) so all
+    // three interfaces agree on what's visible for each type. Name/Logging are never
+    // gated (visible for every type, same as the console's WORLD_FIELD_LOG_ENABLED).
+    const WORLD_EDIT_MUD_FIELD_IDS = [
+        'worldEditHostnameField', 'worldEditPortField', 'worldEditUserField',
+        'worldEditPasswordField', 'worldEditSslField', 'worldEditAutoLoginField',
+        'worldEditKeepAliveField', 'worldEditEncodingField', 'worldEditGmcpField',
+        'worldEditAutoReconnectField', 'worldEditMspEnabledField',
+        'worldEditMcpEnabledField', 'worldEditMccp2EnabledField'
+    ];
+    const WORLD_EDIT_SLACK_FIELD_IDS = [
+        'worldEditSlackTokenField', 'worldEditSlackChannelField', 'worldEditSlackWorkspaceField'
+    ];
+    const WORLD_EDIT_DISCORD_FIELD_IDS = [
+        'worldEditDiscordTokenField', 'worldEditDiscordGuildField',
+        'worldEditDiscordChannelField', 'worldEditDiscordDmUserField'
+    ];
+
+    // Show/hide World Editor rows for the currently selected Type - called on editor
+    // open and on every Type/Keep Alive change (the console equivalent re-runs
+    // automatically via the update_visibility! macro on the same events).
+    function updateWorldEditorTypeVisibility() {
+        const type = elements.worldEditTypeSelect.value;
+        const isMud = type === 'mud' || type === 'mud_timed_prompt';
+        const isSlack = type === 'slack';
+        const isDiscord = type === 'discord';
+
+        WORLD_EDIT_MUD_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isMud));
+        WORLD_EDIT_SLACK_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isSlack));
+        WORLD_EDIT_DISCORD_FIELD_IDS.forEach(id => elements[id]?.classList.toggle('visible', isDiscord));
+
+        // Prompt Wait only applies to Timed Prompt worlds - a plain MUD world never
+        // infers a prompt from silence at all, same as the console's dedicated rule
+        // for WORLD_FIELD_PROMPT_WAIT_MS (not folded into the MUD-family list above).
+        elements.worldEditPromptWaitField?.classList.toggle('visible', type === 'mud_timed_prompt');
+
+        // Keep Alive Cmd keeps its existing "Custom keep-alive only" gate, now also
+        // requiring a MUD-family type (same shape as the console's
+        // `world_type.is_mud() && show_keep_alive_cmd`).
+        const keepAliveCustom = elements.worldEditKeepAliveSelect.value === 'Custom';
+        elements.worldEditKeepAliveCmdField.classList.toggle('visible', isMud && keepAliveCustom);
     }
 
     function saveWorldEditor() {
         if (worldEditorIndex < 0 || worldEditorIndex >= worlds.length) return;
+
+        const worldType = elements.worldEditTypeSelect.value;
+        // Number.isFinite (not `|| 1000`) so an explicit 0 survives - 0 is a real,
+        // valid wait, not "unset" (see investigate-differences-between-tinyfugu-
+        // fluffy-stallman.md Job B).
+        const promptWaitMsRaw = Number(elements.worldEditPromptWaitMs.value);
+        const promptWaitMs = Number.isFinite(promptWaitMsRaw) ? Math.max(0, Math.trunc(promptWaitMsRaw)) : 1000;
+        const slackToken = elements.worldEditSlackToken.value;
+        const slackChannel = elements.worldEditSlackChannel.value;
+        const slackWorkspace = elements.worldEditSlackWorkspace.value;
+        const discordToken = elements.worldEditDiscordToken.value;
+        const discordGuild = elements.worldEditDiscordGuild.value;
+        const discordChannel = elements.worldEditDiscordChannel.value;
+        const discordDmUser = elements.worldEditDiscordDmUser.value;
 
         // Send update to server
         send({
@@ -10940,7 +11037,16 @@
             auto_reconnect_secs: elements.worldEditAutoReconnect ? elements.worldEditAutoReconnect.value.trim() : '0',
             msp_enabled: elements.worldEditMspEnabledToggle.classList.contains('active'),
             mcp_enabled: elements.worldEditMcpEnabledToggle.classList.contains('active'),
-            mccp2_enabled: elements.worldEditMccp2EnabledToggle.classList.contains('active')
+            mccp2_enabled: elements.worldEditMccp2EnabledToggle.classList.contains('active'),
+            world_type: worldType,
+            prompt_wait_ms: promptWaitMs,
+            slack_token: slackToken,
+            slack_channel: slackChannel,
+            slack_workspace: slackWorkspace,
+            discord_token: discordToken,
+            discord_guild: discordGuild,
+            discord_channel: discordChannel,
+            discord_dm_user: discordDmUser
         });
 
         // Update local state
@@ -10966,6 +11072,15 @@
         world.settings.msp_enabled = elements.worldEditMspEnabledToggle.classList.contains('active');
         world.settings.mcp_enabled = elements.worldEditMcpEnabledToggle.classList.contains('active');
         world.settings.mccp2_enabled = elements.worldEditMccp2EnabledToggle.classList.contains('active');
+        world.settings.world_type = worldType;
+        world.settings.prompt_wait_ms = promptWaitMs;
+        world.settings.slack_token = slackToken;
+        world.settings.slack_channel = slackChannel;
+        world.settings.slack_workspace = slackWorkspace;
+        world.settings.discord_token = discordToken;
+        world.settings.discord_guild = discordGuild;
+        world.settings.discord_channel = discordChannel;
+        world.settings.discord_dm_user = discordDmUser;
 
         closeWorldEditorPopup();
     }
@@ -14019,7 +14134,10 @@
             this.classList.toggle('active');
         };
         elements.worldEditKeepAliveSelect.onchange = function() {
-            updateKeepAliveCmdVisibility(this.value);
+            updateWorldEditorTypeVisibility();
+        };
+        elements.worldEditTypeSelect.onchange = function() {
+            updateWorldEditorTypeVisibility();
         };
 
         elements.worldFilter.oninput = function() {

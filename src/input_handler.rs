@@ -905,8 +905,17 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     // Update world name
                     app.worlds[idx].name = settings.name;
 
-                    // Update world type
-                    app.worlds[idx].settings.world_type = WorldType::from_name(&settings.world_type);
+                    // Update world type. A change away from MudTimedPrompt invalidates
+                    // any parked timed-prompt promotion, mirroring the same guard in
+                    // App::update_world_settings (the wire-driven equivalent of this
+                    // console-direct apply).
+                    let new_world_type = WorldType::from_name(&settings.world_type);
+                    if app.worlds[idx].settings.world_type == WorldType::MudTimedPrompt
+                        && new_world_type != WorldType::MudTimedPrompt {
+                        app.worlds[idx].timed_prompt_since = None;
+                    }
+                    app.worlds[idx].settings.world_type = new_world_type;
+                    app.worlds[idx].settings.prompt_wait_ms = settings.prompt_wait_ms;
 
                     // Update MUD settings
                     app.worlds[idx].settings.hostname = settings.hostname;

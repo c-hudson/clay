@@ -1503,7 +1503,7 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
                 WorldType::Discord => {
                     return connect_discord(app, event_tx).await;
                 }
-                WorldType::Mud => {
+                WorldType::Mud | WorldType::MudTimedPrompt => {
                     // Continue with MUD connection below
                 }
             }
@@ -2838,11 +2838,20 @@ pub(crate) fn execute_send_command(
     let targets: Vec<usize> = if all_worlds {
         (0..app.worlds.len()).filter(|&i| app.worlds[i].connected).collect()
     } else if let Some(type_pattern) = world_type {
+        // "mud" is a literal (no wildcard chars), so the anchored regex it compiles to
+        // (`^mud$`) would not match `MudTimedPrompt::name()` ("mud_timed_prompt") even
+        // though a Timed Prompt world is a MUD in every other sense. Special-case the
+        // bare "mud" pattern to mean `WorldType::is_mud()` so `/send -T mud` reaches
+        // both MUD types, same as connection routing and editor visibility do.
+        let is_bare_mud_pattern = type_pattern.eq_ignore_ascii_case("mud");
         let regex_pattern = crate::actions::wildcard_to_regex(type_pattern);
         let re = regex::RegexBuilder::new(&regex_pattern).case_insensitive(true).build().ok();
         (0..app.worlds.len())
             .filter(|&i| app.worlds[i].connected)
             .filter(|&i| {
+                if is_bare_mud_pattern {
+                    return app.worlds[i].settings.world_type.is_mud();
+                }
                 let type_name = app.worlds[i].settings.world_type.name();
                 re.as_ref().is_some_and(|r| r.is_match(type_name))
             })

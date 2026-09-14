@@ -542,6 +542,11 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
         if !world.settings.mccp2_enabled {
             writeln!(file, "mccp2_enabled=false")?;
         }
+        // Only relevant for `WorldType::MudTimedPrompt`; same non-default-only
+        // convention as `auto_reconnect_secs` above (default `DEFAULT_PROMPT_WAIT_MS`).
+        if world.settings.prompt_wait_ms != crate::DEFAULT_PROMPT_WAIT_MS {
+            writeln!(file, "prompt_wait_ms={}", world.settings.prompt_wait_ms)?;
+        }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
             writeln!(file, "slack_token={}", secret(&world.settings.slack_token))?;
@@ -1227,6 +1232,10 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
+                        "prompt_wait_ms" => {
+                            world.settings.prompt_wait_ms =
+                                value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
+                        }
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -1602,6 +1611,10 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "msp_enabled" => world.settings.msp_enabled = value == "true",
                         "mcp_enabled" => world.settings.mcp_enabled = value == "true",
                         "mccp2_enabled" => world.settings.mccp2_enabled = value == "true",
+                        "prompt_wait_ms" => {
+                            world.settings.prompt_wait_ms =
+                                value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
+                        }
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -1757,6 +1770,7 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             // Job 15 (plan Phase 4).
             writeln!(file, "mcp_enabled={}", world.settings.mcp_enabled)?;
             writeln!(file, "mccp2_enabled={}", world.settings.mccp2_enabled)?;
+            writeln!(file, "prompt_wait_ms={}", world.settings.prompt_wait_ms)?;
             writeln!(file, "encoding={}", world.settings.encoding.name())?;
             writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
             writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
@@ -2170,6 +2184,11 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
         // Same convention as msp_enabled above.
         if !world.settings.mccp2_enabled {
             writeln!(file, "mccp2_enabled=false")?;
+        }
+        // Only relevant for `WorldType::MudTimedPrompt`; same non-default-only
+        // convention as msp_enabled above (default `DEFAULT_PROMPT_WAIT_MS`).
+        if world.settings.prompt_wait_ms != crate::DEFAULT_PROMPT_WAIT_MS {
+            writeln!(file, "prompt_wait_ms={}", world.settings.prompt_wait_ms)?;
         }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
@@ -2996,6 +3015,10 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                             "msp_enabled" => tw.settings.msp_enabled = value == "true",
                             "mcp_enabled" => tw.settings.mcp_enabled = value == "true",
                             "mccp2_enabled" => tw.settings.mccp2_enabled = value == "true",
+                            "prompt_wait_ms" => {
+                                tw.settings.prompt_wait_ms =
+                                    value.parse().unwrap_or(crate::DEFAULT_PROMPT_WAIT_MS);
+                            }
                             "encoding" => {
                                 tw.settings.encoding = match value {
                                     "latin1" => Encoding::Latin1,
@@ -3217,6 +3240,18 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
             .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
         world.log_custom_path = tw.log_custom_path;
         world.trigger_partial_line = tw.trigger_partial_line;
+        // Job (investigate-differences-between-tinyfugu-fluffy-stallman.md): `Instant`
+        // cannot be persisted, so a restored non-empty partial on a Timed Prompt world
+        // must re-arm `timed_prompt_since` here or it would sit parked forever (nothing
+        // else sets it until the next packet arrives on this connection, and a hot
+        // reload's exec preserves the socket rather than triggering fresh data). "now"
+        // is deliberately the restore moment, not the original park time (which is lost)
+        // - the same posture as `reconnect_at` just above using the restore moment as
+        // its baseline.
+        if !world.trigger_partial_line.is_empty()
+            && world.settings.world_type == WorldType::MudTimedPrompt {
+            world.timed_prompt_since = Some(std::time::Instant::now());
+        }
         // Job 5 (T3.4): `None`/empty means the state file predates these fields (or
         // there was nothing to restore) - leave the freshly-constructed `World`'s
         // own empty defaults rather than overwrite them. Reassemble name/value by
@@ -3426,6 +3461,7 @@ mod tests {
             msp_enabled: false,                            // default: true
             mcp_enabled: false,                            // default: true
             mccp2_enabled: false,                          // default: true
+            prompt_wait_ms: 2500,                          // default: 1000
         }
     }
 
@@ -3523,6 +3559,7 @@ mod tests {
         assert_eq!(a.msp_enabled, b.msp_enabled, "{context}: msp_enabled");
         assert_eq!(a.mcp_enabled, b.mcp_enabled, "{context}: mcp_enabled");
         assert_eq!(a.mccp2_enabled, b.mccp2_enabled, "{context}: mccp2_enabled");
+        assert_eq!(a.prompt_wait_ms, b.prompt_wait_ms, "{context}: prompt_wait_ms");
     }
 
     /// A connectionless world (`/addworld <name>` with no host, the web client's "add
@@ -3984,6 +4021,87 @@ mod tests {
         load_reload_state_from_str(&mut app, content).expect("load_reload_state_from_str");
         let w = app.worlds.iter().find(|w| w.name == "Legacy").expect("world restored");
         assert!(w.settings.mccp2_enabled, "an absent key must default to true");
+    }
+
+    /// A settings.dat `[world:...]` section without a `prompt_wait_ms` key (every world
+    /// written before the Timed Prompt world type existed) must load as
+    /// `DEFAULT_PROMPT_WAIT_MS` (1000), not 0.
+    #[test]
+    fn test_load_settings_from_str_world_section_without_prompt_wait_ms_key_loads_as_default() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "[world:NoKey]\nhostname=mud.example.com\nport=4000\n";
+        load_settings_from_str(&mut app, content);
+        let w = app.worlds.iter().find(|w| w.name == "NoKey").expect("world loaded");
+        assert_eq!(w.settings.prompt_wait_ms, crate::DEFAULT_PROMPT_WAIT_MS,
+            "a world section without the key must default to DEFAULT_PROMPT_WAIT_MS");
+    }
+
+    /// `prompt_wait_ms` must round-trip through the hot-reload state file
+    /// (`save_reload_state_to`/`load_reload_state_from_str`), same pattern as
+    /// `test_mccp2_enabled_survives_reload_state_roundtrip`.
+    #[test]
+    fn test_prompt_wait_ms_survives_reload_state_roundtrip() {
+        let mut app = App::new();
+        let mut world = World::new("testworld");
+        world.settings.prompt_wait_ms = 2500;
+        app.worlds = vec![world];
+
+        let mut buf = Vec::new();
+        save_reload_state_to(&app, &mut buf).expect("save_reload_state_to failed");
+        let content = String::from_utf8(buf).unwrap();
+
+        let mut reloaded = App::new();
+        load_reload_state_from_str(&mut reloaded, &content).expect("load_reload_state_from_str failed");
+        let w = reloaded.worlds.iter().find(|w| w.name == "testworld").expect("world restored");
+        assert_eq!(w.settings.prompt_wait_ms, 2500, "prompt_wait_ms must survive a hot reload");
+    }
+
+    /// A hot-reload state file predating `prompt_wait_ms` (no key in the
+    /// `[world_state:...]` section) must restore it as `DEFAULT_PROMPT_WAIT_MS`.
+    #[test]
+    fn test_load_reload_state_without_prompt_wait_ms_key_defaults_to_1000() {
+        let mut app = App::new();
+        let content = "[world_state:0]\nname=Legacy\nhostname=mud.example.com\n";
+        load_reload_state_from_str(&mut app, content).expect("load_reload_state_from_str");
+        let w = app.worlds.iter().find(|w| w.name == "Legacy").expect("world restored");
+        assert_eq!(w.settings.prompt_wait_ms, crate::DEFAULT_PROMPT_WAIT_MS,
+            "an absent key must default to DEFAULT_PROMPT_WAIT_MS");
+    }
+
+    /// `world_type=mud_timed_prompt` must round-trip through settings.dat, and an
+    /// unrecognized value must fall back to `Mud` (`WorldType::from_name`'s documented
+    /// `_ => Mud` contract), in both settings.dat and the hot-reload state file - the
+    /// two independent parsers that each call `WorldType::from_name` directly.
+    #[test]
+    fn test_world_type_mud_timed_prompt_and_unknown_name_round_trip_in_settings_dat() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let content = "[world:Timed]\nworld_type=mud_timed_prompt\nhostname=mud.example.com\nport=4000\n\
+                       [world:Bogus]\nworld_type=not_a_real_type\nhostname=mud.example.com\nport=4000\n";
+        load_settings_from_str(&mut app, content);
+        let timed = app.worlds.iter().find(|w| w.name == "Timed").expect("Timed world loaded");
+        assert!(matches!(timed.settings.world_type, WorldType::MudTimedPrompt),
+            "world_type=mud_timed_prompt must load as WorldType::MudTimedPrompt");
+        let bogus = app.worlds.iter().find(|w| w.name == "Bogus").expect("Bogus world loaded");
+        assert!(matches!(bogus.settings.world_type, WorldType::Mud),
+            "an unrecognized world_type value must fall back to WorldType::Mud");
+    }
+
+    /// Same contract as the settings.dat test above, for the hot-reload state parser
+    /// (a separate `WorldType::from_name` call site at a different line).
+    #[test]
+    fn test_world_type_mud_timed_prompt_and_unknown_name_round_trip_in_reload_state() {
+        let mut app = App::new();
+        let content = "[world_state:0]\nname=Timed\nworld_type=mud_timed_prompt\nhostname=mud.example.com\n\
+                       [world_state:1]\nname=Bogus\nworld_type=not_a_real_type\nhostname=mud.example.com\n";
+        load_reload_state_from_str(&mut app, content).expect("load_reload_state_from_str");
+        let timed = app.worlds.iter().find(|w| w.name == "Timed").expect("Timed world restored");
+        assert!(matches!(timed.settings.world_type, WorldType::MudTimedPrompt),
+            "world_type=mud_timed_prompt must restore as WorldType::MudTimedPrompt");
+        let bogus = app.worlds.iter().find(|w| w.name == "Bogus").expect("Bogus world restored");
+        assert!(matches!(bogus.settings.world_type, WorldType::Mud),
+            "an unrecognized world_type value must fall back to WorldType::Mud");
     }
 
     #[test]
@@ -4540,6 +4658,7 @@ pattern=foo
         assert_ne!(non_default.msp_enabled, default.msp_enabled, "msp_enabled should differ");
         assert_ne!(non_default.mcp_enabled, default.mcp_enabled, "mcp_enabled should differ");
         assert_ne!(non_default.mccp2_enabled, default.mccp2_enabled, "mccp2_enabled should differ");
+        assert_ne!(non_default.prompt_wait_ms, default.prompt_wait_ms, "prompt_wait_ms should differ");
     }
 
     #[test]

@@ -60,12 +60,18 @@ pub struct ProtocolState {
     /// (auto-detected) - see `TelnetEvent::WontEchoPromptHint`'s doc comment.
     pub uses_wont_echo_prompt: bool,
     /// True once this connection has delivered a prompt via a real telnet marker
-    /// (GA/EOR/WONT-ECHO). On such a world the marker is authoritative and the
-    /// idle-flush prompt inference must stay out of the way: a trailing partial line
-    /// there is ordinary mid-line output, not a prompt, and treating it as one
-    /// overwrites the real prompt with whatever happened to arrive last — a bare
-    /// colour reset after a prompt would replace `> ` with an invisible ANSI-only
-    /// string. The inference exists only for MUDs that never mark their prompts.
+    /// (GA/EOR/WONT-ECHO) - set only by `App::handle_prompt_text` with
+    /// `PromptSource::Marker`, never by a `PromptSource::Timed` promotion, since that is
+    /// an inference, not an observation of the server's own behavior (see
+    /// `PromptSource`'s doc comment). On such a world the marker is authoritative and
+    /// `App::promote_due_timed_prompts`'s timed-prompt inference must stay out of the
+    /// way: a trailing partial line there is ordinary mid-line output, not a prompt, and
+    /// promoting it would overwrite the real prompt with whatever happened to arrive
+    /// last — a bare colour reset after a prompt would replace `> ` with an invisible
+    /// ANSI-only string. The inference exists only for `WorldType::MudTimedPrompt`
+    /// worlds that never mark their prompts. Reset by `clear()` on every fresh
+    /// connection, so a reconnect gets a clean read of whether *this* connection marks
+    /// its prompts rather than inheriting the previous connection's answer.
     pub seen_prompt_marker: bool,
     /// True if NAWS was negotiated on this connection.
     pub naws_enabled: bool,
@@ -191,6 +197,7 @@ impl ProtocolState {
         self.mcmp_default_url.clear();
         self.gmcp_supported_packages.clear();
         self.uses_wont_echo_prompt = false;
+        self.seen_prompt_marker = false;
     }
 
     /// Apply one `TelnetEvent` to this connection's protocol mirrors. Exhaustive over

@@ -606,6 +606,41 @@ pub enum WsMessage {
         /// not `serde(default)`'s implicit `false`.
         #[serde(default = "default_mccp2_enabled")]
         mccp2_enabled: bool,
+        /// World type (`"mud"`/`"mud_timed_prompt"`/`"slack"`/`"discord"`, see
+        /// `WorldType::name`/`from_name`). Empty means "not sent, leave unchanged" -
+        /// an older client that predates world-type-selectable-everywhere must never
+        /// silently convert a Slack/Discord world back to MUD just because it omitted
+        /// this field. `App::update_world_settings` only applies it when non-empty.
+        #[serde(default)]
+        world_type: String,
+        /// Mirrors `WorldSettings::prompt_wait_ms` - see its doc comment. Unlike
+        /// `world_type` there is no "leave unchanged" sentinel for a number (0 is a
+        /// real, valid wait), so an older client that omits this field resolves to
+        /// `DEFAULT_PROMPT_WAIT_MS` (1000) via `default_prompt_wait_ms`, same
+        /// reasoning as `msp_enabled` resolving to its feature default rather than
+        /// `serde(default)`'s implicit zero value.
+        #[serde(default = "default_prompt_wait_ms")]
+        prompt_wait_ms: u64,
+        /// Slack/Discord credentials and destination fields (mirrors the matching
+        /// `WorldSettings` fields). Tokens follow the password precedent: sent
+        /// plaintext, never masked (`secret()`-encrypted only at rest in
+        /// `persistence.rs`). Same "leave unchanged when omitted/empty" contract as
+        /// `password` above - an older client (or a save that never touched these
+        /// fields) must not wipe a configured Slack/Discord world's credentials.
+        #[serde(default)]
+        slack_token: String,
+        #[serde(default)]
+        slack_channel: String,
+        #[serde(default)]
+        slack_workspace: String,
+        #[serde(default)]
+        discord_token: String,
+        #[serde(default)]
+        discord_guild: String,
+        #[serde(default)]
+        discord_channel: String,
+        #[serde(default)]
+        discord_dm_user: String,
     },
     UpdateGlobalSettings {
         more_mode_enabled: bool,
@@ -1333,6 +1368,36 @@ pub struct WorldSettingsMsg {
     /// to `true`, not `serde(default)`'s implicit `false`.
     #[serde(default = "default_mccp2_enabled")]
     pub mccp2_enabled: bool,
+    /// Mirrors `WorldSettings::world_type` (`WorldType::name()`) so the web/GUI
+    /// editor can show/select MUD, MUD - Timed Prompt, Slack, or Discord - closing
+    /// the pre-existing three-interface-rule gap where world type was console-only.
+    /// An older peer's omitted field resolves to `"mud"` via `default_world_type_name`,
+    /// same reasoning as `default_msp_enabled`.
+    #[serde(default = "default_world_type_name")]
+    pub world_type: String,
+    /// Mirrors `WorldSettings::prompt_wait_ms`; only meaningful for
+    /// `world_type == "mud_timed_prompt"`. An older peer's omitted field resolves to
+    /// `DEFAULT_PROMPT_WAIT_MS` (1000) via `default_prompt_wait_ms`.
+    #[serde(default = "default_prompt_wait_ms")]
+    pub prompt_wait_ms: u64,
+    /// Mirror of `WorldSettings::slack_token`/`slack_channel`/`slack_workspace` and
+    /// `discord_token`/`discord_guild`/`discord_channel`/`discord_dm_user`. Tokens
+    /// follow the password precedent above: sent plaintext to authenticated clients,
+    /// never masked (encryption is at-rest only, see `persistence.rs`).
+    #[serde(default)]
+    pub slack_token: String,
+    #[serde(default)]
+    pub slack_channel: String,
+    #[serde(default)]
+    pub slack_workspace: String,
+    #[serde(default)]
+    pub discord_token: String,
+    #[serde(default)]
+    pub discord_guild: String,
+    #[serde(default)]
+    pub discord_channel: String,
+    #[serde(default)]
+    pub discord_dm_user: String,
 }
 
 /// Global settings for WebSocket protocol
@@ -1480,6 +1545,19 @@ fn default_mcp_enabled() -> bool {
 /// (`TelnetConfig::default()`), rather than `serde(default)`'s implicit `false`.
 fn default_mccp2_enabled() -> bool {
     true
+}
+
+/// Default for `UpdateWorldSettings::world_type`/`WorldSettingsMsg::world_type` when an
+/// older peer's message omits the field. Matches `WorldType::default()`/`WorldType::Mud`'s
+/// own name - see `WorldType::name`.
+fn default_world_type_name() -> String {
+    "mud".to_string()
+}
+
+/// Default for `UpdateWorldSettings::prompt_wait_ms`/`WorldSettingsMsg::prompt_wait_ms`
+/// when an older peer's message omits the field. Matches `DEFAULT_PROMPT_WAIT_MS`.
+fn default_prompt_wait_ms() -> u64 {
+    crate::DEFAULT_PROMPT_WAIT_MS
 }
 
 fn default_web_font_size_phone() -> f32 {

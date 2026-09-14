@@ -2168,6 +2168,19 @@ body.device-phone #output-container { padding: 6px 10px; }
     display: flex;
 }
 
+/* World editor Type-based row visibility (investigate-differences-between-tinyfugu-
+   fluffy-stallman.md Job B): every MUD/Timed-only, Slack-only, and Discord-only row
+   shares this one rule instead of a dedicated block per row - same
+   classList.add/remove('visible') toggle as world-edit-keep-alive-cmd-field above,
+   just driven by updateWorldEditorTypeVisibility() instead of the keep-alive select. */
+.world-editor-modal-content .setting-row.type-gated {
+    display: none;
+}
+
+.world-editor-modal-content .setting-row.type-gated.visible {
+    display: flex;
+}
+
 /* ─── Setup popup ─── */
 #setup-modal {
     background-color: transparent;

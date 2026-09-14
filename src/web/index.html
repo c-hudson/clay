@@ -514,36 +514,47 @@
                         </div>
                     </div>
                     <div class="setting-row">
+                        <span class="setting-label">Type</span>
+                        <div class="setting-value">
+                            <select id="world-edit-type-select" class="form-select">
+                                <option value="mud">MUD</option>
+                                <option value="mud_timed_prompt">MUD - Timed Prompt</option>
+                                <option value="slack">Slack</option>
+                                <option value="discord">Discord</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-hostname-field">
                         <span class="setting-label">Hostname</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-hostname" class="editor-input" autocomplete="off">
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-port-field">
                         <span class="setting-label">Port</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-port" class="editor-input" autocomplete="off">
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-user-field">
                         <span class="setting-label">User</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-user" class="editor-input" autocomplete="off">
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-password-field">
                         <span class="setting-label">Password</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-password" class="editor-input" autocomplete="off">
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-ssl-field">
                         <span class="setting-label">Use SSL</span>
                         <div class="setting-value">
                             <div id="world-edit-ssl-toggle" class="toggle"></div>
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-auto-login-field">
                         <span class="setting-label">Auto Login</span>
                         <div class="setting-value">
                             <select id="world-edit-auto-login-select" class="form-select">
@@ -554,7 +565,13 @@
                             </select>
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-prompt-wait-field">
+                        <span class="setting-label">Prompt Wait (ms)</span>
+                        <div class="setting-value">
+                            <input type="number" id="world-edit-prompt-wait-ms" class="editor-input" min="0" step="50" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-keep-alive-field">
                         <span class="setting-label">Keep Alive</span>
                         <div class="setting-value">
                             <select id="world-edit-keep-alive-select" class="form-select">
@@ -571,7 +588,7 @@
                             <input type="text" id="world-edit-keep-alive-cmd" class="editor-input" autocomplete="off">
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-encoding-field">
                         <span class="setting-label">Encoding</span>
                         <div class="setting-value">
                             <select id="world-edit-encoding-select" class="form-select">
@@ -587,34 +604,76 @@
                             <div id="world-edit-logging-toggle" class="toggle"></div>
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-gmcp-field">
                         <span class="setting-label">GMCP</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-gmcp-packages" class="editor-input" autocomplete="off">
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-auto-reconnect-field">
                         <span class="setting-label">Reconnect</span>
                         <div class="setting-value">
                             <input type="text" id="world-edit-auto-reconnect" class="editor-input" autocomplete="off" placeholder="0, 30, web, web,30">
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-msp-enabled-field">
                         <span class="setting-label">MSP Sound</span>
                         <div class="setting-value">
                             <div id="world-edit-msp-enabled-toggle" class="toggle"></div>
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-mcp-enabled-field">
                         <span class="setting-label">MCP Edit</span>
                         <div class="setting-value">
                             <div id="world-edit-mcp-enabled-toggle" class="toggle"></div>
                         </div>
                     </div>
-                    <div class="setting-row">
+                    <div class="setting-row type-gated" id="world-edit-mccp2-enabled-field">
                         <span class="setting-label">MCCP2</span>
                         <div class="setting-value">
                             <div id="world-edit-mccp2-enabled-toggle" class="toggle"></div>
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-slack-token-field">
+                        <span class="setting-label">Token</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-slack-token" class="editor-input" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-slack-channel-field">
+                        <span class="setting-label">Channel</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-slack-channel" class="editor-input" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-slack-workspace-field">
+                        <span class="setting-label">Workspace</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-slack-workspace" class="editor-input" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-discord-token-field">
+                        <span class="setting-label">Token</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-discord-token" class="editor-input" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-discord-guild-field">
+                        <span class="setting-label">Guild</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-discord-guild" class="editor-input" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-discord-channel-field">
+                        <span class="setting-label">Channel</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-discord-channel" class="editor-input" autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="setting-row type-gated" id="world-edit-discord-dm-user-field">
+                        <span class="setting-label">DM User</span>
+                        <div class="setting-value">
+                            <input type="text" id="world-edit-discord-dm-user" class="editor-input" autocomplete="off">
                         </div>
                     </div>
                 </div>

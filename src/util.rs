@@ -144,6 +144,18 @@ pub fn normalize_prompt(text: &str) -> String {
     format!("{} ", clean.trim())
 }
 
+/// Whether prompt text would show anything once drawn: false for an empty string,
+/// whitespace only, or colour codes only (`"\x1b[0m"`, `"\x1b[0m \x1b[31m"`).
+///
+/// A telnet marker (GA/EOR) with nothing visible before it is not a prompt. The
+/// telnet layer already emits no `Prompt` event for a bare marker after a newline;
+/// a MUD's trailing colour reset + GA after unsolicited output is the same case and
+/// must be treated the same, or `normalize_prompt` turns it into a single space and
+/// the input area draws an invisible one-column prompt in place of the real one.
+pub fn prompt_has_visible_text(text: &str) -> bool {
+    !strip_ansi_codes(text).trim().is_empty()
+}
+
 /// Convert a color name to ANSI background color code
 /// Supports named colors, xterm 256-color codes, and RGB values
 /// Empty string returns a default highlight color (dark cyan background)
@@ -1140,6 +1152,17 @@ mod tests {
     }
 
     // --- normalize_prompt ---
+
+    #[test]
+    fn test_prompt_has_visible_text() {
+        assert!(prompt_has_visible_text("> "));
+        assert!(prompt_has_visible_text("\x1b[31mHP:10>\x1b[0m "));
+        assert!(!prompt_has_visible_text(""));
+        assert!(!prompt_has_visible_text(" "));
+        assert!(!prompt_has_visible_text("\t \r\n"));
+        assert!(!prompt_has_visible_text("\x1b[0m"));
+        assert!(!prompt_has_visible_text("\x1b[0m \x1b[31m"));
+    }
 
     #[test]
     fn test_normalize_prompt_basic() {

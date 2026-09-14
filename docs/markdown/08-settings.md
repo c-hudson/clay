@@ -52,6 +52,7 @@ Open with `/worlds -e` or edit from World Selector:
 | Setting | Description |
 |---------|-------------|
 | World name | Display name for this world |
+| World type | `MUD`, `MUD - Timed Prompt`, `Slack`, or `Discord`. The two MUD types connect identically; **MUD - Timed Prompt** additionally infers a prompt from a line the server leaves unfinished (see Prompt wait below) |
 | Hostname | Server address (e.g., mud.example.com) |
 | Port | Server port (e.g., 4000) |
 | Use SSL | Enable TLS/SSL connection |
@@ -73,6 +74,20 @@ Open with `/worlds -e` or edit from World Selector:
 | MOO_prompt | Like Prompt, but sends username again on third prompt |
 
 Auto-login only triggers if BOTH username AND password are configured.
+
+### Prompt Detection
+
+Clay normally recognises a prompt only when the server marks it with telnet GA/EOR (or a
+WONT-ECHO password prompt). Some MUDs never mark their prompts at all — Aardwolf's login
+prompt is the reference case — so `Prompt`/`MOO_prompt` auto-login could never fire there.
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Prompt wait (ms) | Shown only for **MUD - Timed Prompt** worlds. A line the server leaves unfinished is treated as the prompt once nothing further has arrived for this long. Raise it on a slow link if a line that was merely arriving slowly gets taken for a prompt; lower it if prompts feel late | 1000 |
+
+Plain `MUD` worlds never infer a prompt from timing, so a server that sends long lines in
+several pieces cannot produce a false prompt there. If a world used to rely on the
+unmarked-prompt detection introduced in v1.6.5, set its type to **MUD - Timed Prompt**.
 
 ### Keep-Alive Settings
 
@@ -112,6 +127,7 @@ See the **Telnet Features** chapter for what each of these actually negotiates.
 |---------|-------------|---------|
 | MSP Sound | Play `!!SOUND(...)`/`!!MUSIC(...)` triggers the MUD sends (MUD Sound Protocol). Off means these triggers are not recognized at all — the option is never requested, and any trigger text that still arrives is left in the output unstripped and unplayed | On |
 | MCP Edit | Support MCP (MUD Client Protocol), mainly used by MOOs — makes `@edit` open a real text editor instead of dumping verb source into the scrollback. Off means `#$#`-prefixed protocol lines display as plain text instead of being parsed | On |
+| MCCP2 | Accept MCCP2 compression when the server offers it. Off declines it at negotiation; toggling it on a live connection starts or stops compression immediately. Compressed connections survive `/reload` | On |
 
 ## Web Settings (/web)
 
@@ -159,6 +175,7 @@ http_enabled=false
 http_port=9000
 
 [world:MyMUD]
+world_type=mud
 hostname=mud.example.com
 port=4000
 user=myname

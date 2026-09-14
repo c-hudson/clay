@@ -110,6 +110,7 @@ https_port=9001
 
 ```ini
 [world:MyMUD]
+world_type=mud
 hostname=mud.example.com
 port=4000
 user=username
@@ -121,6 +122,10 @@ auto_connect_type=connect
 keep_alive_type=nop
 keep_alive_cmd=
 ```
+
+`world_type` is one of `mud`, `mud_timed_prompt`, `slack` or `discord` (absent means
+`mud`). `prompt_wait_ms` (default 1000) applies to `mud_timed_prompt` worlds and is
+written only when changed from the default.
 
 ### Value Types
 

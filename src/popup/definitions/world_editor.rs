@@ -23,6 +23,9 @@ pub const WORLD_FIELD_KEEP_ALIVE: FieldId = FieldId(18);
 pub const WORLD_FIELD_KEEP_ALIVE_CMD: FieldId = FieldId(19);
 pub const WORLD_FIELD_GMCP_PACKAGES: FieldId = FieldId(20);
 pub const WORLD_FIELD_AUTO_RECONNECT: FieldId = FieldId(21);
+/// Only visible for `WorldType::MudTimedPrompt` - see `update_field_visibility`'s dedicated
+/// rule for it (not folded into `mud_fields`, which covers both MUD-family types).
+pub const WORLD_FIELD_PROMPT_WAIT_MS: FieldId = FieldId(22);
 pub const WORLD_FIELD_MSP_ENABLED: FieldId = FieldId(23);
 pub const WORLD_FIELD_MCP_ENABLED: FieldId = FieldId(24);
 pub const WORLD_FIELD_MCCP2_ENABLED: FieldId = FieldId(25);
@@ -46,6 +49,7 @@ pub const WORLD_BTN_CONNECT: ButtonId = ButtonId(4);
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WorldType {
     Mud,
+    MudTimedPrompt,
     Slack,
     Discord,
 }
@@ -53,6 +57,7 @@ pub enum WorldType {
 impl WorldType {
     pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
+            "mud_timed_prompt" => WorldType::MudTimedPrompt,
             "slack" => WorldType::Slack,
             "discord" => WorldType::Discord,
             _ => WorldType::Mud,
@@ -62,9 +67,16 @@ impl WorldType {
     pub fn as_str(&self) -> &'static str {
         match self {
             WorldType::Mud => "mud",
+            WorldType::MudTimedPrompt => "mud_timed_prompt",
             WorldType::Slack => "slack",
             WorldType::Discord => "discord",
         }
+    }
+
+    /// True for any MUD-family type (`Mud` and `MudTimedPrompt`) - see the identical
+    /// method on the other `WorldType` enum in `main.rs`.
+    pub fn is_mud(&self) -> bool {
+        matches!(self, WorldType::Mud | WorldType::MudTimedPrompt)
     }
 }
 
@@ -72,6 +84,7 @@ impl WorldType {
 pub fn world_type_options() -> Vec<SelectOption> {
     vec![
         SelectOption::new("mud", "MUD"),
+        SelectOption::new("mud_timed_prompt", "MUD - Timed Prompt"),
         SelectOption::new("slack", "Slack"),
         SelectOption::new("discord", "Discord"),
     ]
@@ -127,6 +140,9 @@ pub struct WorldSettings {
     pub msp_enabled: bool,
     pub mcp_enabled: bool,
     pub mccp2_enabled: bool,
+    /// Only meaningful for `world_type == "mud_timed_prompt"` - see the matching
+    /// `WorldSettings::prompt_wait_ms` (main.rs) doc comment.
+    pub prompt_wait_ms: u64,
     // Slack
     pub slack_token: String,
     pub slack_channel: String,
@@ -143,8 +159,9 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
     let world_type = WorldType::parse(&settings.world_type);
     let world_type_idx = match world_type {
         WorldType::Mud => 0,
-        WorldType::Slack => 1,
-        WorldType::Discord => 2,
+        WorldType::MudTimedPrompt => 1,
+        WorldType::Slack => 2,
+        WorldType::Discord => 3,
     };
 
     let encoding_idx = match settings.encoding.as_str() {
@@ -220,6 +237,14 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             WORLD_FIELD_AUTO_CONNECT,
             "Auto Login",
             FieldKind::select(auto_connect_options(), auto_connect_idx),
+        ))
+        .with_field(Field::new(
+            WORLD_FIELD_PROMPT_WAIT_MS,
+            "Prompt Wait (ms)",
+            // Text, not Number: this popup enters every numeric value (port,
+            // auto-reconnect) as text parsed on save, and a Number field can only be
+            // stepped by 1 with Left/Right - 1500 keypresses to reach 2500 ms.
+            FieldKind::text(settings.prompt_wait_ms.to_string()),
         ))
         .with_field(Field::new(
             WORLD_FIELD_KEEP_ALIVE,
@@ -306,7 +331,7 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             min_width: 50,
             max_width_percent: 70,
             center_horizontal: true,
-            // Top-aligned (matches world_selector.rs / setup.rs) — this popup has 24 fields
+            // Top-aligned (matches world_selector.rs / setup.rs) — this popup has 25 fields
             // and can otherwise size/position itself to overlap the input pane on a short
             // terminal (same fix as the /setup popup, see plan
             // `the-android-app-is-steady-sphinx.md`).
@@ -332,7 +357,7 @@ fn world_editor_help_text() -> Vec<String> {
         "",
         "World: A unique name for this connection.",
         "",
-        "Type: MUD (telnet game server), Slack, or Discord.",
+        "Type: MUD (telnet game server), MUD - Timed Prompt, Slack, or Discord.",
         "",
         "--- MUD Settings ---",
         "",
@@ -359,6 +384,15 @@ fn world_editor_help_text() -> Vec<String> {
         "  Prompt: Wait for prompts, send user then password.",
         "  MOO Prompt: Like Prompt but for MOO-style servers.",
         "  None: Don't auto-login.",
+        "",
+        "Prompt Wait (ms): MUD - Timed Prompt worlds only. How long",
+        "  to wait, after a line with no trailing newline stops",
+        "  growing, before promoting it to the input-area prompt.",
+        "  Default 1000. A plain MUD world never infers a prompt",
+        "  from silence at all - if the continuation arrives after",
+        "  the wait, the promoted prompt stays in the input area",
+        "  and the continuation displays as a new line; raise this",
+        "  value if that happens often.",
         "",
         "Keep Alive: Prevents idle disconnects.",
         "  NOP: Sends a telnet NOP (invisible to server).",
@@ -418,13 +452,20 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
     // Show/hide based on world type
     for id in mud_fields {
         if let Some(field) = def.get_field_mut(id) {
-            field.visible = world_type == WorldType::Mud;
+            field.visible = world_type.is_mud();
         }
     }
 
     // Keep-alive command only visible for MUD with custom keep-alive
     if let Some(field) = def.get_field_mut(WORLD_FIELD_KEEP_ALIVE_CMD) {
-        field.visible = world_type == WorldType::Mud && show_keep_alive_cmd;
+        field.visible = world_type.is_mud() && show_keep_alive_cmd;
+    }
+
+    // Prompt Wait only applies to Timed Prompt worlds - a plain MUD world never infers
+    // a prompt from silence at all, so the setting would be meaningless there (unlike
+    // mud_fields above, which cover both MUD-family types identically).
+    if let Some(field) = def.get_field_mut(WORLD_FIELD_PROMPT_WAIT_MS) {
+        field.visible = world_type == WorldType::MudTimedPrompt;
     }
 
     // Log file visible for all types
@@ -477,6 +518,9 @@ mod tests {
         assert!(state.field(WORLD_FIELD_MCP_ENABLED).unwrap().visible);
         // Same reasoning again - MCCP2 is a telnet-only concept.
         assert!(state.field(WORLD_FIELD_MCCP2_ENABLED).unwrap().visible);
+        // Prompt Wait only applies to MudTimedPrompt, not plain Mud - unlike
+        // MSP/MCP/MCCP2 above, this is NOT part of `is_mud()`'s shared visibility.
+        assert!(!state.field(WORLD_FIELD_PROMPT_WAIT_MS).unwrap().visible);
     }
 
     #[test]
@@ -499,5 +543,59 @@ mod tests {
         assert!(!state.field(WORLD_FIELD_MSP_ENABLED).unwrap().visible);
         assert!(!state.field(WORLD_FIELD_MCP_ENABLED).unwrap().visible);
         assert!(!state.field(WORLD_FIELD_MCCP2_ENABLED).unwrap().visible);
+        assert!(!state.field(WORLD_FIELD_PROMPT_WAIT_MS).unwrap().visible);
+    }
+
+    /// `WorldType::MudTimedPrompt` must behave exactly like `WorldType::Mud` for field
+    /// visibility (`is_mud()`) - MUD fields visible, Slack/Discord fields hidden -
+    /// same contract as `test_world_editor_mud` above. The one deliberate exception is
+    /// `WORLD_FIELD_PROMPT_WAIT_MS`, which is Timed-only (not folded into `mud_fields`).
+    #[test]
+    fn test_world_editor_mud_timed_prompt() {
+        let settings = WorldSettings {
+            name: "TimedMUD".to_string(),
+            world_type: "mud_timed_prompt".to_string(),
+            hostname: "mud.example.com".to_string(),
+            port: "4000".to_string(),
+            prompt_wait_ms: 2500,
+            ..Default::default()
+        };
+        let def = create_world_editor_popup(&settings);
+        let state = PopupState::new(def);
+
+        assert_eq!(state.get_text(WORLD_FIELD_NAME), Some("TimedMUD"));
+        assert_eq!(state.get_text(WORLD_FIELD_HOSTNAME), Some("mud.example.com"));
+        assert_eq!(state.get_text(WORLD_FIELD_PROMPT_WAIT_MS), Some("2500"));
+
+        // MUD fields should be visible, same as plain Mud.
+        assert!(state.field(WORLD_FIELD_HOSTNAME).unwrap().visible);
+        assert!(state.field(WORLD_FIELD_MSP_ENABLED).unwrap().visible);
+        assert!(state.field(WORLD_FIELD_MCP_ENABLED).unwrap().visible);
+        assert!(state.field(WORLD_FIELD_MCCP2_ENABLED).unwrap().visible);
+        // Prompt Wait is the one field visible ONLY for Timed, not plain Mud.
+        assert!(state.field(WORLD_FIELD_PROMPT_WAIT_MS).unwrap().visible);
+        // Slack fields should be hidden.
+        assert!(!state.field(WORLD_FIELD_SLACK_TOKEN).unwrap().visible);
+        assert!(!state.field(WORLD_FIELD_DISCORD_TOKEN).unwrap().visible);
+    }
+
+    /// `WorldType::parse`/`as_str`/`is_mud` round-trip table for all four variants -
+    /// mirrors the identical table test for the other `WorldType` enum in `main.rs`
+    /// (`tests::test_world_type_name_from_name_is_mud_table`).
+    #[test]
+    fn test_world_type_parse_as_str_is_mud_table() {
+        let cases: &[(&str, WorldType, bool)] = &[
+            ("mud", WorldType::Mud, true),
+            ("mud_timed_prompt", WorldType::MudTimedPrompt, true),
+            ("slack", WorldType::Slack, false),
+            ("discord", WorldType::Discord, false),
+        ];
+        for &(name, ty, is_mud) in cases {
+            assert_eq!(WorldType::parse(name), ty, "parse({name:?})");
+            assert_eq!(ty.as_str(), name, "{ty:?}.as_str()");
+            assert_eq!(ty.is_mud(), is_mud, "{ty:?}.is_mud()");
+        }
+        // An unrecognized value falls back to Mud, same contract as the other enum.
+        assert_eq!(WorldType::parse("not_a_real_type"), WorldType::Mud);
     }
 }

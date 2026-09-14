@@ -450,10 +450,12 @@ upgrading from an older Clay that used `~/.clay.dat`/`~/.clay.key.dat`/`~/clay.t
 those legacy dotfiles are migrated into `~/.clay/` automatically on first run. Per-world
 settings include:
 
+- World type (MUD, MUD - Timed Prompt, Slack, Discord)
 - Hostname, port, SSL toggle
 - Username/password for auto-login
 - Character encoding (UTF-8, Latin1, FANSI)
 - Auto-login type (Connect, Prompt, MOO_prompt)
+- Prompt wait, for MUD - Timed Prompt worlds whose server never marks its prompts
 - Keepalive type (NOP, Custom, Generic)
 - Log file path
 - TTS mode (Off, Local, Edge) and speaker whitelist

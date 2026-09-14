@@ -1227,13 +1227,13 @@ async fn handle_daemon_ws_message_impl(
                         // it after, mirroring the WsAsyncAction::Connect delegation pattern
                         // in main.rs (which ultimately calls into the same two functions).
                         let world_type = app.worlds[world_index].settings.world_type.clone();
-                        if !matches!(world_type, WorldType::Mud) {
+                        if !world_type.is_mud() {
                             let prev_index = app.current_world_index;
                             app.current_world_index = world_index;
                             let connected = match world_type {
                                 WorldType::Slack => connect_slack(app, event_tx.clone()).await,
                                 WorldType::Discord => connect_discord(app, event_tx.clone()).await,
-                                WorldType::Mud => unreachable!(),
+                                WorldType::Mud | WorldType::MudTimedPrompt => unreachable!(),
                             };
                             app.current_world_index = prev_index;
                             if connected {
@@ -1908,11 +1908,13 @@ async fn handle_daemon_ws_message_impl(
         WsMessage::DeleteWorld { world_index } => {
             app.delete_world(world_index);
         }
-        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled } => {
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs, msp_enabled, mcp_enabled, mccp2_enabled, world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace, discord_token, discord_guild, discord_channel, discord_dm_user } => {
             app.update_world_settings(
                 world_index, name, hostname, port, user, password, use_ssl, log_enabled,
                 encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages, auto_reconnect_secs,
                 msp_enabled, mcp_enabled, mccp2_enabled,
+                world_type, prompt_wait_ms, slack_token, slack_channel, slack_workspace,
+                discord_token, discord_guild, discord_channel, discord_dm_user,
             );
         }
         WsMessage::CalculateNextWorld { current_index } => {
@@ -2319,14 +2321,19 @@ keep_alive_type=Generic
                                 None => Encoding::Utf8,
                             };
                             let prompt_text = encoding.decode(&prompt_bytes);
-                            conn.prompt = prompt_text.trim_end().to_string() + " ";
+                            // Same rule as App::handle_prompt_text: a marker with nothing
+                            // visible before it (whitespace/colour codes only) leaves the
+                            // current prompt in place rather than replacing it with " ".
+                            if crate::util::prompt_has_visible_text(&prompt_text) {
+                                conn.prompt = prompt_text.trim_end().to_string() + " ";
 
-                            // Send prompt update to this user
-                            if let Some(ws) = &app.ws_server {
-                                ws.broadcast_to_owner(WsMessage::PromptUpdate {
-                                    world_index,
-                                    prompt: conn.prompt.clone(),
-                                }, Some(&username));
+                                // Send prompt update to this user
+                                if let Some(ws) = &app.ws_server {
+                                    ws.broadcast_to_owner(WsMessage::PromptUpdate {
+                                        world_index,
+                                        prompt: conn.prompt.clone(),
+                                    }, Some(&username));
+                                }
                             }
                         }
                     }
@@ -2983,6 +2990,19 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     msp_enabled: world.settings.msp_enabled,
                     mcp_enabled: world.settings.mcp_enabled,
                     mccp2_enabled: world.settings.mccp2_enabled,
+                    // world_type/prompt_wait_ms aren't credentials - visible to every
+                    // client the same as use_ssl/encoding above, owner or not.
+                    world_type: world.settings.world_type.name().to_string(),
+                    prompt_wait_ms: world.settings.prompt_wait_ms,
+                    // Tokens are credentials - never sent to any client, same as
+                    // password above (not just owner-gated like hostname/keep_alive_cmd).
+                    slack_token: String::new(),
+                    slack_channel: if is_owner { world.settings.slack_channel.clone() } else { String::new() },
+                    slack_workspace: if is_owner { world.settings.slack_workspace.clone() } else { String::new() },
+                    discord_token: String::new(),
+                    discord_guild: if is_owner { world.settings.discord_guild.clone() } else { String::new() },
+                    discord_channel: if is_owner { world.settings.discord_channel.clone() } else { String::new() },
+                    discord_dm_user: if is_owner { world.settings.discord_dm_user.clone() } else { String::new() },
                 },
                 last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),

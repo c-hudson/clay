@@ -8857,7 +8857,11 @@ third
 
     /// `WorldSettingsUpdated` must rename the mirrored world and hydrate the same
     /// `WorldSettings` fields `world_from_state_msg` hydrates at connect time - never the
-    /// password, which this message always carries empty.
+    /// password, which this message always carries empty. Also covers `world_type` and
+    /// `prompt_wait_ms`/the Slack/Discord fields (investigate-differences-between-
+    /// tinyfugu-fluffy-stallman.md Job B): the SSH remote-console mirror used to never
+    /// hydrate `world_type` at all here, which would silently leave a converted world's
+    /// mirror stale until the next reconnect.
     #[test]
     fn test_console_mirror_world_settings_updated_renames_and_hydrates_settings() {
         let mut app = App::new();
@@ -8882,6 +8886,15 @@ third
             msp_enabled: true,
             mcp_enabled: true,
             mccp2_enabled: true,
+            world_type: "mud_timed_prompt".to_string(),
+            prompt_wait_ms: 2500,
+            slack_token: "xoxb-token".to_string(),
+            slack_channel: "#general".to_string(),
+            slack_workspace: "acme".to_string(),
+            discord_token: "disc-token".to_string(),
+            discord_guild: "guild1".to_string(),
+            discord_channel: "chan1".to_string(),
+            discord_dm_user: "user1".to_string(),
         };
         app.handle_remote_ws_message(WsMessage::WorldSettingsUpdated {
             world_index: 0,
@@ -8898,6 +8911,16 @@ third
         assert_eq!(app.worlds[0].settings.encoding, Encoding::Latin1);
         assert!(app.worlds[0].settings.password.is_empty(),
             "password must never be touched by this message");
+        assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt,
+            "world_type must be hydrated - this mirror used to never touch it at all");
+        assert_eq!(app.worlds[0].settings.prompt_wait_ms, 2500);
+        assert_eq!(app.worlds[0].settings.slack_token, "xoxb-token");
+        assert_eq!(app.worlds[0].settings.slack_channel, "#general");
+        assert_eq!(app.worlds[0].settings.slack_workspace, "acme");
+        assert_eq!(app.worlds[0].settings.discord_token, "disc-token");
+        assert_eq!(app.worlds[0].settings.discord_guild, "guild1");
+        assert_eq!(app.worlds[0].settings.discord_channel, "chan1");
+        assert_eq!(app.worlds[0].settings.discord_dm_user, "user1");
     }
 
     /// Old-peer compat: `WorldSettingsMsg::mccp2_enabled` must default to `true` (compression
@@ -8944,6 +8967,140 @@ third
             }
             other => panic!("expected UpdateWorldSettings, got {other:?}"),
         }
+    }
+
+    /// investigate-differences-between-tinyfugu-fluffy-stallman.md Job B: an older peer's
+    /// `WorldSettingsMsg` predating world-type-selectable-everywhere must resolve
+    /// `world_type` to `"mud"` and `prompt_wait_ms` to `DEFAULT_PROMPT_WAIT_MS` (1000),
+    /// same modeling as `test_world_settings_msg_mccp2_enabled_defaults_true_when_absent`
+    /// above - a literal `false`/`0` via plain `serde(default)` would be wrong for both.
+    #[test]
+    fn test_world_settings_msg_world_type_and_prompt_wait_ms_default_when_absent() {
+        let json = r#"{
+            "hostname": "mud.example.com",
+            "port": "4000",
+            "user": "",
+            "use_ssl": false,
+            "log_enabled": false,
+            "encoding": "utf8",
+            "auto_connect_type": "connect",
+            "keep_alive_type": "nop",
+            "keep_alive_cmd": ""
+        }"#;
+        let settings: WorldSettingsMsg = serde_json::from_str(json).expect("deserialize WorldSettingsMsg");
+        assert_eq!(settings.world_type, "mud", "an older peer's omitted world_type must resolve to \"mud\"");
+        assert_eq!(settings.prompt_wait_ms, crate::DEFAULT_PROMPT_WAIT_MS,
+            "an older peer's omitted prompt_wait_ms must resolve to DEFAULT_PROMPT_WAIT_MS");
+        assert!(settings.slack_token.is_empty());
+        assert!(settings.discord_token.is_empty());
+    }
+
+    /// Same old-peer compat contract for `WsMessage::UpdateWorldSettings` (client -> server) -
+    /// here empty `world_type` means "leave unchanged" (see its doc comment in
+    /// websocket.rs), which `test_update_world_settings_absent_world_type_leaves_slack_world_slack`
+    /// below exercises end to end through `App::update_world_settings`.
+    #[test]
+    fn test_update_world_settings_world_type_and_prompt_wait_ms_default_when_absent() {
+        let json = r#"{
+            "type": "UpdateWorldSettings",
+            "world_index": 0,
+            "name": "test",
+            "hostname": "mud.example.com",
+            "port": "4000",
+            "user": "",
+            "password": "",
+            "use_ssl": false,
+            "log_enabled": false,
+            "encoding": "utf8",
+            "auto_login": "connect",
+            "keep_alive_type": "nop",
+            "keep_alive_cmd": ""
+        }"#;
+        match serde_json::from_str::<WsMessage>(json).expect("deserialize UpdateWorldSettings") {
+            WsMessage::UpdateWorldSettings { world_type, prompt_wait_ms, slack_token, discord_token, .. } => {
+                assert_eq!(world_type, "", "an older peer's omitted world_type must deserialize empty (= leave unchanged)");
+                assert_eq!(prompt_wait_ms, crate::DEFAULT_PROMPT_WAIT_MS);
+                assert!(slack_token.is_empty());
+                assert!(discord_token.is_empty());
+            }
+            other => panic!("expected UpdateWorldSettings, got {other:?}"),
+        }
+    }
+
+    /// The explicit contract from CLAUDE.md/the plan: an `UpdateWorldSettings` that omits
+    /// `world_type` (empty string) must never convert a Slack world to MUD - the exact
+    /// regression an older client (or a save from an editor that never showed a Type
+    /// control) would otherwise cause.
+    #[test]
+    fn test_update_world_settings_absent_world_type_leaves_slack_world_slack() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].settings.world_type = WorldType::Slack;
+        app.worlds[0].settings.slack_token = "xoxb-existing".to_string();
+
+        app.update_world_settings(
+            0, "alpha".to_string(), String::new(), String::new(), String::new(),
+            String::new(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(), true, true, true,
+            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
+        );
+
+        assert_eq!(app.worlds[0].settings.world_type, WorldType::Slack,
+            "an empty incoming world_type must be treated as 'field not touched', not 'convert to MUD'");
+        assert_eq!(app.worlds[0].settings.slack_token, "xoxb-existing",
+            "an empty incoming slack_token must likewise be treated as 'field not touched'");
+    }
+
+    /// A save that DOES send a real `world_type`/`prompt_wait_ms`/token must apply all
+    /// three - the positive counterpart to the "leave unchanged" test above.
+    #[test]
+    fn test_update_world_settings_applies_world_type_prompt_wait_ms_and_slack_token() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+
+        app.update_world_settings(
+            0, "alpha".to_string(), String::new(), String::new(), String::new(),
+            String::new(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(), true, true, true,
+            "mud_timed_prompt".to_string(), 2500, "xoxb-new".to_string(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
+        );
+
+        assert_eq!(app.worlds[0].settings.world_type, WorldType::MudTimedPrompt);
+        assert_eq!(app.worlds[0].settings.prompt_wait_ms, 2500);
+        assert_eq!(app.worlds[0].settings.slack_token, "xoxb-new");
+    }
+
+    /// A world_type change away from `MudTimedPrompt` must clear any parked
+    /// `timed_prompt_since` - otherwise a promotion could still fire for a partial that
+    /// was parked while the type was still Timed (see `App::promote_due_timed_prompts`'s
+    /// gating on `world_type == MudTimedPrompt`, which no longer matches, but the stale
+    /// timer would still be armed).
+    #[test]
+    fn test_update_world_settings_type_change_away_from_timed_clears_timed_prompt_since() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("alpha"));
+        app.worlds[0].settings.world_type = WorldType::MudTimedPrompt;
+        app.worlds[0].timed_prompt_since = Some(std::time::Instant::now());
+
+        app.update_world_settings(
+            0, "alpha".to_string(), String::new(), String::new(), String::new(),
+            String::new(), false, false,
+            "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
+            String::new(), "0".to_string(), true, true, true,
+            "mud".to_string(), 1000, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
+        );
+
+        assert_eq!(app.worlds[0].settings.world_type, WorldType::Mud);
+        assert!(app.worlds[0].timed_prompt_since.is_none(),
+            "a type change away from MudTimedPrompt must clear the parked promotion timer");
     }
 
     /// `NotesChanged`/`PausedState` are explicit no-ops for this mirror (T1.13): it holds no
@@ -9062,6 +9219,8 @@ third
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
+            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -9080,6 +9239,8 @@ third
             "myuser".to_string(), "ENC:whatever".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
+            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
         );
 
         assert_eq!(app.worlds[0].settings.password, "hunter2",
@@ -9098,6 +9259,8 @@ third
             "myuser".to_string(), "newpassword".to_string(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, true,
+            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
         );
 
         assert_eq!(app.worlds[0].settings.password, "newpassword",
@@ -9174,6 +9337,8 @@ third
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, false,
+            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
         );
         assert!(!app.worlds[0].settings.mccp2_enabled);
         match rx.try_recv() {
@@ -9190,6 +9355,8 @@ third
             "myuser".to_string(), String::new(), false, false,
             "utf8".to_string(), "manual".to_string(), "none".to_string(), String::new(),
             String::new(), "0".to_string(), true, true, false,
+            String::new(), 1000, String::new(), String::new(), String::new(),
+            String::new(), String::new(), String::new(), String::new(),
         );
         assert!(rx.try_recv().is_err(), "an unchanged save must not re-send the toggle");
     }
@@ -10167,76 +10334,74 @@ third
             "end_seq present is what marks the seq as real - seq 0 is a legitimate value");
     }
 
-    /// Aardwolf's login prompt carries no GA/EOR/WONT-ECHO — and cannot, since the
-    /// per-character option that would enable one belongs to a character that does not
-    /// exist until after login. `handle_idle_prompt` is the fallback that lets auto-login
-    /// advance anyway, driven by the reader's idle flush.
-    fn idle_prompt_world(auto: crate::telnet::AutoConnectType) -> App {
-        let mut app = App::new();
-        app.worlds.clear();
-        let mut w = World::new("w");
-        w.connected = true;
-        w.settings.auto_connect_type = auto;
-        w.settings.user = "myname".to_string();
-        w.settings.password = "secret".to_string();
-        app.worlds.push(w);
-        app.current_world_index = 0;
-        app
-    }
-
-    /// Regression: the idle-flush inference must never overwrite a prompt that arrived
+    /// Regression: timed-prompt inference must never overwrite a prompt that arrived
     /// with a real telnet marker. On a marking world, ANY trailing bytes without a
     /// newline — a colour reset, the start of the next line — would otherwise be taken
     /// as a new prompt. A bare `\x1b[0m` after `> ` replaced the prompt with an
-    /// invisible ANSI-only string, which renders as a blank prompt.
+    /// invisible ANSI-only string, which renders as a blank prompt. (Formerly this was
+    /// the idle-flush inference's job; the contract carries over unchanged to
+    /// `App::promote_due_timed_prompts`, gated by `seen_prompt_marker` exactly as before.)
     #[test]
-    fn test_idle_inference_never_overwrites_a_marker_prompt() {
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+    fn test_timed_inference_never_overwrites_a_marker_prompt() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
 
         // A real marker prompt.
-        app.handle_prompt(0, b"> ");
+        app.handle_prompt(0, b"> ", crate::PromptSource::Marker);
         assert_eq!(app.worlds[0].prompt, "> ");
         assert!(app.worlds[0].protocol.seen_prompt_marker,
             "a marker prompt must record that this world marks its prompts");
 
-        // Trailing junk the idle flush would otherwise call a prompt.
-        app.handle_idle_prompt(0, b"\x1b[0m");
+        // Trailing junk that timed inference would otherwise call a prompt.
+        app.process_server_data(0, b"\x1b[0m", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since
+            .expect("a Timed world still arms on a parked partial even with seen_prompt_marker set");
+        assert!(!app.promote_due_timed_prompts(since + Duration::from_secs(10)),
+            "a world that marks its prompts must never be promoted by timed inference");
         assert_eq!(app.worlds[0].prompt, "> ", "inference must not clobber a marker prompt");
-        app.handle_idle_prompt(0, b"partial");
+
+        app.process_server_data(0, b"partial", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+        assert!(!app.promote_due_timed_prompts(since + Duration::from_secs(10)));
         assert_eq!(app.worlds[0].prompt, "> ");
     }
 
     /// ...but a world that never marks its prompts (Aardwolf) must keep working, and one
-    /// inferred prompt must not switch inference off for the rest of the connection.
+    /// promoted prompt must not switch inference off for the rest of the connection.
     #[test]
-    fn test_idle_inference_stays_on_for_a_world_with_no_markers() {
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+    fn test_timed_inference_stays_on_for_a_world_with_no_markers() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
 
-        app.handle_idle_prompt(0, b"What be thy name? ");
+        app.process_server_data(0, b"What be thy name? ", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+        assert!(app.promote_due_timed_prompts(since + Duration::from_secs(2)));
         assert_eq!(app.worlds[0].prompt, "What be thy name? ");
         assert!(!app.worlds[0].protocol.seen_prompt_marker,
-            "an inferred prompt is not a marker and must not disable further inference");
+            "a timed promotion is not a marker and must not disable further inference");
 
-        app.handle_idle_prompt(0, b"Password: ");
+        app.process_server_data(0, b"Password: ", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+        assert!(app.promote_due_timed_prompts(since + Duration::from_secs(2)));
         assert_eq!(app.worlds[0].prompt, "Password: ", "inference must still be active");
     }
 
-    /// An idle-detected prompt must be indistinguishable from a marker (GA/EOR) one: same
+    /// A timed-promoted prompt must be indistinguishable from a marker (GA/EOR) one: same
     /// input-area prompt line, same auto-login sequencing, same absence from the output
     /// buffer. The only difference is where the boundary came from.
     #[test]
-    fn test_idle_prompt_matches_marker_prompt_exactly() {
-        let mut idle = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
-        let mut marker = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
+    fn test_timed_prompt_matches_marker_prompt_exactly() {
+        let mut timed = timed_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        let mut marker = timed_prompt_world(crate::telnet::AutoConnectType::Prompt);
 
-        idle.handle_idle_prompt(0, b"What be thy name? ");
-        marker.handle_prompt(0, b"What be thy name? ");
+        timed.process_server_data(0, b"What be thy name? ", 24, 80, false);
+        let since = timed.worlds[0].timed_prompt_since.unwrap();
+        assert!(timed.promote_due_timed_prompts(since + Duration::from_secs(2)));
+        marker.handle_prompt(0, b"What be thy name? ", crate::PromptSource::Marker);
 
-        assert_eq!(idle.worlds[0].prompt, marker.worlds[0].prompt,
+        assert_eq!(timed.worlds[0].prompt, marker.worlds[0].prompt,
             "the prompt line must match a marker prompt");
-        assert_eq!(idle.worlds[0].prompt_count, marker.worlds[0].prompt_count,
+        assert_eq!(timed.worlds[0].prompt_count, marker.worlds[0].prompt_count,
             "auto-login sequencing must match a marker prompt");
-        assert_eq!(idle.worlds[0].output_lines.len(), marker.worlds[0].output_lines.len(),
+        assert_eq!(timed.worlds[0].output_lines.len(), marker.worlds[0].output_lines.len(),
             "neither may leave the prompt sitting in the output buffer");
     }
 
@@ -10245,21 +10410,316 @@ third
     /// prompt, leaving it there would prepend it to whatever the server sends next. A
     /// marker prompt never reaches that buffer at all (`extract_prompt` drains it).
     #[test]
-    fn test_idle_prompt_clears_the_parked_partial() {
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
-        app.worlds[0].trigger_partial_line = "What be thy name? ".to_string();
-        app.handle_idle_prompt(0, b"What be thy name? ");
+    fn test_timed_prompt_clears_the_parked_partial() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::Prompt);
+        app.process_server_data(0, b"What be thy name? ", 24, 80, false);
+        assert_eq!(app.worlds[0].trigger_partial_line, "What be thy name? ");
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+        assert!(app.promote_due_timed_prompts(since + Duration::from_secs(2)));
         assert!(app.worlds[0].trigger_partial_line.is_empty(),
             "the parked partial must not survive being turned into a prompt");
     }
 
     #[test]
-    fn test_idle_prompt_drives_auto_login_sequence() {
-        let mut app = idle_prompt_world(crate::telnet::AutoConnectType::Prompt);
-        app.handle_idle_prompt(0, b"name? ");
+    fn test_timed_prompt_drives_auto_login_sequence() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::Prompt);
+
+        app.process_server_data(0, b"name? ", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+        assert!(app.promote_due_timed_prompts(since + Duration::from_secs(2)));
         assert_eq!(app.worlds[0].prompt_count, 1, "first prompt is the username step");
-        app.handle_idle_prompt(0, b"password? ");
+
+        app.process_server_data(0, b"password? ", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+        assert!(app.promote_due_timed_prompts(since + Duration::from_secs(2)));
         assert_eq!(app.worlds[0].prompt_count, 2, "second prompt is the password step");
+    }
+
+    /// A `WorldType::MudTimedPrompt` world with auto-login credentials set, connected -
+    /// used by every timed-prompt-inference test below.
+    fn timed_prompt_world(auto: crate::telnet::AutoConnectType) -> App {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = true;
+        w.settings.world_type = WorldType::MudTimedPrompt;
+        w.settings.auto_connect_type = auto;
+        w.settings.user = "myname".to_string();
+        w.settings.password = "secret".to_string();
+        app.worlds.push(w);
+        app.current_world_index = 0;
+        app
+    }
+
+    /// The reported bug, as a regression: a plain `Mud` world (never Timed) fed a line
+    /// split across two `process_server_data` calls with a >1s gap between them must
+    /// never arm timed-prompt inference, must never promote a bogus prompt from the
+    /// silence, and the split line must rejoin into exactly one output line rather than
+    /// having its prefix stolen into `World::prompt` and its suffix emitted as a new,
+    /// truncated line.
+    #[test]
+    fn test_plain_mud_world_never_arms_or_promotes_timed_prompt_on_split_line() {
+        let mut app = App::new();
+        app.worlds.clear();
+        let mut w = World::new("w");
+        w.connected = true;
+        // world_type defaults to WorldType::Mud - the point of this test.
+        app.worlds.push(w);
+        app.current_world_index = 0;
+
+        app.process_server_data(0, b"Enter your na", 24, 80, false);
+        assert!(app.worlds[0].timed_prompt_since.is_none(),
+            "a plain Mud world must never arm timed-prompt inference");
+
+        // A >1s gap with nothing else happening.
+        let later = std::time::Instant::now() + Duration::from_millis(1200);
+        assert!(!app.promote_due_timed_prompts(later),
+            "a plain Mud world must never promote a prompt from silence");
+        assert!(app.worlds[0].prompt.is_empty(), "prompt must stay empty");
+        assert_eq!(app.worlds[0].prompt_count, 0, "prompt_count must not increment");
+
+        app.process_server_data(0, b"me: Bob\r\n", 24, 80, false);
+        assert_eq!(app.worlds[0].output_lines.len(), 1,
+            "the split line must rejoin into exactly one line, not a truncated prefix \
+             lost to a bogus prompt plus a separate suffix line");
+        assert_eq!(app.worlds[0].output_lines[0].text, "Enter your name: Bob");
+    }
+
+    /// A Timed Prompt world must arm `timed_prompt_since` the moment `process_server_data`
+    /// parks a partial line.
+    #[test]
+    fn test_timed_prompt_world_arms_on_parked_partial() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        assert!(app.worlds[0].timed_prompt_since.is_none());
+        app.process_server_data(0, b"login: ", 24, 80, false);
+        assert!(app.worlds[0].timed_prompt_since.is_some(),
+            "a Timed Prompt world must arm on a parked partial line");
+        assert_eq!(app.worlds[0].trigger_partial_line, "login: ");
+    }
+
+    /// A partial that grows (more bytes arrive, still no newline) must restart the wait
+    /// from the new arrival, not keep counting from when the first fragment showed up.
+    #[test]
+    fn test_timed_prompt_since_restarts_when_partial_grows() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"log", 24, 80, false);
+        let first = app.worlds[0].timed_prompt_since.expect("armed on first fragment");
+        std::thread::sleep(Duration::from_millis(5));
+        app.process_server_data(0, b"in: ", 24, 80, false);
+        let second = app.worlds[0].timed_prompt_since.expect("still armed after growing");
+        assert!(second > first, "a growing partial must restart the wait");
+        assert_eq!(app.worlds[0].trigger_partial_line, "login: ");
+    }
+
+    /// A packet that completes the line (terminates it with a newline) must disarm
+    /// promotion immediately - the continuation cancels the inference.
+    #[test]
+    fn test_timed_prompt_since_disarms_when_line_completes() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"login: ", 24, 80, false);
+        assert!(app.worlds[0].timed_prompt_since.is_some());
+        app.process_server_data(0, b"\r\n", 24, 80, false);
+        assert!(app.worlds[0].timed_prompt_since.is_none(),
+            "a completed line must disarm timed-prompt promotion");
+    }
+
+    /// Promotion must wait the full `prompt_wait_ms` (default 1000) - not a moment sooner.
+    #[test]
+    fn test_timed_prompt_promotion_waits_the_full_wait_ms() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"login: ", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+
+        assert!(!app.promote_due_timed_prompts(since + Duration::from_millis(999)),
+            "must not promote before the full default wait has elapsed");
+        assert!(app.worlds[0].prompt.is_empty());
+
+        assert!(app.promote_due_timed_prompts(since + Duration::from_millis(1000)),
+            "must promote once the full default wait has elapsed");
+        assert_eq!(app.worlds[0].prompt, "login: ");
+    }
+
+    /// A custom `prompt_wait_ms` must be honoured instead of the 1000ms default.
+    #[test]
+    fn test_timed_prompt_promotion_honours_custom_wait_ms() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.worlds[0].settings.prompt_wait_ms = 200;
+        app.process_server_data(0, b"login: ", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+
+        assert!(!app.promote_due_timed_prompts(since + Duration::from_millis(199)));
+        assert!(app.promote_due_timed_prompts(since + Duration::from_millis(200)));
+    }
+
+    /// A disconnected world must never be promoted, even past its deadline.
+    #[test]
+    fn test_timed_prompt_promotion_requires_connected() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"login: ", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+        app.worlds[0].connected = false;
+
+        assert!(!app.promote_due_timed_prompts(since + Duration::from_secs(10)),
+            "a disconnected world must never be promoted");
+        assert!(app.worlds[0].prompt.is_empty());
+    }
+
+    /// A world that has already delivered a real marker prompt must never be promoted by
+    /// timed inference, even with a stale armed deadline - and the parked partial is left
+    /// untouched (not silently cleared), since it may still be genuine mid-line output
+    /// waiting for its completion.
+    #[test]
+    fn test_timed_prompt_promotion_gated_by_seen_prompt_marker() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.process_server_data(0, b"login: ", 24, 80, false);
+        app.worlds[0].protocol.seen_prompt_marker = true;
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+
+        assert!(!app.promote_due_timed_prompts(since + Duration::from_secs(10)),
+            "a world that marks its prompts must never be promoted by timed inference");
+        assert_eq!(app.worlds[0].trigger_partial_line, "login: ",
+            "the parked partial must be left untouched, not silently cleared");
+        assert!(app.worlds[0].prompt.is_empty());
+    }
+
+    /// A timed promotion must broadcast `PromptUpdate`, same as a marker prompt does.
+    #[test]
+    fn test_timed_prompt_promotion_broadcasts_prompt_update() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        let (_client_id, mut rx) = phase_c_register_client(&mut app);
+        app.process_server_data(0, b"login: ", 24, 80, false);
+        let since = app.worlds[0].timed_prompt_since.unwrap();
+
+        assert!(app.promote_due_timed_prompts(since + Duration::from_secs(2)));
+        let msgs = drain_ws_messages(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m,
+            crate::websocket::WsMessage::PromptUpdate { prompt, .. } if prompt == "login: ")),
+            "a timed promotion must broadcast PromptUpdate. Got: {msgs:?}");
+    }
+
+    /// `next_timed_prompt_deadline` must be the min over every eligible world, not just
+    /// the first one found.
+    #[test]
+    fn test_next_timed_prompt_deadline_is_min_over_eligible_worlds() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        let mut w2 = World::new("w2");
+        w2.connected = true;
+        w2.settings.world_type = WorldType::MudTimedPrompt;
+        app.worlds.push(w2);
+
+        app.process_server_data(0, b"first: ", 24, 80, false);
+        std::thread::sleep(Duration::from_millis(5));
+        app.process_server_data(1, b"second: ", 24, 80, false);
+
+        let deadline_of = |app: &App, idx: usize| {
+            app.worlds[idx].timed_prompt_since.unwrap()
+                + Duration::from_millis(app.worlds[idx].settings.prompt_wait_ms)
+        };
+        let d0 = deadline_of(&app, 0);
+        let d1 = deadline_of(&app, 1);
+        assert!(d0 < d1, "precondition: world 0 armed first and so is due first");
+        assert_eq!(app.next_timed_prompt_deadline(), Some(d0),
+            "the earlier-armed world's deadline must win");
+    }
+
+    /// A marker with nothing visible before it - a MUD's trailing `\x1b[0m` + GA after
+    /// unsolicited output, or a lone space - is not a prompt. The telnet layer already
+    /// emits nothing for a bare GA after a newline; this is the same case. Before this
+    /// the prompt became `normalize_prompt("\x1b[0m")`, an invisible single space, so a
+    /// world that marks its prompts ended up with a one-column empty prompt over time.
+    #[test]
+    fn test_marker_prompt_with_nothing_visible_keeps_the_current_prompt() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.worlds[0].settings.world_type = WorldType::Mud;
+        app.handle_prompt(0, b"> ", crate::PromptSource::Marker);
+        assert_eq!(app.worlds[0].prompt, "> ");
+        let count = app.worlds[0].prompt_count;
+
+        for junk in [&b"\x1b[0m"[..], b" ", b"\x1b[0m \x1b[31m", b"\t "] {
+            app.handle_prompt(0, junk, crate::PromptSource::Marker);
+            assert_eq!(app.worlds[0].prompt, "> ",
+                "{:?} before a marker must not replace the prompt", String::from_utf8_lossy(junk));
+            assert_eq!(app.worlds[0].prompt_count, count,
+                "an invisible marker must not count toward auto-login");
+        }
+        // It is still a real observation that this server marks its prompts.
+        app.worlds[0].protocol.seen_prompt_marker = false;
+        app.handle_prompt(0, b"\x1b[0m", crate::PromptSource::Marker);
+        assert!(app.worlds[0].protocol.seen_prompt_marker);
+        // A later real prompt still replaces it.
+        app.handle_prompt(0, b"HP:10> ", crate::PromptSource::Marker);
+        assert_eq!(app.worlds[0].prompt, "HP:10> ");
+    }
+
+    /// Same rule for a timed promotion: a parked whitespace-only partial is dropped,
+    /// not shown as an empty prompt.
+    #[test]
+    fn test_timed_promotion_of_whitespace_only_partial_is_not_a_prompt() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.handle_prompt(0, b" ", crate::PromptSource::Timed);
+        assert_eq!(app.worlds[0].prompt, "");
+        assert_eq!(app.worlds[0].prompt_count, 0);
+    }
+
+    /// A disconnected world shows prompts as output lines; an invisible one must not
+    /// push an empty-looking line either.
+    #[test]
+    fn test_invisible_marker_prompt_on_disconnected_world_adds_no_output_line() {
+        let mut app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        app.worlds[0].connected = false;
+        let before = app.worlds[0].output_lines.len();
+        app.handle_prompt(0, b"\x1b[0m", crate::PromptSource::Marker);
+        assert_eq!(app.worlds[0].output_lines.len(), before);
+    }
+
+    /// Only `PromptSource::Marker` is a real observation of the server marking its
+    /// prompts; `PromptSource::Timed` is an inference and must never set
+    /// `seen_prompt_marker`, or the very first timed promotion would disable inference
+    /// for the rest of the connection.
+    #[test]
+    fn test_prompt_source_marker_sets_seen_marker_timed_does_not() {
+        let mut marker_app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        marker_app.handle_prompt(0, b"> ", crate::PromptSource::Marker);
+        assert!(marker_app.worlds[0].protocol.seen_prompt_marker,
+            "PromptSource::Marker must set seen_prompt_marker");
+
+        let mut timed_app = timed_prompt_world(crate::telnet::AutoConnectType::NoLogin);
+        timed_app.handle_prompt(0, b"> ", crate::PromptSource::Timed);
+        assert!(!timed_app.worlds[0].protocol.seen_prompt_marker,
+            "PromptSource::Timed is an inference, not an observation, and must not set the marker");
+    }
+
+    /// `ProtocolState::clear()` must reset `seen_prompt_marker` for a fresh connection -
+    /// otherwise a reconnect to a world that happened to mark its very first prompt would
+    /// permanently disable timed-prompt inference even if the new connection never marks
+    /// anything.
+    #[test]
+    fn test_protocol_state_clear_resets_seen_prompt_marker() {
+        let mut protocol = crate::protocol_state::ProtocolState {
+            seen_prompt_marker: true,
+            ..Default::default()
+        };
+        protocol.clear();
+        assert!(!protocol.seen_prompt_marker,
+            "clear() must reset seen_prompt_marker for a fresh connection");
+    }
+
+    /// `WorldType::name`/`from_name`/`is_mud` round-trip table for all four variants.
+    #[test]
+    fn test_world_type_name_from_name_is_mud_table() {
+        let cases: &[(&str, WorldType, bool)] = &[
+            ("mud", WorldType::Mud, true),
+            ("mud_timed_prompt", WorldType::MudTimedPrompt, true),
+            ("slack", WorldType::Slack, false),
+            ("discord", WorldType::Discord, false),
+        ];
+        for (name, ty, is_mud) in cases {
+            assert_eq!(WorldType::from_name(name), *ty, "from_name({name:?})");
+            assert_eq!(ty.name(), *name, "{ty:?}.name()");
+            assert_eq!(ty.is_mud(), *is_mud, "{ty:?}.is_mud()");
+        }
+        assert!(matches!(WorldType::from_name("not_a_real_type"), WorldType::Mud),
+            "an unrecognized world_type name must fall back to Mud");
     }
 
     /// `handle_prompt` on a disconnected world renders the prompt as an output line and used
@@ -10274,7 +10734,7 @@ third
         app.current_world_index = 0;
         let (_client_id, mut rx) = phase_c_register_client(&mut app);
 
-        app.handle_prompt(0, b"login: ");
+        app.handle_prompt(0, b"login: ", crate::PromptSource::Marker);
 
         let sent = drain_server_data(&mut rx);
         assert!(sent.iter().any(|(_, _, d)| d.contains("login:")),
@@ -10997,7 +11457,7 @@ third
         app.current_world_index = 0;
         app.settings.more_mode_enabled = true;
 
-        app.handle_prompt(0, b"> ");
+        app.handle_prompt(0, b"> ", crate::PromptSource::Marker);
 
         assert!(app.worlds[0].output_lines.is_empty(),
             "the prompt must not jump ahead of the still-queued backlog into output_lines");

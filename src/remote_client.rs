@@ -1870,6 +1870,26 @@ pub(crate) fn handle_remote_client_key(
                 let idx = settings.world_index;
                 if idx < app.worlds.len() {
                     app.worlds[idx].name = settings.name.clone();
+                    // Update world type. A change away from MudTimedPrompt invalidates
+                    // any parked timed-prompt promotion, mirroring the same guard in
+                    // App::update_world_settings and input_handler.rs's local console
+                    // apply - this mirror was previously the one place that never
+                    // hydrated world_type at all, silently converting a Slack/Discord
+                    // world back to MUD on every remote save.
+                    let new_world_type = crate::WorldType::from_name(&settings.world_type);
+                    if app.worlds[idx].settings.world_type == crate::WorldType::MudTimedPrompt
+                        && new_world_type != crate::WorldType::MudTimedPrompt {
+                        app.worlds[idx].timed_prompt_since = None;
+                    }
+                    app.worlds[idx].settings.world_type = new_world_type;
+                    app.worlds[idx].settings.prompt_wait_ms = settings.prompt_wait_ms;
+                    app.worlds[idx].settings.slack_token = settings.slack_token.clone();
+                    app.worlds[idx].settings.slack_channel = settings.slack_channel.clone();
+                    app.worlds[idx].settings.slack_workspace = settings.slack_workspace.clone();
+                    app.worlds[idx].settings.discord_token = settings.discord_token.clone();
+                    app.worlds[idx].settings.discord_guild = settings.discord_guild.clone();
+                    app.worlds[idx].settings.discord_channel = settings.discord_channel.clone();
+                    app.worlds[idx].settings.discord_dm_user = settings.discord_dm_user.clone();
                     app.worlds[idx].settings.hostname = settings.hostname.clone();
                     app.worlds[idx].settings.port = settings.port.clone();
                     app.worlds[idx].settings.user = settings.user.clone();
@@ -1918,6 +1938,15 @@ pub(crate) fn handle_remote_client_key(
                         msp_enabled: settings.msp_enabled,
                         mcp_enabled: settings.mcp_enabled,
                         mccp2_enabled: settings.mccp2_enabled,
+                        world_type: settings.world_type,
+                        prompt_wait_ms: settings.prompt_wait_ms,
+                        slack_token: settings.slack_token,
+                        slack_channel: settings.slack_channel,
+                        slack_workspace: settings.slack_workspace,
+                        discord_token: settings.discord_token,
+                        discord_guild: settings.discord_guild,
+                        discord_channel: settings.discord_channel,
+                        discord_dm_user: settings.discord_dm_user,
                     });
                 }
             }

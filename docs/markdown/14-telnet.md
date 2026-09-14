@@ -228,6 +228,9 @@ Clay detects prompts using telnet GA (Go Ahead) or EOR (End of Record):
 
 - Trailing spaces are normalized: stripped, then one space added
 - ANSI codes in prompts are preserved
+- A marker with nothing visible before it (a bare GA after a newline, or only spaces
+  or colour codes, such as a trailing `ESC[0m` after unsolicited output) leaves the
+  current prompt in place and is not counted for auto-login
 - Cursor positioning uses visible prompt length
 - Prompt cleared when user sends a command
 
@@ -239,6 +242,20 @@ When Auto Login is set to "Prompt" or "MOO_prompt":
 - MOO_prompt third prompt: Username sent again
 
 Prompts that are auto-answered are cleared and not displayed.
+
+### Timed Prompts (MUD - Timed Prompt worlds)
+
+Some MUDs never send GA or EOR — Aardwolf's login prompt cannot, because the option that
+would enable it belongs to a character that does not exist until after login. For those,
+set the world type to **MUD - Timed Prompt**. Clay then holds a line the server leaves
+unfinished and, if nothing further arrives within the world's *Prompt wait* (default
+1000 ms), treats it exactly like a marked prompt: shown in the input area and counted for
+`Prompt`/`MOO_prompt` auto-login. A marked prompt, if the server ever sends one, always
+takes precedence.
+
+The trade-off is inherent: a line that was merely arriving slowly across two packets can
+be taken for a prompt on such a world, with its first part shown as the prompt and the
+rest as a new line. Raise the wait if that happens. Plain `MUD` worlds never do this.
 
 ## Keepalive
 
@@ -303,7 +320,8 @@ Clay properly buffers incoming data:
 ### Partial Lines
 
 Lines without trailing newlines (e.g., prompts) are handled specially:
-- Displayed immediately
+- Held back until the line completes — or, on a **MUD - Timed Prompt** world, promoted
+  to the prompt once the world's Prompt wait passes with nothing further arriving
 - `partial_line` tracks incomplete lines
 - When more data arrives, the line is updated in-place
 - Prevents duplicate lines from TCP read splitting
@@ -343,6 +361,8 @@ Lines without trailing newlines (e.g., prompts) are handled specially:
 1. Verify MUD server sends GA or EOR
 2. Check telnet mode is active (server sends IAC sequences)
 3. Some MUDs require explicit telnet negotiation
+4. If the MUD simply never marks its prompts, set the world type to **MUD - Timed
+   Prompt** and adjust its Prompt wait (see "Timed Prompts" above)
 
 ### Wrong Terminal Type
 

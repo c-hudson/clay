@@ -128,6 +128,9 @@ Telnet prompts (GA/EOR) are per-world:
 - Only displayed when viewing that world
 - Cleared when you send a command
 
+On a **MUD - Timed Prompt** world a prompt is also inferred from a line the server leaves
+unfinished for longer than that world's Prompt wait; the wait is a per-world setting.
+
 ### Logging
 
 Configure per-world in the World Editor:
