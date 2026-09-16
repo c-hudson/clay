@@ -12549,6 +12549,61 @@ third
         }
     }
 
+    #[test]
+    fn test_initial_state_carries_emoji_categories_json() {
+        // build_initial_state must populate emoji_categories_json from
+        // emoji::emoji_categories_json() - the compact wire form `[[index, name, glyph],
+        // ...]`, one row per Category::all() entry, sent once per connection (not on every
+        // GlobalSettingsMsg) because the table is static.
+        let app = App::new();
+        let state = app.build_initial_state(0);
+
+        let emoji_categories_json = match &state {
+            WsMessage::InitialState { emoji_categories_json, .. } => emoji_categories_json.clone(),
+            other => panic!("wrong variant: {:?}", other),
+        };
+
+        assert!(
+            !emoji_categories_json.is_empty(),
+            "emoji_categories_json must be non-empty"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&emoji_categories_json)
+            .expect("emoji_categories_json must parse as JSON");
+        let rows = parsed
+            .as_array()
+            .expect("emoji_categories_json must be a JSON array");
+        assert_eq!(rows.len(), 8, "one row per Category::all() entry");
+    }
+
+    #[test]
+    fn test_initial_state_emoji_categories_json_defaults_empty_when_absent() {
+        // Back-compat: a message built before this field existed (or from an older server)
+        // must still deserialize - #[serde(default)] - and degrade to an empty string, which
+        // the client must fall back on rather than throwing. Built from a real
+        // build_initial_state() and then stripped, so this can't rot into testing a
+        // hand-written shape that drifted from the struct.
+        let app = App::new();
+        let state = app.build_initial_state(0);
+        let mut encoded = serde_json::to_value(&state).expect("serializes");
+
+        assert!(
+            encoded.get("emoji_categories_json").is_some(),
+            "field is present on the wire"
+        );
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("emoji_categories_json");
+
+        match serde_json::from_value::<WsMessage>(encoded).expect("parses without the field") {
+            WsMessage::InitialState { emoji_categories_json, .. } => assert_eq!(
+                emoji_categories_json, "",
+                "an old peer's InitialState (no emoji_categories_json) must default to empty, not fail to parse"
+            ),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
     // ---- Phase J: per-client download state and its accessors ----
 
     /// Minimal `ScrollbackPush` for accessor tests — the planner (step 4) builds the real one.
@@ -17731,18 +17786,29 @@ third
         assert!(state.editing, "search field should start in edit mode");
         assert!(state.is_field_selected(popup::definitions::emoji::EMOJI_FIELD_SEARCH));
 
-        // Every entry the CONSOLE can draw, which is not every entry in the
-        // table: VS16 and ZWJ sequences are held back because a terminal may
-        // give them a different column count than ratatui budgeted, sliding the
-        // row into the popup's border and scrollbar (see emoji::console_safe).
-        let console_safe = crate::emoji::EMOJI
+        // There is no more `All` tab (R5): the Tabs field opens on index 0
+        // (Smileys), the query is empty, so the initial grid must be scoped
+        // to that category - exactly what `refilter_emoji_console` (R6)
+        // would produce for the same state, so the open path and the
+        // keypress path can't diverge. Also holds back VS16/ZWJ sequences a
+        // terminal may draw at a different column count than ratatui
+        // budgeted (see emoji::console_safe).
+        let first_category = crate::emoji::Category::all()[0];
+        let console_safe_first_category = crate::emoji::EMOJI
+            .iter()
+            .filter(|e| e.category == first_category && crate::emoji::console_safe(e.ch))
+            .count();
+        assert_eq!(emoji_grid_len(&app), console_safe_first_category,
+            "opening the popup should scope the grid to the default (first) tab's category");
+
+        let console_safe_all = crate::emoji::EMOJI
             .iter()
             .filter(|e| crate::emoji::console_safe(e.ch))
             .count();
-        assert_eq!(emoji_grid_len(&app), console_safe,
-            "the unfiltered All tab should show every console-drawable entry");
-        assert!(console_safe < crate::emoji::EMOJI.len(),
-            "some entries are expected to be held back from the console grid");
+        assert!(console_safe_first_category < console_safe_all,
+            "the default category must be a strict subset of the console-drawable table");
+
+        assert_eq!(state.definition.title, format!("Emoji — {}", first_category.label()));
     }
 
     #[test]
@@ -17780,10 +17846,23 @@ third
         assert!(narrowed > 0, "the 'heart' fixture entry should still match");
     }
 
+    /// Focus a given emoji zone in the currently-open emoji popup — a test-only
+    /// convenience wrapping `emoji_focus`, since most zone-specific tests need to
+    /// get there before driving a key.
+    fn emoji_set_zone(app: &mut App, zone: popup::definitions::emoji::EmojiZone) {
+        let state = app.popup_manager.current_mut().expect("emoji popup should be open");
+        popup::definitions::emoji::emoji_focus(state, zone);
+    }
+
+    // R8 (Navigation rework): `←`/`→` off the grid's first/last cell no longer
+    // step the category — the tab row is directly reachable via `↑` now. These
+    // two replace the pre-R8 `..._changes_category` tests, which pinned exactly
+    // the behavior this rework removed.
     #[test]
-    fn test_emoji_grid_right_at_last_cell_changes_category() {
+    fn test_emoji_grid_right_at_last_cell_clamps() {
         let mut app = App::new();
         app.open_emoji_popup();
+        emoji_set_zone(&mut app, popup::definitions::emoji::EmojiZone::Grid);
         {
             let state = app.popup_manager.current_mut().unwrap();
             state.grid_end();
@@ -17791,30 +17870,36 @@ third
         let tab_before = emoji_tab_index(&app);
 
         let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert!(matches!(action, NewPopupAction::EmojiFilter),
-            "Right at the last cell must report the edge and ask for a refilter");
-        assert_ne!(emoji_tab_index(&app), tab_before,
-            "Right at the last cell should have stepped to the next category");
+        assert!(matches!(action, NewPopupAction::None),
+            "Right at the last cell must clamp, not report an edge");
+        assert_eq!(emoji_tab_index(&app), tab_before,
+            "Right at the last cell must not change category any more (R8)");
+        assert!(app.popup_manager.current().unwrap().is_field_selected(popup::definitions::emoji::EMOJI_FIELD_GRID),
+            "Right at the last cell must not move focus off the Grid");
     }
 
     #[test]
-    fn test_emoji_grid_left_at_first_cell_changes_category() {
+    fn test_emoji_grid_left_at_first_cell_clamps() {
         let mut app = App::new();
         app.open_emoji_popup();
+        emoji_set_zone(&mut app, popup::definitions::emoji::EmojiZone::Grid);
         // Selection starts at index 0 (the absolute first cell) on open.
         let tab_before = emoji_tab_index(&app);
 
         let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert!(matches!(action, NewPopupAction::EmojiFilter),
-            "Left at the first cell must report the edge and ask for a refilter");
-        assert_ne!(emoji_tab_index(&app), tab_before,
-            "Left at the first cell should have stepped to the previous category");
+        assert!(matches!(action, NewPopupAction::None),
+            "Left at the first cell must clamp, not report an edge");
+        assert_eq!(emoji_tab_index(&app), tab_before,
+            "Left at the first cell must not change category any more (R8)");
+        assert!(app.popup_manager.current().unwrap().is_field_selected(popup::definitions::emoji::EMOJI_FIELD_GRID),
+            "Left at the first cell must not move focus off the Grid");
     }
 
     #[test]
     fn test_emoji_grid_interior_right_does_not_change_category() {
         let mut app = App::new();
         app.open_emoji_popup();
+        emoji_set_zone(&mut app, popup::definitions::emoji::EmojiZone::Grid);
         {
             let state = app.popup_manager.current_mut().unwrap();
             state.grid_select(1); // an interior cell (the full table has hundreds of entries)
@@ -17869,4 +17954,180 @@ third
         let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(action, NewPopupAction::None));
         assert!(app.popup_manager.current().is_none(), "Esc should close the popup");
+    }
+
+    // ---- R8: the focus model / arrows-only key map (EMOJI-PICKER-ROADMAP.md's
+    // Navigation rework "Key map — arrows only" table) ----
+
+    #[test]
+    fn test_emoji_down_from_search_reaches_tabs_then_grid() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        assert!(app.popup_manager.current().unwrap().is_field_selected(popup::definitions::emoji::EMOJI_FIELD_SEARCH),
+            "the popup opens focused on Search");
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None));
+        assert!(app.popup_manager.current().unwrap().is_field_selected(popup::definitions::emoji::EMOJI_FIELD_TABS),
+            "↓ from Search should land on Tabs");
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None));
+        assert!(app.popup_manager.current().unwrap().is_field_selected(popup::definitions::emoji::EMOJI_FIELD_GRID),
+            "↓ from Tabs should land on Grid");
+    }
+
+    /// The collision case the whole rework exists to resolve: typing a query
+    /// walks into the tab row and the grid without clearing what was typed —
+    /// only a deliberate `←`/`→`/`Home`/`End` *on* the tab row clears it.
+    #[test]
+    fn test_emoji_search_query_survives_traversing_tab_row_to_grid() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+
+        for c in "heart".chars() {
+            send_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        {
+            let state = app.popup_manager.current().unwrap();
+            assert_eq!(popup::definitions::emoji::emoji_query(state), "heart");
+        }
+
+        send_key(&mut app, KeyCode::Down, KeyModifiers::NONE); // Search -> Tabs
+        send_key(&mut app, KeyCode::Down, KeyModifiers::NONE); // Tabs -> Grid
+
+        let state = app.popup_manager.current().unwrap();
+        assert!(state.is_field_selected(popup::definitions::emoji::EMOJI_FIELD_GRID),
+            "↓↓ from Search should land on the Grid");
+        assert_eq!(popup::definitions::emoji::emoji_query(state), "heart",
+            "merely traversing the tab row must not clear the query");
+    }
+
+    #[test]
+    fn test_emoji_tabs_left_changes_category_and_clears_query() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        send_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        send_key(&mut app, KeyCode::Down, KeyModifiers::NONE); // Search -> Tabs
+        let tab_before = emoji_tab_index(&app);
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::EmojiFilter),
+            "a deliberate Left on the tab row must ask for a refilter");
+        assert_ne!(emoji_tab_index(&app), tab_before,
+            "Left on the tab row must change category");
+        let state = app.popup_manager.current().unwrap();
+        assert_eq!(popup::definitions::emoji::emoji_query(state), "",
+            "Left on the tab row must clear the query");
+    }
+
+    #[test]
+    fn test_emoji_grid_up_from_top_row_reaches_tabs_else_moves_up() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        emoji_set_zone(&mut app, popup::definitions::emoji::EmojiZone::Grid);
+
+        // Top row: ↑ moves focus to Tabs, not the cursor.
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None));
+        assert!(app.popup_manager.current().unwrap().is_field_selected(popup::definitions::emoji::EMOJI_FIELD_TABS),
+            "↑ from the grid's top row should land on Tabs");
+
+        // A lower row: ↑ moves the cursor up one row and stays in the Grid.
+        emoji_set_zone(&mut app, popup::definitions::emoji::EmojiZone::Grid);
+        {
+            let state = app.popup_manager.current_mut().unwrap();
+            state.grid_move(0, 1);
+        }
+        let (row_before, _, total_rows) = app.popup_manager.current().unwrap().grid_cursor().unwrap();
+        assert!(total_rows > 1, "fixture needs a grid with at least 2 rows");
+        assert!(row_before > 0);
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None));
+        let state = app.popup_manager.current().unwrap();
+        assert!(state.is_field_selected(popup::definitions::emoji::EMOJI_FIELD_GRID),
+            "↑ from a lower row should stay in the Grid");
+        let (row_after, _, _) = state.grid_cursor().unwrap();
+        assert_eq!(row_after, row_before - 1, "↑ from a lower row should move up exactly one row");
+    }
+
+    #[test]
+    fn test_emoji_typing_while_grid_focused_appends_to_search_and_refilters() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        let full_count = emoji_grid_len(&app);
+        emoji_set_zone(&mut app, popup::definitions::emoji::EmojiZone::Grid);
+
+        for c in "heart".chars() {
+            send_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        let narrowed = emoji_grid_len(&app);
+        let state = app.popup_manager.current().unwrap();
+        assert_eq!(popup::definitions::emoji::emoji_query(state), "heart",
+            "typing with the Grid focused should append to the search value");
+        assert!(state.is_field_selected(popup::definitions::emoji::EMOJI_FIELD_GRID),
+            "typing must not move focus off the Grid");
+        assert!(narrowed < full_count && narrowed > 0,
+            "typing should have refiltered the grid (got {narrowed} of {full_count})");
+    }
+
+    #[test]
+    fn test_emoji_tab_and_backtab_are_inert() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        send_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+
+        let tab_before = emoji_tab_index(&app);
+        let (selected_before, query_before) = {
+            let state = app.popup_manager.current().unwrap();
+            (state.selected.clone(), popup::definitions::emoji::emoji_query(state))
+        };
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None), "Tab must do nothing");
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None), "Shift-Tab must do nothing");
+
+        let state = app.popup_manager.current().unwrap();
+        assert_eq!(emoji_tab_index(&app), tab_before, "Tab/Shift-Tab must not change category");
+        assert_eq!(state.selected, selected_before, "Tab/Shift-Tab must not move focus");
+        assert_eq!(popup::definitions::emoji::emoji_query(state), query_before,
+            "Tab/Shift-Tab must not change the query");
+    }
+
+    #[test]
+    fn test_emoji_enter_with_tabs_focused_inserts_selected_grid_cell() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        let expected = {
+            let state = app.popup_manager.current().unwrap();
+            state.get_selected_grid_item().expect("grid should be populated").id.clone()
+        };
+        emoji_set_zone(&mut app, popup::definitions::emoji::EmojiZone::Tabs);
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match action {
+            NewPopupAction::InsertText(text) => assert_eq!(text, expected),
+            _ => panic!("expected InsertText"),
+        }
+        assert!(app.popup_manager.current().is_none(),
+            "Enter with the tab row focused should still insert the selected grid cell and close");
+    }
+
+    #[test]
+    fn test_emoji_question_mark_with_grid_focused_types_search_not_help() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        emoji_set_zone(&mut app, popup::definitions::emoji::EmojiZone::Grid);
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::EmojiFilter),
+            "'?' with the Grid focused must be treated as an ordinary search character");
+
+        let state = app.popup_manager.current().unwrap();
+        assert_eq!(popup::definitions::emoji::emoji_query(state), "?");
+        assert_eq!(state.definition.id, popup::PopupId("emoji"),
+            "'?' must not have opened a help popup over the emoji picker (it has none)");
     }

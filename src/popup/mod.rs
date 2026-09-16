@@ -133,6 +133,14 @@ pub enum FieldKind {
         labels: Vec<String>,
         selected_index: usize,
         scroll_offset: usize,
+        /// Whether the tab strip currently reflects the active category —
+        /// false while a search query is live, since "global search" has no
+        /// current tab (see `EMOJI-PICKER-ROADMAP.md`'s Navigation rework).
+        /// Purely a rendering flag: `render_tabs_field` drops the `══`
+        /// underline and dims every glyph while inactive, except the
+        /// zone-focused cursor glyph, which still gets the bright
+        /// focus background so the user can see where the cursor is.
+        active: bool,
     },
     /// Grid of fixed-stride cells with a 2-D cursor (see
     /// `console_renderer::render_grid_field`). Reuses `ListItem`: `columns`
@@ -320,6 +328,7 @@ impl FieldKind {
             labels,
             selected_index,
             scroll_offset: 0,
+            active: true,
         }
     }
 
@@ -1509,7 +1518,7 @@ impl PopupState {
         if let Some(field) = self.selected_field() {
             if let Some(text) = field.kind.get_text() {
                 self.edit_buffer = text.to_string();
-                self.edit_cursor = self.edit_buffer.len();
+                self.edit_cursor = self.edit_buffer.chars().count();
                 self.edit_scroll = 0;
                 self.editing = true;
             }
@@ -2355,6 +2364,27 @@ impl PopupState {
         None
     }
 
+    /// The first `Grid` field's cursor position as `(row, col, total_rows)`,
+    /// or `None` if there is no `Grid` field or it is empty. Shared by
+    /// anything that needs "is the cursor on the grid's top row" without
+    /// duplicating the `selected_index / columns` arithmetic (e.g. the emoji
+    /// picker's `↑` key - see `EMOJI-PICKER-ROADMAP.md`'s Navigation rework).
+    pub fn grid_cursor(&self) -> Option<(usize, usize, usize)> {
+        for field in &self.definition.fields {
+            if let FieldKind::Grid { cells, selected_index, columns, .. } = &field.kind {
+                if cells.is_empty() {
+                    return None;
+                }
+                let columns = (*columns).max(1);
+                let total_rows = cells.len().div_ceil(columns);
+                let row = *selected_index / columns;
+                let col = *selected_index % columns;
+                return Some((row, col, total_rows));
+            }
+        }
+        None
+    }
+
     /// Step the active tab of the first `Tabs` field by `delta` (typically
     /// `±1`, e.g. Tab/Shift-Tab or a Grid horizontal edge), wrapping around
     /// at either end so repeated stepping cycles through every category.
@@ -2783,6 +2813,28 @@ mod tests {
         state.commit_edit();
         assert!(!state.editing);
         assert_eq!(state.get_text(FIELD_NAME), Some("Hello"));
+    }
+
+    #[test]
+    fn test_start_edit_caret_is_char_index_not_byte_index() {
+        // "héllo" is 5 chars but 6 bytes ('é' is 2 bytes in UTF-8). start_edit must
+        // place the caret at the char count (5), not the byte length (6), or
+        // backspace() -- which walks char_indices() -- silently no-ops because the
+        // cursor is past the end of the char index list.
+        let def = PopupDefinition::new(PopupId("test-multibyte"), "Test Popup")
+            .with_field(Field::new(FIELD_NAME, "Name", FieldKind::text("héllo")));
+        let mut state = PopupState::new(def);
+        state.open();
+        state.select_field(FIELD_NAME);
+
+        state.start_edit();
+        assert!(state.editing);
+        assert_eq!(state.edit_buffer, "héllo");
+        assert_eq!(state.edit_cursor, 5, "caret must be a char index (5), not a byte index (6)");
+
+        state.backspace();
+        assert_eq!(state.edit_buffer, "héll");
+        assert_eq!(state.edit_cursor, 4);
     }
 
     #[test]

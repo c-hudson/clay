@@ -1023,28 +1023,9 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 return KeyAction::RunImport { addr, password, auth_key, allow_insecure: false };
             }
             NewPopupAction::EmojiFilter => {
-                use popup::definitions::emoji::{
-                    filter_emoji_console, tab_index_to_category, update_emoji_grid, update_emoji_info,
-                    EMOJI_FIELD_SEARCH, EMOJI_FIELD_TABS,
-                };
+                use popup::definitions::emoji::refilter_emoji_console;
                 if let Some(state) = app.popup_manager.current_mut() {
-                    // Use edit_buffer if currently editing, otherwise use field value
-                    let query = if state.editing && state.is_field_selected(EMOJI_FIELD_SEARCH) {
-                        state.edit_buffer.clone()
-                    } else {
-                        state.get_text(EMOJI_FIELD_SEARCH).unwrap_or("").to_string()
-                    };
-                    let tab_index = state.field(EMOJI_FIELD_TABS).and_then(|f| {
-                        if let popup::FieldKind::Tabs { selected_index, .. } = &f.kind {
-                            Some(*selected_index)
-                        } else {
-                            None
-                        }
-                    }).unwrap_or(0);
-                    let category = tab_index_to_category(tab_index);
-                    let cells = filter_emoji_console(category, &query);
-                    update_emoji_grid(state, &cells);
-                    update_emoji_info(state);
+                    refilter_emoji_console(state);
                 }
             }
             NewPopupAction::InsertText(text) => {

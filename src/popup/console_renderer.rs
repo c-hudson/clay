@@ -236,7 +236,10 @@ fn calculate_content_height(state: &PopupState) -> usize {
                 *visible_height
             }
             FieldKind::Tabs { .. } => 2, // label row + underline row
-            FieldKind::Grid { visible_rows, .. } => *visible_rows,
+            FieldKind::Grid { cells, columns, visible_rows, .. } => {
+                let rows_needed = cells.len().div_ceil((*columns).max(1));
+                (*visible_rows).min(rows_needed)
+            }
             _ => 1,
         };
     }
@@ -319,7 +322,10 @@ fn compute_field_layout(
                 (*visible_height).min(available_for_field)
             }
             FieldKind::Tabs { .. } => 2, // label row + underline row, fixed like Separator/Label
-            FieldKind::Grid { visible_rows, .. } => (*visible_rows).min(available_for_field),
+            FieldKind::Grid { cells, columns, visible_rows, .. } => {
+                let rows_needed = cells.len().div_ceil((*columns).max(1));
+                (*visible_rows).min(rows_needed).min(available_for_field)
+            }
             _ => 1,
         };
         rows.push(FieldRow { index: i, height: field_height, row_start: cursor });
@@ -383,7 +389,7 @@ fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme
     // and can't write it back itself; this is purely an output cache for an
     // external reader, not something the windowing decision depends on.
     for field in &mut state.definition.fields {
-        if let FieldKind::Tabs { labels, selected_index, scroll_offset } = &mut field.kind {
+        if let FieldKind::Tabs { labels, selected_index, scroll_offset, .. } = &mut field.kind {
             let (start, ..) = compute_tab_window(labels, *selected_index, field_area_width as usize);
             *scroll_offset = start;
         }
@@ -849,12 +855,12 @@ fn render_field(
             render_editable_list_field(f, state, field, items, *selected_index, *scroll_offset, *visible_height, area, is_selected, theme);
         }
 
-        FieldKind::Tabs { labels, selected_index, .. } => {
-            render_tabs_field(f, labels, *selected_index, area, theme);
+        FieldKind::Tabs { labels, selected_index, active, .. } => {
+            render_tabs_field(f, labels, *selected_index, *active, is_selected, area, theme);
         }
 
         FieldKind::Grid { cells, selected_index, scroll_offset, columns, visible_rows } => {
-            render_grid_field(f, cells, *selected_index, *scroll_offset, *columns, *visible_rows, area, theme);
+            render_grid_field(f, cells, *selected_index, *scroll_offset, *columns, *visible_rows, area, is_selected, theme);
         }
     }
 }
@@ -1550,10 +1556,35 @@ fn emoji_cell_width() -> usize {
     GLYPH_WIDTH
 }
 
+/// Style for the selected grid cell's glyph span, focus-aware. Both arms are
+/// brighter than the old single `fg_accent()`-on-`selection_bg()` style —
+/// the popup opens with focus on the search row, so the *unfocused* grid is
+/// the state the original bug report was actually about; brightening only
+/// the focused style would leave that case dark. Emoji render in their own
+/// colours in essentially every terminal, so `fg` here is decorative and
+/// background carries the whole signal:
+/// - focused: the confirm dialog's focused-button colours
+///   (`button_selected_fg()`/`button_selected_bg()` — White/Blue), bold.
+/// - unfocused: `fg()` on `fg_dim()` (DarkGray/Gray) — deliberately not
+///   `fg_accent()`, which is Blue in the Light theme and would collide with
+///   `button_selected_bg()`.
+fn grid_cell_style(theme: &Theme, focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(theme.button_selected_fg())
+            .bg(theme.button_selected_bg())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg()).bg(theme.fg_dim())
+    }
+}
+
 /// Render a `Grid` field: fixed-stride cells built as explicit `Span`s (never
 /// a single `format!("{:<w$}")` string — see `CELL_STRIDE`'s doc comment for
-/// why that's unsafe here). The selected cell carries the popup selection
-/// style (`fg_accent()` on `selection_bg()`); everything else is plain.
+/// why that's unsafe here). The selected cell's glyph carries
+/// `grid_cell_style` (focus-aware); its gutter is a separate, plain span so
+/// the highlight never bleeds into the inter-cell gap. Everything else is
+/// plain.
 #[allow(clippy::too_many_arguments)]
 fn render_grid_field(
     f: &mut Frame,
@@ -1563,6 +1594,7 @@ fn render_grid_field(
     columns: usize,
     visible_rows: usize,
     area: Rect,
+    is_selected: bool,
     theme: &Theme,
 ) {
     if columns == 0 || visible_rows == 0 {
@@ -1571,6 +1603,7 @@ fn render_grid_field(
     let glyph_width = emoji_cell_width();
     let gutter = " ".repeat(CELL_STRIDE.saturating_sub(glyph_width));
     let blank_cell = " ".repeat(CELL_STRIDE);
+    let gutter_style = Style::default().fg(theme.fg());
 
     let total_rows = cells.len().div_ceil(columns);
     let needs_scrollbar = total_rows > visible_rows;
@@ -1580,26 +1613,32 @@ fn render_grid_field(
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let effective_scroll = scroll_offset.min(max_scroll);
 
-    for r in 0..visible_rows {
+    // Draw only as many rows as the content actually needs, capped at
+    // visible_rows — a category/search result that half-fills the grid
+    // must not leave trailing blank rows (EMOJI-PICKER-ROADMAP.md R8).
+    let drawn_rows = visible_rows.min(total_rows);
+
+    for r in 0..drawn_rows {
         let row_y = area.y + r as u16;
         if row_y >= area.y + area.height {
             break;
         }
         let row_idx = effective_scroll + r;
 
-        let mut spans: Vec<Span> = Vec::with_capacity(columns);
+        let mut spans: Vec<Span> = Vec::with_capacity(columns * 2);
         for c in 0..columns {
             let cell_idx = row_idx * columns + c;
             match cells.get(cell_idx) {
                 Some(item) => {
                     let glyph = item.columns.first().map(|s| s.as_str()).unwrap_or("");
                     let is_selected_cell = cell_idx == selected_index;
-                    let style = if is_selected_cell {
-                        Style::default().fg(theme.fg_accent()).bg(theme.selection_bg())
+                    let glyph_style = if is_selected_cell {
+                        grid_cell_style(theme, is_selected)
                     } else {
                         Style::default().fg(theme.fg())
                     };
-                    spans.push(Span::styled(format!("{glyph}{gutter}"), style));
+                    spans.push(Span::styled(glyph.to_string(), glyph_style));
+                    spans.push(Span::styled(gutter.clone(), gutter_style));
                 }
                 None => {
                     spans.push(Span::styled(blank_cell.clone(), Style::default()));
@@ -1636,7 +1675,7 @@ fn compute_tab_window(labels: &[String], active: usize, width: usize) -> (usize,
         return (0, 0, false, false);
     }
     let active = active.min(labels.len() - 1);
-    let label_w = |i: usize| labels[i].chars().count();
+    let label_w = |i: usize| display_width(&labels[i]);
 
     let mut start = active;
     let mut end = active + 1;
@@ -1684,10 +1723,59 @@ fn compute_tab_window(labels: &[String], active: usize, width: usize) -> (usize,
     (start, end, start > 0, end < labels.len())
 }
 
+/// Pure companion to `compute_tab_window`: given the label window it chose,
+/// returns `(prefix_width, active_label_width)` in **display columns** — the
+/// columns before the active label (including the `‹ ` indicator when
+/// present) and the active label's own width. `render_tabs_field` uses these
+/// to place the `═` underline beneath the active tab. Split out from the
+/// span-building loop so the offset is directly testable without a `Frame`;
+/// must use `display_width()`, not `chars().count()`, or a glyph label (1
+/// char, 2 columns) puts the underline under the wrong tab.
+fn compute_tab_underline_offset(
+    labels: &[String],
+    start: usize,
+    end: usize,
+    selected_index: usize,
+    hidden_left: bool,
+) -> (usize, usize) {
+    let mut prefix_width = if hidden_left { 2 } else { 0 };
+    let mut active_label_width = 0usize;
+
+    for (i, label) in labels.iter().enumerate().take(end).skip(start) {
+        let w = display_width(label);
+        if i == selected_index {
+            active_label_width = w;
+        } else if i < selected_index {
+            prefix_width += w;
+        }
+        if i + 1 < end && i < selected_index {
+            prefix_width += 2;
+        }
+    }
+
+    (prefix_width, active_label_width)
+}
+
 /// Render a `Tabs` field: two rows, the windowed label strip (with `‹`/`›`
-/// when either end is hidden) and a `═` underline beneath the active label
-/// only, in the accent colour.
-fn render_tabs_field(f: &mut Frame, labels: &[String], selected_index: usize, area: Rect, theme: &Theme) {
+/// when either end is hidden) and, while `active`, a `═` underline beneath
+/// the active label. Three visual states (see `EMOJI-PICKER-ROADMAP.md`'s
+/// Navigation rework):
+/// - **active + focused** (`active && is_selected`): the cursor glyph gets
+///   `grid_cell_style`'s bright focus background, plus the underline.
+/// - **active + unfocused**: underline only, in `fg_accent()` — today's look.
+/// - **inactive** (a search query is live, so there is no current category):
+///   no underline and every glyph plain, except the cursor glyph still gets
+///   the bright focus background when the zone itself has focus, so the
+///   user can see where the cursor is even though it names no category.
+fn render_tabs_field(
+    f: &mut Frame,
+    labels: &[String],
+    selected_index: usize,
+    active: bool,
+    is_selected: bool,
+    area: Rect,
+    theme: &Theme,
+) {
     if labels.is_empty() || area.height == 0 {
         return;
     }
@@ -1696,31 +1784,29 @@ fn render_tabs_field(f: &mut Frame, labels: &[String], selected_index: usize, ar
     let dim_style = Style::default().fg(theme.fg_dim());
     let normal_style = Style::default().fg(theme.fg());
     let active_style = Style::default().fg(theme.fg_accent()).add_modifier(Modifier::BOLD);
+    let cursor_style = grid_cell_style(theme, true);
 
     let mut label_spans: Vec<Span> = Vec::new();
-    let mut prefix_width = 0usize; // columns before the active label, for the underline row
-    let mut active_label_width = 0usize;
 
     if hidden_left {
         label_spans.push(Span::styled("‹ ", dim_style));
-        prefix_width += 2;
     }
 
     for (i, label) in labels.iter().enumerate().take(end).skip(start) {
-        let is_active = i == selected_index;
-        let style = if is_active { active_style } else { normal_style };
+        let is_cursor = i == selected_index;
+        let style = if is_cursor && is_selected {
+            // The zone-focused cursor glyph always gets the bright focus
+            // background, active or not, so the cursor is visible even
+            // while a search query has suppressed the active category.
+            cursor_style
+        } else if is_cursor && active {
+            active_style
+        } else {
+            normal_style
+        };
         label_spans.push(Span::styled(label.clone(), style));
-        let w = label.chars().count();
-        if is_active {
-            active_label_width = w;
-        } else if i < selected_index {
-            prefix_width += w;
-        }
         if i + 1 < end {
             label_spans.push(Span::raw("  "));
-            if i < selected_index {
-                prefix_width += 2;
-            }
         }
     }
 
@@ -1731,7 +1817,9 @@ fn render_tabs_field(f: &mut Frame, labels: &[String], selected_index: usize, ar
     let label_area = Rect::new(area.x, area.y, area.width, 1);
     f.render_widget(Paragraph::new(Line::from(label_spans)), label_area);
 
-    if area.height >= 2 {
+    if active && area.height >= 2 {
+        let (prefix_width, active_label_width) =
+            compute_tab_underline_offset(labels, start, end, selected_index, hidden_left);
         let mut underline = " ".repeat(prefix_width.min(area.width as usize));
         let remaining = (area.width as usize).saturating_sub(underline.chars().count());
         underline.push_str(&"═".repeat(active_label_width.min(remaining)));
@@ -1985,6 +2073,7 @@ pub fn render_popup_content_direct(state: &PopupState, theme: &Theme) {
                 if *columns == 0 || *visible_rows == 0 {
                     continue;
                 }
+                let is_selected = matches!(&state.selected, ElementSelection::Field(id) if *id == field.id);
 
                 let glyph_width = emoji_cell_width();
                 let gutter = " ".repeat(CELL_STRIDE.saturating_sub(glyph_width));
@@ -2007,14 +2096,27 @@ pub fn render_popup_content_direct(state: &PopupState, theme: &Theme) {
                             Some(item) => {
                                 let glyph = item.columns.first().map(|s| s.as_str()).unwrap_or("");
                                 let is_selected_cell = cell_idx == *selected_index;
-                                let (fg, bg) = if is_selected_cell {
-                                    (to_crossterm_color(theme.fg_accent()), to_crossterm_color(theme.selection_bg()))
+                                let glyph_style = if is_selected_cell {
+                                    grid_cell_style(theme, is_selected)
                                 } else {
-                                    (to_crossterm_color(theme.fg()), popup_bg)
+                                    Style::default().fg(theme.fg())
                                 };
-                                let _ = stdout.queue(SetForegroundColor(fg));
-                                let _ = stdout.queue(SetBackgroundColor(bg));
-                                let _ = stdout.queue(Print(format!("{glyph}{gutter}")));
+                                let glyph_fg = to_crossterm_color(glyph_style.fg.unwrap_or(theme.fg()));
+                                let glyph_bg = glyph_style.bg.map(to_crossterm_color).unwrap_or(popup_bg);
+                                let _ = stdout.queue(SetForegroundColor(glyph_fg));
+                                let _ = stdout.queue(SetBackgroundColor(glyph_bg));
+                                if glyph_style.add_modifier.contains(Modifier::BOLD) {
+                                    let _ = stdout.queue(SetAttribute(Attribute::Bold));
+                                }
+                                let _ = stdout.queue(Print(glyph));
+                                let _ = stdout.queue(SetAttribute(Attribute::Reset));
+
+                                // Gutter is always plain, in its own Print so the
+                                // selection style can never bleed past the glyph's
+                                // own 2 columns into the inter-cell gap.
+                                let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg())));
+                                let _ = stdout.queue(SetBackgroundColor(popup_bg));
+                                let _ = stdout.queue(Print(&gutter));
                             }
                             None => {
                                 let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg())));
@@ -2300,5 +2402,207 @@ mod tests {
         let labels = vec!["All".to_string(), "Smileys".to_string()];
         let (start, end, ..) = compute_tab_window(&labels, 1, 0);
         assert!(start <= 1 && 1 < end);
+    }
+
+    /// The eight R5 tab glyphs (`Category::tab_glyph()` order). Each is one
+    /// `char` but two display columns wide, which is exactly what
+    /// `chars().count()` gets wrong.
+    fn glyph_tab_labels() -> Vec<String> {
+        ["😀", "👋", "🐶", "🍕", "⚽", "💡", "⭐", "🏁"]
+            .iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_compute_tab_window_glyph_labels_all_fit_no_chevrons() {
+        let labels = glyph_tab_labels();
+        // Natural footprint is 8 labels * 2 columns + 7 gaps * 2 columns = 30, but
+        // `compute_tab_window`'s growth loop reserves 2 columns for a `‹`/`›`
+        // indicator based on can_left/can_right *before* each growth step, so the
+        // very last label added still pays that reserve even though it ends up
+        // exhausting the side it was reserved for. 32 is the true minimum that
+        // fits the whole strip - confirmed empirically, and independent of this
+        // fix (the same slack exists for ASCII labels). What this test actually
+        // pins is that the fix (display columns, not chars) is what lets a width
+        // in this ballpark fit the strip at all: the pre-fix `chars().count()`
+        // version under-counts a glyph by half and fits comfortably even at half
+        // this width, silently overflowing the real terminal row.
+        let width = 32usize;
+        for active in 0..labels.len() {
+            let (start, end, hidden_left, hidden_right) = compute_tab_window(&labels, active, width);
+            assert_eq!((start, end), (0, labels.len()), "active={active} should fit the whole strip");
+            assert!(!hidden_left && !hidden_right, "active={active} must show no ‹/› chevrons");
+        }
+    }
+
+    #[test]
+    fn test_tab_underline_offset_uses_display_columns_not_chars() {
+        let labels = glyph_tab_labels();
+        // Whole strip visible (see previous test), so the window is (0, 8).
+        let (start, end, hidden_left, _hidden_right) = compute_tab_window(&labels, 4, 32);
+        assert_eq!((start, end), (0, 8));
+
+        let (prefix_width, active_label_width) =
+            compute_tab_underline_offset(&labels, start, end, 4, hidden_left);
+
+        // Each glyph tab is 2 columns wide plus a 2-column gap = 4 columns/tab.
+        // Four tabs precede index 4, so the underline must start at column 16 -
+        // not 12, which is what `chars().count()` (1 char/tab -> 3 cols/tab) gives.
+        assert_eq!(prefix_width, 16, "underline offset must be in display columns, not chars");
+        assert_eq!(active_label_width, 2);
+    }
+
+    // ---- R4: grid cell styling (EMOJI-PICKER-ROADMAP.md Navigation rework) ----
+
+    #[test]
+    fn test_grid_cell_style_focused_and_unfocused_differ_in_both_themes() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let focused = grid_cell_style(&theme, true);
+            let unfocused = grid_cell_style(&theme, false);
+            assert_ne!(
+                focused.bg, unfocused.bg,
+                "{theme:?}: focused and unfocused grid cell backgrounds must differ - \
+                 the unfocused style is the one the bug report was actually about"
+            );
+        }
+    }
+
+    #[test]
+    fn test_grid_cell_style_matches_documented_colors_and_avoids_light_theme_collision() {
+        // Focused: the confirm dialog's focused-button colours.
+        let dark_focused = grid_cell_style(&Theme::Dark, true);
+        assert_eq!(dark_focused.fg, Some(Theme::Dark.button_selected_fg()));
+        assert_eq!(dark_focused.bg, Some(Theme::Dark.button_selected_bg()));
+        assert!(dark_focused.add_modifier.contains(Modifier::BOLD));
+
+        let light_focused = grid_cell_style(&Theme::Light, true);
+        assert_eq!(light_focused.fg, Some(Theme::Light.button_selected_fg()));
+        assert_eq!(light_focused.bg, Some(Theme::Light.button_selected_bg()));
+
+        // Unfocused: fg_dim() background, never fg_accent() - in the Light
+        // theme fg_accent() is Blue, the same colour as button_selected_bg(),
+        // which would make focused and unfocused indistinguishable.
+        let light_unfocused = grid_cell_style(&Theme::Light, false);
+        assert_eq!(light_unfocused.bg, Some(Theme::Light.fg_dim()));
+        assert_ne!(
+            light_unfocused.bg,
+            Some(Theme::Light.fg_accent()),
+            "unfocused grid cell must not collide with the Light theme's focused colour"
+        );
+        assert_ne!(light_unfocused.bg, light_focused.bg);
+
+        let dark_unfocused = grid_cell_style(&Theme::Dark, false);
+        assert_eq!(dark_unfocused.bg, Some(Theme::Dark.fg_dim()));
+        assert_ne!(dark_unfocused.bg, dark_focused.bg);
+    }
+
+    /// Full-popup `TestBackend` render of the real emoji picker: the selected
+    /// grid cell's background must switch between `button_selected_bg()` and
+    /// `fg_dim()` purely based on which zone has focus, and the gutter
+    /// column immediately after the glyph must never carry either selection
+    /// colour - only the popup background, or the highlight bleeds into the
+    /// inter-cell gap exactly like the bug this rework fixes.
+    #[test]
+    fn test_grid_selected_cell_background_is_focus_aware_and_gutter_is_plain() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use crate::popup::definitions::emoji::{create_emoji_popup, EMOJI_FIELD_GRID};
+
+        let theme = Theme::Dark;
+
+        // Grid focused.
+        let def = create_emoji_popup(6, 10);
+        let mut state = PopupState::new(def);
+        state.visible = true;
+        state.select_field(EMOJI_FIELD_GRID);
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_popup(f, &mut state, &theme)).unwrap();
+
+        let grid_area = state
+            .content_areas
+            .iter()
+            .find(|ca| ca.field_id == EMOJI_FIELD_GRID)
+            .expect("grid content area recorded")
+            .area;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer.get(grid_area.x, grid_area.y).bg,
+            theme.button_selected_bg(),
+            "focused grid: selected glyph background must be button_selected_bg()"
+        );
+        assert_eq!(
+            buffer.get(grid_area.x + 2, grid_area.y).bg,
+            theme.popup_bg(),
+            "the gutter (2 columns right of the glyph) must carry the popup \
+             background, not the selection background"
+        );
+
+        // Grid unfocused: `PopupState::new` focuses Search first, so this is
+        // the state the original bug report was about.
+        let def2 = create_emoji_popup(6, 10);
+        let mut state2 = PopupState::new(def2);
+        state2.visible = true;
+
+        let backend2 = TestBackend::new(80, 30);
+        let mut terminal2 = Terminal::new(backend2).unwrap();
+        terminal2.draw(|f| render_popup(f, &mut state2, &theme)).unwrap();
+
+        let grid_area2 = state2
+            .content_areas
+            .iter()
+            .find(|ca| ca.field_id == EMOJI_FIELD_GRID)
+            .expect("grid content area recorded")
+            .area;
+        let buffer2 = terminal2.backend().buffer();
+        assert_eq!(
+            buffer2.get(grid_area2.x, grid_area2.y).bg,
+            theme.fg_dim(),
+            "unfocused grid: selected glyph background must be fg_dim()"
+        );
+        assert_eq!(
+            buffer2.get(grid_area2.x + 2, grid_area2.y).bg,
+            theme.popup_bg(),
+            "the gutter must stay plain even while the grid is unfocused"
+        );
+    }
+
+    /// The `══` underline must sit under exactly the active glyph's two
+    /// display columns and nowhere else on that row.
+    #[test]
+    fn test_tabs_underline_sits_under_active_glyph_only() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use crate::popup::definitions::emoji::{create_emoji_popup, EMOJI_FIELD_TABS};
+
+        let theme = Theme::Dark;
+        let def = create_emoji_popup(6, 10);
+        let mut state = PopupState::new(def);
+        state.visible = true;
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_popup(f, &mut state, &theme)).unwrap();
+
+        let tabs_rect = state
+            .hit_areas
+            .iter()
+            .find_map(|(area, sel)| {
+                matches!(sel, ElementSelection::Field(id) if *id == EMOJI_FIELD_TABS).then_some(*area)
+            })
+            .expect("tabs field hit area recorded");
+
+        let buffer = terminal.backend().buffer();
+        let underline_y = tabs_rect.y + 1;
+
+        // Tab 0 is active by default (no search query yet), occupying its
+        // glyph's own 2 display columns at the very start of the strip.
+        for x in tabs_rect.x..(tabs_rect.x + tabs_rect.width) {
+            let sym = buffer.get(x, underline_y).symbol();
+            let expected_underline = x == tabs_rect.x || x == tabs_rect.x + 1;
+            if expected_underline {
+                assert_eq!(sym, "═", "expected the underline under the active glyph at column {x}");
+            } else {
+                assert_ne!(sym, "═", "underline leaked to column {x}, outside the active glyph");
+            }
+        }
     }
 }

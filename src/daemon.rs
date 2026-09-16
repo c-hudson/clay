@@ -3096,6 +3096,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         // preference to advertising the capability and then refusing every request.
         scrollback_push: false,
         emoji_json: crate::emoji::emoji_json(),
+        emoji_categories_json: crate::emoji::emoji_categories_json(),
     }
 }
 

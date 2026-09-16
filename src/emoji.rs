@@ -65,6 +65,24 @@ impl Category {
         }
     }
 
+    /// The glyph shown in the picker's tab strip (R5). Deliberately not
+    /// required to be a member of this category's own `EMOJI` entries - e.g.
+    /// Nature's tab glyph is 🐶 (U+1F436), which isn't in the table at all
+    /// (the table has 🐕 for `dog`); the glyph is chosen for recognizability
+    /// as a tab icon, not as a representative catalog entry.
+    pub fn tab_glyph(&self) -> &'static str {
+        match self {
+            Category::Smileys => "😀",
+            Category::People => "👋",
+            Category::Nature => "🐶",
+            Category::Food => "🍕",
+            Category::Activity => "⚽",
+            Category::Objects => "💡",
+            Category::Symbols => "⭐",
+            Category::Flags => "🏁",
+        }
+    }
+
     /// A stable numeric index, used on the wire (`emoji_json`) so JS doesn't
     /// need to know the Rust enum's variant names.
     pub fn index(&self) -> usize {
@@ -565,6 +583,23 @@ pub fn emoji_json() -> String {
     .clone()
 }
 
+/// Compact wire form for `WsMessage::InitialState.emoji_categories_json`
+/// (Navigation rework R10): `[[index, name, glyph], ...]`, one row per
+/// `Category::all()` entry in tab-strip order. Lets the web/GUI picker draw
+/// the same eight tab glyphs as the console without hardcoding them in JS
+/// and drifting from `Category`. Built once into a `OnceLock<String>`.
+pub fn emoji_categories_json() -> String {
+    static JSON: OnceLock<String> = OnceLock::new();
+    JSON.get_or_init(|| {
+        let rows: Vec<serde_json::Value> = Category::all()
+            .iter()
+            .map(|c| serde_json::json!([c.index(), c.label(), c.tab_glyph()]))
+            .collect();
+        serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+    })
+    .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +640,32 @@ mod tests {
             "entries not exactly 2 cells wide:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// `tab_glyph()` feeds directly into the console tab strip (R5), so each
+    /// glyph must be drawable there (`console_safe`) and exactly 2 columns
+    /// wide - the same constraint the grid entries are held to - and the eight
+    /// glyphs must be visually distinguishable from one another. Deliberately
+    /// does NOT assert a glyph is present in `EMOJI`: Nature's tab glyph 🐶
+    /// (U+1F436) is not a table entry (the table has 🐕 for `dog`), which is
+    /// intentional, not a bug.
+    #[test]
+    fn tab_glyph_is_console_safe_two_columns_and_distinct() {
+        use unicode_width::UnicodeWidthStr;
+        let mut seen = std::collections::HashSet::new();
+        for category in Category::all() {
+            let glyph = category.tab_glyph();
+            assert!(console_safe(glyph), "{category:?} tab_glyph {glyph:?} is not console_safe");
+            assert_eq!(
+                UnicodeWidthStr::width(glyph),
+                2,
+                "{category:?} tab_glyph {glyph:?} must be exactly 2 columns wide"
+            );
+            assert!(
+                seen.insert(glyph),
+                "{category:?} tab_glyph {glyph:?} duplicates another category's glyph"
+            );
+        }
     }
 
     /// Two entries sharing a glyph render as two identical cells in the picker
@@ -755,6 +816,24 @@ mod tests {
             assert!(arr[1].is_string());
             assert!(arr[2].is_string());
             assert!(arr[3].is_u64());
+        }
+    }
+
+    #[test]
+    fn emoji_categories_json_matches_category_all() {
+        let json = emoji_categories_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("emoji_categories_json() must produce valid JSON");
+        let rows = parsed
+            .as_array()
+            .expect("emoji_categories_json() must be a JSON array");
+        assert_eq!(rows.len(), 8, "exactly 8 categories");
+        for (row, category) in rows.iter().zip(Category::all().iter()) {
+            let arr = row.as_array().expect("each row must be a JSON array");
+            assert_eq!(arr.len(), 3, "row must be [index, name, glyph]");
+            assert_eq!(arr[0].as_u64(), Some(category.index() as u64));
+            assert_eq!(arr[1].as_str(), Some(category.label()));
+            assert_eq!(arr[2].as_str(), Some(category.tab_glyph()));
         }
     }
 }

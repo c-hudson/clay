@@ -1492,16 +1492,15 @@ body.device-phone #output-container { padding: 6px 10px; }
     border-bottom: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
 }
 
-/* Tab strip, modelled on .settings-tab-btn but laid out as rows rather than the
-   vertical sidebar that rule assumes. The 9 tabs (All + 8 categories) need
-   roughly 560px and the panel is 420px, so they WRAP onto a second line instead
-   of scrolling sideways: a sideways-scrolling strip hid five categories behind a
-   deliberately invisible scrollbar, leaving no way to discover or reach them.
-   The console picker scrolls its strip with a fixed pair of chevrons because a
-   terminal row cannot wrap - a browser has no such constraint. */
+/* Tab strip, modelled on .settings-tab-btn but laid out as a row rather than the
+   vertical sidebar that rule assumes. The navigation rework (see
+   EMOJI-PICKER-ROADMAP.md's "Navigation rework (v1.6.12)" section) dropped the
+   "All" tab in favor of global search and replaced the 8 named category tabs
+   with 8 single-glyph ones, so all of them fit on one line with room to spare -
+   no more wrapping/scrolling strip needed. */
 .emoji-tabs {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 2px;
     padding: 8px 8px 0;
 }
@@ -1509,8 +1508,9 @@ body.device-phone #output-container { padding: 6px 10px; }
 .emoji-tab-btn {
     flex-shrink: 0;
     font-family: inherit;
-    font-size: 12px;
+    font-size: 18px;
     font-weight: 600;
+    line-height: 1;
     white-space: nowrap;
     padding: 6px 10px 7px;
     background: transparent;
@@ -1530,6 +1530,17 @@ body.device-phone #output-container { padding: 6px 10px; }
     color: var(--accent-color);
     border-bottom-color: var(--accent-color);
     background: rgba(8, 145, 178, 0.09);
+}
+
+/* R13: the tab strip's normal .active marker (above) just says "this is the
+   current category" - it stays lit no matter which zone is focused. This adds
+   the second, louder signal that ←/→ actually drives it right now: a filled
+   pill, same accent-color/black-text convention as the grid's own focused
+   selection (below), only applied while data-zone="tabs" on the modal. */
+#emoji-modal[data-zone="tabs"] .emoji-tab-btn.active {
+    background: var(--accent-color);
+    color: #000;
+    border-bottom-color: var(--accent-color);
 }
 
 .emoji-tab-btn:focus-visible {
@@ -1554,8 +1565,19 @@ body.device-phone #output-container { padding: 6px 10px; }
     padding: 7px 10px;
 }
 
+/* R13: DOM focus lives on this input for the popup's entire lifetime (native
+   caret/typing has to keep working regardless of zone - see the keydown
+   handler), so a plain `:focus` rule here would show the accent border
+   permanently and stop meaning anything. Default it back to the plain
+   separator border and only light it up while data-zone="search" actually
+   has the zone - the same "focused vs. not" split the grid and tab strip get,
+   just inverted because this element never truly loses :focus. */
 .emoji-searchrow input:focus {
     outline: none;
+    border-color: var(--separator-color);
+}
+
+#emoji-modal[data-zone="search"] .emoji-searchrow input:focus {
     border-color: var(--accent-color);
 }
 
@@ -1593,10 +1615,26 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 /* House convention for a selected grid cell (matches the console's
-   fg_accent()-on-selection_bg() and the world/action list selection style). */
-.emoji-grid button.emoji-cell.selected {
+   fg_accent()-on-selection_bg() and the world/action list selection style).
+   This is the FOCUSED look - it only applies while the Grid zone actually has
+   the arrow keys, i.e. data-zone="grid" on the modal (see the rule below for
+   the rest of the time). */
+#emoji-modal[data-zone="grid"] .emoji-grid button.emoji-cell.selected {
     background: var(--accent-color);
     color: #000;
+}
+
+/* R13: the console distinguishes a focused grid (bright button_selected_bg())
+   from an unfocused one (dim fg_dim()) - see grid_cell_style in
+   console_renderer.rs. Same idea here: while Search or Tabs has the zone, the
+   remembered selection stays visible (so Enter still has an obvious target
+   after leaving the grid) but unmistakably dimmer than the live one above.
+   --theme-selection-bg is a muted blue in both the light and dark palettes
+   (see theme.rs), so this reads correctly in either theme without a separate
+   dark-mode override. */
+.emoji-grid button.emoji-cell.selected {
+    background: var(--theme-selection-bg, rgba(127, 127, 127, 0.35));
+    color: var(--text-color);
 }
 
 .emoji-grid button.emoji-cell:focus-visible {
@@ -1610,42 +1648,6 @@ body.device-phone #output-container { padding: 6px 10px; }
     font-size: 13px;
     padding: 24px 8px;
     text-align: center;
-}
-
-.emoji-info {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    padding: 9px 12px;
-    border-top: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
-    font-size: 12.5px;
-    color: var(--theme-fg-muted, #71717a);
-    min-height: 40px;
-}
-
-.emoji-info-content {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.emoji-info-content .emoji-info-glyph {
-    font-size: 17px;
-    line-height: 1;
-    margin-right: 6px;
-}
-
-.emoji-info-content .emoji-info-code {
-    font-family: var(--mono);
-    color: var(--text-color);
-    font-size: 12px;
-    margin-right: 6px;
-}
-
-.emoji-info .btn-help {
-    flex-shrink: 0;
 }
 
 /* ─── Actions Editor popup ─── */

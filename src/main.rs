@@ -5734,12 +5734,12 @@ impl App {
     }
 
     /// Open the emoji picker popup (`Esc-e`). Sizes the grid off the current
-    /// terminal dimensions, seeds it with the unfiltered "All" tab, and
-    /// starts the search field editing so typing goes straight to search.
+    /// terminal dimensions, seeds it with the unfiltered first tab
+    /// (Smileys), and focuses+edits the search field so typing goes straight
+    /// to search.
     pub(crate) fn open_emoji_popup(&mut self) {
         use popup::definitions::emoji::{
-            create_emoji_popup, filter_emoji_console, update_emoji_grid, update_emoji_info,
-            EMOJI_FIELD_SEARCH,
+            create_emoji_popup, emoji_focus, refilter_emoji_console, EmojiZone,
         };
 
         let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -5752,8 +5752,11 @@ impl App {
         let natural_columns = ((term_width as usize).saturating_sub(6) / 4).max(1);
         let columns = natural_columns.clamp(8.min(natural_columns), 12);
 
-        // Reserve ~10 rows for the tab strip, search field, footer, help
-        // line and borders, then clamp to a sensible 4-8 range.
+        // Reserve ~10 rows for the tab strip, search field and borders, then
+        // clamp to a sensible 4-8 range. This is a max: the grid itself now
+        // draws fewer rows than this whenever the category/search has less
+        // content to show (R8), and there is no footer/help line any more
+        // to budget for either.
         let natural_rows = (term_height as usize).saturating_sub(10).max(1);
         let visible_rows = natural_rows.clamp(4.min(natural_rows), 8);
 
@@ -5761,11 +5764,8 @@ impl App {
         self.popup_manager.open(def);
 
         if let Some(state) = self.popup_manager.current_mut() {
-            let cells = filter_emoji_console(None, "");
-            update_emoji_grid(state, &cells);
-            update_emoji_info(state);
-            state.select_field(EMOJI_FIELD_SEARCH);
-            state.start_edit();
+            emoji_focus(state, EmojiZone::Search);
+            refilter_emoji_console(state);
         }
     }
 
@@ -14425,6 +14425,7 @@ impl App {
             // so every intermediate build honestly reports "use the legacy path".
             scrollback_push: false,
             emoji_json: crate::emoji::emoji_json(),
+            emoji_categories_json: crate::emoji::emoji_categories_json(),
         }
     }
 
@@ -15565,9 +15566,19 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         state.highlight = None;
     }
 
-    // Generic help button handler: '?' shortcut or Enter/Space on help button
+    let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
+    let is_emoji = popup_id == Some(popup::PopupId("emoji"));
+
+    // Generic help button handler: '?' shortcut or Enter/Space on help button.
+    // Excludes the emoji popup: it has no help_lines/`?` button any more
+    // (R8 dropped `.with_help(...)`, so `?` should never have reached here
+    // for it anyway), but once its zones can be unfocused-from-Search,
+    // `!state.editing` stops implying "not the emoji popup's search box" -
+    // see EMOJI-PICKER-ROADMAP.md's Navigation rework "Traps" section.
     {
-        let should_open_help = if let Some(state) = app.popup_manager.current() {
+        let should_open_help = if is_emoji {
+            false
+        } else if let Some(state) = app.popup_manager.current() {
             !state.definition.help_lines.is_empty()
                 && ((matches!(key.code, crossterm::event::KeyCode::Char('?')) && !state.editing)
                     || (matches!(key.code, crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char(' '))
@@ -15582,14 +15593,12 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         }
     }
 
-    let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
     let is_menu = popup_id == Some(popup::PopupId("menu"));
     let is_confirm = app.popup_manager.current().map(|s| {
         s.definition.buttons.iter().any(|b| b.id == popup::definitions::confirm::CONFIRM_BTN_YES)
             && s.definition.buttons.iter().any(|b| b.id == popup::definitions::confirm::CONFIRM_BTN_NO)
     }).unwrap_or(false);
     let is_world_selector = popup_id == Some(popup::PopupId("world_selector"));
-    let is_emoji = popup_id == Some(popup::PopupId("emoji"));
     let is_setup = popup_id == Some(popup::PopupId("setup"));
     let is_web = popup_id == Some(popup::PopupId("web"));
     let is_modify_key = popup_id == Some(popup::PopupId("modify_key"));
@@ -15746,12 +15755,18 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             return NewPopupAction::None;
         }
 
-        // Emoji picker: owns every key while open (search text lives in the
-        // shared edit buffer the whole time the popup is open, since
-        // `open_emoji_popup` selects the search field and `start_edit()`s it
-        // and nothing in this block ever moves selection off it).
+        // Emoji picker: arrows-only navigation across three zones (Search,
+        // Tabs, Grid) - see EMOJI-PICKER-ROADMAP.md's Navigation rework "Key
+        // map" table. `Tab`/`Shift-Tab` are explicitly inert (matched, but do
+        // nothing) so movement is reachable only by arrows, which is why the
+        // popup carries no help text.
         if is_emoji {
-            use popup::definitions::emoji::update_emoji_info;
+            use popup::definitions::emoji::{
+                emoji_focus, emoji_query_backspace, emoji_query_clear, emoji_query_insert,
+                emoji_tabs_select_edge, emoji_zone, EmojiZone,
+            };
+
+            let zone = emoji_zone(state);
 
             match key.code {
                 Esc => {
@@ -15765,67 +15780,101 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     }
                     // Empty grid: nothing to insert, leave the popup open.
                 }
+                Tab | BackTab => {
+                    // Deliberately inert: movement is arrows-only.
+                }
                 Backspace => {
-                    state.backspace();
+                    emoji_query_backspace(state);
                     return NewPopupAction::EmojiFilter;
                 }
                 Char(c) => {
-                    state.insert_char(c);
+                    emoji_query_insert(state, c);
                     return NewPopupAction::EmojiFilter;
                 }
-                Left => {
-                    // Category-change index reset lives here: hitting the
-                    // absolute-first-cell edge steps the tab, then
-                    // `grid_home()` zeroes selected_index/scroll_offset
-                    // before the caller's refilter rebuilds the cells.
-                    if state.grid_move(-1, 0) {
+                Up => match zone {
+                    EmojiZone::Search => {}
+                    EmojiZone::Tabs => emoji_focus(state, EmojiZone::Search),
+                    EmojiZone::Grid => {
+                        // Top row of the grid goes to Tabs; any other row
+                        // just moves up one row within the grid.
+                        if let Some((row, ..)) = state.grid_cursor() {
+                            if row == 0 {
+                                emoji_focus(state, EmojiZone::Tabs);
+                            } else {
+                                state.grid_move(0, -1);
+                            }
+                        }
+                    }
+                },
+                Down => match zone {
+                    EmojiZone::Search => emoji_focus(state, EmojiZone::Tabs),
+                    EmojiZone::Tabs => emoji_focus(state, EmojiZone::Grid),
+                    EmojiZone::Grid => {
+                        state.grid_move(0, 1);
+                    }
+                },
+                Left => match zone {
+                    EmojiZone::Search => state.cursor_left(),
+                    EmojiZone::Tabs => {
+                        // A deliberate move ON the tab row changes category
+                        // and clears the query - merely traversing through
+                        // the strip (Up/Down) does not.
                         state.tabs_step(-1);
+                        emoji_query_clear(state);
                         state.grid_home();
                         return NewPopupAction::EmojiFilter;
                     }
-                    update_emoji_info(state);
-                }
-                Right => {
-                    if state.grid_move(1, 0) {
+                    EmojiZone::Grid => {
+                        // Clamps at the first cell - no category change, no
+                        // focus change (the tab row is directly reachable
+                        // via Up now, so the old edge-triggers-category-step
+                        // behavior is gone).
+                        state.grid_move(-1, 0);
+                    }
+                },
+                Right => match zone {
+                    EmojiZone::Search => state.cursor_right(),
+                    EmojiZone::Tabs => {
                         state.tabs_step(1);
+                        emoji_query_clear(state);
                         state.grid_home();
                         return NewPopupAction::EmojiFilter;
                     }
-                    update_emoji_info(state);
-                }
-                Up => {
-                    state.grid_move(0, -1);
-                    update_emoji_info(state);
-                }
-                Down => {
-                    state.grid_move(0, 1);
-                    update_emoji_info(state);
-                }
-                Tab => {
-                    state.tabs_step(1);
-                    state.grid_home();
-                    return NewPopupAction::EmojiFilter;
-                }
-                BackTab => {
-                    state.tabs_step(-1);
-                    state.grid_home();
-                    return NewPopupAction::EmojiFilter;
-                }
+                    EmojiZone::Grid => {
+                        state.grid_move(1, 0);
+                    }
+                },
+                Home => match zone {
+                    EmojiZone::Search => state.cursor_home(),
+                    EmojiZone::Tabs => {
+                        emoji_tabs_select_edge(state, false);
+                        emoji_query_clear(state);
+                        state.grid_home();
+                        return NewPopupAction::EmojiFilter;
+                    }
+                    EmojiZone::Grid => {
+                        state.grid_home();
+                    }
+                },
+                End => match zone {
+                    EmojiZone::Search => state.cursor_end(),
+                    EmojiZone::Tabs => {
+                        emoji_tabs_select_edge(state, true);
+                        emoji_query_clear(state);
+                        state.grid_home();
+                        return NewPopupAction::EmojiFilter;
+                    }
+                    EmojiZone::Grid => {
+                        state.grid_end();
+                    }
+                },
                 PageUp => {
+                    // Scrolls the grid a page regardless of which zone is
+                    // focused (grid_page operates on the grid field itself).
                     state.grid_page(-1);
-                    update_emoji_info(state);
                 }
                 PageDown => {
                     state.grid_page(1);
-                    update_emoji_info(state);
-                }
-                Home => {
-                    state.grid_home();
-                    update_emoji_info(state);
-                }
-                End => {
-                    state.grid_end();
-                    update_emoji_info(state);
                 }
                 _ => {}
             }

@@ -339,28 +339,18 @@
         <div id="emoji-modal" class="modal">
             <div class="modal-content emoji-modal-content">
                 <div class="popup-header">
-                    <span class="popup-title">Emoji</span>
+                    <span class="popup-title" id="emoji-modal-title">Emoji</span>
                     <button id="emoji-close-btn" class="popup-close">&#10005;</button>
                 </div>
-                <div id="emoji-tabs" class="emoji-tabs" role="tablist" aria-label="Emoji category">
-                    <button type="button" class="emoji-tab-btn" data-cat="" role="tab">All</button>
-                    <button type="button" class="emoji-tab-btn" data-cat="0" role="tab">Smileys</button>
-                    <button type="button" class="emoji-tab-btn" data-cat="1" role="tab">People</button>
-                    <button type="button" class="emoji-tab-btn" data-cat="2" role="tab">Nature</button>
-                    <button type="button" class="emoji-tab-btn" data-cat="3" role="tab">Food</button>
-                    <button type="button" class="emoji-tab-btn" data-cat="4" role="tab">Activity</button>
-                    <button type="button" class="emoji-tab-btn" data-cat="5" role="tab">Objects</button>
-                    <button type="button" class="emoji-tab-btn" data-cat="6" role="tab">Symbols</button>
-                    <button type="button" class="emoji-tab-btn" data-cat="7" role="tab">Flags</button>
-                </div>
+                <!-- Populated by renderEmojiTabs() from InitialState.emoji_categories_json -
+                     no static buttons here, or the glyphs would live in two places and
+                     drift from Category::all(). Empty (no categories sent) means no tab
+                     strip at all; see EMOJI-PICKER-ROADMAP.md's Navigation rework. -->
+                <div id="emoji-tabs" class="emoji-tabs" role="tablist" aria-label="Emoji category"></div>
                 <div class="emoji-searchrow">
                     <input type="text" id="emoji-search" placeholder="Search emoji..." autocomplete="off" spellcheck="false" aria-label="Search emoji">
                 </div>
                 <div id="emoji-grid" class="emoji-grid" role="listbox" aria-label="Emoji"></div>
-                <div class="emoji-info">
-                    <span id="emoji-info-content" class="emoji-info-content">Type to search, or pick a category above</span>
-                    <button type="button" id="emoji-help-btn" class="btn-help" aria-label="Help">?</button>
-                </div>
             </div>
         </div>
 

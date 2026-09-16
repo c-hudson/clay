@@ -467,3 +467,280 @@ Fixes:
 The footer showed `😊  :smile:   smiley, happy`. It now shows the glyph and its
 search terms with the name leading the list — `⚽   soccer, football` — with no
 colon form anywhere. Pinned by `test_emoji_info_text_has_no_shortcode_form`.
+
+---
+
+# Navigation rework (v1.6.12)
+
+Three complaints after v1.6.11 shipped: the footer repeated the glyph the highlight
+already marked, the highlight was too dark to see, and navigation was split across
+three unrelated key groups (arrows → grid, Tab → category, typing → a search box with
+no reachable caret).
+
+## Progress checklist
+
+- [x] **R1** — `start_edit` caret is a char index, not a byte index
+- [x] **R2** — tab strip measures display columns, not chars
+- [x] **R3** — `Category::tab_glyph()`
+- [x] **R4** — grid cell styling: brighter, focus-aware, glyph-only
+- [x] **R5** — drop `All`, glyph tabs, reorder fields, `Tabs.active`
+- [x] **R6** — `refilter_emoji_console` + runtime title
+- [x] **R7** — footer loses the glyph
+- [x] **R8** — the focus model (the big one)
+- [x] **R9** — help text
+- [x] **R10** — wire: `emoji_categories_json`
+- [x] **R11** — web/GUI
+- [x] **R12** — verification
+- [x] **R13** — web arrow parity and focus capture
+
+**On resume:** find the first unchecked box, re-verify it landed, continue. Sequential.
+
+## Approved design
+
+Tab glyphs in `Category::all()` order: `😀 👋 🐶 🍕 ⚽ 💡 ⭐ 🏁`. All eight categories
+stay. The `All` tab is removed in both interfaces; global search replaces it. The
+active category name goes in the popup title (`┌ Emoji — Nature ──┐`).
+
+**Mode is derived, never stored: browsing ⟺ the query is empty.** A non-empty query
+means global results and no active tab.
+
+### Key map — arrows only. Three zones: Search (row 0), Tabs (rows 1-2), Grid
+
+| Key | Search | Tabs | Grid |
+|---|---|---|---|
+| printable / `Backspace` | edit query at caret | edit query (append/pop at end) | edit query (append/pop at end) |
+| `↑` | — (top) | → Search | top row → Tabs; else up a row |
+| `↓` | → Tabs | → Grid | down a row, clamps |
+| `←` `→` | move the caret | prev/next category, **clears the query** | prev/next cell, **clamps at both ends** |
+| `Home` `End` | caret to start/end | first/last category, clears the query | first/last cell |
+| `PageUp` `PageDown` | scroll grid a page | scroll grid a page | scroll grid a page |
+| `Enter` | insert selected grid cell, close | same | same |
+| `Esc` | close | close | close |
+| `Tab` / `Shift-Tab` | **nothing** | **nothing** | **nothing** |
+
+**Movement is arrow keys only.** `Tab`/`Shift-Tab` are explicitly inert — they must not
+fall through to anything else. Nothing here is reachable except by arrows, which is why
+the popup carries no help text and no `?` button.
+
+**Passing through the tab row does NOT clear the query.** Only a deliberate `←`/`→`/
+`Home`/`End` *on* the tab row changes category, and only that clears the search. This
+resolves the collision between global search and "landing on a tab shows that tab's
+items": typing `heart` then pressing `↓↓` walks into the results with the query intact,
+because merely traversing the strip changes nothing. While a query is live the strip is
+drawn inactive (no underline), which telegraphs that no category is current.
+
+You arrive on whatever `Tabs.selected_index` already held — the last browsed category,
+Smileys at open. It is never reset.
+
+Removed deliberately: `←`/`→` off the grid's first/last cell no longer step the
+category (the tab row is directly reachable now), and `Tab` no longer changes category.
+
+### Chrome the popup does NOT have
+
+No footer line, no `?` help button, no help text, no blank spacer rows. The popup is the
+title, the search box, the tab strip, and the grid — nothing else:
+
+```
+┌ Emoji — Objects ───────────────────────────────┐
+│Search: ▏                                       │
+│😀  👋  🐶  🍕  ⚽  💡  ⭐  🏁                  │
+│                    ══                          │
+│📱  💻  📷  📺  📻  💡  🔦  📖  📚  💵  💳  💎  │
+│🔨  🔧  🔒  🔓  🔑  🔔  🎁  🎈  🎉  🎊  🏰  📜  │
+│🔮  🧪  🪦  🪙  🧭  🏮  🪓  🏹  ⚓  🚢  🪄  💊  │
+│💉  👓  📦                                      │
+└────────────────────────────────────────────────┘
+```
+
+- **`EMOJI_FIELD_INFO` is deleted.** The selected emoji's name and keywords are shown
+  nowhere: the highlight already says which emoji is selected and the title says which
+  category. `emoji_info_text`/`update_emoji_info` go with it.
+- **`.with_help(...)` is dropped**, removing the `?` button. Side effect worth having:
+  that button is the one whose click makes the caller synthesize an `Enter`, which this
+  popup reads as "insert the selected emoji and close" — so *clicking Help inserted an
+  emoji*. Deleting the button deletes the bug for this popup.
+- **The grid renders only as many rows as it has content**, capped at `visible_rows`, so
+  a category that half-fills the grid leaves no trailing blank rows. This makes the
+  popup's height change between categories and as a search narrows — the accepted cost
+  of removing the empty lines.
+
+## Traps — each of these was found by inspection, not by running the code
+
+**`compute_tab_window` and `render_tabs_field` count `chars()`, not columns**
+(`console_renderer.rs:1637` and the `prefix_width`/`active_label_width` arithmetic).
+A glyph tab is 1 char and 2 columns, so with glyph labels the `═` underline lands at
+`active * 3` instead of `active * 4` — **under the wrong tab**, drifting further with
+each tab to the right. Must use `display_width()` (already defined at line 138)
+regardless of anything else here.
+
+**The highlight the user complained about is the UNFOCUSED one.** The popup opens with
+focus on the search row, so the grid is unfocused in the state being complained about.
+Brightening only the focused style leaves the bug in its commonest form. Both styles
+change; the *difference* between them is what carries focus. Emoji are drawn in their
+own colours by essentially every terminal, so `fg` on a selected cell is decorative —
+**background is the whole signal.** Focused: `button_selected_bg()` (White/Blue, the
+confirm dialog's focused-button colour). Unfocused: `fg_dim()` (DarkGray/Gray). Do
+**not** use `fg_accent()` for unfocused — it is Blue in the Light theme and collides
+with `button_selected_bg()`.
+
+**The highlight must cover the glyph's 2 columns, not all 4 of `CELL_STRIDE`.** Today
+one span covers the whole stride, so the highlight bleeds into the inter-cell gutter —
+invisible at `Rgb(40,40,60)`, glaring at solid white. Split the cell into two spans.
+
+**`?` stops being a search character** once `editing` can be false. The generic help
+guard (`main.rs:15568-15580`) fires on `Char('?')` when `!state.editing`, which today
+never happens here. Hoist `let popup_id` above that block and exclude the emoji popup,
+or "typing always edits the search box" becomes false on two of the three rows.
+
+**A live pre-existing bug this rework fixes for free:** `handle_popup_mouse_click`
+(`input_handler.rs:98-147`) already calls `commit_edit()` when you click a different
+field, setting `editing = false` — after which `insert_char` is a no-op and the search
+box is dead until the popup is reopened. Any design that pins `editing = true` for the
+popup's life is already broken by that code. The commit-on-focus-out /
+start-edit-on-focus-in contract below is what that mouse path assumes.
+
+**Do not touch `filter_emoji` or `getFilteredEmoji`.** "Global search" is
+`filter_emoji(None, q)` — the same call that used to mean "the All tab". The meaning
+changed; the code does not. The decision (`category = if query.is_empty() { tab } else
+{ None }`) lives in the *callers* on both sides, which keeps the Rust/JS differential
+check valid.
+
+**Do not assert every tab glyph is an entry in its own category** — 🐶 (U+1F436) is not
+in `EMOJI`; the table has 🐕 for `dog`. Assert `console_safe` + width 2 + all-distinct.
+
+**`render_popup_content_direct` needs no signature change** — `let is_selected =
+matches!(&state.selected, ElementSelection::Field(id) if *id == field.id);` inside its
+existing loop. It needs no `Tabs` arm either: it only runs on mouse-wheel scroll, which
+cannot change the active tab. Only the Grid styling must stay byte-identical with the
+ratatui path, or the highlight flickers between two styles on partial repaints.
+
+**The web keeps its own input model.** It adopts the glyph tabs, the dropped `All` and
+global search — and nothing else. A browser search box has a native text caret; taking
+`←`/`→` away from it to drive zone focus is a regression a mouse-and-keyboard user
+feels immediately. Web `Tab`/`Shift-Tab` stay prev/next category, arrows stay on the
+grid.
+
+## The search text, now that focus moves
+
+The `EMOJI_FIELD_SEARCH` Text field's own `value` is the single source of truth.
+`edit_buffer`/`edit_cursor` are a working copy that exists only while the search row
+has focus: `start_edit()` on focus-in, `commit_edit()` on focus-out. Typing while focus
+is elsewhere appends directly to the field's `value` (at the end — with no visible
+caret, end-of-string is the only defensible position).
+
+- `emoji_focus(state, zone)` is the only thing that moves focus: commit, select, and
+  `start_edit()` iff the target is Search.
+- `emoji_query_insert`/`emoji_query_backspace` delegate to `state.insert_char`/
+  `backspace` when Search is focused-and-editing, else mutate the field value directly.
+- `emoji_query(state)` is the read side — character-for-character the expression
+  already duplicated at `input_handler.rs:1032` and `remote_client.rs:1984`, so the
+  refilter contract does not change, it just stops being copy-pasted.
+
+`start_edit` sets `edit_cursor` to `edit_buffer.len()` — a **byte** count — while
+`insert_char`/`backspace` treat it as a char index (`popup/mod.rs:1508`). Harmless only
+because the popup opens empty; re-entering the search row with text in it makes it
+reachable. Fix to `chars().count()` (R1) — a strict improvement for every popup.
+
+## Killing the duplicated refilter
+
+`EmojiFilter` is handled by ~25 verbatim-duplicated lines in `input_handler.rs` and
+`remote_client.rs`. Extract `refilter_emoji_console(state)` doing grid → footer → title
+→ `Tabs.active` in one pass; both call sites become one line, and `open_emoji_popup`
+uses it too so the open path and the keypress path cannot diverge. `EmojiFilter` keeps
+its empty payload — the `selected_index` re-read moves inside the helper.
+
+Pin it with an `include_str!` test asserting both files mention
+`refilter_emoji_console` — crude, but it is the only thing that catches "someone added
+a third console front end and forgot the arm", which is the failure mode this file
+already warns about for `remote_client.rs`.
+
+## Known adjacent breakage — NOT in scope, recorded so it is not rediscovered
+
+- Clicking a tab only moves focus; it does not change the active tab or refilter.
+- Clicking a grid cell does not select it (`grid_select` has no production caller).
+- `handle_paste` writes `edit_buffer` and returns without reaching `EmojiFilter`, so a
+  pasted search term never refilters.
+
+# R13 — web arrow parity and focus capture
+
+Reported: arrow keys in the web/GUI picker moved nothing visible, and the emoji popup
+lost the keyboard back to the command input while open. Root cause was two focus-steal
+paths plus the web picker never having adopted the arrows-only zone model at all (the
+"web keeps its own input model" decision from the Navigation rework above is superseded
+by this entry — the web now mirrors the console's key map exactly).
+
+**Focus capture (`src/web/app.js`):**
+- `elements.input`'s own `keydown` listener now returns immediately
+  (`if (emojiPopupOpen) return;`) before resolving any chord/action, so it can never
+  intercept-and-`stopPropagation()` a key meant for the popup.
+- The document-level nav-dispatch block's two `elements.input.focus()` calls (the
+  `tf_bound_keys_json`/`RunKeyBinding` arm and the built-in-action-table arm) are now
+  guarded with `if (!emojiPopupOpen)` — opening the popup from that path (chord
+  resolved while nothing had DOM focus) no longer steals focus back to the command
+  input on the very next line.
+- `openEmojiPopup`/`closeEmojiPopup` are unchanged in effect (search gets focus on
+  open, `focusInputWithKeyboard()` restores it on close) but DOM focus now genuinely
+  stays on `elements.emojiSearch` for the popup's entire lifetime — see below.
+
+**Zone model:** a new `emojiZone` variable (`'search' | 'tabs' | 'grid'`), moved by
+`emojiSetZone(zone)`, which just sets `data-zone` on `elements.emojiModal` — no
+re-render needed, since all the visual difference is CSS. Unlike the console, DOM focus
+never actually leaves `elements.emojiSearch`; the zone is a pure UI-state indicator.
+This is what keeps the search box's native caret working while still letting Up/Down
+walk into Tabs/Grid.
+
+New functions in `app.js`, each a direct port of the `PopupState`/`emoji.rs` method it
+mirrors: `emojiGridMove(dx, dy)` (`grid_move`), `emojiGridCursor()` (`grid_cursor`),
+`emojiGridPage(delta)` (`grid_page`), `emojiTabsSelectEdge(last)`
+(`emoji_tabs_select_edge`, via the existing `setEmojiCategory`). The old flat-clamp
+`emojiStep(delta)` is gone, replaced by `emojiGridMove(dx, 0)`, which is the same
+behavior for `dx = ±1` but is also now dy-aware for real row movement.
+
+The `document.onkeydown` `emojiPopupOpen` block was rewritten key-by-key against the
+key-map table: `←`/`→`/`Home`/`End` return without `preventDefault()` while
+`emojiZone === 'search'` (native caret), and are intercepted everywhere else; `Tab`/
+`Shift-Tab` are unconditionally `preventDefault()`-ed and otherwise ignored in every
+zone; `PageUp`/`PageDown` call `emojiGridPage` regardless of zone; printable characters
+and `Backspace` are never intercepted at all (typing always lands in the search box
+natively and never changes zone or clears the query — only a deliberate `←`/`→`/
+`Home`/`End` *on* the Tabs zone does that, via the existing `setEmojiCategory`/
+`emojiTabsSelectEdge`).
+
+**CSS (`src/web/style.css`), all keyed off `#emoji-modal[data-zone="…"]`:**
+- `.emoji-grid button.emoji-cell.selected` is now the *unfocused* look
+  (`var(--theme-selection-bg)`, a muted blue in both the light and dark palettes, on
+  `var(--text-color)`); `#emoji-modal[data-zone="grid"] .emoji-cell.selected` restores
+  today's bright `var(--accent-color)`-on-black look, matching the console's
+  `button_selected_bg()` vs. `fg_dim()` split.
+- `#emoji-modal[data-zone="tabs"] .emoji-tab-btn.active` gets the same bright
+  accent-color fill while the Tabs zone actually has the arrow keys; the plain
+  underline (`.emoji-tab-btn.active` alone) still marks "current category" the rest of
+  the time.
+- `.emoji-searchrow input:focus` no longer shows the accent border unconditionally
+  (DOM `:focus` never leaves this input while the popup is open, so that rule used to
+  be permanently "on" and stopped meaning anything) — it now defaults to the plain
+  separator border, and `#emoji-modal[data-zone="search"] .emoji-searchrow input:focus`
+  is what lights it up.
+
+**Verification:** no node in this sandbox. Served `src/web/` via `python3 -m
+http.server` on 127.0.0.1 and drove real headless Firefox through geckodriver's HTTP
+API (`-headless`, per `reference_clay_js_browser_harness`). `new Function(src)` on the
+live-fetched `app.js` confirmed no `SyntaxError`. A harness fetched the real file text,
+extracted (via brace-matching, not reimplementation) the actual `emojiGridMove`/
+`emojiGridCursor`/`emojiGridPage`/`emojiTabsSelectEdge`/`emojiSetZone`/
+`getEmojiGridMetrics`/`setEmojiCategory` functions and the real `emojiPopupOpen`
+keydown block, wired them against a real (off-screen, fixed 4-column) grid element so
+`getEmojiGridMetrics`'s DOM measurement ran for real, and ran 20 assertions: Search→
+Tabs→Grid on repeated `↓`, Grid-top-row `↑`→Tabs, `←`/`→` clamp at both grid ends,
+`←`/`→`/`Home`/`End` are not `preventDefault`-ed in Search but are everywhere else,
+typing `heart` then `↓↓` preserves the query while reaching Grid, `Tab` is inert, and a
+plain character key is never intercepted — all 20 passed. A second harness rendered a
+real `.emoji-cell.selected` and `.emoji-tab-btn.active` under the real `style.css` and
+toggled `data-zone`: focused-vs-unfocused `background-color` differed for both the grid
+cell and the tab (confirmed again with the actual dark/light `--theme-selection-bg` hex
+values injected, for real contrast against `--text-color` in both themes), and the
+search input's border color differed between `data-zone="search"` and the other two
+zones despite DOM `:focus` never moving. `cargo test --no-default-features --features
+rustls-backend,ssh-transport`: 1778 passed, 0 failed (matches baseline). All spawned
+geckodriver/http.server processes were killed after verification; the user's own
+Firefox windows were left untouched.

@@ -238,6 +238,31 @@ tab to it first.
 | `F` or `/` | Focus the filter field |
 | `Esc` | Close popup |
 
+## Emoji Picker (Esc-e)
+
+Three zones, top to bottom: the search box, the category tab strip (one glyph per
+category), and the emoji grid. Navigation is arrow keys only — there is no `Tab`
+cycling and no help button; the highlighted cell and the `Emoji — <Category>` title
+are the only affordances.
+
+| Key | Search | Tabs | Grid |
+|---|---|---|---|
+| Type text / `Backspace` | Edit the query at the caret | Edit the query (appends/erases at the end) | Edit the query (appends/erases at the end) |
+| `Up` | (already at the top) | Move to Search | Top row moves to Tabs; otherwise up a row |
+| `Down` | Move to Tabs | Move to Grid | Down a row (clamps at the bottom) |
+| `Left` / `Right` | Move the caret | Previous/next category — **clears the search** | Previous/next cell (clamps at both ends) |
+| `Home` / `End` | Caret to start/end | First/last category — **clears the search** | First/last cell |
+| `PageUp` / `PageDown` | Scroll the grid a page | Scroll the grid a page | Scroll the grid a page |
+| `Enter` | Insert the selected emoji and close | Insert the selected emoji and close | Insert the selected emoji and close |
+| `Esc` | Close the popup | Close the popup | Close the popup |
+| `Tab` / `Shift-Tab` | Does nothing | Does nothing | Does nothing |
+
+Typing always edits the search box, no matter which zone has focus, and a non-empty
+query searches every category at once regardless of the active tab. Merely moving
+through the tab strip with `Up`/`Down` does not change or clear the search — only a
+deliberate `Left`/`Right`/`Home`/`End` *on* the tab row switches category, and that's
+the only thing that clears it.
+
 ## Confirmation Dialogs
 
 | Key | Action |

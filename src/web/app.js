@@ -544,12 +544,11 @@
         actionConfirmNoBtn: document.getElementById('action-confirm-no-btn'),
         // Emoji picker popup (Esc-e)
         emojiModal: document.getElementById('emoji-modal'),
+        emojiModalTitle: document.getElementById('emoji-modal-title'),
         emojiCloseBtn: document.getElementById('emoji-close-btn'),
         emojiTabs: document.getElementById('emoji-tabs'),
         emojiSearch: document.getElementById('emoji-search'),
         emojiGrid: document.getElementById('emoji-grid'),
-        emojiInfoContent: document.getElementById('emoji-info-content'),
-        emojiHelpBtn: document.getElementById('emoji-help-btn'),
         // Worlds list popup
         worldsModal: document.getElementById('worlds-modal'),
         worldsTableBody: document.getElementById('worlds-table-body'),
@@ -1335,16 +1334,28 @@
     let searchMatchIndices = [];  // indices into output_lines that match
     let searchCurrentPos = -1;    // which match is currently shown at bottom
 
-    // Emoji picker popup state (Esc-e, EMOJI-PICKER-ROADMAP.md Step 7)
+    // Emoji picker popup state (Esc-e, EMOJI-PICKER-ROADMAP.md Step 7; navigation
+    // rework in EMOJI-PICKER-ROADMAP.md's "Navigation rework (v1.6.12)" section)
     let emojiPopupOpen = false;
     // Parsed once from InitialState.emoji_json: [{ch, name, keywords, category}, ...].
     // category is 0-7 in Category::all() order (Smileys..Flags), matching the
     // server's Category::index(). Stays empty (never throws) if emoji_json is
     // absent/empty/malformed - the picker then shows a one-line notice.
     let emojiData = [];
-    let emojiCategory = null; // null = "All" tab, else 0-7
+    // Parsed once from InitialState.emoji_categories_json: [{index, name, glyph}, ...],
+    // one row per Category::all() entry (0-7, Smileys..Flags). Stays empty (never
+    // throws) if the field is absent/empty/malformed (older server) - the picker
+    // then draws no tab strip at all; global search and the full grid still work.
+    let emojiCategories = [];
+    let emojiCategory = 0; // 0-7, the currently browsed category; ignored while emojiQuery is non-empty
     let emojiQuery = '';
     let emojiSelectedIndex = 0;
+    // Which of the three zones (Search/Tabs/Grid) arrow keys act on - mirrors
+    // EmojiZone in src/popup/definitions/emoji.rs. Unlike the console, DOM focus
+    // never leaves elements.emojiSearch while the popup is open (a browser text
+    // input's native caret is worth keeping), so this is purely a UI-state
+    // indicator driven off data-zone on elements.emojiModal; see emojiSetZone.
+    let emojiZone = 'search';
 
     // Font popup state (/font)
     // fontPopupOpen removed — merged into settingsPopupOpen
@@ -3085,6 +3096,17 @@
                     }) : [];
                 } catch (emojiErr) {
                     emojiData = [];
+                }
+                // Same contract as emoji_json above, same #[serde(default)] on an older
+                // server: absent/empty/malformed must never throw, just degrade to no
+                // tab strip (see renderEmojiTabs).
+                try {
+                    const categoryRows = msg.emoji_categories_json ? JSON.parse(msg.emoji_categories_json) : [];
+                    emojiCategories = Array.isArray(categoryRows) ? categoryRows.map(function(row) {
+                        return { index: row[0], name: row[1], glyph: row[2] };
+                    }) : [];
+                } catch (emojiCatErr) {
+                    emojiCategories = [];
                 }
                 splashLines = msg.splash_lines || [];
                 // Reset client-side more-mode state (each client handles more locally)
@@ -7217,22 +7239,10 @@
             '  Paste a key here manually, or tap Download when',
             '  connected to fetch the key from the server and',
             '  store it in the app for future logins.'
-        ],
-        emoji: [
-            'Emoji Picker - Insert an Emoji', '',
-            'Browse or search a curated set of emoji and insert',
-            'one into the command input at the cursor.', '',
-            'Tabs: Pick a category, or All to search everything.', '',
-            'Search: Type to narrow by name or keyword.', '',
-            'Left/Right/Up/Down: Move the grid cursor.',
-            '  Left on the first cell / Right on the last cell',
-            '  changes category instead.', '',
-            'Tab / Shift-Tab: Next / previous category.',
-            'PageUp / PageDown: Scroll the grid a page.',
-            'Home / End: First / last cell.', '',
-            'Enter: Insert the selected emoji and close.',
-            'Esc: Close without inserting.'
         ]
+        // No `emoji` entry: the picker dropped its help button in the navigation
+        // rework (EMOJI-PICKER-ROADMAP.md's "Navigation rework (v1.6.12)" section),
+        // same as the console.
     };
 
     function openPopupHelp(key) {
@@ -9710,18 +9720,36 @@
         });
     }
 
-    // ---------- Emoji picker (Esc-e, EMOJI-PICKER-ROADMAP.md Step 7) ----------
+    // ---------- Emoji picker (Esc-e, EMOJI-PICKER-ROADMAP.md Step 7; navigation
+    // rework in the "Navigation rework (v1.6.12)" section; R13 gave the web picker
+    // full arrow-key zone parity with the console) ----------
     // One implementation shared by web and the WebView GUI. Modelled on
     // openActionsListPopup/renderActionsList (search field + live-narrowed list),
     // with the list swapped for a 2-D grid and a tab strip for category narrowing.
+    //
+    // The web picker mirrors the console's arrows-only, three-zone (Search/Tabs/
+    // Grid) key map exactly (R13) - the one deliberate difference is that DOM
+    // focus never leaves elements.emojiSearch while the popup is open, so Left/
+    // Right/Home/End in the Search zone are native browser caret movement rather
+    // than a zone-tracked position. Tab/Shift-Tab are inert in every zone, same
+    // as the console.
 
-    // Tab index 0 is "All" (category null); tab N+1 is Category::all()[N] (0-7,
-    // Smileys..Flags), matching emoji_json's wire category_index exactly.
+    // No more "All" tab, so tab index and category index are the same number -
+    // these are now identities, kept only so call sites don't have to care.
     function emojiTabIndexToCategory(tabIndex) {
-        return tabIndex === 0 ? null : tabIndex - 1;
+        return tabIndex;
     }
     function emojiCategoryToTabIndex(category) {
-        return category === null ? 0 : category + 1;
+        return category;
+    }
+
+    // The category a filter should scope to, or null for global search. Mode is
+    // derived, never stored: a live (non-empty) query means global results, full
+    // stop, regardless of which tab was last active. Mirrors emoji_active_category
+    // in src/popup/definitions/emoji.rs - every getFilteredEmoji call site reads
+    // through this rather than the raw emojiCategory variable.
+    function emojiActiveCategory() {
+        return emojiQuery ? null : emojiCategory;
     }
 
     // Must agree EXACTLY with the Rust filter_emoji (src/popup/definitions/emoji.rs):
@@ -9729,8 +9757,11 @@
     // keyword individually (keywords arrive as a single space-joined string per
     // emoji_json's wire form, so they're split back into tokens here rather than
     // substring-matched against the joined string, which could false-match across
-    // a token boundary the Rust side would never match). category === null is the
-    // "All" tab; an empty query matches everything in the category.
+    // a token boundary the Rust side would never match). category === null means
+    // global search; an empty query matches everything in the category. Do not
+    // touch this function to implement global search - the mode decision belongs
+    // in the caller (emojiActiveCategory), which is what keeps this cross-checked
+    // against the Rust side by a differential test.
     function getFilteredEmoji(category, query) {
         const q = (query || '').toLowerCase();
         return emojiData.filter(function(e) {
@@ -9770,13 +9801,22 @@
 
     function openEmojiPopup() {
         emojiPopupOpen = true;
-        emojiCategory = null;
+        // No tabs (degraded/older server) => no category to restrict to; show the
+        // full grid, since search is the only way to narrow it without a strip to
+        // click. Otherwise land on the first tab (Smileys), same as the console.
+        emojiCategory = emojiCategories.length > 0 ? emojiCategories[0].index : null;
         emojiQuery = '';
         emojiSelectedIndex = 0;
         if (elements.emojiSearch) elements.emojiSearch.value = '';
         elements.emojiModal.className = 'modal visible';
         renderEmojiTabs();
         renderEmojiGrid();
+        updateEmojiTitle();
+        // R13: focus belongs to the popup for its whole lifetime - land on the
+        // Search zone (same as the console, which starts on EMOJI_FIELD_SEARCH)
+        // and leave DOM focus on the search box itself; it never moves again
+        // until the popup closes (see emojiSetZone).
+        emojiSetZone('search');
         if (elements.emojiSearch) elements.emojiSearch.focus();
     }
 
@@ -9786,56 +9826,165 @@
         focusInputWithKeyboard();
     }
 
+    // Rewrite the popup title from the current mode: the active category's name
+    // while browsing, or plain "Emoji" while a search query is live. Mirrors
+    // update_emoji_title in src/popup/definitions/emoji.rs.
+    function updateEmojiTitle() {
+        if (!elements.emojiModalTitle) return;
+        const cat = emojiActiveCategory();
+        const entry = cat !== null ? emojiCategories.find(function(c) { return c.index === cat; }) : null;
+        elements.emojiModalTitle.textContent = entry ? ('Emoji — ' + entry.name) : 'Emoji';
+    }
+
+    // Builds the tab strip from emojiCategories (InitialState.emoji_categories_json).
+    // An empty array (absent/malformed on an older server) renders no tab strip at
+    // all - global search and the full grid still work without one; there is no
+    // "All" tab to fall back to. Rebuilt on every call (open + category change)
+    // rather than diffed in place - eight buttons is cheap and it keeps the click
+    // handler wiring co-located with the elements it targets.
     function renderEmojiTabs() {
         if (!elements.emojiTabs) return;
-        const activeIndex = emojiCategoryToTabIndex(emojiCategory);
-        const buttons = elements.emojiTabs.querySelectorAll('.emoji-tab-btn');
-        buttons.forEach(function(btn, i) {
-            const isActive = i === activeIndex;
+        elements.emojiTabs.innerHTML = '';
+        const isSearching = emojiQuery !== '';
+        emojiCategories.forEach(function(cat) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'emoji-tab-btn';
+            btn.setAttribute('role', 'tab');
+            btn.setAttribute('data-cat', String(cat.index));
+            btn.textContent = cat.glyph;
+            btn.title = cat.name;
+            btn.setAttribute('aria-label', cat.name);
+            const isActive = !isSearching && cat.index === emojiCategory;
             btn.classList.toggle('active', isActive);
             btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+            btn.addEventListener('click', function() {
+                setEmojiCategory(cat.index);
+                emojiSetZone('tabs');
+                if (elements.emojiSearch) elements.emojiSearch.focus();
+            });
+            elements.emojiTabs.appendChild(btn);
         });
     }
 
-    // Changes category, resetting the selection to index 0 (or the last cell,
-    // for stepping backward off the first cell via emojiStep). Wraps at the
-    // tab-strip ends, same as Tab/Shift-Tab.
-    function setEmojiCategory(tabIndex, where) {
-        const total = elements.emojiTabs ? elements.emojiTabs.querySelectorAll('.emoji-tab-btn').length : 1;
-        let idx = tabIndex;
+    // Changes category, clearing any live search (a deliberate category pick
+    // always shows that category's own items) and resetting the selection to the
+    // first cell. Wraps at the tab-strip ends, same as the console's tabs_step.
+    // A no-op with no tabs to switch to (degraded picker).
+    function setEmojiCategory(index) {
+        const total = emojiCategories.length;
+        if (total === 0) return;
+        let idx = index;
         if (idx < 0) idx = total - 1;
         if (idx >= total) idx = 0;
-        emojiCategory = emojiTabIndexToCategory(idx);
-        const list = getFilteredEmoji(emojiCategory, emojiQuery);
-        emojiSelectedIndex = where === 'end' ? Math.max(0, list.length - 1) : 0;
+        emojiCategory = emojiCategories[idx].index;
+        emojiQuery = '';
+        if (elements.emojiSearch) elements.emojiSearch.value = '';
+        emojiSelectedIndex = 0;
         renderEmojiTabs();
+        renderEmojiGrid();
+        updateEmojiTitle();
+    }
+
+    // Mirrors PopupState::grid_move (src/popup/mod.rs) exactly, R13: dx is a flat
+    // clamp across the whole filtered list (so Right off the end of a row lands
+    // on the next row's first cell, and stepping off the absolute first/last cell
+    // just stays put - no category change, the tab row is reached via the zone
+    // switch instead). dy is row-aware: it clamps the ROW to the grid's extent
+    // and preserves the column, or clamps to the target row's own last column if
+    // that row is shorter (a ragged last row).
+    function emojiGridMove(dx, dy) {
+        const list = getFilteredEmoji(emojiActiveCategory(), emojiQuery);
+        if (list.length === 0) return;
+        const metrics = getEmojiGridMetrics();
+        const columns = Math.max(1, metrics.cols);
+        const rowLen = function(row) {
+            return Math.max(0, Math.min(columns, list.length - row * columns));
+        };
+        if (dx !== 0) {
+            const n = emojiSelectedIndex + dx;
+            if (n >= 0 && n < list.length) emojiSelectedIndex = n;
+        }
+        if (dy !== 0) {
+            const totalRows = Math.ceil(list.length / columns);
+            const row = Math.floor(emojiSelectedIndex / columns);
+            const col = emojiSelectedIndex % columns;
+            const newRow = Math.max(0, Math.min(totalRows - 1, row + dy));
+            const newCol = Math.min(col, Math.max(0, rowLen(newRow) - 1));
+            emojiSelectedIndex = newRow * columns + newCol;
+        }
         renderEmojiGrid();
     }
 
-    // Left/Right walk the flat filtered list and cross row boundaries freely;
-    // only stepping off the absolute first cell (delta -1 from index 0) or the
-    // absolute last cell (delta +1 from the end) changes category - never a mere
-    // row edge. Mirrors the approved mockup's step() and the Rust grid_move
-    // edge-reporting semantics from Step 2/4.
-    function emojiStep(delta) {
-        const list = getFilteredEmoji(emojiCategory, emojiQuery);
-        const n = emojiSelectedIndex + delta;
-        if (n < 0) { setEmojiCategory(emojiCategoryToTabIndex(emojiCategory) - 1, 'end'); return; }
-        if (n >= list.length) { setEmojiCategory(emojiCategoryToTabIndex(emojiCategory) + 1, 'start'); return; }
-        emojiSelectedIndex = n;
+    // Mirrors PopupState::grid_cursor: the selected cell's (row, col, totalRows),
+    // or null for an empty grid. ArrowUp uses this to tell "top row -> Tabs
+    // zone" apart from "move up a row within the grid".
+    function emojiGridCursor() {
+        const list = getFilteredEmoji(emojiActiveCategory(), emojiQuery);
+        if (list.length === 0) return null;
+        const metrics = getEmojiGridMetrics();
+        const columns = Math.max(1, metrics.cols);
+        return {
+            row: Math.floor(emojiSelectedIndex / columns),
+            col: emojiSelectedIndex % columns,
+            totalRows: Math.ceil(list.length / columns),
+        };
+    }
+
+    // Mirrors PopupState::grid_page: scroll a whole page (metrics.rows rows) up
+    // or down, clamping the target row and re-homing the column into it. Applies
+    // regardless of which zone is focused, same as the console (grid_page
+    // operates on the grid field directly).
+    function emojiGridPage(delta) {
+        const list = getFilteredEmoji(emojiActiveCategory(), emojiQuery);
+        if (list.length === 0) return;
+        const metrics = getEmojiGridMetrics();
+        const columns = Math.max(1, metrics.cols);
+        const rows = Math.max(1, metrics.rows);
+        const totalRows = Math.ceil(list.length / columns);
+        const rowDelta = delta * rows;
+        const curRow = Math.floor(emojiSelectedIndex / columns);
+        const col = emojiSelectedIndex % columns;
+        const newRow = Math.max(0, Math.min(totalRows - 1, curRow + rowDelta));
+        const newRowLen = Math.max(0, Math.min(columns, list.length - newRow * columns));
+        const newCol = Math.min(col, Math.max(0, newRowLen - 1));
+        emojiSelectedIndex = newRow * columns + newCol;
         renderEmojiGrid();
+    }
+
+    // Jump the tab strip to its first/last category - mirrors
+    // emoji_tabs_select_edge (src/popup/definitions/emoji.rs). setEmojiCategory
+    // already clears the query, resets the grid selection and re-renders
+    // everything, so this is a thin wrapper that just picks the edge index.
+    function emojiTabsSelectEdge(last) {
+        if (emojiCategories.length === 0) return;
+        setEmojiCategory(last ? emojiCategories.length - 1 : 0);
+    }
+
+    // The only thing that moves focus between the three zones - mirrors
+    // emoji_focus (src/popup/definitions/emoji.rs), minus the edit-buffer commit:
+    // the web has no in-progress edit to strand, since DOM focus never actually
+    // leaves elements.emojiSearch (R13's "keep the native caret" decision - see
+    // the block comment at the top of this section). Setting data-zone is all
+    // that's needed; style.css keys the grid highlight, tab pill and search
+    // border off it directly, so nothing here needs to re-render anything.
+    function emojiSetZone(zone) {
+        emojiZone = zone;
+        if (elements.emojiModal) elements.emojiModal.setAttribute('data-zone', zone);
     }
 
     function updateEmojiFilter() {
         emojiQuery = elements.emojiSearch ? elements.emojiSearch.value : '';
         emojiSelectedIndex = 0;
+        renderEmojiTabs();
         renderEmojiGrid();
+        updateEmojiTitle();
     }
 
     function renderEmojiGrid() {
         const grid = elements.emojiGrid;
         if (!grid) return;
-        const list = getFilteredEmoji(emojiCategory, emojiQuery);
+        const list = getFilteredEmoji(emojiActiveCategory(), emojiQuery);
         if (emojiSelectedIndex >= list.length) emojiSelectedIndex = Math.max(0, list.length - 1);
         grid.innerHTML = '';
 
@@ -9846,7 +9995,6 @@
             notice.className = 'emoji-grid-empty';
             notice.textContent = 'No emoji data available from this server.';
             grid.appendChild(notice);
-            showEmojiInfo(null);
             return;
         }
         if (list.length === 0) {
@@ -9854,7 +10002,6 @@
             empty.className = 'emoji-grid-empty';
             empty.textContent = 'No emoji match “' + emojiQuery + '”';
             grid.appendChild(empty);
-            showEmojiInfo(null);
             return;
         }
 
@@ -9867,7 +10014,6 @@
             btn.setAttribute('role', 'option');
             btn.setAttribute('aria-label', e.name);
             if (i === emojiSelectedIndex) btn.setAttribute('aria-selected', 'true');
-            btn.addEventListener('mouseenter', function() { showEmojiInfo(e); });
             btn.addEventListener('click', function() {
                 emojiSelectedIndex = i;
                 insertEmoji(e);
@@ -9880,20 +10026,6 @@
             const gt = grid.scrollTop, gh = grid.clientHeight, ot = selNode.offsetTop, oh = selNode.offsetHeight;
             if (ot < gt) grid.scrollTop = ot;
             else if (ot + oh > gt + gh) grid.scrollTop = ot + oh - gh;
-        }
-        showEmojiInfo(list[emojiSelectedIndex]);
-    }
-
-    function showEmojiInfo(e) {
-        const content = elements.emojiInfoContent;
-        if (!content) return;
-        if (e) {
-            const keywordsCsv = (e.keywords || '').split(' ').filter(Boolean).join(', ');
-            content.innerHTML = '<span class="emoji-info-glyph">' + escapeHtml(e.ch) + '</span>' +
-                '<code class="emoji-info-code">:' + escapeHtml(e.name) + ':</code>' +
-                '<span>' + escapeHtml(keywordsCsv) + '</span>';
-        } else {
-            content.textContent = 'Type to search, or pick a category above';
         }
     }
 
@@ -13971,52 +14103,117 @@
             }
 
             // Handle emoji picker popup (Esc-e). Owns every key while open, same as
-            // the other popup blocks here - the search input has native focus, so
-            // Left/Right/Home/End must be intercepted here or the browser would move
-            // the text caret inside the search box instead of the grid cursor.
+            // the other popup blocks here. R13: mirrors the console's arrows-only,
+            // three-zone (Search/Tabs/Grid) key map from EMOJI-PICKER-ROADMAP.md's
+            // "Navigation rework" section exactly - see emoji_zone/emoji_focus/
+            // grid_move/grid_cursor/grid_page/tabs_step in src/popup/mod.rs and
+            // src/popup/definitions/emoji.rs. The one deliberate web-only carve-out:
+            // DOM focus never leaves elements.emojiSearch, so Left/Right/Home/End in
+            // the Search zone must NOT be intercepted - they're native caret
+            // movement, which is the whole reason the web keeps a real <input>.
             if (emojiPopupOpen) {
-                const emojiList = getFilteredEmoji(emojiCategory, emojiQuery);
-                const emojiMetrics = getEmojiGridMetrics();
+                if (e.key === 'Tab') {
+                    // Movement is arrows-only; Tab/Shift-Tab are explicitly inert in
+                    // every zone (matches the console - see the key-map table).
+                    e.preventDefault();
+                    return;
+                }
                 if (e.key === 'Escape') {
                     e.preventDefault();
                     closeEmojiPopup();
-                } else if (e.key === 'Enter') {
-                    e.preventDefault();
-                    if (emojiList[emojiSelectedIndex]) insertEmoji(emojiList[emojiSelectedIndex]);
-                } else if (e.key === 'ArrowRight') {
-                    e.preventDefault();
-                    emojiStep(1);
-                } else if (e.key === 'ArrowLeft') {
-                    e.preventDefault();
-                    emojiStep(-1);
-                } else if (e.key === 'ArrowDown') {
-                    e.preventDefault();
-                    emojiSelectedIndex = Math.min(emojiList.length - 1, emojiSelectedIndex + emojiMetrics.cols);
-                    renderEmojiGrid();
-                } else if (e.key === 'ArrowUp') {
-                    e.preventDefault();
-                    emojiSelectedIndex = Math.max(0, emojiSelectedIndex - emojiMetrics.cols);
-                    renderEmojiGrid();
-                } else if (e.key === 'PageDown') {
-                    e.preventDefault();
-                    emojiSelectedIndex = Math.min(emojiList.length - 1, emojiSelectedIndex + emojiMetrics.cols * emojiMetrics.rows);
-                    renderEmojiGrid();
-                } else if (e.key === 'PageUp') {
-                    e.preventDefault();
-                    emojiSelectedIndex = Math.max(0, emojiSelectedIndex - emojiMetrics.cols * emojiMetrics.rows);
-                    renderEmojiGrid();
-                } else if (e.key === 'Home') {
-                    e.preventDefault();
-                    emojiSelectedIndex = 0;
-                    renderEmojiGrid();
-                } else if (e.key === 'End') {
-                    e.preventDefault();
-                    emojiSelectedIndex = Math.max(0, emojiList.length - 1);
-                    renderEmojiGrid();
-                } else if (e.key === 'Tab') {
-                    e.preventDefault();
-                    setEmojiCategory(emojiCategoryToTabIndex(emojiCategory) + (e.shiftKey ? -1 : 1), 'start');
+                    return;
                 }
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const list = getFilteredEmoji(emojiActiveCategory(), emojiQuery);
+                    if (list[emojiSelectedIndex]) insertEmoji(list[emojiSelectedIndex]);
+                    return;
+                }
+                if (e.key === 'PageDown') {
+                    e.preventDefault();
+                    emojiGridPage(1);
+                    return;
+                }
+                if (e.key === 'PageUp') {
+                    e.preventDefault();
+                    emojiGridPage(-1);
+                    return;
+                }
+                if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    if (emojiZone === 'search') {
+                        // Nothing - Search is the top zone.
+                    } else if (emojiZone === 'tabs') {
+                        emojiSetZone('search');
+                    } else {
+                        // Grid: top row goes to Tabs; any other row just moves up.
+                        const cursor = emojiGridCursor();
+                        if (!cursor || cursor.row === 0) {
+                            emojiSetZone('tabs');
+                        } else {
+                            emojiGridMove(0, -1);
+                        }
+                    }
+                    return;
+                }
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    if (emojiZone === 'search') emojiSetZone('tabs');
+                    else if (emojiZone === 'tabs') emojiSetZone('grid');
+                    else emojiGridMove(0, 1);
+                    return;
+                }
+                if (e.key === 'ArrowLeft') {
+                    if (emojiZone === 'search') return; // native caret movement
+                    e.preventDefault();
+                    if (emojiZone === 'tabs') {
+                        // A deliberate move ON the tab row changes category and
+                        // clears the query - merely traversing through the strip
+                        // (Up/Down) does not.
+                        setEmojiCategory(emojiCategory - 1);
+                    } else {
+                        emojiGridMove(-1, 0);
+                    }
+                    return;
+                }
+                if (e.key === 'ArrowRight') {
+                    if (emojiZone === 'search') return; // native caret movement
+                    e.preventDefault();
+                    if (emojiZone === 'tabs') {
+                        setEmojiCategory(emojiCategory + 1);
+                    } else {
+                        emojiGridMove(1, 0);
+                    }
+                    return;
+                }
+                if (e.key === 'Home') {
+                    if (emojiZone === 'search') return; // native caret to start
+                    e.preventDefault();
+                    if (emojiZone === 'tabs') {
+                        emojiTabsSelectEdge(false);
+                    } else {
+                        emojiSelectedIndex = 0;
+                        renderEmojiGrid();
+                    }
+                    return;
+                }
+                if (e.key === 'End') {
+                    if (emojiZone === 'search') return; // native caret to end
+                    e.preventDefault();
+                    if (emojiZone === 'tabs') {
+                        emojiTabsSelectEdge(true);
+                    } else {
+                        const list = getFilteredEmoji(emojiActiveCategory(), emojiQuery);
+                        emojiSelectedIndex = Math.max(0, list.length - 1);
+                        renderEmojiGrid();
+                    }
+                    return;
+                }
+                // Printable characters, Backspace, and anything else unhandled:
+                // let the browser handle it natively against the search input
+                // (DOM focus never leaves it while the popup is open) - typing
+                // always edits the query regardless of zone and never changes
+                // zone. Do not preventDefault here.
                 return;
             }
 
@@ -14182,7 +14379,11 @@
                         e.preventDefault();
                         e.stopPropagation();
                         send({ type: 'RunKeyBinding', key: name, kbnum: kb });
-                        elements.input.focus();
+                        // R13: don't steal focus back if the bound key just opened
+                        // the emoji popup - openEmojiPopup() already put DOM focus
+                        // on elements.emojiSearch, and the popup owns the keyboard
+                        // for its whole lifetime.
+                        if (!emojiPopupOpen) elements.input.focus();
                         return;
                     }
                     const action = lookupBinding(name);
@@ -14190,7 +14391,11 @@
                         e.preventDefault();
                         e.stopPropagation();
                         dispatchAction(action);
-                        elements.input.focus();
+                        // Same reasoning as above - dispatchAction('emoji_picker')
+                        // synchronously opens the popup and focuses its search box;
+                        // refocusing the command input here would immediately steal
+                        // it back.
+                        if (!emojiPopupOpen) elements.input.focus();
                         return;
                     }
                 }
@@ -14214,6 +14419,14 @@
         // check keyed off the RAW key so e.g. an unbound "Esc-Enter" still submits,
         // then plain character fallthrough).
         elements.input.addEventListener('keydown', function(e) {
+            // R13: while the emoji popup is open, it owns the keyboard - this
+            // listener must not handle (or stopPropagation) anything, or the
+            // document-level emojiPopupOpen block never gets the event. Reachable
+            // only via a focus race (DOM focus is supposed to stay on
+            // elements.emojiSearch for the popup's whole lifetime - see
+            // openEmojiPopup/emojiSetZone), but returning here unconditionally
+            // costs nothing and closes that race off for good.
+            if (emojiPopupOpen) return;
             const resolution = resolveKeyName(e);
 
             if (resolution.type === 'pending') {
@@ -14396,17 +14609,11 @@
             renderActionsList();
         };
 
-        // Emoji picker popup (Esc-e)
+        // Emoji picker popup (Esc-e). Tab-button click handlers are wired inside
+        // renderEmojiTabs() itself, since the buttons are built there from
+        // emojiCategories rather than existing statically in the DOM.
         if (elements.emojiCloseBtn) elements.emojiCloseBtn.onclick = closeEmojiPopup;
         if (elements.emojiSearch) elements.emojiSearch.oninput = updateEmojiFilter;
-        if (elements.emojiTabs) {
-            elements.emojiTabs.querySelectorAll('.emoji-tab-btn').forEach(function(btn, i) {
-                btn.addEventListener('click', function() {
-                    setEmojiCategory(i, 'start');
-                    if (elements.emojiSearch) elements.emojiSearch.focus();
-                });
-            });
-        }
 
         // Actions Editor popup
         elements.actionSaveBtn.onclick = saveAction;
@@ -14883,7 +15090,6 @@
         };
         if (elements.worldEditHelpBtn) elements.worldEditHelpBtn.onclick = function() { openPopupHelp('worldEditor'); };
         if (elements.worldSelectorHelpBtn) elements.worldSelectorHelpBtn.onclick = function() { openPopupHelp('worldSelector'); };
-        if (elements.emojiHelpBtn) elements.emojiHelpBtn.onclick = function() { openPopupHelp('emoji'); };
         if (elements.actionsListHelpBtn) elements.actionsListHelpBtn.onclick = function() { openPopupHelp('actionsList'); };
         if (elements.actionEditorHelpBtn) elements.actionEditorHelpBtn.onclick = function() { openPopupHelp('actionEditor'); };
         if (elements.connectionsHelpBtn) elements.connectionsHelpBtn.onclick = function() { openPopupHelp('connections'); };

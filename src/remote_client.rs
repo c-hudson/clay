@@ -1976,27 +1976,9 @@ pub(crate) fn handle_remote_client_key(
                 // The emoji table is compiled into this binary too (it's static
                 // data, not something the daemon owns), so the SSH remote
                 // console can refilter locally exactly like the main console.
-                use popup::definitions::emoji::{
-                    filter_emoji_console, tab_index_to_category, update_emoji_grid, update_emoji_info,
-                    EMOJI_FIELD_SEARCH, EMOJI_FIELD_TABS,
-                };
+                use popup::definitions::emoji::refilter_emoji_console;
                 if let Some(state) = app.popup_manager.current_mut() {
-                    let query = if state.editing && state.is_field_selected(EMOJI_FIELD_SEARCH) {
-                        state.edit_buffer.clone()
-                    } else {
-                        state.get_text(EMOJI_FIELD_SEARCH).unwrap_or("").to_string()
-                    };
-                    let tab_index = state.field(EMOJI_FIELD_TABS).and_then(|f| {
-                        if let popup::FieldKind::Tabs { selected_index, .. } = &f.kind {
-                            Some(*selected_index)
-                        } else {
-                            None
-                        }
-                    }).unwrap_or(0);
-                    let category = tab_index_to_category(tab_index);
-                    let cells = filter_emoji_console(category, &query);
-                    update_emoji_grid(state, &cells);
-                    update_emoji_info(state);
+                    refilter_emoji_console(state);
                 }
             }
             NewPopupAction::InsertText(text) => {

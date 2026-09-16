@@ -385,6 +385,18 @@ pub enum WsMessage {
         /// must degrade to "picker opens with a notice" rather than throwing.
         #[serde(default)]
         emoji_json: String,
+        /// The emoji picker's category tabs, in the compact wire form
+        /// `[[index, name, glyph], ...]` from `emoji::emoji_categories_json()`, one row per
+        /// `Category::all()` entry. Lets the web/GUI picker draw the same eight tab glyphs
+        /// as the console instead of hardcoding them in JS and drifting from `Category`.
+        /// The table is static, so it is sent once per connection here rather than on every
+        /// `GlobalSettingsMsg` settings broadcast. `serde(default)` = empty string against
+        /// an older server (or a message built before this field existed), which the client
+        /// must degrade on by drawing no tab strip at all - global search and the full
+    /// grid still work without one - rather than throwing or inventing labels. There is
+    /// no "All" tab to fall back to; it was removed when search went global.
+        #[serde(default)]
+        emoji_categories_json: String,
     },
 
     // Real-time updates (server -> client)
