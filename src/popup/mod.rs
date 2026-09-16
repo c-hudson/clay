@@ -120,6 +120,35 @@ pub enum FieldKind {
         scroll_offset: usize,
         visible_height: usize,
     },
+    /// Horizontal tab strip (see `console_renderer::render_tabs_field`). Two
+    /// rendered rows: the labels, then the active tab's `═` underline.
+    /// Windows itself against the popup's available width
+    /// (`console_renderer::compute_tab_window`) rather than ever wrapping or
+    /// scrolling vertically. `scroll_offset` caches the last-computed
+    /// window's start column-index; it is a pure function's cached *output*,
+    /// not an input the windowing decision reads back, so nothing in this
+    /// file updates it — the renderer does, purely so an external reader
+    /// (a future `/dump`, say) can see the window actually drawn.
+    Tabs {
+        labels: Vec<String>,
+        selected_index: usize,
+        scroll_offset: usize,
+    },
+    /// Grid of fixed-stride cells with a 2-D cursor (see
+    /// `console_renderer::render_grid_field`). Reuses `ListItem`: `columns`
+    /// (of the `ListItem`) = `[display glyph, name, keywords]`, `id` = the
+    /// text to insert on Enter. `columns` (of this variant) is the grid's
+    /// column count; every cell renders at a fixed stride regardless of the
+    /// glyph's byte length — see `console_renderer::CELL_STRIDE` for why
+    /// (multi-byte, double-width emoji break the byte/char-counting
+    /// `render_list_field` uses for ordinary lists).
+    Grid {
+        cells: Vec<ListItem>,
+        selected_index: usize,
+        scroll_offset: usize,
+        columns: usize,
+        visible_rows: usize,
+    },
 }
 
 /// An item in a list field
@@ -282,6 +311,26 @@ impl FieldKind {
             selected_index: 0,
             scroll_offset: 0,
             visible_height,
+        }
+    }
+
+    /// Create a horizontal tab strip field
+    pub fn tabs(labels: Vec<String>, selected_index: usize) -> Self {
+        Self::Tabs {
+            labels,
+            selected_index,
+            scroll_offset: 0,
+        }
+    }
+
+    /// Create a grid field with the given number of columns and viewport height
+    pub fn grid(cells: Vec<ListItem>, columns: usize, visible_rows: usize) -> Self {
+        Self::Grid {
+            cells,
+            selected_index: 0,
+            scroll_offset: 0,
+            columns,
+            visible_rows,
         }
     }
 
@@ -1370,6 +1419,7 @@ impl PopupState {
             match &field.kind {
                 FieldKind::List { .. } => { self.list_select_down(); return; }
                 FieldKind::ScrollableContent { .. } => { self.scroll_down(1); return; }
+                FieldKind::Grid { .. } => { self.grid_move(0, 1); return; }
                 _ => {}
             }
         }
@@ -1394,6 +1444,7 @@ impl PopupState {
             match &field.kind {
                 FieldKind::List { .. } => { self.list_select_up(); return; }
                 FieldKind::ScrollableContent { .. } => { self.scroll_up(1); return; }
+                FieldKind::Grid { .. } => { self.grid_move(0, -1); return; }
                 _ => {}
             }
         }
@@ -2138,6 +2189,190 @@ impl PopupState {
     }
 
     // ========================================================================
+    // Grid / Tabs navigation
+    // ========================================================================
+
+    /// Move the grid cursor by `(dx, dy)` cells. Finds the first `Grid` field,
+    /// mirroring how `list_select_up`/`list_select_down` operate on "the
+    /// first list field" rather than taking a `FieldId`.
+    ///
+    /// Horizontal movement (`dx`) walks the flat cell list in reading order
+    /// and crosses row boundaries freely — approved mockup uses a *linear*
+    /// cursor for left/right, not a strict 2-D one, so `←` at the first
+    /// column of a row lands on the last cell of the *previous* row rather
+    /// than getting stuck or changing category. Only the absolute first cell
+    /// of the whole grid (`←`) or the absolute last cell (`→`) reports the
+    /// edge (returns `true`), so the caller (the console key-handling
+    /// wiring) can step to the previous/next category there — and only
+    /// there; a user walking a 40-cell result set must not hit a category
+    /// change every ten keypresses just from crossing rows.
+    ///
+    /// Vertical movement (`dy`) is still a real 2-D move: it clamps at the
+    /// top/bottom row and never reports an edge — there is no "next
+    /// category" to fall through to vertically.
+    ///
+    /// Returns `false` (no edge hit) if there is no `Grid` field, it is
+    /// empty, or the movement was not blocked.
+    pub fn grid_move(&mut self, dx: i32, dy: i32) -> bool {
+        for field in &mut self.definition.fields {
+            if let FieldKind::Grid { cells, selected_index, scroll_offset, columns, visible_rows } = &mut field.kind {
+                let columns = (*columns).max(1);
+                if cells.is_empty() {
+                    return false;
+                }
+                let row_len = |r: usize| -> usize {
+                    cells.len().saturating_sub(r * columns).min(columns)
+                };
+
+                let mut hit_edge = false;
+
+                if dx != 0 {
+                    let new_index = *selected_index as i32 + dx;
+                    if new_index < 0 || new_index >= cells.len() as i32 {
+                        hit_edge = true;
+                    } else {
+                        *selected_index = new_index as usize;
+                    }
+                }
+
+                if dy != 0 {
+                    let total_rows = cells.len().div_ceil(columns);
+                    let row = *selected_index / columns;
+                    let col = *selected_index % columns;
+                    let new_row = (row as i32 + dy).clamp(0, total_rows as i32 - 1) as usize;
+                    let new_col = col.min(row_len(new_row).saturating_sub(1));
+                    *selected_index = new_row * columns + new_col;
+                }
+
+                let row = *selected_index / columns;
+                if row < *scroll_offset {
+                    *scroll_offset = row;
+                } else if *visible_rows > 0 && row >= *scroll_offset + *visible_rows {
+                    *scroll_offset = row + 1 - *visible_rows;
+                }
+
+                return hit_edge;
+            }
+        }
+        false
+    }
+
+    /// Select a specific cell index in the first `Grid` field (clamped to
+    /// the cell range), scrolling to keep it visible.
+    pub fn grid_select(&mut self, index: usize) {
+        for field in &mut self.definition.fields {
+            if let FieldKind::Grid { cells, selected_index, scroll_offset, columns, visible_rows } = &mut field.kind {
+                if cells.is_empty() {
+                    return;
+                }
+                let columns = (*columns).max(1);
+                *selected_index = index.min(cells.len() - 1);
+                let row = *selected_index / columns;
+                if row < *scroll_offset {
+                    *scroll_offset = row;
+                } else if *visible_rows > 0 && row >= *scroll_offset + *visible_rows {
+                    *scroll_offset = row + 1 - *visible_rows;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Scroll the grid by `delta` whole pages (in rows of `visible_rows`),
+    /// keeping the selection on-screen and within the cell range. A page is
+    /// `visible_rows` rows; `delta` may be negative (Page Up) or positive
+    /// (Page Down).
+    pub fn grid_page(&mut self, delta: i32) {
+        for field in &mut self.definition.fields {
+            if let FieldKind::Grid { cells, selected_index, scroll_offset, columns, visible_rows } = &mut field.kind {
+                if cells.is_empty() || *visible_rows == 0 {
+                    return;
+                }
+                let columns = (*columns).max(1);
+                let total_rows = cells.len().div_ceil(columns);
+                let max_scroll = total_rows.saturating_sub(*visible_rows);
+                let row_delta = delta * *visible_rows as i32;
+
+                let cur_row = *selected_index / columns;
+                let col = *selected_index % columns;
+                let new_row = (cur_row as i32 + row_delta).clamp(0, total_rows as i32 - 1) as usize;
+                let new_row_len = cells.len().saturating_sub(new_row * columns).min(columns);
+                let new_col = col.min(new_row_len.saturating_sub(1));
+                *selected_index = new_row * columns + new_col;
+
+                let new_scroll = (*scroll_offset as i32 + row_delta).clamp(0, max_scroll as i32) as usize;
+                *scroll_offset = new_scroll;
+                // Keep the (possibly re-clamped) selection visible even if the
+                // page jump alone didn't land the scroll window on it.
+                if new_row < *scroll_offset {
+                    *scroll_offset = new_row;
+                } else if new_row >= *scroll_offset + *visible_rows {
+                    *scroll_offset = new_row + 1 - *visible_rows;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Jump to the first cell of the first `Grid` field.
+    pub fn grid_home(&mut self) {
+        for field in &mut self.definition.fields {
+            if let FieldKind::Grid { cells, selected_index, scroll_offset, .. } = &mut field.kind {
+                if cells.is_empty() {
+                    return;
+                }
+                *selected_index = 0;
+                *scroll_offset = 0;
+                return;
+            }
+        }
+    }
+
+    /// Jump to the last cell of the first `Grid` field.
+    pub fn grid_end(&mut self) {
+        for field in &mut self.definition.fields {
+            if let FieldKind::Grid { cells, selected_index, scroll_offset, columns, visible_rows } = &mut field.kind {
+                if cells.is_empty() {
+                    return;
+                }
+                let columns = (*columns).max(1);
+                *selected_index = cells.len() - 1;
+                let row = *selected_index / columns;
+                let total_rows = cells.len().div_ceil(columns);
+                *scroll_offset = total_rows.saturating_sub(*visible_rows).min(row);
+                return;
+            }
+        }
+    }
+
+    /// Get the currently selected item in a grid field
+    pub fn get_selected_grid_item(&self) -> Option<&ListItem> {
+        for field in &self.definition.fields {
+            if let FieldKind::Grid { cells, selected_index, .. } = &field.kind {
+                return cells.get(*selected_index);
+            }
+        }
+        None
+    }
+
+    /// Step the active tab of the first `Tabs` field by `delta` (typically
+    /// `±1`, e.g. Tab/Shift-Tab or a Grid horizontal edge), wrapping around
+    /// at either end so repeated stepping cycles through every category.
+    pub fn tabs_step(&mut self, delta: i32) {
+        for field in &mut self.definition.fields {
+            if let FieldKind::Tabs { labels, selected_index, .. } = &mut field.kind {
+                if labels.is_empty() {
+                    return;
+                }
+                let len = labels.len() as i32;
+                let new_index = (*selected_index as i32 + delta).rem_euclid(len);
+                *selected_index = new_index as usize;
+                return;
+            }
+        }
+    }
+
+    // ========================================================================
     // Custom State
     // ========================================================================
 
@@ -2737,5 +2972,199 @@ mod tests {
         // Try to move up past beginning
         state.list_select_up();
         assert_eq!(state.get_selected_list_item().map(|i| i.id.as_str()), Some("item_0"));
+    }
+
+    /// Build `n` grid cells, `id`/`columns[0]` = "cell_<i>", 4 columns wide.
+    fn grid_cells(n: usize) -> Vec<ListItem> {
+        (0..n)
+            .map(|i| ListItem {
+                id: format!("cell_{i}"),
+                columns: vec![format!("cell_{i}")],
+                style: ListItemStyle::default(),
+            })
+            .collect()
+    }
+
+    fn grid_popup(n: usize, columns: usize, visible_rows: usize) -> PopupState {
+        let def = PopupDefinition::new(PopupId("test"), "Test")
+            .with_field(Field::new(FieldId(1), "", FieldKind::grid(grid_cells(n), columns, visible_rows)));
+        let mut state = PopupState::new(def);
+        state.open();
+        state
+    }
+
+    fn selected_grid_id(state: &PopupState) -> Option<String> {
+        state.get_selected_grid_item().map(|i| i.id.clone())
+    }
+
+    #[test]
+    fn test_grid_move_horizontal_edges_reported() {
+        // 10 cells, 4 columns: rows are [0..4), [4..8), [8..10) (a short last row).
+        // Horizontal movement is a LINEAR cursor over the flat cell list — it
+        // crosses row boundaries freely, and only the absolute first/last cell
+        // of the whole grid reports the edge (approved-mockup behaviour).
+        let mut state = grid_popup(10, 4, 10); // tall viewport: no scrolling involved here
+        assert_eq!(selected_grid_id(&state), Some("cell_0".into()));
+
+        // Left off cell 0 (the absolute first cell) is the edge.
+        assert!(state.grid_move(-1, 0), "left at the absolute first cell must report the edge");
+        assert_eq!(selected_grid_id(&state), Some("cell_0".into()), "blocked move must not change selection");
+
+        // Walking right crosses every column, including row boundaries, without
+        // ever reporting an edge until the truly last cell.
+        for expected in 1..=9 {
+            assert!(!state.grid_move(1, 0), "moving right before the last cell must not report an edge");
+            assert_eq!(selected_grid_id(&state), Some(format!("cell_{expected}")));
+        }
+
+        // Right at the absolute last cell (cell_9, the short last row's only
+        // occupied second column) is the edge.
+        assert!(state.grid_move(1, 0), "right at the absolute last cell must report the edge");
+        assert_eq!(selected_grid_id(&state), Some("cell_9".into()));
+
+        // Walking back left crosses every row boundary too, landing exactly one
+        // cell back each time, until the absolute first cell reports the edge.
+        for expected in (0..=8).rev() {
+            assert!(!state.grid_move(-1, 0), "moving left before the first cell must not report an edge");
+            assert_eq!(selected_grid_id(&state), Some(format!("cell_{expected}")));
+        }
+        assert!(state.grid_move(-1, 0));
+        assert_eq!(selected_grid_id(&state), Some("cell_0".into()));
+    }
+
+    #[test]
+    fn test_grid_move_horizontal_crosses_row_boundaries() {
+        // Pins the specific "linear cursor" cases the approved mockup requires:
+        // ← from the first cell of a non-first row lands on the last cell of
+        // the previous row (not a category change), and the symmetric → case.
+        let mut state = grid_popup(10, 4, 10);
+
+        // First cell of row 1 (cell_4) -> left -> last cell of row 0 (cell_3).
+        state.grid_select(4);
+        assert!(!state.grid_move(-1, 0), "crossing a row boundary leftward must not report the edge");
+        assert_eq!(selected_grid_id(&state), Some("cell_3".into()));
+
+        // Last cell of row 0 (cell_3) -> right -> first cell of row 1 (cell_4).
+        state.grid_select(3);
+        assert!(!state.grid_move(1, 0), "crossing a row boundary rightward must not report the edge");
+        assert_eq!(selected_grid_id(&state), Some("cell_4".into()));
+
+        // Same check across the short last row's boundary: first cell of row 2
+        // (cell_8) -> left -> last cell of row 1 (cell_7).
+        state.grid_select(8);
+        assert!(!state.grid_move(-1, 0));
+        assert_eq!(selected_grid_id(&state), Some("cell_7".into()));
+    }
+
+    #[test]
+    fn test_grid_move_vertical_clamps_without_reporting_edge() {
+        let mut state = grid_popup(10, 4, 10);
+        // Already at the top row: moving up clamps, and dy-only movement never
+        // reports an edge (there is no "next category" vertically).
+        assert!(!state.grid_move(0, -1));
+        assert_eq!(selected_grid_id(&state), Some("cell_0".into()));
+
+        state.grid_select(9); // bottom-right-most cell (short last row)
+        assert!(!state.grid_move(0, 1), "moving down from the last row must clamp, not report an edge");
+        assert_eq!(selected_grid_id(&state), Some("cell_9".into()));
+    }
+
+    #[test]
+    fn test_grid_page_clamps_to_content() {
+        // 10 cells, 4 columns -> 3 rows; visible_rows=2 -> max_scroll = 1.
+        let mut state = grid_popup(10, 4, 2);
+        state.grid_page(1); // page down: row 0 -> row 2 (clamped), scroll -> 1
+        assert_eq!(selected_grid_id(&state), Some("cell_8".into()));
+        if let Some(field) = state.field(FieldId(1)) {
+            if let FieldKind::Grid { scroll_offset, .. } = &field.kind {
+                assert_eq!(*scroll_offset, 1);
+            } else {
+                panic!("expected Grid field");
+            }
+        }
+
+        state.grid_page(-1); // page up: back to row 0, scroll -> 0
+        assert_eq!(selected_grid_id(&state), Some("cell_0".into()));
+        if let Some(field) = state.field(FieldId(1)) {
+            if let FieldKind::Grid { scroll_offset, .. } = &field.kind {
+                assert_eq!(*scroll_offset, 0);
+            }
+        }
+
+        // Paging further up/down than the content has must clamp, not panic or
+        // wrap.
+        state.grid_page(-5);
+        assert_eq!(selected_grid_id(&state), Some("cell_0".into()));
+        state.grid_page(5);
+        assert_eq!(selected_grid_id(&state), Some("cell_8".into()));
+    }
+
+    #[test]
+    fn test_grid_home_and_end() {
+        let mut state = grid_popup(10, 4, 2);
+        state.grid_select(5);
+        state.grid_home();
+        assert_eq!(selected_grid_id(&state), Some("cell_0".into()));
+        if let Some(field) = state.field(FieldId(1)) {
+            if let FieldKind::Grid { scroll_offset, .. } = &field.kind {
+                assert_eq!(*scroll_offset, 0);
+            }
+        }
+
+        state.grid_end();
+        assert_eq!(selected_grid_id(&state), Some("cell_9".into()));
+        if let Some(field) = state.field(FieldId(1)) {
+            if let FieldKind::Grid { scroll_offset, .. } = &field.kind {
+                // 3 rows total, 2 visible -> scrolled to show the last row.
+                assert_eq!(*scroll_offset, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_next_item_prev_item_stay_inside_grid() {
+        let mut state = grid_popup(10, 4, 10);
+        state.next_item(); // Down: row0 -> row1, same column
+        assert_eq!(selected_grid_id(&state), Some("cell_4".into()));
+        state.prev_item(); // Up: back to row0
+        assert_eq!(selected_grid_id(&state), Some("cell_0".into()));
+    }
+
+    #[test]
+    fn test_tabs_step_wraps_both_directions() {
+        let labels = vec!["All".to_string(), "Smileys".to_string(), "People".to_string(), "Nature".to_string()];
+        let def = PopupDefinition::new(PopupId("test"), "Test")
+            .with_field(Field::new(FieldId(1), "", FieldKind::tabs(labels, 0)));
+        let mut state = PopupState::new(def);
+        state.open();
+
+        let selected_tab = |state: &PopupState| -> usize {
+            match state.field(FieldId(1)).map(|f| &f.kind) {
+                Some(FieldKind::Tabs { selected_index, .. }) => *selected_index,
+                _ => panic!("expected Tabs field"),
+            }
+        };
+
+        assert_eq!(selected_tab(&state), 0);
+        state.tabs_step(1);
+        assert_eq!(selected_tab(&state), 1);
+        state.tabs_step(1);
+        state.tabs_step(1);
+        assert_eq!(selected_tab(&state), 3);
+        state.tabs_step(1); // wraps past the last tab back to the first
+        assert_eq!(selected_tab(&state), 0);
+        state.tabs_step(-1); // wraps the other way
+        assert_eq!(selected_tab(&state), 3);
+    }
+
+    #[test]
+    fn test_grid_and_tabs_field_kind_flags() {
+        let grid = FieldKind::grid(grid_cells(3), 3, 2);
+        assert!(grid.is_interactive());
+        assert!(!grid.is_text_editable());
+
+        let tabs = FieldKind::tabs(vec!["All".to_string()], 0);
+        assert!(tabs.is_interactive());
+        assert!(!tabs.is_text_editable());
     }
 }

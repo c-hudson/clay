@@ -1972,6 +1972,37 @@ pub(crate) fn handle_remote_client_key(
                     RecentWorldsAction::Close => {}
                 }
             }
+            NewPopupAction::EmojiFilter => {
+                // The emoji table is compiled into this binary too (it's static
+                // data, not something the daemon owns), so the SSH remote
+                // console can refilter locally exactly like the main console.
+                use popup::definitions::emoji::{
+                    filter_emoji_console, tab_index_to_category, update_emoji_grid, update_emoji_info,
+                    EMOJI_FIELD_SEARCH, EMOJI_FIELD_TABS,
+                };
+                if let Some(state) = app.popup_manager.current_mut() {
+                    let query = if state.editing && state.is_field_selected(EMOJI_FIELD_SEARCH) {
+                        state.edit_buffer.clone()
+                    } else {
+                        state.get_text(EMOJI_FIELD_SEARCH).unwrap_or("").to_string()
+                    };
+                    let tab_index = state.field(EMOJI_FIELD_TABS).and_then(|f| {
+                        if let popup::FieldKind::Tabs { selected_index, .. } = &f.kind {
+                            Some(*selected_index)
+                        } else {
+                            None
+                        }
+                    }).unwrap_or(0);
+                    let category = tab_index_to_category(tab_index);
+                    let cells = filter_emoji_console(category, &query);
+                    update_emoji_grid(state, &cells);
+                    update_emoji_info(state);
+                }
+            }
+            NewPopupAction::InsertText(text) => {
+                app.input.insert_str(&text);
+                app.popup_manager.close();
+            }
             NewPopupAction::ImportSubmit { .. } => {
                 // /import's in-process driver (plan i-d-like-to-make-snuggly-rain.md, step 8)
                 // is master-console-only for now — this popup is never opened from a
@@ -2673,6 +2704,9 @@ pub(crate) fn dispatch_remote_action(
         }
         "input_shrink" => {
             if app.input_height > 1 { app.input_height -= 1; }
+        }
+        "emoji_picker" => {
+            app.open_emoji_popup();
         }
         _ => {}
     }

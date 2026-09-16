@@ -1204,7 +1204,14 @@ body.device-phone #output-container { padding: 6px 10px; }
     border-color: var(--accent-color);
 }
 
-.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn) {
+/* Default styling for a plain action button inside a modal. Components whose
+   buttons are NOT full-width rows opt out by name here - this selector is
+   (0,4,1), so a component rule like `.emoji-tab-btn` (0,1,0) or
+   `.emoji-grid button.emoji-cell` (0,2,1) loses to it and the component ends up
+   with `width: 100%` plus a `margin-top` it never asked for. That is exactly
+   what flattened the emoji picker's tab strip into one full-width "All" tab
+   with the rest scrolled off behind a hidden scrollbar. */
+.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell) {
     width: 100%;
     padding: 8px;
     margin-top: 6px;
@@ -1216,7 +1223,7 @@ body.device-phone #output-container { padding: 6px 10px; }
     font-size: inherit;
 }
 
-.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):hover {
+.modal-content button:not(.popup-close):not(.stepper-btn):not(.btn):not(.emoji-tab-btn):not(.emoji-cell):hover {
     background-color: var(--theme-bg-hover, #444);
 }
 
@@ -1463,6 +1470,182 @@ body.device-phone #output-container { padding: 6px 10px; }
     flex: 1 1 auto;
     min-width: 0;
     text-align: left;
+}
+
+/* ─── Emoji picker popup (Esc-e) ─── */
+.emoji-modal-content {
+    width: min(92vw, 420px);
+    max-width: 95vw;
+    padding: 0;
+    background: var(--theme-bg-elevated, #1a1a1f);
+    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
+    border-radius: 10px;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+    box-sizing: border-box;
+    overflow: hidden;
+    text-align: left;
+}
+
+.emoji-modal-content .popup-header {
+    padding: 11px 14px;
+    margin-bottom: 0;
+    border-bottom: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
+}
+
+/* Tab strip, modelled on .settings-tab-btn but laid out as rows rather than the
+   vertical sidebar that rule assumes. The 9 tabs (All + 8 categories) need
+   roughly 560px and the panel is 420px, so they WRAP onto a second line instead
+   of scrolling sideways: a sideways-scrolling strip hid five categories behind a
+   deliberately invisible scrollbar, leaving no way to discover or reach them.
+   The console picker scrolls its strip with a fixed pair of chevrons because a
+   terminal row cannot wrap - a browser has no such constraint. */
+.emoji-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 8px 8px 0;
+}
+
+.emoji-tab-btn {
+    flex-shrink: 0;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    padding: 6px 10px 7px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 5px 5px 0 0;
+    color: var(--theme-fg-muted, #71717a);
+    cursor: pointer;
+}
+
+.emoji-tab-btn:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-color);
+}
+
+.emoji-tab-btn.active {
+    color: var(--accent-color);
+    border-bottom-color: var(--accent-color);
+    background: rgba(8, 145, 178, 0.09);
+}
+
+.emoji-tab-btn:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
+}
+
+.emoji-searchrow {
+    padding: 8px 10px 10px;
+    border-bottom: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
+}
+
+.emoji-searchrow input {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--mono);
+    font-size: 13px;
+    background: var(--theme-bg, #000);
+    color: var(--text-color);
+    border: 1px solid var(--separator-color);
+    border-radius: 6px;
+    padding: 7px 10px;
+}
+
+.emoji-searchrow input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+/* First CSS Grid in the codebase - everything else here is flexbox, so keep
+   it contained to this popup. align-content: start is load-bearing: without
+   it the rows stretch to fill the fixed-height container instead of packing
+   from the top, and the grid looks broken. */
+.emoji-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(38px, 1fr));
+    gap: 2px;
+    padding: 8px;
+    align-content: start;
+    height: 208px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+
+.emoji-grid button.emoji-cell {
+    aspect-ratio: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 21px;
+    line-height: 1;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    padding: 0;
+}
+
+.emoji-grid button.emoji-cell:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+/* House convention for a selected grid cell (matches the console's
+   fg_accent()-on-selection_bg() and the world/action list selection style). */
+.emoji-grid button.emoji-cell.selected {
+    background: var(--accent-color);
+    color: #000;
+}
+
+.emoji-grid button.emoji-cell:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
+}
+
+.emoji-grid-empty {
+    grid-column: 1 / -1;
+    color: var(--theme-fg-muted, #71717a);
+    font-size: 13px;
+    padding: 24px 8px;
+    text-align: center;
+}
+
+.emoji-info {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 12px;
+    border-top: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.08));
+    font-size: 12.5px;
+    color: var(--theme-fg-muted, #71717a);
+    min-height: 40px;
+}
+
+.emoji-info-content {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.emoji-info-content .emoji-info-glyph {
+    font-size: 17px;
+    line-height: 1;
+    margin-right: 6px;
+}
+
+.emoji-info-content .emoji-info-code {
+    font-family: var(--mono);
+    color: var(--text-color);
+    font-size: 12px;
+    margin-right: 6px;
+}
+
+.emoji-info .btn-help {
+    flex-shrink: 0;
 }
 
 /* ─── Actions Editor popup ─── */

@@ -164,6 +164,7 @@ the full list of changed defaults.
 | `F5` | Search command history |
 | `F8` | Toggle action-pattern highlighting |
 | `F9` | Toggle GMCP media audio |
+| `Esc-e` | Open the emoji picker |
 | `^G` | Bell — also cancels a buffered chord or a pending numeric prefix |
 | `^L` | Redraw the screen, keeping only server output (drops client-generated lines). Unchanged from earlier Clay releases. TF's plain repaint is the separate `refresh_line` action, unbound by default |
 | `^R` / `^X^R` | Hot reload (same as `/reload`). Clay keeps this on `^R`; TF's own `^R` is "refresh line", available as the unbound `refresh_line` action or `/dokey REFRESH` |
@@ -317,6 +318,7 @@ you change a default, update both.
 | `Esc-b` | `cursor_word_left` |
 | `Esc-c` | `capitalize_word` |
 | `Esc-d` | `delete_word_forward` |
+| `Esc-e` | `emoji_picker` |
 | `Esc-f` | `cursor_word_right` |
 | `Esc-h` | `scroll_half_page` |
 | `Esc-j` | `flush_output` |

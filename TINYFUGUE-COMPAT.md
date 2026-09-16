@@ -63,7 +63,7 @@ name to an action id with no chord/kbnum/insert support at all. The rewrite:
 | `^U` | kill to start of line | clear whole line | **TF** (kill ring kept; whole-line clear = `clear_line`, TF's own `/dokey DLINE`, unbound by default) |
 | `Esc--` / `Esc-=` | kbnum negative / goto bracket | goto bracket / unbound | **TF** |
 | `^S`, `Insert`, `Esc-v`, `Ctrl-Left/Right`, `Ctrl-Home/End`, `Ctrl-PgDn`, `Esc-<`/`>`, `Esc-^N`/`^P`, `Esc-^L`, `Esc-^E`, `Esc-L`, `Esc-0..9`, `^X^R ^X^V ^X^? ^X[ ^X] ^X{ ^X}`, `^]` | bound | unbound | **added** (pure additions, no conflict) |
-| `^Y`, `Shift-Up/Down`, `F2 F4 F5 F8 F9`, `Alt-Up/Down`, double-`^C`, `Esc-w` | unbound | bound | **kept** (Clay extras) |
+| `^Y`, `Shift-Up/Down`, `F2 F4 F5 F8 F9`, `Alt-Up/Down`, double-`^C`, `Esc-w`, `Esc-e` | unbound | bound | **kept** (Clay extras) |
 
 Identical already (no change either direction): `^A ^B ^D ^E ^F ^G ^K ^N ^P ^T ^V ^W`,
 `Esc-b/f/c/d/l/u`, `Esc-Space`, `Esc-.`/`_`, `Esc-p/n`, `Esc-j/J`, `Esc-h`,
@@ -312,6 +312,7 @@ only checked on a machine that has it. Changing a default means changing all thr
 | `Esc-b` | `cursor_word_left` |
 | `Esc-c` | `capitalize_word` |
 | `Esc-d` | `delete_word_forward` |
+| `Esc-e` | `emoji_picker` |
 | `Esc-f` | `cursor_word_right` |
 | `Esc-h` | `scroll_half_page` |
 | `Esc-j` | `flush_output` |

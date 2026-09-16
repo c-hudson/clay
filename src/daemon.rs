@@ -3095,6 +3095,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         // `false` keeps multiuser clients on `RequestScrollback`, which does work here, in
         // preference to advertising the capability and then refusing every request.
         scrollback_push: false,
+        emoji_json: crate::emoji::emoji_json(),
     }
 }
 

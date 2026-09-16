@@ -133,6 +133,13 @@ fn calculate_popup_area(area: Rect, layout: &PopupLayout, state: &PopupState) ->
 }
 
 /// Calculate required content width
+/// Width of `s` in terminal columns, as ratatui itself measures it. Used
+/// wherever a field's content can contain non-ASCII - `str::len()` counts bytes
+/// and silently over-sizes the popup.
+fn display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
 fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
     let mut max_width = layout.min_width;
 
@@ -145,12 +152,15 @@ fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
             FieldKind::Text { value, .. } => {
                 layout.label_width + value.len() + 4
             }
+            // Display columns, not bytes. Identical for the ASCII every other
+            // popup uses, but the emoji picker's footer label leads with a
+            // 4-byte glyph that occupies 2 columns - measured as `.len()` it
+            // widened the popup by 2 for no reason.
             FieldKind::Label { text } => {
-                // Find the longest line in the label
-                text.lines().map(|l| l.len()).max().unwrap_or(0) + 2
+                text.lines().map(display_width).max().unwrap_or(0) + 2
             }
             FieldKind::ErrorText { text } => {
-                text.lines().map(|l| l.len()).max().unwrap_or(0) + 2
+                text.lines().map(display_width).max().unwrap_or(0) + 2
             }
             FieldKind::List { items, .. } => {
                 items.iter()
@@ -169,6 +179,14 @@ fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
                 let item_preview = items.iter().map(|s| s.len().min(40)).max().unwrap_or(20);
                 label_part + item_preview + 4
             }
+            FieldKind::Tabs { .. } => {
+                // The strip windows/scrolls itself (`compute_tab_window`), so it must
+                // never force the popup wider than its configured minimum just to fit
+                // every category label at once — only other fields (Search, Grid)
+                // should drive that.
+                layout.min_width
+            }
+            FieldKind::Grid { columns, .. } => columns * CELL_STRIDE + 2,
             _ => layout.label_width + 20,
         };
 
@@ -217,6 +235,8 @@ fn calculate_content_height(state: &PopupState) -> usize {
             FieldKind::EditableList { visible_height, .. } => {
                 *visible_height
             }
+            FieldKind::Tabs { .. } => 2, // label row + underline row
+            FieldKind::Grid { visible_rows, .. } => *visible_rows,
             _ => 1,
         };
     }
@@ -298,6 +318,8 @@ fn compute_field_layout(
             FieldKind::EditableList { visible_height, .. } => {
                 (*visible_height).min(available_for_field)
             }
+            FieldKind::Tabs { .. } => 2, // label row + underline row, fixed like Separator/Label
+            FieldKind::Grid { visible_rows, .. } => (*visible_rows).min(available_for_field),
             _ => 1,
         };
         rows.push(FieldRow { index: i, height: field_height, row_start: cursor });
@@ -354,6 +376,19 @@ fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme
     let scrollbar_width: u16 = if needs_scroll { 1 } else { 0 };
     let field_area_width = area.width.saturating_sub(scrollbar_width);
 
+    // Tabs fields window themselves against the field area width
+    // (`compute_tab_window`, a pure function of labels/selected_index/width —
+    // it doesn't read `scroll_offset` back as an input). Cache the resulting
+    // window start here, since `render_field` only gets an immutable `Field`
+    // and can't write it back itself; this is purely an output cache for an
+    // external reader, not something the windowing decision depends on.
+    for field in &mut state.definition.fields {
+        if let FieldKind::Tabs { labels, selected_index, scroll_offset } = &mut field.kind {
+            let (start, ..) = compute_tab_window(labels, *selected_index, field_area_width as usize);
+            *scroll_offset = start;
+        }
+    }
+
     // Clear hit areas and content areas for this render pass
     state.hit_areas.clear();
     state.content_areas.clear();
@@ -399,6 +434,15 @@ fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme
                     field_id,
                     scroll_offset: *scroll_offset,
                     total_lines: items.len(),
+                });
+            }
+            FieldKind::Grid { cells, scroll_offset, columns, .. } => {
+                let total_rows = cells.len().div_ceil((*columns).max(1));
+                content_area_infos.push(ContentArea {
+                    area: field_area,
+                    field_id,
+                    scroll_offset: *scroll_offset,
+                    total_lines: total_rows,
                 });
             }
             _ => {}
@@ -803,6 +847,14 @@ fn render_field(
 
         FieldKind::EditableList { items, selected_index, scroll_offset, visible_height } => {
             render_editable_list_field(f, state, field, items, *selected_index, *scroll_offset, *visible_height, area, is_selected, theme);
+        }
+
+        FieldKind::Tabs { labels, selected_index, .. } => {
+            render_tabs_field(f, labels, *selected_index, area, theme);
+        }
+
+        FieldKind::Grid { cells, selected_index, scroll_offset, columns, visible_rows } => {
+            render_grid_field(f, cells, *selected_index, *scroll_offset, *columns, *visible_rows, area, theme);
         }
     }
 }
@@ -1467,6 +1519,230 @@ fn render_buttons(f: &mut Frame, state: &mut PopupState, area: Rect, theme: &The
     }
 }
 
+// ============================================================================
+// Grid / Tabs field renderers
+// ============================================================================
+
+/// Terminal columns a single `Grid` cell spans on screen: the glyph itself
+/// (see `emoji_cell_width`) plus a gutter to the next cell. `render_grid_field`
+/// pads to this fixed stride instead of measuring the glyph string with
+/// `.len()`/`.chars().count()` — both wrong for emoji, which are multi-byte
+/// and render as 2 terminal columns despite `unicode_width` often reporting 1
+/// for VS16 emoji-presentation sequences (see the `ARCHIVE_PREFIX_WIDTH`
+/// comment in `src/util.rs`). This is the entire reason `Grid` exists instead
+/// of reusing `FieldKind::List`, whose `render_list_field` does exactly the
+/// wrong kind of measuring for this content.
+const CELL_STRIDE: usize = 4;
+
+/// Terminal columns every glyph in a `Grid` cell is assumed to occupy.
+/// Deliberately a fixed constant rather than a measurement — the Step 1 table
+/// (`src/emoji.rs`) is what actually guarantees every entry renders as
+/// exactly this many columns (see its own width tests); this `debug_assert`
+/// just keeps `CELL_STRIDE` and this constant from drifting apart from each
+/// other.
+fn emoji_cell_width() -> usize {
+    const GLYPH_WIDTH: usize = 2;
+    debug_assert_eq!(
+        CELL_STRIDE,
+        GLYPH_WIDTH + 2,
+        "CELL_STRIDE must be emoji_cell_width() plus a 2-column gutter"
+    );
+    GLYPH_WIDTH
+}
+
+/// Render a `Grid` field: fixed-stride cells built as explicit `Span`s (never
+/// a single `format!("{:<w$}")` string — see `CELL_STRIDE`'s doc comment for
+/// why that's unsafe here). The selected cell carries the popup selection
+/// style (`fg_accent()` on `selection_bg()`); everything else is plain.
+#[allow(clippy::too_many_arguments)]
+fn render_grid_field(
+    f: &mut Frame,
+    cells: &[super::ListItem],
+    selected_index: usize,
+    scroll_offset: usize,
+    columns: usize,
+    visible_rows: usize,
+    area: Rect,
+    theme: &Theme,
+) {
+    if columns == 0 || visible_rows == 0 {
+        return;
+    }
+    let glyph_width = emoji_cell_width();
+    let gutter = " ".repeat(CELL_STRIDE.saturating_sub(glyph_width));
+    let blank_cell = " ".repeat(CELL_STRIDE);
+
+    let total_rows = cells.len().div_ceil(columns);
+    let needs_scrollbar = total_rows > visible_rows;
+    let scrollbar_width: u16 = if needs_scrollbar { 1 } else { 0 };
+    let content_width = area.width.saturating_sub(scrollbar_width);
+
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let effective_scroll = scroll_offset.min(max_scroll);
+
+    for r in 0..visible_rows {
+        let row_y = area.y + r as u16;
+        if row_y >= area.y + area.height {
+            break;
+        }
+        let row_idx = effective_scroll + r;
+
+        let mut spans: Vec<Span> = Vec::with_capacity(columns);
+        for c in 0..columns {
+            let cell_idx = row_idx * columns + c;
+            match cells.get(cell_idx) {
+                Some(item) => {
+                    let glyph = item.columns.first().map(|s| s.as_str()).unwrap_or("");
+                    let is_selected_cell = cell_idx == selected_index;
+                    let style = if is_selected_cell {
+                        Style::default().fg(theme.fg_accent()).bg(theme.selection_bg())
+                    } else {
+                        Style::default().fg(theme.fg())
+                    };
+                    spans.push(Span::styled(format!("{glyph}{gutter}"), style));
+                }
+                None => {
+                    spans.push(Span::styled(blank_cell.clone(), Style::default()));
+                }
+            }
+        }
+
+        let row_area = Rect::new(area.x, row_y, content_width, 1);
+        f.render_widget(Paragraph::new(Line::from(spans)), row_area);
+    }
+
+    if needs_scrollbar {
+        let scrollbar_x = area.x + area.width.saturating_sub(1);
+        render_scrollbar_column(
+            f, scrollbar_x, area.y, area.y + area.height,
+            visible_rows, total_rows, effective_scroll, theme,
+        );
+    }
+}
+
+/// Pure windowing decision for a `Tabs` field's label strip: given every tab
+/// label, which one is active, and the width available to draw them in,
+/// returns the contiguous range of labels to show (`start..end`) and whether
+/// either end is hidden (`‹`/`›`). Grows outward from the active tab,
+/// alternating which side gets the next whole label, until neither side has
+/// room left — it never splits a label mid-word, and the active tab is
+/// always included even if it alone doesn't fit the given width.
+///
+/// Pure and total: the same inputs always produce the same window, which is
+/// what keeps the strip visually stable across repaints of the same state —
+/// `render_tabs_field` calls this fresh every frame.
+fn compute_tab_window(labels: &[String], active: usize, width: usize) -> (usize, usize, bool, bool) {
+    if labels.is_empty() {
+        return (0, 0, false, false);
+    }
+    let active = active.min(labels.len() - 1);
+    let label_w = |i: usize| labels[i].chars().count();
+
+    let mut start = active;
+    let mut end = active + 1;
+    let mut used = label_w(active);
+    let mut prefer_right = true;
+
+    loop {
+        let can_left = start > 0;
+        let can_right = end < labels.len();
+        if !can_left && !can_right {
+            break;
+        }
+        // Reserve room for whichever indicator(s) would still be needed if
+        // growth stopped after this iteration.
+        let reserve = usize::from(can_left) * 2 + usize::from(can_right) * 2;
+        let budget = width.saturating_sub(reserve);
+
+        let order: [bool; 2] = if prefer_right { [true, false] } else { [false, true] };
+        let mut grew = false;
+        for &side_right in &order {
+            let cost = if side_right {
+                can_right.then(|| label_w(end) + 2)
+            } else {
+                can_left.then(|| label_w(start - 1) + 2)
+            };
+            if let Some(add) = cost {
+                if used + add <= budget {
+                    used += add;
+                    if side_right {
+                        end += 1;
+                    } else {
+                        start -= 1;
+                    }
+                    prefer_right = !side_right;
+                    grew = true;
+                    break;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    (start, end, start > 0, end < labels.len())
+}
+
+/// Render a `Tabs` field: two rows, the windowed label strip (with `‹`/`›`
+/// when either end is hidden) and a `═` underline beneath the active label
+/// only, in the accent colour.
+fn render_tabs_field(f: &mut Frame, labels: &[String], selected_index: usize, area: Rect, theme: &Theme) {
+    if labels.is_empty() || area.height == 0 {
+        return;
+    }
+    let (start, end, hidden_left, hidden_right) = compute_tab_window(labels, selected_index, area.width as usize);
+
+    let dim_style = Style::default().fg(theme.fg_dim());
+    let normal_style = Style::default().fg(theme.fg());
+    let active_style = Style::default().fg(theme.fg_accent()).add_modifier(Modifier::BOLD);
+
+    let mut label_spans: Vec<Span> = Vec::new();
+    let mut prefix_width = 0usize; // columns before the active label, for the underline row
+    let mut active_label_width = 0usize;
+
+    if hidden_left {
+        label_spans.push(Span::styled("‹ ", dim_style));
+        prefix_width += 2;
+    }
+
+    for (i, label) in labels.iter().enumerate().take(end).skip(start) {
+        let is_active = i == selected_index;
+        let style = if is_active { active_style } else { normal_style };
+        label_spans.push(Span::styled(label.clone(), style));
+        let w = label.chars().count();
+        if is_active {
+            active_label_width = w;
+        } else if i < selected_index {
+            prefix_width += w;
+        }
+        if i + 1 < end {
+            label_spans.push(Span::raw("  "));
+            if i < selected_index {
+                prefix_width += 2;
+            }
+        }
+    }
+
+    if hidden_right {
+        label_spans.push(Span::styled(" ›", dim_style));
+    }
+
+    let label_area = Rect::new(area.x, area.y, area.width, 1);
+    f.render_widget(Paragraph::new(Line::from(label_spans)), label_area);
+
+    if area.height >= 2 {
+        let mut underline = " ".repeat(prefix_width.min(area.width as usize));
+        let remaining = (area.width as usize).saturating_sub(underline.chars().count());
+        underline.push_str(&"═".repeat(active_label_width.min(remaining)));
+        let underline_area = Rect::new(area.x, area.y + 1, area.width, 1);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(underline, Style::default().fg(theme.fg_accent())))),
+            underline_area,
+        );
+    }
+}
+
 /// Get button style based on type and selection state
 fn get_button_style(button_style: ButtonStyle, is_selected: bool, theme: &Theme) -> Style {
     let base = match button_style {
@@ -1700,6 +1976,69 @@ pub fn render_popup_content_direct(state: &PopupState, theme: &Theme) {
                 let _ = stdout.queue(SetAttribute(Attribute::Reset));
             }
 
+            FieldKind::Grid { cells, selected_index, scroll_offset, columns, visible_rows } => {
+                let ca = state.content_areas.iter().find(|ca| ca.field_id == field.id);
+                let area = match ca {
+                    Some(ca) => ca.area,
+                    None => continue,
+                };
+                if *columns == 0 || *visible_rows == 0 {
+                    continue;
+                }
+
+                let glyph_width = emoji_cell_width();
+                let gutter = " ".repeat(CELL_STRIDE.saturating_sub(glyph_width));
+                let blank_cell = " ".repeat(CELL_STRIDE);
+
+                let total_rows = cells.len().div_ceil(*columns);
+                let needs_scrollbar = total_rows > *visible_rows;
+                let max_scroll = total_rows.saturating_sub(*visible_rows);
+                let effective_scroll = (*scroll_offset).min(max_scroll);
+                let actual_visible = (*visible_rows).min(area.height as usize);
+
+                for r in 0..actual_visible {
+                    let row_y = area.y + r as u16;
+                    let row_idx = effective_scroll + r;
+
+                    let _ = stdout.queue(MoveTo(area.x, row_y));
+                    for c in 0..*columns {
+                        let cell_idx = row_idx * *columns + c;
+                        match cells.get(cell_idx) {
+                            Some(item) => {
+                                let glyph = item.columns.first().map(|s| s.as_str()).unwrap_or("");
+                                let is_selected_cell = cell_idx == *selected_index;
+                                let (fg, bg) = if is_selected_cell {
+                                    (to_crossterm_color(theme.fg_accent()), to_crossterm_color(theme.selection_bg()))
+                                } else {
+                                    (to_crossterm_color(theme.fg()), popup_bg)
+                                };
+                                let _ = stdout.queue(SetForegroundColor(fg));
+                                let _ = stdout.queue(SetBackgroundColor(bg));
+                                let _ = stdout.queue(Print(format!("{glyph}{gutter}")));
+                            }
+                            None => {
+                                let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg())));
+                                let _ = stdout.queue(SetBackgroundColor(popup_bg));
+                                let _ = stdout.queue(Print(&blank_cell));
+                            }
+                        }
+                    }
+
+                    if needs_scrollbar {
+                        let thumb_size = ((actual_visible as f64 / total_rows as f64) * actual_visible as f64).max(1.0) as usize;
+                        let thumb_pos = if max_scroll == 0 { 0 } else {
+                            ((effective_scroll as f64 / max_scroll as f64) * actual_visible.saturating_sub(thumb_size) as f64) as usize
+                        };
+                        let ch = if r >= thumb_pos && r < thumb_pos + thumb_size { "█" } else { "│" };
+                        let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg_dim())));
+                        let _ = stdout.queue(SetBackgroundColor(popup_bg));
+                        let _ = stdout.queue(Print(ch));
+                    }
+                }
+
+                let _ = stdout.queue(SetAttribute(Attribute::Reset));
+            }
+
             _ => {}
         }
     }
@@ -1864,5 +2203,102 @@ mod tests {
         let visible_rows = 5usize.saturating_sub(2);
         assert!(needs_scroll);
         assert_eq!(offset, total.saturating_sub(visible_rows));
+    }
+
+    #[test]
+    fn test_compute_field_layout_measures_tabs_and_grid() {
+        use crate::popup::{FieldKind, ListItem, ListItemStyle};
+
+        let cells: Vec<ListItem> = (0..12)
+            .map(|i| ListItem { id: format!("c{i}"), columns: vec![format!("c{i}")], style: ListItemStyle::default() })
+            .collect();
+        let def = PopupDefinition::new(PopupId("test"), "Test")
+            .with_field(Field::new(FieldId(1), "", FieldKind::tabs(vec!["All".into(), "Smileys".into()], 0)))
+            .with_field(Field::new(FieldId(2), "", FieldKind::grid(cells, 4, 3)));
+        let selected = ElementSelection::Field(FieldId(1));
+
+        // Plenty of room: no scrolling, and each field measures its own fixed size
+        // (Tabs = 2 rows, Grid = its configured visible_rows) rather than 1.
+        let (rows, total, needs_scroll, _) = compute_field_layout(&def, &selected, 0, 20, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].height, 2, "Tabs must measure as 2 rows (labels + underline)");
+        assert_eq!(rows[0].row_start, 0);
+        assert_eq!(rows[1].height, 3, "Grid must measure as its visible_rows");
+        assert_eq!(rows[1].row_start, 2);
+        assert_eq!(total, 5);
+        assert!(!needs_scroll);
+    }
+
+    #[test]
+    fn test_calculate_content_width_and_height_for_tabs_and_grid() {
+        use crate::popup::{FieldKind, ListItem, ListItemStyle};
+
+        let cells: Vec<ListItem> = (0..12)
+            .map(|i| ListItem { id: format!("c{i}"), columns: vec![format!("c{i}")], style: ListItemStyle::default() })
+            .collect();
+        let def = PopupDefinition::new(PopupId("test"), "Test")
+            .with_field(Field::new(FieldId(1), "", FieldKind::tabs(vec!["All".into(), "Smileys".into(), "People".into()], 0)))
+            .with_field(Field::new(FieldId(2), "", FieldKind::grid(cells, 4, 3)));
+        let state = crate::popup::PopupState::new(def.clone());
+
+        // Grid contributes columns * CELL_STRIDE + 2; Tabs never forces the popup
+        // wider than layout.min_width (it windows/scrolls itself instead).
+        let width = calculate_content_width(&state, &def.layout);
+        assert_eq!(width, (4 * CELL_STRIDE + 2).max(def.layout.min_width));
+
+        let height = calculate_content_height(&state);
+        assert_eq!(height, 2 + 3); // Tabs (2) + Grid visible_rows (3)
+    }
+
+    #[test]
+    fn test_compute_tab_window_active_always_included_and_flags_correct() {
+        let labels: Vec<String> = ["All", "Smileys", "People", "Nature", "Food", "Activities", "Objects", "Symbols", "Flags"]
+            .iter().map(|s| s.to_string()).collect();
+        let width = 30usize; // narrower than the full label set
+
+        // Left extreme: nothing hidden on the left, something hidden on the right.
+        // `first` is bound rather than inlined so this assertion keeps the same
+        // `start <= active && active < end` shape as the two cases below - written
+        // against a literal 0 it reads as an absurd comparison (usize can't go lower)
+        // and clippy rejects it under `--tests`.
+        let first = 0usize;
+        let (start, end, hidden_left, hidden_right) = compute_tab_window(&labels, first, width);
+        assert!(start <= first && first < end, "active tab must be inside the window");
+        assert!(!hidden_left);
+        assert!(hidden_right);
+
+        // Right extreme: nothing hidden on the right, something hidden on the left.
+        let last = labels.len() - 1;
+        let (start, end, hidden_left, hidden_right) = compute_tab_window(&labels, last, width);
+        assert!(start <= last && last < end, "active tab must be inside the window");
+        assert!(hidden_left);
+        assert!(!hidden_right);
+
+        // Middle: both sides can be hidden.
+        let mid = labels.len() / 2;
+        let (start, end, hidden_left, hidden_right) = compute_tab_window(&labels, mid, width);
+        assert!(start <= mid && mid < end, "active tab must be inside the window");
+        assert!(hidden_left);
+        assert!(hidden_right);
+
+        // Plenty of width: nothing hidden anywhere, whole set shown.
+        let (start, end, hidden_left, hidden_right) = compute_tab_window(&labels, mid, 500);
+        assert_eq!((start, end), (0, labels.len()));
+        assert!(!hidden_left && !hidden_right);
+    }
+
+    #[test]
+    fn test_compute_tab_window_degenerate_inputs() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(compute_tab_window(&empty, 0, 40), (0, 0, false, false));
+
+        // A single label always fits and is never marked hidden.
+        let one = vec!["All".to_string()];
+        assert_eq!(compute_tab_window(&one, 0, 40), (0, 1, false, false));
+
+        // Width too small even for the active label alone: it's still included.
+        let labels = vec!["All".to_string(), "Smileys".to_string()];
+        let (start, end, ..) = compute_tab_window(&labels, 1, 0);
+        assert!(start <= 1 && 1 < end);
     }
 }

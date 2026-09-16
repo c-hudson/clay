@@ -377,6 +377,14 @@ pub enum WsMessage {
         /// catch-all and wait forever for a batch that never comes.
         #[serde(default)]
         scrollback_push: bool,
+        /// The emoji picker's curated table, in the compact wire form
+        /// `[[ch, name, "kw1 kw2", category_index], ...]` from `emoji::emoji_json()`. The
+        /// table is static, so it is sent once per connection here rather than on every
+        /// `GlobalSettingsMsg` settings broadcast. `serde(default)` = empty string against
+        /// an older server (or a message built before this field existed), which the client
+        /// must degrade to "picker opens with a notice" rather than throwing.
+        #[serde(default)]
+        emoji_json: String,
     },
 
     // Real-time updates (server -> client)

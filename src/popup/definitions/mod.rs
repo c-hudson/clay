@@ -6,6 +6,7 @@
 pub mod actions;
 pub mod confirm;
 pub mod connections;
+pub mod emoji;
 pub mod filter;
 pub mod help;
 pub mod import;
@@ -21,6 +22,7 @@ pub mod world_selector;
 pub use actions::*;
 pub use confirm::*;
 pub use connections::*;
+pub use emoji::*;
 pub use filter::*;
 pub use help::*;
 pub use import::*;

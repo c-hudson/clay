@@ -1,5 +1,6 @@
 // Module declarations
 pub mod encoding;
+pub mod emoji;
 pub mod telnet;
 pub mod telnet_reader;
 pub mod telnet_writer;
@@ -5729,6 +5730,42 @@ impl App {
                     *selected_index = self.current_world_index;
                 }
             }
+        }
+    }
+
+    /// Open the emoji picker popup (`Esc-e`). Sizes the grid off the current
+    /// terminal dimensions, seeds it with the unfiltered "All" tab, and
+    /// starts the search field editing so typing goes straight to search.
+    pub(crate) fn open_emoji_popup(&mut self) {
+        use popup::definitions::emoji::{
+            create_emoji_popup, filter_emoji_console, update_emoji_grid, update_emoji_info,
+            EMOJI_FIELD_SEARCH,
+        };
+
+        let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
+
+        // Each grid cell is 4 columns wide (2 glyph cells + a 2-column
+        // gutter - mirrors `CELL_STRIDE` in `popup/console_renderer.rs`).
+        // Reserve ~6 columns for the popup's border/padding, then clamp to
+        // a sensible 8-12 range without ever asking for more columns than
+        // the terminal can actually show.
+        let natural_columns = ((term_width as usize).saturating_sub(6) / 4).max(1);
+        let columns = natural_columns.clamp(8.min(natural_columns), 12);
+
+        // Reserve ~10 rows for the tab strip, search field, footer, help
+        // line and borders, then clamp to a sensible 4-8 range.
+        let natural_rows = (term_height as usize).saturating_sub(10).max(1);
+        let visible_rows = natural_rows.clamp(4.min(natural_rows), 8);
+
+        let def = create_emoji_popup(visible_rows, columns);
+        self.popup_manager.open(def);
+
+        if let Some(state) = self.popup_manager.current_mut() {
+            let cells = filter_emoji_console(None, "");
+            update_emoji_grid(state, &cells);
+            update_emoji_info(state);
+            state.select_field(EMOJI_FIELD_SEARCH);
+            state.start_edit();
         }
     }
 
@@ -14387,6 +14424,7 @@ impl App {
             // can answer it would strand a new client waiting on a batch that never comes,
             // so every intermediate build honestly reports "use the legacy path".
             scrollback_push: false,
+            emoji_json: crate::emoji::emoji_json(),
         }
     }
 
@@ -15293,6 +15331,10 @@ pub(crate) enum NewPopupAction {
     RecentWorlds(RecentWorldsAction),
     /// /import popup submitted (plan i-d-like-to-make-snuggly-rain.md, step 8)
     ImportSubmit { addr: String, password: Option<String>, auth_key: Option<String> },
+    /// Emoji picker: search text or category changed - caller refilters the grid
+    EmojiFilter,
+    /// Emoji picker: Enter pressed - insert this text at the input cursor
+    InsertText(String),
 }
 
 /// Settings from the setup popup
@@ -15547,6 +15589,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
             && s.definition.buttons.iter().any(|b| b.id == popup::definitions::confirm::CONFIRM_BTN_NO)
     }).unwrap_or(false);
     let is_world_selector = popup_id == Some(popup::PopupId("world_selector"));
+    let is_emoji = popup_id == Some(popup::PopupId("emoji"));
     let is_setup = popup_id == Some(popup::PopupId("setup"));
     let is_web = popup_id == Some(popup::PopupId("web"));
     let is_modify_key = popup_id == Some(popup::PopupId("modify_key"));
@@ -15697,6 +15740,92 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     } else if state.select_field_by_shortcut(c) {
                         // Field shortcut (e.g. 'F' for Filter): highlight only, no auto-edit
                     }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Emoji picker: owns every key while open (search text lives in the
+        // shared edit buffer the whole time the popup is open, since
+        // `open_emoji_popup` selects the search field and `start_edit()`s it
+        // and nothing in this block ever moves selection off it).
+        if is_emoji {
+            use popup::definitions::emoji::update_emoji_info;
+
+            match key.code {
+                Esc => {
+                    app.popup_manager.close();
+                }
+                Enter => {
+                    if let Some(item) = state.get_selected_grid_item() {
+                        let text = item.id.clone();
+                        app.popup_manager.close();
+                        return NewPopupAction::InsertText(text);
+                    }
+                    // Empty grid: nothing to insert, leave the popup open.
+                }
+                Backspace => {
+                    state.backspace();
+                    return NewPopupAction::EmojiFilter;
+                }
+                Char(c) => {
+                    state.insert_char(c);
+                    return NewPopupAction::EmojiFilter;
+                }
+                Left => {
+                    // Category-change index reset lives here: hitting the
+                    // absolute-first-cell edge steps the tab, then
+                    // `grid_home()` zeroes selected_index/scroll_offset
+                    // before the caller's refilter rebuilds the cells.
+                    if state.grid_move(-1, 0) {
+                        state.tabs_step(-1);
+                        state.grid_home();
+                        return NewPopupAction::EmojiFilter;
+                    }
+                    update_emoji_info(state);
+                }
+                Right => {
+                    if state.grid_move(1, 0) {
+                        state.tabs_step(1);
+                        state.grid_home();
+                        return NewPopupAction::EmojiFilter;
+                    }
+                    update_emoji_info(state);
+                }
+                Up => {
+                    state.grid_move(0, -1);
+                    update_emoji_info(state);
+                }
+                Down => {
+                    state.grid_move(0, 1);
+                    update_emoji_info(state);
+                }
+                Tab => {
+                    state.tabs_step(1);
+                    state.grid_home();
+                    return NewPopupAction::EmojiFilter;
+                }
+                BackTab => {
+                    state.tabs_step(-1);
+                    state.grid_home();
+                    return NewPopupAction::EmojiFilter;
+                }
+                PageUp => {
+                    state.grid_page(-1);
+                    update_emoji_info(state);
+                }
+                PageDown => {
+                    state.grid_page(1);
+                    update_emoji_info(state);
+                }
+                Home => {
+                    state.grid_home();
+                    update_emoji_info(state);
+                }
+                End => {
+                    state.grid_end();
+                    update_emoji_info(state);
                 }
                 _ => {}
             }

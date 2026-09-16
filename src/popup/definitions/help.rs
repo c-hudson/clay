@@ -28,6 +28,7 @@ pub const HELP_LINES: &[&str] = &[
     "  Esc-Left / Esc-Right - Switch connected worlds",
     "  Ctrl-P / Ctrl-N      - Command history",
     "  Tab                  - Release world output when paused.",
+    "  Esc-e                - Open the emoji picker",
     "",
     "Basic Configuration:",
     "  /setup               - General settings popup",

@@ -2347,6 +2347,7 @@ Display:
   F5                   - Search command history
   F8                   - Highlight action matches
   F9                   - Toggle GMCP media audio
+  Esc+E                - Open the emoji picker
 
 System:
   Ctrl+C (twice)       - Quit

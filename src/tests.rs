@@ -12501,6 +12501,54 @@ third
         }
     }
 
+    #[test]
+    fn test_initial_state_carries_emoji_json() {
+        // build_initial_state must populate emoji_json from emoji::emoji_json() - the
+        // compact wire form `[[ch, name, "kw1 kw2", category_index], ...]`, one row per
+        // crate::emoji::EMOJI entry, sent once per connection (not on every
+        // GlobalSettingsMsg) because the table is static.
+        let app = App::new();
+        let state = app.build_initial_state(0);
+
+        let emoji_json = match &state {
+            WsMessage::InitialState { emoji_json, .. } => emoji_json.clone(),
+            other => panic!("wrong variant: {:?}", other),
+        };
+
+        assert!(!emoji_json.is_empty(), "emoji_json must be non-empty");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&emoji_json).expect("emoji_json must parse as JSON");
+        let rows = parsed.as_array().expect("emoji_json must be a JSON array");
+        assert_eq!(
+            rows.len(),
+            crate::emoji::EMOJI.len(),
+            "one row per crate::emoji::EMOJI entry"
+        );
+    }
+
+    #[test]
+    fn test_initial_state_emoji_json_defaults_empty_when_absent() {
+        // Back-compat: a message built before this field existed (or from an older server)
+        // must still deserialize - #[serde(default)] - and degrade to an empty string, which
+        // the client treats as "picker opens with a notice" rather than throwing. Built from
+        // a real build_initial_state() and then stripped, so this can't rot into testing a
+        // hand-written shape that drifted from the struct.
+        let app = App::new();
+        let state = app.build_initial_state(0);
+        let mut encoded = serde_json::to_value(&state).expect("serializes");
+
+        assert!(encoded.get("emoji_json").is_some(), "field is present on the wire");
+        encoded.as_object_mut().unwrap().remove("emoji_json");
+
+        match serde_json::from_value::<WsMessage>(encoded).expect("parses without the field") {
+            WsMessage::InitialState { emoji_json, .. } => assert_eq!(
+                emoji_json, "",
+                "an old peer's InitialState (no emoji_json) must default to empty, not fail to parse"
+            ),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
     // ---- Phase J: per-client download state and its accessors ----
 
     /// Minimal `ScrollbackPush` for accessor tests — the planner (step 4) builds the real one.
@@ -17649,4 +17697,176 @@ third
         assert_eq!(app.worlds[idx].settings.password, "hunter2");
         assert!(app.worlds[idx].settings.auto_connect_type == AutoConnectType::Connect,
             "portal world must be set to auto-login (Connect) so standard auto-login fires");
+    }
+
+    // ---- Emoji picker console wiring (EMOJI-PICKER-ROADMAP.md Step 4) ----
+
+    fn emoji_tab_index(app: &App) -> usize {
+        let state = app.popup_manager.current().expect("emoji popup should be open");
+        let field = state.field(popup::definitions::emoji::EMOJI_FIELD_TABS).expect("tabs field");
+        if let popup::FieldKind::Tabs { selected_index, .. } = &field.kind {
+            *selected_index
+        } else {
+            panic!("expected Tabs field");
+        }
+    }
+
+    fn emoji_grid_len(app: &App) -> usize {
+        let state = app.popup_manager.current().expect("emoji popup should be open");
+        let field = state.field(popup::definitions::emoji::EMOJI_FIELD_GRID).expect("grid field");
+        if let popup::FieldKind::Grid { cells, .. } = &field.kind {
+            cells.len()
+        } else {
+            panic!("expected Grid field");
+        }
+    }
+
+    #[test]
+    fn test_open_emoji_popup_populates_grid_and_focuses_search() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+
+        let state = app.popup_manager.current().expect("emoji popup should be open");
+        assert_eq!(state.definition.id, popup::PopupId("emoji"));
+        assert!(state.editing, "search field should start in edit mode");
+        assert!(state.is_field_selected(popup::definitions::emoji::EMOJI_FIELD_SEARCH));
+
+        // Every entry the CONSOLE can draw, which is not every entry in the
+        // table: VS16 and ZWJ sequences are held back because a terminal may
+        // give them a different column count than ratatui budgeted, sliding the
+        // row into the popup's border and scrollbar (see emoji::console_safe).
+        let console_safe = crate::emoji::EMOJI
+            .iter()
+            .filter(|e| crate::emoji::console_safe(e.ch))
+            .count();
+        assert_eq!(emoji_grid_len(&app), console_safe,
+            "the unfiltered All tab should show every console-drawable entry");
+        assert!(console_safe < crate::emoji::EMOJI.len(),
+            "some entries are expected to be held back from the console grid");
+    }
+
+    #[test]
+    fn test_emoji_typing_returns_filter_action() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+
+        // handle_new_popup_key itself only edits the search buffer and signals the
+        // caller to refilter - it does not rebuild the grid (that's the arm in
+        // input_handler.rs / remote_client.rs).
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::EmojiFilter));
+        let state = app.popup_manager.current().unwrap();
+        assert_eq!(state.edit_buffer, "h");
+    }
+
+    #[test]
+    fn test_emoji_typing_narrows_grid_through_full_dispatch() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        let full_count = emoji_grid_len(&app);
+
+        // Drive the real key-dispatch path (handle_key_event), which runs the
+        // EmojiFilter arm's filter_emoji + update_emoji_grid after handle_new_popup_key
+        // returns.
+        send_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        send_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        send_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        send_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+        send_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+
+        let narrowed = emoji_grid_len(&app);
+        assert!(narrowed < full_count,
+            "typing 'heart' should narrow the grid below the full {full_count} entries (got {narrowed})");
+        assert!(narrowed > 0, "the 'heart' fixture entry should still match");
+    }
+
+    #[test]
+    fn test_emoji_grid_right_at_last_cell_changes_category() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        {
+            let state = app.popup_manager.current_mut().unwrap();
+            state.grid_end();
+        }
+        let tab_before = emoji_tab_index(&app);
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::EmojiFilter),
+            "Right at the last cell must report the edge and ask for a refilter");
+        assert_ne!(emoji_tab_index(&app), tab_before,
+            "Right at the last cell should have stepped to the next category");
+    }
+
+    #[test]
+    fn test_emoji_grid_left_at_first_cell_changes_category() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        // Selection starts at index 0 (the absolute first cell) on open.
+        let tab_before = emoji_tab_index(&app);
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::EmojiFilter),
+            "Left at the first cell must report the edge and ask for a refilter");
+        assert_ne!(emoji_tab_index(&app), tab_before,
+            "Left at the first cell should have stepped to the previous category");
+    }
+
+    #[test]
+    fn test_emoji_grid_interior_right_does_not_change_category() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        {
+            let state = app.popup_manager.current_mut().unwrap();
+            state.grid_select(1); // an interior cell (the full table has hundreds of entries)
+        }
+        let tab_before = emoji_tab_index(&app);
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None),
+            "an interior Right must not report the edge");
+        assert_eq!(emoji_tab_index(&app), tab_before,
+            "an interior Right must not change category");
+    }
+
+    #[test]
+    fn test_emoji_enter_inserts_selected_and_closes_popup() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        let expected = {
+            let state = app.popup_manager.current().unwrap();
+            state.get_selected_grid_item().expect("grid should be populated").id.clone()
+        };
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match action {
+            NewPopupAction::InsertText(text) => assert_eq!(text, expected),
+            _ => panic!("expected InsertText"),
+        }
+        assert!(app.popup_manager.current().is_none(), "Enter should close the popup");
+    }
+
+    #[test]
+    fn test_emoji_enter_on_empty_grid_leaves_popup_open() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+        {
+            let state = app.popup_manager.current_mut().unwrap();
+            popup::definitions::emoji::update_emoji_grid(state, &[]);
+        }
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None),
+            "Enter on an empty grid must not fabricate an insert");
+        assert!(app.popup_manager.current().is_some(),
+            "Enter on an empty grid must leave the popup open");
+    }
+
+    #[test]
+    fn test_emoji_esc_closes_without_inserting() {
+        let mut app = App::new();
+        app.open_emoji_popup();
+
+        let action = handle_new_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(action, NewPopupAction::None));
+        assert!(app.popup_manager.current().is_none(), "Esc should close the popup");
     }

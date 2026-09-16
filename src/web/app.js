@@ -542,6 +542,14 @@
         actionConfirmText: document.getElementById('action-confirm-text'),
         actionConfirmYesBtn: document.getElementById('action-confirm-yes-btn'),
         actionConfirmNoBtn: document.getElementById('action-confirm-no-btn'),
+        // Emoji picker popup (Esc-e)
+        emojiModal: document.getElementById('emoji-modal'),
+        emojiCloseBtn: document.getElementById('emoji-close-btn'),
+        emojiTabs: document.getElementById('emoji-tabs'),
+        emojiSearch: document.getElementById('emoji-search'),
+        emojiGrid: document.getElementById('emoji-grid'),
+        emojiInfoContent: document.getElementById('emoji-info-content'),
+        emojiHelpBtn: document.getElementById('emoji-help-btn'),
         // Worlds list popup
         worldsModal: document.getElementById('worlds-modal'),
         worldsTableBody: document.getElementById('worlds-table-body'),
@@ -1326,6 +1334,17 @@
     let searchText = '';
     let searchMatchIndices = [];  // indices into output_lines that match
     let searchCurrentPos = -1;    // which match is currently shown at bottom
+
+    // Emoji picker popup state (Esc-e, EMOJI-PICKER-ROADMAP.md Step 7)
+    let emojiPopupOpen = false;
+    // Parsed once from InitialState.emoji_json: [{ch, name, keywords, category}, ...].
+    // category is 0-7 in Category::all() order (Smileys..Flags), matching the
+    // server's Category::index(). Stays empty (never throws) if emoji_json is
+    // absent/empty/malformed - the picker then shows a one-line notice.
+    let emojiData = [];
+    let emojiCategory = null; // null = "All" tab, else 0-7
+    let emojiQuery = '';
+    let emojiSelectedIndex = 0;
 
     // Font popup state (/font)
     // fontPopupOpen removed — merged into settingsPopupOpen
@@ -3054,6 +3073,19 @@
                 currentWorldIndex = resolvedWorldIndex;
 
                 actions = msg.actions || [];
+                // Emoji picker dataset (EMOJI-PICKER-ROADMAP.md Step 6/7): sent once as
+                // a top-level InitialState field, never re-sent on settings changes.
+                // Must never throw - file:// origins (Android) sanitize an uncaught
+                // error to "Script error.", so an absent/empty/malformed value just
+                // degrades to an empty picker with a one-line notice.
+                try {
+                    const emojiRows = msg.emoji_json ? JSON.parse(msg.emoji_json) : [];
+                    emojiData = Array.isArray(emojiRows) ? emojiRows.map(function(row) {
+                        return { ch: row[0], name: row[1], keywords: row[2] || '', category: row[3] };
+                    }) : [];
+                } catch (emojiErr) {
+                    emojiData = [];
+                }
                 splashLines = msg.splash_lines || [];
                 // Reset client-side more-mode state (each client handles more locally)
                 paused = false;
@@ -7185,6 +7217,21 @@
             '  Paste a key here manually, or tap Download when',
             '  connected to fetch the key from the server and',
             '  store it in the app for future logins.'
+        ],
+        emoji: [
+            'Emoji Picker - Insert an Emoji', '',
+            'Browse or search a curated set of emoji and insert',
+            'one into the command input at the cursor.', '',
+            'Tabs: Pick a category, or All to search everything.', '',
+            'Search: Type to narrow by name or keyword.', '',
+            'Left/Right/Up/Down: Move the grid cursor.',
+            '  Left on the first cell / Right on the last cell',
+            '  changes category instead.', '',
+            'Tab / Shift-Tab: Next / previous category.',
+            'PageUp / PageDown: Scroll the grid a page.',
+            'Home / End: First / last cell.', '',
+            'Enter: Insert the selected emoji and close.',
+            'Esc: Close without inserting.'
         ]
     };
 
@@ -9661,6 +9708,213 @@
             };
             elements.actionsList.appendChild(div);
         });
+    }
+
+    // ---------- Emoji picker (Esc-e, EMOJI-PICKER-ROADMAP.md Step 7) ----------
+    // One implementation shared by web and the WebView GUI. Modelled on
+    // openActionsListPopup/renderActionsList (search field + live-narrowed list),
+    // with the list swapped for a 2-D grid and a tab strip for category narrowing.
+
+    // Tab index 0 is "All" (category null); tab N+1 is Category::all()[N] (0-7,
+    // Smileys..Flags), matching emoji_json's wire category_index exactly.
+    function emojiTabIndexToCategory(tabIndex) {
+        return tabIndex === 0 ? null : tabIndex - 1;
+    }
+    function emojiCategoryToTabIndex(category) {
+        return category === null ? 0 : category + 1;
+    }
+
+    // Must agree EXACTLY with the Rust filter_emoji (src/popup/definitions/emoji.rs):
+    // case-insensitive SUBSTRING match (never whole-word) over name, then over each
+    // keyword individually (keywords arrive as a single space-joined string per
+    // emoji_json's wire form, so they're split back into tokens here rather than
+    // substring-matched against the joined string, which could false-match across
+    // a token boundary the Rust side would never match). category === null is the
+    // "All" tab; an empty query matches everything in the category.
+    function getFilteredEmoji(category, query) {
+        const q = (query || '').toLowerCase();
+        return emojiData.filter(function(e) {
+            if (category !== null && e.category !== category) return false;
+            if (!q) return true;
+            if (e.name.toLowerCase().indexOf(q) !== -1) return true;
+            const keywords = e.keywords ? e.keywords.toLowerCase().split(' ') : [];
+            for (let i = 0; i < keywords.length; i++) {
+                if (keywords[i].indexOf(q) !== -1) return true;
+            }
+            return false;
+        });
+    }
+
+    // Measures the grid's actual rendered column count (CSS auto-fill, so it
+    // varies with viewport width) and how many rows fit in the scroll viewport,
+    // for Up/Down/PageUp/PageDown. Recomputed on demand rather than cached,
+    // since it can change between keypresses (resize, orientation change).
+    function getEmojiGridMetrics() {
+        const grid = elements.emojiGrid;
+        const cells = grid ? grid.querySelectorAll('button.emoji-cell') : [];
+        if (!grid || cells.length === 0) return { cols: 1, rows: 1 };
+        const firstTop = cells[0].offsetTop;
+        let cols = 0;
+        for (let i = 0; i < cells.length; i++) {
+            if (cells[i].offsetTop === firstTop) cols++;
+            else break;
+        }
+        cols = Math.max(1, cols);
+        let rowHeight = cells[0].offsetHeight;
+        if (cells.length > cols) {
+            rowHeight = cells[cols].offsetTop - firstTop;
+        }
+        const rows = rowHeight > 0 ? Math.max(1, Math.floor(grid.clientHeight / rowHeight)) : 1;
+        return { cols, rows };
+    }
+
+    function openEmojiPopup() {
+        emojiPopupOpen = true;
+        emojiCategory = null;
+        emojiQuery = '';
+        emojiSelectedIndex = 0;
+        if (elements.emojiSearch) elements.emojiSearch.value = '';
+        elements.emojiModal.className = 'modal visible';
+        renderEmojiTabs();
+        renderEmojiGrid();
+        if (elements.emojiSearch) elements.emojiSearch.focus();
+    }
+
+    function closeEmojiPopup() {
+        emojiPopupOpen = false;
+        elements.emojiModal.className = 'modal';
+        focusInputWithKeyboard();
+    }
+
+    function renderEmojiTabs() {
+        if (!elements.emojiTabs) return;
+        const activeIndex = emojiCategoryToTabIndex(emojiCategory);
+        const buttons = elements.emojiTabs.querySelectorAll('.emoji-tab-btn');
+        buttons.forEach(function(btn, i) {
+            const isActive = i === activeIndex;
+            btn.classList.toggle('active', isActive);
+            btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        });
+    }
+
+    // Changes category, resetting the selection to index 0 (or the last cell,
+    // for stepping backward off the first cell via emojiStep). Wraps at the
+    // tab-strip ends, same as Tab/Shift-Tab.
+    function setEmojiCategory(tabIndex, where) {
+        const total = elements.emojiTabs ? elements.emojiTabs.querySelectorAll('.emoji-tab-btn').length : 1;
+        let idx = tabIndex;
+        if (idx < 0) idx = total - 1;
+        if (idx >= total) idx = 0;
+        emojiCategory = emojiTabIndexToCategory(idx);
+        const list = getFilteredEmoji(emojiCategory, emojiQuery);
+        emojiSelectedIndex = where === 'end' ? Math.max(0, list.length - 1) : 0;
+        renderEmojiTabs();
+        renderEmojiGrid();
+    }
+
+    // Left/Right walk the flat filtered list and cross row boundaries freely;
+    // only stepping off the absolute first cell (delta -1 from index 0) or the
+    // absolute last cell (delta +1 from the end) changes category - never a mere
+    // row edge. Mirrors the approved mockup's step() and the Rust grid_move
+    // edge-reporting semantics from Step 2/4.
+    function emojiStep(delta) {
+        const list = getFilteredEmoji(emojiCategory, emojiQuery);
+        const n = emojiSelectedIndex + delta;
+        if (n < 0) { setEmojiCategory(emojiCategoryToTabIndex(emojiCategory) - 1, 'end'); return; }
+        if (n >= list.length) { setEmojiCategory(emojiCategoryToTabIndex(emojiCategory) + 1, 'start'); return; }
+        emojiSelectedIndex = n;
+        renderEmojiGrid();
+    }
+
+    function updateEmojiFilter() {
+        emojiQuery = elements.emojiSearch ? elements.emojiSearch.value : '';
+        emojiSelectedIndex = 0;
+        renderEmojiGrid();
+    }
+
+    function renderEmojiGrid() {
+        const grid = elements.emojiGrid;
+        if (!grid) return;
+        const list = getFilteredEmoji(emojiCategory, emojiQuery);
+        if (emojiSelectedIndex >= list.length) emojiSelectedIndex = Math.max(0, list.length - 1);
+        grid.innerHTML = '';
+
+        if (emojiData.length === 0) {
+            // Degrade gracefully: absent/empty/malformed emoji_json (see the
+            // InitialState handler) must never leave the picker looking broken.
+            const notice = document.createElement('div');
+            notice.className = 'emoji-grid-empty';
+            notice.textContent = 'No emoji data available from this server.';
+            grid.appendChild(notice);
+            showEmojiInfo(null);
+            return;
+        }
+        if (list.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'emoji-grid-empty';
+            empty.textContent = 'No emoji match “' + emojiQuery + '”';
+            grid.appendChild(empty);
+            showEmojiInfo(null);
+            return;
+        }
+
+        list.forEach(function(e, i) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'emoji-cell' + (i === emojiSelectedIndex ? ' selected' : '');
+            btn.textContent = e.ch;
+            btn.title = ':' + e.name + ':';
+            btn.setAttribute('role', 'option');
+            btn.setAttribute('aria-label', e.name);
+            if (i === emojiSelectedIndex) btn.setAttribute('aria-selected', 'true');
+            btn.addEventListener('mouseenter', function() { showEmojiInfo(e); });
+            btn.addEventListener('click', function() {
+                emojiSelectedIndex = i;
+                insertEmoji(e);
+            });
+            grid.appendChild(btn);
+        });
+
+        const selNode = grid.querySelector('.emoji-cell.selected');
+        if (selNode) {
+            const gt = grid.scrollTop, gh = grid.clientHeight, ot = selNode.offsetTop, oh = selNode.offsetHeight;
+            if (ot < gt) grid.scrollTop = ot;
+            else if (ot + oh > gt + gh) grid.scrollTop = ot + oh - gh;
+        }
+        showEmojiInfo(list[emojiSelectedIndex]);
+    }
+
+    function showEmojiInfo(e) {
+        const content = elements.emojiInfoContent;
+        if (!content) return;
+        if (e) {
+            const keywordsCsv = (e.keywords || '').split(' ').filter(Boolean).join(', ');
+            content.innerHTML = '<span class="emoji-info-glyph">' + escapeHtml(e.ch) + '</span>' +
+                '<code class="emoji-info-code">:' + escapeHtml(e.name) + ':</code>' +
+                '<span>' + escapeHtml(keywordsCsv) + '</span>';
+        } else {
+            content.textContent = 'Type to search, or pick a category above';
+        }
+    }
+
+    // Insertion reuses the lastArgument() idiom: capture the input's caret
+    // position BEFORE anything below moves focus (closeEmojiPopup/
+    // focusInputWithKeyboard), splice the emoji character in at that position,
+    // then call resetCompletion() and re-set the caret ourselves - setting
+    // .value fires no 'input' event, and focusInputWithKeyboard() forces the
+    // caret to the end of the input on phone/tablet, so it must be overridden
+    // after, not before (same pattern as the overwrite-mode keydown path).
+    function insertEmoji(e) {
+        if (!e) return;
+        const input = elements.input;
+        const pos = input.selectionStart == null ? input.value.length : input.selectionStart;
+        const end = input.selectionEnd == null ? pos : input.selectionEnd;
+        input.value = input.value.slice(0, pos) + e.ch + input.value.slice(end);
+        const newPos = pos + e.ch.length;
+        closeEmojiPopup();
+        resetCompletion();
+        focusInputWithKeyboard();
+        input.selectionStart = input.selectionEnd = newPos;
     }
 
     // Build the pattern rows in the inline action editor (patterns is a simple string array)
@@ -12390,6 +12644,9 @@
             case 'search_popup':
                 if (searchPopupOpen) closeSearchPopup(); else openSearchPopup();
                 return true;
+            case 'emoji_picker':
+                if (emojiPopupOpen) closeEmojiPopup(); else openEmojiPopup();
+                return true;
             case 'toggle_action_highlight':
                 highlightActions = !highlightActions;
                 renderOutput();
@@ -12703,6 +12960,7 @@
     function closeAllPopups(except) {
         if (filterPopupOpen && except !== 'filter') closeFilterPopup();
         if (searchPopupOpen && except !== 'search') closeSearchPopup();
+        if (emojiPopupOpen) closeEmojiPopup();
         if (helpPopupOpen) closeHelpPopup();
         if (actionsListPopupOpen) closeActionsListPopup();
         if (actionsEditorPopupOpen) closeActionsEditorPopup();
@@ -13712,6 +13970,56 @@
                 return;
             }
 
+            // Handle emoji picker popup (Esc-e). Owns every key while open, same as
+            // the other popup blocks here - the search input has native focus, so
+            // Left/Right/Home/End must be intercepted here or the browser would move
+            // the text caret inside the search box instead of the grid cursor.
+            if (emojiPopupOpen) {
+                const emojiList = getFilteredEmoji(emojiCategory, emojiQuery);
+                const emojiMetrics = getEmojiGridMetrics();
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeEmojiPopup();
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (emojiList[emojiSelectedIndex]) insertEmoji(emojiList[emojiSelectedIndex]);
+                } else if (e.key === 'ArrowRight') {
+                    e.preventDefault();
+                    emojiStep(1);
+                } else if (e.key === 'ArrowLeft') {
+                    e.preventDefault();
+                    emojiStep(-1);
+                } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    emojiSelectedIndex = Math.min(emojiList.length - 1, emojiSelectedIndex + emojiMetrics.cols);
+                    renderEmojiGrid();
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    emojiSelectedIndex = Math.max(0, emojiSelectedIndex - emojiMetrics.cols);
+                    renderEmojiGrid();
+                } else if (e.key === 'PageDown') {
+                    e.preventDefault();
+                    emojiSelectedIndex = Math.min(emojiList.length - 1, emojiSelectedIndex + emojiMetrics.cols * emojiMetrics.rows);
+                    renderEmojiGrid();
+                } else if (e.key === 'PageUp') {
+                    e.preventDefault();
+                    emojiSelectedIndex = Math.max(0, emojiSelectedIndex - emojiMetrics.cols * emojiMetrics.rows);
+                    renderEmojiGrid();
+                } else if (e.key === 'Home') {
+                    e.preventDefault();
+                    emojiSelectedIndex = 0;
+                    renderEmojiGrid();
+                } else if (e.key === 'End') {
+                    e.preventDefault();
+                    emojiSelectedIndex = Math.max(0, emojiList.length - 1);
+                    renderEmojiGrid();
+                } else if (e.key === 'Tab') {
+                    e.preventDefault();
+                    setEmojiCategory(emojiCategoryToTabIndex(emojiCategory) + (e.shiftKey ? -1 : 1), 'start');
+                }
+                return;
+            }
+
             // Handle worlds list popup
             if (worldsPopupOpen) {
                 // Get connected worlds for navigation
@@ -14087,6 +14395,18 @@
             }
             renderActionsList();
         };
+
+        // Emoji picker popup (Esc-e)
+        if (elements.emojiCloseBtn) elements.emojiCloseBtn.onclick = closeEmojiPopup;
+        if (elements.emojiSearch) elements.emojiSearch.oninput = updateEmojiFilter;
+        if (elements.emojiTabs) {
+            elements.emojiTabs.querySelectorAll('.emoji-tab-btn').forEach(function(btn, i) {
+                btn.addEventListener('click', function() {
+                    setEmojiCategory(i, 'start');
+                    if (elements.emojiSearch) elements.emojiSearch.focus();
+                });
+            });
+        }
 
         // Actions Editor popup
         elements.actionSaveBtn.onclick = saveAction;
@@ -14563,6 +14883,7 @@
         };
         if (elements.worldEditHelpBtn) elements.worldEditHelpBtn.onclick = function() { openPopupHelp('worldEditor'); };
         if (elements.worldSelectorHelpBtn) elements.worldSelectorHelpBtn.onclick = function() { openPopupHelp('worldSelector'); };
+        if (elements.emojiHelpBtn) elements.emojiHelpBtn.onclick = function() { openPopupHelp('emoji'); };
         if (elements.actionsListHelpBtn) elements.actionsListHelpBtn.onclick = function() { openPopupHelp('actionsList'); };
         if (elements.actionEditorHelpBtn) elements.actionEditorHelpBtn.onclick = function() { openPopupHelp('actionEditor'); };
         if (elements.connectionsHelpBtn) elements.connectionsHelpBtn.onclick = function() { openPopupHelp('connections'); };

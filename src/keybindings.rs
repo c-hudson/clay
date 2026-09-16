@@ -154,6 +154,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     ActionInfo { id: "toggle_gmcp_media", name: "Toggle GMCP Media (F9)", category: "Clay" },
     ActionInfo { id: "input_grow", name: "Grow Input Area", category: "Clay" },
     ActionInfo { id: "input_shrink", name: "Shrink Input Area", category: "Clay" },
+    ActionInfo { id: "emoji_picker", name: "Emoji Picker (Esc-e)", category: "Clay" },
 
     // TF-parity plan Job 20 (P2.4): overwrite/insert toggle (TF `Insert` key / `Esc-v`,
     // `/@test insert := !insert`). Default binding added in Job 22 (three-UI rule).
@@ -331,6 +332,7 @@ impl KeyBindings {
         b.insert("F9".into(), "toggle_gmcp_media".into());
         b.insert("Alt-Up".into(), "input_grow".into());
         b.insert("Alt-Down".into(), "input_shrink".into());
+        b.insert("Esc-e".into(), "emoji_picker".into());
 
         // TF's `;; make meta_<namedkey> act like esc_<namedkey>` block (tf-lib/kbbind.tf)
         // defines every `key_meta_<x>` as an alias of `key_esc_<x>`. TF keeps its own
@@ -942,6 +944,7 @@ mod tests {
         ("F9", "toggle_gmcp_media"),
         ("Alt-Up", "input_grow"),
         ("Alt-Down", "input_shrink"),
+        ("Esc-e", "emoji_picker"),
         // TF's meta_<namedkey> == esc_<namedkey> aliases, generated in `defaults()` from
         // every `Esc-<named>` binding above. Adding an `Esc-<named>` default therefore adds
         // its `Alt-` twin here too.
