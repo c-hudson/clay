@@ -14,9 +14,19 @@
 //! a VS16 selector draws `❤️` in ONE column, and one that cannot compose a ZWJ
 //! sequence draws `❤️‍🔥` as two glyphs in FOUR. Either way the row slides
 //! relative to the buffer and its last cell lands on the popup's own border and
-//! scrollbar. [`console_safe`] holds those sequences back from the console grid;
-//! the web/GUI picker (a browser does its own layout) and `:shortcode:` lookup
-//! are unaffected and still see the whole table.
+//! scrollbar.
+//!
+//! The console grid used to hold those 38 sequences back from the picker
+//! entirely — excluded from the grid AND unreachable by search, which is how
+//! searching `heart` in the console came to return 17 results and not ❤️
+//! itself (`EMOJI-PICKER-ROADMAP.md` R14). Instead, [`console_glyph`] derives
+//! a *display* form whose rendered width `unicode_width` can state
+//! truthfully — strip the VS16 selector, truncate at the first ZWJ — while
+//! the value actually inserted on `Enter` stays the real, full glyph
+//! (`ListItem::id` in `popup/definitions/emoji.rs` is never touched by this;
+//! only `columns[0]`, the text painted into the grid, is). The web/GUI picker
+//! (a browser does its own layout) and `:shortcode:` lookup were never
+//! affected either way and always saw the whole table.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -537,32 +547,62 @@ pub fn lookup(name: &str) -> Option<&'static str> {
     lookup_table().get(name).copied()
 }
 
-/// Whether this glyph is safe to draw in the console grid — i.e. whether every
-/// terminal will occupy the same number of columns with it that ratatui budgeted.
+/// Derive the console-safe **display** form of a glyph: strip `U+FE0F` (VS16)
+/// wherever it appears, and stop at the first `U+200D` (ZWJ), dropping
+/// everything from there on. `❤️` (U+2764 U+FE0F) becomes `❤`; `❤️‍🔥`
+/// (U+2764 U+FE0F U+200D U+1F525) becomes `❤`; `🏳️‍🌈` becomes `🏳`. A glyph
+/// with neither marker — including a regional-indicator flag pair like
+/// `🇺🇸`, which is two plain codepoints and contains neither selector — passes
+/// through unchanged.
 ///
-/// ratatui lays its buffer out with `unicode_width`, which applies emoji
-/// presentation and answers 2 for every entry in this table. A terminal may
-/// disagree, and when it does, the row slides and its last cell overwrites the
-/// popup's own border and scrollbar. Two sequence kinds are unreliable:
+/// This exists because `unicode_width` disagrees with what a terminal
+/// actually draws for these two sequence kinds, and ratatui lays its buffer
+/// out with `unicode_width`'s numbers:
 ///
-/// - **VS16** (`U+FE0F`, as in `❤️` = U+2764 U+FE0F). A terminal that honours
-///   the selector draws 2 columns; one that ignores it draws the bare BMP
-///   dingbat in 1. Drift of 1 per glyph.
-/// - **ZWJ** (`U+200D`, as in `❤️‍🔥`). A terminal that composes the sequence
-///   draws 2 columns; one that can't draws the parts side by side, so 4.
+/// - **VS16** (`U+FE0F`). A terminal that honours the selector draws the
+///   sequence in 2 columns; one that ignores it draws the bare BMP dingbat
+///   in 1. `unicode_width` always answers 2.
+/// - **ZWJ** (`U+200D`). A terminal that composes the sequence draws 2
+///   columns; one that can't draws the parts side by side, so 4.
+///   `unicode_width` always answers 2.
 ///
-/// Regional-indicator flag pairs (`🇺🇸`) are deliberately *kept*: composed into
-/// one flag or drawn as two boxed letters, either way they occupy 2 columns, so
-/// there is nothing to drift. That also keeps the Flags tab from being empty.
+/// Either way the row painted from `unicode_width`'s numbers can slide
+/// against a real terminal's, sending the row's last cell into the popup's
+/// own border and scrollbar. The console grid used to hold these 38 entries
+/// back from the picker entirely to avoid that (see git history), which also
+/// made them unreachable by search. `console_glyph` instead gives the grid a
+/// display string whose width it can state truthfully — every entry's result
+/// measures 1 or 2 columns (pinned by this module's tests) — while the value
+/// actually inserted on `Enter` stays the untouched original glyph.
+/// Whether the console picker can show this emoji as its own distinguishable
+/// cell.
 ///
-/// Computed, never a hand-maintained list, so a new table entry cannot silently
-/// start corrupting the popup. The web and GUI pickers have no such limit — a
-/// browser lays out glyphs itself — and `:shortcode:` lookup is unaffected.
-pub fn console_safe(ch: &str) -> bool {
-    if ch.chars().any(|c| c == '\u{FE0F}' || c == '\u{200D}') {
-        return false;
+/// [`console_glyph`] makes a VS16 sequence width-truthful by dropping the
+/// selector, which is lossless enough to draw — `❤️` still reads as a heart.
+/// A **ZWJ** sequence is different: truncating it at the joiner collapses it
+/// onto its own base character, which is usually another entry in this table.
+/// `heart_on_fire` becomes `❤`, indistinguishable from `heart`; `rainbow_flag`
+/// becomes `🏳`, indistinguishable from `white_flag`. Two identical-looking
+/// cells in a picker read as a rendering bug, and with no footer there is
+/// nothing to tell them apart - so the three ZWJ entries stay out of the
+/// console grid. They remain in the web/GUI picker, which composes them
+/// properly, and in `:shortcode:` lookup.
+pub fn console_renderable(ch: &str) -> bool {
+    !ch.contains('\u{200D}')
+}
+
+pub fn console_glyph(ch: &str) -> String {
+    let mut out = String::new();
+    for c in ch.chars() {
+        if c == '\u{200D}' {
+            break;
+        }
+        if c == '\u{FE0F}' {
+            continue;
+        }
+        out.push(c);
     }
-    unicode_width::UnicodeWidthStr::width(ch) == 2
+    out
 }
 
 /// Compact wire form for `WsMessage::InitialState.emoji_json` (Step 6):
@@ -642,20 +682,26 @@ mod tests {
         );
     }
 
-    /// `tab_glyph()` feeds directly into the console tab strip (R5), so each
-    /// glyph must be drawable there (`console_safe`) and exactly 2 columns
-    /// wide - the same constraint the grid entries are held to - and the eight
-    /// glyphs must be visually distinguishable from one another. Deliberately
-    /// does NOT assert a glyph is present in `EMOJI`: Nature's tab glyph 🐶
-    /// (U+1F436) is not a table entry (the table has 🐕 for `dog`), which is
-    /// intentional, not a bug.
+    /// `tab_glyph()` feeds directly into the console tab strip (R5), which
+    /// pads on the fixed 2-column assumption unlike the grid (the tab strip
+    /// is not routed through `console_glyph`), so each glyph must already be
+    /// plain (no VS16/ZWJ to strip — `console_glyph` is a no-op on it) and
+    /// exactly 2 columns wide, and the eight glyphs must be visually
+    /// distinguishable from one another. Deliberately does NOT assert a
+    /// glyph is present in `EMOJI`: Nature's tab glyph 🐶 (U+1F436) is not a
+    /// table entry (the table has 🐕 for `dog`), which is intentional, not a
+    /// bug.
     #[test]
     fn tab_glyph_is_console_safe_two_columns_and_distinct() {
         use unicode_width::UnicodeWidthStr;
         let mut seen = std::collections::HashSet::new();
         for category in Category::all() {
             let glyph = category.tab_glyph();
-            assert!(console_safe(glyph), "{category:?} tab_glyph {glyph:?} is not console_safe");
+            assert_eq!(
+                console_glyph(glyph),
+                glyph,
+                "{category:?} tab_glyph {glyph:?} must have no VS16/ZWJ to strip"
+            );
             assert_eq!(
                 UnicodeWidthStr::width(glyph),
                 2,
@@ -668,59 +714,54 @@ mod tests {
         }
     }
 
-    /// Two entries sharing a glyph render as two identical cells in the picker
-    /// grid, which reads as a rendering bug. Names may differ (`:smile:` vs
-    /// `:blush:`); the character must not repeat. Fold the extra spelling in as
-    /// an alias instead of adding a second entry.
-    /// The console grid may only contain glyphs where `unicode_width` agrees
-    /// with what a terminal draws, because ratatui lays its buffer out with
-    /// `unicode_width`. Where they disagree the row slides and overwrites the
-    /// popup's own border and scrollbar - the bug this predicate exists to stop.
+    /// `console_glyph` on each of the four shapes the doc comment calls out:
+    /// a plain emoji is untouched, a VS16 sequence loses the selector, a ZWJ
+    /// sequence is truncated at the join, and a regional-indicator flag pair
+    /// — which is easy to break with a naive `take_while` that stops at any
+    /// non-ASCII lead byte — passes through whole because it contains neither
+    /// marker.
     #[test]
-    fn console_safe_rejects_vs16_and_zwj_only() {
-        use unicode_width::UnicodeWidthStr;
-        let mut kept = 0;
-        for entry in EMOJI {
-            let has_seq = entry.ch.chars().any(|c| c == '\u{FE0F}' || c == '\u{200D}');
-            let expected = !has_seq && UnicodeWidthStr::width(entry.ch) == 2;
-            assert_eq!(
-                console_safe(entry.ch),
-                expected,
-                "{} ({}) classified wrongly",
-                entry.name,
-                entry.ch
-            );
-            if expected {
-                kept += 1;
-            }
-        }
-        // Most of the table is drawable in a terminal; only the VS16/ZWJ
-        // sequences are held back. If this ratio collapses, the predicate has
-        // become too aggressive.
-        assert!(
-            kept * 10 >= EMOJI.len() * 8,
-            "console grid kept only {kept} of {} entries",
-            EMOJI.len()
+    fn console_glyph_classifies_the_known_hard_cases() {
+        assert_eq!(console_glyph("\u{1F600}"), "\u{1F600}", "plain emoji unchanged");
+        assert_eq!(
+            console_glyph("\u{1F1FA}\u{1F1F8}"),
+            "\u{1F1FA}\u{1F1F8}",
+            "regional-indicator flag pair passes through whole"
+        );
+        assert_eq!(console_glyph("\u{2764}\u{FE0F}"), "\u{2764}", "VS16 stripped");
+        assert_eq!(console_glyph("\u{2639}\u{FE0F}"), "\u{2639}", "VS16 stripped");
+        assert_eq!(
+            console_glyph("\u{2764}\u{FE0F}\u{200D}\u{1F525}"),
+            "\u{2764}",
+            "ZWJ heart-on-fire truncated to the heart"
+        );
+        assert_eq!(
+            console_glyph("\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"),
+            "\u{1F3F3}",
+            "ZWJ rainbow flag truncated to the white flag"
         );
     }
 
-    /// A VS16 sequence measures 1 and a ZWJ sequence measures 3, so both must be
-    /// excluded; an ordinary supplementary-plane emoji and a regional-indicator
-    /// flag pair both measure 2 and must be kept. Pinned by example so a future
-    /// `unicode-width` bump that starts handling emoji presentation shows up
-    /// here as a deliberate decision rather than a silent behaviour change.
+    /// Every entry's `console_glyph` must measure 1 or 2 columns under
+    /// `unicode_width` — the invariant `console_renderer`'s per-cell gutter
+    /// padding (`CELL_STRIDE - width`, clamped to at least 1) depends on.
+    /// Nothing wider than `CELL_STRIDE` and nothing zero-width may reach the
+    /// grid.
     #[test]
-    fn console_safe_classifies_the_known_hard_cases() {
-        assert!(console_safe("\u{1F600}"), "plain emoji");
+    fn console_glyph_is_always_one_or_two_columns_wide() {
+        use unicode_width::UnicodeWidthStr;
+        let mut failures = Vec::new();
+        for entry in EMOJI {
+            let glyph = console_glyph(entry.ch);
+            let w = UnicodeWidthStr::width(glyph.as_str());
+            if w != 1 && w != 2 {
+                failures.push(format!("{} ({:?} -> {:?}) has width {w}", entry.name, entry.ch, glyph));
+            }
+        }
         assert!(
-            console_safe("\u{1F1FA}\u{1F1F8}"),
-            "regional-indicator flag pair: 2 columns composed or not"
-        );
-        assert!(!console_safe("\u{2764}\u{FE0F}"), "VS16 heart");
-        assert!(!console_safe("\u{2639}\u{FE0F}"), "VS16 frown");
-        assert!(
-            !console_safe("\u{2764}\u{FE0F}\u{200D}\u{1F525}"),
-            "ZWJ heart-on-fire"
+            failures.is_empty(),
+            "console_glyph produced an unexpected width:\n{}",
+            failures.join("\n")
         );
     }
 
@@ -837,4 +878,5 @@ mod tests {
         }
     }
 }
+
 

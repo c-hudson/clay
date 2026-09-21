@@ -492,6 +492,7 @@ no reachable caret).
 - [x] **R11** — web/GUI
 - [x] **R12** — verification
 - [x] **R13** — web arrow parity and focus capture
+- [x] **R14** — all emoji reachable from console search
 
 **On resume:** find the first unchecked box, re-verify it landed, continue. Sequential.
 
@@ -744,3 +745,55 @@ zones despite DOM `:focus` never moving. `cargo test --no-default-features --fea
 rustls-backend,ssh-transport`: 1778 passed, 0 failed (matches baseline). All spawned
 geckodriver/http.server processes were killed after verification; the user's own
 Firefox windows were left untouched.
+
+# R14 — all emoji reachable from console search
+
+`emoji::console_safe()` rejected any glyph containing VS16 (`U+FE0F`) or ZWJ
+(`U+200D`), and `filter_emoji_console` filtered the whole table through it — excluding
+38 of 389 entries from the console picker **entirely**: not browsable, and not
+findable by search either. Most visibly, searching `heart` in the console returned 17
+results and not ❤️ itself. The exclusion existed for a real reason (see the Step 1
+history above and `emoji.rs`'s module doc comment): ratatui lays its buffer out with
+`unicode_width`, which answers 2 for these sequences, but a terminal that ignores a
+VS16 selector draws `❤️` in ONE column, and one that can't compose a ZWJ sequence draws
+`❤️‍🔥` in FOUR — either way the row slides against the buffer and its last cell lands
+on the popup's own border.
+
+**Fix: display a width-truthful form, insert the real one.** `emoji::console_glyph(ch)`
+strips VS16 and truncates at the first ZWJ (`❤️` → `❤`, `❤️‍🔥` → `❤`, `🏳️‍🌈` → `🏳`,
+a regional-indicator flag pair or an ordinary emoji passes through unchanged — measured
+with the real `unicode-width` crate, this leaves 37 entries at width 1 and 1 at width 2,
+nothing zero-width or wider than 2). `console_safe` is gone; `filter_emoji_console` no
+longer filters at all — it is now the same 389-entry set as `filter_emoji`.
+`emoji_list_item` (`popup/definitions/emoji.rs`) paints `columns[0] =
+console_glyph(entry.ch)` for the grid but keeps `id = entry.ch` untouched, so `Enter`
+still inserts the real ❤️/❤️‍🔥/🏳️‍🌈, not the stripped display form — the split between
+"what's painted" and "what's inserted" is the entire fix and must never be allowed to
+converge.
+
+`console_renderer.rs`'s `render_grid_field` and `render_popup_content_direct`'s Grid arm
+(the ratatui path and the raw-crossterm partial-repaint path — both had to change
+identically or the grid would shift on mouse-wheel scroll, a repeated trap in this
+feature) now pad each cell by `CELL_STRIDE - emoji_cell_width(glyph)` — a per-glyph
+measurement, no longer a fixed constant — clamped into `1..CELL_STRIDE` so a 1-column
+display glyph gets a 3-space gutter and a 2-column one gets 2, and every cell still
+starts on a 4-column boundary.
+
+Rewrote (not deleted) `emoji.rs`'s `console_safe_rejects_vs16_and_zwj_only` and
+`console_safe_classifies_the_known_hard_cases` into `console_glyph`-based tests;
+`popup/definitions/emoji.rs`'s `test_filter_emoji_console_is_all_width_two` (no longer
+true — 37 entries are now width 1) and `test_filter_emoji_console_is_a_subset_of_filter_emoji`
+(no longer a subset — it's the same set); and `src/tests.rs`'s
+`test_open_emoji_popup_populates_grid_and_focuses_search`, which asserted a
+`console_safe`-filtered strict subset of the category count. Added: `console_glyph` on
+all four shapes (plain, VS16, ZWJ, regional-indicator pair — the last is the easy one to
+break with a naive `take_while`); every entry's `console_glyph` measures 1 or 2 columns
+(the invariant the renderer's per-cell padding depends on); a VS16 entry's `ListItem` has
+`columns[0] != id` with `id` staying the full original glyph; and
+`filter_emoji_console(None, "heart")` includes the `heart` entry itself — the user's
+exact failing case.
+
+**Verification:** `cargo check`/`cargo test`/`cargo clippy --tests`, all
+`--no-default-features --features rustls-backend,ssh-transport`. 1780 passed (baseline
+1778 + 2 net new), 0 failed, clippy clean. No pty verification — the user does that
+themselves for this entry.

@@ -1540,20 +1540,34 @@ fn render_buttons(f: &mut Frame, state: &mut PopupState, area: Rect, theme: &The
 /// wrong kind of measuring for this content.
 const CELL_STRIDE: usize = 4;
 
-/// Terminal columns every glyph in a `Grid` cell is assumed to occupy.
-/// Deliberately a fixed constant rather than a measurement — the Step 1 table
-/// (`src/emoji.rs`) is what actually guarantees every entry renders as
-/// exactly this many columns (see its own width tests); this `debug_assert`
-/// just keeps `CELL_STRIDE` and this constant from drifting apart from each
-/// other.
-fn emoji_cell_width() -> usize {
-    const GLYPH_WIDTH: usize = 2;
-    debug_assert_eq!(
-        CELL_STRIDE,
-        GLYPH_WIDTH + 2,
-        "CELL_STRIDE must be emoji_cell_width() plus a 2-column gutter"
+/// Terminal columns a specific display glyph occupies, per-cell (R14).
+///
+/// Before R14 every grid cell held a real, unmodified emoji, and the Step 1
+/// table (`src/emoji.rs`) guaranteed every one of those measured exactly 2
+/// columns, so a single fixed constant was safe. R14 reintroduced the 38
+/// VS16/ZWJ entries the console grid used to exclude entirely, painting
+/// `emoji::console_glyph(ch)` for those — a stripped display form measuring
+/// 1 column, not 2 (see `console_glyph`'s own width test, which guarantees
+/// every entry lands on 1 or 2, never 0 or more than `CELL_STRIDE`). The
+/// gutter must therefore be computed per cell rather than assumed fixed:
+/// `CELL_STRIDE - emoji_cell_width(glyph)`, clamped to at least 1, is what
+/// keeps every cell starting on a `CELL_STRIDE`-column boundary regardless of
+/// whether its glyph is 1 or 2 columns wide.
+fn emoji_cell_width(glyph: &str) -> usize {
+    let w = display_width(glyph);
+    debug_assert!(
+        (1..CELL_STRIDE).contains(&w),
+        "grid glyph {glyph:?} has width {w}, expected 1..{CELL_STRIDE}"
     );
-    GLYPH_WIDTH
+    w.clamp(1, CELL_STRIDE.saturating_sub(1))
+}
+
+/// Right-padding gutter for one grid cell's glyph, per R14. `emoji_cell_width`
+/// already clamps into `1..CELL_STRIDE`, so this is always at least 1 space —
+/// cells never run together even for a glyph that measured wider than
+/// expected.
+fn emoji_cell_gutter(glyph: &str) -> String {
+    " ".repeat(CELL_STRIDE.saturating_sub(emoji_cell_width(glyph)))
 }
 
 /// Style for the selected grid cell's glyph span, focus-aware. Both arms are
@@ -1600,8 +1614,6 @@ fn render_grid_field(
     if columns == 0 || visible_rows == 0 {
         return;
     }
-    let glyph_width = emoji_cell_width();
-    let gutter = " ".repeat(CELL_STRIDE.saturating_sub(glyph_width));
     let blank_cell = " ".repeat(CELL_STRIDE);
     let gutter_style = Style::default().fg(theme.fg());
 
@@ -1638,7 +1650,7 @@ fn render_grid_field(
                         Style::default().fg(theme.fg())
                     };
                     spans.push(Span::styled(glyph.to_string(), glyph_style));
-                    spans.push(Span::styled(gutter.clone(), gutter_style));
+                    spans.push(Span::styled(emoji_cell_gutter(glyph), gutter_style));
                 }
                 None => {
                     spans.push(Span::styled(blank_cell.clone(), Style::default()));
@@ -2075,8 +2087,6 @@ pub fn render_popup_content_direct(state: &PopupState, theme: &Theme) {
                 }
                 let is_selected = matches!(&state.selected, ElementSelection::Field(id) if *id == field.id);
 
-                let glyph_width = emoji_cell_width();
-                let gutter = " ".repeat(CELL_STRIDE.saturating_sub(glyph_width));
                 let blank_cell = " ".repeat(CELL_STRIDE);
 
                 let total_rows = cells.len().div_ceil(*columns);
@@ -2113,10 +2123,12 @@ pub fn render_popup_content_direct(state: &PopupState, theme: &Theme) {
 
                                 // Gutter is always plain, in its own Print so the
                                 // selection style can never bleed past the glyph's
-                                // own 2 columns into the inter-cell gap.
+                                // own column width into the inter-cell gap. Sized
+                                // per-cell (R14): a VS16/ZWJ entry's stripped
+                                // display glyph is 1 column, not 2.
                                 let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg())));
                                 let _ = stdout.queue(SetBackgroundColor(popup_bg));
-                                let _ = stdout.queue(Print(&gutter));
+                                let _ = stdout.queue(Print(&emoji_cell_gutter(glyph)));
                             }
                             None => {
                                 let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg())));

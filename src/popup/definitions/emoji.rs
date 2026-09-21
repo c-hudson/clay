@@ -7,7 +7,7 @@
 //! list swapped for a `Grid` and a `Tabs` field added for category
 //! narrowing. See `EMOJI-PICKER-ROADMAP.md`'s Navigation rework.
 
-use crate::emoji::{Category, EMOJI};
+use crate::emoji::{console_glyph, Category, EMOJI};
 use crate::popup::{
     Field, FieldId, FieldKind, ListItem, ListItemStyle, PopupDefinition, PopupId, PopupLayout,
     PopupState,
@@ -44,13 +44,17 @@ fn tab_labels() -> Vec<String> {
     Category::all().iter().map(|c| c.tab_glyph().to_string()).collect()
 }
 
-/// Build a `ListItem` for one emoji entry: `id` is the character to insert,
-/// `columns` are `[glyph, name, keywords]`.
+/// Build a `ListItem` for one emoji entry: `id` is the full character to
+/// insert on `Enter`, `columns[0]` is `console_glyph(entry.ch)` — the
+/// width-truthful display form the console grid actually paints (see
+/// `EMOJI-PICKER-ROADMAP.md` R14). These two deliberately diverge for VS16/
+/// ZWJ entries (`id` keeps the selector/join, `columns[0]` does not); do not
+/// let them converge, or `Enter` starts inserting the stripped form.
 fn emoji_list_item(entry: &crate::emoji::EmojiEntry) -> ListItem {
     let keywords = entry.aliases.join(" ");
     ListItem {
         id: entry.ch.to_string(),
-        columns: vec![entry.ch.to_string(), entry.name.to_string(), keywords],
+        columns: vec![console_glyph(entry.ch), entry.name.to_string(), keywords],
         style: ListItemStyle::default(),
     }
 }
@@ -81,19 +85,25 @@ pub fn filter_emoji(category: Option<Category>, query: &str) -> Vec<ListItem> {
         .collect()
 }
 
-/// [`filter_emoji`] for the **console** grid: the same matching rule, minus the
-/// glyphs a terminal and `unicode_width` disagree about (see
-/// [`crate::emoji::console_safe`]).
+/// [`filter_emoji`] for the **console** grid.
 ///
-/// Deliberately a separate function rather than a filter inside `filter_emoji`.
-/// `filter_emoji` is the shared matching rule that `getFilteredEmoji` in app.js
-/// mirrors one-for-one, and the two are cross-checked against each other; the
-/// exclusion here is a console *rendering* limit, not a change to what "matches".
-/// The web and GUI pickers, and `:shortcode:` lookup, still see the whole table.
+/// As of `EMOJI-PICKER-ROADMAP.md` R14 this returns exactly the same matches
+/// as `filter_emoji` — nothing is excluded any more. It used to drop every
+/// entry a terminal and `unicode_width` disagree about (VS16/ZWJ sequences),
+/// which made those 38 entries unreachable by search as well as invisible in
+/// the grid; the console can now show all of them because `emoji_list_item`
+/// gives the grid a separate, width-truthful *display* string
+/// (`console_glyph`) instead of relying on the real glyph's own width.
+///
+/// Kept as a separate function (rather than folded into `filter_emoji`)
+/// because `filter_emoji` is the shared matching rule that `getFilteredEmoji`
+/// in app.js mirrors one-for-one and the two are cross-checked against each
+/// other — a console-only quirk, even an empty one, belongs in its own call
+/// site, not the shared rule.
 pub fn filter_emoji_console(category: Option<Category>, query: &str) -> Vec<ListItem> {
     filter_emoji(category, query)
         .into_iter()
-        .filter(|item| crate::emoji::console_safe(&item.id))
+        .filter(|item| crate::emoji::console_renderable(&item.id))
         .collect()
 }
 
@@ -315,37 +325,127 @@ pub fn emoji_tabs_select_edge(state: &mut PopupState, last: bool) {
 mod tests {
     use super::*;
 
-    /// Every cell the console grid can show must be one ratatui measures as 2
-    /// columns - that is the whole contract that keeps the popup's border and
-    /// scrollbar from being overwritten.
+    /// Every cell the console grid can show paints `columns[0]`
+    /// (`console_glyph(id)`), and that display form must measure 1 or 2
+    /// columns under `unicode_width` - the invariant the per-cell gutter
+    /// padding in `console_renderer` depends on. It is no longer true that
+    /// every cell is width 2 (R14) - a VS16/ZWJ entry's display form is
+    /// narrower than its real glyph.
     #[test]
-    fn test_filter_emoji_console_is_all_width_two() {
+    fn test_filter_emoji_console_display_glyphs_are_one_or_two_columns() {
         use unicode_width::UnicodeWidthStr;
         let cells = filter_emoji_console(None, "");
         assert!(!cells.is_empty());
         for cell in &cells {
-            assert_eq!(
-                UnicodeWidthStr::width(cell.id.as_str()),
-                2,
-                "console grid cell {:?} is not 2 columns wide",
-                cell.id
+            let display = cell.columns.first().map(|s| s.as_str()).unwrap_or("");
+            let w = UnicodeWidthStr::width(display);
+            assert!(
+                w == 1 || w == 2,
+                "console grid display glyph {:?} (from id {:?}) is {} columns wide",
+                display,
+                cell.id,
+                w
             );
         }
     }
 
-    /// The console view is a strict subset of the shared rule: it never adds a
-    /// match, and it only ever drops glyphs the terminal can't place reliably.
+    /// R14: the console view is no longer a filtered-down subset of the
+    /// shared rule - it is now the *same* set, because every entry can be
+    /// displayed in the grid (via `console_glyph`) even though a VS16/ZWJ
+    /// entry's `id` (what `Enter` inserts) still carries its selector/join.
     #[test]
-    fn test_filter_emoji_console_is_a_subset_of_filter_emoji() {
+    fn test_filter_emoji_console_is_filter_emoji_minus_zwj() {
         for query in ["", "heart", "flag", "a"] {
             let all = filter_emoji(None, query);
             let console = filter_emoji_console(None, query);
-            assert!(console.len() <= all.len());
-            let all_ids: Vec<&str> = all.iter().map(|i| i.id.as_str()).collect();
-            for cell in &console {
-                assert!(all_ids.contains(&cell.id.as_str()));
+            let expected: Vec<&str> = all
+                .iter()
+                .map(|i| i.id.as_str())
+                .filter(|id| crate::emoji::console_renderable(id))
+                .collect();
+            let console_ids: Vec<&str> = console.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(console_ids, expected, "query {query:?} diverged");
+        }
+    }
+
+    /// A `ListItem` for a VS16 entry must have `columns[0] != id`: the grid
+    /// paints the stripped display form but `id` - what `Enter` inserts -
+    /// stays the full original glyph with its selector intact. This is the
+    /// whole guarantee behind "search finds heart, and Enter inserts the
+    /// real ❤️, not a bare ❤".
+    #[test]
+    fn test_vs16_entry_display_glyph_differs_from_id() {
+        let heart = EMOJI
+            .iter()
+            .find(|e| e.name == "heart")
+            .expect("fixture needs a 'heart' entry");
+        assert!(
+            heart.ch.contains('\u{FE0F}'),
+            "fixture assumption: 'heart' entry carries VS16"
+        );
+        let item = emoji_list_item(heart);
+        assert_eq!(item.id, heart.ch, "id must stay the full original glyph");
+        let display = item.columns.first().map(|s| s.as_str()).unwrap_or("");
+        assert_ne!(display, item.id.as_str(), "display glyph must differ from id");
+        assert_eq!(display, crate::emoji::console_glyph(heart.ch));
+    }
+
+    /// The user's exact failing case: searching "heart" in the console must
+    /// include the entry actually named `heart` (❤️), not just its 17
+    /// VS16/ZWJ-free relatives.
+    /// Two cells drawing the same glyph read as a rendering bug, and with no
+    /// footer there is nothing to tell them apart. `console_glyph` collapses a
+    /// ZWJ sequence onto its base, which collides with the base's own entry
+    /// (`heart_on_fire` -> the same `❤` as `heart`), so those are excluded.
+    /// This pins the property rather than the exclusion, so a future table
+    /// addition that collides some other way also fails here.
+    #[test]
+    fn test_console_grid_has_no_duplicate_display_glyphs() {
+        use std::collections::HashMap;
+        let cells = filter_emoji_console(None, "");
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let mut dups = Vec::new();
+        for cell in &cells {
+            let glyph = cell.columns.first().cloned().unwrap_or_default();
+            let name = cell.columns.get(1).cloned().unwrap_or_default();
+            if let Some(owner) = seen.get(&glyph) {
+                dups.push(format!("{glyph} drawn by both {owner:?} and {name:?}"));
+            } else {
+                seen.insert(glyph, name);
             }
         }
+        assert!(dups.is_empty(), "duplicate display glyphs:\n{}", dups.join("\n"));
+    }
+
+    /// The three ZWJ entries are the only thing the console holds back, and
+    /// they stay reachable everywhere else.
+    #[test]
+    fn test_only_zwj_entries_are_held_back_from_the_console() {
+        let all = filter_emoji(None, "");
+        let console = filter_emoji_console(None, "");
+        let held: Vec<&str> = all
+            .iter()
+            .filter(|a| !console.iter().any(|c| c.id == a.id))
+            .map(|a| a.columns.get(1).map(String::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(held.len(), 3, "expected exactly the ZWJ entries, got {held:?}");
+        for name in &held {
+            let entry = crate::emoji::EMOJI.iter().find(|e| e.name == *name).unwrap();
+            assert!(entry.ch.contains('\u{200D}'), "{name} is held back but is not a ZWJ sequence");
+        }
+    }
+
+    #[test]
+    fn test_filter_emoji_console_finds_heart_itself() {
+        let heart = EMOJI
+            .iter()
+            .find(|e| e.name == "heart")
+            .expect("fixture needs a 'heart' entry");
+        let results = filter_emoji_console(None, "heart");
+        assert!(
+            results.iter().any(|item| item.id == heart.ch),
+            "filter_emoji_console(\"heart\") must include the heart entry itself"
+        );
     }
 
     #[test]
