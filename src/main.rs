@@ -4778,7 +4778,7 @@ pub struct App {
     pub spell_state: SpellState,
     pub last_input_was_delete: bool, // Track if last input action was backspace/delete (for spell check)
     pub skip_temp_conversion: Option<String>, // Temperature to skip re-converting (after user undid conversion)
-    pub cached_misspelled: Vec<(usize, usize)>, // Cached misspelled word ranges (char positions)
+    pub cached_misspelled: Vec<(usize, usize)>, // Cached misspelled word ranges (absolute BYTE offsets)
     pub suggestion_message: Option<String>,
     pub settings: Settings,
     pub confirm_dialog: ConfirmDialog,
@@ -14661,101 +14661,150 @@ impl App {
         self.input.cursor_position = self.input.buffer.len();
     }
 
-    fn find_misspelled_words(&mut self) -> Vec<(usize, usize)> {
-        let mut misspelled = Vec::new();
-        let chars: Vec<char> = self.input.buffer.chars().collect();
-        let mut i = 0;
+    /// Misspelled-word ranges to underline in the input area, restricted to the byte
+    /// window `[win_start, win_end)` that `render_input` can actually draw. Returned
+    /// ranges are **window-relative character indices**, which is how the renderer
+    /// indexes its `chars` slice.
+    ///
+    /// This used to scan and spell-check the entire input buffer on every frame. On an
+    /// accidental 700KB paste that meant running ~130,000 words through the dictionary
+    /// about 9ms of work, every repaint, to decorate at most a few visible lines.
+    ///
+    /// The scan is widened outward from the window to whole-word boundaries (plus one
+    /// character, so the "followed by a separator" rule can see its delimiter), which
+    /// keeps a word straddling either edge judged as the whole word it is rather than
+    /// as the fragment that happens to be on screen.
+    ///
+    /// `cached_misspelled` holds **absolute byte** ranges, not character indices: byte
+    /// offsets are what the cursor and the window are already expressed in, so nothing
+    /// has to count characters from the start of the buffer to use them. Entries
+    /// outside the scanned span are kept as-is, so scrolling cannot quietly discard the
+    /// cached verdict for the word being typed at the end of the buffer.
+    fn find_misspelled_words_in_window(&mut self, win_start: usize, win_end: usize) -> Vec<(usize, usize)> {
+        let buf_len = self.input.buffer.len();
+        if win_start >= win_end || win_end > buf_len {
+            return Vec::new();
+        }
 
-        // Helper to check if a character at position is part of a word
-        // (alphabetic, or apostrophe between alphabetic characters)
-        let is_word_char = |pos: usize| -> bool {
-            if pos >= chars.len() {
-                return false;
+        // Widen to whole words at both edges, then one more character so the
+        // separator test below has something to look at.
+        let mut scan_start = win_start;
+        while scan_start > 0 {
+            match self.input.buffer[..scan_start].chars().next_back() {
+                Some(c) if c.is_alphabetic() || c == '\'' => scan_start -= c.len_utf8(),
+                _ => break,
             }
-            let c = chars[pos];
+        }
+        let mut scan_end = win_end;
+        while scan_end < buf_len {
+            match self.input.buffer[scan_end..].chars().next() {
+                Some(c) if c.is_alphabetic() || c == '\'' => scan_end += c.len_utf8(),
+                _ => break,
+            }
+        }
+        if let Some(c) = self.input.buffer[scan_end..].chars().next() {
+            scan_end += c.len_utf8();
+        }
+
+        // (absolute byte offset, character) for every character in the scanned span.
+        let scan: Vec<(usize, char)> = self.input.buffer[scan_start..scan_end]
+            .char_indices()
+            .map(|(b, c)| (scan_start + b, c))
+            .collect();
+        // Absolute byte offset just past character `i`.
+        let byte_after = |i: usize| -> usize {
+            scan.get(i).map(|(b, c)| b + c.len_utf8()).unwrap_or(scan_end)
+        };
+        // Window-relative character index of scanned character `i`. A word starting
+        // before the window clamps to 0; the renderer clips the range to the line it
+        // is drawing anyway.
+        let win_start_idx = scan.iter().position(|(b, _)| *b >= win_start).unwrap_or(scan.len());
+        let to_window = |i: usize| -> usize { i.saturating_sub(win_start_idx) };
+
+        let is_word_char = |pos: usize| -> bool {
+            let Some(&(_, c)) = scan.get(pos) else { return false };
             if c.is_alphabetic() {
                 return true;
             }
             // Include apostrophe if between alphabetic characters (contractions)
             if c == '\'' {
-                let has_alpha_before = pos > 0 && chars[pos - 1].is_alphabetic();
-                let has_alpha_after = pos + 1 < chars.len() && chars[pos + 1].is_alphabetic();
+                let has_alpha_before = pos > 0 && scan[pos - 1].1.is_alphabetic();
+                let has_alpha_after = scan.get(pos + 1).is_some_and(|(_, n)| n.is_alphabetic());
                 return has_alpha_before && has_alpha_after;
             }
             false
         };
 
-        // Convert byte cursor to character position
-        let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
+        let cursor = self.input.cursor_position;
         let cached = &self.cached_misspelled;
-
-        // Helper to check if a word overlaps with any cached misspelled range
+        // Does this word overlap a range the previous pass already flagged?
         let is_cached_misspelled = |start: usize, end: usize| -> bool {
             cached.iter().any(|(cs, ce)| start < *ce && end > *cs)
         };
-
-        // Helper to check if followed by separator
         let has_separator = |end_pos: usize| -> bool {
-            if end_pos >= chars.len() {
-                return false;
-            }
-            let next_char = chars[end_pos];
+            let Some(&(_, next_char)) = scan.get(end_pos) else { return false };
             next_char.is_whitespace() || matches!(next_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"' | '%' | '@' | '#' | '$' | '^' | '&' | '*' | '(' | '[' | '{')
         };
 
-        while i < chars.len() {
+        let mut visible: Vec<(usize, usize)> = Vec::new();
+        let mut found: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0usize;
+
+        while i < scan.len() {
             // Skip non-word characters
-            while i < chars.len() && !chars[i].is_alphabetic() {
+            while i < scan.len() && !scan[i].1.is_alphabetic() {
                 i += 1;
             }
-            if i >= chars.len() {
+            if i >= scan.len() {
                 break;
             }
 
             let start = i;
             // Continue while we have word characters (including internal apostrophes)
-            while i < chars.len() && is_word_char(i) {
+            while i < scan.len() && is_word_char(i) {
                 i += 1;
             }
             let end = i;
 
-            let word: String = chars[start..end].iter().collect();
-            // Don't check if cursor is inside the word (actively typing)
-            let cursor_in_word = cursor_char_pos >= start && cursor_char_pos < end;
+            let start_byte = scan[start].0;
+            let end_byte = byte_after(end - 1);
 
-            if cursor_in_word {
-                // Cursor inside word - don't flag
+            // Don't check if cursor is inside the word (actively typing)
+            if cursor >= start_byte && cursor < end_byte {
                 continue;
             }
 
-            let at_end_of_input = end >= chars.len();
-            let cursor_at_word_end = cursor_char_pos == end;
+            // "End of input" means the end of the whole buffer, not the end of the
+            // scanned span - the span usually stops well short of it.
+            let at_end_of_input = end >= scan.len() && scan_end == buf_len;
+            let cursor_at_word_end = cursor == end_byte;
 
-            if at_end_of_input && cursor_at_word_end {
-                // Word at end of input with cursor right at the end
-                // Use cached state - if word overlaps with cached misspelled, keep it flagged
-                // This keeps words flagged while typing/backspacing until completed again
-                if is_cached_misspelled(start, end) {
-                    misspelled.push((start, end));
-                }
-                // If not in cache, don't flag - user is typing a fresh word
-            } else if at_end_of_input {
-                // Word at end of input but cursor moved away - check spelling
-                if !self.spell_checker.is_valid(&word) {
-                    misspelled.push((start, end));
-                }
-            } else if has_separator(end) {
-                // Word followed by separator - check spelling
-                if !self.spell_checker.is_valid(&word) {
-                    misspelled.push((start, end));
+            let flagged = if at_end_of_input && cursor_at_word_end {
+                // Word at end of input with cursor right at the end: use cached state,
+                // so it stays flagged while the user types/backspaces through it and
+                // isn't re-flagged as a fresh half-typed word.
+                is_cached_misspelled(start_byte, end_byte)
+            } else if at_end_of_input || has_separator(end) {
+                // Word is complete (buffer ends, or a separator follows): check it.
+                let word: String = scan[start..end].iter().map(|(_, c)| *c).collect();
+                !self.spell_checker.is_valid(&word)
+            } else {
+                // Not followed by a separator and not at the end: don't check.
+                false
+            };
+
+            if flagged {
+                found.push((start_byte, end_byte));
+                if end_byte > win_start && start_byte < win_end {
+                    visible.push((to_window(start), to_window(end)));
                 }
             }
-            // else: word not followed by separator and not at end - don't check
         }
 
-        // Update cache with current result
-        self.cached_misspelled = misspelled.clone();
-        misspelled
+        // Keep cached verdicts for words outside the span we just re-examined.
+        self.cached_misspelled.retain(|(s, e)| *e <= scan_start || *s >= scan_end);
+        self.cached_misspelled.extend(found);
+        visible
     }
 
     /// Build the display block `try_load_archive_lines` splices onto the front of a world's

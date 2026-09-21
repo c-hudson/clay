@@ -59,6 +59,26 @@ pub fn display_control_char(c: char) -> char {
     }
 }
 
+/// Display width of one *buffer* character as the input area actually draws it.
+///
+/// This is the single width model shared by everything that maps a byte offset in
+/// `InputArea::buffer` onto a screen position: `cursor_line`, `cursor_column`,
+/// `line_starts`/`line_start_byte`, and the two cursor-column replicas in
+/// `rendering.rs`. It measures the *substituted* glyph (`display_control_char`),
+/// because that is what `render_input` builds its lines from - measuring the raw
+/// control character instead reports 0 columns for something the renderer draws as
+/// one cell, which slides the cursor off the text by one column per control
+/// character on the line.
+///
+/// It also takes the `char` by value rather than formatting it into a `String`
+/// first. The `to_string()` that used to be here allocated once per character
+/// scanned, which made `cursor_line` roughly 20x slower than the otherwise
+/// identical loop in `cursor_column` - about 10ms per keystroke on a 700KB paste.
+#[inline]
+pub fn input_char_width(c: char) -> usize {
+    UnicodeWidthChar::width(display_control_char(c)).unwrap_or(0)
+}
+
 /// Calculate display width of a string (handles zero-width characters and wide chars)
 pub fn display_width(s: &str) -> usize {
     s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
@@ -81,6 +101,225 @@ pub fn chars_for_display_width(chars: &[char], target_width: usize) -> (usize, u
         width += char_width;
     }
     (chars.len(), width)
+}
+
+/// Jitter width used to reorder a word's interior letters in `scramble_words`.
+///
+/// A plain shuffle of the interior is the form the "Cambridge" meme uses, but the reading
+/// research behind it is narrower than the meme: Rawlinson's 1976 thesis measured a real
+/// but modest cost for interior shuffling, and the follow-up work (Davis; Perea & Lupker;
+/// Velan & Frost) found the cost scales with *how far* each letter moves, not merely with
+/// whether it moved. Neighbouring transpositions are read almost for free; a letter flung
+/// to the far end of a long word is not. Keeping each letter near where it started is what
+/// makes a whole sentence stay readable rather than just a short word, which is the point
+/// of this binding.
+const SCRAMBLE_JITTER: usize = 6;
+
+/// Hard cap on how far any letter can end up from where it started.
+///
+/// Guaranteed by construction, not by luck - see `shuffle_locally`. The first attempt here
+/// was a windowed Fisher-Yates, which *looks* local but lets a letter be carried forward
+/// again each time the loop index catches up with it; it moved a letter 15 places in a
+/// 20-letter word, which is exactly the unreadable case this is meant to avoid.
+pub(crate) const SCRAMBLE_MAX_TRAVEL: usize = 4;
+
+/// Words this long or longer keep their first and last letter where they are, and only
+/// their interior is reordered - the classic form of the effect.
+///
+/// Shorter words (two and three letters) are shuffled whole, edges included. Pinning both
+/// edges of a three-letter word leaves a single interior letter and therefore no possible
+/// rearrangement at all, so they would otherwise pass through untouched.
+const SCRAMBLE_PIN_EDGES: usize = 4;
+
+/// Small SplitMix64 generator, used only to scramble text for display.
+///
+/// Deliberately not `getrandom` per call: this is a typing toy, and a `getrandom` failure
+/// must leave it working rather than fail closed the way a key or a nonce has to (see
+/// `App::generate_auth_key`). Seeding once from the OS and falling back to the clock is
+/// plenty, and `seeded` lets the tests pin an exact arrangement.
+pub struct Scrambler {
+    state: u64,
+}
+
+impl Scrambler {
+    /// Seed from the OS, falling back to the clock if that is unavailable.
+    pub fn from_entropy() -> Self {
+        let mut bytes = [0u8; 8];
+        let seed = if getrandom::getrandom(&mut bytes).is_ok() {
+            u64::from_le_bytes(bytes)
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        };
+        Self::seeded(seed)
+    }
+
+    pub fn seeded(seed: u64) -> Self {
+        Self { state: seed ^ 0x9E37_79B9_7F4A_7C15 }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform-enough value in `0..n`. `n` here is a handful of letters, so the modulo
+    /// bias is far below anything a reader could notice.
+    fn below(&mut self, n: usize) -> usize {
+        if n <= 1 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+}
+
+/// Is this character part of a scrambleable word?
+///
+/// Letters only. Digits are deliberately excluded: `150` must not become `105`, and a
+/// MUD command carrying an amount, a coordinate or an object id has to survive this
+/// intact. Punctuation is excluded for the same reason and, specifically, so a leading
+/// `"` (the say command on most MUDs), `'`, `:` or `;` keeps its position and the line
+/// can still be sent as typed without repairing it afterwards.
+fn is_scramble_letter(c: char) -> bool {
+    c.is_alphabetic()
+}
+
+/// Reorder `letters` in place so that no letter ends up more than `SCRAMBLE_MAX_TRAVEL`
+/// places from where it started.
+///
+/// Short runs get a straight shuffle - they are too short to travel far anyway. Longer
+/// runs are sorted by a jittered key (`position + random jitter`), which bounds travel by
+/// construction: a letter can only overtake another when their jitters differ by more than
+/// the gap between them, so nothing moves further than the jitter width allows. That is
+/// the property a windowed swap loop fails to give, because it can pick the same letter up
+/// over and over as the loop advances.
+fn shuffle_locally(letters: &mut [char], rng: &mut Scrambler) {
+    let n = letters.len();
+    if n < 2 {
+        return;
+    }
+    if n <= SCRAMBLE_MAX_TRAVEL {
+        // Fisher-Yates; with this few letters no one can travel past the cap.
+        for i in (1..n).rev() {
+            let j = rng.below(i + 1);
+            letters.swap(i, j);
+        }
+        return;
+    }
+    let mut keyed: Vec<(usize, char)> = letters
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i + rng.below(SCRAMBLE_JITTER), *c))
+        .collect();
+    // Stable, so equal keys keep their original relative order.
+    keyed.sort_by_key(|(k, _)| *k);
+    for (slot, (_, c)) in keyed.into_iter().enumerate() {
+        letters[slot] = c;
+    }
+}
+
+/// Scramble one word's interior, keeping its first and last letter where they are.
+/// Give `c` the upper/lower casing of `like`, leaving it alone when the conversion is not
+/// one character to one character (`ß` uppercases to `SS`, which would change the length).
+fn recase(c: char, like: char) -> char {
+    if like.is_uppercase() && c.is_lowercase() {
+        let mut it = c.to_uppercase();
+        let first = it.next();
+        if it.next().is_none() {
+            return first.unwrap_or(c);
+        }
+    } else if like.is_lowercase() && c.is_uppercase() {
+        let mut it = c.to_lowercase();
+        let first = it.next();
+        if it.next().is_none() {
+            return first.unwrap_or(c);
+        }
+    }
+    c
+}
+
+fn scramble_one_word(word: &[char], rng: &mut Scrambler) -> Vec<char> {
+    // One letter has no second arrangement.
+    if word.len() < 2 {
+        return word.to_vec();
+    }
+    // Long enough to keep its silhouette: pin the outer letters, reorder the middle.
+    // Too short for that: move the whole thing, first and last letter included.
+    let (head, body, tail) = if word.len() >= SCRAMBLE_PIN_EDGES {
+        (&word[..1], &word[1..word.len() - 1], &word[word.len() - 1..])
+    } else {
+        (&word[..0], word, &word[..0])
+    };
+    // A word like "aaaa" has no other arrangement; don't spin looking for one.
+    let can_differ = body.iter().any(|c| *c != body[0]);
+
+    let mut out: Vec<char> = Vec::with_capacity(word.len());
+    for attempt in 0..8 {
+        let mut shuffled = body.to_vec();
+        shuffle_locally(&mut shuffled, rng);
+        let changed = shuffled != body;
+        if changed || !can_differ || attempt == 7 {
+            out.clear();
+            out.extend_from_slice(head);
+            out.extend(shuffled);
+            out.extend_from_slice(tail);
+            break;
+        }
+    }
+    // Capitalisation belongs to the *position*, not to the letter that moved into it.
+    // Letting the capital travel turns "The" into "hTe" and "Bob" into "obB", which reads
+    // as a glitch rather than as scrambled text - and a capital in the middle of a word is
+    // a strong visual disruptor, which is the opposite of what this is for. Pinning the
+    // pattern keeps sentence-initial capitals and names looking deliberate. The letters are
+    // therefore preserved exactly, except for their case.
+    for (c, original) in out.iter_mut().zip(word.iter()) {
+        *c = recase(*c, *original);
+    }
+    out
+}
+
+/// Scramble the interior letters of every word in `text`, leaving the first and last
+/// letter of each word, and every non-letter, exactly where they are.
+///
+/// Non-letters never move, which is what lets a line keep working as a command: a leading
+/// `"`/`'`/`:`/`;` say-or-emote prefix stays put, digits keep their value, and punctuation
+/// keeps its place. A leading Clay `/command` word is skipped outright, since scrambling
+/// the command name itself would just make the line fail.
+pub fn scramble_words_with(text: &str, rng: &mut Scrambler) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(chars.len());
+    let mut i = 0usize;
+
+    // Leave a leading `/command` alone - only the command name, not its arguments.
+    if chars.first() == Some(&'/') && chars.get(1).is_some_and(|c| is_scramble_letter(*c)) {
+        out.push('/');
+        i = 1;
+        while i < chars.len() && is_scramble_letter(chars[i]) {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    while i < chars.len() {
+        if !is_scramble_letter(chars[i]) {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && is_scramble_letter(chars[i]) {
+            i += 1;
+        }
+        out.extend(scramble_one_word(&chars[start..i], rng));
+    }
+
+    out.into_iter().collect()
 }
 
 pub struct InputArea {
@@ -143,9 +382,14 @@ impl InputArea {
         self.adjust_viewport();
     }
 
-    pub fn cursor_line(&self) -> usize {
+    /// Display line *and* column of the cursor, in one walk of the text before it.
+    ///
+    /// `cursor_line` and `cursor_column` run the identical loop, so the callers that
+    /// need both (vertical cursor movement) used to walk the same prefix twice. On a
+    /// large paste each walk is the dominant cost of the keystroke, so they share one.
+    pub fn cursor_line_col(&self) -> (usize, usize) {
         if self.width == 0 {
-            return 0;
+            return (0, 0);
         }
         let width = self.width as usize;
         let first_line_capacity = width.saturating_sub(self.prompt_len);
@@ -163,7 +407,7 @@ impl InputArea {
                 is_first_line = false;
                 continue;
             }
-            let cw = display_width(&c.to_string());
+            let cw = input_char_width(c);
             let capacity = if is_first_line { first_line_capacity } else { width };
             col_width += cw;
             if capacity > 0 && col_width >= capacity {
@@ -181,7 +425,11 @@ impl InputArea {
                 }
             }
         }
-        line
+        (line, col_width)
+    }
+
+    pub fn cursor_line(&self) -> usize {
+        self.cursor_line_col().0
     }
 
     pub fn adjust_viewport(&mut self) {
@@ -618,90 +866,127 @@ impl InputArea {
         self.adjust_viewport();
     }
 
-    /// Get the column position within the current line (0-indexed, in display width)
-    fn cursor_column(&self) -> usize {
-        if self.width == 0 {
-            return 0;
-        }
+
+    /// Walk the buffer's display-line boundaries, calling `f(line_index, byte_offset)`
+    /// for the start of every line after line 0. Returning `false` from `f` stops the
+    /// walk early.
+    ///
+    /// This is the **one** implementation of the input area's wrapping model, shared by
+    /// every caller that maps a display line onto a byte offset. `render_input` used to
+    /// carry a second, independent copy of this walk to locate its viewport, and the two
+    /// disagreed on consecutive blank lines: the renderer's version stepped over the
+    /// newline with a `.max(1)` and then skipped the same newline a second time, losing
+    /// one display line per blank-line pair. The error accumulated down the buffer, so a
+    /// paste holding thousands of blank lines drew text from a completely different
+    /// region than the one the cursor had been placed in - which is what made a large
+    /// paste look like it had rendered as nothing but blank space.
+    ///
+    /// It allocates nothing and stops as soon as the caller has what it needs, so a
+    /// lookup near the top of a large buffer does not pay for the whole buffer.
+    fn walk_line_starts<F>(&self, mut f: F)
+    where
+        F: FnMut(usize, usize) -> bool,
+    {
         let width = self.width as usize;
         let first_line_capacity = width.saturating_sub(self.prompt_len);
-        let text_before_cursor = &self.buffer[..self.cursor_position];
-
+        let mut current_line = 0usize;
         let mut col_width = 0usize;
         let mut is_first_line = true;
-
-        for c in text_before_cursor.chars() {
-            if c == '\n' {
-                col_width = 0;
-                is_first_line = false;
-                continue;
-            }
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            let capacity = if is_first_line { first_line_capacity } else { width };
-            col_width += cw;
-            if capacity > 0 && col_width >= capacity {
-                if col_width == capacity {
-                    col_width = 0;
-                } else {
-                    col_width = cw;
-                }
-                is_first_line = false;
-            }
-        }
-        col_width
-    }
-
-    /// Build a map of (line_index -> byte_offset_of_line_start) for the buffer,
-    /// accounting for both newlines and width-based wrapping.
-    fn line_starts(&self) -> Vec<usize> {
-        let width = self.width as usize;
-        let first_line_capacity = width.saturating_sub(self.prompt_len);
-        let mut starts = vec![0usize]; // line 0 starts at byte 0
-        let mut col_width = 0usize;
-        let mut is_first_line = true;
-        let mut byte_pos = 0;
+        let mut byte_pos = 0usize;
 
         for c in self.buffer.chars() {
-            if c == '\n' {
+            // Byte offset at which a new line begins, if this character ended one.
+            let boundary = if c == '\n' {
                 byte_pos += c.len_utf8();
-                starts.push(byte_pos);
                 col_width = 0;
                 is_first_line = false;
-                continue;
-            }
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            let capacity = if is_first_line { first_line_capacity } else { width };
-            col_width += cw;
-            if capacity > 0 && col_width >= capacity {
-                byte_pos += c.len_utf8();
-                if col_width == capacity {
-                    // Exact fill — next char starts a new line
-                    starts.push(byte_pos);
-                    col_width = 0;
+                Some(byte_pos)
+            } else {
+                let cw = input_char_width(c);
+                let capacity = if is_first_line { first_line_capacity } else { width };
+                col_width += cw;
+                if capacity > 0 && col_width >= capacity {
+                    byte_pos += c.len_utf8();
+                    let at = if col_width == capacity {
+                        // Exact fill - the next character starts the new line.
+                        col_width = 0;
+                        byte_pos
+                    } else {
+                        // Overflow - this character itself starts the new line.
+                        col_width = cw;
+                        byte_pos - c.len_utf8()
+                    };
+                    is_first_line = false;
+                    Some(at)
                 } else {
-                    // Overflow — this char starts a new line
-                    starts.push(byte_pos - c.len_utf8());
-                    col_width = cw;
+                    byte_pos += c.len_utf8();
+                    None
                 }
-                is_first_line = false;
-                continue;
+            };
+
+            if let Some(at) = boundary {
+                current_line += 1;
+                if !f(current_line, at) {
+                    return;
+                }
             }
-            byte_pos += c.len_utf8();
         }
-        starts
+    }
+
+    /// Byte offsets at which display lines `first` and `first + count` begin, clamped
+    /// to the end of the buffer. Lets `render_input` materialise only the slice it can
+    /// actually draw instead of copying the whole buffer into a `Vec<char>` per frame.
+    pub(crate) fn line_window_bytes(&self, first: usize, count: usize) -> (usize, usize) {
+        let last = first.saturating_add(count);
+        if last == 0 {
+            return (0, 0);
+        }
+        let mut start: Option<usize> = if first == 0 { Some(0) } else { None };
+        let mut end: Option<usize> = None;
+        self.walk_line_starts(|line, at| {
+            if line == first {
+                start = Some(at);
+            }
+            if line == last {
+                end = Some(at);
+                return false;
+            }
+            true
+        });
+        let buf_len = self.buffer.len();
+        (start.unwrap_or(buf_len), end.unwrap_or(buf_len))
+    }
+
+    /// Byte range `[start, next_start)` of display line `line`, or `None` when the
+    /// buffer has no such line. `next_start` is the end of the buffer for the last
+    /// line. Vertical cursor movement used to call `line_starts`, which built a
+    /// `Vec` entry for every display line in the buffer - 23,666 of them for a 700KB
+    /// paste, on each press of Up or Down. This looks up only the line it needs.
+    fn line_span(&self, line: usize) -> Option<(usize, usize)> {
+        let mut start: Option<usize> = if line == 0 { Some(0) } else { None };
+        let mut next: Option<usize> = None;
+        self.walk_line_starts(|l, at| {
+            if l == line {
+                start = Some(at);
+            }
+            if l == line + 1 {
+                next = Some(at);
+                return false;
+            }
+            true
+        });
+        start.map(|s| (s, next.unwrap_or(self.buffer.len())))
     }
 
     /// Move cursor up one line, maintaining column position if possible
     /// Move cursor up one line. Returns true if already at the top line
     /// (caller should trigger history_prev).
     pub fn move_cursor_up(&mut self) -> bool {
-        let current_line = self.cursor_line();
+        let (current_line, current_col) = self.cursor_line_col();
         if current_line == 0 {
             return true; // At top — caller should navigate history
         }
 
-        let current_col = self.cursor_column();
-        let starts = self.line_starts();
         let target_line = current_line - 1;
 
         // Target column: maintain screen column, adjusted for prompt on first line
@@ -713,20 +998,19 @@ impl InputArea {
             current_col
         };
 
-        if target_line < starts.len() {
-            let line_start = starts[target_line];
+        if let Some((line_start, next_start)) = self.line_span(target_line) {
             // Walk from line_start to find the byte position at target_col display width
             let mut col = 0;
             let mut pos = line_start;
             for c in self.buffer[line_start..].chars() {
                 if c == '\n' { break; }
-                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                let cw = input_char_width(c);
                 if col + cw > target_col { break; }
                 col += cw;
                 pos += c.len_utf8();
-                // Stop at line boundary (next line start)
-                if target_line + 1 < starts.len() && pos >= starts[target_line + 1] {
-                    pos = starts[target_line + 1];
+                // Stop at line boundary (start of the following display line)
+                if pos >= next_start {
+                    pos = next_start;
                     break;
                 }
             }
@@ -739,16 +1023,15 @@ impl InputArea {
     /// Move cursor down one line. Returns true if already at the bottom line
     /// (caller should trigger history_next).
     pub fn move_cursor_down(&mut self) -> bool {
-        let current_line = self.cursor_line();
-        let current_col = self.cursor_column();
-        let starts = self.line_starts();
-        let total_lines = starts.len();
-
-        if current_line >= total_lines.saturating_sub(1) {
-            return true; // At bottom — caller should navigate history
-        }
-
+        let (current_line, current_col) = self.cursor_line_col();
         let target_line = current_line + 1;
+
+        // No such display line means the cursor is already on the last one. Asking for
+        // the single line we are moving to replaces building a `Vec` of every line
+        // start in the buffer just to read its length.
+        let Some((line_start, next_start)) = self.line_span(target_line) else {
+            return true; // At bottom — caller should navigate history
+        };
         // Maintain column position
         let target_col = if current_line == 0 {
             // Moving from first line — screen column includes prompt,
@@ -759,19 +1042,18 @@ impl InputArea {
             current_col
         };
 
-        if target_line < starts.len() {
-            let line_start = starts[target_line];
+        {
             let mut col = 0;
             let mut pos = line_start;
             for c in self.buffer[line_start..].chars() {
                 if c == '\n' { break; }
-                let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                let cw = input_char_width(c);
                 if col + cw > target_col { break; }
                 col += cw;
                 pos += c.len_utf8();
                 // Stop at line boundary
-                if target_line + 1 < starts.len() && pos >= starts[target_line + 1] {
-                    pos = starts[target_line + 1];
+                if pos >= next_start {
+                    pos = next_start;
                     break;
                 }
             }
@@ -895,6 +1177,36 @@ impl InputArea {
         self.buffer = format!("{} {}", before, after);
         self.cursor_position = before.len() + 1; // After the single space
         self.adjust_viewport();
+    }
+
+    /// Scramble the interior letters of every word on the input line (`Esc-M`).
+    ///
+    /// The whole line, not the word at the cursor: the effect this reproduces is a
+    /// sentence-level one, and scrambling a sentence a word at a time would take a
+    /// keypress per word. The other word transforms (`Esc-u`/`Esc-l`/`Esc-c`) stay
+    /// word-at-cursor; this one is shaped like `collapse_spaces` instead.
+    ///
+    /// Every non-letter keeps its position, so the line is still sendable as typed - see
+    /// `scramble_words_with`.
+    pub fn scramble_words(&mut self) {
+        self.clear_kbnum();
+        let mut rng = Scrambler::from_entropy();
+        let scrambled = scramble_words_with(&self.buffer, &mut rng);
+        if scrambled == self.buffer {
+            return;
+        }
+        self.buffer = scrambled;
+        // Scrambling permutes characters within a word, so the buffer's byte length is
+        // unchanged and the cursor stays put - but a multi-byte letter that moved can
+        // leave the old offset mid-character.
+        self.cursor_position = self.cursor_position.min(self.buffer.len());
+        while self.cursor_position < self.buffer.len()
+            && !self.buffer.is_char_boundary(self.cursor_position)
+        {
+            self.cursor_position += 1;
+        }
+        self.adjust_viewport();
+        self.history_index = None;
     }
 
     /// Insert last word from previous history entry (Esc+. / Esc+_).

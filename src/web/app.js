@@ -6296,6 +6296,121 @@
         input.selectionStart = input.selectionEnd = start + 1;
     }
 
+    // Scramble each word's interior letters (Esc-M). Twin of `InputArea::scramble_words`
+    // / `input::scramble_words_with` in Rust - keep the two rules in step.
+    //
+    // First and last letter of every word stay put, and each interior letter moves at
+    // most SCRAMBLE_WINDOW places, because readability falls off with how far a letter
+    // travels rather than with whether it moved at all. Non-letters never move: that is
+    // what keeps a leading `"`/`'`/`:`/`;` say prefix, digits, and punctuation intact so
+    // the line can still be sent as typed. A leading Clay `/command` name is skipped.
+    const SCRAMBLE_JITTER = 6;      // jitter width; bounds travel by construction
+    const SCRAMBLE_MAX_TRAVEL = 4;  // no letter ends up further than this from home
+    const SCRAMBLE_PIN_EDGES = 4;   // words this long keep their first and last letter
+
+    function isScrambleLetter(ch) {
+        // Letters only - digits must keep their value, punctuation its position.
+        return typeof ch === 'string' && ch.length > 0 && /\p{L}/u.test(ch);
+    }
+
+    // Short runs get a straight shuffle - too short to travel far anyway. Longer runs are
+    // sorted by a jittered key (position + random jitter), which caps travel by
+    // construction: a letter can only overtake one whose gap is smaller than the jitter
+    // difference. A windowed swap loop looks local but can pick the same letter up again
+    // each time the loop index reaches it, which moved a letter 15 places in a 20-letter
+    // word during development.
+    function shuffleLocally(letters) {
+        const n = letters.length;
+        if (n < 2) return letters;
+        if (n <= SCRAMBLE_MAX_TRAVEL) {
+            for (let i = n - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                const t = letters[i]; letters[i] = letters[j]; letters[j] = t;
+            }
+            return letters;
+        }
+        const keyed = letters.map((c, i) => ({
+            k: i + Math.floor(Math.random() * SCRAMBLE_JITTER),
+            i: i,
+            c: c,
+        }));
+        // Stable: equal keys keep their original relative order.
+        keyed.sort((a, b) => (a.k - b.k) || (a.i - b.i));
+        for (let slot = 0; slot < n; slot++) letters[slot] = keyed[slot].c;
+        return letters;
+    }
+
+    // Give `c` the upper/lower casing of `like`, unless the conversion is not one
+    // character to one character.
+    function recase(c, like) {
+        const isUpper = ch => ch !== ch.toLowerCase() && ch === ch.toUpperCase();
+        const isLower = ch => ch !== ch.toUpperCase() && ch === ch.toLowerCase();
+        if (isUpper(like) && isLower(c)) {
+            const u = c.toUpperCase();
+            return Array.from(u).length === 1 ? u : c;
+        }
+        if (isLower(like) && isUpper(c)) {
+            const l = c.toLowerCase();
+            return Array.from(l).length === 1 ? l : c;
+        }
+        return c;
+    }
+
+    function scrambleOneWord(word) {
+        if (word.length < 2) return word;           // one letter has no second arrangement
+        // Long enough to keep its silhouette: pin the outer letters, reorder the middle.
+        // Too short for that (two or three letters): move the whole thing, edges included,
+        // since pinning both edges would leave nothing that could be rearranged.
+        const pin = word.length >= SCRAMBLE_PIN_EDGES;
+        const head = pin ? [word[0]] : [];
+        const body = pin ? word.slice(1, word.length - 1) : word.slice();
+        const tail = pin ? [word[word.length - 1]] : [];
+        const canDiffer = body.some(c => c !== body[0]);
+        let out = word;
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const shuffled = shuffleLocally(body.slice());
+            const changed = shuffled.join('') !== body.join('');
+            if (changed || !canDiffer || attempt === 7) {
+                out = head.concat(shuffled, tail);
+                break;
+            }
+        }
+        // Capitalisation belongs to the position, not to the letter that moved into it:
+        // letting the capital travel turns "The" into "hTe" and "Bob" into "obB", which
+        // reads as a glitch rather than as scrambled text.
+        return out.map((c, i) => recase(c, word[i]));
+    }
+
+    function scrambleWordsText(text) {
+        const chars = Array.from(text);
+        const out = [];
+        let i = 0;
+        // Leave a leading `/command` name alone - scrambling it just breaks the line.
+        if (chars[0] === '/' && isScrambleLetter(chars[1])) {
+            out.push('/');
+            i = 1;
+            while (i < chars.length && isScrambleLetter(chars[i])) out.push(chars[i++]);
+        }
+        while (i < chars.length) {
+            if (!isScrambleLetter(chars[i])) { out.push(chars[i++]); continue; }
+            const start = i;
+            while (i < chars.length && isScrambleLetter(chars[i])) i++;
+            out.push.apply(out, scrambleOneWord(chars.slice(start, i)));
+        }
+        return out.join('');
+    }
+
+    function scrambleWords() {
+        const input = elements.input;
+        const scrambled = scrambleWordsText(input.value);
+        if (scrambled === input.value) return;
+        const pos = input.selectionStart;
+        input.value = scrambled;
+        // A permutation within each word leaves the length unchanged, so the caret can
+        // stay exactly where it was.
+        input.selectionStart = input.selectionEnd = Math.min(pos, scrambled.length);
+    }
+
     // Insert last word of previous history entry (Esc+. / Esc+_)
     function lastArgument() {
         if (commandHistory.length === 0) return;
@@ -12464,6 +12579,9 @@
             }
             case 'collapse_spaces':
                 collapseSpaces();
+                return true;
+            case 'scramble_words':
+                scrambleWords();
                 return true;
             case 'goto_matching_bracket':
                 gotoMatchingBracket();

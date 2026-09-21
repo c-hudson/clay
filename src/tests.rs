@@ -17790,23 +17790,23 @@ third
         // (Smileys), the query is empty, so the initial grid must be scoped
         // to that category - exactly what `refilter_emoji_console` (R6)
         // would produce for the same state, so the open path and the
-        // keypress path can't diverge. Also holds back VS16/ZWJ sequences a
-        // terminal may draw at a different column count than ratatui
-        // budgeted (see emoji::console_safe).
+        // keypress path can't diverge. As of R14 the console grid is no
+        // longer a filtered-down subset of the table - every entry is
+        // reachable via `console_glyph`'s width-truthful display form, except
+        // the three ZWJ sequences: truncating those at the joiner collapses
+        // them onto another entry's glyph, so the grid would draw two
+        // identical cells (see `console_renderable`).
         let first_category = crate::emoji::Category::all()[0];
-        let console_safe_first_category = crate::emoji::EMOJI
+        let first_category_count = crate::emoji::EMOJI
             .iter()
-            .filter(|e| e.category == first_category && crate::emoji::console_safe(e.ch))
+            .filter(|e| e.category == first_category)
+            .filter(|e| crate::emoji::console_renderable(e.ch))
             .count();
-        assert_eq!(emoji_grid_len(&app), console_safe_first_category,
+        assert_eq!(emoji_grid_len(&app), first_category_count,
             "opening the popup should scope the grid to the default (first) tab's category");
 
-        let console_safe_all = crate::emoji::EMOJI
-            .iter()
-            .filter(|e| crate::emoji::console_safe(e.ch))
-            .count();
-        assert!(console_safe_first_category < console_safe_all,
-            "the default category must be a strict subset of the console-drawable table");
+        assert!(first_category_count < crate::emoji::EMOJI.len(),
+            "the default category must be a strict subset of the whole table");
 
         assert_eq!(state.definition.title, format!("Emoji — {}", first_category.label()));
     }
@@ -18130,4 +18130,460 @@ third
         assert_eq!(popup::definitions::emoji::emoji_query(state), "?");
         assert_eq!(state.definition.id, popup::PopupId("emoji"),
             "'?' must not have opened a help popup over the emoji picker (it has none)");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Large-paste handling in the input area.
+    //
+    // Reported as "the input pane is very slow and doesn't seem to show anything but
+    // spaces as I try to navigate around in it" after ~700KB of Perl source was pasted
+    // into the command line by accident. Two separate defects: `render_input` located
+    // its viewport with its own copy of the display-line walk that drifted away from
+    // the cursor's, and several per-keystroke paths were O(buffer) with a `String`
+    // allocation per character scanned.
+    // ---------------------------------------------------------------------------
+
+    /// A buffer full of blank lines must still draw the line the cursor is on.
+    ///
+    /// `render_input` used to walk to its viewport with a loop that, on an empty line,
+    /// stepped over the newline and then skipped the *following* newline as well. Each
+    /// pair of consecutive blank lines therefore lost one display line, and the error
+    /// accumulated, so the pane drew a region thousands of lines away from the cursor -
+    /// usually near-empty lines, which is what "nothing but spaces" was.
+    #[test]
+    fn test_input_viewport_shows_the_cursors_own_line_despite_blank_lines() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.input_height = 3;
+        app.input.set_dimensions(60, 3);
+
+        // Runs of *consecutive* blank lines are what compounded the drift: the old walk
+        // lost one display line per adjacent pair. The file in the report had 149 such
+        // runs, which is roughly what this builds.
+        let mut buf = String::new();
+        for i in 0..300 {
+            buf.push_str(&format!("filler line {i}\n"));
+            if i % 2 == 0 {
+                buf.push_str("\n\n"); // a run of two blank lines
+            }
+        }
+        let marker_at = buf.len();
+        buf.push_str("UNIQUE_MARKER_LINE\n");
+        for i in 0..300 {
+            buf.push_str(&format!("trailing line {i}\n"));
+            if i % 2 == 0 {
+                buf.push_str("\n\n");
+            }
+        }
+
+        app.input.buffer = buf;
+        app.input.cursor_position = marker_at + "UNIQUE_MARKER_LINE".len();
+        app.input.adjust_viewport();
+
+        let text = rendering::render_input(&mut app, 60, "> ");
+        let drawn: String = text.lines.iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(drawn.contains("UNIQUE_MARKER_LINE"),
+            "the input pane must draw the line the cursor is on; it drew:\n{drawn}");
+    }
+
+    /// The window `render_input` draws must always contain the cursor, whatever the
+    /// buffer looks like. This is the invariant the two independent line walks broke.
+    #[test]
+    fn test_input_render_window_always_contains_the_cursor() {
+        let shapes: Vec<(&str, String)> = vec![
+            ("blank line pairs", (0..300).map(|i| format!("line {i}\n")).collect::<Vec<_>>().join("\n")),
+            ("blank line runs", (0..200).map(|i| format!("line {i}\n\n\n")).collect::<Vec<_>>().join("\n")),
+            ("no newlines at all", "x".repeat(20_000)),
+            ("long wrapped lines", (0..200).map(|i| format!("{i} {}", "word ".repeat(40))).collect::<Vec<_>>().join("\n")),
+            ("wide characters", (0..200).map(|i| format!("{i} 日本語テキスト\n")).collect::<Vec<_>>().join("\n")),
+            ("mixed", (0..200).map(|i| if i % 3 == 0 { String::new() } else { format!("{i} mixed 日本 text") }).collect::<Vec<_>>().join("\n")),
+        ];
+
+        for (name, buf) in shapes {
+            for width in [20u16, 60, 120] {
+                for height in [1u16, 3, 8] {
+                    let mut ia = InputArea::new(height);
+                    ia.set_dimensions(width, height);
+                    ia.prompt_len = 3;
+                    ia.buffer = buf.clone();
+
+                    for step in 0..=16 {
+                        let mut pos = buf.len() * step / 16;
+                        while pos < buf.len() && !buf.is_char_boundary(pos) { pos += 1; }
+                        ia.cursor_position = pos;
+                        ia.adjust_viewport();
+
+                        let (ws, we) = ia.line_window_bytes(ia.viewport_start_line, height as usize + 1);
+                        assert!(ws <= pos && pos <= we,
+                            "{name} w={width} h={height}: cursor at byte {pos} is outside the \
+                             drawn window [{ws}, {we}] (viewport line {})", ia.viewport_start_line);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spell-check results are window-relative and cover only the visible slice. The
+    /// whole buffer used to be scanned and dictionary-checked on every repaint.
+    #[test]
+    fn test_misspelled_words_are_scoped_to_the_drawn_window() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        // "qwertyuiop" is not a word; put one far outside the window and one inside.
+        let head = "qwertyuiop ".to_string() + &"aaaa ".repeat(2000);
+        let window_text = "zxcvbnmasd wordhere ";
+        app.input.buffer = format!("{head}{window_text}tail");
+        app.input.cursor_position = app.input.buffer.len();
+
+        let win_start = head.len();
+        let win_end = head.len() + window_text.len();
+        let found = app.find_misspelled_words_in_window(win_start, win_end);
+
+        for (s, e) in &found {
+            assert!(*s <= window_text.len() && *e <= window_text.len() + 1,
+                "range ({s},{e}) is not window-relative (window is {} chars)", window_text.len());
+        }
+        // The nonsense word inside the window is at window-relative chars 0..10.
+        assert!(found.iter().any(|(s, _)| *s == 0),
+            "expected the misspelled word at the start of the window, got {found:?}");
+    }
+
+    /// A word straddling the window edge is judged as the whole word it is, not as the
+    /// fragment that happens to be on screen.
+    #[test]
+    fn test_misspelled_scan_widens_to_whole_words_at_window_edges() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.input.buffer = "the quick brown fox jumps".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        // Window cuts "brown" in half; "brow" alone would not be a word.
+        let win_start = "the quick br".len();
+        let win_end = "the quick brown fo".len();
+        let found = app.find_misspelled_words_in_window(win_start, win_end);
+        assert!(found.is_empty(),
+            "no real word should be flagged when the window merely cuts one: {found:?}");
+    }
+
+    /// An accidental paste far past anything a command line could mean is refused with
+    /// a message, not truncated into a command the user never wrote.
+    #[test]
+    fn test_oversized_paste_is_refused_with_a_message() {
+        use crate::input_handler::{MAX_INPUT_PASTE_BYTES, oversized_paste_message};
+
+        assert!(oversized_paste_message("a normal paste").is_none());
+        assert!(oversized_paste_message(&"x".repeat(MAX_INPUT_PASTE_BYTES)).is_none(),
+            "a paste exactly at the limit must still be accepted");
+
+        let msg = oversized_paste_message(&"x".repeat(MAX_INPUT_PASTE_BYTES + 1))
+            .expect("a paste over the limit must be refused");
+        assert!(msg.contains("rejected"), "message should say it was refused: {msg}");
+        assert!(msg.contains("64 KB"), "message should name the limit: {msg}");
+    }
+
+    /// The refused paste must leave the input buffer untouched.
+    #[test]
+    fn test_oversized_paste_leaves_the_input_line_alone() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.input.buffer = "look".to_string();
+        app.input.cursor_position = 4;
+
+        crate::input_handler::handle_paste(&mut app, &"x".repeat(200_000));
+        assert_eq!(app.input.buffer, "look",
+            "an oversized paste must not be spliced into the command line");
+
+        crate::input_handler::handle_paste(&mut app, " north");
+        assert_eq!(app.input.buffer, "look north", "an ordinary paste must still work");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Esc-M: scramble each word's interior letters (`input::scramble_words_with`).
+    //
+    // The readable-scrambled-text effect: first and last letter of every word stay put,
+    // interior letters move but stay near where they started, and nothing that isn't a
+    // letter moves at all - which is what keeps the line sendable as typed.
+    // ---------------------------------------------------------------------------
+
+    use crate::input::{Scrambler, scramble_words_with};
+
+    /// Every character that is not a letter must stay at exactly the position it was in.
+    /// The reported case is a leading `"`, the say command on most MUDs: the line has to
+    /// stay sendable without repairing it afterwards.
+    #[test]
+    fn test_scramble_never_moves_a_non_letter() {
+        let cases = [
+            "\"hello everyone, how are you today?",
+            "'whisper something quietly",
+            ":waves cheerfully at everybody",
+            ";emotes thoughtfully",
+            "give 150 gold pieces to merchant",
+            "north;south;east;west",
+            "tell friend=meeting at 19:30 sharp",
+        ];
+        for text in cases {
+            for seed in 0..40u64 {
+                let mut rng = Scrambler::seeded(seed);
+                let out = scramble_words_with(text, &mut rng);
+                assert_eq!(out.chars().count(), text.chars().count(),
+                    "length changed for {text:?}");
+                for (i, (a, b)) in text.chars().zip(out.chars()).enumerate() {
+                    if !a.is_alphabetic() {
+                        assert_eq!(a, b,
+                            "non-letter {a:?} at index {i} moved (became {b:?}) in {out:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A leading `"` specifically, checked on its own because it is the one the report
+    /// named: it must still be character zero after scrambling.
+    #[test]
+    fn test_scramble_keeps_leading_say_quote_in_place() {
+        for seed in 0..40u64 {
+            let mut rng = Scrambler::seeded(seed);
+            let out = scramble_words_with("\"everybody understand this sentence", &mut rng);
+            assert!(out.starts_with('"'), "say prefix lost: {out:?}");
+        }
+    }
+
+    /// Digits must keep their value and order - a scrambled amount or object id would
+    /// silently change what the command does.
+    #[test]
+    fn test_scramble_leaves_numbers_alone() {
+        for seed in 0..40u64 {
+            let mut rng = Scrambler::seeded(seed);
+            let out = scramble_words_with("drop 1500 coins and 42 gems", &mut rng);
+            assert!(out.contains("1500") && out.contains("42"), "numbers changed: {out:?}");
+        }
+    }
+
+    /// First and last letter of each word stay put, and no letter is lost or invented.
+    #[test]
+    fn test_scramble_preserves_word_edges_and_letters() {
+        let text = "according to research the important thing is scrambled readability";
+        for seed in 0..60u64 {
+            let mut rng = Scrambler::seeded(seed);
+            let out = scramble_words_with(text, &mut rng);
+            let orig: Vec<&str> = text.split(' ').collect();
+            let got: Vec<&str> = out.split(' ').collect();
+            assert_eq!(orig.len(), got.len(), "word count changed: {out:?}");
+            for (a, b) in orig.iter().zip(got.iter()) {
+                let ac: Vec<char> = a.chars().collect();
+                let bc: Vec<char> = b.chars().collect();
+                assert_eq!(ac.len(), bc.len(), "word length changed: {a} -> {b}");
+                // Only words of four letters or more keep their outer letters; shorter
+                // ones are shuffled whole, edges included.
+                if ac.len() >= 4 {
+                    assert_eq!(ac[0], bc[0], "first letter changed: {a} -> {b}");
+                    assert_eq!(ac[ac.len()-1], bc[bc.len()-1], "last letter changed: {a} -> {b}");
+                }
+                // Case-insensitive: capitalisation is pinned to the position, so a moved
+                // letter takes on the case of the slot it lands in.
+                let mut as_: Vec<char> = ac.iter().flat_map(|c| c.to_lowercase()).collect();
+                let mut bs: Vec<char> = bc.iter().flat_map(|c| c.to_lowercase()).collect();
+                as_.sort_unstable();
+                bs.sort_unstable();
+                assert_eq!(as_, bs, "letters lost or invented: {a} -> {b}");
+            }
+        }
+    }
+
+    /// Two- and three-letter words are shuffled whole, first and last letter included.
+    /// Pinning both edges of a three-letter word leaves one interior letter and therefore
+    /// no possible rearrangement, so they would otherwise never change at all.
+    #[test]
+    fn test_scramble_reorders_two_and_three_letter_words() {
+        for word in ["at", "on", "the", "inn", "you"] {
+            let mut changed = 0;
+            for seed in 0..200u64 {
+                let mut rng = Scrambler::seeded(seed);
+                let out = scramble_words_with(word, &mut rng);
+                let mut a: Vec<char> = word.chars().collect();
+                let mut b: Vec<char> = out.chars().collect();
+                a.sort_unstable();
+                b.sort_unstable();
+                assert_eq!(a, b, "{word} -> {out} is not a rearrangement of the same letters");
+            }
+            for seed in 0..200u64 {
+                let mut rng = Scrambler::seeded(seed);
+                if scramble_words_with(word, &mut rng) != word {
+                    changed += 1;
+                }
+            }
+            assert!(changed > 20, "{word} came out reordered only {changed}/200 times");
+        }
+    }
+
+    /// A single letter has no second arrangement, so it never changes.
+    #[test]
+    fn test_scramble_leaves_single_letters_alone() {
+        for seed in 0..40u64 {
+            let mut rng = Scrambler::seeded(seed);
+            assert_eq!(scramble_words_with("I a I", &mut rng), "I a I");
+        }
+    }
+
+    /// Capitalisation belongs to the position, not to the letter that moved into it:
+    /// letting the capital travel turns "The" into "hTe" and "Bob" into "obB", which reads
+    /// as a glitch rather than as scrambled text.
+    #[test]
+    fn test_scramble_keeps_the_capitalisation_pattern() {
+        let text = "The Bob Sue understands McDonald ALLCAPS sentences";
+        for seed in 0..100u64 {
+            let mut rng = Scrambler::seeded(seed);
+            let out = scramble_words_with(text, &mut rng);
+            assert_eq!(text.chars().count(), out.chars().count());
+            for (i, (a, b)) in text.chars().zip(out.chars()).enumerate() {
+                assert_eq!(a.is_uppercase(), b.is_uppercase(),
+                    "case pattern changed at index {i}: {text:?} -> {out:?}");
+            }
+        }
+    }
+
+    /// A long word with distinct letters must actually come out different, otherwise the
+    /// keybinding looks like it did nothing.
+    #[test]
+    fn test_scramble_actually_changes_longer_words() {
+        let mut unchanged = 0;
+        for seed in 0..200u64 {
+            let mut rng = Scrambler::seeded(seed);
+            let out = scramble_words_with("understanding", &mut rng);
+            if out == "understanding" { unchanged += 1; }
+        }
+        assert!(unchanged < 5, "{unchanged}/200 scrambles of a 13-letter word did nothing");
+    }
+
+    /// Letters stay near where they started. This is the property that keeps a whole
+    /// sentence readable rather than just a short word: reading cost tracks how far each
+    /// letter travelled, not merely whether it moved. A uniform shuffle of this interior
+    /// would average about n/3 (~6) places of movement.
+    #[test]
+    fn test_scramble_keeps_letters_near_their_original_position() {
+        let word: String = ('a'..='t').collect(); // 20 distinct letters
+        let mut total = 0f64;
+        let mut samples = 0f64;
+        let mut worst = 0usize;
+        for seed in 0..300u64 {
+            let mut rng = Scrambler::seeded(seed);
+            let out = scramble_words_with(&word, &mut rng);
+            for (i, c) in out.chars().enumerate() {
+                let orig = word.chars().position(|o| o == c).unwrap();
+                let d = i.abs_diff(orig);
+                total += d as f64;
+                samples += 1.0;
+                worst = worst.max(d);
+            }
+        }
+        let mean = total / samples;
+        assert!(mean < 3.0, "mean displacement {mean:.2} is too large to stay readable");
+        // Bounded by construction, not by luck: the jittered-key sort cannot let a letter
+        // overtake one further away than the jitter width allows.
+        assert!(worst <= crate::input::SCRAMBLE_MAX_TRAVEL,
+            "a letter travelled {worst} places, past the {} cap",
+            crate::input::SCRAMBLE_MAX_TRAVEL);
+    }
+
+    /// A leading Clay `/command` name is left alone; its arguments are still scrambled.
+    #[test]
+    fn test_scramble_skips_a_leading_slash_command_name() {
+        for seed in 0..40u64 {
+            let mut rng = Scrambler::seeded(seed);
+            let out = scramble_words_with("/whisper everybody understands this", &mut rng);
+            assert!(out.starts_with("/whisper "), "command name was scrambled: {out:?}");
+        }
+    }
+
+    /// The `Esc-M` default binding reaches the action, and the action reaches the buffer.
+    #[test]
+    fn test_scramble_words_is_bound_to_esc_m_and_edits_the_buffer() {
+        let kb = crate::keybindings::KeyBindings::tf_defaults();
+        // Both cases. Key names are case-significant, so binding only the capital meant
+        // the key did nothing at all unless Shift happened to be held - which is how this
+        // was first reported. Pressing Escape then plain `m` is the normal thing to do.
+        assert_eq!(kb.get_action("Esc-m"), Some("scramble_words"),
+            "Escape then plain 'm' must scramble - this is the keypress users actually make");
+        assert_eq!(kb.get_action("Esc-M"), Some("scramble_words"),
+            "Escape then Shift-M must scramble too, so Shift doesn't matter");
+
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.input.buffer = "\"everybody understands scrambled sentences".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        let before = app.input.buffer.clone();
+        crate::input_handler::dispatch_action("scramble_words", &mut app);
+        assert_ne!(app.input.buffer, before, "the action did not change the input line");
+        assert!(app.input.buffer.starts_with('"'), "say prefix lost");
+        assert_eq!(app.input.buffer.len(), before.len(), "length changed");
+        assert!(app.input.buffer.is_char_boundary(app.input.cursor_position),
+            "cursor left mid-character");
+    }
+
+    /// `Esc-M` has to reach the input line over SSH too. The remote console keeps its own
+    /// copy of the action dispatcher (`dispatch_remote_action`), which is a fourth site
+    /// beyond the three the "new action id" rule in CLAUDE.md names - an action missing
+    /// from it fails silently, doing nothing at all when the key is pressed.
+    #[test]
+    fn test_scramble_words_dispatches_on_the_ssh_remote_console_too() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+        app.input.buffer = "\"everybody understands scrambled sentences".to_string();
+        app.input.cursor_position = app.input.buffer.len();
+
+        let before = app.input.buffer.clone();
+        let quit = crate::remote_client::dispatch_remote_action("scramble_words", &mut app, &tx);
+        assert!(!quit, "scramble_words must not ask the client to quit");
+        assert_ne!(app.input.buffer, before, "the remote console did not scramble the line");
+        assert!(app.input.buffer.starts_with('"'), "say prefix lost on the remote console");
+    }
+
+    /// Scrambling permutes characters, so a word of multi-byte letters moves bytes around
+    /// underneath the cursor. Nothing may be corrupted and the cursor must stay on a
+    /// character boundary.
+    #[test]
+    fn test_scramble_is_safe_with_multibyte_letters() {
+        let mut app = App::new();
+        app.worlds.clear();
+        app.worlds.push(World::new("test"));
+        app.current_world_index = 0;
+
+        for text in ["\"привет всем здесь", "\"schön überall grüße", "\"καλημέρα σε όλους"] {
+            for _ in 0..40 {
+                app.input.buffer = text.to_string();
+                app.input.cursor_position = text.len() / 2;
+                while !app.input.buffer.is_char_boundary(app.input.cursor_position) {
+                    app.input.cursor_position += 1;
+                }
+                app.input.scramble_words();
+                let out = app.input.buffer.clone();
+                assert_eq!(out.chars().count(), text.chars().count(), "length changed: {out}");
+                assert!(out.starts_with('"'), "say prefix lost: {out}");
+                assert!(out.is_char_boundary(app.input.cursor_position),
+                    "cursor left mid-character in {out:?}");
+                let mut a: Vec<char> = text.chars().flat_map(|c| c.to_lowercase()).collect();
+                let mut b: Vec<char> = out.chars().flat_map(|c| c.to_lowercase()).collect();
+                a.sort_unstable(); b.sort_unstable();
+                assert_eq!(a, b, "characters lost or invented: {text} -> {out}");
+            }
+        }
     }

@@ -67,6 +67,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     ActionInfo { id: "lowercase_word", name: "Lowercase Word", category: "Editing" },
     ActionInfo { id: "uppercase_word", name: "Uppercase Word", category: "Editing" },
     ActionInfo { id: "collapse_spaces", name: "Collapse Spaces", category: "Editing" },
+    ActionInfo { id: "scramble_words", name: "Scramble Words", category: "Editing" },
     ActionInfo { id: "goto_matching_bracket", name: "Goto Matching Bracket", category: "Editing" },
     ActionInfo { id: "insert_last_arg", name: "Insert Last Arg", category: "Editing" },
     ActionInfo { id: "yank", name: "Yank (Paste Kill Ring)", category: "Editing" },
@@ -224,6 +225,13 @@ impl KeyBindings {
         b.insert("Esc-l".into(), "lowercase_word".into());
         b.insert("Esc-u".into(), "uppercase_word".into());
         b.insert("Esc-Space".into(), "collapse_spaces".into());
+        // Clay extension, no TF equivalent: scramble each word's interior letters.
+        // Bound on both cases on purpose. Key names here are case-significant (`Esc-j` is
+        // not `Esc-J`), so binding only the capital would mean the key silently did
+        // nothing unless Shift happened to be held - which is exactly how it was first
+        // reported. Lowercase is the one to quote to users; the capital is a courtesy.
+        b.insert("Esc-m".into(), "scramble_words".into());
+        b.insert("Esc-M".into(), "scramble_words".into());
         b.insert("Esc-Backspace".into(), "delete_word_backward_punct".into());
         // Esc-= is TF's own "goto matching bracket" (Esc-- moves to kbnum_negative below,
         // matching TF - ruling table).
@@ -866,6 +874,8 @@ mod tests {
         ("Esc-l", "lowercase_word"),
         ("Esc-u", "uppercase_word"),
         ("Esc-Space", "collapse_spaces"),
+        ("Esc-M", "scramble_words"),
+        ("Esc-m", "scramble_words"),
         ("Esc-Backspace", "delete_word_backward_punct"),
         ("Esc-=", "goto_matching_bracket"),
         ("Esc-.", "insert_last_arg"),

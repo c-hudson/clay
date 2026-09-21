@@ -2265,7 +2265,12 @@ const INPUT_MASK_CHAR: char = '*';
 /// `render_output_crossterm`'s crossterm replica of the same arithmetic call this - see
 /// that function's own comment for why the second copy exists at all.
 fn input_cursor_char_width(c: char, masked: bool) -> usize {
-    if masked { 1 } else { display_width(&c.to_string()) }
+    // Unmasked: measure exactly what `render_input` draws for this character - the
+    // `display_control_char` substitution, not the raw character (see
+    // `input::input_char_width`). Measuring the raw character reported 0 columns for
+    // a `^V`-inserted control that the renderer draws as one cell, and allocated a
+    // `String` per character scanned, which cost ~10ms per keystroke on a large paste.
+    if masked { 1 } else { crate::input::input_char_width(c) }
 }
 
 pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
@@ -2349,13 +2354,29 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
     // Spell-checking a masked line would be pointless and would still leak word
     // boundaries via the misspelling highlight below, so it's skipped entirely.
     let masked = app.current_world().protocol.echo_masked;
-    let misspelled: Vec<(usize, usize)> = if masked { Vec::new() } else { app.find_misspelled_words() };
+
+    // Only the display lines inside the viewport can possibly be drawn, so locate that
+    // window first and work on it alone. Copying the whole buffer into a `Vec<char>`
+    // here (and spell-checking all of it) cost ~12ms per frame on an accidental 700KB
+    // paste, to draw three visible lines. `line_window_bytes` is also the *same* walk
+    // the cursor uses, so the drawn text can no longer drift away from the cursor the
+    // way this function's own private walk did on consecutive blank lines.
+    let win_lines = (app.input_height as usize).saturating_add(1);
+    let (win_start, win_end) = app.input.line_window_bytes(app.input.viewport_start_line, win_lines);
+    // Spell-check the window before borrowing the buffer for it: the ranges come back
+    // window-relative, which is how the span-building code below indexes `chars`.
+    let misspelled: Vec<(usize, usize)> = if masked {
+        Vec::new()
+    } else {
+        app.find_misspelled_words_in_window(win_start, win_end)
+    };
+    let window: &str = app.input.buffer.get(win_start..win_end).unwrap_or("");
     let chars: Vec<char> = if masked {
-        app.input.buffer.chars().map(|c| if c == '\n' { '\n' } else { INPUT_MASK_CHAR }).collect()
+        window.chars().map(|c| if c == '\n' { '\n' } else { INPUT_MASK_CHAR }).collect()
     } else {
         // A literal control character (inserted via `^V`) must be drawn as a visible
         // stand-in, never emitted raw — see `input::display_control_char`.
-        app.input.buffer.chars().map(crate::input::display_control_char).collect()
+        window.chars().map(crate::input::display_control_char).collect()
     };
 
     // Calculate visible prompt length (without ANSI codes)
@@ -2570,25 +2591,15 @@ pub(crate) fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'s
             }
         }
     } else {
-        // Scrolled down, don't show prompt
-        // Calculate start_char by iterating through lines to find correct starting position
-        // This accounts for variable chars-per-line due to display width differences
-        // IMPORTANT: First line has less capacity due to prompt
-        let first_line_width = width.saturating_sub(prompt_visible_len);
-        let mut start_char = 0;
-        for line_idx in 0..app.input.viewport_start_line {
-            if start_char >= chars.len() {
-                break;
-            }
-            // First line has reduced width due to prompt, subsequent lines have full width
-            let line_width = if line_idx == 0 { first_line_width } else { width };
-            let (chars_on_line, has_nl) = chars_for_line(&chars[start_char..], line_width);
-            start_char += chars_on_line.max(1); // Ensure progress even with weird chars
-            if has_nl && start_char < chars.len() && chars[start_char] == '\n' {
-                start_char += 1;
-            }
-        }
-        let mut char_pos = start_char;
+        // Scrolled down, don't show prompt. `chars` already begins exactly at the first
+        // visible display line (`line_window_bytes` above), so there is nothing to walk
+        // to here. The loop this replaces was a second, subtly different implementation
+        // of that same walk: on an empty line it advanced past the newline with `.max(1)`
+        // and then skipped the *following* newline as well, losing one display line per
+        // pair of consecutive blank lines. The error accumulated, so on a large paste
+        // holding many blank lines the text drawn here came from a completely different
+        // part of the buffer than the one the cursor was placed in.
+        let mut char_pos = 0usize;
         while char_pos < chars.len() && lines.len() < app.input_height as usize {
             let (chars_on_line, has_nl) = chars_for_line(&chars[char_pos..], width);
             let line_end = char_pos + chars_on_line;

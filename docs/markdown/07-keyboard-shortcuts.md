@@ -79,6 +79,7 @@ key — bind them in `keybindings.dat` or the keybind editor.
 | `^Y` | Yank (paste the most recent kill-ring entry) |
 | `Esc-c` / `Esc-l` / `Esc-u` | Capitalize / lowercase / uppercase word |
 | `Esc-Space` | Collapse surrounding spaces to one |
+| `Esc-m` (or `Esc-M`) | Scramble the letters inside every word on the input line, keeping the first and last letter of words of four letters or more (shorter words shuffle whole) and leaving punctuation, digits and a leading `/command` name in place (see below) |
 | `Esc-=` | Goto matching bracket (`()[]{}`) |
 | `Esc-.` / `Esc-_` | Insert the last word of the previous history entry |
 | `Esc-^E` | Expand line (substitute `%var`/`$[...]`/`$(...)` in the input line in place — TF `kb_expand_line`) |
@@ -88,6 +89,41 @@ key — bind them in `keybindings.dat` or the keybind editor.
 
 **Kill ring:** `^K`, `^U`, `^W`, `Esc-d`, and `Esc-Backspace` all push the
 deleted text to the kill ring; `^Y` pastes the most recent entry.
+
+**Scrambled words (`Esc-m`):** reorders the letters inside each word while keeping
+the text readable, the way the well-known "jumbled letters" passages do.
+
+- Words of **four letters or more** keep their **first and last letter** where they
+  are, and only the middle is reordered. No letter is added or lost.
+- Interior letters move, but never more than four places from where they started.
+  Reading cost tracks how *far* a letter travels rather than whether it moved at
+  all, so holding letters near home is what keeps a whole sentence readable instead
+  of just a short word.
+- **Two- and three-letter words are shuffled whole**, first and last letter
+  included. Pinning both edges of a three-letter word leaves a single interior
+  letter and so no possible rearrangement, which is why they would otherwise never
+  change. A one-letter word has no second arrangement and never changes.
+- **Capitalisation stays with the position, not the letter.** `The` becomes `Hte`,
+  never `hTe`; `Bob` becomes `Obb`, never `obB`. A capital stranded mid-word reads
+  as a glitch rather than as scrambled text.
+- **Nothing that is not a letter moves.** A leading `"`, `'`, `:` or `;` say/emote
+  prefix keeps its position, digits keep their value and order (`150` never becomes
+  `105`), and punctuation stays put. A leading Clay `/command` name is skipped too.
+  The line therefore stays sendable exactly as typed, with nothing to repair
+  afterwards.
+
+Bound on both `Esc-m` and `Esc-M`, so it works whether or not Shift is held.
+
+It applies to the **whole input line**, unlike the word-at-cursor case transforms
+(`Esc-c`/`Esc-l`/`Esc-u`), because the effect is a sentence-level one.
+
+```
+"everybody understands scrambled sentences perfectly well
+"evreyodby undesrtadns scarbmled stenneces prefectly wlel
+
+The dog ran to the inn at the top of the hill
+Hte ogd anr ot hte nni ta eht opt fo hte hlil
+```
 
 ## Numeric Prefix (kbnum)
 
@@ -331,6 +367,7 @@ you change a default, update both.
 | `Esc-J` | `selective_flush` |
 | `Esc-L` | `toggle_limit` |
 | `Esc-Left` | `world_socket_prev` |
+| `Esc-M` | `scramble_words` |
 | `Esc-Right` | `world_socket_next` |
 | `Esc-Space` | `collapse_spaces` |
 | `Esc-Tab` | `completion` |
@@ -348,6 +385,7 @@ you change a default, update both.
 | `Esc-h` | `scroll_half_page` |
 | `Esc-j` | `flush_output` |
 | `Esc-l` | `lowercase_word` |
+| `Esc-m` | `scramble_words` |
 | `Esc-n` | `history_search_forward` |
 | `Esc-p` | `history_search_backward` |
 | `Esc-u` | `uppercase_word` |

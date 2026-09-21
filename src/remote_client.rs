@@ -1250,12 +1250,22 @@ pub(crate) async fn run_console_client(addr: &str, ssh: Option<crate::ssh::SshTa
                             needs_redraw = true;
                         }
                         Event::Paste(text) => {
-                            for c in text.chars() {
-                                if c == '\n' || c == '\r' {
-                                    app.input.insert_char('\n');
-                                } else if !c.is_control() {
-                                    app.input.insert_char(c);
-                                }
+                            // Splice the paste in as one string. Feeding it through
+                            // `insert_char` per character made this quadratic: every
+                            // insert re-derived the cursor's display line by walking
+                            // the buffer from the start, so an N-character paste cost
+                            // O(N^2) - minutes of hang for the 700KB paste that
+                            // prompted this, versus milliseconds now.
+                            if let Some(msg) = crate::input_handler::oversized_paste_message(&text) {
+                                app.add_output(&msg);
+                            } else {
+                                let clean: String = text
+                                    .replace("\r\n", "\n")
+                                    .replace('\r', "\n")
+                                    .chars()
+                                    .filter(|c| *c == '\n' || !c.is_control())
+                                    .collect();
+                                app.input.insert_str(&clean);
                             }
                             app.last_input_was_delete = false;
                             needs_redraw = true;
@@ -2398,6 +2408,7 @@ pub(crate) fn dispatch_remote_action(
             for _ in 0..n { app.input.uppercase_word(); }
         }
         "collapse_spaces" => { app.input.collapse_spaces(); }
+        "scramble_words" => { app.input.scramble_words(); }
         "goto_matching_bracket" => { app.input.goto_matching_bracket(); }
         "insert_last_arg" => { app.input.last_argument(); }
         "yank" => { app.input.yank(); }

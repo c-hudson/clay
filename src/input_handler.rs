@@ -1338,6 +1338,36 @@ pub(crate) fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 /// collapse each into a single space (single-line targets, so the whole paste
 /// stays visible and editable on one line instead of silently losing everything
 /// after the first line break).
+/// Largest bracketed paste accepted into the command line, in bytes.
+///
+/// The command line is a place to type a MUD command, not a document: even a
+/// generous multi-line paste of commands or a long description is a few kilobytes.
+/// A paste far past that is a misdirected one - the report behind this limit was a
+/// 700KB Perl source file pasted into the input pane by accident - and sending it
+/// would flood the world as well as the client.
+///
+/// This is a backstop, not the fix for the slowness that report also described:
+/// scrolling and editing a buffer that size are handled in `input.rs` and
+/// `rendering.rs` (one shared display-line walk, and a renderer that materialises
+/// only the lines it can actually draw). The limit exists so an accidental paste is
+/// refused outright and said so, rather than silently becoming the next command.
+pub(crate) const MAX_INPUT_PASTE_BYTES: usize = 64 * 1024;
+
+/// The message to show when a paste is too big for the command line, or `None` when
+/// it fits. Rejecting outright rather than truncating is deliberate: a silently
+/// clipped paste in a command line is a command the user did not write.
+pub(crate) fn oversized_paste_message(text: &str) -> Option<String> {
+    if text.len() <= MAX_INPUT_PASTE_BYTES {
+        return None;
+    }
+    Some(format!(
+        "Paste rejected: {} KB exceeds the {} KB limit for the input line. \
+         Nothing was inserted.",
+        text.len() / 1024,
+        MAX_INPUT_PASTE_BYTES / 1024
+    ))
+}
+
 fn sanitize_paste(text: &str, keep_newlines: bool) -> String {
     text.replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -1420,6 +1450,10 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) {
 
     // Nothing above claimed it: the command line. It's multi-line capable, so
     // keep literal newlines, same as today's behavior.
+    if let Some(msg) = oversized_paste_message(text) {
+        app.add_tf_output(&msg);
+        return;
+    }
     app.input.insert_str(&sanitize_paste(text, true));
 }
 
@@ -1779,6 +1813,12 @@ fn dispatch_action_impl(action: &str, app: &mut App) -> Option<KeyAction> {
         "uppercase_word" => {
             let n = app.input.take_kbnum_positive();
             for _ in 0..n { app.input.uppercase_word(); }
+            KeyAction::None
+        }
+        // Clay extension (Esc-M): scramble every word's interior letters on the line.
+        // Whole-line like collapse_spaces, not word-at-cursor like the case transforms.
+        "scramble_words" => {
+            app.input.scramble_words();
             KeyAction::None
         }
         "collapse_spaces" => {
