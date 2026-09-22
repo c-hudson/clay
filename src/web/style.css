@@ -3199,3 +3199,15 @@ body.device-phone .help-ref-table td:first-child {
         flex-shrink: 0;
     }
 }
+
+/* Remote Access dialog (app.js showRemoteAccessDialog): the server-built
+   reachability report - LAN/VPN/public addresses, firewall, router mapping,
+   and the "type this on the other device" hints with per-hint Copy buttons. */
+.reach-report { display: flex; flex-direction: column; gap: 4px; }
+.reach-row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.reach-key { flex: 0 0 9.5em; opacity: 0.75; }
+.reach-val { flex: 1 1 12em; min-width: 0; white-space: pre-wrap; word-break: break-all; }
+.reach-mono { font-family: monospace; }
+.reach-good { color: var(--theme-success); }
+.reach-bad { color: var(--theme-error); }
+.reach-copy { padding: 2px 8px; font-size: 0.85em; }

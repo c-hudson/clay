@@ -431,6 +431,18 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             }),
                         }
                     }
+                    AppEvent::PublicIpResult(result, reply_to) => {
+                        let line = app.apply_public_ip_result(result);
+                        app.reply_reach_line(reply_to, &line);
+                    }
+                    AppEvent::FirewallResult(status, action_error, reply_to) => {
+                        let line = app.apply_firewall_result(status, action_error);
+                        app.reply_reach_line(reply_to, &line);
+                    }
+                    AppEvent::PortMapResult(status, reply_to) => {
+                        let line = app.apply_port_map_result(status);
+                        app.reply_reach_line(reply_to, &line);
+                    }
                     AppEvent::RemoteListResult(requesting_client_id, world_index, lines) => {
                         app.remote_ping_responses = None;
                         for line in &lines {
@@ -507,7 +519,6 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                     KeepAliveType::Nop => {
                                         let nop = vec![TELNET_IAC, TELNET_NOP];
                                         let _ = tx.try_send(WriteCommand::Raw(nop));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent NOP to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -520,7 +531,6 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                         let cmd = world.settings.keep_alive_cmd
                                             .replace("##rand##", &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Custom keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -531,7 +541,6 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                             .as_nanos() % 1000 + 1) as u32;
                                         let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Generic keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -1198,6 +1207,20 @@ async fn handle_daemon_ws_message_impl(
                         flush: false, gagged: false, highlight_colors: Vec::new(),
                     });
                 }
+                Command::Reach { refresh, lookup } => {
+                    let target = Some((client_id, world_index));
+                    for line in crate::reach::format_reach_lines(&app.build_reachability_info()) {
+                        app.reply_reach_line(target, &line);
+                    }
+                    if refresh {
+                        app.reply_reach_line(target, "Re-checking firewall and router status...");
+                        app.request_reachability_refresh(target, event_tx.clone());
+                    }
+                    if lookup {
+                        app.reply_reach_line(target, "Looking up public IP (checkip.amazonaws.com)...");
+                        app.request_public_ip_lookup(target, event_tx.clone());
+                    }
+                }
                 // AddWorld - add or update world definition
                 Command::AddWorld { name, host, port, user, password, use_ssl, file } => {
                     execute_add_world_command(app, name, host, port, user, password, use_ssl, file, world_index, true);
@@ -1476,6 +1499,23 @@ async fn handle_daemon_ws_message_impl(
         // reconnect using the same inline pattern ConnectWorld above uses (daemon.rs doesn't
         // have a shared "connect this world" helper to call here - see Phase C's ConnectWorld
         // consolidation note for that separate, larger duplication).
+        // Remote Access panel (reach.rs). Replies go to nobody in particular
+        // (`None`): the dialog re-renders from the reachability broadcast, and an
+        // output line would land in whichever world the server happens to show.
+        WsMessage::SetPortMapping { enabled } => {
+            app.set_port_map_enabled(enabled, "web");
+        }
+        WsMessage::FirewallRule { action } => {
+            if action == "add" {
+                app.request_firewall_rule(None, event_tx.clone());
+            }
+        }
+        WsMessage::LookupPublicIp => {
+            app.request_public_ip_lookup(None, event_tx.clone());
+        }
+        WsMessage::RefreshReachability => {
+            app.request_reachability_refresh(None, event_tx.clone());
+        }
         WsMessage::TrustCertificate { world_index, host, new_fingerprint } => {
             if world_index < app.worlds.len() {
                 persistence::replace_pin(&host, &new_fingerprint);

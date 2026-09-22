@@ -6595,6 +6595,31 @@ if you're more curious.\"";
     }
 
     #[test]
+    fn test_parse_reach_command_flags() {
+        match parse_command("/reach") {
+            Command::Reach { refresh, lookup } => {
+                assert!(!refresh);
+                assert!(!lookup);
+            }
+            other => panic!("Expected Reach, got {:?}", other),
+        }
+        match parse_command("/reach --refresh --lookup") {
+            Command::Reach { refresh, lookup } => {
+                assert!(refresh);
+                assert!(lookup);
+            }
+            other => panic!("Expected Reach, got {:?}", other),
+        }
+        match parse_command("/reach -l") {
+            Command::Reach { refresh, lookup } => {
+                assert!(!refresh);
+                assert!(lookup);
+            }
+            other => panic!("Expected Reach, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parse_remote_attach_command_host_port_colon() {
         match parse_command("/connect example.com:9000") {
             Command::RemoteAttach { addr, close, cancel } => {

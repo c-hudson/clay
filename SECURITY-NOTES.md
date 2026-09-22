@@ -194,3 +194,23 @@ in Settings.
   reload into and no remote MUD connections that would need the outbound TLS proxy.
   Everything else — worlds, actions, TF scripting, scrollback — works the same as remote
   mode.
+
+# Router port mapping (UPnP) and the Windows Firewall rule
+
+Two Remote Access helpers (`/web` → Remote Access, or `/reach`) change what can reach the
+web server from outside:
+
+- **Port Mapping (UPnP)** asks your router to forward the web port to this machine, which
+  exposes the port to the whole internet. Off by default. Everything above stays in force
+  for those connections: the stealth path (scanners see a dead port), the password, the
+  allow list, the ban list and the knock. Turning the toggle off, changing the port or
+  quitting removes the mapping; a hot reload keeps it; a crash leaves it until its one-hour
+  lease expires (a router that only grants permanent leases keeps it until the next Clay
+  start removes or re-adds it).
+- **Add Firewall Rule** (Windows) adds an inbound Windows Defender Firewall rule for Clay's
+  executable — per-program, TCP, all profiles — and removes any inbound rule for that
+  executable that was there before, including the Block rule Windows creates when the
+  first-run alert is cancelled. One UAC prompt, on the Windows machine's own screen. It
+  only affects the Clay program; no port is opened for anything else.
+- **Look Up Public IP** contacts `checkip.amazonaws.com` when you press it, and never on
+  its own.

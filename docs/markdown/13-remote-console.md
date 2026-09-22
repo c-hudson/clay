@@ -184,6 +184,11 @@ cargo build --target x86_64-unknown-linux-musl \
 
 ## SSH Tunnel (--ssh)
 
+If the underlying problem is that no port can be opened on the router or the
+firewall at all, `/reach` and the Web Interface chapter's "Reaching Clay from
+outside your network" walk through every option; the SSH tunnel below is the one
+that needs no open port.
+
 Clay can tunnel `--console=`/`--gui=` over SSH itself instead of relying on a manual
 port-forward — pass `--ssh` and give the target in
 `[user@]host[:clayport[:sshport]]` form:

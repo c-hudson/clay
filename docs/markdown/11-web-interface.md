@@ -223,6 +223,101 @@ For secure connections:
 3. Enable "WS Use TLS"
 4. Use HTTPS and wss:// URLs
 
+## Reaching Clay from outside your network
+
+Everything in this section is summarized live by `/reach` (console) and by the
+**Remote Access** button in `/web` (all interfaces): your addresses, the Windows
+Firewall verdict, the router mapping state, and exactly what to type on the other
+device.
+
+### 1. Same network (LAN)
+
+Other devices on your Wi-Fi/LAN use the LAN address `/reach` shows:
+
+| Client | What to enter |
+|--------|---------------|
+| Browser | `https://192.168.1.20:9000/clay/` (accept the one-time certificate warning) |
+| Clay GUI | `clay --gui=192.168.1.20` |
+| Clay console | `clay --console=192.168.1.20` |
+| Android app | Host `192.168.1.20`, Port `9000` |
+
+The `:9000` is implied when the port is the default.
+
+### 2. Windows Firewall
+
+Windows blocks incoming connections by default. The first time Clay's web server
+starts, Windows shows a "Windows Defender Firewall has blocked some features"
+alert. **Allow access** creates an Allow rule. **Cancel** creates a *Block* rule
+for `clay.exe`, and a Block rule beats any Allow rule added later — this is the
+most common reason a phone cannot reach a Windows PC.
+
+Clay checks this for you: `/reach` reports the verdict (`allowed`, `no rule`,
+`BLOCKED`), and Clay prints a one-line hint at startup when the verdict is bad.
+**Add Firewall Rule** in Remote Access fixes it: one UAC prompt, after which Clay
+removes every inbound rule for its own executable (the stale Block rule included)
+and adds a per-program Allow rule named "Clay MUD Client". Notes:
+
+- The UAC prompt appears on the Windows machine's own screen, even when the
+  button was pressed from a phone or another Clay.
+- The rule is per-program, not per-port, so changing the port never breaks it.
+- It applies to all network profiles (Domain, Private, Public). Home networks
+  are frequently classified "Public" by Windows, and Clay's stealth path,
+  password, allow list and ban list are the real gate (see Security above).
+- Manual equivalent, in an elevated prompt:
+  `netsh advfirewall firewall add rule name="Clay MUD Client" dir=in action=allow program="C:\path\to\clay.exe" protocol=TCP enable=yes profile=any`
+- On Linux and macOS Clay does not manage the firewall; open the port with
+  `ufw`/`firewalld` or the macOS application firewall if one is active.
+
+### 3. Your router
+
+From the internet, connections arrive at your router's public address, and the
+router must forward the port to the machine running Clay. Two ways:
+
+**Port Mapping (UPnP)** — the toggle in Remote Access. Clay asks the router to
+forward the port to this machine (UPnP IGD), renews the lease every 20 minutes,
+and removes the mapping when you turn the toggle off, change the port, or quit.
+A hot reload keeps it; a crash leaves it until the one-hour lease expires. The
+router must have UPnP enabled. Off by default: it exposes the port to the whole
+internet (see `SECURITY-NOTES.md` for what protects it).
+
+**Manual port forward** — in the router's admin page, forward external TCP port
+9000 to the LAN address `/reach` shows, port 9000. Give the Clay machine a fixed
+LAN address (a DHCP reservation) so the forward keeps pointing at it.
+
+Either way, the address to use from outside is your **public IP**. `/reach
+--lookup` (or the Look Up Public IP button) asks `checkip.amazonaws.com` for it —
+never automatically. Then: `clay --gui=203.0.113.5`, or the Android app's
+Remote Host field.
+
+**When it cannot work: double NAT / carrier-grade NAT.** If `/reach` shows the
+router's WAN address as private (`10.x`, `172.16-31.x`, `192.168.x`, or
+`100.64-127.x`), the router is itself behind another NAT — a second router, or
+your ISP's carrier-grade NAT. No port forward on your router can reach the
+internet then. Use option 4 or 5 instead.
+
+### 4. SSH tunnel
+
+If you can log in to any SSH host that can reach the Clay machine (the Clay
+machine itself, or a box on its LAN), other Clays need no open port at all:
+
+```bash
+clay --gui=user@host --ssh
+```
+
+See the **Remote Console** chapter, "SSH Tunnel", for the details and the
+Android app's SSH mode.
+
+### 5. Mesh VPN (Tailscale, WireGuard, ZeroTier)
+
+A mesh VPN gives every device a private address that works from anywhere, with
+no port forwarding and no public exposure. Clay lists a Tailscale-style
+`100.64.x.x` address on this machine as **VPN** in `/reach`; any device on the
+same VPN connects to it like a LAN address. This is the simplest option when you
+are behind carrier-grade NAT.
+
+A reverse tunnel that lets the Clay machine publish itself through an SSH host
+you own (no port opened anywhere) is planned.
+
 ## Cross-Interface Sync
 
 The web interface stays synchronized with console and GUI:
@@ -245,9 +340,11 @@ Each client can independently:
 ### Can't Connect
 
 1. Verify server is running (check Clay console)
-2. Check firewall allows the port
+2. Run `/reach` — it shows the address to use, the firewall verdict and the
+   router mapping state (see "Reaching Clay from outside your network")
 3. Verify password is correct
-4. Try non-secure WebSocket first (ws://)
+4. A remote browser gets HTTPS with a self-signed certificate — accept the
+   one-time warning
 
 ### Connection Drops
 

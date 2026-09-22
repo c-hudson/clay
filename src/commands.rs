@@ -1306,6 +1306,19 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
         Command::Version => {
             app.add_output(&get_version_string());
         }
+        Command::Reach { refresh, lookup } => {
+            for line in crate::reach::format_reach_lines(&app.build_reachability_info()) {
+                app.add_output(&line);
+            }
+            if refresh {
+                app.add_output("Re-checking firewall and router status...");
+                app.request_reachability_refresh(Some((0, 0)), event_tx.clone());
+            }
+            if lookup {
+                app.add_output("Looking up public IP (checkip.amazonaws.com)...");
+                app.request_public_ip_lookup(Some((0, 0)), event_tx.clone());
+            }
+        }
         Command::Menu => {
             app.open_menu_popup_new();
         }
@@ -1316,6 +1329,8 @@ pub(crate) async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sen
             // Drain the archive writer before tearing anything down, so the last
             // batch of output reaches disk rather than dying with the process.
             app.flush_scrollback();
+            // Give the router its port back (no-op unless a UPnP mapping is held).
+            app.unmap_on_quit().await;
             // Kill all TLS proxy processes before quitting
             for world in &app.worlds {
                 #[cfg(unix)]

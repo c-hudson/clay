@@ -8,6 +8,9 @@ pub mod mcp;
 pub mod spell;
 pub mod input;
 pub mod util;
+pub mod reach;
+pub mod firewall;
+pub mod portmap;
 pub mod websocket;
 pub mod ansi_music;
 pub mod tf;
@@ -1279,36 +1282,6 @@ fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
         .ok()
 }
 
-/// Run a command with a timeout. Returns None if the command fails or times out.
-fn run_command_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
-    let mut child = std::process::Command::new(cmd)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                let output = child.wait_with_output().ok()?;
-                return String::from_utf8(output.stdout).ok();
-            }
-            Ok(Some(_)) => return None, // Exited with error
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => return None,
-        }
-    }
-}
-
 /// Get all non-loopback IPv4 addresses on this machine.
 fn get_local_ip_addresses() -> Vec<String> {
     let mut addrs = Vec::new();
@@ -1329,7 +1302,7 @@ fn get_local_ip_addresses() -> Vec<String> {
     // On Linux, use hostname -I to get all local IPs
     #[cfg(target_os = "linux")]
     {
-        if let Some(output) = run_command_with_timeout("hostname", &["-I"], 2) {
+        if let Some(output) = util::run_command_with_timeout("hostname", &["-I"], 2) {
             let ips = output;
             for ip in ips.split_whitespace() {
                 let ip = ip.trim().to_string();
@@ -1356,7 +1329,7 @@ fn generate_self_signed_cert(cert_path: &std::path::Path, key_path: &std::path::
     ];
 
     // Add all local IP addresses so the cert works across the LAN
-    if let Some(name) = run_command_with_timeout("hostname", &[], 2) {
+    if let Some(name) = util::run_command_with_timeout("hostname", &[], 2) {
         let name = name.trim().to_string();
         if !name.is_empty() && !san_names.contains(&name) {
             san_names.push(name);
@@ -1760,6 +1733,7 @@ pub struct Settings {
     http_enabled: bool,            // Enable the web server
     http_port: u16,                // Port for the web interface
     web_path: String,              // Stealth path prefix for web UI (default "clay"; empty = legacy mode at "/")
+    port_map_enabled: bool,        // Ask the router to forward http_port here via UPnP IGD (reach.rs/portmap.rs); default off
     websocket_password: String,
     websocket_allow_list: String,  // CSV list of hosts that can be whitelisted
     websocket_whitelisted_host: Option<String>,  // Currently whitelisted host (authenticated from allow list)
@@ -1853,6 +1827,7 @@ impl Default for Settings {
             http_enabled: false,
             http_port: 9000,
             web_path: "clay".to_string(),
+            port_map_enabled: false,
             websocket_password: String::new(),
             websocket_allow_list: String::new(),
             websocket_whitelisted_host: None,
@@ -2281,6 +2256,9 @@ pub enum Command {
     HelpTopic { topic: String },
     /// /version - show version info
     Version,
+    /// /reach [--refresh|-r] [--lookup|-l] - how other devices can reach this Clay
+    /// (reach.rs); the console twin of the /web -> Remote Access popup
+    Reach { refresh: bool, lookup: bool },
     /// /quit - exit application
     Quit,
     /// /reload - hot reload binary
@@ -2486,6 +2464,10 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "/version" => Command::Version,
+        "/reach" => Command::Reach {
+            refresh: args.iter().any(|a| *a == "--refresh" || *a == "-r"),
+            lookup: args.iter().any(|a| *a == "--lookup" || *a == "-l"),
+        },
         "/quit" => Command::Quit,
         "/reload" => Command::Reload,
         "/update" => {
@@ -4951,6 +4933,24 @@ pub struct App {
     pub media_music_key: Option<(usize, String)>,
     /// Event channel sender for async media events
     pub event_tx: Option<mpsc::Sender<AppEvent>>,
+    // ── Remote access (reach.rs) — rendered into GlobalSettingsMsg.reachability_json ──
+    /// Windows Firewall verdict for this executable (always NotApplicable off Windows).
+    pub firewall_status: reach::FirewallStatus,
+    /// Router (UPnP) mapping state for http_port.
+    pub port_map_status: reach::PortMapStatus,
+    /// When the last mapping attempt finished (any outcome); drives the periodic
+    /// renew of a live mapping and the retry of a failed one.
+    pub port_map_last_attempt: Option<std::time::Instant>,
+    /// Public address from an explicit lookup (`source` = "lookup"); UPnP's own
+    /// external address is read straight from `port_map_status` instead.
+    pub public_ip: Option<String>,
+    pub public_ip_source: String,
+    pub public_ip_error: Option<String>,
+    /// The one-line "Windows Firewall is blocking Clay" startup hint has been printed.
+    pub firewall_hint_shown: bool,
+    /// Why the last Add Firewall Rule attempt failed (UAC declined, netsh error);
+    /// shown as a suffix on the Firewall line until the next attempt or an Allowed verdict.
+    pub firewall_error: Option<String>,
     /// Currently playing ANSI music handle
     /// Tracked so we can stop it before starting a new sequence
     pub ansi_music_handle: Option<audio::PlayHandle>,
@@ -5093,6 +5093,14 @@ impl App {
             media_processes: std::collections::HashMap::new(),
             media_music_key: None,
             event_tx: None,
+            firewall_status: if cfg!(windows) { reach::FirewallStatus::Unchecked } else { reach::FirewallStatus::NotApplicable },
+            port_map_status: reach::PortMapStatus::Off,
+            port_map_last_attempt: None,
+            public_ip: None,
+            public_ip_source: String::new(),
+            public_ip_error: None,
+            firewall_hint_shown: false,
+            firewall_error: None,
             ansi_music_handle: None,
             ansi_music_counter: 0,
             msp_sound_counter: 0,
@@ -5278,6 +5286,7 @@ impl App {
             tf_bound_keys_json: self.tf_bound_keys_json(),
             auth_key: self.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default(),
             ws_password: self.settings.websocket_password.clone(),
+            reachability_json: self.reachability_json(),
         }
     }
 
@@ -12282,6 +12291,340 @@ impl App {
         let _ = persistence::save_settings(self);
     }
 
+    // ── Remote access / reachability (reach.rs) ─────────────────────────────
+    //
+    // Everything a user needs to reach this Clay from another device — LAN/VPN/
+    // public addresses, the Windows Firewall verdict, the router (UPnP) mapping
+    // and the exact strings to type elsewhere — is assembled here once and shipped
+    // to every UI as `GlobalSettingsMsg.reachability_json`. UIs render it, never
+    // recompute it, so `/reach`, the TUI popup, the web/GUI dialog and Android agree.
+
+    /// Assemble the reachability picture. Cheap: the only work is listing local
+    /// addresses, so it is fine to call on every `GlobalSettingsMsg` build.
+    pub fn build_reachability_info(&self) -> reach::ReachabilityInfo {
+        let (vpn_addrs, lan_ips): (Vec<String>, Vec<String>) = reach::local_ipv4_addrs()
+            .into_iter()
+            .partition(|ip| ip.parse::<std::net::Ipv4Addr>().map(reach::is_cgnat_v4).unwrap_or(false));
+        let port = self.settings.http_port;
+        let web_path = self.settings.web_path.clone();
+        let lan_urls = lan_ips.iter().map(|ip| reach::web_url(ip, port, &web_path)).collect();
+        // A live mapping knows the real WAN address; otherwise fall back to an explicit lookup.
+        let (public_ip, public_ip_source) = match &self.port_map_status {
+            reach::PortMapStatus::Mapped { external_ip, .. } => (Some(external_ip.clone()), "upnp".to_string()),
+            _ => (self.public_ip.clone(), self.public_ip_source.clone()),
+        };
+        let mut info = reach::ReachabilityInfo {
+            http_enabled: self.settings.http_enabled,
+            port,
+            web_path,
+            lan_ips,
+            lan_urls,
+            vpn_addrs,
+            public_ip,
+            public_ip_source,
+            public_ip_error: self.public_ip_error.clone(),
+            firewall: self.firewall_status.clone(),
+            firewall_text: match &self.firewall_error {
+                Some(e) => format!("{} - last attempt failed: {e}", reach::firewall_text(&self.firewall_status)),
+                None => reach::firewall_text(&self.firewall_status),
+            },
+            is_windows: cfg!(windows),
+            port_map_enabled: self.settings.port_map_enabled,
+            port_map: self.port_map_status.clone(),
+            port_map_text: reach::port_map_text(&self.port_map_status, self.settings.port_map_enabled),
+            client_hints: Vec::new(),
+        };
+        info.client_hints = reach::build_client_hints(&info);
+        info
+    }
+
+    /// `build_reachability_info()` as the JSON blob carried by `GlobalSettingsMsg`.
+    pub fn reachability_json(&self) -> String {
+        serde_json::to_string(&self.build_reachability_info()).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Push the current reachability picture to every client — it rides in a
+    /// `GlobalSettingsUpdated` re-broadcast, the same vehicle
+    /// `refresh_tf_bound_keys_if_changed` uses — and refresh the TUI Remote Access
+    /// popup's report if it is open.
+    pub fn broadcast_reachability(&mut self) {
+        let settings_msg = self.build_global_settings_msg();
+        self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+            settings: settings_msg,
+            input_height: self.input_height,
+        });
+        // Keep the TUI Remote Access popup's report current while it is on top.
+        let popup_open = self
+            .popup_manager
+            .current_mut()
+            .map(|s| s.definition.id == popup::PopupId("remote_access"))
+            .unwrap_or(false);
+        if popup_open {
+            let info = self.build_reachability_info();
+            if let Some(state) = self.popup_manager.current_mut() {
+                popup::definitions::remote_access::update_report(state, &info);
+            }
+        }
+    }
+
+    /// Deliver one line of remote-access output to whoever asked: `Some((0, _))` is
+    /// the console, `Some((client_id, world_index))` a WebSocket client — shown as
+    /// client text in the world it was looking at, like `/version` over the wire —
+    /// and `None` nobody (the reachability broadcast alone carries the new state).
+    pub fn reply_reach_line(&mut self, reply_to: Option<(u64, usize)>, line: &str) {
+        match reply_to {
+            Some((0, _)) => self.add_output(line),
+            Some((client_id, world_index)) => self.ws_send_to_client(client_id, WsMessage::ServerData {
+                archive_sourced: false,
+                world_index,
+                data: line.to_string(),
+                is_viewed: false,
+                ts: current_timestamp_secs(),
+                from_server: false,
+                seq: 0, end_seq: None,
+                flush: false, gagged: false, highlight_colors: Vec::new(),
+            }),
+            None => {}
+        }
+    }
+
+    /// Opt-in only (the Look Up Public IP button / `/reach --lookup`): ask
+    /// checkip.amazonaws.com for our public address. Never called automatically —
+    /// it contacts a third party. The answer arrives as `AppEvent::PublicIpResult`.
+    pub fn request_public_ip_lookup(&mut self, reply_to: Option<(u64, usize)>, event_tx: mpsc::Sender<AppEvent>) {
+        tokio::spawn(async move {
+            let result = reach::lookup_public_ip().await;
+            let _ = event_tx.send(AppEvent::PublicIpResult(result, reply_to)).await;
+        });
+    }
+
+    /// Record a finished public-IP lookup and return the one-line report for the requester.
+    pub fn apply_public_ip_result(&mut self, result: Result<String, String>) -> String {
+        let line = match result {
+            Ok(ip) => {
+                self.public_ip_error = None;
+                self.public_ip_source = "lookup".to_string();
+                let line = format!("Public IP: {ip}");
+                self.public_ip = Some(ip);
+                line
+            }
+            Err(e) => {
+                let line = format!("Public IP lookup failed: {e}");
+                self.public_ip_error = Some(e);
+                line
+            }
+        };
+        self.broadcast_reachability();
+        line
+    }
+
+    /// Hook run whenever the HTTPS server has (re)started, on every path that
+    /// starts it (cold start in both loops, `restart_http_server`): kick off the
+    /// firewall query — and, once portmap.rs lands, the router mapping.
+    pub fn after_http_server_started(&mut self) {
+        let Some(tx) = self.event_tx.clone() else {
+            debug_log(true, "after_http_server_started: no event channel yet; skipping reachability checks");
+            return;
+        };
+        self.spawn_firewall_check(None, tx.clone());
+        self.start_port_mapping(None, tx);
+    }
+
+    /// Query the Windows Firewall verdict in the background (`firewall.rs`; a
+    /// non-Windows build answers `NotApplicable` the same way). The answer arrives
+    /// as `AppEvent::FirewallResult`.
+    pub fn spawn_firewall_check(&mut self, reply_to: Option<(u64, usize)>, event_tx: mpsc::Sender<AppEvent>) {
+        if cfg!(windows) {
+            self.firewall_status = reach::FirewallStatus::Checking;
+            self.broadcast_reachability();
+        }
+        tokio::spawn(async move {
+            let status = tokio::task::spawn_blocking(firewall::query_firewall_status)
+                .await
+                .unwrap_or_else(|e| reach::FirewallStatus::Unknown { detail: format!("query task failed: {e}") });
+            let _ = event_tx.send(AppEvent::FirewallResult(status, None, reply_to)).await;
+        });
+    }
+
+    /// Add (or repair) the Windows Firewall rule for this executable: one UAC
+    /// prompt on *this* machine's desktop, then a fresh query so the verdict shown
+    /// is what Windows actually enforces. Off Windows it just reports `NotApplicable`.
+    pub fn request_firewall_rule(&mut self, reply_to: Option<(u64, usize)>, event_tx: mpsc::Sender<AppEvent>) {
+        if !cfg!(windows) {
+            self.firewall_status = reach::FirewallStatus::NotApplicable;
+            let line = self.apply_firewall_result(reach::FirewallStatus::NotApplicable, None);
+            self.reply_reach_line(reply_to, &line);
+            return;
+        }
+        self.firewall_error = None;
+        self.firewall_status = reach::FirewallStatus::Unknown {
+            detail: "waiting for the UAC prompt on this machine...".to_string(),
+        };
+        self.broadcast_reachability();
+        tokio::spawn(async move {
+            let (status, error) = tokio::task::spawn_blocking(|| match firewall::add_firewall_rule() {
+                Ok(()) => (firewall::query_firewall_status(), None),
+                Err(e) => (firewall::query_firewall_status(), Some(e)),
+            })
+            .await
+            .unwrap_or_else(|e| (reach::FirewallStatus::Unknown { detail: format!("task failed: {e}") }, None));
+            let _ = event_tx.send(AppEvent::FirewallResult(status, error, reply_to)).await;
+        });
+    }
+
+    /// Record a firewall verdict (and an add attempt's failure, if any), print the
+    /// once-per-process startup hint when Windows is blocking us, broadcast, and
+    /// return the one-line report for the requester.
+    pub fn apply_firewall_result(&mut self, status: reach::FirewallStatus, action_error: Option<String>) -> String {
+        self.firewall_status = status;
+        if action_error.is_some() {
+            self.firewall_error = action_error.clone();
+        } else if matches!(self.firewall_status, reach::FirewallStatus::Allowed { .. }) {
+            self.firewall_error = None;
+        }
+        let blocking = matches!(self.firewall_status, reach::FirewallStatus::Missing | reach::FirewallStatus::Blocked);
+        if cfg!(windows) && blocking && !self.firewall_hint_shown && self.settings.http_enabled && !self.is_reload {
+            self.firewall_hint_shown = true;
+            self.add_output(
+                "Windows Firewall is not allowing incoming connections to Clay - other devices cannot connect. \
+                 Use /web -> Remote Access (or /reach) to add the rule.",
+            );
+        }
+        self.broadcast_reachability();
+        let verdict = format!("Firewall: {}", reach::firewall_text(&self.firewall_status));
+        match action_error {
+            Some(e) => format!("Add Firewall Rule failed: {e}. {verdict}"),
+            None => verdict,
+        }
+    }
+
+    /// Re-query the firewall and, when the toggle is on, re-add the router mapping.
+    pub fn request_reachability_refresh(&mut self, reply_to: Option<(u64, usize)>, event_tx: mpsc::Sender<AppEvent>) {
+        self.spawn_firewall_check(reply_to, event_tx.clone());
+        self.start_port_mapping(reply_to, event_tx);
+    }
+
+    // ── Router port mapping lifecycle (portmap.rs) ──────────────────────────
+
+    /// Ask the router to forward `http_port` here — or re-add the same mapping,
+    /// which is how a UPnP lease is renewed. No-op unless the toggle is on and the
+    /// web server is enabled. The outcome arrives as `AppEvent::PortMapResult`.
+    pub fn start_port_mapping(&mut self, reply_to: Option<(u64, usize)>, event_tx: mpsc::Sender<AppEvent>) {
+        if !self.settings.port_map_enabled || !self.settings.http_enabled {
+            return;
+        }
+        let port = self.settings.http_port;
+        let live = matches!(self.port_map_status, reach::PortMapStatus::Mapped { .. } | reach::PortMapStatus::DoubleNat { .. });
+        if !live {
+            self.port_map_status = reach::PortMapStatus::Searching;
+            self.broadcast_reachability();
+        }
+        tokio::spawn(async move {
+            let status = portmap::map_port(port).await;
+            let _ = event_tx.send(AppEvent::PortMapResult(status, reply_to)).await;
+        });
+    }
+
+    /// Drop the router mapping (toggle off, port change, web server turned off).
+    /// The removal itself runs in the background; the state flips to Off at once.
+    pub fn stop_port_mapping(&mut self) {
+        if let Some(ext) = portmap::take_active() {
+            tokio::spawn(async move {
+                match portmap::unmap_port(ext).await {
+                    Ok(()) => debug_log(true, &format!("portmap: removed router mapping for external port {ext}")),
+                    Err(e) => debug_log(true, &format!("portmap: could not remove router mapping for external port {ext}: {e}")),
+                }
+            });
+        }
+        self.port_map_status = reach::PortMapStatus::Off;
+        self.port_map_last_attempt = None;
+        self.broadcast_reachability();
+    }
+
+    /// Keepalive-tick hook: re-add a live mapping (lease renewal) or retry a
+    /// failed one once `portmap::RENEW_EVERY` has passed since the last attempt.
+    pub fn maybe_renew_port_mapping(&mut self) {
+        if !self.settings.port_map_enabled || matches!(self.port_map_status, reach::PortMapStatus::Off | reach::PortMapStatus::Searching) {
+            return;
+        }
+        let due = self.port_map_last_attempt.map(|t| t.elapsed() >= portmap::RENEW_EVERY).unwrap_or(true);
+        if due {
+            if let Some(tx) = self.event_tx.clone() {
+                self.start_port_mapping(None, tx);
+            }
+        }
+    }
+
+    /// Record a mapping outcome, remember the held port for the exit paths, print
+    /// the one-line "mapping active" notice on first activation, broadcast, and
+    /// return the one-line report for the requester.
+    pub fn apply_port_map_result(&mut self, status: reach::PortMapStatus) -> String {
+        // The toggle may have been switched off while the request was in flight:
+        // don't resurrect the mapping, remove what the router just made.
+        if !self.settings.port_map_enabled {
+            if let reach::PortMapStatus::Mapped { external_port, .. } | reach::PortMapStatus::DoubleNat { external_port, .. } = &status {
+                let p = *external_port;
+                tokio::spawn(async move { let _ = portmap::unmap_port(p).await; });
+            }
+            return format!("Router: {}", reach::port_map_text(&self.port_map_status, false));
+        }
+        let was_live = matches!(self.port_map_status, reach::PortMapStatus::Mapped { .. } | reach::PortMapStatus::DoubleNat { .. });
+        self.port_map_last_attempt = Some(std::time::Instant::now());
+        match &status {
+            reach::PortMapStatus::Mapped { external_port, .. } | reach::PortMapStatus::DoubleNat { external_port, .. } => {
+                portmap::set_active(Some(*external_port));
+            }
+            _ => portmap::set_active(None),
+        }
+        self.port_map_status = status;
+        if !was_live && !self.is_reload {
+            match &self.port_map_status {
+                reach::PortMapStatus::Mapped { external_ip, external_port, lan_ip, .. } => {
+                    let line = format!(
+                        "Router port mapping active: {external_ip}:{external_port} -> {lan_ip}:{} (see /reach)",
+                        self.settings.http_port
+                    );
+                    self.add_output(&line);
+                }
+                reach::PortMapStatus::DoubleNat { .. } => {
+                    self.add_output("Router port mapping made, but the router is itself behind another NAT - the internet cannot reach it (see /reach)");
+                }
+                _ => {}
+            }
+        }
+        self.broadcast_reachability();
+        format!("Router: {}", reach::port_map_text(&self.port_map_status, true))
+    }
+
+    /// Clean-quit hook for the async exit paths (console `/quit`, the keyboard
+    /// Quit action): remove the held mapping, waiting at most a few seconds. Hot
+    /// reload deliberately never calls this — the new process re-adds the mapping.
+    pub async fn unmap_on_quit(&mut self) {
+        if let Some(ext) = portmap::take_active() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), portmap::unmap_port(ext)).await;
+        }
+    }
+
+    /// Flip the UPnP port-mapping toggle: immediate effect, persisted (with the
+    /// requesting UI as the audit source), broadcast to every client. Deliberately
+    /// not part of `UpdateGlobalSettings`, so an older client that doesn't know the
+    /// field can't silently reset it. Starting/stopping the mapping itself hooks in
+    /// here once portmap.rs exists.
+    pub fn set_port_map_enabled(&mut self, enabled: bool, source: &str) {
+        if self.settings.port_map_enabled != enabled {
+            self.settings.port_map_enabled = enabled;
+            let _ = persistence::save_settings_with_source(self, source);
+        }
+        if enabled {
+            match self.event_tx.clone() {
+                Some(tx) => self.start_port_mapping(None, tx),
+                None => self.broadcast_reachability(),
+            }
+        } else {
+            self.stop_port_mapping();
+        }
+    }
+
     /// Generate a new auth key string. Fails closed (returns `None`) rather than
     /// producing a guessable key if the OS RNG is unavailable (C2, security
     /// remediation) — the timestamp/pid-derived hasher input alone is not a secure
@@ -13145,6 +13488,20 @@ impl App {
                     flush: false, gagged: false, highlight_colors: Vec::new(),
                 });
             }
+            Command::Reach { refresh, lookup } => {
+                let target = Some((client_id, world_index));
+                for line in reach::format_reach_lines(&self.build_reachability_info()) {
+                    self.reply_reach_line(target, &line);
+                }
+                if refresh {
+                    self.reply_reach_line(target, "Re-checking firewall and router status...");
+                    self.request_reachability_refresh(target, event_tx.clone());
+                }
+                if lookup {
+                    self.reply_reach_line(target, "Looking up public IP (checkip.amazonaws.com)...");
+                    self.request_public_ip_lookup(target, event_tx.clone());
+                }
+            }
             // AddWorld - add or update world definition
             Command::AddWorld { name, host, port, user, password, use_ssl, file } => {
                 execute_add_world_command(self, name, host, port, user, password, use_ssl, file, world_index, false);
@@ -13583,6 +13940,24 @@ impl App {
                         return WsAsyncAction::Connect { world_index, prev_index, broadcast: true };
                     }
                 }
+            }
+            // Remote Access panel (reach.rs). Replies go to nobody in particular
+            // (`None`): the dialog re-renders from the reachability broadcast, and an
+            // output line would land in whichever world the server happens to show.
+            WsMessage::SetPortMapping { enabled } => {
+                let source = self.ws_get_client_type(client_id).map(|t| t.label()).unwrap_or("web");
+                self.set_port_map_enabled(enabled, source);
+            }
+            WsMessage::FirewallRule { action } => {
+                if action == "add" {
+                    self.request_firewall_rule(None, event_tx.clone());
+                }
+            }
+            WsMessage::LookupPublicIp => {
+                self.request_public_ip_lookup(None, event_tx.clone());
+            }
+            WsMessage::RefreshReachability => {
+                self.request_reachability_refresh(None, event_tx.clone());
             }
             WsMessage::TrustCertificate { world_index, host, new_fingerprint } => {
                 // User explicitly accepted a changed TLS certificate after a pin
@@ -15185,6 +15560,17 @@ pub enum AppEvent {
     // Ok((settings_dat, theme_dat, keybindings_dat)) or the failure reason. See
     // handle_import_result and plan `i-d-like-to-make-snuggly-rain.md`.
     ImportResult(u64, String, Result<(String, String, String), remote_client::ImportClientError>),
+    /// Opt-in public IP lookup finished (`App::request_public_ip_lookup`): the address or
+    /// the failure reason, plus who asked — `Some((0, _))` the console, `Some((client_id,
+    /// world_index))` that WebSocket client (line shown in the world it was viewing),
+    /// `None` nobody beyond the reachability broadcast. See `App::reply_reach_line`.
+    PublicIpResult(Result<String, String>, Option<(u64, usize)>),
+    /// A Windows Firewall query or Add Firewall Rule attempt finished: the fresh
+    /// verdict, the add attempt's failure reason (if this was one and it failed),
+    /// and who asked (same convention as `PublicIpResult`).
+    FirewallResult(reach::FirewallStatus, Option<String>, Option<(u64, usize)>),
+    /// A router (UPnP) mapping attempt finished (`portmap::map_port`), with who asked.
+    PortMapResult(reach::PortMapStatus, Option<(u64, usize)>),
 }
 
 /// Successful update download ready to install
@@ -15578,13 +15964,17 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
         WEB_FIELD_WS_PASSWORD, WEB_FIELD_AUTH_KEY,
         WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_CUSTOM_CERT, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
         WEB_FIELD_REMOTE_LINES,
-        WEB_BTN_SAVE, WEB_BTN_CANCEL, WEB_BTN_MODIFY_KEY,
+        WEB_BTN_SAVE, WEB_BTN_CANCEL, WEB_BTN_MODIFY_KEY, WEB_BTN_REMOTE_ACCESS,
         update_web_visibility,
     };
     use popup::definitions::modify_key::{
         create_modify_key_popup, set_displayed_key,
         MODIFY_KEY_BTN_COPY, MODIFY_KEY_BTN_REGEN,
         MODIFY_KEY_BTN_DELETE, MODIFY_KEY_BTN_CLOSE,
+    };
+    use popup::definitions::remote_access::{
+        create_remote_access_popup,
+        RA_FIELD_PORTMAP, RA_BTN_FIREWALL, RA_BTN_LOOKUP, RA_BTN_REFRESH, RA_BTN_CLOSE,
     };
     use popup::definitions::actions::{
         ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST,
@@ -15651,6 +16041,7 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
     let is_setup = popup_id == Some(popup::PopupId("setup"));
     let is_web = popup_id == Some(popup::PopupId("web"));
     let is_modify_key = popup_id == Some(popup::PopupId("modify_key"));
+    let is_remote_access = popup_id == Some(popup::PopupId("remote_access"));
     let is_connections = popup_id == Some(popup::PopupId("connections"));
     let is_actions_list = popup_id == Some(popup::PopupId("actions_list"));
     let is_action_editor = popup_id == Some(popup::PopupId("action_editor"));
@@ -16133,6 +16524,11 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                 let auth_key = app.settings.websocket_auth_key.as_ref().map(|ak| ak.key.clone()).unwrap_or_default();
                 app.popup_manager.push(create_modify_key_popup(&auth_key));
             };
+            // Open the Remote Access sub-popup (reach.rs picture), stacking on top of this one.
+            let open_remote_access = |app: &mut App| {
+                let info = app.build_reachability_info();
+                app.popup_manager.push(create_remote_access_popup(&info));
+            };
 
             // Check if current field is a text field
             let is_text_field = state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false);
@@ -16164,6 +16560,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             }
                         } else if state.is_button_focused(WEB_BTN_MODIFY_KEY) {
                             open_modify_key(app);
+                        } else if state.is_button_focused(WEB_BTN_REMOTE_ACCESS) {
+                            open_remote_access(app);
                         } else if state.is_button_focused(WEB_BTN_CANCEL) {
                             app.popup_manager.close();
                         }
@@ -16267,6 +16665,8 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                             }
                         } else if btn_id == WEB_BTN_MODIFY_KEY {
                             open_modify_key(app);
+                        } else if btn_id == WEB_BTN_REMOTE_ACCESS {
+                            open_remote_access(app);
                         } else if btn_id == WEB_BTN_CANCEL {
                             app.popup_manager.close();
                         }
@@ -16361,6 +16761,69 @@ pub(crate) fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupActi
                     sync_parent(app);
                 }
                 ModifyKeyAction::None => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Remote Access popup handling (nested under /web — see WEB_BTN_REMOTE_ACCESS above).
+        // The report field is display-only (disabled, so it is never focused and never
+        // auto-scrolls to its end); the toggle and buttons act on App immediately, and every
+        // result comes back through App::broadcast_reachability(), which refreshes the report
+        // while this popup is on top.
+        if is_remote_access {
+            // Resolve the action first so `state` (borrowed from app.popup_manager) is not
+            // held across the app.xxx() calls below — same shape as the Modify Key block.
+            enum RaAction { Toggle, Firewall, Lookup, Refresh, Close, None }
+            let action = match key.code {
+                Esc => RaAction::Close,
+                Enter | Char(' ') => {
+                    if state.is_button_focused(RA_BTN_FIREWALL) { RaAction::Firewall }
+                    else if state.is_button_focused(RA_BTN_LOOKUP) { RaAction::Lookup }
+                    else if state.is_button_focused(RA_BTN_REFRESH) { RaAction::Refresh }
+                    else if state.is_button_focused(RA_BTN_CLOSE) { RaAction::Close }
+                    else if state.selected_field().map(|f| f.id == RA_FIELD_PORTMAP).unwrap_or(false) { RaAction::Toggle }
+                    else { RaAction::None }
+                }
+                Char(c) => {
+                    match state.find_button_by_shortcut(c) {
+                        Some(id) if id == RA_BTN_FIREWALL => RaAction::Firewall,
+                        Some(id) if id == RA_BTN_LOOKUP => RaAction::Lookup,
+                        Some(id) if id == RA_BTN_REFRESH => RaAction::Refresh,
+                        Some(id) if id == RA_BTN_CLOSE => RaAction::Close,
+                        _ => RaAction::None,
+                    }
+                }
+                Tab => { state.cycle_field_buttons(); RaAction::None }
+                BackTab => { state.cycle_field_buttons_rev(); RaAction::None }
+                Up => { state.prev_item(); RaAction::None }
+                Down => { state.next_item(); RaAction::None }
+                _ => RaAction::None,
+            };
+
+            // The console has no client id: replies go to the output area (`Some((0, 0))`),
+            // and the popup's report is refreshed by the reachability broadcast either way.
+            let console = Some((0u64, 0usize));
+            match action {
+                RaAction::Toggle => {
+                    let enabled = !app.settings.port_map_enabled;
+                    app.set_port_map_enabled(enabled, "console");
+                }
+                RaAction::Firewall => match app.event_tx.clone() {
+                    Some(tx) => app.request_firewall_rule(console, tx),
+                    None => debug_log(true, "remote_access: no event channel for firewall request"),
+                },
+                RaAction::Lookup => match app.event_tx.clone() {
+                    Some(tx) => app.request_public_ip_lookup(console, tx),
+                    None => debug_log(true, "remote_access: no event channel for public IP lookup"),
+                },
+                RaAction::Refresh => match app.event_tx.clone() {
+                    Some(tx) => app.request_reachability_refresh(console, tx),
+                    None => debug_log(true, "remote_access: no event channel for refresh"),
+                },
+                RaAction::Close => {
+                    app.popup_manager.close();
+                }
+                RaAction::None => {}
             }
             return NewPopupAction::None;
         }
@@ -18120,6 +18583,12 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
         }
     };
 
+    // A live router mapping points at the old port: drop it now; the start hook
+    // below re-adds one for the new configuration if the toggle is still on.
+    if portmap::active().is_some() {
+        app.stop_port_mapping();
+    }
+
     // Shut down existing HTTP server
     if let Some(ref mut server) = app.http_server {
         if let Some(tx) = server.shutdown_tx.take() { let _ = tx.send(()); }
@@ -18150,6 +18619,7 @@ pub async fn restart_http_server(app: &mut App, event_tx: mpsc::Sender<AppEvent>
                     Ok(()) => {
                         app.add_output(&format!("HTTPS web interface restarted on port {http_port}"));
                         app.https_server = Some(https_server);
+                        app.after_http_server_started();
                     }
                     Err(e) => {
                         app.add_output(&format!("Failed to start HTTPS server on port {http_port}: {e}"));
@@ -18635,6 +19105,7 @@ pub async fn run_app_headless(
                             app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
+                        app.after_http_server_started();
                     }
                     Err(e) => {
                         app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
@@ -18983,6 +19454,18 @@ pub async fn run_app_headless(
                             }
                         }
                     }
+                    AppEvent::PublicIpResult(result, reply_to) => {
+                        let line = app.apply_public_ip_result(result);
+                        app.reply_reach_line(reply_to, &line);
+                    }
+                    AppEvent::FirewallResult(status, action_error, reply_to) => {
+                        let line = app.apply_firewall_result(status, action_error);
+                        app.reply_reach_line(reply_to, &line);
+                    }
+                    AppEvent::PortMapResult(status, reply_to) => {
+                        let line = app.apply_port_map_result(status);
+                        app.reply_reach_line(reply_to, &line);
+                    }
                     AppEvent::UpdateResult(result) => {
                         match result {
                             Ok(success) => {
@@ -19037,6 +19520,7 @@ pub async fn run_app_headless(
                 // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE);
                 // piggybacking on this existing once-a-minute tick rather than a new timer.
                 app.reap_stale_ws_client_worlds();
+                app.maybe_renew_port_mapping();
                 for world in &mut app.worlds {
                     if world.connected {
                         // Only check last_send_time: server kicks us when WE go idle.
@@ -19052,7 +19536,6 @@ pub async fn run_app_headless(
                                     KeepAliveType::Nop => {
                                         let nop = vec![TELNET_IAC, TELNET_NOP];
                                         let _ = tx.try_send(WriteCommand::Raw(nop));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent NOP to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -19065,7 +19548,6 @@ pub async fn run_app_headless(
                                         let cmd = world.settings.keep_alive_cmd
                                             .replace("##rand##", &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Custom keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -19076,7 +19558,6 @@ pub async fn run_app_headless(
                                             .as_nanos() % 1000 + 1) as u32;
                                         let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                                         let _ = tx.try_send(WriteCommand::Text(cmd));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Generic keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -19987,7 +20468,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         KeepAliveType::Nop => {
                             let nop = vec![TELNET_IAC, TELNET_NOP];
                             let _ = tx.try_send(WriteCommand::Raw(nop));
-                            debug_log(is_debug_enabled(), &format!("keepalive: sent NOP to world '{}'", world.name));
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -20000,7 +20480,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let cmd = world.settings.keep_alive_cmd
                                 .replace("##rand##", &idler_tag);
                             let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                            debug_log(is_debug_enabled(), &format!("keepalive: sent Custom keepalive to world '{}'", world.name));
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -20011,7 +20490,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 .as_nanos() % 1000 + 1) as u32;
                             let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                             let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                            debug_log(is_debug_enabled(), &format!("keepalive: sent Generic keepalive to world '{}'", world.name));
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -20093,6 +20571,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
+                        app.after_http_server_started();
                     }
                     Err(e) => {
                         let err_str = e.to_string();
@@ -20119,6 +20598,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
+                        app.after_http_server_started();
                     }
                     Err(e) => {
                         let err_str = e.to_string();
@@ -20358,7 +20838,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 } else if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press { continue; }
                     match handle_key_event(key, &mut app) {
-                        KeyAction::Quit => return Ok(()),
+                        KeyAction::Quit => {
+                            app.unmap_on_quit().await;
+                            return Ok(());
+                        }
                         KeyAction::Redraw => {
                             // Filter output to only show server data (remove client-generated
                             // lines). Also drops the console's OWN ▶ markers (see
@@ -21179,6 +21662,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
+                    AppEvent::PublicIpResult(result, reply_to) => {
+                        let line = app.apply_public_ip_result(result);
+                        app.reply_reach_line(reply_to, &line);
+                    }
+                    AppEvent::FirewallResult(status, action_error, reply_to) => {
+                        let line = app.apply_firewall_result(status, action_error);
+                        app.reply_reach_line(reply_to, &line);
+                    }
+                    AppEvent::PortMapResult(status, reply_to) => {
+                        let line = app.apply_port_map_result(status);
+                        app.reply_reach_line(reply_to, &line);
+                    }
                     AppEvent::UpdateResult(result) => {
                         match result {
                             Ok(success) => {
@@ -21223,6 +21718,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 needs_draw = true; // Clock display updates every minute
                 // Reap long-disconnected WS clients' view-state entries (WS_VIEWER_GRACE).
                 app.reap_stale_ws_client_worlds();
+                app.maybe_renew_port_mapping();
 
                 // Clear popup error messages after timeout
                 if let Some(state) = app.popup_manager.current_mut() {
@@ -21255,7 +21751,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     KeepAliveType::Nop => {
                                         let nop = vec![TELNET_IAC, TELNET_NOP];
                                         let _ = tx.try_send(WriteCommand::Raw(nop));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent NOP to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -21269,7 +21764,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         let cmd = world.settings.keep_alive_cmd
                                             .replace("##rand##", &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Custom keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -21281,7 +21775,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             .as_nanos() % 1000 + 1) as u32;
                                         let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                                         let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                                        debug_log(is_debug_enabled(), &format!("keepalive: sent Generic keepalive to world '{}'", world.name));
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -22020,6 +22513,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             flush: false, gagged: false, highlight_colors: Vec::new(),
                         });
                     }
+                }
+                AppEvent::PublicIpResult(result, reply_to) => {
+                    let line = app.apply_public_ip_result(result);
+                    app.reply_reach_line(reply_to, &line);
+                }
+                AppEvent::FirewallResult(status, action_error, reply_to) => {
+                    let line = app.apply_firewall_result(status, action_error);
+                    app.reply_reach_line(reply_to, &line);
+                }
+                AppEvent::PortMapResult(status, reply_to) => {
+                    let line = app.apply_port_map_result(status);
+                    app.reply_reach_line(reply_to, &line);
                 }
             }
             // Time budget exceeded — break to draw and handle keyboard input.

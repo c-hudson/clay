@@ -434,6 +434,7 @@ fn write_settings_dat(app: &App, w: &mut impl IoWrite, plaintext_secrets: bool) 
     // Written unconditionally (even when empty): key-absent (old settings file) means
     // default "clay"; present-but-empty means legacy mode (UI served at "/").
     writeln!(file, "web_path={}", app.settings.web_path)?;
+    writeln!(file, "port_map_enabled={}", app.settings.port_map_enabled)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", secret(&app.settings.websocket_password))?;
     }
@@ -1141,6 +1142,7 @@ pub fn load_settings_from_str(app: &mut App, content: &str) {
                         // means legacy mode (UI served at "/").
                         app.settings.web_path = sanitize_web_path(value);
                     }
+                    "port_map_enabled" => app.settings.port_map_enabled = value == "true",
                     // Legacy fields - map https to http when web_secure, ws_nonsecure to ws when !web_secure
                     "https_enabled" => {
                         // If https was enabled in old config, set http_enabled and web_secure
@@ -1919,6 +1921,7 @@ pub fn save_reload_state_to(app: &App, file: &mut impl std::io::Write) -> io::Re
     // Written unconditionally (even when empty): key-absent (old settings file) means
     // default "clay"; present-but-empty means legacy mode (UI served at "/").
     writeln!(file, "web_path={}", app.settings.web_path)?;
+    writeln!(file, "port_map_enabled={}", app.settings.port_map_enabled)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
@@ -2849,6 +2852,7 @@ pub fn load_reload_state_from_str(app: &mut App, content: &str) -> io::Result<bo
                     "web_path" => {
                         app.settings.web_path = sanitize_web_path(value);
                     }
+                    "port_map_enabled" => app.settings.port_map_enabled = value == "true",
                     // Legacy fields
                     "https_enabled" => {
                         if value == "true" {
@@ -3382,6 +3386,7 @@ mod tests {
             http_enabled: true,                // default: false
             http_port: 8080,                   // default: 9000
             web_path: "stealth".to_string(),   // default: "clay"
+            port_map_enabled: true,            // default: false
             websocket_password: "testpass".to_string(),     // default: ""
             websocket_allow_list: "192.168.1.1".to_string(), // default: ""
             websocket_whitelisted_host: Some("10.0.0.1".to_string()), // default: None (not persisted to .clay.dat)
@@ -3492,6 +3497,7 @@ mod tests {
         assert_eq!(a.http_enabled, b.http_enabled, "{context}: http_enabled");
         assert_eq!(a.http_port, b.http_port, "{context}: http_port");
         assert_eq!(a.web_path, b.web_path, "{context}: web_path");
+        assert_eq!(a.port_map_enabled, b.port_map_enabled, "{context}: port_map_enabled");
         assert_eq!(a.websocket_password, b.websocket_password, "{context}: websocket_password");
         assert_eq!(a.websocket_allow_list, b.websocket_allow_list, "{context}: websocket_allow_list");
         // websocket_whitelisted_host is not persisted to .clay.dat (runtime state)
@@ -4599,6 +4605,7 @@ pattern=foo
         assert_ne!(non_default.http_enabled, default.http_enabled, "http_enabled should differ");
         assert_ne!(non_default.http_port, default.http_port, "http_port should differ");
         assert_ne!(non_default.web_path, default.web_path, "web_path should differ");
+        assert_ne!(non_default.port_map_enabled, default.port_map_enabled, "port_map_enabled should differ");
         assert_ne!(non_default.websocket_password, default.websocket_password, "websocket_password should differ");
         assert_ne!(non_default.websocket_allow_list, default.websocket_allow_list, "websocket_allow_list should differ");
         assert_ne!(non_default.websocket_cert_file, default.websocket_cert_file, "websocket_cert_file should differ");

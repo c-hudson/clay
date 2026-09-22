@@ -30,6 +30,8 @@ pub const WEB_FIELD_VALIDATION_MSG: FieldId = FieldId(13);
 pub const WEB_BTN_SAVE: ButtonId = ButtonId(1);
 pub const WEB_BTN_CANCEL: ButtonId = ButtonId(2);
 pub const WEB_BTN_MODIFY_KEY: ButtonId = ButtonId(3);
+/// Opens the Remote Access sub-popup (remote_access.rs): how other devices reach this Clay.
+pub const WEB_BTN_REMOTE_ACCESS: ButtonId = ButtonId(4);
 
 /// Port field options: disabled, the default 9000, or a user-defined port
 /// (revealed as a separate "Custom Port" text field).
@@ -133,6 +135,7 @@ pub fn create_web_popup(
             )
             .disabled(),
         )
+        .with_button(Button::new(WEB_BTN_REMOTE_ACCESS, "Remote Access").with_shortcut('R'))
         .with_button(Button::new(WEB_BTN_MODIFY_KEY, "Modify Key").with_shortcut('M'))
         .with_button(Button::new(WEB_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(WEB_BTN_SAVE, "Save").primary().with_shortcut('S'))
@@ -236,6 +239,11 @@ fn web_help_text() -> Vec<String> {
         "  it proves the key before any web request, which is",
         "  the only way in from an address not on the Allow",
         "  List. Regen or delete takes effect immediately.",
+        "",
+        "Remote Access: how other devices reach this Clay —",
+        "  LAN/VPN/public addresses, Windows Firewall and router",
+        "  (UPnP) status, and what to type elsewhere. Same as",
+        "  /reach in the output area.",
     ].into_iter().map(|s| s.to_string()).collect()
 }
 
@@ -441,6 +449,7 @@ mod tests {
         assert_eq!(state.definition.id, PopupId("web"));
         assert_eq!(state.definition.title, "Web Settings");
         assert_eq!(state.definition.fields.len(), 11);
+        assert!(state.definition.buttons.iter().any(|b| b.id == WEB_BTN_REMOTE_ACCESS));
     }
 
     #[test]

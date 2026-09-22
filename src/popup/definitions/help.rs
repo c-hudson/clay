@@ -33,6 +33,7 @@ pub const HELP_LINES: &[&str] = &[
     "Basic Configuration:",
     "  /setup               - General settings popup",
     "  /web                 - Web interface / remote access settings",
+    "  /reach               - How other devices can reach this Clay",
     "  /actions             - Manage triggers and actions",
     "",
     "For more help:",
@@ -143,6 +144,8 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
             "",
             "Configure WebSocket (ws/wss), HTTP/HTTPS servers,",
             "TLS certificates, passwords, and allow lists.",
+            "Remote Access (also /reach) shows how other devices",
+            "reach this Clay: addresses, firewall, router mapping.",
         ],
         "menu" => vec![
             "/menu                      Open menu popup",
@@ -208,6 +211,17 @@ pub fn get_topic_help(topic: &str) -> Option<Vec<String>> {
         ],
         "version" => vec![
             "/version                   Show version info",
+        ],
+        "reach" => vec![
+            "/reach                     How other devices can reach this Clay",
+            "",
+            "Shows this machine's LAN/VPN/public addresses, the Windows",
+            "Firewall and router (UPnP) status, and exactly what to type",
+            "on another device. The same panel is at /web -> Remote Access.",
+            "",
+            "/reach --refresh (-r)      Re-check firewall and router mapping",
+            "/reach --lookup (-l)       Look up the public IP (asks",
+            "                           checkip.amazonaws.com; never automatic)",
         ],
         "reload" => vec![
             "/reload                    Hot reload binary",

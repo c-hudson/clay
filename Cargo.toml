@@ -77,6 +77,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # above - russh's default pulls aws-lc-rs, which needs a C toolchain and does not
 # cross-compile to Android/Termux armv7. ring is pure-Rust and matches everything else.
 russh = { version = "0.63", optional = true, default-features = false, features = ["ring", "rsa"] }
+igd-next = { version = "0.17.1", default-features = false, features = ["aio_tokio"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

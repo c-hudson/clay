@@ -1386,6 +1386,10 @@ fn create_webview_window(
                 }
             }
             Event::UserEvent(WvEvent::Quit) => {
+                // Give the router its port back before the process ends (no-op unless a
+                // UPnP mapping is held; the master GUI's App lives on the runtime thread,
+                // so this goes through portmap's process-wide record).
+                crate::portmap::unmap_active_blocking();
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(WvEvent::SetOpacity(opacity)) => {

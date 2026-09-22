@@ -649,6 +649,7 @@
         settingsClayServerSection: document.getElementById('settings-clay-server'),
         webAuthKey: document.getElementById('web-auth-key'),
         webModifyKeyBtn: document.getElementById('web-modify-key-btn'),
+        webRemoteAccessBtn: document.getElementById('web-remote-access-btn'),
         // Setup fields (inside combined settings modal)
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
@@ -1285,6 +1286,9 @@
     let wsPassword = '';
     let tlsConfigured = false;  // True if server has a custom (user-provided) TLS cert+key configured
     let serverAuthKey = '';  // Auth key from server (for display in web settings)
+    // reach::ReachabilityInfo from the server (GlobalSettingsMsg.reachability_json): how other
+    // devices reach this Clay. Rendered by the Remote Access dialog, never recomputed here.
+    let reachabilityInfo = null;
     // Guards against pushing a full UpdateGlobalSettings snapshot before this client
     // has received the server's real values (InitialState / GlobalSettingsUpdated).
     // Without this, any global still at its JS default (false/'') would overwrite
@@ -1598,7 +1602,7 @@
     // 'ver', 'man', 'nogag' are TF-engine commands from Phase 1's missing-builtins/stdlib
     // work, listed in that test's tf_only_completion_commands allowlist.
     const INTERNAL_COMMANDS = [
-        'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
+        'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'reach', 'actions',
         'worlds', 'world', 'connections', 'l', 'disconnect', 'dc', 'connect', 'import',
         'flush', 'menu', 'send', 'remote', 'ban', 'unban',
         'testmusic', 'dump', 'mssp', 'msdp', 'stats', 'notify', 'addworld', 'note', 'tag', 'tags',
@@ -3560,6 +3564,9 @@
                         try { tfBoundKeys = new Set(JSON.parse(msg.settings.tf_bound_keys_json)); }
                         catch (e) { tfBoundKeys = new Set(); }
                     }
+                    if (msg.settings.reachability_json !== undefined) {
+                        applyReachabilityJson(msg.settings.reachability_json);
+                    }
                     settingsSynced = true;
                 }
                 } catch (e) {
@@ -4401,6 +4408,9 @@
                     if (msg.settings.tf_bound_keys_json !== undefined) {
                         try { tfBoundKeys = new Set(JSON.parse(msg.settings.tf_bound_keys_json)); }
                         catch (e) { tfBoundKeys = new Set(); }
+                    }
+                    if (msg.settings.reachability_json !== undefined) {
+                        applyReachabilityJson(msg.settings.reachability_json);
                     }
                     settingsSynced = true;
                 }
@@ -7244,7 +7254,11 @@
             'Allow List: Comma-separated IP addresses or',
             '  subnets allowed to connect. Empty = allow all.', '',
             'TLS Cert/Key File: Paths to your TLS/SSL certificate',
-            '  and private key files for secure connections.'
+            '  and private key files for secure connections.', '',
+            'Remote Access: how other devices reach this Clay -',
+            '  LAN/VPN/public addresses, Windows Firewall and router',
+            '  (UPnP) status, and exactly what to type on the other',
+            '  device. Same as /reach in the output area.'
         ],
         worldEditor: [
             'World Settings - Configure a Connection', '',
@@ -13249,6 +13263,9 @@
             case 'web':
                 openSettingsPopup('web');
                 break;
+            case 'reach':
+                showRemoteAccessDialog();
+                break;
             case 'font':
                 openSettingsPopup('font');
                 break;
@@ -15050,6 +15067,12 @@
                 showModifyKeyDialog();
             };
         }
+        // Remote Access button - addresses, firewall and router mapping (same as /reach)
+        if (elements.webRemoteAccessBtn) {
+            elements.webRemoteAccessBtn.onclick = function() {
+                showRemoteAccessDialog();
+            };
+        }
         // Web save/cancel/close handled by unified settings buttons above
 
         // Font popup
@@ -15487,6 +15510,146 @@
 
     function isModifyKeyDialogOpen() {
         const dlg = document.getElementById('modify-key-dialog');
+        return !!(dlg && dlg.style.display !== 'none');
+    }
+
+    // Remote Access dialog (plan for-clay-to-work-sequential-wirth.md, step 7). Renders the
+    // server-built reach::ReachabilityInfo blob (GlobalSettingsMsg.reachability_json) - the same
+    // picture /reach prints and the TUI popup shows - and never recomputes any of it. Every value
+    // goes through escapeHtml and the whole markup through sanitizeHtml; attributes the sanitizer
+    // might drop (checked/disabled/title) are set on the DOM after rendering instead.
+    function applyReachabilityJson(json) {
+        if (!json) { return; }
+        try { reachabilityInfo = JSON.parse(json); } catch (e) { reachabilityInfo = null; }
+        if (isRemoteAccessDialogOpen()) {
+            renderRemoteAccessDialog(document.getElementById('remote-access-dialog'));
+        }
+    }
+
+    function showRemoteAccessDialog() {
+        let dlg = document.getElementById('remote-access-dialog');
+        if (!dlg) {
+            dlg = document.createElement('div');
+            dlg.id = 'remote-access-dialog';
+            dlg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:3000;display:flex;align-items:center;justify-content:center;';
+            document.body.appendChild(dlg);
+        }
+        renderRemoteAccessDialog(dlg);
+        dlg.style.display = 'flex';
+        // Ask the server to re-check the firewall and router; the reply re-renders us.
+        send({ type: 'RefreshReachability' });
+    }
+
+    function setRemoteAccessStatus(text) {
+        const el = document.getElementById('remote-access-status');
+        if (el) { el.textContent = text; }
+    }
+
+    function renderRemoteAccessDialog(dlg) {
+        const info = reachabilityInfo;
+        const rows = [];
+        const row = function(k, v, cls) {
+            rows.push('<div class="reach-row"><span class="reach-key">' + escapeHtml(k) + '</span><span class="reach-val' +
+                (cls ? ' ' + cls : '') + '">' + escapeHtml(v) + '</span></div>');
+        };
+        let hints = [];
+        if (!info) {
+            row('Status', 'waiting for the server...');
+        } else {
+            const path = info.web_path ? '/' + info.web_path + '/' : '/';
+            row('Web server', info.http_enabled ? ('on, port ' + info.port + ', path ' + path) : 'OFF (enable it in Web Settings)',
+                info.http_enabled ? '' : 'reach-bad');
+            row('LAN', (info.lan_urls && info.lan_urls.length) ? info.lan_urls.join('\n') : 'no non-loopback IPv4 address found');
+            if (info.vpn_addrs && info.vpn_addrs.length) {
+                row('VPN', info.vpn_addrs.join(', ') + '  (Tailscale or similar; reachable from that VPN without port forwarding)');
+            }
+            let pub;
+            if (info.public_ip) {
+                pub = info.public_ip + (info.public_ip_source === 'upnp' ? ' (reported by the router)' :
+                    info.public_ip_source === 'lookup' ? ' (looked up)' : '');
+            } else if (info.public_ip_error) {
+                pub = 'lookup failed: ' + info.public_ip_error;
+            } else {
+                pub = 'unknown (use Look Up Public IP)';
+            }
+            row('Public IP', pub);
+            const fwKind = info.firewall && info.firewall.kind;
+            row('Firewall', info.firewall_text || '',
+                (fwKind === 'Blocked' || fwKind === 'Missing') ? 'reach-bad' : (fwKind === 'Allowed' ? 'reach-good' : ''));
+            const pmKind = info.port_map && info.port_map.kind;
+            row('Router', info.port_map_text || '',
+                pmKind === 'Mapped' ? 'reach-good' :
+                (pmKind === 'DoubleNat' || pmKind === 'Failed' || pmKind === 'NoGateway') ? 'reach-bad' : '');
+            hints = info.client_hints || [];
+        }
+        const hintRows = hints.map(function(h) {
+            return '<div class="reach-row"><span class="reach-key">' + escapeHtml(h.label) + '</span><span class="reach-val reach-mono">' +
+                escapeHtml(h.value) + '</span><button class="reach-copy">Copy</button></div>';
+        }).join('');
+        const isWin = !!(info && info.is_windows);
+        const pmEnabled = !!(info && info.port_map_enabled);
+        dlg.innerHTML = sanitizeHtml(`
+            <div style="background:#1a1a1a;color:#eee;border:2px solid #555;border-radius:8px;padding:20px;max-width:640px;width:94%;max-height:90vh;overflow:auto;">
+                <div style="font-weight:bold;font-size:1.1em;margin-bottom:10px;">Remote Access</div>
+                <div style="opacity:0.85;margin-bottom:10px;">How other devices reach this Clay. Same as typing /reach.</div>
+                <div class="reach-report">${rows.join('')}</div>
+                <div style="font-weight:bold;margin:12px 0 6px;">Connect from another device</div>
+                <div class="reach-report">${hintRows}</div>
+                <label style="display:flex;align-items:center;gap:8px;margin:14px 0 10px;">
+                    <input type="checkbox" id="remote-access-portmap">
+                    <span>Port Mapping (UPnP): ask the router to forward the port to this machine</span>
+                </label>
+                <div id="remote-access-status" style="min-height:1.2em;opacity:0.85;margin-bottom:10px;"></div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
+                    <button id="remote-access-close" style="padding:8px 16px;">Close</button>
+                    <button id="remote-access-refresh" style="padding:8px 16px;">Refresh</button>
+                    <button id="remote-access-lookup" style="padding:8px 16px;">Look Up Public IP</button>
+                    <button id="remote-access-firewall" style="padding:8px 16px;">Add Firewall Rule</button>
+                </div>
+            </div>
+        `);
+        document.getElementById('remote-access-close').onclick = function() {
+            hideRemoteAccessDialog();
+        };
+        document.getElementById('remote-access-refresh').onclick = function() {
+            setRemoteAccessStatus('Re-checking firewall and router...');
+            send({ type: 'RefreshReachability' });
+        };
+        document.getElementById('remote-access-lookup').onclick = function() {
+            setRemoteAccessStatus('Looking up public IP (asks checkip.amazonaws.com)...');
+            send({ type: 'LookupPublicIp' });
+        };
+        const fw = document.getElementById('remote-access-firewall');
+        fw.disabled = !isWin;
+        fw.title = isWin
+            ? 'Add an inbound Windows Firewall rule for Clay (one UAC prompt on the Clay machine)'
+            : 'Windows only';
+        fw.onclick = function() {
+            setRemoteAccessStatus("Answer the UAC prompt on the Clay machine's own screen...");
+            send({ type: 'FirewallRule', action: 'add' });
+        };
+        const cb = document.getElementById('remote-access-portmap');
+        cb.checked = pmEnabled;
+        cb.onchange = function() {
+            send({ type: 'SetPortMapping', enabled: cb.checked });
+        };
+        const copies = dlg.querySelectorAll('.reach-copy');
+        for (let i = 0; i < copies.length; i++) {
+            copies[i].onclick = (function(hint) {
+                return function() { if (hint) copyTextToClipboard(hint.value); };
+            })(hints[i]);
+        }
+    }
+
+    function hideRemoteAccessDialog() {
+        const dlg = document.getElementById('remote-access-dialog');
+        if (dlg) {
+            dlg.style.display = 'none';
+        }
+    }
+
+    function isRemoteAccessDialogOpen() {
+        const dlg = document.getElementById('remote-access-dialog');
         return !!(dlg && dlg.style.display !== 'none');
     }
 

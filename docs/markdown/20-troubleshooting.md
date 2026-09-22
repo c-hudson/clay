@@ -116,7 +116,8 @@ Common issues and their solutions.
 1. Verify WebSocket server is enabled in `/web`
 2. Check password is set
 3. Verify correct port
-4. Check firewall allows the port
+4. Run `/reach` — it shows the firewall verdict, the router mapping state and the
+   exact address to use (see Web Interface, "Reaching Clay from outside your network")
 5. For HTTPS, verify TLS certificate is valid
 
 ### Web Interface Shows "Disconnected"

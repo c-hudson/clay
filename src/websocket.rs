@@ -321,6 +321,23 @@ pub enum WsMessage {
     // Client requests auth key regeneration (from web settings UI)
     RegenerateAuthKey,
 
+    // ── Remote Access panel (reach.rs) ──────────────────────────────────────
+    /// Toggle the router (UPnP) port mapping. Immediate effect, persisted, and
+    /// broadcast to every client in `GlobalSettingsUpdated.settings.reachability_json`.
+    /// Deliberately NOT a field of `UpdateGlobalSettings`: an older client that
+    /// doesn't know it could otherwise silently reset the toggle on every save.
+    SetPortMapping { enabled: bool },
+    /// Windows Firewall action on the *server* machine. `action` is `"add"`: delete
+    /// every inbound rule for this executable, then add a per-program Allow rule —
+    /// one UAC prompt, shown on the server's own desktop even when a phone asked.
+    /// Any other action is ignored.
+    FirewallRule { action: String },
+    /// Opt-in public IP lookup (contacts checkip.amazonaws.com). The answer comes
+    /// back in the next reachability broadcast; never triggered automatically.
+    LookupPublicIp,
+    /// Re-query the firewall verdict and the router mapping.
+    RefreshReachability,
+
     // Password change (multiuser mode)
     ChangePassword {
         old_password_hash: String,
@@ -1529,6 +1546,13 @@ pub struct GlobalSettingsMsg {
     /// WebSocket password (plaintext, sent to authenticated clients for display in settings)
     #[serde(default)]
     pub ws_password: String,
+    /// The remote-access picture (`reach::ReachabilityInfo` as JSON): LAN/VPN/public
+    /// addresses, Windows Firewall verdict, router (UPnP) mapping state and the "type
+    /// this on the other device" hints. Display-only: clients render it, never
+    /// recompute it, and `apply_global_settings` ignores it. Empty from a server that
+    /// predates it.
+    #[serde(default)]
+    pub reachability_json: String,
 }
 
 fn default_gui_transparency() -> f32 {

@@ -1066,6 +1066,65 @@ pub fn convert_temperatures(text: &str) -> String {
     result
 }
 
+// ============================================================================
+// External command helpers
+// ============================================================================
+
+/// Run `cmd args...` with a wall-clock timeout, capturing stdout. Returns
+/// `Some((exit_code, stdout))` whenever the process ran to completion — a
+/// non-zero exit is still a result, because some tools use it to report a
+/// perfectly ordinary answer (`netsh advfirewall firewall show rule` exits 1
+/// for "No rules match the specified criteria."). Returns `None` only when the
+/// command could not be spawned, timed out (it is killed), or wrote non-UTF-8.
+///
+/// On Windows the child is started with `CREATE_NO_WINDOW` so a console window
+/// never flashes over the GUI while, say, `netsh` or `ipconfig` runs.
+pub fn run_command_capture(cmd: &str, args: &[&str], timeout_secs: u64) -> Option<(i32, String)> {
+    let mut command = std::process::Command::new(cmd);
+    command
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().ok()?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.code().unwrap_or(-1);
+                let output = child.wait_with_output().ok()?;
+                return String::from_utf8(output.stdout).ok().map(|s| (code, s));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Run a command with a timeout and return its stdout only when it exited
+/// successfully. `None` for a spawn failure, a timeout, or a non-zero exit.
+/// Thin wrapper over [`run_command_capture`] for callers that only care about
+/// the happy path (`hostname`, `hostname -I`, ...).
+pub fn run_command_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
+    match run_command_capture(cmd, args, timeout_secs) {
+        Some((0, out)) => Some(out),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

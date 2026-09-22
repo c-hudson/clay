@@ -121,6 +121,19 @@ Open Web Settings popup for HTTP/WebSocket configuration.
 
 See the **Web Interface** chapter for details.
 
+### /reach
+Show how other devices can reach this Clay: LAN/VPN/public addresses, the
+Windows Firewall verdict, the router (UPnP) mapping state, and exactly what to
+type on the other device. The same panel is the **Remote Access** button in `/web`.
+
+```
+/reach              Show the report
+/reach --refresh    Re-check the firewall and router mapping (-r)
+/reach --lookup     Look up the public IP via checkip.amazonaws.com; never automatic (-l)
+```
+
+See the **Web Interface** chapter, "Reaching Clay from outside your network".
+
 ### /actions
 Open the Actions editor to create triggers.
 
